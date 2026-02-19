@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Any
 
 
 class ToolInterface(ABC):
@@ -10,8 +11,14 @@ class ToolInterface(ABC):
         """The name of the tool."""
         pass
 
+    @property
     @abstractmethod
-    def execute(self, **args: str) -> str:
+    def schema(self) -> dict:
+        """The OpenAI-format tool schema for this tool."""
+        pass
+
+    @abstractmethod
+    def execute(self, **args: Any) -> str:
         """
         Execute the tool with the given arguments.
 
