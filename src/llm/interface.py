@@ -14,7 +14,7 @@ class ToolCall(BaseModel):
 
 class Message(BaseModel):
     """A message in the conversation."""
-    role: str  # "user", "assistant", "tool_call", "tool_result"
+    role: str  # "system", "user", "assistant", "tool_call", "tool_result"
     content: str
     # For tool_call messages
     tool_call: ToolCall | None = None

@@ -10,6 +10,10 @@ class Conversation:
         self.tool_runner = tool_runner
         self.messages: list[Message] = []
 
+    def add_system_message(self, content: str) -> None:
+        """Add a system message to the conversation."""
+        self.messages.append(Message(role="system", content=content))
+
     def add_user_message(self, content: str) -> None:
         """Add a user message to the conversation."""
         self.messages.append(Message(role="user", content=content))
@@ -26,21 +30,15 @@ class Conversation:
         """Add a tool result to the conversation."""
         self.messages.append(Message(role="tool_result", content=content, call_id=call_id))
 
-    def run_turn(self, user_input: str) -> str:
+    def generate_response(self) -> str:
         """
-        Run a single conversation turn.
+        Generate a response from the current messages.
 
-        Adds the user input, generates a response, and handles any tool calls.
-        Streams the response to stdout as it arrives.
-
-        Args:
-            user_input: The user's input message.
+        Streams the response to stdout and handles any tool calls.
 
         Returns:
             The final assistant response as a string.
         """
-        self.add_user_message(user_input)
-
         while True:
             full_response = ""
             tool_call: ToolCall | None = None
@@ -71,3 +69,19 @@ class Conversation:
                 print()  # newline after streaming
                 self.add_assistant_message(full_response)
                 return full_response
+
+    def run_turn(self, user_input: str) -> str:
+        """
+        Run a single conversation turn.
+
+        Adds the user input, generates a response, and handles any tool calls.
+        Streams the response to stdout as it arrives.
+
+        Args:
+            user_input: The user's input message.
+
+        Returns:
+            The final assistant response as a string.
+        """
+        self.add_user_message(user_input)
+        return self.generate_response()

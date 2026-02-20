@@ -1,14 +1,18 @@
-"""Interactive script for generating employee directory."""
+"""Interactive script for generating source directory structure."""
 
 from datetime import datetime
 
 from src.llm.conversation import Conversation
 from src.llm.openai_llm import OpenAILLM
-from src.paths import COMPANY_OVERVIEW_PATH, EMPLOYEE_DIRECTORY_PATH, INITIATIVES_PATH
-from src.prompts.employee_directory import EMPLOYEE_DIRECTORY_SYSTEM_PROMPT
-from src.schemas.employee_directory import EXPECTED_FORMAT, validate_employee_directory
+from src.paths import (
+    COMPANY_OVERVIEW_PATH,
+    INITIATIVES_PATH,
+    SOURCES_DIR,
+)
+from src.prompts.source_structure import SOURCE_STRUCTURE_SYSTEM_PROMPT
+from src.tools.mkdir import MkdirTool
+from src.tools.read_employee_directory import ReadEmployeeDirectoryTool
 from src.tools.runner import ToolRunner
-from src.tools.write import WriteTool
 
 
 def load_file(path: str) -> str:
@@ -26,32 +30,31 @@ def main() -> None:
     initiatives = load_file(INITIATIVES_PATH)
     current_date = datetime.now().strftime("%B %d, %Y")
 
-    prompt = EMPLOYEE_DIRECTORY_SYSTEM_PROMPT.format(
+    prompt = SOURCE_STRUCTURE_SYSTEM_PROMPT.format(
         company_overview_md_contents=company_overview,
         initiatives_md_contents=initiatives,
         current_date=current_date,
     )
 
-    # Create write tool with validation for employee directory schema
-    write_tool = WriteTool(
-        file_path_override=EMPLOYEE_DIRECTORY_PATH,
-        validator=validate_employee_directory,
-        expected_format=EXPECTED_FORMAT,
-    )
+    # Create tools
+    mkdir_tool = MkdirTool(base_dir=SOURCES_DIR)
+    read_employee_directory_tool = ReadEmployeeDirectoryTool()
 
-    # Initialize LLM with write tool schema
-    llm = OpenAILLM(tools=[write_tool.schema])
+    # Initialize LLM with tool schemas
+    llm = OpenAILLM(tools=[mkdir_tool.schema, read_employee_directory_tool.schema])
 
-    # Create tool runner and register the write tool
+    # Create tool runner and register tools
     tool_runner = ToolRunner()
-    tool_runner.register(write_tool)
+    tool_runner.register(mkdir_tool)
+    tool_runner.register(read_employee_directory_tool)
 
     # Create conversation with LLM and tool runner
     conversation = Conversation(llm=llm, tool_runner=tool_runner)
 
-    print("Employee Directory Generator")
+    print("Source Directory Structure Generator")
     print("=" * 40)
-    print("Collaborate with the assistant to generate the employee directory.")
+    print("Collaborate with the assistant to create the source directory structure.")
+    print(f"Base directory: {SOURCES_DIR}")
     print("Type 'quit' to exit.\n")
 
     # Add system prompt and get initial response

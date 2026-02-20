@@ -1,8 +1,10 @@
 """Validate employee directory and print org chart."""
 
+from io import StringIO
+
 import yaml
 
-from src.paths import EMPLOYEE_DIRECTORY_PATH
+from src.paths import EMPLOYEE_DIRECTORY_PATH, VISUAL_EMPLOYEE_DIRECTORY_PATH
 from src.schemas.employee_directory import EmployeeDirectory
 
 
@@ -117,49 +119,52 @@ def get_employee_info(directory: EmployeeDirectory, name: str) -> str:
     return name
 
 
-def print_tree(
+def write_tree(
     directory: EmployeeDirectory,
     reports: dict[str, list[str]],
     node: str,
+    output: StringIO,
     prefix: str = "",
     is_last: bool = True,
 ) -> None:
-    """Recursively print the org tree."""
+    """Recursively write the org tree to output buffer."""
     connector = "└── " if is_last else "├── "
     info = get_employee_info(directory, node)
-    print(f"{prefix}{connector}{info}")
+    output.write(f"{prefix}{connector}{info}\n")
 
     if node in reports:
         children = sorted(reports[node])
         for i, child in enumerate(children):
             is_child_last = i == len(children) - 1
             child_prefix = prefix + ("    " if is_last else "│   ")
-            print_tree(directory, reports, child, child_prefix, is_child_last)
+            write_tree(directory, reports, child, output, child_prefix, is_child_last)
 
 
-def print_org_chart(directory: EmployeeDirectory) -> None:
-    """Print the full org chart."""
+def generate_org_chart(directory: EmployeeDirectory) -> str:
+    """Generate the full org chart as a string."""
     reports = build_org_tree(directory)
     roots = reports.get("__ROOT__", [])
+    output = StringIO()
 
     if not roots:
-        print("No top-level employees found (everyone has a manager)")
-        return
+        return "No top-level employees found (everyone has a manager)"
 
-    print("\n" + "=" * 60)
-    print("ORG CHART")
-    print("=" * 60 + "\n")
+    output.write("=" * 60 + "\n")
+    output.write("ORG CHART\n")
+    output.write("=" * 60 + "\n\n")
 
     for i, root in enumerate(sorted(roots)):
         info = get_employee_info(directory, root)
-        print(f"🏢 {info}")
+        output.write(f"{info}\n")
         if root in reports:
             children = sorted(reports[root])
             for j, child in enumerate(children):
                 is_last = j == len(children) - 1
-                print_tree(directory, reports, child, "", is_last)
+                write_tree(directory, reports, child, output, "", is_last)
         if i < len(roots) - 1:
-            print()
+            output.write("\n")
+
+    return output.getvalue()
 
 
 def main() -> None:
@@ -211,9 +216,15 @@ def main() -> None:
         print("-" * 40)
         return
 
-    # Print org chart
-    print_org_chart(directory)
-    print("\n✓ Validation complete - no errors found")
+    # Generate and print org chart
+    org_chart = generate_org_chart(directory)
+    print("\n" + org_chart)
+
+    # Save to file
+    with open(VISUAL_EMPLOYEE_DIRECTORY_PATH, "w") as f:
+        f.write(org_chart)
+    print(f"✓ Saved org chart to {VISUAL_EMPLOYEE_DIRECTORY_PATH}")
+    print("✓ Validation complete - no errors found")
 
 
 if __name__ == "__main__":

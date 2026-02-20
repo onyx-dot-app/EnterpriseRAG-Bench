@@ -43,7 +43,9 @@ class OpenAILLM(LLMInterface):
         input_items: list[dict[str, Any]] = []
 
         for msg in messages:
-            if msg.role == "user":
+            if msg.role == "system":
+                input_items.append({"role": "system", "content": msg.content})
+            elif msg.role == "user":
                 input_items.append({"role": "user", "content": msg.content})
             elif msg.role == "assistant":
                 input_items.append({"role": "assistant", "content": msg.content})

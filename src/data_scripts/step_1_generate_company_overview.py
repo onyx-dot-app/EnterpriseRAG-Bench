@@ -27,8 +27,9 @@ def main() -> None:
     print("Collaborate with the assistant to generate a company overview.")
     print("Type 'quit' to exit.\n")
 
-    # Get initial response from the assistant using system prompt
-    conversation.run_turn(COMPANY_OVERVIEW_SYSTEM_PROMPT)
+    # Add system prompt and get initial response
+    conversation.add_system_message(COMPANY_OVERVIEW_SYSTEM_PROMPT)
+    conversation.generate_response()
     print()
 
     # Interactive loop
