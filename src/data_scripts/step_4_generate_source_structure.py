@@ -16,6 +16,7 @@ from src.tools.tool_implementations import (
     MvdirTool,
     ReadEmployeeDirectoryTool,
     RmdirTool,
+    TreeTool,
 )
 
 
@@ -44,6 +45,7 @@ def main() -> None:
     mkdir_tool = MkdirTool(base_dir=SOURCES_DIR)
     rmdir_tool = RmdirTool(base_dir=SOURCES_DIR)
     mvdir_tool = MvdirTool(base_dir=SOURCES_DIR)
+    tree_tool = TreeTool(base_dir=SOURCES_DIR)
     filter_llm = OpenAILLM()  # LLM for filtering employee directory queries
     read_employee_directory_tool = ReadEmployeeDirectoryTool(llm=filter_llm)
 
@@ -52,6 +54,7 @@ def main() -> None:
         mkdir_tool.schema,
         rmdir_tool.schema,
         mvdir_tool.schema,
+        tree_tool.schema,
         read_employee_directory_tool.schema,
     ])
 
@@ -60,6 +63,7 @@ def main() -> None:
     tool_runner.register(mkdir_tool)
     tool_runner.register(rmdir_tool)
     tool_runner.register(mvdir_tool)
+    tool_runner.register(tree_tool)
     tool_runner.register(read_employee_directory_tool)
 
     # Create conversation with LLM and tool runner
@@ -69,6 +73,11 @@ def main() -> None:
     print("=" * 40)
     print("Collaborate with the assistant to create the source directory structure.")
     print(f"Base directory: {SOURCES_DIR}")
+    print()
+    print("TIP: This step is best run in batches (e.g., one source type at a time).")
+    print("     Long conversations cost more per turn as context accumulates.")
+    print("     You can quit and re-run to start fresh while keeping created directories.")
+    print()
     print("Type 'quit' to exit.\n")
 
     # Add system prompt and get initial response
