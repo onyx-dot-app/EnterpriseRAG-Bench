@@ -10,9 +10,13 @@ from src.paths import (
     SOURCES_DIR,
 )
 from src.prompts.source_structure import SOURCE_STRUCTURE_SYSTEM_PROMPT
-from src.tools.mkdir import MkdirTool
-from src.tools.read_employee_directory import ReadEmployeeDirectoryTool
 from src.tools.runner import ToolRunner
+from src.tools.tool_implementations import (
+    MkdirTool,
+    MvdirTool,
+    ReadEmployeeDirectoryTool,
+    RmdirTool,
+)
 
 
 def load_file(path: str) -> str:
@@ -38,14 +42,24 @@ def main() -> None:
 
     # Create tools
     mkdir_tool = MkdirTool(base_dir=SOURCES_DIR)
-    read_employee_directory_tool = ReadEmployeeDirectoryTool()
+    rmdir_tool = RmdirTool(base_dir=SOURCES_DIR)
+    mvdir_tool = MvdirTool(base_dir=SOURCES_DIR)
+    filter_llm = OpenAILLM()  # LLM for filtering employee directory queries
+    read_employee_directory_tool = ReadEmployeeDirectoryTool(llm=filter_llm)
 
-    # Initialize LLM with tool schemas
-    llm = OpenAILLM(tools=[mkdir_tool.schema, read_employee_directory_tool.schema])
+    # Initialize main LLM with tool schemas
+    llm = OpenAILLM(tools=[
+        mkdir_tool.schema,
+        rmdir_tool.schema,
+        mvdir_tool.schema,
+        read_employee_directory_tool.schema,
+    ])
 
     # Create tool runner and register tools
     tool_runner = ToolRunner()
     tool_runner.register(mkdir_tool)
+    tool_runner.register(rmdir_tool)
+    tool_runner.register(mvdir_tool)
     tool_runner.register(read_employee_directory_tool)
 
     # Create conversation with LLM and tool runner

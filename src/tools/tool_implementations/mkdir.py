@@ -55,6 +55,13 @@ class MkdirTool(ToolInterface):
         if ".." in path:
             return "Error: Path cannot contain '..'"
 
+        # Strip "sources/" prefix if LLM includes it (base_dir already has it)
+        base_name = os.path.basename(self._base_dir)
+        if path.startswith(f"{base_name}/"):
+            path = path[len(base_name) + 1:]
+        elif path == base_name:
+            path = ""
+
         full_path = os.path.join(self._base_dir, path)
 
         try:

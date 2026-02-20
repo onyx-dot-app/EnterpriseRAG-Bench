@@ -35,36 +35,39 @@ class Conversation:
         Generate a response from the current messages.
 
         Streams the response to stdout and handles any tool calls.
+        When parallel tool calls are made, all are executed before
+        returning to the LLM.
 
         Returns:
             The final assistant response as a string.
         """
         while True:
             full_response = ""
-            tool_call: ToolCall | None = None
+            tool_calls: list[ToolCall] = []
 
             for chunk in self.llm.generate(self.messages):
                 if isinstance(chunk, str):
                     print(chunk, end="", flush=True)
                     full_response += chunk
                 elif isinstance(chunk, ToolCall):
-                    tool_call = chunk
+                    tool_calls.append(chunk)
 
-            # Handle tool call first - execute and continue loop for LLM to process result
-            if tool_call:
-                self.add_tool_call(tool_call)
+            # Handle all tool calls before returning to LLM
+            if tool_calls:
+                for tool_call in tool_calls:
+                    self.add_tool_call(tool_call)
 
-                if self.tool_runner is None:
-                    error_msg = f"Tool '{tool_call.name}' called but no tool runner configured"
-                    print(f"\n[Tool Result]\n{error_msg}\n[/Tool Result]\n", flush=True)
-                    self.add_tool_result(tool_call.call_id, error_msg)
-                else:
-                    result = self.tool_runner.run(tool_call.name, **tool_call.args)
-                    print(f"\n[Tool Result]\n{result}\n[/Tool Result]\n", flush=True)
-                    self.add_tool_result(tool_call.call_id, result)
+                    if self.tool_runner is None:
+                        error_msg = f"Tool '{tool_call.name}' called but no tool runner configured"
+                        print(f"\n[Tool Result]\n{error_msg}\n[/Tool Result]\n", flush=True)
+                        self.add_tool_result(tool_call.call_id, error_msg)
+                    else:
+                        result = self.tool_runner.run(tool_call.name, **tool_call.args)
+                        print(f"\n[Tool Result]\n{result}\n[/Tool Result]\n", flush=True)
+                        self.add_tool_result(tool_call.call_id, result)
                 continue
 
-            # Return text response only when there's no tool call
+            # Return text response only when there are no tool calls
             if full_response:
                 print()  # newline after streaming
                 self.add_assistant_message(full_response)

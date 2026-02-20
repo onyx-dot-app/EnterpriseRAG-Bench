@@ -23,4 +23,4 @@ Important aspects to cover:
 After calling the {WRITE_TOOL} tool, tell the user to verify the company_overview.md file. If they are happy with the overview, tell them to move on to the next step (running the step 2 script). \
 If they are not happy, ask them what modifications they would like to make. Do not call the {WRITE_TOOL} tool again unless the user has asked for specific changes. \
 Do not offer to do any additional work for the user. There are other dedicated flows for the next step.
-"""
+""".strip()

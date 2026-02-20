@@ -10,6 +10,16 @@ from src.llm.interface import LLMInterface, Message, ToolCall
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+BRAINTRUST_API_KEY = os.environ.get("BRAINTRUST_API_KEY")
+BRAINTRUST_PROJECT = os.environ.get("BRAINTRUST_PROJECT")
+
+
+def _init_braintrust_client(api_key: str) -> OpenAI:
+    """Initialize OpenAI client with Braintrust tracing."""
+    from braintrust import init_logger, wrap_openai
+
+    init_logger(project=BRAINTRUST_PROJECT)
+    return wrap_openai(OpenAI(api_key=api_key))
 
 
 class OpenAILLM(LLMInterface):
@@ -36,7 +46,12 @@ class OpenAILLM(LLMInterface):
             )
         self.model = model or LLM_MODEL
         self.tools = tools
-        self.client = OpenAI(api_key=self.api_key)
+
+        # Use Braintrust tracing if configured
+        if BRAINTRUST_API_KEY and BRAINTRUST_PROJECT:
+            self.client = _init_braintrust_client(self.api_key)
+        else:
+            self.client = OpenAI(api_key=self.api_key)
 
     def _build_input(self, messages: list[Message]) -> list[dict[str, Any]]:
         """Convert messages to OpenAI Responses API input format."""
@@ -88,11 +103,10 @@ class OpenAILLM(LLMInterface):
 
         stream = self.client.responses.create(**kwargs)
 
-        tool_call_id = ""
-        tool_call_name = ""
-        tool_call_args = ""
+        # Track multiple parallel tool calls
+        tool_calls: list[dict[str, str]] = []
+        current_tool_call: dict[str, str] | None = None
         in_reasoning = False
-        in_tool_call = False
 
         for event in stream:
             event_type = event.type
@@ -117,23 +131,27 @@ class OpenAILLM(LLMInterface):
             elif event_type == "response.output_item.added":
                 item = event.item
                 if hasattr(item, "type") and item.type == "function_call":
-                    tool_call_name = item.name
-                    tool_call_id = item.call_id
-                    in_tool_call = True
-                    yield f"\n[Tool Call: {tool_call_name}]\n"
+                    current_tool_call = {
+                        "name": item.name,
+                        "call_id": item.call_id,
+                        "args": "",
+                    }
+                    yield f"\n[Tool Call: {item.name}]\n"
 
             elif event_type == "response.function_call_arguments.delta":
-                tool_call_args += event.delta
+                if current_tool_call is not None:
+                    current_tool_call["args"] += event.delta
                 yield event.delta
 
             elif event_type == "response.output_item.done":
-                if in_tool_call:
+                if current_tool_call is not None:
                     yield "\n[/Tool Call]\n"
-                    in_tool_call = False
+                    tool_calls.append(current_tool_call)
+                    current_tool_call = None
 
-        if tool_call_name:
+        for tc in tool_calls:
             yield ToolCall(
-                name=tool_call_name,
-                args=json.loads(tool_call_args) if tool_call_args else {},
-                call_id=tool_call_id,
+                name=tc["name"],
+                args=json.loads(tc["args"]) if tc["args"] else {},
+                call_id=tc["call_id"],
             )

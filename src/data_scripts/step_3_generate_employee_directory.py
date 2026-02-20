@@ -8,7 +8,7 @@ from src.paths import COMPANY_OVERVIEW_PATH, EMPLOYEE_DIRECTORY_PATH, INITIATIVE
 from src.prompts.employee_directory import EMPLOYEE_DIRECTORY_SYSTEM_PROMPT
 from src.schemas.employee_directory import EXPECTED_FORMAT, validate_employee_directory
 from src.tools.runner import ToolRunner
-from src.tools.write import WriteTool
+from src.tools.tool_implementations import WriteTool
 
 
 def load_file(path: str) -> str:

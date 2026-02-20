@@ -5,7 +5,7 @@ from src.llm.openai_llm import OpenAILLM
 from src.paths import COMPANY_OVERVIEW_PATH
 from src.prompts.company_overview import COMPANY_OVERVIEW_SYSTEM_PROMPT
 from src.tools.runner import ToolRunner
-from src.tools.write import WriteTool
+from src.tools.tool_implementations import WriteTool
 
 
 def main() -> None:

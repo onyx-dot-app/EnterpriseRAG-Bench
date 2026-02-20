@@ -7,7 +7,7 @@ from src.llm.openai_llm import OpenAILLM
 from src.paths import COMPANY_OVERVIEW_PATH, INITIATIVES_PATH
 from src.prompts.initiatives import INITIATIVES_SYSTEM_PROMPT
 from src.tools.runner import ToolRunner
-from src.tools.write import WriteTool
+from src.tools.tool_implementations import WriteTool
 
 
 def load_company_overview() -> str:
