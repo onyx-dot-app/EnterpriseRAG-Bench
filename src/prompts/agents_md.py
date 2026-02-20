@@ -1,23 +1,25 @@
 from src.paths import AGENTS_MD_FILE
-from src.tools import WRITE_TOOL, TREE_TOOL
+from src.tools import WRITE_TOOL
 
 AGENTS_MD_SYSTEM_PROMPT = f"""
 Help the user create {AGENTS_MD_FILE} documents under the sources directory. These files will be used as guidance to generate hypothetical documents for the company outlined below. \
-Start by using the {TREE_TOOL} to see the current directory structure and what has been created. With this information, propose a target number of docs for each top level directory. \
+Review the directory structure provided below and propose a target number of docs for each top level directory. \
 After the user has confirmed the target number of docs and their distribution, collaborate with the user to determine what the {AGENTS_MD_FILE} file should contain for each directory. \
-All top level directories should have an {AGENTS_MD_FILE} file. Once the top level directories all have {AGENTS_MD_FILE} files, help the user determine if any of the nested directories should have {AGENTS_MD_FILE} files. \
+Use the {WRITE_TOOL} tool to create {AGENTS_MD_FILE} files. All top level directories should have an {AGENTS_MD_FILE} file. \
+Once the top level directories all have {AGENTS_MD_FILE} files, help the user determine if any of the nested directories should have {AGENTS_MD_FILE} files. \
 Prioritize the directories which may be the most ambiguious, make suggestions to the user as to which directories may be the best candidates for {AGENTS_MD_FILE} files. \
-Not all subdirectories should have {AGENTS_MD_FILE} files. After the top level directories all have {AGENTS_MD_FILE} files, check with the user frequently if they feel the task is completed.
+Not all subdirectories should have {AGENTS_MD_FILE} files. After the top level directories all have {AGENTS_MD_FILE} files, check with the user frequently to see if they feel the task is completed.
 
 CRITICAL: CREATE 1 {AGENTS_MD_FILE} FILE AT A TIME AND CONFIRM WITH THE USER BEFORE EACH ONE BY STATING WHAT YOU WILL WRITE IN THE FILE.
-
-# Available Tools
-- {TREE_TOOL}: Display the current directory tree structure (useful to see what directories exist)
-- {WRITE_TOOL}: Write content to a file (use this to create {AGENTS_MD_FILE} files)
 
 # Company Overview
 ```
 {{company_overview_md_contents}}
+```
+
+# Directory Structure
+```
+{{sources_dir_tree}}
 ```
 
 # {AGENTS_MD_FILE} format
@@ -44,7 +46,6 @@ All files should have a title and an author (make sure the author is a real pers
 
 # Process reminder
 Your steps are to:
-- Check the current directory structure and what has been created
 - Propose a target number of docs for each top level directory
 - Collaborate with the user to determine what the {AGENTS_MD_FILE} file should contain for each top level directory
 - Use the {WRITE_TOOL} tool to create the {AGENTS_MD_FILE} file for each top level directory

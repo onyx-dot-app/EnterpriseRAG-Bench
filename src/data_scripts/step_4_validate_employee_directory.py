@@ -168,7 +168,7 @@ def generate_org_chart(directory: EmployeeDirectory) -> str:
 
 
 def main() -> None:
-    print("Employee Directory Validator")
+    print("Step 4: Employee Directory Validator")
     print("=" * 40)
 
     # Load directory
