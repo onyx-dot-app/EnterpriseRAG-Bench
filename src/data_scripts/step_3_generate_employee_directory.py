@@ -49,9 +49,14 @@ def main() -> None:
     # Create conversation with LLM and tool runner
     conversation = Conversation(llm=llm, tool_runner=tool_runner)
 
-    print("Employee Directory Generator")
+    print("Step 3: Employee Directory Generator")
     print("=" * 40)
-    print("Collaborate with the assistant to generate the employee directory.")
+    print("This script generates an employee directory with org structure and team members.")
+    print("Employees will be referenced as authors and participants in generated documents.")
+    print()
+    print("You will have a conversation with an LLM to guide you through the process.")
+    input("Press Enter to begin...")
+    print()
     print("Type 'quit' to exit.\n")
 
     # Add system prompt and get initial response

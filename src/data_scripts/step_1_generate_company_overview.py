@@ -22,9 +22,14 @@ def main() -> None:
     # Create conversation with LLM and tool runner
     conversation = Conversation(llm=llm, tool_runner=tool_runner)
 
-    print("Company Overview Generator")
+    print("Step 1: Company Overview Generator")
     print("=" * 40)
-    print("Collaborate with the assistant to generate a company overview.")
+    print("This script generates a company overview document that serves as the foundation")
+    print("for all subsequent data generation steps.")
+    print()
+    print("You will have a conversation with an LLM to guide you through the process.")
+    input("Press Enter to begin...")
+    print()
     print("Type 'quit' to exit.\n")
 
     # Add system prompt and get initial response

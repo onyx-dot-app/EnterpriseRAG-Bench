@@ -13,6 +13,7 @@ class WriteTool(ToolInterface):
 
     def __init__(
         self,
+        base_dir: str | None = None,
         file_path_override: str | None = None,
         validator: ValidatorFunc | None = None,
         expected_format: str | None = None,
@@ -21,12 +22,15 @@ class WriteTool(ToolInterface):
         Initialize the WriteTool.
 
         Args:
+            base_dir: Base directory for all file writes. Paths will be resolved
+                relative to this directory.
             file_path_override: If set, all writes go to this path regardless of
                 the file_path argument passed to execute().
             validator: Optional function to validate content before writing.
                 Should return None if valid, or an error message string if invalid.
             expected_format: Description of expected format to include in error messages.
         """
+        self._base_dir = base_dir
         self._file_path_override = file_path_override
         self._validator = validator
         self._expected_format = expected_format
@@ -35,13 +39,28 @@ class WriteTool(ToolInterface):
     def name(self) -> str:
         return WRITE_TOOL
 
+    def _normalize_path(self, path: str) -> str:
+        """Normalize path by stripping base dir prefix if present."""
+        if not self._base_dir:
+            return path
+        path = path.lstrip("/")
+        base_name = os.path.basename(self._base_dir)
+        if path.startswith(f"{base_name}/"):
+            path = path[len(base_name) + 1:]
+        elif path == base_name:
+            path = ""
+        return path
+
     @property
     def schema(self) -> dict:
         # Responses API format (name at top level, not nested under "function")
+        description = "Write content to a file"
+        if self._base_dir:
+            description += f" under {self._base_dir}"
         return {
             "type": "function",
             "name": self.name,
-            "description": "Write content to a file",
+            "description": description,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -72,6 +91,13 @@ class WriteTool(ToolInterface):
         target = self._file_path_override or file_path
         if not target:
             return "Error: No file path provided"
+
+        # Handle base_dir if set
+        if self._base_dir and not self._file_path_override:
+            if ".." in target:
+                return "Error: Path cannot contain '..'"
+            target = self._normalize_path(target)
+            target = os.path.join(self._base_dir, target)
 
         # Validate content if validator is configured
         if self._validator:

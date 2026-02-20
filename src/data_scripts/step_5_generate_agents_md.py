@@ -1,22 +1,17 @@
-"""Interactive script for generating source directory structure."""
-
-from datetime import datetime
+"""Interactive script for generating agents.md files in source directories."""
 
 from src.llm.conversation import Conversation
 from src.llm.openai_llm import OpenAILLM
 from src.paths import (
+    AGENTS_MD_FILE,
     COMPANY_OVERVIEW_PATH,
-    INITIATIVES_PATH,
     SOURCES_DIR,
 )
-from src.prompts.source_structure import SOURCE_STRUCTURE_SYSTEM_PROMPT
+from src.prompts.agents_md import AGENTS_MD_SYSTEM_PROMPT
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import (
-    MkdirTool,
-    MvdirTool,
-    ReadEmployeeDirectoryTool,
-    RmdirTool,
     TreeTool,
+    WriteTool,
 )
 
 
@@ -32,52 +27,41 @@ def load_file(path: str) -> str:
 def main() -> None:
     # Load context files and build the prompt
     company_overview = load_file(COMPANY_OVERVIEW_PATH)
-    initiatives = load_file(INITIATIVES_PATH)
-    current_date = datetime.now().strftime("%B %d, %Y")
 
-    prompt = SOURCE_STRUCTURE_SYSTEM_PROMPT.format(
+    prompt = AGENTS_MD_SYSTEM_PROMPT.format(
         company_overview_md_contents=company_overview,
-        initiatives_md_contents=initiatives,
-        current_date=current_date,
     )
 
     # Create tools
-    mkdir_tool = MkdirTool(base_dir=SOURCES_DIR)
-    rmdir_tool = RmdirTool(base_dir=SOURCES_DIR)
-    mvdir_tool = MvdirTool(base_dir=SOURCES_DIR)
     tree_tool = TreeTool(base_dir=SOURCES_DIR)
-    filter_llm = OpenAILLM()  # LLM for filtering employee directory queries
-    read_employee_directory_tool = ReadEmployeeDirectoryTool(llm=filter_llm)
+    write_tool = WriteTool(base_dir=SOURCES_DIR)
 
     # Initialize main LLM with tool schemas
     llm = OpenAILLM(tools=[
-        mkdir_tool.schema,
-        rmdir_tool.schema,
-        mvdir_tool.schema,
         tree_tool.schema,
-        read_employee_directory_tool.schema,
+        write_tool.schema,
     ])
 
     # Create tool runner and register tools
     tool_runner = ToolRunner()
-    tool_runner.register(mkdir_tool)
-    tool_runner.register(rmdir_tool)
-    tool_runner.register(mvdir_tool)
     tool_runner.register(tree_tool)
-    tool_runner.register(read_employee_directory_tool)
+    tool_runner.register(write_tool)
 
     # Create conversation with LLM and tool runner
     conversation = Conversation(llm=llm, tool_runner=tool_runner)
 
-    print("Step 4: Source Directory Structure Generator")
+    print(f"Step 5: {AGENTS_MD_FILE} Generator")
     print("=" * 40)
-    print("This script creates the directory structure for data sources (Slack, GitHub, etc.).")
-    print("These directories will be populated with documents in later steps.")
+    print(f"This script creates {AGENTS_MD_FILE} files that guide document generation for each directory.")
+    print("These files define content rules, metadata rules, and target document counts.")
     print(f"Base directory: {SOURCES_DIR}")
     print()
-    print("TIP: This step is best run in batches (e.g., one source type at a time).")
-    print("     Long conversations cost more per turn as context accumulates.")
-    print("     You can quit and re-run to start fresh while keeping created directories.")
+    print(f"NOTE: You can generate as many {AGENTS_MD_FILE} files as you would like.")
+    print(f"      The relatively important piece is that the top level directories")
+    print(f"      all have an {AGENTS_MD_FILE} file but additional ones are at your discretion.")
+    print()
+    print(f"TIP:  You are encouraged to manually modify the generated {AGENTS_MD_FILE} files")
+    print(f"      to best represent what you want in there.")
     print()
     print("You will have a conversation with an LLM to guide you through the process.")
     input("Press Enter to begin...")

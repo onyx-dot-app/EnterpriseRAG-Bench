@@ -1,5 +1,7 @@
 """Shared file paths for the data generation flow."""
 
+AGENTS_MD_FILE = "agents.md"
+
 DATA_CLEAN_DIR = "data_clean"
 
 COMPANY_OVERVIEW_PATH = f"{DATA_CLEAN_DIR}/company_overview.md"

@@ -41,9 +41,14 @@ def main() -> None:
     # Create conversation with LLM and tool runner
     conversation = Conversation(llm=llm, tool_runner=tool_runner)
 
-    print("Initiatives & Roadmap Generator")
+    print("Step 2: Initiatives & Roadmap Generator")
     print("=" * 40)
-    print("Collaborate with the assistant to generate company initiatives.")
+    print("This script generates company initiatives and roadmap based on the company overview.")
+    print("These initiatives will inform the content and context of generated documents.")
+    print()
+    print("You will have a conversation with an LLM to guide you through the process.")
+    input("Press Enter to begin...")
+    print()
     print("Type 'quit' to exit.\n")
 
     # Add system prompt and get initial response
