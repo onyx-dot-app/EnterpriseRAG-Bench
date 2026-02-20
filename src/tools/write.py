@@ -1,21 +1,35 @@
 import os
+from collections.abc import Callable
 
 from src.tools import WRITE_TOOL
 from src.tools.interface import ToolInterface
+
+# Validator function type: takes content string, returns error message or None
+ValidatorFunc = Callable[[str], str | None]
 
 
 class WriteTool(ToolInterface):
     """Tool for writing content to files."""
 
-    def __init__(self, file_path_override: str | None = None):
+    def __init__(
+        self,
+        file_path_override: str | None = None,
+        validator: ValidatorFunc | None = None,
+        expected_format: str | None = None,
+    ):
         """
         Initialize the WriteTool.
 
         Args:
             file_path_override: If set, all writes go to this path regardless of
                 the file_path argument passed to execute().
+            validator: Optional function to validate content before writing.
+                Should return None if valid, or an error message string if invalid.
+            expected_format: Description of expected format to include in error messages.
         """
         self._file_path_override = file_path_override
+        self._validator = validator
+        self._expected_format = expected_format
 
     @property
     def name(self) -> str:
@@ -58,6 +72,15 @@ class WriteTool(ToolInterface):
         target = self._file_path_override or file_path
         if not target:
             return "Error: No file path provided"
+
+        # Validate content if validator is configured
+        if self._validator:
+            error = self._validator(content)
+            if error:
+                msg = f"The file format does not conform to expected. {error}"
+                if self._expected_format:
+                    msg += f"\n\nExpected format:\n{self._expected_format}"
+                return msg
 
         try:
             # Create parent directories if they don't exist
