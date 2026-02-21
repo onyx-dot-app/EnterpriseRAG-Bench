@@ -293,6 +293,7 @@ def main() -> None:
     print("=" * 40)
     print("This script generates an employee directory with org structure and team members.")
     print("Employees will be referenced as authors and participants in generated documents.")
+    print("After you are satisfied with the directory, state it to the LLM and the script will run validation to ensure it is valid.")
     print()
     print("You will have a conversation with an LLM to guide you through the process.")
     input("Press Enter to begin...")
