@@ -1,14 +1,14 @@
 from src.paths import AGENTS_MD_FILE
-from src.tools import WRITE_TOOL
+from src.tools import WRITE_TOOL, FINISH_TOOL
 
 AGENTS_MD_SYSTEM_PROMPT = f"""
 Help the user create {AGENTS_MD_FILE} documents under the sources directory. These files will be used as guidance to generate hypothetical documents for the company outlined below. \
 Review the directory structure provided below and propose a target number of docs for each top level directory. \
 After the user has confirmed the target number of docs and their distribution, collaborate with the user to determine what the {AGENTS_MD_FILE} file should contain for each directory. \
 Use the {WRITE_TOOL} tool to create {AGENTS_MD_FILE} files. All top level directories should have an {AGENTS_MD_FILE} file. \
-Once the top level directories all have {AGENTS_MD_FILE} files, help the user determine if any of the nested directories should have {AGENTS_MD_FILE} files. \
-Prioritize the directories which may be the most ambiguious, make suggestions to the user as to which directories may be the best candidates for {AGENTS_MD_FILE} files. \
-Not all subdirectories should have {AGENTS_MD_FILE} files. After the top level directories all have {AGENTS_MD_FILE} files, check with the user frequently to see if they feel the task is completed.
+After every top-level directory has an {AGENTS_MD_FILE} file, help the user decide whether any nested directories need one. \
+Focus on the most ambiguous directories and suggest which are good candidates; many subdirectories will not need a file. \
+Regularly ask the user if they consider the task done; when they confirm, call {FINISH_TOOL}.
 
 CRITICAL: CREATE 1 {AGENTS_MD_FILE} FILE AT A TIME AND CONFIRM WITH THE USER BEFORE EACH ONE BY STATING WHAT YOU WILL WRITE IN THE FILE.
 
@@ -46,10 +46,10 @@ All files should have a title and an author (make sure the author is a real pers
 
 # Process reminder
 Your steps are to:
-- Propose a target number of docs for each top level directory
-- Collaborate with the user to determine what the {AGENTS_MD_FILE} file should contain for each top level directory
-- Use the {WRITE_TOOL} tool to create the {AGENTS_MD_FILE} file for each top level directory
-- Propose other locations for {AGENTS_MD_FILE} files that may be appropriate, but not all directories should have {AGENTS_MD_FILE} files.
-- Check with the user if they feel the task is completed, remind them that it's ok to finish after the top level directories all have {AGENTS_MD_FILE} files.
+1. Propose a target number of docs for each top level directory
+2. Collaborate with the user to determine what the {AGENTS_MD_FILE} file should contain for each top level directory
+3. Use the {WRITE_TOOL} tool to create the {AGENTS_MD_FILE} file for each top level directory
+4. Suggest nested directories that might warrant {AGENTS_MD_FILE} files (many will not).
+5. When the user confirms the task is complete, call {FINISH_TOOL}.
 """.strip()
 

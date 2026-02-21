@@ -1,3 +1,4 @@
+FINISH_TOOL = "finish"
 GLOB_TOOL = "glob"
 GREP_TOOL = "grep"
 MKDIR_TOOL = "mkdir"
@@ -9,6 +10,7 @@ TREE_TOOL = "tree"
 WRITE_TOOL = "write"
 
 TOOL_NAMES = [
+    FINISH_TOOL,
     GLOB_TOOL,
     GREP_TOOL,
     MKDIR_TOOL,

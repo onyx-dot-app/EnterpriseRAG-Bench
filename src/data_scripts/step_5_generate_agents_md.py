@@ -10,7 +10,7 @@ from src.paths import (
 )
 from src.prompts.agents_md import AGENTS_MD_SYSTEM_PROMPT
 from src.tools.runner import ToolRunner
-from src.tools.tool_implementations import WriteTool
+from src.tools.tool_implementations import FinishTool, WriteTool
 
 
 def load_file(path: str) -> str:
@@ -34,20 +34,23 @@ def main() -> None:
 
     # Create tools
     write_tool = WriteTool(base_dir=SOURCES_DIR)
+    finish_tool = FinishTool()
 
     # Initialize main LLM with tool schemas
     llm = OpenAILLM(tools=[
         write_tool.schema,
+        finish_tool.schema,
     ])
 
     # Create tool runner and register tools
     tool_runner = ToolRunner()
     tool_runner.register(write_tool)
+    tool_runner.register(finish_tool)
 
     # Create conversation with LLM and tool runner
     conversation = Conversation(llm=llm, tool_runner=tool_runner)
 
-    print(f"Step 7: {AGENTS_MD_FILE} Generator")
+    print(f"Step 5: {AGENTS_MD_FILE} Generator")
     print("=" * 40)
     print(f"This script creates {AGENTS_MD_FILE} files that guide document generation for each directory.")
     print("These files define content rules, metadata rules, and target document counts.")
@@ -72,6 +75,11 @@ def main() -> None:
 
     # Interactive loop
     while True:
+        # Check if finish tool was called
+        if finish_tool.finished:
+            print(f"\n{AGENTS_MD_FILE} generation complete!")
+            break
+
         try:
             user_input = input("You: ").strip()
             if not user_input:
