@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from src.llm import get_llm
 from src.llm.conversation import Conversation
-from src.llm.interface import Message, ToolCall
+from src.llm.interface import LLMInterface, Message, ToolCall
 from src.paths import (
     COMPANY_OVERVIEW_PATH,
     INITIATIVES_PATH,
@@ -88,7 +88,7 @@ def get_source_list(sources_dir: str) -> str:
 
 
 def run_auto_conversation(
-    llm: OpenAILLM,
+    llm: LLMInterface,
     tool_runner: ToolRunner,
     messages: list[Message],
     max_tool_cycles: int = 20,
