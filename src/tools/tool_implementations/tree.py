@@ -35,6 +35,14 @@ class TreeTool(ToolInterface):
                         "type": "string",
                         "description": "Optional subdirectory path to show tree for (relative to base directory). If not provided, shows entire tree.",
                     },
+                    "level": {
+                        "type": "integer",
+                        "description": "Optional maximum depth to descend into the directory tree. If not provided, shows all levels.",
+                    },
+                    "filelimit": {
+                        "type": "integer",
+                        "description": "Optional maximum number of entries to show per directory. If not provided, shows all entries.",
+                    },
                 },
                 "required": [],
             },
@@ -50,9 +58,20 @@ class TreeTool(ToolInterface):
             path = ""
         return path
 
-    def _build_tree(self, dir_path: str, prefix: str = "") -> list[str]:
+    def _build_tree(
+        self,
+        dir_path: str,
+        prefix: str = "",
+        level: int | None = None,
+        filelimit: int | None = None,
+        current_depth: int = 0,
+    ) -> list[str]:
         """Recursively build tree lines for a directory."""
         lines: list[str] = []
+
+        # Check depth limit
+        if level is not None and current_depth >= level:
+            return lines
 
         try:
             entries = sorted(os.listdir(dir_path))
@@ -62,24 +81,44 @@ class TreeTool(ToolInterface):
         # Filter to only directories
         dirs = [e for e in entries if os.path.isdir(os.path.join(dir_path, e))]
 
+        # Apply filelimit
+        truncated = False
+        if filelimit is not None and len(dirs) > filelimit:
+            dirs = dirs[:filelimit]
+            truncated = True
+
         for i, name in enumerate(dirs):
-            is_last = i == len(dirs) - 1
+            is_last = i == len(dirs) - 1 and not truncated
             connector = "└── " if is_last else "├── "
             lines.append(f"{prefix}{connector}{name}/")
 
             # Recurse into subdirectory
             child_prefix = prefix + ("    " if is_last else "│   ")
             child_path = os.path.join(dir_path, name)
-            lines.extend(self._build_tree(child_path, child_prefix))
+            lines.extend(
+                self._build_tree(
+                    child_path, child_prefix, level, filelimit, current_depth + 1
+                )
+            )
+
+        if truncated:
+            lines.append(f"{prefix}└── ...")
 
         return lines
 
-    def execute(self, path: str = "") -> str:
+    def execute(
+        self,
+        path: str = "",
+        level: int | None = None,
+        filelimit: int | None = None,
+    ) -> str:
         """
         Display directory tree structure.
 
         Args:
             path: Optional subdirectory path (relative to base directory).
+            level: Optional maximum depth to descend into the tree.
+            filelimit: Optional maximum number of entries per directory.
 
         Returns:
             Tree structure as a string.
@@ -100,7 +139,7 @@ class TreeTool(ToolInterface):
         # Build the tree
         root_name = os.path.basename(full_path) or os.path.basename(self._base_dir)
         lines = [f"{root_name}/"]
-        lines.extend(self._build_tree(full_path))
+        lines.extend(self._build_tree(full_path, level=level, filelimit=filelimit))
 
         if len(lines) == 1:
             return f"{root_name}/ (empty)"

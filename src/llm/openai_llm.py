@@ -97,6 +97,7 @@ class OpenAILLM(LLMInterface):
             "model": self.model,
             "input": self._build_input(messages),
             "stream": True,
+            "reasoning": {"effort": "medium", "summary": "auto"},
         }
         if self.tools:
             kwargs["tools"] = self.tools
@@ -108,6 +109,8 @@ class OpenAILLM(LLMInterface):
         current_tool_call: dict[str, str] | None = None
         in_reasoning = False
 
+        reasoning_content: list[str] = []
+
         for event in stream:
             event_type = event.type
 
@@ -116,6 +119,7 @@ class OpenAILLM(LLMInterface):
                 if not in_reasoning:
                     in_reasoning = True
                     yield "\n[Reasoning]\n"
+                reasoning_content.append(event.delta)
                 yield event.delta
 
             elif event_type == "response.reasoning_summary_text.done":
@@ -148,6 +152,17 @@ class OpenAILLM(LLMInterface):
                     yield "\n[/Tool Call]\n"
                     tool_calls.append(current_tool_call)
                     current_tool_call = None
+
+        # Log reasoning to Braintrust trace if available
+        if reasoning_content and BRAINTRUST_API_KEY and BRAINTRUST_PROJECT:
+            try:
+                from braintrust import current_span
+
+                span = current_span()
+                if span:
+                    span.log(metadata={"reasoning": "".join(reasoning_content)})
+            except Exception:
+                pass  # Braintrust span not available
 
         for tc in tool_calls:
             yield ToolCall(

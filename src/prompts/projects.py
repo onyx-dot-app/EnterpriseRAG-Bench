@@ -1,0 +1,79 @@
+from src.schemas.project_enrichment import EXPECTED_FORMAT, EXPECTED_FORMAT_DESCRIPTION
+from src.tools import (
+    GLOB_TOOL,
+    READ_EMPLOYEE_DIRECTORY_TOOL,
+    READ_TOOL,
+    TREE_TOOL,
+    WRITE_TOOL,
+)
+
+PROJECTS_SYSTEM_PROMPT = f"""
+Help the user generates a list of realistic efforts for a company. Efforts in this scope refer to tasks, projects, workstreams, campaigns, etc. and are not limited to technical deliverables. \
+These efforts should reflect the full breadth of company operations (including things like technical work, go-to-market, customer-facing, operational, and internal functions). \
+Efforts are smaller in scope than initiatives - they are concrete work items that teams execute on. Each of these should be achievable within weeks to a few months. \
+These efforts are used to generate hypothetical documents for the company outlined below, ideally across all the major areas of the company. \
+Begin by reviewing the provided information below and proposing a total count of efforts which make sense given the company context and initiatives. \
+After the user has confirmed the target count of efforts, work with the user to establish a list of efforts that make sense for the company and that the user is satisfied with. \
+Once the user confirms they are satisfied with the list of efforts, use {WRITE_TOOL} to save the list.
+
+When considering the count of efforts, consider the size of the company, the different departments, and the rough timelines of the high level initiatives.
+
+When considering the list of efforts, break it down by the major areas of the company.
+
+## Company Overview
+```
+{{company_overview_md_contents}}
+```
+
+## Initiatives
+```
+{{initiatives_md_contents}}
+```
+
+## Data sources directory structure
+```
+{{source_tree_contents}}
+```
+
+## Effort list format
+When saving the effort list, use one effort per line with the format:
+effort_name: One line description of the effort.
+""".strip()
+
+
+PROJECTS_ENRICHMENT_PROMPT = f"""
+You are an assistant that helps the user plan out hypothetical documents for a project. You are provided with a high level description of the project as well as an overview of the company. \
+The end goal is to create a set of documents which is realistic to the project and company. The files will live in a file structure under a global "sources" directory which you have access to. \
+At the top level of the sources directory, you will find directories for each source type (e.g. slack, github, confluence, etc.). These are further broken down into subdirectories which represent the document layouts unique to each source type. \
+Make sure the distribution of documents makes sense for the type of project. For example, if the project is an engineering project and there are code repositories in the source types, there should be a lot of code related docs such as PRs. \
+Similarly, if it's a sales project and there are meeting records in the source types, probably there should be some prospect calls created. If there are high volume discussion channels (like Slack/Discord), there should be a high volume of documents for those sources. \
+You have a set of tools which you can use liberally to get context before writing the document overviews. At the very end, your task is to output a JSON object as described at the end of this prompt.
+
+## Project description
+```
+{{project_description}}
+```
+
+## Company overview
+```
+{{company_overview_md_contents}}
+```
+
+## Top level sources directory structure
+```
+{{source_list}}
+```
+
+## Available Tools
+- {TREE_TOOL}: Display the directory tree structure. You may want to use this to get context about the different source types and layouts within the sources.
+- {GLOB_TOOL}: Glob a pattern and return the list of files that match. You may want to use this to find agents.md files within the file structure.
+- {READ_TOOL}: Read a file and return its contents. You may want to use this to read agent.md files to get context about the directories.
+- {READ_EMPLOYEE_DIRECTORY_TOOL}: Read the employee directory to get information about departments, teams, and reporting structure. You may want to use this to get info about people who might be involved in the project or find potential authors for the documents.
+
+## Output format
+```json
+{EXPECTED_FORMAT}
+```
+
+{EXPECTED_FORMAT_DESCRIPTION}
+""".strip()

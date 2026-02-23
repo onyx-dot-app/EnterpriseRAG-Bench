@@ -10,3 +10,7 @@ EMPLOYEE_DIRECTORY_PATH = f"{DATA_CLEAN_DIR}/employee_directory.yaml"
 VISUAL_EMPLOYEE_DIRECTORY_PATH = f"{DATA_CLEAN_DIR}/visual_employee_directory.txt"
 SOURCES_DIR = f"{DATA_CLEAN_DIR}/sources"
 SOURCE_TREE_PATH = f"{DATA_CLEAN_DIR}/source_tree.txt"
+
+PROJECTS_DIR = f"{DATA_CLEAN_DIR}/projects"
+PROJECTS_CACHE_DIR = f"{PROJECTS_DIR}/generation_cache"
+PROJECT_LIST_PATH = f"{PROJECTS_CACHE_DIR}/project_list.txt"

@@ -1,0 +1,80 @@
+"""Tool for reading file contents."""
+
+import os
+
+from src.tools import READ_TOOL
+from src.tools.interface import ToolInterface
+
+
+class ReadTool(ToolInterface):
+    """Tool for reading file contents."""
+
+    def __init__(self, base_dir: str):
+        """
+        Initialize the ReadTool.
+
+        Args:
+            base_dir: Base directory for file reads.
+        """
+        self._base_dir = base_dir
+
+    @property
+    def name(self) -> str:
+        return READ_TOOL
+
+    @property
+    def schema(self) -> dict:
+        return {
+            "type": "function",
+            "name": self.name,
+            "description": f"Read the contents of a file within {self._base_dir}.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to read (relative to base directory).",
+                    },
+                },
+                "required": ["path"],
+            },
+        }
+
+    def _normalize_path(self, path: str) -> str:
+        """Normalize path by stripping base dir prefix if present."""
+        path = path.lstrip("/")
+        base_name = os.path.basename(self._base_dir)
+        if path.startswith(f"{base_name}/"):
+            path = path[len(base_name) + 1 :]
+        elif path == base_name:
+            path = ""
+        return path
+
+    def execute(self, path: str) -> str:
+        """
+        Read the contents of a file.
+
+        Args:
+            path: Path to the file (relative to base directory).
+
+        Returns:
+            File contents or error message.
+        """
+        if ".." in path:
+            return "Error: Path cannot contain '..'"
+
+        path = self._normalize_path(path)
+        full_path = os.path.join(self._base_dir, path)
+
+        if not os.path.exists(full_path):
+            return f"Error: File does not exist: {path}"
+
+        if not os.path.isfile(full_path):
+            return f"Error: Path is not a file: {path}"
+
+        try:
+            with open(full_path) as f:
+                content = f.read()
+            return content
+        except Exception as e:
+            return f"Error reading file: {e}"

@@ -3,8 +3,8 @@
 import subprocess
 from datetime import datetime
 
+from src.llm import get_llm
 from src.llm.conversation import Conversation
-from src.llm.openai_llm import OpenAILLM
 from src.paths import (
     COMPANY_OVERVIEW_PATH,
     INITIATIVES_PATH,
@@ -77,12 +77,12 @@ def main() -> None:
     rmdir_tool = RmdirTool(base_dir=SOURCES_DIR)
     mvdir_tool = MvdirTool(base_dir=SOURCES_DIR)
     tree_tool = TreeTool(base_dir=SOURCES_DIR)
-    filter_llm = OpenAILLM()  # LLM for filtering employee directory queries
+    filter_llm = get_llm()  # LLM for filtering employee directory queries
     read_employee_directory_tool = ReadEmployeeDirectoryTool(llm=filter_llm)
     finish_tool = FinishTool()
 
     # Initialize main LLM with tool schemas
-    llm = OpenAILLM(tools=[
+    llm = get_llm(tools=[
         mkdir_tool.schema,
         rmdir_tool.schema,
         mvdir_tool.schema,

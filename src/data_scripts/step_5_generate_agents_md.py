@@ -1,7 +1,7 @@
 """Interactive script for generating agents.md files in source directories."""
 
+from src.llm import get_llm
 from src.llm.conversation import Conversation
-from src.llm.openai_llm import OpenAILLM
 from src.paths import (
     AGENTS_MD_FILE,
     COMPANY_OVERVIEW_PATH,
@@ -37,7 +37,7 @@ def main() -> None:
     finish_tool = FinishTool()
 
     # Initialize main LLM with tool schemas
-    llm = OpenAILLM(tools=[
+    llm = get_llm(tools=[
         write_tool.schema,
         finish_tool.schema,
     ])

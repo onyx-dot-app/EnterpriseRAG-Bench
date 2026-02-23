@@ -2,8 +2,8 @@
 
 from datetime import datetime
 
+from src.llm import get_llm
 from src.llm.conversation import Conversation
-from src.llm.openai_llm import OpenAILLM
 from src.paths import COMPANY_OVERVIEW_PATH, INITIATIVES_PATH
 from src.prompts.initiatives import INITIATIVES_SYSTEM_PROMPT
 from src.tools.runner import ToolRunner
@@ -32,7 +32,7 @@ def main() -> None:
     write_tool = WriteTool(file_path_override=INITIATIVES_PATH)
 
     # Initialize LLM with write tool schema
-    llm = OpenAILLM(tools=[write_tool.schema])
+    llm = get_llm(tools=[write_tool.schema])
 
     # Create tool runner and register the write tool
     tool_runner = ToolRunner()

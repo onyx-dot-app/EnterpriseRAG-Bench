@@ -5,8 +5,8 @@ from io import StringIO
 
 import yaml
 
+from src.llm import get_llm
 from src.llm.conversation import Conversation
-from src.llm.openai_llm import OpenAILLM
 from src.paths import COMPANY_OVERVIEW_PATH, EMPLOYEE_DIRECTORY_PATH, INITIATIVES_PATH, VISUAL_EMPLOYEE_DIRECTORY_PATH
 from src.prompts.employee_directory import EMPLOYEE_DIRECTORY_SYSTEM_PROMPT
 from src.schemas.employee_directory import EXPECTED_FORMAT, EmployeeDirectory, validate_employee_directory
@@ -279,7 +279,7 @@ def main() -> None:
     finish_tool = FinishTool()
 
     # Initialize LLM with tool schemas
-    llm = OpenAILLM(tools=[write_tool.schema, finish_tool.schema])
+    llm = get_llm(tools=[write_tool.schema, finish_tool.schema])
 
     # Create tool runner and register tools
     tool_runner = ToolRunner()

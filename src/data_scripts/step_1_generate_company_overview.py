@@ -1,7 +1,7 @@
 """Interactive script for generating company overviews."""
 
+from src.llm import get_llm
 from src.llm.conversation import Conversation
-from src.llm.openai_llm import OpenAILLM
 from src.paths import COMPANY_OVERVIEW_PATH
 from src.prompts.company_overview import COMPANY_OVERVIEW_SYSTEM_PROMPT
 from src.tools.runner import ToolRunner
@@ -13,7 +13,7 @@ def main() -> None:
     write_tool = WriteTool(file_path_override=COMPANY_OVERVIEW_PATH)
 
     # Initialize LLM with write tool schema
-    llm = OpenAILLM(tools=[write_tool.schema])
+    llm = get_llm(tools=[write_tool.schema])
 
     # Create tool runner and register the write tool
     tool_runner = ToolRunner()
