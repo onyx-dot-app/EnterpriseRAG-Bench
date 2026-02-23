@@ -1,6 +1,5 @@
 import json
 import os
-import uuid
 from collections.abc import Generator
 from typing import Any
 
@@ -148,7 +147,7 @@ class AnthropicLLM(LLMInterface):
                     block = event.content_block
                     if block.type == "thinking":
                         in_thinking = True
-                        yield "\n[Thinking]\n"
+                        print("\n[Thinking]", flush=True)
                     elif block.type == "tool_use":
                         current_tool = {
                             "id": block.id,
@@ -161,7 +160,7 @@ class AnthropicLLM(LLMInterface):
                     delta = event.delta
                     if delta.type == "thinking_delta":
                         thinking_content.append(delta.thinking)
-                        yield delta.thinking
+                        print(delta.thinking, end="", flush=True)
                     elif delta.type == "text_delta":
                         yield delta.text
                     elif delta.type == "input_json_delta":
@@ -171,7 +170,7 @@ class AnthropicLLM(LLMInterface):
 
                 elif event.type == "content_block_stop":
                     if in_thinking:
-                        yield "\n[/Thinking]\n\n"
+                        print("\n[/Thinking]\n", flush=True)
                         in_thinking = False
                     elif current_tool is not None:
                         yield "\n[/Tool Call]\n"

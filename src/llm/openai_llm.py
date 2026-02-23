@@ -114,17 +114,17 @@ class OpenAILLM(LLMInterface):
         for event in stream:
             event_type = event.type
 
-            # Handle reasoning summary streaming
+            # Handle reasoning summary streaming (print directly, don't include in messages)
             if event_type == "response.reasoning_summary_text.delta":
                 if not in_reasoning:
                     in_reasoning = True
-                    yield "\n[Reasoning]\n"
+                    print("\n[Reasoning]", flush=True)
                 reasoning_content.append(event.delta)
-                yield event.delta
+                print(event.delta, end="", flush=True)
 
             elif event_type == "response.reasoning_summary_text.done":
                 if in_reasoning:
-                    yield "\n[/Reasoning]\n\n"
+                    print("\n[/Reasoning]\n", flush=True)
                     in_reasoning = False
 
             # Handle text output streaming
