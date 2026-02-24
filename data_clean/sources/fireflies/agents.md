@@ -18,7 +18,7 @@ Content rules:
 - Transcript structure should resemble typical Fireflies exports:
   - A brief meeting header (date/time, duration, attendees)
   - Optional auto-generated sections (may be present or absent): Summary, Topics, Action items, Questions
-  - Transcript body with speaker labels and periodic timestamps (e.g., every 1560 seconds)
+  - Transcript body with speaker labels and periodic timestamps (e.g., every 15-60 seconds)
 - The transcript itself should feel authentic:
   - Transcription is often imperfect.
     - Words may be swapped for similar-sounding ones.

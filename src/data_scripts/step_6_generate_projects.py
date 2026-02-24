@@ -13,6 +13,7 @@ from src.llm.conversation import Conversation
 from src.llm.interface import LLMInterface, Message, ToolCall
 from src.paths import (
     COMPANY_OVERVIEW_PATH,
+    DATA_CLEAN_DIR,
     INITIATIVES_PATH,
     PROJECT_LIST_PATH,
     PROJECTS_CACHE_DIR,
@@ -22,6 +23,7 @@ from src.paths import (
 from src.prompts.projects import PROJECTS_ENRICHMENT_PROMPT, PROJECTS_SYSTEM_PROMPT
 from src.schemas.project_enrichment import (
     EXPECTED_FORMAT_UNESCAPED,
+    filter_invalid_paths,
     parse_project_enrichment,
     validate_project_enrichment,
 )
@@ -48,17 +50,62 @@ def parse_project_list(content: str) -> list[tuple[str, str]]:
     """
     Parse project list file into list of (name, description) tuples.
 
-    Format: "project_name: One line description."
+    Format:
+        # Section Header
+        project_name: One line description.
+
+    Lines are grouped under headers. Empty lines or new headers end a section.
+    The description is formatted as:
+        General area: {header without #}  (omitted if no header)
+        Project name: {name}  (omitted if no colon separator)
+        Project description: {one-liner or full line}
     """
-    projects = []
-    for line in content.strip().splitlines():
-        line = line.strip()
-        if not line:
+    # First pass: build list of (header or None, line) tuples
+    entries: list[tuple[str | None, str]] = []
+    current_header: str | None = None
+
+    for line in content.splitlines():
+        stripped = line.strip()
+
+        # Empty line ends current section
+        if not stripped:
+            current_header = None
             continue
-        # Split on first colon
+
+        # New header
+        if stripped.startswith("#"):
+            current_header = stripped
+            continue
+
+        # Project line
+        if stripped:
+            entries.append((current_header, stripped))
+
+    # Second pass: build project list
+    projects = []
+    for header, line in entries:
+        parts = []
+
+        # Add general area if header exists
+        if header:
+            area = header.lstrip("#").strip()
+            parts.append(f"General area: {area}")
+
+        # Check if line has name: description format
         if ":" in line:
-            name, description = line.split(":", 1)
-            projects.append((name.strip(), description.strip()))
+            name, one_liner = line.split(":", 1)
+            name = name.strip()
+            one_liner = one_liner.strip()
+            parts.append(f"Project name: {name}")
+            parts.append(f"Project description: {one_liner}")
+        else:
+            # No colon, use whole line as description
+            name = line
+            parts.append(f"Project description: {line}")
+
+        description = "\n".join(parts)
+        projects.append((name, description))
+
     return projects
 
 
@@ -214,10 +261,9 @@ def enrich_single_project(
     employee_llm = get_llm()
     employee_tool = ReadEmployeeDirectoryTool(llm=employee_llm)
 
-    # Build the prompt
-    full_description = f"{project_name}: {project_description}"
+    # Build the prompt (project_description already contains header + full line)
     prompt = PROJECTS_ENRICHMENT_PROMPT.format(
-        project_description=full_description,
+        project_description=project_description,
         company_overview_md_contents=company_overview,
         source_list=source_list,
     )
@@ -252,8 +298,9 @@ def enrich_single_project(
         validation_error = validate_project_enrichment(json_str)
 
         if validation_error is None:
-            # Valid - parse and return
+            # Valid - parse, filter invalid paths, and return
             result = parse_project_enrichment(json_str)
+            result = filter_invalid_paths(result, DATA_CLEAN_DIR)
             return result.model_dump()
 
     except ValueError as e:
@@ -275,8 +322,9 @@ def enrich_single_project(
         validation_error = validate_project_enrichment(json_str)
 
         if validation_error is None:
-            # Valid on retry - parse and return
+            # Valid on retry - parse, filter invalid paths, and return
             result = parse_project_enrichment(json_str)
+            result = filter_invalid_paths(result, DATA_CLEAN_DIR)
             return result.model_dump()
 
         # Still invalid after retry
