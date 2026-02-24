@@ -45,7 +45,8 @@ class ReadEmployeeDirectoryTool(ToolInterface):
             "description": (
                 "Read the employee directory and filter employees based on a query. "
                 "Examples: 'Engineers working on auth', 'Random subset of 10 people', "
-                "'Everyone', 'Managers in the Platform team', 'People who started in 2024'."
+                "'Everyone', 'Managers in the Platform team', 'People who started in 2024', "
+                "'A specific person by name'."
             ),
             "parameters": {
                 "type": "object",
