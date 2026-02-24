@@ -268,13 +268,57 @@ def is_valid_path(path: str, base_dir: str) -> bool:
     return os.path.isdir(parent_dir)
 
 
+def try_hardcoded_recovery(path: str, base_dir: str) -> str | None:
+    """
+    Try to recover an invalid path by finding the deepest valid leaf directory.
+
+    If a path like sources/a/b/c/d/file.json is invalid but sources/a/b exists
+    and is a leaf directory (has no subdirectories), recover to sources/a/b/file.json.
+
+    Args:
+        path: The invalid path (e.g., "sources/google_drive/.../deep/file.json").
+        base_dir: Base directory to resolve paths against.
+
+    Returns:
+        Recovered path if successful, None otherwise.
+    """
+    # Get the filename
+    filename = os.path.basename(path)
+
+    # Get the directory part and split into components
+    dir_part = os.path.dirname(path)
+    parts = dir_part.split(os.sep)
+
+    # Walk up the path to find the deepest existing directory
+    for i in range(len(parts), 0, -1):
+        candidate_dir = os.path.join(*parts[:i])
+        full_candidate_dir = os.path.join(base_dir, candidate_dir)
+
+        if os.path.isdir(full_candidate_dir):
+            # Check if this directory is a leaf (has no subdirectories)
+            has_subdirs = any(
+                os.path.isdir(os.path.join(full_candidate_dir, entry))
+                for entry in os.listdir(full_candidate_dir)
+            )
+
+            if not has_subdirs:
+                # This is a leaf directory, recover the path here
+                return os.path.join(candidate_dir, filename)
+            else:
+                # Directory exists but has subdirectories, don't recover here
+                # The LLM might find a better match
+                return None
+
+    return None
+
+
 def filter_invalid_paths(
     enrichment: ProjectEnrichment,
     base_dir: str,
 ) -> ProjectEnrichment:
     """
     Filter out files with invalid parent directories.
-    Attempts to recover invalid paths using LLM.
+    Attempts to recover invalid paths first with hardcoded logic, then LLM.
 
     Since these are planned documents (not yet created), we validate
     that the parent directory exists, not the file itself.
@@ -303,20 +347,31 @@ def filter_invalid_paths(
                 file = ProjectFile(path=normalized_path, description=file.description)
             valid_files.append(file)
         else:
-            # Try to recover the path using LLM
             print(f"  Invalid path: {file.path}")
+
+            # First try hardcoded recovery (find deepest leaf directory)
+            recovered_path = try_hardcoded_recovery(normalized_path, base_dir)
+
+            if recovered_path and is_valid_path(recovered_path, base_dir):
+                print(f"  Recovered (leaf dir): {recovered_path}")
+                valid_files.append(
+                    ProjectFile(path=recovered_path, description=file.description)
+                )
+                continue
+
+            # Fall back to LLM recovery
             recovered_path = recover_path(file.path, base_dir)
 
             if recovered_path:
                 if is_valid_path(recovered_path, base_dir):
-                    print(f"  Recovered to: {recovered_path}")
+                    print(f"  Recovered (LLM): {recovered_path}")
                     valid_files.append(
                         ProjectFile(path=recovered_path, description=file.description)
                     )
                 else:
                     print(f"  Recovery failed (parent dir doesn't exist): {recovered_path}")
             else:
-                print(f"  Recovery failed (no path returned)")
+                print("  Recovery failed (no path returned)")
 
     if not valid_files:
         raise ValueError(
