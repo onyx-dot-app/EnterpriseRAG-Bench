@@ -12,5 +12,4 @@ SOURCES_DIR = f"{DATA_CLEAN_DIR}/sources"
 SOURCE_TREE_PATH = f"{DATA_CLEAN_DIR}/source_tree.txt"
 
 PROJECTS_DIR = f"{DATA_CLEAN_DIR}/projects"
-PROJECTS_CACHE_DIR = f"{PROJECTS_DIR}/generation_cache"
-PROJECT_LIST_PATH = f"{PROJECTS_CACHE_DIR}/project_list.txt"
+PROJECT_LIST_PATH = f"{PROJECTS_DIR}/project_list.txt"

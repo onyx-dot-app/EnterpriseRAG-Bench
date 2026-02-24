@@ -16,7 +16,7 @@ from src.paths import (
     DATA_CLEAN_DIR,
     INITIATIVES_PATH,
     PROJECT_LIST_PATH,
-    PROJECTS_CACHE_DIR,
+    PROJECTS_DIR,
     SOURCE_TREE_PATH,
     SOURCES_DIR,
 )
@@ -457,12 +457,16 @@ def enrich_projects(max_parallelization: int = 5) -> None:
     pending: list[tuple[str, str]] = []
     for name, desc in projects:
         filename = project_name_to_filename(name)
-        output_path = os.path.join(PROJECTS_CACHE_DIR, filename)
+        output_path = os.path.join(PROJECTS_DIR, filename)
         if not os.path.exists(output_path):
             pending.append((name, desc))
 
     if not pending:
-        print("All projects already enriched. Done.")
+        print("All projects already enriched.")
+        print()
+        print("To regenerate projects, remove everything under:")
+        print(f"  {PROJECTS_DIR}")
+        print_document_statistics(PROJECTS_DIR)
         return
 
     print(f"{len(projects) - len(pending)} already enriched, {len(pending)} remaining.")
@@ -480,7 +484,7 @@ def enrich_projects(max_parallelization: int = 5) -> None:
                 project,
                 company_overview,
                 source_list,
-                PROJECTS_CACHE_DIR,
+                PROJECTS_DIR,
             ): project[0]
             for project in pending
         }
@@ -513,7 +517,7 @@ def enrich_projects(max_parallelization: int = 5) -> None:
             print(f"  - {name}: {error}")
 
     # Print document statistics
-    print_document_statistics(PROJECTS_CACHE_DIR)
+    print_document_statistics(PROJECTS_DIR)
 
 
 def run_interactive_generation() -> None:
@@ -601,8 +605,8 @@ def main() -> None:
         print("Skipping interactive generation...")
         with open(PROJECT_LIST_PATH) as f:
             content = f.read()
-        line_count = len(content.strip().splitlines())
-        print(f"Project list contains {line_count} projects.")
+        projects = parse_project_list(content)
+        print(f"Project list contains {len(projects)} projects.")
     else:
         print("Phase 1: Interactive Project List Generation")
         print("-" * 40)
