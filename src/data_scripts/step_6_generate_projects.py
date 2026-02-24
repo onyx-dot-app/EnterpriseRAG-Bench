@@ -375,6 +375,63 @@ def process_single_project(
         return (name, False, f"Error: {e}")
 
 
+def print_document_statistics(cache_dir: str) -> None:
+    """
+    Print statistics about generated documents per top-level source.
+
+    Reads all JSON files in the cache directory and counts documents
+    by top-level source directory (e.g., confluence, google_drive, slack).
+
+    Args:
+        cache_dir: Directory containing the enriched project JSON files.
+    """
+    from collections import Counter
+
+    source_counts: Counter[str] = Counter()
+    total_documents = 0
+    total_projects = 0
+
+    # Read all JSON files in the cache directory
+    if not os.path.exists(cache_dir):
+        return
+
+    for filename in os.listdir(cache_dir):
+        if not filename.endswith(".json"):
+            continue
+
+        filepath = os.path.join(cache_dir, filename)
+        try:
+            with open(filepath) as f:
+                data = json.load(f)
+
+            total_projects += 1
+            files = data.get("files", [])
+
+            for file_entry in files:
+                path = file_entry.get("path", "")
+                # Extract top-level source from path like "sources/confluence/..."
+                parts = path.split("/")
+                if len(parts) >= 2 and parts[0] == "sources":
+                    top_level_source = parts[1]
+                    source_counts[top_level_source] += 1
+                    total_documents += 1
+
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+
+    # Print statistics
+    print()
+    print("=" * 40)
+    print("Document Statistics")
+    print("=" * 40)
+    print(f"Total projects: {total_projects}")
+    print(f"Total documents: {total_documents}")
+    print()
+    print("Documents per source:")
+    for source, count in sorted(source_counts.items(), key=lambda x: -x[1]):
+        print(f"  {source}: {count}")
+
+
 def enrich_projects(max_parallelization: int = 5) -> None:
     """
     Enrich all projects with parallelization and progress bar.
@@ -454,6 +511,9 @@ def enrich_projects(max_parallelization: int = 5) -> None:
         print("Failed projects:")
         for name, error in failed_projects:
             print(f"  - {name}: {error}")
+
+    # Print document statistics
+    print_document_statistics(PROJECTS_CACHE_DIR)
 
 
 def run_interactive_generation() -> None:

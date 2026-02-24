@@ -1,441 +1,273 @@
 {
-  "description": "Project: KV cache compaction improvements (Serving Runtime Performance: Kernel + Scheduling).\n\nProblem / motivation:\nRedwood\u2019s serving runtime uses GPU memory heavily for KV cache. Under bursty workloads and mixed sequence-length distributions, allocations and frees can fragment the KV cache arena/pool. Fragmentation increases allocator overhead, can force suboptimal placement/evictions, and can cause burst tail-latency spikes (p95/p99) when the runtime hits memory-pressure and performs expensive slow-paths (e.g., emergency eviction, re-allocations, or partial stalls). Some customers observe latency \u201csawtoothing\u201d during traffic bursts and occasional decode-time jitter tied to KV cache churn.\n\nGoals:\n- Reduce GPU memory fragmentation for KV cache over long-running processes.\n- Reduce burst tail latencies (p95/p99) and variance, especially during mixed prefill/decode and burst traffic.\n- Add a principled compaction + eviction strategy with clear policy knobs.\n- Improve observability: fragmentation metrics, memory-pressure signals, and compaction cost accounting.\n- Provide safe rollout controls (feature flag/config) and regression tests (perf + correctness).\n\nNon-goals:\n- Redesign the entire caching subsystem (prefix cache semantics remain unchanged).\n- Introduce model-quality changes (no changes to outputs).\n- Replace the GPU allocator globally (scope is KV cache allocation/management; any general allocator work must be justified by impact).\n\nScope / workstreams:\n1) Instrumentation & diagnostics\n- Add runtime metrics: fragmentation ratio, largest-free-block, allocation failure rate, compaction bytes moved, compaction time, eviction counts by reason.\n- Add tracing spans for compaction/eviction decision points.\n- Extend perf canary scenarios to include long-running, bursty mixed-length workloads.\n\n2) Compaction strategy\n- Define compaction triggers (threshold-based + hysteresis): e.g., fragmentation > X%, allocation failure near-miss, or memory-pressure high-watermark.\n- Implement compaction algorithm for KV blocks/pages (e.g., moving live KV segments to coalesce free space), with bounded per-iteration work.\n- Ensure correctness and concurrency safety with in-flight decode and scheduler interactions.\n\n3) Eviction strategy\n- Add policy-driven eviction when compaction can\u2019t satisfy allocations quickly enough.\n- Integrate with scheduler to prefer evicting low-priority or low-reuse candidates; support \u201cgraceful degradation\u201d modes under pressure.\n\n4) Scheduling integration\n- Coordinate compaction work with scheduler to avoid synchronized stalls (e.g., budgeted background compaction, scheduling-aware windows, and backpressure integration).\n\n5) Validation & rollout\n- Benchmarks: microbench for allocator/compaction cost; macrobench for end-to-end latency under load.\n- Guardrails: feature flags, staged rollout (staging \u2192 canary \u2192 5% prod \u2192 25% \u2192 100%), auto-disable on regression.\n- Documentation updates: standards, runbooks, known issues, and release notes.\n\nStakeholders / teams:\n- Primary engineering: Serving Runtime (VP Mateo Alvarez), Runtime Scheduling (EM Sofia Ivanova), Runtime Kernels (EM Hiro Tanaka).\n- Key contributors: Samir Qureshi (memory/KV), Omar El-Sayed (KV + tail latency), Noah Patel (runtime architecture/correctness), Marcus Reed/Lena Fischer (scheduler + perf).\n- SRE/Infra partners: Sean Gallagher, Rafael Mendes, Aisha Bello (dashboards/alerts), Tom\u00e1\u0161 Nov\u00e1k (incident learnings).\n- Benchmarking support: Claire Dubois, Rina Kobayashi.\n- Product interface/priority alignment: Henry Cho (PM, perf transparency/customer messaging).\n\nTimeline (hypothetical):\n- Phase 0 (late Jan\u2013Feb 2026): incident-driven triage, instrumentation, initial design/ADR.\n- Phase 1 (Feb\u2013Mar 2026): implement compaction v1 behind flag + perf canary coverage.\n- Phase 2 (Mar\u2013Apr 2026): eviction policy integration + scheduling-aware compaction budgeting.\n- Phase 3 (Apr 2026): staged production rollout + LTS backport decision + documentation/runbooks finalized.\n\nDeliverables:\n- Design doc + ADR, implementation PRs, perf suite updates, new dashboards/alerts, runbook, release notes, and post-incident follow-up closure in Linear.",
+  "description": "Project: KV cache compaction improvements (Serving Runtime Performance \u2014 Kernel + Scheduling)\n\nProblem / motivation:\nRedwood\u2019s serving runtime relies heavily on the GPU KV cache for decoding efficiency. Under bursty traffic and mixed sequence-length distributions, the KV cache becomes fragmented (holes from completed/evicted sequences, uneven block utilization), which increases allocator/search overhead, raises the probability of expensive re-allocations, and causes bursty p95/p99 latency spikes. In some regions/pools this also increases OOM risk and forces conservative admission control, hurting throughput and customer SLOs.\n\nGoals:\n- Reduce KV cache memory fragmentation under real production mixes (prefill/decode interleaving, variable context lengths, multi-tenant pools).\n- Reduce burst tail latencies attributable to KV cache allocation/eviction churn (target measurable p95/p99 improvements on internal perf suites and perf-canary).\n- Provide a clear eviction/compaction strategy that is scheduler-aware (fairness, backpressure) and safe under concurrency.\n- Improve observability: allocator/fragmentation metrics, compaction cost metrics, and per-request attribution to tail latency.\n- Ship behind a runtime flag with safe incremental rollout (canary by region/pool), with clear rollback levers.\n\nNon-goals:\n- Rewriting the entire attention cache subsystem or changing model semantics.\n- Long-horizon memory defragmentation across device resets (we focus on online compaction/eviction during runtime).\n- Product/console UX changes beyond dashboards/alerts needed for safe rollout.\n\nScope / technical approach (expected):\n- Introduce a compaction-capable allocator (e.g., block/page-based KV cache with movable segments) or a two-tier strategy (hot/cold segments) to reduce holes.\n- Define eviction policy that cooperates with the scheduler (e.g., priority by request age, SLA class, tenant tier, or \u201clikely-to-be-reused\u201d prefix cache heuristics).\n- Add compaction triggers and budgets: threshold-based (fragmentation ratio), time-based, and \u201con allocation failure\u201d fallback.\n- Implement safety constraints: compaction must respect in-flight kernels, stream synchronization, and must not regress average latency.\n- Extend performance suite and canary checks to cover fragmentation + burst scenarios.\n\nStakeholders / teams:\n- Engineering (Serving Runtime): Mateo Alvarez (VP Eng Runtime), Sofia Ivanova (Scheduling), Hiro Tanaka (Kernels), Noah Patel (runtime architecture), Omar El-Sayed & Samir Qureshi (KV cache/memory management), Marcus Reed/Rina Kobayashi (perf suite).\n- SRE/Infra: Sean Gallagher, Rafael Mendes, Allison Grant (observability) for rollout, SLOs, and incident prevention.\n- Product: Nikhil Sharma (Hosted API), Lauren Bishop (Dedicated) for customer impact prioritization and rollout expectations.\n\nMilestones / timeline (hypothetical):\n- Phase 0 (1\u20132 weeks): incident/data review, instrumentation, baseline fragmentation benchmarks; draft design.\n- Phase 1 (2\u20134 weeks): implement allocator + metrics + feature flag; integrate initial eviction strategy.\n- Phase 2 (2\u20133 weeks): scheduler integration, compaction triggers/budgets, regression testing; perf suite + perf-canary.\n- Phase 3 (1\u20132 weeks): canary rollout (one region + one dedicated pool), dashboards/alerts, iterate.\n- Phase 4 (1\u20132 weeks): broad rollout and documentation (runbooks, standards, release notes).\n\nKey deliverables:\n- Confluence design doc + ADRs for key tradeoffs.\n- Linear project + execution tickets.\n- GitHub PR series implementing allocator/eviction/metrics/tests.\n- Dashboards/alerts and runbooks for monitoring + rollback.\n- Support artifacts tying customer-reported tail latency to the fix (Jira, comms).",
   "files": [
     {
-      "path": "sources/confluence/eng-serving-runtime/kernel-and-scheduling/kv-cache-compaction-improvements-design.json",
-      "description": "Primary design doc: fragmentation problem statement, allocator model, proposed compaction algorithm (data structures, concurrency), triggers, budgets, and rollout plan; links to Linear epic and benchmark plan."
+      "path": "sources/confluence/eng-serving-runtime/kernel-and-scheduling/kv-cache-compaction-improvements-design-v1.json",
+      "description": "Primary design doc: fragmentation problem statement, proposed compaction/eviction architecture, data structures, concurrency model, scheduler integration points, performance expectations, testing strategy, and rollout plan (feature flag + canary)."
     },
     {
-      "path": "sources/confluence/architecture-and-standards/decision-records/adr-0142-kv-cache-compaction-and-eviction-policy.json",
-      "description": "ADR capturing the chosen approach (compaction + policy-based eviction) vs alternatives (bigger pool, periodic restart, global allocator swap), with trade-offs and decision date/owners."
+      "path": "sources/confluence/architecture-and-standards/decision-records/adr-0127-kv-cache-block-size-and-move-semantics.json",
+      "description": "ADR: choose KV cache allocation granularity (page/block size), whether blocks are movable, tradeoffs vs kernel complexity, and migration plan."
     },
     {
-      "path": "sources/confluence/eng-serving-runtime/benchmarking-and-perf-suite/kv-fragmentation-burst-tail-benchmark-plan.json",
-      "description": "Benchmark plan: synthetic workloads, long-run fragmentation tests, burst schedules, acceptance thresholds (p95/p99), and how results are stored/compared."
+      "path": "sources/confluence/architecture-and-standards/decision-records/adr-0128-compaction-trigger-policy-and-budgeting.json",
+      "description": "ADR: define compaction triggers (fragmentation ratio, allocation pressure) and compaction budget model (time/token budget) to protect median latency."
     },
     {
-      "path": "sources/confluence/eng-serving-runtime/profiling-playbook/gpu-memory-fragmentation-triage-playbook.json",
-      "description": "Profiling guide addendum: how to detect fragmentation, what counters to look at, Nsight/trace steps, and common failure modes."
+      "path": "sources/confluence/architecture-and-standards/decision-records/adr-0129-eviction-policy-scheduler-contract.json",
+      "description": "ADR: define eviction strategy and the explicit contract between scheduler and KV cache (priority classes, fairness constraints, overload behavior)."
     },
     {
-      "path": "sources/confluence/eng-serving-runtime/known-issues/kv-cache-memory-pressure-and-fragmentation.json",
-      "description": "Known issue page: symptoms, mitigations, config knobs, and links to runbooks/alerts; updated as compaction rolls out."
+      "path": "sources/confluence/eng-serving-runtime/runtime-architecture/kv-cache-allocator-and-fragmentation-metrics.json",
+      "description": "Runtime architecture page update: allocator internals, fragmentation definitions, new counters/telemetry, and how components (scheduler, prefix cache, kernels) interact."
     },
     {
-      "path": "sources/confluence/eng-sre/runbooks/runtime-kv-cache-memory-pressure-mitigation.json",
-      "description": "SRE runbook: what to do when memory pressure spikes (feature-flag toggles, rate-limits/load shedding, rollback steps, dashboards to consult)."
+      "path": "sources/confluence/eng-serving-runtime/benchmarking-and-perf-suite/fragmentation-benchmarks-burst-tail-methodology.json",
+      "description": "Perf methodology doc: new benchmark scenarios (bursty arrivals, mixed lengths, multi-tenant), metrics (fragmentation ratio, compaction cost), and acceptance thresholds."
     },
     {
-      "path": "sources/confluence/eng-platform/dashboards-and-alerts/kv-cache-fragmentation-dashboards.json",
-      "description": "Dashboards/alerts spec: panels for fragmentation ratio, compaction time, eviction rate, latency correlation; proposed alert thresholds and paging policy."
+      "path": "sources/confluence/eng-serving-runtime/profiling-playbook/profiling-kv-cache-fragmentation-and-compaction-overhead.json",
+      "description": "Step-by-step profiling guide: how to capture allocator stats, GPU memory snapshots, and correlate compaction events with p99 latency spikes."
     },
     {
-      "path": "sources/confluence/eng-sre/incident-review/2026-02-kv-fragmentation-tail-latency-spike-incident-review.json",
-      "description": "Incident review summary: timeline, customer impact, contributing factors (fragmentation + burst traffic), immediate mitigations, and follow-up actions tied to this project."
+      "path": "sources/confluence/eng-serving-runtime/known-issues/kv-cache-fragmentation-under-bursts.json",
+      "description": "Known issue entry: symptoms, how to detect, current mitigations (admission control, cache limits), and link to the compaction project."
     },
     {
-      "path": "sources/confluence/architecture-and-standards/performance-standards/runtime-memory-management-performance-criteria.json",
-      "description": "Update to performance standards: defines required memory/fragmentation metrics, perf gates for long-running tests, and regression budget policies."
+      "path": "sources/confluence/eng-sre/slo-and-error-budgets/hosted-runtime-tail-latency-slo-fragmentation-signals.json",
+      "description": "SLO guidance: how tail latency SLOs incorporate fragmentation signals; alert thresholds for compaction regressions; escalation paths."
     },
     {
-      "path": "sources/confluence/eng-serving-runtime/release-notes/runtime-1-21-kv-cache-compaction-preview.json",
-      "description": "Runtime release note draft: introduces compaction feature flag, config options, expected perf changes, and safe-rollback instructions."
+      "path": "sources/confluence/eng-platform/dashboards-and-alerts/kv-cache-health-dashboard-spec.json",
+      "description": "Dashboard spec: panels for fragmentation ratio, eviction rate, compaction CPU/GPU time, allocation failures, and p95/p99 per pool/region."
     },
     {
-      "path": "sources/linear/engineering/ENG-4821.json",
-      "description": "Epic: \u201cKV cache compaction improvements\u201d (project umbrella). Includes goals/non-goals, milestones, and links to design doc/ADR."
+      "path": "sources/confluence/eng-sre/runbooks/mitigating-kv-cache-fragmentation-incidents.json",
+      "description": "Operational runbook: triage checklist, safe runtime flag changes, pool-level mitigations, rollback steps, and when to page runtime oncall."
     },
     {
-      "path": "sources/linear/engineering/ENG-4822.json",
-      "description": "Instrumentation: add fragmentation metrics + allocator slow-path counters; acceptance criteria includes dashboard readiness and sampling overhead limits."
+      "path": "sources/confluence/oncall-and-incident-response/postmortems/pm-2025-02-11-burst-tail-latency-kv-fragmentation.json",
+      "description": "Postmortem: timeline, contributing factors (fragmentation + burst routing), customer impact, immediate mitigations, and follow-ups that seeded this project."
     },
     {
-      "path": "sources/linear/engineering/ENG-4823.json",
-      "description": "Implement compaction v1 behind feature flag; defines compaction triggers and maximum per-step budget; includes testing + rollback plan."
+      "path": "sources/linear/engineering/ENG-2841.json",
+      "description": "Linear project/umbrella issue: \u201cKV cache compaction improvements\u201d with milestones, owners, success metrics, and links to design/ADRs."
     },
     {
-      "path": "sources/linear/engineering/ENG-4824.json",
-      "description": "Concurrency/correctness audit for moving KV blocks with in-flight decode; includes stress tests and race-check tooling."
+      "path": "sources/linear/engineering/ENG-2842.json",
+      "description": "Instrumentation: add fragmentation ratio + allocation failure counters; include labels by region/pool/model family; define metric names and units."
     },
     {
-      "path": "sources/linear/engineering/ENG-4825.json",
-      "description": "Eviction policy work: define candidate scoring (age, reuse probability, request priority) and integrate with scheduler."
+      "path": "sources/linear/engineering/ENG-2843.json",
+      "description": "Perf suite: add bursty-mix benchmark scenario; publish baseline results and regression gates."
     },
     {
-      "path": "sources/linear/engineering/ENG-4826.json",
-      "description": "Scheduler integration: schedule-aware compaction windows + backpressure hooks; avoids synchronized stalls."
+      "path": "sources/linear/engineering/ENG-2844.json",
+      "description": "Allocator refactor: introduce compaction-capable block map; ensure thread-safety and minimal overhead in fast path."
     },
     {
-      "path": "sources/linear/engineering/ENG-4827.json",
-      "description": "Perf suite: add long-running burst fragmentation scenario to benchmark-lab/perf-canary; sets pass/fail thresholds."
+      "path": "sources/linear/engineering/ENG-2845.json",
+      "description": "Eviction policy v1: define victim selection (age/tier/fairness); add tests for correctness and pathological cases."
     },
     {
-      "path": "sources/linear/engineering/ENG-4828.json",
-      "description": "Canary rollout plan: staged enablement + auto-disable rules; required dashboards and alerts before 25% traffic."
+      "path": "sources/linear/engineering/ENG-2846.json",
+      "description": "Scheduler integration: add hooks for eviction pressure signals; ensure no starvation; document contract and invariants."
     },
     {
-      "path": "sources/linear/engineering/ENG-4829.json",
-      "description": "Production guardrails: config validation, safe defaults, and \u201cpanic mode\u201d behavior under allocator failure."
+      "path": "sources/linear/engineering/ENG-2847.json",
+      "description": "Compaction triggers: implement threshold-based triggers + per-interval budget; add safety guardrails to avoid thrash."
     },
     {
-      "path": "sources/linear/engineering/ENG-4830.json",
-      "description": "Backport decision for enterprise/LTS runtime branch; includes risk assessment and test requirements."
+      "path": "sources/linear/engineering/ENG-2848.json",
+      "description": "Feature flag + config: runtime flags for enabling compaction, setting budgets, and selecting eviction mode; default off."
     },
     {
-      "path": "sources/linear/engineering/ENG-4831.json",
-      "description": "Documentation tasks: update runbooks/known issues/release notes once feature flag ships."
+      "path": "sources/linear/engineering/ENG-2849.json",
+      "description": "Correctness tests: stress tests under concurrent decode/prefill; ensure no corruption across stream sync points."
     },
     {
-      "path": "sources/linear/engineering/ENG-4832.json",
-      "description": "Post-incident follow-up closure: verify tail-latency improvement on affected regions; attach before/after graphs."
+      "path": "sources/linear/engineering/ENG-2850.json",
+      "description": "Observability dashboards: implement the KV cache health dashboard in the observability pack; define alerts."
     },
     {
-      "path": "sources/linear/engineering/ENG-4833.json",
-      "description": "Allocator tuning: adjust KV block sizing / binning strategy to reduce fragmentation upstream of compaction."
+      "path": "sources/linear/engineering/ENG-2851.json",
+      "description": "Canary plan: pick one hosted region + one dedicated pool; define success criteria and rollback triggers."
     },
     {
-      "path": "sources/linear/engineering/ENG-4834.json",
-      "description": "Observability pack: add standard Prometheus metrics + exemplars; ensure consistent naming and cardinality limits."
+      "path": "sources/linear/engineering/ENG-2852.json",
+      "description": "Rollout to 25% traffic: staged enablement and monitoring checklist; capture learnings and adjust thresholds."
     },
     {
-      "path": "sources/linear/engineering/ENG-4835.json",
-      "description": "Failure-mode testing: simulate near-OOM + burst traffic; confirm graceful eviction instead of request timeouts."
+      "path": "sources/linear/engineering/ENG-2853.json",
+      "description": "Documentation: update profiling playbook + runbook + release notes; ensure oncall readiness."
     },
     {
-      "path": "sources/github/redwood/pr_19401.json",
-      "description": "PR: add KV allocator fragmentation metrics (ratio, largest-free-block) and export to runtime metrics pipeline; includes unit tests and perf overhead check."
+      "path": "sources/linear/engineering/ENG-2854.json",
+      "description": "Perf-canary: add new canary scenario to detect fragmentation-induced tails; integrate with release gating."
     },
     {
-      "path": "sources/github/redwood/pr_19407.json",
-      "description": "PR: introduce feature flag/config plumbing for compaction (disabled by default), including validation and dynamic reload behavior."
+      "path": "sources/linear/engineering/ENG-2855.json",
+      "description": "Follow-up: evaluate prefix-cache interactions (reuse vs eviction) and propose policy adjustments."
     },
     {
-      "path": "sources/github/redwood/pr_19412.json",
-      "description": "PR: implement compaction v1 core (move-live-blocks to coalesce free space) with bounded work per tick; includes correctness assertions."
+      "path": "sources/github/redwood/pr-18423.json",
+      "description": "PR: Add KV cache fragmentation metrics + structured logging; includes metric naming, tags (region/pool/model), and unit tests."
     },
     {
-      "path": "sources/github/redwood/pr_19418.json",
-      "description": "PR: add allocator slow-path tracing spans and timing histograms; links to dashboards and sampled tracing configuration."
+      "path": "sources/github/redwood/pr-18431.json",
+      "description": "PR: Refactor KV cache allocator into block map abstraction; prepares for compaction (no behavior change)."
     },
     {
-      "path": "sources/github/redwood/pr_19423.json",
-      "description": "PR: scheduler hook to run background compaction under decode-heavy steady state; adds compaction budget controls."
+      "path": "sources/github/redwood/pr-18444.json",
+      "description": "PR: Implement eviction policy v1 (victim selection + fairness constraints); adds simulator tests."
     },
     {
-      "path": "sources/github/redwood/pr_19431.json",
-      "description": "PR: eviction policy scaffolding (interfaces + default LRU-ish strategy) and integration point in memory-pressure handling."
+      "path": "sources/github/redwood/pr-18457.json",
+      "description": "PR: Compaction engine (move blocks + update pointers/metadata); includes synchronization strategy and safety checks."
     },
     {
-      "path": "sources/github/redwood/pr_19435.json",
-      "description": "PR: implement eviction candidate scoring with request priority + age; adds tests and notes about fairness/starvation."
+      "path": "sources/github/redwood/pr-18463.json",
+      "description": "PR: Scheduler integration\u2014introduce \u2018cache pressure\u2019 signal and backpressure coordination; updates scheduling heuristics."
     },
     {
-      "path": "sources/github/redwood/pr_19441.json",
-      "description": "PR: fix race discovered in compaction with concurrent stream cancellations; adds stress test reproducer."
+      "path": "sources/github/redwood/pr-18469.json",
+      "description": "PR: Feature flag + config plumbing for compaction/eviction modes; default off; adds runtime config docs in-code."
     },
     {
-      "path": "sources/github/redwood/pr_19446.json",
-      "description": "PR: add compaction telemetry: bytes moved, time spent, and \u2018compaction aborted\u2019 reasons; ensures low-cardinality labels."
+      "path": "sources/github/redwood/pr-18472.json",
+      "description": "PR: Add regression tests for bursty traffic + mixed lengths; reproduces fragmentation tail behavior pre-fix."
     },
     {
-      "path": "sources/github/redwood/pr_19452.json",
-      "description": "PR: update runtime config docs and comments in-code describing compaction/eviction knobs; includes migration notes."
+      "path": "sources/github/redwood/pr-18481.json",
+      "description": "PR: Optimize compaction fast path to reduce overhead; introduces compaction budget enforcement."
     },
     {
-      "path": "sources/github/redwood/pr_19460.json",
-      "description": "PR: add \u201cpanic mode\u201d fallback\u2014force aggressive eviction and throttle when allocator fails; includes SRE-friendly log messages."
+      "path": "sources/github/redwood/pr-18490.json",
+      "description": "PR: Fix rare race in compaction vs decode stream sync; adds stress test and incident reference."
     },
     {
-      "path": "sources/github/redwood/pr_19469.json",
-      "description": "PR: refactor KV block binning strategy to reduce fragmentation for common sequence-length buckets."
+      "path": "sources/github/benchmark-lab/pr-912.json",
+      "description": "PR: Add benchmark scenario for fragmentation ratio and burst tails; publishes baseline tables and artifacts."
     },
     {
-      "path": "sources/github/redwood/pr_19474.json",
-      "description": "PR: add long-running soak test harness for KV fragmentation; runs in CI nightly with artifact upload."
+      "path": "sources/github/perf-canary/pr-388.json",
+      "description": "PR: Add perf-canary check for compaction-enabled runtime; gating on p99 and allocator failure rate."
     },
     {
-      "path": "sources/github/redwood/pr_19481.json",
-      "description": "PR: ensure compaction is scheduling-aware (avoid compaction during prefill spikes); adds heuristics and tunables."
+      "path": "sources/github/observability-pack/pr-521.json",
+      "description": "PR: Add dashboard panels + alerts for KV cache health (fragmentation, eviction rate, compaction cost) with recommended thresholds."
     },
     {
-      "path": "sources/github/redwood/pr_19490.json",
-      "description": "PR: tighten CI perf gate thresholds and add regression detection for p99 under burst scenario."
+      "path": "sources/slack/eng-runtime/1739311842.json",
+      "description": "Thread: runtime engineers coordinating design review for compaction approach; questions about pointer stability, stream sync, and worst-case overhead."
     },
     {
-      "path": "sources/github/benchmark-lab/pr_611.json",
-      "description": "PR: add benchmark scenario \u201cmixed-length burst + long-run fragmentation\u201d with output schema for fragmentation metrics."
+      "path": "sources/slack/architecture/1739385501.json",
+      "description": "Thread: ADR discussion\u2014debate block size and whether to allow moves; includes tradeoffs for kernel address calculations."
     },
     {
-      "path": "sources/github/benchmark-lab/pr_618.json",
-      "description": "PR: add notebook/script updates for comparing before/after compaction runs; standardizes plots and summary tables."
+      "path": "sources/slack/eng-runtime/1739462100.json",
+      "description": "Thread: perf baseline results shared; identifies which workload mixes trigger the worst fragmentation; links to benchmark-lab run."
     },
     {
-      "path": "sources/github/perf-canary/pr_287.json",
-      "description": "PR: add canary job that runs 6-hour soak on staging GPUs; fails on fragmentation slope and p99 jitter thresholds."
+      "path": "sources/slack/eng-sre/1739488811.json",
+      "description": "Thread: SRE asks for proposed alerting/rollback signals for canary; negotiates thresholds and paging strategy."
     },
     {
-      "path": "sources/github/perf-canary/pr_291.json",
-      "description": "PR: tune canary alerting and rerun logic to reduce flakiness; adds annotation when hardware SKU changes."
+      "path": "sources/slack/incidents/1739544202.json",
+      "description": "Thread: incident coordination during a burst tail latency event; notes about allocator failures and immediate mitigations (flag changes / pool routing)."
     },
     {
-      "path": "sources/github/observability-pack/pr_433.json",
-      "description": "PR: add Grafana dashboard JSON and alert rules for KV cache fragmentation and compaction time; includes runbook links."
+      "path": "sources/slack/eng-oncall/1739549010.json",
+      "description": "Thread: oncall handoff\u2014what to watch overnight during compaction canary; dashboards and safe toggles."
     },
     {
-      "path": "sources/github/redwood/pr_19502.json",
-      "description": "PR: add end-to-end test for eviction correctness (no wrong-token outputs) under forced memory pressure."
+      "path": "sources/slack/eng-releases/1739641301.json",
+      "description": "Thread: release engineering coordinating runtime build that includes compaction flag; discusses rollout sequencing and backport considerations."
     },
     {
-      "path": "sources/github/redwood/pr_19508.json",
-      "description": "PR: optimize compaction memcpy path / stream usage to reduce GPU stall; includes microbench numbers and reviewer feedback."
+      "path": "sources/slack/eng-runtime/1739728004.json",
+      "description": "Thread: debugging a race found in stress tests; shares logs, minimal reproducer config, and assigns fix owner."
     },
     {
-      "path": "sources/github/redwood/pr_19515.json",
-      "description": "PR: add \u201ccompaction budget exceeded\u201d logging + metrics; ensures compaction work is bounded to avoid latency spikes."
+      "path": "sources/slack/eng-runtime/1739815509.json",
+      "description": "Thread: review feedback on PR series; discussion about test coverage and perf regressions in median latency."
     },
     {
-      "path": "sources/github/redwood/pr_19521.json",
-      "description": "PR: fix metric cardinality issue (per-request labels) caught in review; replaces with bucketed labels."
+      "path": "sources/slack/eng-sre/1739902101.json",
+      "description": "Thread: canary results after 24h\u2014p99 improvement vs one regression in a specific model/pool; decides to tune budgets."
     },
     {
-      "path": "sources/github/redwood/pr_19527.json",
-      "description": "PR: staging rollout config enabling compaction for 5% traffic; includes verification checklist and rollback steps."
+      "path": "sources/slack/product/1739918800.json",
+      "description": "Thread: PMs ask whether improvements will change customer-visible latency SLOs; coordinates comms for Dedicated accounts."
     },
     {
-      "path": "sources/github/redwood/pr_19533.json",
-      "description": "PR: add runtime release note entry + config reference updates; ties to runtime-1.21."
+      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/kv-compaction-working-notes.json",
+      "description": "Working doc: early brainstorming, alternative approaches (slab allocator vs segmented pages), open questions, and links to Slack threads/PRs."
     },
     {
-      "path": "sources/github/redwood/pr_19539.json",
-      "description": "PR: improve allocator debug dumps for oncall (compact summary of free lists and largest blocks)."
+      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/fragmentation-baseline-results.json",
+      "description": "Spreadsheet: baseline fragmentation ratio and tail latency across scenarios/regions/models; includes charts and a \u2018regression gate\u2019 tab."
     },
     {
-      "path": "sources/github/redwood/pr_19544.json",
-      "description": "PR: hotfix to reduce compaction trigger aggressiveness after staging p95 regression; adds hysteresis and cooldown."
+      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/compaction-cost-model.json",
+      "description": "Doc: back-of-the-envelope cost model for compaction (bytes moved, expected GPU copy cost, sync overhead) and proposed budgets."
     },
     {
-      "path": "sources/github/redwood/pr_19551.json",
-      "description": "PR: add compatibility handling for older GPU SKUs where compaction path performs worse; auto-disable with warning."
+      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/canary-rollout-checklist.json",
+      "description": "Checklist: step-by-step canary enablement, dashboards to watch, rollback conditions, and communications plan."
     },
     {
-      "path": "sources/github/redwood/pr_19557.json",
-      "description": "PR: integrate SRE runbook link into alert annotations and error messages for faster incident response."
+      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/design-review-deck.json",
+      "description": "Slide deck: design review for compaction/eviction; diagrams of allocator states, trigger policy, and expected impact."
     },
     {
-      "path": "sources/github/redwood/pr_19563.json",
-      "description": "PR: implement eviction \u201cprotect streaming sessions\u201d rule to avoid user-visible stream interruptions; includes tests."
+      "path": "sources/google_drive/shared_drives/engineering/observability/kv-cache-health-dashboard-mockup.json",
+      "description": "Slides: dashboard mockups and panel definitions; proposed alerts and examples of \u2018bad\u2019 patterns."
     },
     {
-      "path": "sources/github/redwood/pr_19568.json",
-      "description": "PR: add soak-test report upload to Drive/GCS artifact store; includes summary comment posted by CI bot."
+      "path": "sources/jira/customer-support/SUP-4391.json",
+      "description": "Customer support ticket: Dedicated customer reports bursty p99 latency spikes; investigation points to KV cache fragmentation; links to incident + planned compaction rollout."
     },
     {
-      "path": "sources/github/redwood/pr_19574.json",
-      "description": "PR: finalize production rollout defaults (still flag-gated) and add config migration notes for Dedicated/Private."
+      "path": "sources/jira/customer-support/SUP-4410.json",
+      "description": "Customer support ticket: Hosted API timeouts during high load; Support requests mitigation guidance; SRE references runbook and interim tuning."
     },
     {
-      "path": "sources/github/redwood/pr_19580.json",
-      "description": "PR: LTS backport (cherry-picks critical metrics + safe compaction fixes) with reduced scope; includes release-manager approval."
+      "path": "sources/jira/customer-support/SUP-4422.json",
+      "description": "Customer support ticket: OOM events correlated with long-context traffic; includes logs and environment details; escalated to runtime team."
     },
     {
-      "path": "sources/github/redwood/pr_19588.json",
-      "description": "PR: cleanup + tech debt follow-up: remove old allocator debug code paths and update internal docs links."
+      "path": "sources/jira/internal-support/INT-1183.json",
+      "description": "Internal support ticket: request to add new runtime metrics to central telemetry schema and ensure retention in observability pipeline."
     },
     {
-      "path": "sources/slack/incidents/thread_1760824451.json",
-      "description": "Incident coordination thread: sudden p99 spike during burst; initial hypotheses include KV cache fragmentation; links to dashboards and mitigations."
+      "path": "sources/fireflies/misc/ff-2025-02-14-technical-deep-dive-kv-cache-latency.json",
+      "description": "Fireflies transcript: technical deep dive with an enterprise prospect evaluating Dedicated; discussion focuses on tail latency, memory fragmentation, and upcoming compaction strategy."
     },
     {
-      "path": "sources/slack/eng-oncall/thread_1760825122.json",
-      "description": "Oncall handoff thread: notes about memory-pressure signals, temporary config changes, and pointers to the incident thread/runbook."
+      "path": "sources/fireflies/customer-success/ff-2025-03-01-poc-checkin-latency-stability.json",
+      "description": "Fireflies transcript: PoC check-in where customer shares burst traffic traces; Redwood team explains canary plan and what metrics will improve."
     },
     {
-      "path": "sources/slack/eng-runtime/thread_1760731188.json",
-      "description": "Runtime thread: discussion of allocator behavior, screenshots/log snippets, and agreement to pursue compaction strategy; links to draft design doc."
+      "path": "sources/gmail/mateo_alvarez/thread-9d2c3f1a-kv-compaction-escalation.json",
+      "description": "Email thread: internal escalation after a customer-facing latency event; aligns Runtime + SRE on priority, staffing, and timeline; includes links to SUP ticket and postmortem."
     },
     {
-      "path": "sources/slack/eng-runtime/thread_1760734499.json",
-      "description": "Implementation Q&A: whether to compact in-place vs move to new arena; concerns about decode concurrency and CUDA stream synchronization."
+      "path": "sources/gmail/neha_kapoor/thread-1a77b0c2-canary-risk-review.json",
+      "description": "Email thread: infra/reliability leadership review of canary risk and rollback plan; requests specific alert thresholds and oncall coverage."
     },
     {
-      "path": "sources/slack/eng-runtime/thread_1760740331.json",
-      "description": "Perf results thread: early microbench showing compaction overhead; debate about trigger thresholds and cooldown."
+      "path": "sources/gmail/nikhil_sharma/thread-3f8b91e0-customer-comms-tail-latency.json",
+      "description": "Email thread: product comms planning for key accounts; sets expectations on when tail latency improvements will land and how to describe the change (no breaking behavior)."
     },
     {
-      "path": "sources/slack/eng-runtime/thread_1760745010.json",
-      "description": "Code review coordination: reviewers assigned for compaction PR; notes about test gaps and metric naming."
+      "path": "sources/hubspot/deal-102884-enterprise-dedicated-eval-latency-risk.json",
+      "description": "HubSpot deal note: enterprise evaluation where tail latency stability is a decision criterion; logs technical objections and links to the technical deep dive call."
     },
     {
-      "path": "sources/slack/eng-runtime/thread_1760752033.json",
-      "description": "Debugging thread: rare crash in compaction under stream cancel; shares stack trace and proposes lock ordering fix."
-    },
-    {
-      "path": "sources/slack/eng-runtime/thread_1760759920.json",
-      "description": "Decision thread: settle on \u2018budgeted background compaction\u2019 vs stop-the-world; confirms non-goals and rollout sequencing."
-    },
-    {
-      "path": "sources/slack/eng-runtime/thread_1760766655.json",
-      "description": "Config thread: what knobs to expose (enable flag, thresholds, max bytes/tick), and what should remain internal."
-    },
-    {
-      "path": "sources/slack/eng-sre/thread_1760769021.json",
-      "description": "SRE thread: proposes alert thresholds and how to correlate fragmentation to latency; discussion about paging vs ticketing."
-    },
-    {
-      "path": "sources/slack/eng-sre/thread_1760771882.json",
-      "description": "Dashboard review thread: Grafana panels for fragmentation + compaction time; requests for annotations and runbook links."
-    },
-    {
-      "path": "sources/slack/architecture/thread_1760775441.json",
-      "description": "ADR review thread: trade-offs discussed (eviction-only vs compaction, larger pool vs engineering fix); approvals requested."
-    },
-    {
-      "path": "sources/slack/eng-runtime/thread_1760780030.json",
-      "description": "Benchmark-lab thread: how to model bursty traffic and long-run fragmentation; agreement on acceptance criteria."
-    },
-    {
-      "path": "sources/slack/eng-runtime/thread_1760787744.json",
-      "description": "CI/perf gate thread: perf-canary flakes; discussion about hardware variance and rerun policy."
-    },
-    {
-      "path": "sources/slack/eng-runtime/thread_1760791103.json",
-      "description": "Staging rollout thread: enabling compaction for small slice; live monitoring notes and quick rollback instructions."
-    },
-    {
-      "path": "sources/slack/eng-runtime/thread_1760795218.json",
-      "description": "Regression thread: staging p95 regression detected; identifies trigger too aggressive; proposes hysteresis fix."
-    },
-    {
-      "path": "sources/slack/eng-runtime/thread_1760801044.json",
-      "description": "Eviction policy thread: how to protect streaming sessions; debate about fairness vs latency under memory pressure."
-    },
-    {
-      "path": "sources/slack/eng-runtime/thread_1760806802.json",
-      "description": "Correctness testing thread: which invariants to assert during compaction; suggests stress harness and fuzz-like workloads."
-    },
-    {
-      "path": "sources/slack/eng-runtime/thread_1760812322.json",
-      "description": "Release planning thread: what goes into runtime-1.21; whether to backport to LTS; owner assignments."
-    },
-    {
-      "path": "sources/slack/eng-releases/thread_1760815888.json",
-      "description": "Release engineering thread: flag rollout mechanics across hosted/dedicated/private; versioning notes and change-management checklist."
-    },
-    {
-      "path": "sources/slack/eng-sre/thread_1760829012.json",
-      "description": "Post-incident follow-up thread: confirming improvements on affected region; attaches before/after graphs and closes action items."
-    },
-    {
-      "path": "sources/slack/general/thread_1760739011.json",
-      "description": "Company-wide FYI thread: brief note about latency incident mitigation and upcoming runtime changes; minimal technical detail."
-    },
-    {
-      "path": "sources/slack/eng-runtime/thread_1760832210.json",
-      "description": "Hotfix coordination thread: cherry-pick compaction hysteresis fix; confirms canary criteria and rollback."
-    },
-    {
-      "path": "sources/slack/eng-runtime/thread_1760835501.json",
-      "description": "Metrics naming thread: aligns runtime metric names with observability standards; resolves cardinality concerns."
-    },
-    {
-      "path": "sources/slack/eng-platform/thread_1760838822.json",
-      "description": "Platform thread: wiring new runtime metrics into dashboards/alerts pipeline; confirms retention and alert routing."
-    },
-    {
-      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/kv-compaction-draft-spec-notes.json",
-      "description": "Working draft spec: rough algorithm sketches, open questions, and links to relevant code locations and prior issues."
-    },
-    {
-      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/kv-fragmentation-soak-results-sheet.json",
-      "description": "Spreadsheet-like doc: soak test runs with fragmentation ratio over time, p95/p99 charts, and notes about anomalies."
-    },
-    {
-      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/kv-cache-allocator-debugging-logs.json",
-      "description": "Collection of log excerpts and allocator debug dumps captured during incident and reproduced in staging."
-    },
-    {
-      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/compaction-trigger-thresholds-experiments.json",
-      "description": "Experiment notes: threshold sweeps, cooldown/hysteresis variants, and a short recommendation section."
-    },
-    {
-      "path": "sources/google_drive/shared_drives/engineering/site-reliability-engineering/kv-fragmentation-alert-tuning-notes.json",
-      "description": "SRE working doc: proposed alerts, false-positive analysis, and paging policy discussion notes."
-    },
-    {
-      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/runtime-1-21-launch-brief-kv-compaction.json",
-      "description": "Launch brief draft: rollout phases, success metrics, owners, and comms checklist for runtime-1.21."
-    },
-    {
-      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/weekly-notes-kv-compaction-2026-w07.json",
-      "description": "Weekly project notes: progress, risks, and next week\u2019s focus; includes quick links to PRs and Linear tickets."
-    },
-    {
-      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/weekly-notes-kv-compaction-2026-w08.json",
-      "description": "Weekly project notes: perf findings, staging rollout status, and blockers; action items with owners."
-    },
-    {
-      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/kv-eviction-policy-brainstorm.json",
-      "description": "Brainstorm doc: candidate scoring ideas, edge cases (streaming), and how to integrate with scheduler priority."
-    },
-    {
-      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/compaction-correctness-test-plan.json",
-      "description": "Test plan draft: invariants, stress scenarios, and how to simulate cancellations/overload; maps to CI jobs."
-    },
-    {
-      "path": "sources/jira/customer-support/SUP-9132.json",
-      "description": "Customer ticket: reports burst p99 latency spikes; includes environment/region, affected models, and links to incident thread; tracked to fragmentation."
-    },
-    {
-      "path": "sources/jira/customer-support/SUP-9140.json",
-      "description": "Customer ticket: intermittent timeouts during peak hours on Dedicated; investigation notes point to KV churn and memory-pressure slow-paths."
-    },
-    {
-      "path": "sources/jira/customer-support/SUP-9151.json",
-      "description": "Customer ticket: asks for mitigation guidance and timeline; support shares workaround toggles and upcoming compaction rollout."
-    },
-    {
-      "path": "sources/jira/internal-support/INT-2207.json",
-      "description": "Internal request: add new Grafana panels and alert routes for fragmentation metrics; includes acceptance criteria and owners."
-    },
-    {
-      "path": "sources/jira/internal-support/INT-2211.json",
-      "description": "Internal issue: perf-canary job flaking after adding long-run tests; requests infra help to stabilize runners/SKUs."
-    },
-    {
-      "path": "sources/jira/internal-support/INT-2218.json",
-      "description": "Internal ticket: request to backport safe metrics + compaction hotfix to LTS branch for enterprise deployments."
-    },
-    {
-      "path": "sources/gmail/neha_kapoor/thread_kv-fragmentation-escalation-202602.json",
-      "description": "Email thread: leadership escalation on customer-visible tail latency; asks for incident summary, mitigation, and timeline for compaction rollout."
-    },
-    {
-      "path": "sources/gmail/sean_gallagher/thread_post-incident-followups-kv-fragmentation.json",
-      "description": "Email thread: SRE follow-ups and action item tracking; links to Confluence incident review and runbook updates."
-    },
-    {
-      "path": "sources/gmail/mateo_alvarez/thread_customer-update-compaction-timeline.json",
-      "description": "Email thread with external customer stakeholders: provides mitigation guidance, status updates, and beta/canary timeline for compaction."
-    },
-    {
-      "path": "sources/gmail/hiro_tanaka/thread_allocator-implementation-review-notes.json",
-      "description": "Internal email thread: detailed review feedback on compaction implementation approach, GPU stream usage, and kernel-side constraints."
-    },
-    {
-      "path": "sources/fireflies/sales-calls/ff_2026-02-18_redwood_technical_deep_dive_tail_latency.json",
-      "description": "Fireflies transcript: technical deep dive with enterprise prospect on tail latency; discusses KV cache fragmentation symptoms, upcoming compaction work, and benchmark plan."
-    },
-    {
-      "path": "sources/fireflies/customer-success/ff_2026-02-25_customer_checkin_latency_spikes_followup.json",
-      "description": "Fireflies transcript: customer success check-in after latency incident; recap of mitigations, rollout plan, and success criteria for improvement."
-    },
-    {
-      "path": "sources/hubspot/company_104882_northlake_ai.json",
-      "description": "HubSpot company record: enterprise prospect concerned about p99; notes include technical requirements, security needs, and links to Fireflies deep dive."
-    },
-    {
-      "path": "sources/hubspot/company_104901_helio_support.json",
-      "description": "HubSpot company record: existing customer with Dedicated deployment; notes reference SUP-9132 and expectation for runtime compaction fix."
+      "path": "sources/hubspot/ticket-77812-customer-latency-escalation-summary.json",
+      "description": "HubSpot support/escalation summary: account timeline, impact statement, promised follow-ups, and mapping to Jira SUP tickets + rollout milestones."
     }
   ]
 }
