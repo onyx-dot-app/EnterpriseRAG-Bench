@@ -4,11 +4,14 @@ import json
 import os
 import subprocess
 
+import yaml
 from pydantic import BaseModel, field_validator
 
 from src.llm import get_llm
 from src.llm.interface import Message
+from src.paths import EMPLOYEE_DIRECTORY_PATH
 from src.prompts.path_recovery import PATH_RECOVERY_PROMPT
+from src.prompts.people_recovery import PATH_RECOVERY_PROMPT as PEOPLE_RECOVERY_PROMPT
 
 
 class ProjectFile(BaseModel):
@@ -23,6 +26,29 @@ class ProjectFile(BaseModel):
         """Validate path starts with 'sources/'."""
         if not v.startswith("sources/"):
             raise ValueError("path must start with 'sources/'")
+        return v
+
+
+class ProjectPerson(BaseModel):
+    """Schema for a person entry."""
+
+    name: str
+    project_role: str
+
+
+class ProjectPeople(BaseModel):
+    """Schema for people-only JSON output."""
+
+    people: list[ProjectPerson]
+
+    @field_validator("people")
+    @classmethod
+    def validate_people_not_empty(
+        cls, v: list[ProjectPerson]
+    ) -> list[ProjectPerson]:
+        """Validate that people list is not empty."""
+        if not v:
+            raise ValueError("people list cannot be empty")
         return v
 
 
@@ -73,6 +99,31 @@ EXPECTED_FORMAT_DESCRIPTION = """
 - "files": List each hypothetical document. Each entry has:
   - "path": File path starting from `sources/` (e.g. `sources/confluence/engineering/design-doc.json`). CRITICAL: THIS MUST BE A VALID PATH STARTING WITH 'sources/' and the file must be a .json file.
   - "description": What the file will loosely contain or discuss (e.g. "Kickoff meeting notes: attendees, agenda, decisions, action items").
+""".strip()
+
+
+# Note: Curly braces are doubled to escape them for use in .format() calls
+EXPECTED_PEOPLE_FORMAT = """
+{{
+  "people": [
+    {{
+      "name": "Full Name",
+      "project_role": "In very few words, the role the person will play in the project (e.g. System architect)."
+    }}
+  ]
+}}
+""".strip()
+
+# Unescaped version for display/validation purposes
+EXPECTED_PEOPLE_FORMAT_UNESCAPED = """
+{
+  "people": [
+    {
+      "name": "Full Name",
+      "project_role": "In very few words, the role the person will play in the project (e.g. System architect)."
+    }
+  ]
+}
 """.strip()
 
 
@@ -382,3 +433,147 @@ def filter_invalid_paths(
         description=enrichment.description,
         files=valid_files,
     )
+
+
+# =============================================================================
+# People validation functions
+# =============================================================================
+
+
+def load_employee_names() -> set[str]:
+    """Load all employee names from employee_directory.yaml."""
+    with open(EMPLOYEE_DIRECTORY_PATH) as f:
+        data = yaml.safe_load(f)
+    names: set[str] = set()
+    for dept_employees in data.get("departments", {}).values():
+        for emp in dept_employees:
+            if "name" in emp:
+                names.add(emp["name"])
+    return names
+
+
+def get_employee_directory_contents() -> str:
+    """Load employee directory as string for LLM context."""
+    with open(EMPLOYEE_DIRECTORY_PATH) as f:
+        return f.read()
+
+
+def recover_person(
+    invalid_name: str,
+    project_description: str,
+    employee_directory: str,
+) -> str | None:
+    """
+    Use LLM to recover a correct person name.
+
+    Args:
+        invalid_name: The name that doesn't exist in the directory.
+        project_description: The project description for context.
+        employee_directory: The employee directory contents.
+
+    Returns:
+        Recovered name if successful, None otherwise.
+    """
+    prompt = PEOPLE_RECOVERY_PROMPT.format(
+        project_overview=project_description,
+        employee_directory=employee_directory,
+        user_name=invalid_name,
+    )
+    llm = get_llm()
+    messages = [Message(role="user", content=prompt)]
+    response = ""
+    for chunk in llm.generate(messages):
+        if isinstance(chunk, str):
+            response += chunk
+    result = response.strip().strip("\"'`.,")
+    return result if result else None
+
+
+def filter_invalid_people(
+    people: list[ProjectPerson],
+    project_description: str,
+) -> list[ProjectPerson]:
+    """
+    Filter out invalid people, attempting LLM recovery first.
+
+    Args:
+        people: List of ProjectPerson to validate.
+        project_description: Project description for recovery context.
+
+    Returns:
+        List of valid people.
+
+    Raises:
+        ValueError: If all people are invalid.
+    """
+    valid_names = load_employee_names()
+    employee_directory = get_employee_directory_contents()
+    valid_people: list[ProjectPerson] = []
+
+    for person in people:
+        if person.name in valid_names:
+            valid_people.append(person)
+        else:
+            print(f"  Invalid person: {person.name}")
+            recovered = recover_person(
+                person.name, project_description, employee_directory
+            )
+            if recovered and recovered in valid_names:
+                print(f"  Recovered: {recovered}")
+                valid_people.append(
+                    ProjectPerson(name=recovered, project_role=person.project_role)
+                )
+            else:
+                if recovered:
+                    print(f"  Skipping (recovered name not in directory): {recovered}")
+                else:
+                    print("  Skipping (recovery failed)")
+
+    if not valid_people:
+        raise ValueError("All people are invalid")
+
+    return valid_people
+
+
+def validate_project_people(content: str) -> str | None:
+    """
+    Validate people JSON content.
+
+    Args:
+        content: The JSON content to validate.
+
+    Returns:
+        None if valid, error message string if invalid.
+    """
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON syntax: {e}"
+
+    try:
+        ProjectPeople.model_validate(data)
+    except Exception as e:
+        return f"Schema validation failed: {e}"
+
+    return None
+
+
+def parse_project_people(content: str) -> ProjectPeople:
+    """
+    Parse and validate people JSON content.
+
+    Args:
+        content: The JSON content to parse.
+
+    Returns:
+        Validated ProjectPeople object.
+
+    Raises:
+        ValueError: If content is invalid.
+    """
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON syntax: {e}")
+
+    return ProjectPeople.model_validate(data)

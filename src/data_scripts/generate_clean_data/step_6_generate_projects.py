@@ -14,18 +14,26 @@ from src.llm.interface import LLMInterface, Message, ToolCall
 from src.paths import (
     COMPANY_OVERVIEW_PATH,
     DATA_CLEAN_DIR,
+    EMPLOYEE_DIRECTORY_PATH,
     INITIATIVES_PATH,
     PROJECT_LIST_PATH,
     PROJECTS_DIR,
     SOURCE_TREE_PATH,
     SOURCES_DIR,
 )
-from src.prompts.projects import PROJECTS_ENRICHMENT_PROMPT, PROJECTS_SYSTEM_PROMPT
+from src.prompts.projects import (
+    PROJECT_PEOPLE_PROMPT,
+    PROJECTS_ENRICHMENT_PROMPT,
+    PROJECTS_SYSTEM_PROMPT,
+)
 from src.schemas.project_enrichment import (
     EXPECTED_FORMAT_UNESCAPED,
     filter_invalid_paths,
+    filter_invalid_people,
     parse_project_enrichment,
+    parse_project_people,
     validate_project_enrichment,
+    validate_project_people,
 )
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import (
@@ -581,6 +589,167 @@ def run_interactive_generation() -> None:
             return  # Exit without enrichment
 
 
+def get_projects_without_people(projects_dir: str) -> list[str]:
+    """
+    Return list of project JSON filenames that don't have a 'people' field.
+
+    Args:
+        projects_dir: Directory containing project JSON files.
+
+    Returns:
+        List of filenames missing the 'people' field.
+    """
+    missing: list[str] = []
+    if not os.path.exists(projects_dir):
+        return missing
+
+    for filename in os.listdir(projects_dir):
+        if not filename.endswith(".json"):
+            continue
+        filepath = os.path.join(projects_dir, filename)
+        try:
+            with open(filepath) as f:
+                data = json.load(f)
+            if "people" not in data or not data["people"]:
+                missing.append(filename)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    return missing
+
+
+def add_people_to_project(
+    project_path: str,
+    company_overview: str,
+    employee_directory: str,
+) -> tuple[bool, str]:
+    """
+    Add people to a single project file.
+
+    Args:
+        project_path: Path to the project JSON file.
+        company_overview: Company overview content.
+        employee_directory: Employee directory content.
+
+    Returns:
+        (success, message) tuple.
+    """
+    # Load existing project
+    with open(project_path) as f:
+        project_data = json.load(f)
+
+    project_description = project_data.get("description", "")
+
+    # Build prompt
+    prompt = PROJECT_PEOPLE_PROMPT.format(
+        project_description=project_description,
+        company_overview=company_overview,
+        employee_directory=employee_directory,
+    )
+
+    # Get LLM response (no tools needed)
+    llm = get_llm()
+    messages: list[Message] = [Message(role="user", content=prompt)]
+
+    response = ""
+    for chunk in llm.generate(messages):
+        if isinstance(chunk, str):
+            response += chunk
+
+    # Extract and validate JSON
+    try:
+        json_str = extract_json_from_response(response)
+        validation_error = validate_project_people(json_str)
+
+        if validation_error:
+            return (False, f"Validation error: {validation_error}")
+
+        people_data = parse_project_people(json_str)
+
+        # Filter invalid people (with recovery)
+        valid_people = filter_invalid_people(
+            people_data.people,
+            project_description,
+        )
+
+        # Add people to project
+        project_data["people"] = [p.model_dump() for p in valid_people]
+
+        # Write back
+        with open(project_path, "w") as f:
+            json.dump(project_data, f, indent=2)
+
+        return (True, f"Added {len(valid_people)} people")
+
+    except Exception as e:
+        return (False, str(e))
+
+
+def populate_project_people(max_parallelization: int = 5) -> None:
+    """
+    Phase 3: Add people to projects that are missing them.
+
+    Args:
+        max_parallelization: Maximum number of parallel operations.
+    """
+    print()
+    print("=" * 40)
+    print("Phase 3: Populate Project People")
+    print("=" * 40)
+
+    # Check which projects need people
+    missing = get_projects_without_people(PROJECTS_DIR)
+
+    if not missing:
+        print("All projects already have people.")
+        return
+
+    print(f"Found {len(missing)} projects without people.")
+
+    # Load context
+    company_overview = load_file(COMPANY_OVERVIEW_PATH)
+    employee_directory = load_file(EMPLOYEE_DIRECTORY_PATH)
+
+    # Process in parallel
+    succeeded = 0
+    failed: list[tuple[str, str]] = []
+
+    with ThreadPoolExecutor(max_workers=max_parallelization) as executor:
+        futures = {
+            executor.submit(
+                add_people_to_project,
+                os.path.join(PROJECTS_DIR, filename),
+                company_overview,
+                employee_directory,
+            ): filename
+            for filename in missing
+        }
+
+        with tqdm(total=len(missing), desc="Adding people") as pbar:
+            for future in as_completed(futures):
+                filename = futures[future]
+                try:
+                    success, message = future.result()
+                    if success:
+                        succeeded += 1
+                    else:
+                        failed.append((filename, message))
+                        tqdm.write(f"[FAIL] {filename}: {message}")
+                except Exception as e:
+                    failed.append((filename, str(e)))
+                    tqdm.write(f"[FAIL] {filename}: {e}")
+                pbar.update(1)
+
+    print()
+    print(f"Complete. {succeeded} succeeded, {len(failed)} failed.")
+
+    if failed:
+        print()
+        print("Failed projects:")
+        for filename, error in failed:
+            print(f"  - {filename}: {error}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate and enrich projects based on company context."
@@ -619,6 +788,11 @@ def main() -> None:
 
     # Phase 2: Enrich projects
     enrich_projects(max_parallelization=args.max_parallelization)
+
+    # Phase 3: Populate people
+    # NOTE: This is necessary as a separate step because the step above is already quite complex
+    # and the miss rate when these were combined was too high.
+    populate_project_people(max_parallelization=args.max_parallelization)
 
 
 if __name__ == "__main__":

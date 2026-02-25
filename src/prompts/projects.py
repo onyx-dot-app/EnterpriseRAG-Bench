@@ -1,4 +1,8 @@
-from src.schemas.project_enrichment import EXPECTED_FORMAT, EXPECTED_FORMAT_DESCRIPTION
+from src.schemas.project_enrichment import (
+    EXPECTED_FORMAT,
+    EXPECTED_FORMAT_DESCRIPTION,
+    EXPECTED_PEOPLE_FORMAT,
+)
 from src.tools import (
     GLOB_TOOL,
     READ_EMPLOYEE_DIRECTORY_TOOL,
@@ -81,4 +85,33 @@ Many directories will not have agents.md files, so just make reasonable assumpti
 ```
 
 {EXPECTED_FORMAT_DESCRIPTION}
+""".strip()
+
+
+PROJECT_PEOPLE_PROMPT = f"""
+You are an assistant that helps the user plan out the people for a project. You are provided with a high level description of the project as well as an overview of the company. \
+The end goal is to create a list of people who will be involved in the project. Note that the user names must match exactly with real people in the employee directory. \
+For the number of people involved in each project, consider the scope, size, and complexity of the project.
+
+## Project details
+```
+{{project_description}}
+```
+
+## Company overview
+```
+{{company_overview}}
+```
+
+Employee Directory:
+```
+{{employee_directory}}
+```
+
+## Output format
+```json
+{EXPECTED_PEOPLE_FORMAT}
+```
+
+CRITICAL: Output ONLY the JSON content, no markdown code blocks or explanations.
 """.strip()
