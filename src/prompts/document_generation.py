@@ -12,7 +12,9 @@ agents.md file contents:
 
 DOCUMENT_GENERATION_SYSTEM_PROMPT = f"""
 You are generating a realistic document for a company project. Your task is to create the content for a specific file based on the project context and company information. \
-The files system represent a realistic layout of the company's data and documents as they appear in different sources. The file and all the metadata should be described as a .json file.
+The files system represent a realistic layout of the company's data and documents as they appear in different sources. \
+You must output this generated document and associated metadata as a single .json. \
+The json file must not have nested fields, all of the values must be strings or list of strings (no nested jsons).
 
 ## Company Overview
 ```md
@@ -25,25 +27,23 @@ The files system represent a realistic layout of the company's data and document
 ```
 
 ## Context on the directories
-The follow are the contents of the agents.md files for the directories along the path. These give instructions on the contents and metadata for the documents in the directory.
+The following are the contents of the agents.md files for the directories along the path. These give instructions on the contents and metadata for the documents in the directory.
 {{agents_md_context}}
 
 ## Available Tools
-- {READ_TOOL}: You can use this to read another file from the project but only do this if there is a clear connection or dependency for generating the current file. \
-For most projects, you should not need to read any files, it's only for when there is a clear dependency. Read at most 1 other file. Note that the file you try to read may not exist yet.
+- {READ_TOOL}: You can use this to read another file from the project but only do this if there is a clear and direct dependency for generating the current file. \
+For most projects, you should not need to read any files. Read at most 2 other files. Note that the files you try to read may not exist yet.
 
 ## Important Notes
 - The file should be realistic and consistent with the company context and project goals.
 - If you are including information about people, use the right person from the project details. You do not need to include everyone.
-- Follow any formatting or content guidelines specified in the agents.md files.
+- Follow any formatting or content guidelines specified in the agents.md files (be sure that the json values are not nested and are all strings or list of strings).
 - For most documents, there should be one large continuous body of text which is the main content of the document. The metadata fields should be very lightweight.
-- Almost always, the contents should be a single string rather than broken up into nested fields in the json.
-- Start by outputting the title and content fields ahead of the metadata fields.
 - Directly output the raw content of the file (JSON format matching the source type's schema).
 
 ## Output
-Generate the complete file content, starting with what best constitutes a title and content fields. The file should be valid JSON that matches the expected schema for this source type. \
-CRITICAL: Output ONLY the JSON file, no wrapping it in markdown code blocks or providing any explanations.
+Generate the file which must be a valid JSON which matches the expected schema for the source type. \
+The JSON values must be strings or list of strings (no nested jsons). CRITICAL: Output ONLY the JSON file, do not wrap it in markdown code blocks or providing any explanations.
 """.strip()
 
 

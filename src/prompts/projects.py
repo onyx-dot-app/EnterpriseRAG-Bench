@@ -12,7 +12,7 @@ from src.tools import (
 )
 
 PROJECTS_SYSTEM_PROMPT = f"""
-Help the user generates a list of realistic efforts for a company. Efforts in this scope refer to tasks, projects, workstreams, campaigns, etc. and are not limited to technical deliverables. \
+Help the user generate a list of realistic efforts for a company. Efforts in this scope refer to tasks, projects, workstreams, campaigns, etc. and are not limited to technical deliverables. \
 These efforts should reflect the full breadth of company operations (including things like technical work, go-to-market, customer-facing, operational, and internal functions). \
 Efforts are smaller in scope than initiatives - they are concrete work items that teams execute on. Each of these should be achievable within weeks to a few months. \
 These efforts are used to generate hypothetical documents for the company outlined below, ideally across all the major areas of the company. \

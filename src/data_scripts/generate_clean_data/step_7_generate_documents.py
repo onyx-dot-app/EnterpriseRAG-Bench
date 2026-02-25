@@ -41,6 +41,41 @@ def load_file(path: str) -> str:
     return content
 
 
+def _is_simple_value(val: object) -> bool:
+    """Check if a value is a simple string, primitive, or list of strings/primitives."""
+    if isinstance(val, (str, int, float, bool, type(None))):
+        return True
+    if isinstance(val, list):
+        return all(isinstance(item, (str, int, float, bool, type(None))) for item in val)
+    return False
+
+
+def validate_no_nested_dicts(data: dict) -> str | None:
+    """
+    Validate that a JSON dict has no nested dicts.
+
+    All values must be strings, primitives, or lists of strings/primitives.
+
+    Args:
+        data: The parsed JSON dict.
+
+    Returns:
+        None if valid, error message if nested dicts found.
+    """
+    if not isinstance(data, dict):
+        return "Top-level must be a dict"
+
+    nested_keys = []
+    for key, value in data.items():
+        if not _is_simple_value(value):
+            nested_keys.append(key)
+
+    if nested_keys:
+        return f"Nested dicts found in keys: {nested_keys}"
+
+    return None
+
+
 def _save_debug_response(
     file_path: str,
     raw_response: str,
@@ -369,6 +404,12 @@ def generate_single_file(
 
         # Validate it's valid JSON
         parsed = json.loads(json_content)
+
+        # Validate no nested dicts (values must be strings or list of strings)
+        nested_error = validate_no_nested_dicts(parsed)
+        if nested_error:
+            _save_debug_response(file_path, response, json_content)
+            return (False, f"Nested dicts: {nested_error}")
 
         # Ensure parent directory exists
         os.makedirs(os.path.dirname(full_path), exist_ok=True)

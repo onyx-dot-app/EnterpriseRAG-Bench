@@ -24,7 +24,7 @@ CRITICAL: CREATE 1 {AGENTS_MD_FILE} FILE AT A TIME AND CONFIRM WITH THE USER BEF
 
 # {AGENTS_MD_FILE} format
 Every {AGENTS_MD_FILE} file should have the following items:
-- Target number of files: an loose estimate of the number of files that might make sense for this directory (and including all the directories below it).
+- Target number of files: a loose estimate of the number of files that might make sense for this directory (and including all the directories below it).
 - Content rules: rules for the content of the files.
 - Metadata rules: rules for the metadata of the files. For example, most documents will have a title field. This will be strongly tied to the type of sources the directory represents.
 
@@ -37,8 +37,8 @@ Target number of files:
 1000
 
 Content rules:
-The documents in this directory are personal scratchpads. They tend to be less organized and less formal with ocassional phrases instead of always complete sentences.
-It is used primary by engineering team members so there may be references to code and a lot of technical details.
+The documents in this directory are personal scratchpads. They tend to be less organized and less formal with occasional phrases instead of always complete sentences.
+It is used primarily by engineering team members so there may be references to code and a lot of technical details.
 
 Metadata rules:
 All files should have a title and an author (make sure the author is a real person in the organization), 10% of them will have tags, and each has a status of draft/review/published.
