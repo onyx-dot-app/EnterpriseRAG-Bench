@@ -10,14 +10,6 @@ Content rules:
   - product management
   - design
 - Each document represents one Linear ticket.
-- Compared to Jira/Slack, Linear issues are more execution-oriented and better structured:
-  - Clear problem statement and context
-  - Goals and non-goals
-  - Scope and constraints
-  - Acceptance criteria / definition of done
-  - Implementation notes and open questions
-  - Testing plan and rollout/release plan (feature flags, canary, monitoring)
-  - Risks, dependencies, and mitigation plans
 - Comments and updates should reflect real project work:
   - Progress updates, partial decisions, trade-offs
   - Review feedback (PM/Design/Eng), approvals, and follow-up tasks
@@ -30,10 +22,6 @@ Content rules:
   - Private/VPC/on-prem deployment features (RBAC, audit logging, upgrades)
   - Console UX improvements (dashboards, rollouts, cost breakdowns)
   - Security & compliance feature work (SSO/SAML, encryption/KMS integrations)
-- Use realistic planning constructs:
-  - Projects/Initiatives group multiple issues.
-  - Cycles/sprints may be referenced for scheduling.
-  - Estimates and priorities are commonly used.
 
 Metadata rules:
 - Team directories and key prefixes:
@@ -50,7 +38,7 @@ Metadata rules:
   - updated_at (YYYY-MM-DD)
   - creator: real Redwood employee name
   - assignee: real Redwood employee name (or unassigned)
-- Optional metadata (use frequently where appropriate):
+- Optional metadata (use where appropriate):
   - project: project/initiative name
   - cycle: e.g., 2025-W07 or Cycle 41
   - estimate: integer points
@@ -58,7 +46,6 @@ Metadata rules:
   - labels: list
   - parent_issue / sub_issues: list of keys
   - dependencies: list of keys
-  - links: list of URLs/ids (GitHub PRs, Confluence pages, Drive docs, dashboards)
   - customer_impact: none | low | medium | high
   - release: e.g., runtime-1.18, console-2025.02
   - security_review_required: boolean

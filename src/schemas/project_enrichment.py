@@ -389,6 +389,11 @@ def filter_invalid_paths(
     valid_files: list[ProjectFile] = []
 
     for file in enrichment.files:
+        # Reject paths that don't end with .json
+        if not file.path.endswith(".json"):
+            print(f"  Skipping invalid path (must end with .json): {file.path}")
+            continue
+
         # Normalize the path first
         normalized_path = normalize_path(file.path)
 

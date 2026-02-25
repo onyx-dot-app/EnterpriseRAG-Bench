@@ -20,9 +20,15 @@ from src.prompts.document_generation import (
     AGENT_MD_FORMAT,
     DOCUMENT_GENERATION_SYSTEM_PROMPT,
     DOCUMENT_GENERATION_USER_PROMPT,
+    FIELD_LABELER_PROMPT,
+)
+from src.schemas.field_labels import (
+    parse_field_labels,
+    validate_field_labels,
+    validate_field_labels_against_document,
 )
 from src.tools.runner import ToolRunner
-from src.tools.tool_implementations import ReadEmployeeDirectoryTool, ReadTool
+from src.tools.tool_implementations import ReadTool
 
 
 def load_file(path: str) -> str:
@@ -179,6 +185,54 @@ def extract_json_from_response(response: str) -> str:
     return response
 
 
+def label_document_fields(document: dict) -> dict:
+    """
+    Run field labeling on a document to identify title and content fields.
+
+    Args:
+        document: The parsed document JSON.
+
+    Returns:
+        Updated document with title_field_name and content_field_names added.
+
+    Raises:
+        ValueError: If field labeling fails validation.
+    """
+    # Build the prompt
+    prompt = FIELD_LABELER_PROMPT.format(
+        json_document=json.dumps(document, indent=2),
+    )
+
+    # Get LLM response (no tools needed)
+    llm = get_llm()
+    messages: list[Message] = [Message(role="user", content=prompt)]
+
+    response = ""
+    for chunk in llm.generate(messages):
+        if isinstance(chunk, str):
+            response += chunk
+
+    # Extract and validate JSON
+    json_str = extract_json_from_response(response)
+
+    validation_error = validate_field_labels(json_str)
+    if validation_error:
+        raise ValueError(f"Field labels validation failed: {validation_error}")
+
+    field_labels = parse_field_labels(json_str)
+
+    # Validate that the field names exist in the document
+    doc_validation_error = validate_field_labels_against_document(field_labels, document)
+    if doc_validation_error:
+        raise ValueError(f"Field labels reference invalid keys: {doc_validation_error}")
+
+    # Add the field labels to the document
+    document["title_field_name"] = field_labels.title_field_name
+    document["content_field_names"] = field_labels.content_field_names
+
+    return document
+
+
 def generate_single_file(
     file_path: str,
     file_description: str,
@@ -221,17 +275,12 @@ def generate_single_file(
     # Create tools
     read_tool = ReadTool(base_dir=SOURCES_DIR)
 
-    # ReadEmployeeDirectoryTool needs its own LLM instance
-    employee_llm = get_llm()
-    employee_tool = ReadEmployeeDirectoryTool(llm=employee_llm)
-
     # Initialize LLM with tool schemas
-    llm = get_llm(tools=[read_tool.schema, employee_tool.schema])
+    llm = get_llm(tools=[read_tool.schema])
 
     # Create tool runner
     tool_runner = ToolRunner()
     tool_runner.register(read_tool)
-    tool_runner.register(employee_tool)
 
     # Initialize messages with system and user prompts
     messages: list[Message] = [
@@ -425,7 +474,7 @@ def generate_documents(
     """
     print()
     print("=" * 40)
-    print("Step 7: Generate Project Documents")
+    print("Phase 1: Generate Documents")
     print("=" * 40)
 
     # Load company overview
@@ -445,6 +494,7 @@ def generate_documents(
     # Count total and pending files across all projects
     total_files = 0
     pending_files = 0
+    existing_files: list[str] = []
     for project_file in project_files:
         try:
             project_json = load_project_json(project_file)
@@ -453,13 +503,15 @@ def generate_documents(
             for file_entry in files:
                 file_path = file_entry.get("path", "")
                 full_path = os.path.join(DATA_CLEAN_DIR, file_path)
-                if not os.path.exists(full_path):
+                if os.path.exists(full_path):
+                    existing_files.append(file_path)
+                else:
                     pending_files += 1
         except Exception:
             pass
 
     print(f"Found {len(project_files)} projects with {total_files} total files.")
-    print(f"Pending: {pending_files} files to generate, {total_files - pending_files} already exist.")
+    print(f"Pending: {pending_files} files to generate, {len(existing_files)} already exist.")
     print(f"Project parallelism: {project_parallelism}")
     print(f"File parallelism per project: {project_file_parallelism}")
     print()
@@ -533,6 +585,140 @@ def generate_documents(
     print_document_statistics()
 
 
+def get_documents_without_labels(sources_dir: str) -> list[str]:
+    """
+    Return list of document JSON files that don't have field labels.
+
+    Args:
+        sources_dir: Directory containing source documents.
+
+    Returns:
+        List of file paths (relative to DATA_CLEAN_DIR) missing field labels.
+    """
+    missing: list[str] = []
+    if not os.path.exists(sources_dir):
+        return missing
+
+    for root, _dirs, files in os.walk(sources_dir):
+        for filename in files:
+            if not filename.endswith(".json"):
+                continue
+            # Skip agents.md files
+            if filename == "agents.md":
+                continue
+
+            filepath = os.path.join(root, filename)
+            try:
+                with open(filepath) as f:
+                    data = json.load(f)
+                # Check if field labels are missing
+                if "title_field_name" not in data or "content_field_names" not in data:
+                    # Get path relative to DATA_CLEAN_DIR
+                    rel_path = os.path.relpath(filepath, DATA_CLEAN_DIR)
+                    missing.append(rel_path)
+            except (json.JSONDecodeError, OSError):
+                continue
+
+    return missing
+
+
+def label_single_document(file_path: str) -> tuple[bool, str]:
+    """
+    Add field labels to a single document file.
+
+    Args:
+        file_path: Path to the document file (relative to DATA_CLEAN_DIR).
+
+    Returns:
+        (success, message) tuple.
+    """
+    full_path = os.path.join(DATA_CLEAN_DIR, file_path)
+
+    try:
+        # Load existing document
+        with open(full_path) as f:
+            document = json.load(f)
+
+        # Skip if already labeled
+        if "title_field_name" in document and "content_field_names" in document:
+            return (True, "Skipped (already labeled)")
+
+        # Run field labeling
+        labeled_doc = label_document_fields(document)
+
+        # Write back
+        with open(full_path, "w") as f:
+            json.dump(labeled_doc, f, indent=2)
+
+        return (True, "Labeled")
+
+    except ValueError as e:
+        return (False, str(e))
+    except Exception as e:
+        return (False, f"Error: {e}")
+
+
+def label_documents(max_parallelism: int = 5) -> None:
+    """
+    Phase 2: Add field labels to documents that are missing them.
+
+    Args:
+        max_parallelism: Maximum number of parallel operations.
+    """
+    print()
+    print("=" * 40)
+    print("Phase 2: Label Document Fields")
+    print("=" * 40)
+
+    sources_dir = os.path.join(DATA_CLEAN_DIR, "sources")
+
+    # Check which documents need labeling
+    missing = get_documents_without_labels(sources_dir)
+
+    if not missing:
+        print("All documents already have field labels.")
+        return
+
+    print(f"Found {len(missing)} documents without field labels.")
+    print()
+
+    # Process in parallel
+    succeeded = 0
+    failed: list[tuple[str, str]] = []
+
+    with ThreadPoolExecutor(max_workers=max_parallelism) as executor:
+        futures = {
+            executor.submit(label_single_document, file_path): file_path
+            for file_path in missing
+        }
+
+        with tqdm(total=len(missing), desc="Labeling documents") as pbar:
+            for future in as_completed(futures):
+                file_path = futures[future]
+                try:
+                    success, message = future.result()
+                    if success:
+                        succeeded += 1
+                    else:
+                        failed.append((file_path, message))
+                        tqdm.write(f"[FAIL] {file_path}: {message}")
+                except Exception as e:
+                    failed.append((file_path, str(e)))
+                    tqdm.write(f"[FAIL] {file_path}: {e}")
+                pbar.update(1)
+
+    print()
+    print(f"Complete. {succeeded} labeled, {len(failed)} failed.")
+
+    if failed:
+        print()
+        print(f"Failed documents ({len(failed)}):")
+        for file_path, error in failed[:20]:
+            print(f"  - {file_path}: {error}")
+        if len(failed) > 20:
+            print(f"  ... and {len(failed) - 20} more errors")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate project document files based on enriched project data."
@@ -549,18 +735,29 @@ def main() -> None:
         default=1,
         help="Number of files to process in parallel within each project (default: 1)",
     )
+    parser.add_argument(
+        "--labeling-parallelism",
+        type=int,
+        default=5,
+        help="Number of documents to label in parallel (default: 5)",
+    )
     args = parser.parse_args()
 
     print("Step 7: Generate Project Documents")
     print("=" * 40)
-    print("This script generates individual document files for each project based on the project overviews created in the previous step.")
-    print("This step is autonomous and will run without user input.")
+    print("This script generates individual document files for each project and adds field labels.")
+    print("Phase 1: Generate documents based on project overviews")
+    print("Phase 2: Add title/content field labels to documents")
     print()
 
+    # Phase 1: Generate documents
     generate_documents(
         project_parallelism=args.project_parallelism,
         project_file_parallelism=args.project_file_parallelism,
     )
+
+    # Phase 2: Label documents
+    label_documents(max_parallelism=args.labeling_parallelism)
 
 
 if __name__ == "__main__":
