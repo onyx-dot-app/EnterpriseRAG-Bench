@@ -91,6 +91,7 @@ def run_auto_conversation(
     messages: list[Message],
     max_tool_cycles: int = 10,
     max_iterations: int = 30,
+    quiet: bool = False,
 ) -> str:
     """
     Run a conversation automatically without user input until completion.
@@ -101,6 +102,7 @@ def run_auto_conversation(
         messages: The conversation messages (modified in place).
         max_tool_cycles: Maximum number of tool call cycles before forcing output.
         max_iterations: Maximum total LLM calls to prevent infinite loops.
+        quiet: If True, suppress LLM status output for fallback LLM.
 
     Returns:
         The final text response from the LLM.
@@ -133,7 +135,7 @@ def run_auto_conversation(
                         ),
                     )
                 )
-                current_llm = get_llm(tools=None)
+                current_llm = get_llm(tools=None, quiet=quiet)
                 continue
 
             for tool_call in tool_calls:
@@ -185,12 +187,13 @@ def extract_json_from_response(response: str) -> str:
     return response
 
 
-def label_document_fields(document: dict) -> dict:
+def label_document_fields(document: dict, quiet: bool = False) -> dict:
     """
     Run field labeling on a document to identify title and content fields.
 
     Args:
         document: The parsed document JSON.
+        quiet: If True, suppress LLM status output.
 
     Returns:
         Updated document with title_field_name and content_field_names added.
@@ -204,7 +207,7 @@ def label_document_fields(document: dict) -> dict:
     )
 
     # Get LLM response (no tools needed)
-    llm = get_llm()
+    llm = get_llm(quiet=quiet)
     messages: list[Message] = [Message(role="user", content=prompt)]
 
     response = ""
@@ -238,6 +241,7 @@ def generate_single_file(
     file_description: str,
     project_json: dict,
     company_overview: str,
+    quiet: bool = False,
 ) -> tuple[bool, str]:
     """
     Generate a single document file.
@@ -247,6 +251,7 @@ def generate_single_file(
         file_description: Description of what the file should contain.
         project_json: The full project JSON for context.
         company_overview: Company overview content.
+        quiet: If True, suppress LLM status output.
 
     Returns:
         (success, message) tuple.
@@ -276,7 +281,7 @@ def generate_single_file(
     read_tool = ReadTool(base_dir=SOURCES_DIR)
 
     # Initialize LLM with tool schemas
-    llm = get_llm(tools=[read_tool.schema])
+    llm = get_llm(tools=[read_tool.schema], quiet=quiet)
 
     # Create tool runner
     tool_runner = ToolRunner()
@@ -290,7 +295,7 @@ def generate_single_file(
 
     try:
         # Generate the document
-        response = run_auto_conversation(llm, tool_runner, messages)
+        response = run_auto_conversation(llm, tool_runner, messages, quiet=quiet)
 
         # Extract JSON content
         json_content = extract_json_from_response(response)
@@ -318,6 +323,7 @@ def process_project_files(
     project_json: dict,
     company_overview: str,
     file_parallelism: int,
+    quiet: bool = False,
 ) -> tuple[int, int, int, list[tuple[str, str]]]:
     """
     Process all files for a single project.
@@ -327,6 +333,7 @@ def process_project_files(
         project_json: The project JSON data.
         company_overview: Company overview content.
         file_parallelism: Number of files to process in parallel.
+        quiet: If True, suppress LLM status output.
 
     Returns:
         (succeeded, skipped, failed, errors) tuple where errors is list of (path, error_msg).
@@ -364,6 +371,7 @@ def process_project_files(
                 file_description=file_desc,
                 project_json=project_json,
                 company_overview=company_overview,
+                quiet=quiet,
             )
 
             if success:
@@ -372,7 +380,7 @@ def process_project_files(
                 failed += 1
                 errors.append((file_path, message))
     else:
-        # Parallel processing within project
+        # Parallel processing within project - always use quiet mode
         with ThreadPoolExecutor(max_workers=file_parallelism) as executor:
             futures = {
                 executor.submit(
@@ -381,6 +389,7 @@ def process_project_files(
                     file_entry.get("description", ""),
                     project_json,
                     company_overview,
+                    True,  # quiet=True for parallel
                 ): file_entry.get("path", "")
                 for file_entry in pending_files
             }
@@ -405,6 +414,7 @@ def process_single_project(
     project_file: str,
     company_overview: str,
     file_parallelism: int,
+    quiet: bool = False,
 ) -> tuple[str, int, int, int, list[tuple[str, str]]]:
     """
     Process a single project (wrapper for ThreadPoolExecutor).
@@ -424,6 +434,7 @@ def process_single_project(
         project_json=project_json,
         company_overview=company_overview,
         file_parallelism=file_parallelism,
+        quiet=quiet,
     )
 
     return (project_name, succeeded, skipped, failed, errors)
@@ -526,11 +537,14 @@ def generate_documents(
     total_failed = 0
     all_errors: list[tuple[str, str, str]] = []  # (project, path, error)
 
+    # Use quiet mode when running projects or files in parallel
+    use_quiet = project_parallelism > 1 or project_file_parallelism > 1
+
     if project_parallelism <= 1:
         # Sequential project processing
         for project_file in tqdm(project_files, desc="Processing projects"):
             project_name, succeeded, skipped, failed, errors = process_single_project(
-                project_file, company_overview, project_file_parallelism
+                project_file, company_overview, project_file_parallelism, use_quiet
             )
             total_succeeded += succeeded
             total_skipped += skipped
@@ -547,6 +561,7 @@ def generate_documents(
                     project_file,
                     company_overview,
                     project_file_parallelism,
+                    True,  # quiet=True for parallel
                 ): project_file
                 for project_file in project_files
             }
@@ -622,12 +637,13 @@ def get_documents_without_labels(sources_dir: str) -> list[str]:
     return missing
 
 
-def label_single_document(file_path: str) -> tuple[bool, str]:
+def label_single_document(file_path: str, quiet: bool = False) -> tuple[bool, str]:
     """
     Add field labels to a single document file.
 
     Args:
         file_path: Path to the document file (relative to DATA_CLEAN_DIR).
+        quiet: If True, suppress LLM status output.
 
     Returns:
         (success, message) tuple.
@@ -644,7 +660,7 @@ def label_single_document(file_path: str) -> tuple[bool, str]:
             return (True, "Skipped (already labeled)")
 
         # Run field labeling
-        labeled_doc = label_document_fields(document)
+        labeled_doc = label_document_fields(document, quiet=quiet)
 
         # Write back
         with open(full_path, "w") as f:
@@ -686,9 +702,12 @@ def label_documents(max_parallelism: int = 5) -> None:
     succeeded = 0
     failed: list[tuple[str, str]] = []
 
+    # Use quiet mode when running in parallel to avoid garbled output
+    use_quiet = max_parallelism > 1
+
     with ThreadPoolExecutor(max_workers=max_parallelism) as executor:
         futures = {
-            executor.submit(label_single_document, file_path): file_path
+            executor.submit(label_single_document, file_path, use_quiet): file_path
             for file_path in missing
         }
 

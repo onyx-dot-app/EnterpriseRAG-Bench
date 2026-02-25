@@ -18,7 +18,6 @@ Content rules:
   - Security/compliance policies and evidence procedures
   - Company handbook / HR policies
   - Customer success processes, enablement, and escalation playbooks
-- Keep tone professional and internally oriented. Avoid highly speculative content.
 - Include concrete details where appropriate: service names, SLOs, thresholds, rollout steps, ownership, and links/references to related pages.
 - It’s OK to include code snippets, CLI commands, JSON/YAML examples, and diagrams described in text.
 - Avoid “meeting notes” style content here; place team notes/scratchpads in Google Drive instead.

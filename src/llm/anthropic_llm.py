@@ -30,6 +30,7 @@ class AnthropicLLM(LLMInterface):
         api_key: str | None = None,
         model: str | None = None,
         tools: list[dict] | None = None,
+        quiet: bool = False,
     ):
         """
         Initialize the Anthropic LLM.
@@ -38,6 +39,7 @@ class AnthropicLLM(LLMInterface):
             api_key: Anthropic API key. Defaults to ANTHROPIC_API_KEY env var.
             model: Model to use. Defaults to ANTHROPIC_MODEL env var or claude-sonnet-4-20250514.
             tools: List of tool schemas in OpenAI format (will be converted).
+            quiet: If True, suppress status print statements.
         """
         self.api_key = api_key or ANTHROPIC_API_KEY
         if not self.api_key:
@@ -46,6 +48,7 @@ class AnthropicLLM(LLMInterface):
             )
         self.model = model or ANTHROPIC_MODEL
         self.tools = self._convert_tools(tools) if tools else None
+        self.quiet = quiet
 
         # Use Braintrust tracing if configured
         if BRAINTRUST_API_KEY and BRAINTRUST_PROJECT:
@@ -116,7 +119,8 @@ class AnthropicLLM(LLMInterface):
         Yields:
             String chunks for text responses, or ToolCall objects at the end.
         """
-        print("Waiting on LLM...", flush=True)
+        if not self.quiet:
+            print("Waiting on LLM...", flush=True)
 
         system_message, anthropic_messages = self._build_messages(messages)
 
@@ -147,33 +151,39 @@ class AnthropicLLM(LLMInterface):
                     block = event.content_block
                     if block.type == "thinking":
                         in_thinking = True
-                        print("\n[Thinking]", flush=True)
+                        if not self.quiet:
+                            print("\n[Thinking]", flush=True)
                     elif block.type == "tool_use":
                         current_tool = {
                             "id": block.id,
                             "name": block.name,
                             "input": "",
                         }
-                        yield f"\n[Tool Call: {block.name}]\n"
+                        if not self.quiet:
+                            yield f"\n[Tool Call: {block.name}]\n"
 
                 elif event.type == "content_block_delta":
                     delta = event.delta
                     if delta.type == "thinking_delta":
                         thinking_content.append(delta.thinking)
-                        print(delta.thinking, end="", flush=True)
+                        if not self.quiet:
+                            print(delta.thinking, end="", flush=True)
                     elif delta.type == "text_delta":
                         yield delta.text
                     elif delta.type == "input_json_delta":
                         if current_tool is not None:
                             current_tool["input"] += delta.partial_json
-                        yield delta.partial_json
+                        if not self.quiet:
+                            yield delta.partial_json
 
                 elif event.type == "content_block_stop":
                     if in_thinking:
-                        print("\n[/Thinking]\n", flush=True)
+                        if not self.quiet:
+                            print("\n[/Thinking]\n", flush=True)
                         in_thinking = False
                     elif current_tool is not None:
-                        yield "\n[/Tool Call]\n"
+                        if not self.quiet:
+                            yield "\n[/Tool Call]\n"
                         tool_calls.append(ToolCall(
                             name=current_tool["name"],
                             args=json.loads(current_tool["input"]) if current_tool["input"] else {},

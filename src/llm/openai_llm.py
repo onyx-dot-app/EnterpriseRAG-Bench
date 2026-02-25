@@ -30,6 +30,7 @@ class OpenAILLM(LLMInterface):
         api_key: str | None = None,
         model: str | None = None,
         tools: list[dict] | None = None,
+        quiet: bool = False,
     ):
         """
         Initialize the OpenAI LLM.
@@ -38,6 +39,7 @@ class OpenAILLM(LLMInterface):
             api_key: OpenAI API key. Defaults to OPENAI_API_KEY env var.
             model: Model to use. Defaults to LLM_MODEL env var or gpt-4o-mini.
             tools: List of tool schemas in OpenAI format.
+            quiet: If True, suppress status print statements.
         """
         self.api_key = api_key or OPENAI_API_KEY
         if not self.api_key:
@@ -46,6 +48,7 @@ class OpenAILLM(LLMInterface):
             )
         self.model = model or LLM_MODEL
         self.tools = tools
+        self.quiet = quiet
 
         # Use Braintrust tracing if configured
         if BRAINTRUST_API_KEY and BRAINTRUST_PROJECT:
@@ -91,7 +94,8 @@ class OpenAILLM(LLMInterface):
             String chunks for text responses (prefixed for reasoning),
             or a single ToolCall at the end.
         """
-        print("Waiting on LLM...", flush=True)
+        if not self.quiet:
+            print("Waiting on LLM...", flush=True)
 
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -118,13 +122,16 @@ class OpenAILLM(LLMInterface):
             if event_type == "response.reasoning_summary_text.delta":
                 if not in_reasoning:
                     in_reasoning = True
-                    print("\n[Reasoning]", flush=True)
+                    if not self.quiet:
+                        print("\n[Reasoning]", flush=True)
                 reasoning_content.append(event.delta)
-                print(event.delta, end="", flush=True)
+                if not self.quiet:
+                    print(event.delta, end="", flush=True)
 
             elif event_type == "response.reasoning_summary_text.done":
                 if in_reasoning:
-                    print("\n[/Reasoning]\n", flush=True)
+                    if not self.quiet:
+                        print("\n[/Reasoning]\n", flush=True)
                     in_reasoning = False
 
             # Handle text output streaming
@@ -140,16 +147,19 @@ class OpenAILLM(LLMInterface):
                         "call_id": item.call_id,
                         "args": "",
                     }
-                    yield f"\n[Tool Call: {item.name}]\n"
+                    if not self.quiet:
+                        yield f"\n[Tool Call: {item.name}]\n"
 
             elif event_type == "response.function_call_arguments.delta":
                 if current_tool_call is not None:
                     current_tool_call["args"] += event.delta
-                yield event.delta
+                if not self.quiet:
+                    yield event.delta
 
             elif event_type == "response.output_item.done":
                 if current_tool_call is not None:
-                    yield "\n[/Tool Call]\n"
+                    if not self.quiet:
+                        yield "\n[/Tool Call]\n"
                     tool_calls.append(current_tool_call)
                     current_tool_call = None
 

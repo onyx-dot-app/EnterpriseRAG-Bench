@@ -148,6 +148,7 @@ def run_auto_conversation(
     messages: list[Message],
     max_tool_cycles: int = 20,
     max_iterations: int = 50,
+    quiet: bool = False,
 ) -> str:
     """
     Run a conversation automatically without user input until completion.
@@ -158,6 +159,7 @@ def run_auto_conversation(
         messages: The conversation messages (modified in place).
         max_tool_cycles: Maximum number of tool call cycles before forcing output.
         max_iterations: Maximum total LLM calls to prevent infinite loops.
+        quiet: If True, suppress LLM status output for fallback LLM.
 
     Returns:
         The final text response from the LLM.
@@ -192,7 +194,7 @@ def run_auto_conversation(
                     )
                 )
                 # Create a new LLM instance without tools to force text output
-                current_llm = get_llm(tools=None)
+                current_llm = get_llm(tools=None, quiet=quiet)
                 continue
 
             for tool_call in tool_calls:
@@ -244,6 +246,7 @@ def enrich_single_project(
     project_description: str,
     company_overview: str,
     source_list: str,
+    quiet: bool = False,
 ) -> dict:
     """
     Enrich a single project using the LLM with validation and retry.
@@ -253,6 +256,7 @@ def enrich_single_project(
         project_description: One-line description.
         company_overview: Company overview content.
         source_list: List of source directories.
+        quiet: If True, suppress LLM status output.
 
     Returns:
         Validated dict with description and files.
@@ -266,7 +270,7 @@ def enrich_single_project(
     read_tool = ReadTool(base_dir=SOURCES_DIR)
 
     # ReadEmployeeDirectoryTool needs its own LLM instance
-    employee_llm = get_llm()
+    employee_llm = get_llm(quiet=quiet)
     employee_tool = ReadEmployeeDirectoryTool(llm=employee_llm)
 
     # Build the prompt (project_description already contains header + full line)
@@ -283,7 +287,8 @@ def enrich_single_project(
             glob_tool.schema,
             read_tool.schema,
             employee_tool.schema,
-        ]
+        ],
+        quiet=quiet,
     )
 
     # Create tool runner
@@ -299,7 +304,7 @@ def enrich_single_project(
     ]
 
     # First attempt
-    response = run_auto_conversation(llm, tool_runner, messages)
+    response = run_auto_conversation(llm, tool_runner, messages, quiet=quiet)
 
     try:
         json_str = extract_json_from_response(response)
@@ -323,7 +328,7 @@ def enrich_single_project(
     )
     messages.append(Message(role="user", content=retry_prompt))
 
-    response = run_auto_conversation(llm, tool_runner, messages)
+    response = run_auto_conversation(llm, tool_runner, messages, quiet=quiet)
 
     try:
         json_str = extract_json_from_response(response)
@@ -347,6 +352,7 @@ def process_single_project(
     company_overview: str,
     source_list: str,
     output_dir: str,
+    quiet: bool = False,
 ) -> tuple[str, bool, str]:
     """
     Process a single project (for use with ThreadPoolExecutor).
@@ -368,6 +374,7 @@ def process_single_project(
             project_description=description,
             company_overview=company_overview,
             source_list=source_list,
+            quiet=quiet,
         )
 
         # Ensure output directory exists
@@ -485,6 +492,9 @@ def enrich_projects(max_parallelization: int = 5) -> None:
     succeeded = 0
     failed_projects: list[tuple[str, str]] = []  # (name, error_message)
 
+    # Use quiet mode when running in parallel to avoid garbled output
+    use_quiet = max_parallelization > 1
+
     with ThreadPoolExecutor(max_workers=max_parallelization) as executor:
         futures = {
             executor.submit(
@@ -493,6 +503,7 @@ def enrich_projects(max_parallelization: int = 5) -> None:
                 company_overview,
                 source_list,
                 PROJECTS_DIR,
+                use_quiet,
             ): project[0]
             for project in pending
         }
@@ -622,6 +633,7 @@ def add_people_to_project(
     project_path: str,
     company_overview: str,
     employee_directory: str,
+    quiet: bool = False,
 ) -> tuple[bool, str]:
     """
     Add people to a single project file.
@@ -630,6 +642,7 @@ def add_people_to_project(
         project_path: Path to the project JSON file.
         company_overview: Company overview content.
         employee_directory: Employee directory content.
+        quiet: If True, suppress LLM status output.
 
     Returns:
         (success, message) tuple.
@@ -648,7 +661,7 @@ def add_people_to_project(
     )
 
     # Get LLM response (no tools needed)
-    llm = get_llm()
+    llm = get_llm(quiet=quiet)
     messages: list[Message] = [Message(role="user", content=prompt)]
 
     response = ""
@@ -714,6 +727,9 @@ def populate_project_people(max_parallelization: int = 5) -> None:
     succeeded = 0
     failed: list[tuple[str, str]] = []
 
+    # Use quiet mode when running in parallel to avoid garbled output
+    use_quiet = max_parallelization > 1
+
     with ThreadPoolExecutor(max_workers=max_parallelization) as executor:
         futures = {
             executor.submit(
@@ -721,6 +737,7 @@ def populate_project_people(max_parallelization: int = 5) -> None:
                 os.path.join(PROJECTS_DIR, filename),
                 company_overview,
                 employee_directory,
+                use_quiet,
             ): filename
             for filename in missing
         }

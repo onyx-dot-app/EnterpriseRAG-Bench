@@ -6,12 +6,13 @@ from src.llm.interface import LLMInterface
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai")
 
 
-def get_llm(tools: list[dict] | None = None) -> LLMInterface:
+def get_llm(tools: list[dict] | None = None, quiet: bool = False) -> LLMInterface:
     """
     Get the default LLM based on LLM_PROVIDER environment variable.
 
     Args:
         tools: List of tool schemas in OpenAI format.
+        quiet: If True, suppress status print statements (useful for parallel calls).
 
     Returns:
         An LLM instance configured based on environment variables.
@@ -23,10 +24,10 @@ def get_llm(tools: list[dict] | None = None) -> LLMInterface:
 
     if provider == "openai":
         from src.llm.openai_llm import OpenAILLM
-        return OpenAILLM(tools=tools)
+        return OpenAILLM(tools=tools, quiet=quiet)
     elif provider == "anthropic":
         from src.llm.anthropic_llm import AnthropicLLM
-        return AnthropicLLM(tools=tools)
+        return AnthropicLLM(tools=tools, quiet=quiet)
     else:
         raise ValueError(
             f"Unsupported LLM provider: {provider}. "
