@@ -13,6 +13,7 @@ from src.paths import (
     AGENTS_MD_FILE,
     COMPANY_OVERVIEW_PATH,
     DATA_CLEAN_DIR,
+    DEBUG_DIR,
     PROJECTS_DIR,
     SOURCES_DIR,
 )
@@ -38,6 +39,35 @@ def load_file(path: str) -> str:
     if not content.strip():
         raise ValueError(f"File at {path} is empty")
     return content
+
+
+def _save_debug_response(
+    file_path: str,
+    raw_response: str,
+    extracted_json: str | None = None,
+) -> None:
+    """
+    Save a failed response to the debug directory for inspection.
+
+    Args:
+        file_path: Original file path (e.g., "sources/slack/devex/thread.json")
+        raw_response: The raw LLM response
+        extracted_json: The extracted JSON string (if extraction succeeded)
+    """
+    # Ensure debug directory exists
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+
+    # Use just the filename without the path
+    filename = os.path.basename(file_path)
+    # Change extension to .txt for the debug file
+    debug_filename = os.path.splitext(filename)[0] + "_debug.txt"
+    debug_path = os.path.join(DEBUG_DIR, debug_filename)
+
+    with open(debug_path, "w") as f:
+        f.write(f"=== Original file path ===\n{file_path}\n\n")
+        f.write(f"=== Raw LLM response ===\n{raw_response}\n\n")
+        if extracted_json is not None:
+            f.write(f"=== Extracted JSON (before parsing) ===\n{extracted_json}\n")
 
 
 def load_project_json(path: str) -> dict:
@@ -158,7 +188,12 @@ def run_auto_conversation(
 
 def extract_json_from_response(response: str) -> str:
     """
-    Extract JSON from LLM response, handling markdown code blocks.
+    Extract JSON from LLM response by finding the outermost JSON structure.
+
+    Tries multiple strategies:
+    1. Find first '{' or '[' and match with last '}' or ']'
+    2. Fallback: Look for JSON in markdown code blocks
+    3. Fallback: Use regex to find JSON object/array
 
     Args:
         response: The LLM response text.
@@ -170,16 +205,45 @@ def extract_json_from_response(response: str) -> str:
 
     response = response.strip()
 
-    # Try to find JSON in a code block first
+    # Strategy 1: Find outermost JSON structure
+    first_brace = response.find("{")
+    first_bracket = response.find("[")
+
+    if first_brace != -1 or first_bracket != -1:
+        if first_brace == -1:
+            start = first_bracket
+            close_char = "]"
+        elif first_bracket == -1:
+            start = first_brace
+            close_char = "}"
+        elif first_brace < first_bracket:
+            start = first_brace
+            close_char = "}"
+        else:
+            start = first_bracket
+            close_char = "]"
+
+        last_close = response.rfind(close_char)
+        if last_close != -1 and last_close >= start:
+            candidate = response[start:last_close + 1]
+            # Validate it's parseable JSON before returning
+            try:
+                json.loads(candidate)
+                return candidate
+            except json.JSONDecodeError:
+                pass  # Fall through to backup strategies
+
+    # Strategy 2 (fallback): Try to find JSON in a markdown code block
     json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", response)
     if json_match:
-        return json_match.group(1).strip()
+        candidate = json_match.group(1).strip()
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            pass
 
-    # If response starts with { or [, assume it's raw JSON
-    if response.startswith("{") or response.startswith("["):
-        return response
-
-    # Try to find a JSON object or array in the response
+    # Strategy 3 (fallback): Regex for JSON object or array
     json_match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", response)
     if json_match:
         return json_match.group(1)
@@ -293,6 +357,9 @@ def generate_single_file(
         Message(role="user", content=user_prompt),
     ]
 
+    response = ""
+    json_content: str | None = None
+
     try:
         # Generate the document
         response = run_auto_conversation(llm, tool_runner, messages, quiet=quiet)
@@ -313,8 +380,13 @@ def generate_single_file(
         return (True, "Created")
 
     except json.JSONDecodeError as e:
+        # Save failed response to debug directory
+        _save_debug_response(file_path, response, json_content)
         return (False, f"Invalid JSON: {e}")
     except Exception as e:
+        # Save failed response for other errors too if we have a response
+        if response:
+            _save_debug_response(file_path, response, json_content)
         return (False, f"Error: {e}")
 
 

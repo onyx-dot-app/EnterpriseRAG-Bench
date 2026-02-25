@@ -12,6 +12,7 @@ Content rules:
   - Other repositories exist (SDKs, docs, tooling), but together they represent a minority of PRs.
 - PR content should look like realistic GitHub PR pages:
   - Title and description (often includes checklists and links)
+  - The description should be a single continuous string even when there are sections
   - A list/summary of commits (can be high-level)
   - Changed areas/files listed at a high level (do not generate huge diffs; include small illustrative snippets only when useful)
   - Review conversation: reviewer comments, author replies, requested changes, approvals
@@ -20,7 +21,6 @@ Content rules:
 - PR writing norms:
   - Engineering tone: concise, technical, action-oriented.
   - Include context and motivation, especially for non-trivial changes.
-  - Common PR sections: “What”, “Why”, “How”, “Testing”, “Rollout/Backwards compatibility”, “Screenshots” (console/UI).
   - Reference related work items (Linear is primary for project management; Jira keys may appear for support/escalations).
 - Typical PR themes at Redwood:
   - Serving runtime performance improvements (batching, KV cache, scheduling)

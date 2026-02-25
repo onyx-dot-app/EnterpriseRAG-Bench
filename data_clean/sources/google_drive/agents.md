@@ -7,6 +7,7 @@ Target number of files:
 Content rules:
 - Google Drive is Redwood Inference’s working-area for team-specific documents and in-progress thinking.
 - This directory should contain a mix of formal and informal documents, with informal/working docs being the majority.
+- Most documents are doc/docx type files with a large majority of just text without too much formatting.
 - Common doc types include:
   - Team notes and internal memos (weekly updates, project notes, planning)
   - Brainstorms, outlines, and rough drafts of specs/PRDs

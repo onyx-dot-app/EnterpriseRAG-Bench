@@ -36,11 +36,14 @@ For most projects, you should not need to read any files, it's only for when the
 - The file should be realistic and consistent with the company context and project goals.
 - If you are including information about people, use the right person from the project details. You do not need to include everyone.
 - Follow any formatting or content guidelines specified in the agents.md files.
-- The output should be the raw content of the file (JSON format matching the source type's schema).
+- For most documents, there should be one large continuous body of text which is the main content of the document. The metadata fields should be very lightweight.
+- Almost always, the contents should be a single string rather than broken up into nested fields in the json.
+- Start by outputting the title and content fields ahead of the metadata fields.
+- Directly output the raw content of the file (JSON format matching the source type's schema).
 
 ## Output
-Generate the complete file content. The content should be valid JSON that matches the expected schema for this source type. \
-CRITICAL: Output ONLY the JSON content, no markdown code blocks or explanations.
+Generate the complete file content, starting with what best constitutes a title and content fields. The file should be valid JSON that matches the expected schema for this source type. \
+CRITICAL: Output ONLY the JSON file, no wrapping it in markdown code blocks or providing any explanations.
 """.strip()
 
 

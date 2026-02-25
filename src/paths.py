@@ -13,3 +13,5 @@ SOURCE_TREE_PATH = f"{DATA_CLEAN_DIR}/source_tree.txt"
 
 PROJECTS_DIR = f"{DATA_CLEAN_DIR}/projects"
 PROJECT_LIST_PATH = f"{DATA_CLEAN_DIR}/project_list.txt"
+
+DEBUG_DIR = f"{DATA_CLEAN_DIR}/debug"

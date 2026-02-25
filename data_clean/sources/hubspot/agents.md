@@ -7,6 +7,7 @@ Target number of files:
 Content rules:
 - This directory represents HubSpot CRM data, but modeled as a single record type:
   - Each document corresponds to one Company (account) record.
+  - The most interesting parts are the user provided notes.
 - Company records should be CRM-like and structured rather than long narrative documents.
 - Each company record should typically include:
   - Basic firmographics: company name, domain, industry, size band, HQ region, and notes about deployment constraints (cloud/VPC/on-prem).
