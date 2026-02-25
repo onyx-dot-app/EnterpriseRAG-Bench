@@ -1,0 +1,52 @@
+{
+  "key": "ENG-2747",
+  "team": "engineering",
+  "title": "Perf-canary integration for provisioning readiness (minimal throughput/latency gate before Ready)",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-02-20",
+  "updated_at": "2025-03-14",
+  "creator": "Vanessa Ortiz",
+  "assignee": "Rina Kobayashi",
+  "project": "Provision-to-ready automation sprint",
+  "cycle": "2025-W09",
+  "estimate": "8",
+  "due_date": "2025-03-08",
+  "labels": [
+    "dedicated",
+    "fleet",
+    "provisioning",
+    "readiness",
+    "perf-canary",
+    "gating",
+    "automation"
+  ],
+  "dependencies": [
+    "ENG-2742",
+    "ENG-2746",
+    "ENG-2759"
+  ],
+  "customer_impact": "medium",
+  "release": "control-plane-2025.03",
+  "security_review_required": "false",
+  "description": "Context\n- We\u2019re adding automated readiness gates to the Dedicated provision-to-ready pipeline. Smoke tests + health checks catch obvious failures, but we still have cases where a pool \u201clooks healthy\u201d yet has materially worse throughput/latency (driver mismatch, wrong runtime chart values, MIG config drift, kernel params, etc.).\n- This issue integrates perf-canary as the final step of Validating: run a lightweight benchmark (\u201creadiness suite\u201d) against the newly bootstrapped pool before transitioning to Ready.\n\nGoal\n- Gate Ready on a minimal performance signal that:\n  1) confirms the dataplane can serve tokens end-to-end\n  2) catches obvious perf regressions (misconfig, wrong image/runtime, missing optimizations)\n  3) is fast enough to keep time-to-ready targets\n\nScope\n- Add a new provisioning validation sub-step: perf-canary readiness suite.\n- Implement orchestration in fleet-provisioner/control plane to schedule the run, fetch results, and write pass/fail + summary to the provisioning run record.\n- Define default thresholds + per-SKU overrides, with conservative initial values and a plan to tighten post-pilot.\n- Emit stage events/metrics for canary duration and outcome.\n\nNon-goals\n- Full benchmark coverage (long-run soak, multiple models, or quality evals).\n- Runtime-level optimization work.\n\nProposed behavior\n- When a run reaches stage=Validating, fleet-provisioner triggers perf-canary readiness mode:\n  - launched as a Kubernetes Job inside the new pool cluster (so we validate intra-cluster networking + service discovery)\n  - hits the pool\u2019s inference endpoint using internal DNS/service VIP (same path used by routing, minus global routing advertisement)\n  - uses a fixed small prompt set and concurrency meant to approximate \u201cis it basically working and not wildly slow\u201d\n  - writes results JSON to object storage + posts a compact summary back to control plane\n\nBenchmark spec (initial)\n- Suite: perf-canary \u201creadiness\u201d mode (see perf-canary PR-287).\n- Model:\n  - Default: the pool\u2019s configured default model (if already pulled/available), else fallback to a pinned lightweight verification model.\n  - For pilot we will prefer the pool default (to detect mismatched runtime flags for that arch).\n- Traffic shape (defaults):\n  - Warmup: 60s\n  - Measure: 120s\n  - Concurrency: 4 (tunable per SKU)\n  - Prompt mix: small fixed set; output tokens capped (to reduce runtime)\n- Output: JSON summary with at least:\n  - pass/fail\n  - throughput tokens/sec\n  - p50/p95 TTFT (time-to-first-token)\n  - p50/p95 inter-token latency\n  - error rate and top error (if any)\n  - metadata: sku/region, runtime version, chart version, image version\n\nThresholds (initial, conservative)\n- Pass if ALL are true:\n  - error_rate <= 0.5%\n  - p95_ttft_ms <= sku_default.p95_ttft_ms\n  - tokens_per_sec >= sku_default.min_tps\n- Threshold source of truth:\n  - ship defaults keyed by sku class (e.g., A100-80GB, H100-80GB, L40S) + model family (where needed)\n  - allow pool config override (validated via schema) for:\n    - min_tps\n    - p95_ttft_ms\n    - max_duration_minutes\n  - overrides must be recorded in audit trail; break-glass overrides handled by separate control (ENG-2751), not this ticket.\n\nState machine + gating semantics\n- perf-canary is a hard gate for Ready.\n- If perf-canary fails:\n  - provisioning run moves to Failed (or stays in Validating with terminal failure reason), with a structured error code and the canary summary attached.\n  - capacity must not be advertised to routing.\n- Retry semantics:\n  - \u201ctransient\u201d failures (Job scheduling, image pull, canary infra) should be retried with bounded backoff.\n  - \u201cperformance threshold\u201d failures should not auto-retry more than once (to avoid burning time); require operator intervention or explicit re-run.\n\nImplementation plan\n1) Orchestration\n- Add control-plane/fleet-provisioner action: TriggerPerfCanary(run_id, pool_id, config)\n- Create K8s Job spec template with:\n  - perf-canary container image tag pinned\n  - env vars for endpoint URL, auth token (scoped), suite params\n  - resource requests/limits appropriate to avoid starving the node\n  - timeoutSecondsAfterFinished set for cleanup\n\n2) Result ingestion\n- perf-canary readiness suite writes:\n  - /outputs/summary.json (required)\n  - /outputs/raw.json (optional)\n- Job uploads summary.json to object storage; posts a callback to control plane with location + checksum.\n- Control plane persists:\n  - canary_status: PASS/FAIL/ERROR\n  - canary_summary_url\n  - canary_metrics: flattened key/value fields in provisioning run record (for dashboards)\n\n3) Metrics/Events\n- Emit:\n  - provisioning_stage_duration{stage=\"perf_canary\"}\n  - perf_canary_outcome{outcome, sku, region, model}\n  - perf_canary_latency_ms (p50/p95)\n  - perf_canary_tps\n- Ensure cardinality safeguards (pool_id as exemplar/correlation only).\n\n4) Operator UX\n- CLI prints:\n  - perf-canary outcome\n  - reason (threshold breached or infra error)\n  - link to summary.json and dashboard panel\n- Re-run support via CLI stage rerun (ENG-2750 / ENG-2747 integration): allow rerun of perf-canary only if stage>=Validating.\n\nAcceptance criteria\n- A provisioning run cannot transition to Ready unless perf-canary outcome=PASS.\n- perf-canary completes within 5 minutes (p95) on pilot SKUs under normal conditions.\n- On failure, operators can see:\n  - which metric breached\n  - canary summary link\n  - recommended runbook next step (e.g., check runtime chart versions, node driver, GPU health)\n- Metrics are available for dashboarding (time-to-ready breakdown includes perf-canary).\n\nTesting plan\n- Unit: parse/validate canary summary JSON; threshold comparison logic; error classification.\n- Integration (staging):\n  - success path on internal staging pool\n  - forced failure by setting min_tps absurdly high\n  - infra failure by blocking Job from scheduling (taints) and confirming retry behavior\n- Regression: ensure routing integration only consumes Ready (ENG-2759).\n\nRollout notes\n- Behind provisioning pipeline feature flag in staging first.\n- Start with conservative thresholds and log-only comparison for 2-3 runs (but still require PASS; thresholds set low enough to not block normal pools).\n- Tighten thresholds after baseline collection (tracked in follow-up).\n\nLinks\n- GitHub: perf-canary PR-287 (readiness suite mode)\n- Related control-plane work: PR-48234 (Ready gating in routing), PR-48245 (fix race: Ready set before perf-canary completion)\n- Related Linear: ENG-2746 (readiness gates), ENG-2748 (stage timing metrics/events)\n\nOpen questions (resolved)\n- Q: Should Validating capacity be usable for customer traffic? A: No; routing only uses Ready.\n- Q: Per-SKU thresholds or global? A: Per-SKU defaults with optional per-pool override (schema-validated).",
+  "comments": [
+    "2025-02-21 (Rina Kobayashi): Sync with Rafael/Aisha: we want this to be a hard gate, but keep the suite <=5m p95. I\u2019ll start with warmup=60s measure=120s, concurrency=4 and adjust after first staging run.",
+    "2025-02-24 (Ethan Park): Please make sure we don\u2019t mark Ready until canary callback is persisted. We had an earlier incident where Validating completed on smoke tests and routing picked up capacity too early; gate needs to be transactional with state machine.",
+    "2025-02-27 (Rina Kobayashi): Implemented Job launcher + result parser in fleet-provisioner. Added error classification: THRESHOLD_BREACH vs JOB_FAILED vs TIMEOUT. Need help from Logan/Caleb to confirm metric names align with time-to-ready dashboard spec.",
+    "2025-03-01 (Rafael Mendes): First staging run failed with DNS misconfig; canary caught it (couldn\u2019t resolve service endpoint) which is good. Confirmed it surfaces as JOB_FAILED with actionable message + link to runbook section. Retried after fixing CoreDNS and it passed.",
+    "2025-03-05 (Vanessa Ortiz): We should store the canary summary in the provisioning run record (URL + a few fields) so CS can reference \u201cvalidated\u201d in customer comms. Please include runtime/image/chart versions in summary if perf-canary can output it.",
+    "2025-03-07 (Rina Kobayashi): perf-canary readiness suite updated to include runtime/chart/image metadata in summary. Control plane stores flattened fields for dashboard filters. Added CLI output: shows breached metric and threshold values.",
+    "2025-03-10 (Miles Thornton): Multi-region note: allow a slightly higher TTFT threshold in eu-west due to cross-AZ LB variance during canary? Rina: we\u2019re running in-cluster to avoid cross-region/LB noise; TTFT threshold is keyed by sku, not region, but we can add region overrides later if needed.",
+    "2025-03-13 (Rina Kobayashi): Addressed race where state machine could set Ready on Validating completion while canary callback was still in-flight. Fix merged as part of gating changes (see PR-48245 reference in parent issue).",
+    "2025-03-14 (Vanessa Ortiz): Marking Done. Follow-up created to tighten thresholds after we collect 10+ successful runs per SKU and to add region override support if needed."
+  ],
+  "sub_issues": [
+    "ENG-2748"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ]
+}

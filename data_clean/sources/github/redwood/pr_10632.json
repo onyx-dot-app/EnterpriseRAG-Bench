@@ -1,0 +1,42 @@
+{
+  "repo": "redwood",
+  "pr_number": "10632",
+  "title": "Scheduler instrumentation: export queue wait time histograms split by quant mode + phase",
+  "author": "Julian Moore",
+  "created_at": "2025-10-07",
+  "updated_at": "2025-10-10",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/scheduler-queue-wait-quant-histograms",
+  "merged_at": "2025-10-10",
+  "reviewers": [
+    "Sofia Ivanova",
+    "Marcus Reed",
+    "Allison Grant",
+    "Sean Gallagher"
+  ],
+  "labels": [
+    "runtime",
+    "scheduler",
+    "observability",
+    "perf",
+    "quantization"
+  ],
+  "linked_linear": [
+    "ENG-24810",
+    "ENG-24816",
+    "ENG-24817"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "428",
+  "deletions": "67",
+  "body": "## Summary\nAdds scheduler-level instrumentation to measure time spent waiting in internal queues before execution, exported as Prometheus histograms and tagged by:\n- quant_mode: fp16|fp8|int8|mixed|unknown\n- phase: prefill|decode\n- gpu_sku (coarse): a100|h100|h200|l40s|unknown\n\nThis is intended to make quant regressions diagnosable when p95 latency shifts are driven by scheduler behavior (prefill/decode interleaving, batch caps) rather than kernel time.\n\n## Motivation\nDuring the FP8/INT8 benchmarking sprint we saw cases where end-to-end TTFT/TPOT deltas were not explained by kernel timelines alone. We need a first-class metric for queueing delay attributable to the scheduler so we can correlate:\n- quant mode selection + kernel path\n- request phase (prefill vs decode)\n- tail latency changes under mixed prompt length distributions\n\nThis PR focuses specifically on queue wait time histograms split by quant mode and phase, plus lightweight counters for dropped/ignored samples.\n\n## Design notes\n- We measure queue wait as: `now - enqueue_ts` at the moment a work item is dequeued for execution.\n- Phase derivation:\n  - prefill: first-pass prompt processing (input tokens > 0 and sequence state not yet in decode)\n  - decode: generation steps after prefill\n- Quant mode derivation:\n  - read from the runtime execution plan on the request context if available\n  - fallback to `unknown` if the plan is absent (should be rare; expected mainly for legacy paths)\n  - `mixed` is used when a request is served with a mixed quant plan (e.g. partial fallback) and we can detect it\n- Cardinality control:\n  - No model name label.\n  - No kernel-id label.\n  - GPU SKU label is bucketed to a short enum.\n  - Request route is intentionally not labeled here; dashboard-level join is done via logs/traces if needed.\n\n## Metrics added\nPrometheus:\n- `runtime_scheduler_queue_wait_seconds_bucket{phase,quant_mode,gpu_sku}`\n- `runtime_scheduler_queue_wait_seconds_sum{phase,quant_mode,gpu_sku}`\n- `runtime_scheduler_queue_wait_seconds_count{phase,quant_mode,gpu_sku}`\n- `runtime_scheduler_queue_wait_samples_total{phase,quant_mode,gpu_sku}` (counter)\n- `runtime_scheduler_queue_wait_samples_dropped_total{reason}` (counter)\n\nBuckets (seconds): 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0\n\n## Implementation details\n- Instrumentation is behind a config gate and sampled to reduce overhead:\n  - `RUNTIME_SCHED_METRICS_QUEUE_WAIT=1` enables\n  - `RUNTIME_SCHED_METRICS_QUEUE_WAIT_SAMPLE_RATE` default 0.05\n- Uses monotonic clock for timestamps to avoid issues with NTP adjustments.\n- Work item enqueue/dequeue paths were refactored slightly to ensure the enqueue timestamp is always set.\n- Adds unit tests for phase/quant label derivation and histogram bucket mapping.\n\n## Changed areas / files\n- `runtime/scheduler/queue.h` / `runtime/scheduler/queue.cc`: track enqueue timestamps; export wait time at dequeue\n- `runtime/scheduler/phase_classifier.{h,cc}`: consistent prefill/decode determination for instrumentation and logs\n- `runtime/observability/metrics_registry.{h,cc}`: register new histogram + counters\n- `runtime/config/runtime_flags.cc`: add flags + defaults\n- `runtime/scheduler/tests/queue_metrics_test.cc`: unit tests\n- `docs/observability/metrics.md`: metric definitions + examples\n\nIllustrative snippet (registration):\n`runtime_scheduler_queue_wait_seconds = histogram(\"runtime_scheduler_queue_wait_seconds\", labels={\"phase\",\"quant_mode\",\"gpu_sku\"}, buckets=kQueueWaitBucketsSeconds)`\n\n## Validation\n- Local: verified metric emission on synthetic load (prefill-heavy + decode-heavy), confirmed phase and quant labels match expected.\n- Perf-lab quick pass: ran a 10-min canary scenario; instrumentation overhead within noise at 5% sampling (CPU +0.2% on scheduler threads, no measurable GPU impact).\n\n## Rollout\n- Ship gated OFF by default.\n- Perf-canary jobs can enable via env var for targeted runs.\n- Follow-up PR (observability-pack) will add dashboard panels using this histogram (already coordinated with Allison).\n\n## Notes for dashboards\nRecommended panels:\n- p95 queue wait by phase+quant_mode (stacked)\n- queue wait p95 vs TTFT/TPOT overlays\n- fraction of time in queue (queue_wait / total_phase_time) as a derived query\n\n## Linked work\n- ENG-24816 (scheduler policy experiment matrix)\n- ENG-24817 (integrate quant benchmarks into perf-canary)\n\n---\n\n### Review conversation (highlights)\n**Sofia Ivanova:** Can we confirm queue wait includes time spent in backpressure throttling? We should be explicit.\n\n**Julian Moore (author):** Yes \u2014 this measures time from enqueue into the scheduler work queue until dequeue. If a work item is withheld before enqueue (e.g. admission control), it won\u2019t be counted. Added a doc line clarifying what is and isn\u2019t included.\n\n**Marcus Reed:** Histogram labels look okay, but I\u2019m worried about cardinality with gpu_sku. Can we avoid per-device IDs?\n\n**Julian Moore:** Agreed. It\u2019s a coarse enum (a100/h100/h200/l40s/unknown). No node IDs. Updated code to bucket from capability table; removed accidental `gpu_model_string` usage.\n\n**Allison Grant:** Please add an example PromQL snippet to metrics doc + ensure metric naming matches our conventions.\n\n**Julian Moore:** Added to `docs/observability/metrics.md`:\n- `histogram_quantile(0.95, sum by (le, phase, quant_mode) (rate(runtime_scheduler_queue_wait_seconds_bucket[5m])))`\n\n**Sean Gallagher:** Any risk of lock contention on hot path? Queue dequeue is extremely hot under load.\n\n**Julian Moore:** Metrics update is under sampling gate + uses thread-local fast path; no extra locks in dequeue except existing queue lock. Added a microbench and included results in PR notes.\n\n### CI\nChecks:\n- build (linux/x86_64): pass\n- unit-tests: pass\n- runtime-scheduler-tests: pass\n- lint/format: pass\n\n### Merge\nSquash merged to `main`.\nSquash commit message: \"Scheduler: add queue wait histograms tagged by quant mode + phase\"",
+  "release_notes": "Internal: Added optional scheduler queue-wait histograms split by quant mode and phase (prefill/decode) to support FP8/INT8 perf attribution.",
+  "breaking_change": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ]
+}

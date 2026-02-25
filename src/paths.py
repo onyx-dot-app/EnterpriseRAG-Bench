@@ -15,3 +15,4 @@ PROJECTS_DIR = f"{DATA_CLEAN_DIR}/projects"
 PROJECT_LIST_PATH = f"{DATA_CLEAN_DIR}/project_list.txt"
 
 DEBUG_DIR = f"{DATA_CLEAN_DIR}/debug"
+AGGREGATE_STATISTICS_PATH = f"{DATA_CLEAN_DIR}/aggregate_statistics.txt"

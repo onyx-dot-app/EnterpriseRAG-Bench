@@ -1,0 +1,45 @@
+{
+  "repo": "redwood",
+  "pr_number": "8468",
+  "title": "runtime/scheduler: fix priority inversion where short requests can block behind long prefill batch",
+  "author": "Marcus Reed",
+  "created_at": "2024-11-14",
+  "updated_at": "2024-11-16",
+  "merged_at": "2024-11-16",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "hotfix/scheduler-priority-inversion-prefill",
+  "reviewers": [
+    "Sofia Ivanova",
+    "Lena Fischer",
+    "Omar El-Sayed",
+    "Julian Moore",
+    "Hiro Tanaka"
+  ],
+  "labels": [
+    "runtime",
+    "scheduler",
+    "perf",
+    "bug",
+    "p95",
+    "hotfix"
+  ],
+  "linked_linear": [
+    "ENG-4823",
+    "ENG-4824",
+    "ENG-4827",
+    "ENG-4831"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "9",
+  "additions": "312",
+  "deletions": "98",
+  "breaking_change": "false",
+  "release_notes": "Fixes a scheduler priority inversion bug in the mixed-workload prototype where short/interactive requests could be delayed behind a long prefill batch under specific arrival patterns; adds regression coverage.",
+  "description": "## Summary\nFixes a priority inversion observed during mixed-workload load testing: short/interactive requests were occasionally blocked behind a long prefill batch even with the short/long two-queue policy enabled.\n\nThe root cause was that the scheduler could commit to a long-prefill dispatch (batch construction + \u201cinflight prefill\u201d reservation) and then skip re-checking the short queue until the long prefill completed. Under a burst pattern (one long prompt enters, then a burst of short prompts arrives), the short queue would build up but would not be serviced until after the prefill kernel finished, producing a p95 regression.\n\nThis PR makes prefill dispatch \"interruptible\" at the scheduler level: we add a yield point between selecting a long-prefill candidate and committing resources, and we cap the long-prefill commit window so short work can preempt at the next dispatch tick.\n\nAdds a deterministic regression test that reproduces the inversion and asserts an upper bound on short-queue wait time when long-prefill work is present.\n\n## Context\n- Found in a load test while validating ENG-4823 (two-queue policy) + ENG-4827 (backpressure by class).\n- Symptom: short requests arriving after a long-prefill selection would wait ~1x long prefill duration (hundreds of ms to seconds depending on context length) before first token.\n- This was *not* kernel-side starvation; it\u2019s scheduler decision ordering + reservation behavior.\n\n## What changed\n1) Scheduler dispatch order / reservation fix\n- Split \"select\" vs \"commit\" for long-prefill dispatch.\n- Before committing a long-prefill batch, re-check short queue depth and any ready short work.\n- Add `max_long_prefill_commit_ms` (config/flag-scoped) to ensure we don\u2019t hold onto long-prefill intent across multiple ticks.\n- Ensure that when short queue becomes non-empty, the next dispatch tick can immediately pick from short queue even if a long-prefill batch was previously selected but not yet committed.\n\n2) Regression test\n- Adds `SchedulerPriorityInversionTest.ShortBurstAfterLongPrefill` using the simulation harness.\n- Scenario:\n  - t=0: enqueue one long request (prefill-heavy)\n  - t=+2ms: enqueue N short requests\n  - scheduler tick interval ~1ms\n- Assertion: worst-case short request wait does not exceed fairness window + small constant; and at least one short request is dispatched before the long prefill completes.\n\n3) Lightweight metrics/trace improvement (test-only visibility)\n- Adds a trace annotation for \"rechecked_short_queue_before_commit\" (guarded by debug build / sampled) to help confirm behavior during canary.\n\n## Implementation notes\nThe key change is that `maybeDispatchLongPrefill()` no longer unconditionally reserves the prefill lane and returns; it now performs:\n\n- select candidate batch (no reservations)\n- yield / re-check short queue and starvation guardrails\n- commit (reserve lane + enqueue work to executor)\n\nIllustrative snippet (simplified):\n\n```cpp\nauto long_candidate = selectLongPrefillCandidate();\nif (long_candidate) {\n  // yield point to avoid priority inversion\n  if (short_queue_.hasReady() && shouldPreferShortNow()) {\n    return dispatchShort();\n  }\n\n  if (now_ms() - long_candidate->selected_at_ms > max_long_prefill_commit_ms_) {\n    // stale selection; reselect next tick\n    return;\n  }\n\n  commitLongPrefill(*long_candidate);\n  return;\n}\n```\n\n## Files / areas touched\n- `runtime/scheduler/mixed_workload_dispatch.cc` (select/commit split, yield point)\n- `runtime/scheduler/mixed_workload_dispatch.h` (new helper + config)\n- `runtime/config/runtime_flags.yaml` (adds `max_long_prefill_commit_ms` under scheduler prototype flag)\n- `runtime/tests/scheduler/scheduler_priority_inversion_test.cc` (new regression)\n- `runtime/tests/scheduler/scheduler_sim_harness.*` (minor harness helper)\n- `runtime/observability/trace_schema.md` (small note re: debug annotation)\n\n## Verification\n- Reproduced on local sim harness: inversion prior to fix, eliminated after.\n- Ran mixed-workload microbench: no measurable throughput regression within noise for baseline distributions.\n- CI: unit + sim tests added.\n\n## Checklist\n- [x] Added regression test covering reported scenario\n- [x] Verified no deadlocks / lock contention regressions (quick perf profile)\n- [x] Flag-scoped behavior; default-off\n- [x] Linked Linear issues\n\n## Related PRs\n- PR #8433 two-queue dispatch policy\n- PR #8439 starvation guardrails\n- PR #8462 separate admission control by class\n\n---\n\n### CI\n- `runtime-unit-tests` \u2705\n- `runtime-sim-tests` \u2705\n- `lint` \u2705\n- `perf-smoke (A10)` \u2705\n- `perf-smoke (H100)` \u2705\n\n### Merge\nSquash merge into `main`.\n\n---\n\n## Review conversation (selected)\n\n**Sofia Ivanova (reviewer):** The yield point makes sense. Can you clarify why we need `max_long_prefill_commit_ms` in addition to re-checking `short_queue_.hasReady()`?\n\n**Marcus Reed (author):** Two reasons: (1) in the real runtime the select step can happen while short queue is empty, then short arrives before we commit (we\u2019ll catch that), but (2) under high load we can select long, then get delayed by unrelated scheduling/locks and commit much later; the cap prevents \u201cstale intent\u201d from behaving like a hidden priority reservation. It also keeps the logic stable across different tick intervals.\n\n**Lena Fischer (reviewer):** Test assertion: can we assert on dispatch ordering rather than time? The sim clock can drift when we change tick interval defaults.\n\n**Marcus Reed (author):** Good point. I updated the test to assert: (a) at least 1 short dispatch occurs before the long prefill completes, and (b) max short wait <= `fairness_window_ms + tick_ms * 3`. That should be stable even if we tune tick interval.\n\n**Omar El-Sayed (reviewer):** Any risk this reduces batching efficiency for long-prefill traffic?\n\n**Marcus Reed (author):** It can, but only in the specific pattern where short arrives during a long select/commit window. The yield point is just a re-check; we still batch long prefill normally when short queue is empty. I ran the mixed distribution microbench and didn\u2019t see throughput movement outside noise (<0.5%).\n\n**Hiro Tanaka (reviewer):** Please confirm we\u2019re not changing kernel selection inputs (sequence length bucketing) in a way that could confound perf measurements.\n\n**Marcus Reed (author):** Confirmed. This PR only changes scheduler ordering and commit timing; no changes to token bucketing / kernel selection logic.\n\n**Julian Moore (reviewer):** Can we add a trace event on the pre-commit re-check so we can validate in canary if this path triggers frequently?\n\n**Marcus Reed (author):** Added a debug/sampled annotation `scheduler.long_prefill.precommit_short_recheck=true` (only emitted when the yield path is evaluated). Also added a counter in the sim harness for test visibility.\n\n**Sofia Ivanova (reviewer):** Looks good after the test update. Approving.\n\n### Approvals\n- Sofia Ivanova \u2705\n- Lena Fischer \u2705\n- Omar El-Sayed \u2705\n- Julian Moore \u2705\n- Hiro Tanaka \u2705\n\n---\n\n## Notes for rollout\nThis fix is safe to include in the scheduler prototype canary because it only affects ordering when both queues are active. If we see any unexpected throughput drop in long-prefill-heavy scenarios, we can tune `max_long_prefill_commit_ms` upward (default in this PR: 2ms) without reverting the logic.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "release_notes",
+    "description"
+  ]
+}

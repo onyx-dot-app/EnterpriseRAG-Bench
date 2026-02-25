@@ -1,0 +1,74 @@
+{
+  "key": "ENG-2407",
+  "team": "engineering",
+  "title": "Add TP-group watchdog + automatic quarantine/recovery for stuck groups (metrics + alerts, mitigate false positives)",
+  "status": "In Review",
+  "priority": "P0",
+  "created_at": "2025-02-18",
+  "updated_at": "2025-03-06",
+  "creator": "Talia Benson",
+  "assignee": "Samir Qureshi",
+  "project": "Multi-GPU (TP) stability fixes (Serving Runtime Performance: Kernel + Scheduling)",
+  "cycle": "2025-W09",
+  "estimate": "8",
+  "due_date": "2025-03-07",
+  "labels": [
+    "serving-runtime",
+    "tensor-parallel",
+    "reliability",
+    "watchdog",
+    "quarantine",
+    "sre-guardrails",
+    "hosted",
+    "dedicated",
+    "sev1-followup"
+  ],
+  "parent_issue": "ENG-2401",
+  "sub_issues": [],
+  "dependencies": [
+    "ENG-2402",
+    "ENG-2404",
+    "ENG-2408"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.19",
+  "security_review_required": "false",
+  "description": "Context\n- We have recurring production hangs/timeouts where a tensor-parallel (TP) worker group stops making forward progress under sustained load (often streaming + mixed sequence lengths).\n- Today, stuck TP groups can keep receiving work, amplifying 5xx/timeout rate and making mitigation harder (needs manual restarts/traffic shifts).\n\nGoal\n- Implement a per-TP-group forward-progress watchdog that detects \u201cstuck\u201d groups and automatically quarantines them (stop scheduling), then performs controlled recovery.\n- Provide clear metrics/logs for oncall triage and alerting.\n- Avoid excessive false positives (do not flap/quarantine healthy but slow groups).\n\nNon-goals\n- Not a full redesign of TP architecture or comm backend.\n- Not replacing kernel/collective-level timeouts; this is a safety net + failure domain containment.\n\nProposed behavior (v1)\n1) Forward progress model\n- Each TP group exposes a monotonic progress signal updated on meaningful progress events (per-rank + group aggregate):\n  - recommended: increment a group-level counter when a decode step completes OR when any rank reports a completed collective for the active microbatch.\n  - watchdog reads (a) last_progress_timestamp and (b) last_progress_counter.\n- Watchdog evaluation interval: 1s (configurable).\n\n2) Stuck detection (mitigate false positives)\n- Trigger only if ALL conditions are true:\n  - No progress for >= WATCHDOG_STALL_SECONDS (default varies by deployment mode).\n  - Group has in-flight work (not idle) AND has not been explicitly draining.\n  - Stalled condition persists for N consecutive checks (e.g., 3) to smooth jitter.\n- Additional \u201cslow vs stuck\u201d guardrails:\n  - If the group is executing extremely long sequences, allow a higher threshold (use per-request expected step time bucket or p99 token latency multiplier).\n  - If host is under global backpressure (scheduler queue high / GPU util saturated), do NOT suppress watchdog; but require the consecutive-check threshold.\n\n3) Quarantine semantics\n- Transition TP group state to QUARANTINED in scheduler (no new work scheduled).\n- Fail/abort in-flight requests with a well-defined error code:\n  - internal: TP_GROUP_QUARANTINED (mapped to 5xx for Hosted, surfaced with retryable signal)\n  - include group_id, pool_id, model_id, reason in structured log.\n- Maintain failure domain boundaries:\n  - quarantine the TP group first; do NOT immediately restart the entire host unless repeated failures indicate host-level issue.\n\n4) Recovery (controlled teardown + rejoin)\n- For v1: controlled teardown of the TP group comm context and worker processes for that group (implementation-specific: restart worker subprocess OR re-init communicator and CUDA contexts if supported reliably).\n- Cooldown after recovery: do not schedule onto the recovered group for COOLDOWN_SECONDS (default 30s) to avoid immediate re-trigger.\n- Rate limiting:\n  - Max resets per host per 10 minutes (configurable).\n  - If exceeded, escalate to host-level cordon + page (prevents infinite loops).\n\n5) Observability (required)\nMetrics (names tentative; align with Observability Pack naming conventions):\n- tp_group_watchdog_trigger_total{reason,model,pool,cluster,region}\n- tp_group_quarantine_total{reason,...}\n- tp_group_reset_total{reset_type,...}\n- tp_group_time_since_progress_seconds{group_id,...} (gauge; consider sampling to avoid cardinality explosion)\n- tp_group_inflight_requests{...}\n- tp_group_quarantine_cooldown_active{...}\nStructured logs/spans:\n- \"tp_watchdog_stall_detected\" with fields: group_id, ranks, last_progress_age_s, inflight, active_collective, scheduler_state, model_id, request_ids_sampled (bounded), reason\n- \"tp_group_quarantined\" + \"tp_group_recovered\" with timing\n\nAlerts (SRE-owned, implemented via ENG-2408 but this ticket defines requirements)\n- Page-worthy (Hosted pools):\n  - watchdog triggers rate > X/min per pool AND correlated with timeout/5xx spike\n  - resets-per-host > threshold (indicates flapping/host instability)\n- Ticket-level:\n  - any watchdog trigger in perf-canary nightly workflow\n\nAcceptance criteria\n- Functional:\n  - When a TP group is artificially stalled (fault injection), the watchdog quarantines within threshold and stops new scheduling to that group.\n  - Quarantine produces the required metrics + structured logs, and in-flight requests are failed quickly (bounded).\n  - Recovery attempts occur and the group returns to service after cooldown.\n- Safety/false positives:\n  - Under heavy load but no actual stall (slow tokens), watchdog does not trigger above an acceptable rate (define target: < 1 false positive / 12h per 1k GPUs in perf runs).\n  - Quarantine/reset rate limited; does not degrade fleet by repeated restarts.\n- Operational:\n  - Oncall can differentiate \"comm stall\" vs \"kernel stall\" vs \"scheduler starvation\" using the emitted reason + dashboard panels.\n\nImplementation notes\n- Integrates with scheduler TP-group state machine (ENG-2402): needs QUARANTINED state and a \"do not assign\" check on dispatch path.\n- Requires instrumentation (ENG-2404): progress counter and timestamps must be available cheaply.\n- Needs config knobs (PR-18473): WATCHDOG_STALL_SECONDS, WATCHDOG_CONSECUTIVE_CHECKS, RESET_RATE_LIMIT, COOLDOWN_SECONDS; defaults per Hosted vs Dedicated.\n\nLinks\n- Confluence initiative: sources/confluence/eng-sre/reliability-initiatives/tp-group-watchdog-and-quarantine-initiative.json\n- Design/root causes: sources/confluence/eng-serving-runtime/kernel-and-scheduling/tp-stability-hangs-root-causes-and-fix-plan.json\n- Representative incident: sources/confluence/oncall-and-incident-response/postmortems/2025-02-13-tp-hang-us-east-sev1.json\n\nRisk notes\n- Watchdog false positives can be more damaging than the hang if it causes widespread quarantines. Must ship behind a feature flag with conservative defaults + canary gates.\n- Cardinality: per-group metrics must be bounded; avoid group_id labels in high-volume production metrics (log group_id instead; aggregate metrics by pool/model/region).",
+  "comments": [
+    "2025-02-18 \u2014 Talia Benson: Creating workstream ticket scoped to watchdog + quarantine/recovery. Please keep acceptance criteria crisp; SRE wants a clear paging story + rate limiting.",
+    "2025-02-19 \u2014 Rafael Mendes: From Sev1 followups: we need (1) stop scheduling onto a stuck group immediately, (2) bounded blast radius, (3) a metric we can alert on that isn\u2019t too noisy. Please don\u2019t ship with group_id as a metric label.",
+    "2025-02-20 \u2014 Sofia Ivanova: Scheduler changes (ENG-2402) will expose QUARANTINED and COOLDOWN states. This ticket should call the scheduler API to transition states; no direct manipulation of dispatch queues from watchdog thread.",
+    "2025-02-23 \u2014 Samir Qureshi: Drafted detection logic: consecutive checks + inflight requirement + cooldown. Added reset rate-limit guard (per host). Still deciding if recovery is worker restart vs communicator re-init; leaning restart for safety in v1.",
+    "2025-02-26 \u2014 Omar El-Sayed: Please ensure structured logs include reason codes that align with dashboard facets: COMM_STALL_SUSPECTED, KERNEL_STALL_SUSPECTED, SCHEDULER_STARVATION_SUSPECTED, UNKNOWN. We can infer from last completed collective age + CUDA event progress if available.",
+    "2025-03-02 \u2014 Connor O'Brien: Release constraint: if this lands for runtime-1.19 patch, must be feature-flagged default-off for Dedicated initially. Hosted canary ok with SRE sign-off + rollback plan.",
+    "2025-03-05 \u2014 Samir Qureshi: Code ready for review; added conservative defaults and metrics. Still need to confirm alert thresholds with SRE (tracked in ENG-2408)."
+  ],
+  "activity_log": [
+    "2025-02-18: Issue created (P0) after Sev1 action items review; owner assigned.",
+    "2025-02-21: Scope updated to include recovery cooldown + rate limiting; added explicit false-positive mitigations.",
+    "2025-02-24: Dependencies added on scheduler state machine + instrumentation workstreams.",
+    "2025-03-05: Moved to In Review; linked implementation PRs."
+  ],
+  "related_prs": [
+    "sources/github/redwood/pr-18462.json",
+    "sources/github/redwood/pr-18473.json",
+    "sources/github/redwood/pr-18470.json"
+  ],
+  "related_incidents_tickets": [
+    "sources/confluence/oncall-and-incident-response/postmortems/2025-02-13-tp-hang-us-east-sev1.json",
+    "sources/jira/internal-support/INT-611.json"
+  ],
+  "rollout_plan": "Phase 1 (Hosted canary, flag ON for 1 pool):\n- Enable watchdog for 1 high-load Hosted pool (us-east) with conservative thresholds.\n- Monitor: watchdog_trigger_rate, quarantine_count, reset_count, timeout_rate, p95/p99 token latency.\n- Rollback triggers: sustained false positive quarantines (trigger rate without timeouts), reset flapping (rate-limit hits), latency regression > agreed threshold.\n\nPhase 2 (Hosted broader):\n- Expand to additional regions/pools once 48h clean.\n\nPhase 3 (Dedicated opt-in):\n- Expose config flag in Dedicated runtime config; CS/Solutions can enable for impacted customers.\n\nPhase 4 (Default-on decision):\n- After SRE sign-off + perf-canary stable, evaluate default-on for Hosted; Dedicated remains opt-in until PM policy (PM-513).",
+  "open_questions": [
+    "Should recovery be process restart (safer) vs communicator re-init (faster)? v1 preference: restart to avoid CUDA/NCCL weird states.",
+    "What is the right default WATCHDOG_STALL_SECONDS per model size + sequence length mix? Need data from tp-watchdog-thresholds experiments.",
+    "Do we want to fail in-flight requests immediately on quarantine or attempt a bounded retry/fallback to another group? (fallback policy likely separate workstream)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "rollout_plan",
+    "open_questions"
+  ]
+}

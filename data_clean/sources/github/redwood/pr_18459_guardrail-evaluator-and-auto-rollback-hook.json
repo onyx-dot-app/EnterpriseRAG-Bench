@@ -1,0 +1,73 @@
+{
+  "repo": "redwood",
+  "pr_number": "18459",
+  "title": "A/B experiments: guardrail evaluator + auto-rollback hook (latency/error regressions)",
+  "author": "Allison Grant",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-02-23",
+  "merged_at": "2026-02-23",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/ab-guardrails-auto-rollback",
+  "reviewers": [
+    "Sean Gallagher",
+    "Dylan Brooks",
+    "Mina Haddad",
+    "Logan Wright",
+    "Chloe Martin"
+  ],
+  "labels": [
+    "ab-testing",
+    "sre",
+    "observability",
+    "guardrails",
+    "rollouts"
+  ],
+  "linked_linear": [
+    "ENG-2845",
+    "ENG-2844",
+    "ENG-2843",
+    "ENG-2848"
+  ],
+  "linked_jira": [
+    "SUP-3940"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "19",
+  "additions": "1184",
+  "deletions": "241",
+  "breaking_change": "false",
+  "body": "Title: Guardrail evaluator + auto-rollback hook for route-level A/B experiments\n\nContext\nThis PR implements the first end-to-end guardrail loop for route-level A/B experiments: evaluate error/latency regressions on a running experiment, emit alerts, and (optionally) trigger the rollback workflow automatically. This is a dependency for beta enablement (ENG-2845 / ENG-2848) and addresses learnings from the EU-West capacity/429 incident class (see SUP-3940 for the customer-facing follow-up).\n\nWhat\u2019s in this PR\n- Guardrail evaluator job (server-side, low-frequency) that evaluates experiment health on a fixed cadence using the aggregated results dataset (materialized views from ENG-2844).\n- Guardrail rules v1:\n  - Error-rate regression (5xx + gateway timeouts) vs control\n  - 429-rate regression vs control (treated separately; often indicates capacity pressure)\n  - p95 end-to-end latency regression vs control\n  - p95 TTFT regression vs control (if streaming)\n  - Minimum exposure gating to avoid acting on tiny samples\n- Auto-rollback hook:\n  - Calls Console/Control-plane rollback endpoint with (experiment_id, reason_code, evaluator_run_id)\n  - Emits a structured \u201cguardrail_triggered\u201d event for alert routing + audit correlation\n- Alerting integration:\n  - Emits a guardrail evaluation summary event which is picked up by our alert router (existing infra used for rollout regressions)\n  - Adds a default paging policy for \u201cauto_rollback_executed\u201d and a lower-severity warning for \u201cguardrail_breached_no_action\u201d\n- Safety features / operational guardrails:\n  - Dry-run mode (default ON in staging; OFF only via config in prod)\n  - Cooldown window to prevent repeated rollbacks / alert spam\n  - Sticky evaluator run IDs + idempotency key so retries don\u2019t trigger multiple rollbacks\n  - Region-aware evaluation (only evaluate where we have sufficient exposures; do not mix regions)\n  - Hard cap on number of experiments evaluated per run to bound query costs\n\nDesign notes / behavior\n- Comparisons are always against the experiment\u2019s designated control variant (variant role = control). If no control role exists, evaluator refuses to act and emits a configuration error event.\n- Evaluator uses a rolling window (default 10 minutes, configurable per tier) and requires min exposures per variant (default: 2k control / 500 treatment) before taking action.\n- Regression math is intentionally simple for v1 (ratio + absolute delta threshold). We\u2019re not doing statistical significance gating for operational rollback decisions.\n- Rollback precedence: evaluator triggers the same rollback mechanism as Console \u201cRollback\u201d so policy engine precedence stays consistent (no bypass).\n\nConfiguration (new)\n- Added guardrail config under ab_testing.guardrails.* (tier-aware defaults). Example:\n  - error_rate.max_relative_increase = 1.25\n  - error_rate.max_absolute_increase = 0.002\n  - latency_p95.max_relative_increase = 1.20\n  - latency_p95.max_absolute_increase_ms = 150\n  - http_429_rate.max_absolute_increase = 0.001\n  - min_exposures.control = 2000\n  - min_exposures.treatment = 500\n  - cooldown_minutes = 30\n  - action_mode = dry_run|auto_rollback\n\nCode structure\n- New package: services/ab_testing/guardrails\n  - evaluator.ts (core orchestration)\n  - rules/*.ts (metric-specific checks)\n  - types.ts (shared contracts)\n- New internal client: clients/rollouts/rollbackClient.ts (wraps rollback endpoint)\n- New events: telemetry/events/ab_guardrail_evaluation_v1 + ab_guardrail_action_v1\n\nChanged areas (high level)\n- console-backend\n  - Scheduled job registration + config wiring\n  - Rollback client integration\n- analytics/query layer\n  - Read-only query helpers for aggregated experiment metrics\n- alert router\n  - New routing keys + templates for guardrail-triggered messages\n\nExample log output\n- \"ab_guardrail_evaluation_v1\": {experiment_id=exp_7f3..., region=eu-west-1, window=10m, breaches=[\"http_429_rate\"], action_taken=\"auto_rollback\"}\n\nHow tested\n- Unit tests for each guardrail rule (boundary conditions: min exposures, NaNs, missing control)\n- Integration test with a stubbed results dataset and mocked rollback endpoint\n- E2E in staging:\n  - Created an experiment on /v1/chat/completions with treatment forced to a throttled backend\n  - Observed 429 breach => evaluator warning in dry-run\n  - Switched action_mode to auto_rollback => rollback endpoint invoked once; subsequent runs suppressed by cooldown\n\nRollout plan\n- Merge behind config defaults (dry_run in prod)\n- Enable auto_rollback for internal dogfood projects only (feature-flag guarded)\n- Expand to beta partners after SRE signoff + runbook verification\n\nChecklist\n- [x] Unit tests added\n- [x] Idempotency + cooldown implemented\n- [x] Alert templates reviewed with SRE\n- [x] Config defaults documented\n- [x] Linked to ENG-2845, ENG-2848\n\nScreenshots\nN/A (backend + alerting only).\n\nReview conversation highlights\n- Sean Gallagher: Requested cooldown + idempotency and explicit 429 handling (separate from generic error_rate). Also asked for a hard cap on evaluated experiments per run to avoid query storms.\n  - Allison Grant: Added cooldown_minutes, evaluator_run_id, idempotency_key, and split 429-rate guardrail. Added max_experiments_per_run with pagination.\n- Mina Haddad: Confirmed rollback call path uses the same policy rollback endpoint (no bespoke routing override). Requested region-isolated evaluation to avoid hiding a single-region incident.\n  - Allison Grant: Evaluator now computes per-region breaches; does not aggregate across regions.\n- Logan Wright: Requested that emitted events keep tag cardinality low (no route strings) and that experiment_id be the primary dimension.\n  - Allison Grant: Events contain experiment_id + variant_id + region; route is intentionally omitted.\n- Chloe Martin: Asked that missing-control-role be treated as a config error surfaced in the UI later.\n  - Allison Grant: Added a \u201cconfiguration_error\u201d evaluation result and corresponding event type.\n\nCI\n- build (pass)\n- unit-tests (pass)\n- lint (pass)\n- integration-tests (pass)\n\nMerge\nMerged via squash to main.\n\nFollow-ups\n- Add Console surface for guardrail configuration and action mode (tracked in ENG-2862)\n- Improve evaluator to support per-metric alert throttling + dedupe across regions (ENG-2863)\n- Add runbook links into alert payloads once runbook PR lands (ENG-2864)",
+  "commits": [
+    "ab-testing/guardrails: add evaluator orchestration and rule engine",
+    "ab-testing/guardrails: add error-rate + 429-rate guardrails with min exposure gating",
+    "ab-testing/guardrails: add p95 latency + p95 TTFT regression checks",
+    "rollouts client: add rollback client + idempotency key support",
+    "telemetry: add guardrail evaluation/action events v1",
+    "alerts: route guardrail events and add templates + severity mapping",
+    "tests: unit + integration coverage for evaluator and rules",
+    "config: add tier-aware defaults + dry-run mode"
+  ],
+  "changed_files": [
+    "services/ab_testing/guardrails/evaluator.ts",
+    "services/ab_testing/guardrails/types.ts",
+    "services/ab_testing/guardrails/rules/errorRate.ts",
+    "services/ab_testing/guardrails/rules/http429Rate.ts",
+    "services/ab_testing/guardrails/rules/latencyP95.ts",
+    "services/ab_testing/guardrails/rules/ttftP95.ts",
+    "jobs/scheduled/registerAbGuardrailEvaluator.ts",
+    "clients/rollouts/rollbackClient.ts",
+    "telemetry/events/ab_guardrail_evaluation_v1.ts",
+    "telemetry/events/ab_guardrail_action_v1.ts",
+    "alerts/routing/abGuardrails.ts",
+    "config/defaults/ab_testing_guardrails.yaml",
+    "test/ab_testing/guardrails/evaluator.test.ts",
+    "test/ab_testing/guardrails/rules.test.ts"
+  ],
+  "release_notes": "Adds backend guardrail evaluation for A/B experiments (latency/error/429 regressions) with optional auto-rollback and alerting hooks; defaults to dry-run in production until enabled by SRE.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ]
+}

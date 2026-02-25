@@ -1,0 +1,45 @@
+{
+  "repo": "redwood",
+  "pr_number": "18488",
+  "title": "Integrate overload protection with cost-efficient batching tier (backpressure thresholds + load-shed reason codes)",
+  "author": "Jordan Lee",
+  "created_at": "2025-03-04",
+  "updated_at": "2025-03-08",
+  "merged_at": "2025-03-08",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/costefficient-overload-protection",
+  "reviewers": [
+    "Sofia Ivanova",
+    "Rafael Mendes",
+    "Allison Grant",
+    "Omar El-Sayed",
+    "Nadia Rahman"
+  ],
+  "labels": [
+    "runtime",
+    "sre",
+    "perf",
+    "rollout",
+    "observability"
+  ],
+  "linked_linear": [
+    "ENG-18424",
+    "ENG-18422"
+  ],
+  "linked_jira": [
+    "SUP-18492"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "23",
+  "additions": "1184",
+  "deletions": "221",
+  "breaking_change": "false",
+  "body": "Title: Integrate overload protection with cost-efficient batching tier (backpressure thresholds + load-shed reason codes)\n\nContext\nCost-efficient tier intentionally increases batching aggressiveness (larger max_batch, longer queue delay) to improve $/token. During internal dogfooding and early beta ramps we observed that under bursty concurrency, the same aggressiveness can push the system into a \u201clatency spiral\u201d (queue delay grows, timeouts increase, retries amplify load) unless overload protection thresholds are tier-aware and we emit actionable reason codes. This PR wires tier selection into the existing overload protection module and adds explicit load-shed reason codes + metrics hooks so SRE dashboards can distinguish \u201cexpected shedding\u201d vs regressions.\n\nWhat\u2019s in this PR\n- Tier-aware overload thresholds\n  - When batching_tier == cost_efficient, apply more conservative backpressure earlier (lower admission watermark, stricter queue-delay caps) to avoid tail-latency blowups.\n  - When batching_tier == fast, preserve existing behavior (minimal queueing) and avoid false positives for streaming routes.\n  - Standard tier remains the current baseline.\n- Load-shed reason codes (request-facing + metrics)\n  - Introduces a stable set of shed reasons with consistent naming across gateway/runtime:\n    - queue_delay_budget_exceeded\n    - gpu_kv_cache_pressure\n    - inflight_requests_cap\n    - prefill_backlog\n    - decode_backlog\n    - scheduler_deadline_miss\n  - Adds response header for internal debugging and Console integration:\n    - x-redwood-load-shed-reason: <reason>\n  - Tracing span attribute:\n    - redwood.overload.shed_reason\n- Metrics / dashboard hooks\n  - Counter: redwood_overload_shed_total{tier,route,model,reason}\n  - Gauge: redwood_overload_backpressure_active{tier,route,model}\n  - Histogram: redwood_overload_admission_queue_delay_ms{tier,route,model}\n  - These align with the tiered batching dashboard spec; the intent is that SRE can alert on rate-of-shed and reason mix shifts rather than raw 5xx alone.\n- Policy/guardrail integration\n  - Adds tier to overload protection context so that guardrail rules can branch on tier without re-deriving it.\n  - Ensures explicit batching overrides do not bypass overload protection; overload protection acts on effective scheduler state, not config intent.\n\nBehavioral changes\n- In cost-efficient tier, when queue delay exceeds the tier-specific budget for the route, we begin load shedding sooner rather than letting latency drift into timeouts.\n- For streaming routes, we bias toward inflight caps and decode backlog detection rather than queue delay alone (prevents over-shedding while token cadence is healthy).\n\nDefaults / thresholds (initial)\n- cost_efficient:\n  - admission_watermark: 0.80 (was 0.90)\n  - queue_delay_budget_ms: 200 (chat), 300 (completions), 100 (embeddings)\n  - kv_cache_pressure_shed_at: 0.88 (was 0.92)\n- standard: unchanged\n- fast:\n  - queue_delay_budget_ms remains low; shedding primarily via inflight cap and deadline misses\n\nNotes:\n- These are intentionally conservative. The goal is to reduce timeouts during bursts by shedding earlier with clear reason codes; tuning will happen post-beta with benchmarks + canary data.\n\nTest plan\n- Unit tests:\n  - Tier-specific threshold selection and precedence\n  - Reason code mapping stability and serialization to header/span\n- Integration tests:\n  - Synthetic overload scenarios validate shed behavior does not regress fast tier streaming cadence\n  - Cost-efficient tier under burst: shed_total increases while timeout rate decreases\n- Manual:\n  - Verified dashboards ingestion in staging (metrics labels present: tier,reason)\n\nRollout plan\n- Behind feature flag: runtime.overload.tier_aware_thresholds (default off).\n- Enable in staging for 48h; verify reason mix and no increase in overall 5xx.\n- Canary production: 5% of traffic for cost-efficient tier only in us-east for two launch models.\n- Abort signals:\n  - p95 latency up > 10% for fast/standard\n  - timeout_rate up > 0.2% absolute\n  - shed_total spike without corresponding reduction in timeouts (indicates misconfigured thresholds)\n\nChanged areas (high level)\n- runtime/overload/\n  - add TieredThresholds and policy context plumbed from effective config\n- runtime/scheduler/\n  - exposes scheduler backlog signals required for decode_backlog/prefill_backlog reasons\n- api-gateway/\n  - forwards x-redwood-load-shed-reason on 429/503 from runtime\n- observability/\n  - metric definitions and labels\n\nIllustrative snippet (reason code)\n- Before: shed_reason = \"overloaded\"\n- After: shed_reason = \"queue_delay_budget_exceeded\" | \"gpu_kv_cache_pressure\" | ...\n\nRelated\n- Linear: ENG-18424 (overload protection alignment), ENG-18422 (queue delay & batch formation metrics)\n- Reference: Support escalation SUP-18492 (timeouts when trying cost-efficient tier; this PR is part of the fix by preventing timeout spirals)\n\nChecklist\n- [x] Added tests for tier mapping and reason codes\n- [x] Added metrics with tier + reason labels\n- [x] Updated internal runbook notes in code comments (SRE will link in dashboards spec)\n- [x] No API breaking changes (header is additive)\n\nCommits\n1) runtime/overload: introduce tier-aware thresholds and reason enum\n2) runtime/scheduler: export backlog signals and wire to overload module\n3) gateway: propagate shed reason header for 429/503\n4) observability: add metrics + label set, update exporters\n5) tests: unit + integration coverage, add golden tests for reason strings\n\nReview conversation (highlights)\n- Sofia Ivanova: \u201cCan we avoid queue_delay as the primary signal for streaming? It\u2019s too noisy when clients disconnect/reconnect.\u201d\n  - Jordan Lee: Switched streaming routes to prefer decode_backlog and inflight caps; queue delay budget still enforced but de-prioritized. Added integration test that asserts no increased shed rate during healthy cadence.\n- Rafael Mendes: \u201cReason code strings need to be stable for alerting; please add a golden test and doc comment that they\u2019re part of the contract.\u201d\n  - Jordan Lee: Added golden test for all reason enum values and a contract comment + linter check that forbids renames without updating the golden file.\n- Allison Grant: \u201cMetrics need tier and reason labels; also please add a separate gauge for backpressure active.\u201d\n  - Jordan Lee: Added redwood_overload_backpressure_active and updated counter label set.\n- Nadia Rahman: \u201cWe should be careful that earlier shedding doesn\u2019t increase retries and overall cost; do we have visibility?\u201d\n  - Jordan Lee: Added shed reason header to make client-side retry debugging easier; also added a note for Optimize/Console to surface shed reasons so customers can adjust client retry behavior.\n\nCI\n- Initial run: perf-smoke failed (flake in scheduler backlog test)\n- Rerun: pass\n- Final checks: buildkite/runtime-tests \u2705, buildkite/gateway-tests \u2705, lint \u2705, perf-smoke \u2705\n\nMerge\nSquash merged to main. Follow-up items: tune thresholds per model family/GPU SKU and wire dashboard panels to new reason breakdown (tracked in ENG-18427).",
+  "release_notes": "- Runtime: tier-aware overload protection thresholds for cost-efficient batching tier (flagged)\n- Observability: overload shedding metrics now include tier and shed reason labels; adds x-redwood-load-shed-reason header for debugging",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "key": "ENG-3925",
+  "team": "engineering",
+  "title": "GPU capability detection + normalization for selector v2 (SKU mapping, SM capability, MIG/partitioning)",
+  "status": "Done",
+  "priority": "P1",
+  "created_at": "2026-01-09",
+  "updated_at": "2026-02-20",
+  "creator": "Talia Benson",
+  "assignee": "Yuki Sato",
+  "project": "Kernel auto-selection v2",
+  "cycle": "2026-W04",
+  "estimate": "8",
+  "due_date": "2026-02-14",
+  "labels": [
+    "runtime",
+    "kernel-selector-v2",
+    "gpu",
+    "nvml",
+    "cuda",
+    "mig",
+    "perf",
+    "reliability"
+  ],
+  "parent_issue": "ENG-3921",
+  "dependencies": [
+    "ENG-3923",
+    "ENG-3926",
+    "ENG-3927"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.19",
+  "security_review_required": "false",
+  "description": "## Context\nKernel auto-selection v2 needs a stable, low-cardinality GPU identifier to select kernels by GPU class/SKU + SM capability. Today we have a mix of heuristics (string matching `cudaGetDeviceProperties().name`, implicit assumptions from device memory size, etc.) that are:\n- inconsistent across cloud providers / driver versions\n- brittle for new SKUs (L4 variants, H100 PCIe vs SXM, etc.)\n- incorrect/unstable under MIG and other partitioned environments (reported names change; memory size reflects partition)\n\nThis ticket adds a single normalization layer that produces **canonical GPU capability + normalized SKU class** for use by selector v2 and telemetry.\n\n## Goals\n- Produce a canonical, deterministic GPU identity from runtime signals:\n  - SKU class: `L4 | A10 | A100 | H100 | Unknown`\n  - SM capability: `sm_75 / sm_80 / sm_86 / sm_89 / sm_90` (etc.)\n  - Partitioning context: MIG enabled + MIG profile when available\n- Make the output stable across:\n  - driver updates (minor name formatting changes)\n  - container/runtime environments (K8s, systemd, bare metal)\n  - MIG configurations (1g/2g/3g/4g/7g profiles)\n- Provide safe fallback behavior: if we can\u2019t determine a known SKU class, return `Unknown` and force selector v2 to route to \u201csafe kernel set\u201d (or v1 fallback depending on selector config).\n\n## Non-goals\n- Full GPU inventory management (this is per-process local detection).\n- Detecting every GPU SKU under the sun; we target the Redwood fleet matrix first (L4, A10, A100, H100) and add a correct unknown path.\n\n## Proposed output contract (used by selector v2)\nThe normalization layer returns a single structure (conceptually) with:\n- `gpu_vendor`: `nvidia`\n- `gpu_sku_class`: one of `L4/A10/A100/H100/Unknown`\n- `gpu_sm`: `sm_<major><minor>` derived from compute capability\n- `gpu_mem_gb_bucket`: coarse memory bucket for debugging only (e.g., `<=16`, `<=24`, `<=40`, `<=80`, `>80`) to avoid high-cardinality\n- `gpu_is_mig`: `true/false`\n- `gpu_mig_profile`: coarse profile name when available (e.g., `1g.5gb`, `2g.10gb`, `3g.20gb`, `7g.80gb`, else `unknown`)\n\nNotes:\n- Selector should key off `gpu_sku_class` + `gpu_sm` + `gpu_is_mig` (and optionally profile) only.\n- Telemetry should NOT include raw device names or UUIDs.\n\n## Detection strategy\n1) Prefer NVML when available (more accurate for MIG):\n   - Identify physical GPU vs MIG device\n   - Get compute capability / arch\n   - Get MIG mode + profile (when running on MIG instance)\n2) Fall back to CUDA runtime properties if NVML is unavailable:\n   - Use `cudaDeviceProp.major/minor` for compute capability\n   - Use `cudaDeviceProp.name` with pattern mapping to `gpu_sku_class`\n   - Detect \u201cMIG-ish\u201d names and mark `gpu_is_mig=true` but treat profile as `unknown` unless confidently parsed\n\n## SKU normalization rules (initial)\n- H100:\n  - compute capability `9.0` => `gpu_sm=sm_90`\n  - names matching `H100` => `gpu_sku_class=H100`\n- A100:\n  - compute capability `8.0` => `gpu_sm=sm_80`\n  - names matching `A100` => `gpu_sku_class=A100`\n- L4:\n  - compute capability `8.9` => `gpu_sm=sm_89`\n  - names matching `L4` => `gpu_sku_class=L4`\n- A10:\n  - compute capability `8.6` => `gpu_sm=sm_86`\n  - names matching `A10` => `gpu_sku_class=A10`\n- Unknown:\n  - otherwise, `gpu_sku_class=Unknown` and selector v2 must not attempt \u201caggressive\u201d kernels.\n\nImportant: compute capability alone is NOT sufficient to distinguish all SKUs; we still use name matching, but it is centralized and versioned.\n\n## MIG/partitioned environments\n- MIG detection:\n  - NVML: if device is a MIG device or MIG mode enabled and a MIG instance is visible to the process\n  - CUDA-only: parse device name patterns containing `MIG` and set `gpu_is_mig=true`\n- Policy for selector v2:\n  - When `gpu_is_mig=true`, default to the conservative kernel choices for the `gpu_sku_class` unless registry has an explicit MIG entry.\n  - Reason: MIG memory + SM partitioning shifts optimal kernels, and we\u2019ve seen tail-latency variance when treating MIG as full device.\n\n## Implementation plan\n- Add a `gpu_caps` module in runtime:\n  - single public function: `DetectAndNormalizeGpuCaps()` (name TBD)\n  - returns normalized fields used by selector context\n- Add unit tests:\n  - fixtures for common `cudaDeviceProp.name` strings seen in fleet\n  - fixtures for NVML MIG profiles\n  - regression test: ensure deterministic output for the same inputs\n- Wire into selector v2 context:\n  - replace existing scattered detection code paths\n  - ensure selection telemetry uses normalized fields\n\n## Acceptance criteria\n- [x] Selector v2 context includes `gpu_sku_class` and `gpu_sm` from the normalization layer.\n- [x] MIG is detected reliably in our K8s MIG clusters; `gpu_is_mig=true` when running inside MIG.\n- [x] Unknown GPU does not crash and forces safe selection path (either v1 fallback or safe kernel set).\n- [x] Telemetry labels are low-cardinality (no raw UUID, no raw device name).\n- [x] Tests cover at least: L4, A10, A100 (40/80), H100, and one unknown.\n\n## Rollout / risk\n- Low functional risk but high blast radius if wrong: misclassification can pick the wrong kernel and regress tail latency.\n- Mitigation:\n  - keep selector v2 feature-flagged\n  - add debug endpoint output (ENG-3932) to print normalized GPU caps\n  - dashboards should break down by `gpu_sku_class` (not raw)\n\n## Follow-ups (out of scope here)\n- Add explicit MIG entries to kernel registry once we have benchmark coverage for common profiles.\n- Expand mapping for additional SKUs as fleet evolves (e.g., H200 or provider-specific variants).",
+  "comments": [
+    "2026-01-10 (Talia Benson): Creating as a standalone ticket because kernel selector v2 needs a stable GPU key; current name-based matching is duplicated in 3 places and breaks under MIG.",
+    "2026-01-21 (Yuki Sato): Drafted normalization contract. Plan is NVML-first, CUDA fallback. Will ensure selector sees only {sku_class, sm, is_mig, mig_profile_bucket}.",
+    "2026-01-29 (Yuki Sato): Implemented initial mapping rules for L4/A10/A100/H100 and Unknown. Added MIG detection via NVML; CUDA-only detection marks is_mig but doesn\u2019t attempt profile parsing unless obvious.",
+    "2026-02-05 (Grace Kim): Review: please ensure we never emit raw device names into metrics. Also, compute capability should be surfaced even for Unknown GPUs for debugging; keep it as sm_<..> label (bounded set).",
+    "2026-02-08 (Thomas Baird): Cardinality review: OK to label `gpu_sku_class` + `gpu_sm` + `gpu_is_mig`. Not OK to include memory size as exact value; use coarse buckets if needed.",
+    "2026-02-12 (Yuki Sato): Hooked into selector context. Added tests for common device-name strings from fleet and a synthetic MIG fixture. Unknown path returns sku_class=Unknown and selector will fall back to safe set.",
+    "2026-02-18 (Connor O'Brien): Marking done for runtime-1.19 train. Ensure release notes mention improved GPU normalization for selector v2 diagnostics (no customer-facing change)."
+  ],
+  "related_links": [
+    "GitHub PR: sources/github/redwood/pr_18463_gpu_sku_normalization.json",
+    "Umbrella: sources/linear/engineering/ENG-3921.json",
+    "Selector v2 core logic: sources/linear/engineering/ENG-3923.json",
+    "Telemetry work: sources/linear/engineering/ENG-3927.json",
+    "Scheduler seq bucket signal: sources/linear/engineering/ENG-3924.json"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ]
+}

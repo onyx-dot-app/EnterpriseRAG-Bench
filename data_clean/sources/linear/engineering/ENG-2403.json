@@ -1,0 +1,48 @@
+{
+  "key": "ENG-2403",
+  "team": "engineering",
+  "title": "Fix cancellation + barrier interaction that can deadlock TP groups under streaming disconnects",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-02-10",
+  "updated_at": "2025-03-03",
+  "creator": "Sofia Ivanova",
+  "assignee": "Marcus Reed",
+  "project": "Multi-GPU (TP) stability fixes (Serving Runtime Performance: Kernel + Scheduling)",
+  "cycle": "2025-W07",
+  "estimate": "5",
+  "due_date": "2025-02-28",
+  "labels": [
+    "serving-runtime",
+    "scheduler",
+    "tensor-parallel",
+    "cancellation",
+    "streaming",
+    "deadlock",
+    "sev1-followup",
+    "runtime-1.19"
+  ],
+  "parent_issue": "ENG-2401",
+  "dependencies": [
+    "ENG-2402",
+    "ENG-2406"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.19",
+  "security_review_required": "false",
+  "description": "Background / Why\nWe\u2019ve observed a class of TP hangs where a tensor-parallel worker group stops making forward progress under sustained streaming load, typically correlated with client disconnects or server-side timeouts. This is distinct from pure NCCL stalls: the group is \u201calive\u201d but waiting on a scheduler/barrier condition that can never be satisfied once one rank exits a request early.\n\nImpact\n- Requests stuck until watchdog/host restart, driving timeouts/5xx.\n- TP group becomes effectively wedged and continues to receive work (until quarantine is added in ENG-2402/2407).\n- Seen in Hosted high-load pools and at least one Dedicated escalation.\n\nSymptoms / Signature\n- Long-running streaming decode; client disconnect triggers cancellation.\n- Some ranks observe cancellation and unwind; other ranks continue decode microsteps.\n- Next scheduler barrier (e.g., step boundary / microbatch boundary) expects N arrivals; fewer arrivals occur => deadlock.\n- Logs often show repeated \u201cwaiting at barrier\u201d / no new token progress for a subset of ranks; GPU utilization drops but process remains healthy.\n\nGoal\nMake cancellation semantics barrier-safe in TP execution so that:\n- A canceled request cannot strand a TP group at a barrier.\n- Cancellation is deterministic: either all ranks agree to exit the request, or the TP group transitions to an error/recovery path (but not deadlock).\n\nProposed Fix (implementation summary)\n1) Cancellation becomes a TP-group coordinated event\n- When any rank observes request cancellation (client disconnect, request timeout, explicit cancel), it must notify the TP group and ensure the cancellation is \u201cbroadcast\u201d to all ranks in that group before barriers that require all-rank participation.\n- Introduce a scheduler-level \u201ccancel epoch / cancel token\u201d that is advanced under a TP-group lock and visible to all ranks.\n\n2) Make barriers cancellation-aware\n- Update barrier wait logic to accept an abort condition tied to (a) request-cancel epoch change, or (b) per-request cancellation bit.\n- A rank waiting in barrier must wake and unwind if cancellation becomes true, rather than waiting indefinitely for arrivals.\n\n3) Ensure unwinding does not skip mandatory bookkeeping\n- On unwind, ranks must still execute the minimal \u201carrival accounting\u201d so barrier counters don\u2019t permanently stay below expected counts.\n- If we cannot safely account for arrival without risking correctness (e.g., mid-collective), we fail fast: mark the TP group as unhealthy and hand off to quarantine/reset mechanisms (ENG-2402/2407).\n\n4) Streaming disconnect path uses the same mechanism\n- Server detects stream close => triggers request cancel => same codepath as timeout cancel.\n- Avoid any fast-path return that bypasses the coordinated cancellation/broadcast.\n\nNon-goals\n- Replacing NCCL backend or redesigning batching engine.\n- Addressing comm stalls not related to scheduler/cancellation (tracked in ENG-2406).\n\nAcceptance Criteria\n- No barrier deadlocks when a streaming client disconnects mid-decode under TP.\n- For injected disconnect/cancel scenarios, all ranks exit the request and the TP group continues servicing subsequent requests.\n- If cancellation occurs in an unsafe window, TP group transitions to a controlled failure state (to be quarantined) rather than hanging.\n- Add regression coverage that would have caught the 2025-02-13 Sev1 signature.\n\nTest Plan\nUnit / component tests\n- Scheduler barrier: cancellation-aware wait wakes correctly when cancel epoch increments.\n- Arrival accounting: ensure barrier counters are consistent when one rank cancels early.\n\nIntegration tests (runtime)\n- Add deterministic-ish regression test: TP=2/4, long decode stream, force disconnect at token k, verify:\n  - request completes as canceled within bounded time\n  - subsequent request on same TP group succeeds\n  - no barrier wait exceeds threshold (assert via internal counters / logs)\n\nStress harness (perf-canary / repro suite)\n- Wire into TP hang repro suite scenarios:\n  - Mixed seq lengths + streaming responses\n  - High concurrency with periodic forced disconnects (e.g., 1\u20135% of streams)\n  - Server-side timeout cancellations under load\n- Pass/fail:\n  - No stuck TP groups (no forward progress stalls > X seconds)\n  - No increase in p99 latency beyond agreed tolerance (compare to baseline)\n\nEdge Cases to Validate\n- Cancel during prefill vs cancel during decode.\n- Cancel while rank is between microsteps vs inside a barrier wait.\n- Multiple cancels arriving concurrently (idempotent cancel token).\n- Cancel + retry / router fallback: ensure we don\u2019t double-free request state.\n- Cancel due to client disconnect vs cancel due to server deadline.\n- Partial failure: one rank hits an error and cancels while others are healthy (should converge to group-level exit or fail-fast).\n\nObservability (minimum required for rollout)\n- Structured log when barrier wait is aborted due to cancellation (include tp_group_id, request_id, barrier_id, cancel_epoch).\n- Counter: tp_barrier_aborts_total{reason=\"cancellation\"}.\n- Histogram: tp_barrier_wait_ms (to detect tail growth).\n\nLinks / Artifacts\n- Root causes + fix plan (Confluence): sources/confluence/eng-serving-runtime/kernel-and-scheduling/tp-stability-hangs-root-causes-and-fix-plan.json\n- ADR: sources/confluence/architecture-and-standards/decision-records/adr-0147-tp-collective-timeouts-and-async-error-propagation.json\n- Debugging playbook: sources/confluence/eng-serving-runtime/profiling-playbook/debugging-tp-hangs-playbook.json\n- Related PR (merged): sources/github/redwood/pr-18441.json\n- Repro suite spec: sources/confluence/eng-serving-runtime/benchmarking-and-perf-suite/tp-hang-repro-stress-suite.json\n\nRollout Notes\n- Land behind runtime-1.19 patchline.\n- Canary in high-load Hosted pools; watch for:\n  - tp_barrier_aborts_total rising (expected some increase)\n  - stuck group incidence decreasing\n  - no regression in throughput/p99.\n- Dedicated opt-in after 1 week of canary stability.\n\nOwner Notes\nPrimary: Marcus Reed (Scheduling + perf tests)\nReviewer: Sofia Ivanova (TP lifecycle)\nConsulted: Sean Gallagher / Rafael Mendes (incident signatures, rollout guardrails)",
+  "comments": [
+    "2025-02-11 (Sofia Ivanova): This looks like the cleanest repro signature for the streaming hangs. Let\u2019s keep the fix narrowly scoped: cancellation-aware barrier wait + group-wide cancel broadcast. If we can\u2019t make it safe in some windows, fail fast and rely on quarantine (ENG-2407).",
+    "2025-02-13 (Sean Gallagher): Sev1 today matches this: stream disconnects + TP enabled, then tp_group stopped progressing. Please prioritize as P0; we can accept slightly higher cancel-path overhead if it prevents wedges.",
+    "2025-02-17 (Marcus Reed): Root cause confirmed in local repro: rank0 sees disconnect and unwinds before reaching step barrier; rank1 waits at barrier forever. Proposed change: barrier wait checks cancel_epoch and returns ABORTED so rank1 can unwind too; plus ensure arrival accounting doesn\u2019t leave barrier short.",
+    "2025-02-21 (Julian Moore): Please add a structured log + counter for barrier abort due to cancellation so oncall can distinguish this from NCCL stalls. Also include tp_group_id + barrier_id in the log for correlation.",
+    "2025-02-24 (Marcus Reed): Implemented cancellation-aware barrier wait + coordinated cancel token. Added regression test that forces disconnect at token=32 in a TP=2 streaming decode and asserts next request succeeds. PR up: redwood/pr-18441.",
+    "2025-02-26 (Sofia Ivanova): Reviewed PR\u2014looks good. One note: make sure cancel broadcast is idempotent and doesn\u2019t contend the group lock in the hot path. Approved after small cleanup on naming and adding a brief comment about unsafe windows -> fail-fast.",
+    "2025-03-03 (Marcus Reed): PR merged and canary green for 72h in us-east high-load pool; saw expected increase in tp_barrier_aborts_total with a corresponding drop in stuck-group events. Marking Done."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ]
+}

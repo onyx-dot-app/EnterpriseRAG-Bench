@@ -6,36 +6,32 @@ Target number of files:
 
 Content rules:
 - Each document represents exactly one Slack thread.
+  - The documents are named some timestamp.json, just a single number with no underscore etc.
   - Include the root message and all replies.
   - Present messages in chronological order.
+- Every Slack thread should be contained as a single continuous string containing messages from different people
+  - The messages do not need individual timestamps, we just need the time of the initial message.
+  - The messages should be prefixed with the sender's name
 - Slack threads do not have natural-language titles. Do NOT invent or infer titles.
 - Write messages in realistic Slack style:
   - Short, informal, sometimes incomplete sentences.
+  - A lot of messages will be fairly short/choppy from the team.
   - Common abbreviations, quick questions, and back-and-forth coordination.
   - @mentions, emoji shortcodes (e.g., :thumbsup:), reactions (as lightweight annotations), and links.
   - Inline code and fenced code blocks for logs, commands, config snippets.
   - Occasional bot/system messages (e.g., incident bot, deploy bot) are allowed.
-- Do not add narrative summaries or hindsight context unless it appears as a message in the thread.
-- If a message references files, screenshots, or attachments, represent them as small stubs (filename, type, URL placeholder) rather than generating long binary-like content.
-- Threads may reference other systems (Jira/Linear tickets, GitHub PRs, incidents, runbooks). Preserve these references as-is.
+- Most threads are very short but some can be quite long depending on the topic.
 
 Metadata rules:
 - Required metadata for every thread document:
   - channel: Slack channel name (must correspond to a subdirectory under sources/slack/, e.g., eng-sre, incidents, product)
-  - thread_ts: the root message timestamp (Slack-style, e.g., 1705171331.123456)
+  - thread_ts: the root message timestamp (e.g., 1740535447)
   - first_message_ts: timestamp of the first message in the thread
   - last_message_ts: timestamp of the last message in the thread
   - participants: list of participant display names (real Redwood employees; may include bots)
-  - message_count: integer
 - Title:
   - Omit the title field entirely for Slack thread documents.
-- Optional metadata (use sparingly):
-  - related_jira_keys: list (e.g., ["SRE-1842", "SUP-9910"])
-  - related_linear_ids: list
-  - related_github_prs: list of URLs or org/repo#id
-  - incident_id: string (if in incident-related channels)
-  - tags: 0–5 short tags (rare)
-  - visibility: internal (default) | restricted (for security/customer-sensitive threads)
+- Slack does not have a lot of other metadata so keep it constrainted to the list above.
 - Timestamp constraints:
   - last_message_ts >= first_message_ts.
   - Timestamps should be plausible over multiple years.

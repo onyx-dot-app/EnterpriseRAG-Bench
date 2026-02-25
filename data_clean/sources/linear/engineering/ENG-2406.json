@@ -1,0 +1,60 @@
+{
+  "key": "ENG-2406",
+  "team": "engineering",
+  "title": "Harden TP collectives: async error propagation + timeouts to prevent silent stalls",
+  "status": "In Review",
+  "priority": "P0",
+  "created_at": "2025-02-17",
+  "updated_at": "2025-03-04",
+  "creator": "Noah Patel",
+  "assignee": "Grace Kim",
+  "project": "Multi-GPU (TP) stability fixes (Serving Runtime Performance: Kernel + Scheduling)",
+  "cycle": "2025-W08",
+  "estimate": "8",
+  "due_date": "2025-03-06",
+  "customer_impact": "high",
+  "release": "runtime-1.19",
+  "labels": [
+    "runtime",
+    "tensor-parallel",
+    "collectives",
+    "nccl",
+    "reliability",
+    "sev1-prevention"
+  ],
+  "parent_issue": "ENG-2401",
+  "dependencies": [
+    "ENG-2402",
+    "ENG-2407",
+    "ENG-2404"
+  ],
+  "sub_issues": [
+    "ENG-2403"
+  ],
+  "security_review_required": "false",
+  "links": [
+    "Confluence design doc: sources/confluence/eng-serving-runtime/kernel-and-scheduling/tp-stability-hangs-root-causes-and-fix-plan.json",
+    "ADR: sources/confluence/architecture-and-standards/decision-records/adr-0147-tp-collective-timeouts-and-async-error-propagation.json",
+    "PR (collectives): sources/github/redwood/pr-18455.json",
+    "PR (config knobs): sources/github/redwood/pr-18473.json",
+    "Postmortem (representative Sev1): sources/confluence/oncall-and-incident-response/postmortems/2025-02-13-tp-hang-us-east-sev1.json"
+  ],
+  "description": "Background / Problem\n- We have multi-GPU tensor-parallel (TP) hangs under sustained load where a TP worker group enters a stuck state without surfacing a clear error.\n- A common failure mode is NCCL/collective async errors (or transport issues) that do not immediately propagate to the runtime scheduler; collectives appear to \u201cwait forever\u201d and we keep assigning work to a group that will never make forward progress.\n\nGoal\n- Ensure collective-layer failures are detected and surfaced quickly enough to:\n  1) stop scheduling new work onto a doomed TP group,\n  2) quarantine/reset the TP group (handled in ENG-2407/ENG-2402), and\n  3) return deterministic errors upstream (rather than silent stalls / long tail timeouts).\n\nIn scope\n- Add periodic async error checks for collective operations (NCCL async error state), and treat detected errors as terminal for the in-flight request and TP group.\n- Add explicit timeouts for collectives / rendezvous points where we otherwise wait indefinitely.\n- Define abort policy (what do we abort, when, and how) compatible with correctness:\n  - When to abort the TP group vs abort a single request.\n  - How to ensure we don\u2019t keep a partially-failed communicator alive.\n- Ensure the scheduler sees a single \u201ccollective failure\u201d signal quickly, with enough context for logs/metrics.\n\nOut of scope\n- Switching comm backend or major refactor of TP architecture.\n- Customer networking/driver remediation.\n\nProposed behavior (high level)\n- Runtime has a per-TP-group collective \u201chealth\u201d channel that receives errors from the collective path.\n- During collective waits, we periodically poll for async error state and/or completion (without blocking indefinitely).\n- If async error is detected OR timeout threshold is exceeded:\n  - Fail current request with a typed error (CollectiveTimeout / CollectiveAsyncError).\n  - Mark TP group as unhealthy (handoff to scheduler state machine in ENG-2402).\n  - Trigger quarantine path (ENG-2407) and prevent new work from landing.\n\nAbort policy (initial)\n- Default: abort at TP-group scope (failure domain = TP group) once we see a collective async error or timeout on any rank.\n  - Rationale: once a communicator is poisoned, continuing can wedge subsequent requests and cause prolonged stalls.\n- Request-only abort is allowed ONLY for explicit request cancellation before the collective begins (handled in ENG-2403). Once a collective is entered, failures are treated as TP-group failures.\n- For Hosted (large pools): aggressive quarantine to limit blast radius.\n- For Dedicated: configurable thresholds with conservative defaults; allow opt-in more aggressive behavior after canary results.\n\nTuning knobs / flags (expected)\n- collective_async_error_poll_interval_ms (default: 50ms)\n- collective_hard_timeout_ms (default: 15000ms for Hosted; 30000ms for Dedicated; Private TBD)\n- collective_soft_timeout_ms (optional; if exceeded, emit warning log + metric but don\u2019t abort yet)\n- collective_abort_policy (group|host) (initially group only; host restart handled separately by watchdog/quarantine work)\n\nMetrics / observability (minimal requirements for this ticket)\n- runtime.tp.collective.async_error_detected_total{op,model,gpu_type}\n- runtime.tp.collective.timeout_total{op,model,gpu_type,threshold=soft|hard}\n- runtime.tp.collective.wait_ms_histogram{op,model}\n- runtime.tp.group.abort_reason_total{reason=collective_async_error|collective_timeout}\n- Structured log on abort with:\n  - tp_group_id, rank, op, elapsed_ms, request_id (if available), model_id, nccl_error_code (if available)\n\nAcceptance criteria\n- In repro suite (ENG-2405) scenarios that previously hung indefinitely:\n  - runtime detects condition and aborts within hard_timeout_ms + 2*poll_interval.\n  - scheduler receives the failure and stops dispatching new work to that TP group (validated via existing state metrics / logs; enforcement may land in ENG-2402).\n- No increase in false positive aborts above agreed threshold in canary (tracked in watchdog experiments doc; initial target <0.1% of TP groups/day in Hosted canary).\n- Perf impact:\n  - <1% throughput regression on standard TP benchmark suite; polling must not introduce global synchronization.\n\nImplementation notes / constraints\n- Avoid calling blocking NCCL APIs on critical CUDA stream; ensure polling does not stall kernel execution.\n- Ensure error checks are rank-consistent enough to avoid half the ranks proceeding (use a shared abort signal / check before launching next collective).\n- Be careful with request cancellation: if a request is canceled mid-collective, treat as collective failure only if it causes collective mismatch; otherwise cancellation should not poison communicator.\n\nRollout\n- Land behind feature flag default-off in runtime-1.19 pre-release builds.\n- Enable in Hosted canary pools first with conservative hard_timeout.\n- Expand to 10% Hosted, then 50%, then default-on.\n- Dedicated: opt-in per cluster with documented defaults; support can advise customers experiencing hangs.\n\nTesting\n- Unit test: simulated collective wait path triggers timeout and emits expected error type + metrics.\n- Integration test: fault injection from repro harness (rank delay / forced NCCL error) leads to abort + quarantine signal.\n\nOwner notes\n- Grace Kim driving implementation with review from Hiro Tanaka (collectives) and Rafael Mendes (SRE guardrails).",
+  "comments": [
+    "2025-02-17 (Noah Patel): Creating this as P0 out of Sev1 learnings. We need to stop the \u2018silent stall\u2019 mode; even a controlled abort is better than indefinite hangs. Please align abort policy with ADR-0147 so SRE can build clean alerting + runbooks.",
+    "2025-02-18 (Hiro Tanaka): Agree on TP-group failure domain for async errors. We\u2019ve seen poisoned communicators where the *next* request wedges, so request-scoped retries are risky. Let\u2019s keep it simple: once any rank reports an async error / hard timeout, flip group health -> unhealthy and let scheduler quarantine. Also: polling interval should be small but not per-kernel; we can do it in the collective wait loop only.",
+    "2025-02-20 (Grace Kim): Drafted implementation approach: (1) wrap collective launch + wait in a small state object that tracks start_ts + op name; (2) every poll_interval: check completion + call ncclCommGetAsyncError (or equivalent wrapper); (3) if error, return Status::CollectiveAsyncError; (4) if elapsed > hard timeout, return Status::CollectiveTimeout. Will wire to scheduler via existing \u2018tp_group_fault\u2019 channel (new enum value).",
+    "2025-02-21 (Rafael Mendes): SRE ask: ensure we emit a single, rate-limited ERROR log per TP group transition to unhealthy. During incidents, log volume killed us. Also please include tp_group_id and rank in log fields (structured) for correlation. For canary gating: we\u2019ll watch tp_group_resets + 5xx + timeout rate.",
+    "2025-02-24 (Grace Kim): Opened PR-18455 with polling + timeout. Added new metrics counters + histogram; defaults set to 15s hard timeout for Hosted. Need to confirm Dedicated default (30s?) with Sofia/Lena because long sequences can legitimately take longer.",
+    "2025-02-25 (Sofia Ivanova): Scheduler side: we can consume the \u2018tp_group_fault\u2019 signal and mark group unhealthy; hard enforcement (no new work to quarantined groups) is in ENG-2402 PR-18432. For this ticket, just make sure the fault signal is synchronous and not dropped on cancellation path.",
+    "2025-02-27 (Isabella Rossi): Perf sanity: polling adds a branch in the wait path; microbench on A100 shows no measurable regression (<0.2%). Please avoid additional device sync; keep everything on host-side check loop.",
+    "2025-03-01 (Hiro Tanaka): Code review on PR-18455: please ensure we map NCCL error codes into a stable error class for dashboards (don\u2019t log raw strings only). Also: soft timeout should warn once per request, not on every poll tick.",
+    "2025-03-03 (Grace Kim): Addressed feedback: added stable error_code field, rate-limited logs, and soft-timeout single warning. PR updated; pending final approval + merge window for runtime-1.19 hotfix branch.",
+    "2025-03-04 (Connor O'Brien): Release note dependency: once merged, please update runtime-1.19 TP stability fixes note with new flags and defaults (poll interval + hard timeout). We need a clear statement on behavior change: \u2018hangs become fast-fail + auto quarantine\u2019."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ]
+}

@@ -1,5 +1,7 @@
 """Interactive script for generating agents.md files in source directories."""
 
+import os
+
 from src.llm import get_llm
 from src.llm.conversation import Conversation
 from src.paths import (
@@ -9,6 +11,7 @@ from src.paths import (
     SOURCES_DIR,
 )
 from src.prompts.agents_md import AGENTS_MD_SYSTEM_PROMPT
+from src.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import FinishTool, WriteTool
 
@@ -22,7 +25,49 @@ def load_file(path: str) -> str:
     return content
 
 
+def find_agents_md_files(base_dir: str) -> list[str]:
+    """
+    Find all agents.md files and return their relative paths.
+
+    Args:
+        base_dir: Base directory to search in.
+
+    Returns:
+        Sorted list of relative paths to agents.md files.
+    """
+    paths = []
+    for root, _dirs, files in os.walk(base_dir):
+        if AGENTS_MD_FILE in files:
+            rel_path = os.path.relpath(os.path.join(root, AGENTS_MD_FILE), base_dir)
+            paths.append(rel_path)
+    return sorted(paths)
+
+
+def _has_agents_md_files() -> bool:
+    """Check if there are any agents.md files under sources."""
+    return len(find_agents_md_files(SOURCES_DIR)) > 0
+
+
+def _confirm_generate_more() -> bool:
+    """Prompt user to confirm generating more agents.md files."""
+    response = input("agents.md files already exist. Generate more? [y/N]: ").strip().lower()
+    return response in ("y", "yes")
+
+
 def main() -> None:
+    # Check if agents.md files already exist
+    if _has_agents_md_files():
+        if not _confirm_generate_more():
+            # Just update statistics and exit
+            print("Updating statistics only...")
+            agents_paths = find_agents_md_files(SOURCES_DIR)
+            update_statistics("Step 5: Agents MD", {
+                "total_agents_md_files": len(agents_paths),
+                "paths": agents_paths,
+            })
+            print("Statistics updated.")
+            return
+
     # Load context files and build the prompt
     company_overview = load_file(COMPANY_OVERVIEW_PATH)
     source_tree = load_file(SOURCE_TREE_PATH)
@@ -77,6 +122,12 @@ def main() -> None:
     while True:
         # Check if finish tool was called
         if finish_tool.finished:
+            # Update aggregate statistics
+            agents_paths = find_agents_md_files(SOURCES_DIR)
+            update_statistics("Step 5: Agents MD", {
+                "total_agents_md_files": len(agents_paths),
+                "paths": agents_paths,
+            })
             print(f"\n{AGENTS_MD_FILE} generation complete!")
             break
 

@@ -1,0 +1,67 @@
+{
+  "repo": "redwood",
+  "pr_number": "48302",
+  "title": "Shadow Traffic: global kill switch + admin override endpoints (Console-integrated)",
+  "author": "Dylan Brooks",
+  "created_at": "2025-11-18",
+  "updated_at": "2025-11-21",
+  "merged_at": "2025-11-21",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/shadow-traffic-kill-switch-admin-overrides",
+  "reviewers": [
+    "Sean Gallagher",
+    "Rafael Mendes",
+    "Chloe Martin",
+    "Benji Okafor",
+    "Allison Grant",
+    "Naomi Feldman"
+  ],
+  "labels": [
+    "shadow-traffic",
+    "platform",
+    "sre",
+    "security",
+    "console",
+    "observability"
+  ],
+  "linked_linear": [
+    "ENG-2443",
+    "ENG-2419"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "19",
+  "additions": "612",
+  "deletions": "148",
+  "breaking_change": "false",
+  "body": "Title: Shadow Traffic: global kill switch + admin override endpoints (Console-integrated) Summary: This adds (1) a global kill switch that forces shadow execution OFF across all routes/environments, and (2) scoped admin overrides (per-route and per-customer) to disable shadowing without a deploy. It also wires the control-plane endpoints into the Console admin controls (internal-only for beta) so on-call/SRE can flip the switch during incidents and verify propagation. Context: During beta rollout we need a hard stop mechanism with predictable propagation and auditability. Shadow traffic must never compromise the primary path; if queue depth spikes or capacity budgets are exceeded, we need a single action that stops new shadow work immediately. This PR is part of ENG-2443 and complements existing shadow sampling + backpressure (PRs 48244/48275) by adding a control-plane override layer. User-facing behavior: Primary responses are unchanged. When the global kill switch is ON, the shadow runner will not enqueue any new shadow executions (still emits a shadow_eval.drop counter with reason=kill_switch). When a route/customer override disable is present, shadowing is suppressed for matching requests (drop reason=admin_override). Existing in-flight shadow jobs are not canceled by default (safer + avoids queue churn); they drain naturally under the existing worker timeouts. What changed: Control plane: - Added Admin API endpoints (RBAC-protected) to set and clear shadow traffic overrides: POST /v1/admin/shadow-traffic/kill-switch { enabled: boolean, reason: string } GET /v1/admin/shadow-traffic/kill-switch POST /v1/admin/shadow-traffic/overrides/disable { scope: global|route|customer, route_id?: string, customer_id?: string, reason: string, ttl_seconds?: number } POST /v1/admin/shadow-traffic/overrides/clear { override_id: string } GET /v1/admin/shadow-traffic/overrides?active=true - Overrides are stored in the control-plane config store with a monotonic version. For route/customer overrides we support optional TTL to avoid \u201cforgotten disables\u201d after incident response. - Audit log events (ShadowTrafficOverrideSet/ShadowTrafficOverrideCleared) include actor, scope, reason, TTL, and a hashed route/customer identifier (to avoid leaking identifiers into the audit index). Data plane (shadow runner / request mirroring hook): - The mirroring decision now consults ShadowTrafficOverrideSnapshot (periodically refreshed; defaults to safe behavior if snapshot fetch fails). - Decision order: global kill switch > admin override (route/customer) > RoutePolicy sampling config. - Enforced a strict \u201cfail closed\u201d only for kill switch state: if we cannot fetch override snapshot and last known state is kill_switch=enabled, we continue to suppress shadowing. If snapshot is unavailable and last known state is kill_switch=disabled, we do NOT change behavior (continue sampling per policy). Console: - Added internal admin panel wiring (feature-flagged: console.adminShadowControls) for beta operators: toggle global kill switch, view active overrides, add route/customer disable override with TTL and reason, and quick links to the SRE dashboard. - Added permission gate: Console requires AdminOps role; the backend additionally enforces service-to-service auth + AdminOps scope. Metrics/observability: - shadow_eval.drop{reason=kill_switch|admin_override, scope=global|route|customer} increments when we suppress shadow execution due to controls. - shadow_control.snapshot_age_seconds gauge added to detect stale override propagation. - Structured log: shadow_control_decision includes request_id, route_id (hashed), primary_model, decision=allow|drop, drop_reason. Illustrative snippet: In the mirroring decision path we now gate shadow enqueue: `if overrides.globalKillSwitchEnabled() { metrics.inc(\"shadow_eval.drop\", tags={\"reason\":\"kill_switch\",\"scope\":\"global\"}); return Drop } if overrides.isDisabledFor(routeID, customerID) { metrics.inc(\"shadow_eval.drop\", tags={\"reason\":\"admin_override\",\"scope\":overrides.matchScope(...)}) ; return Drop } return Allow` Propagation model: - Control-plane pushes override updates via existing config distribution channel; data plane refresh interval is 10s with jitter (max staleness ~20s). - Console shows \u201clast applied version\u201d per region from the config distributor status endpoint. Security/abuse considerations: - Admin endpoints are not exposed to customers; only internal Console + break-glass tooling uses them. - All actions are audited. - Override reasons are required; TTL recommended (Console defaults to 2h). - Route/customer identifiers are validated and normalized; invalid identifiers are rejected (400) to avoid silent no-ops during incident response. Tests: - Unit tests for override matching (route/customer precedence) and TTL expiry. - Integration tests for Admin API RBAC + audit log emission. - Data plane test ensures global kill switch suppresses enqueue and emits drop counter. - Console e2e smoke test updated to ensure admin panel is hidden without flag/role. How to verify (staging): 1) Enable shadow sampling on a test route. Confirm shadow_eval.run_count increases. 2) Toggle kill switch ON in Console Admin \u2192 Shadow Traffic. Confirm shadow_eval.drop{reason=kill_switch} increases and run_count stops increasing within 20s. 3) Toggle kill switch OFF. Confirm run_count resumes. 4) Add a route-level disable override with TTL=300s. Confirm only that route drops shadowing. Wait for expiry and confirm it resumes. Rollout plan: - Ship behind server-side admin RBAC + Console flag. - During beta, only SRE + Console/Tooling on-call have access. - Follow-up will add customer-visible per-route disable control (non-admin) once product requirements land. Notes / follow-ups (not in this PR): - Cancelation of in-flight shadow jobs (explicit drain/abort) is intentionally out of scope; we should revisit if queue times become problematic during incidents. - Add paging alert on shadow_control.snapshot_age_seconds > 60s (tracked in ENG-2440). Commits: - feat(shadow-control): add override store + Admin API endpoints - feat(shadow-runner): consult override snapshot before enqueue + metrics - feat(console): admin panel wiring for kill switch + overrides (flagged) - chore(audit): add shadow traffic override audit events - test: add override precedence/ttl tests + RBAC integration tests Changed areas (high level): - control-plane/admin/shadow_traffic_overrides.* - control-plane/auth/rbac_policies.* - data-plane/shadow/decision.* - console/admin/ShadowTrafficControls.* - observability/metrics/shadow_control.* Review conversation (highlights): - Sean Gallagher: Asked about propagation staleness and whether we can \u201cfail closed\u201d safely. Resolution: Added snapshot_age gauge + clarified fail-closed semantics only when kill switch previously enabled; added jittered 10s refresh. - Naomi Feldman: Requested audit log details + data minimization. Resolution: Hash route/customer ids in audit index; keep raw ids only in restricted store with separate access policy. - Benji Okafor: Requested explicit precedence order and schema validation. Resolution: Documented precedence in code comments + added validation errors for ambiguous scope requests. - Chloe Martin: Noted Console endpoint needed idempotency to avoid double-click issues. Resolution: Made POST set endpoints idempotent on (scope, key) with stable override_id; Console now shows current state after mutation. CI: - build (monorepo): pass - unit tests: pass - integration (control-plane): pass (rerun once due to flaky clock test; fixed by using fake clock in TTL expiry tests) - lint/format: pass - security scan: pass Merge: Squash merged to main.",
+  "changed_files": [
+    "control-plane/src/admin/shadow_traffic_overrides_controller.ts",
+    "control-plane/src/admin/shadow_traffic_overrides_service.ts",
+    "control-plane/src/admin/routes.ts",
+    "control-plane/src/auth/rbac/policies/admin_ops.yaml",
+    "control-plane/src/audit/events/shadow_traffic_override.ts",
+    "data-plane/src/shadow/override_snapshot.ts",
+    "data-plane/src/shadow/mirroring_decision.ts",
+    "data-plane/src/shadow/metrics.ts",
+    "console/src/features/admin/ShadowTrafficControls.tsx",
+    "console/src/features/admin/api/shadowTrafficAdmin.ts",
+    "console/src/flags/featureFlags.ts",
+    "observability/src/metrics/definitions/shadow_control.ts",
+    "control-plane/test/admin/shadow_traffic_overrides_rbac.test.ts",
+    "data-plane/test/shadow/mirroring_decision_overrides.test.ts"
+  ],
+  "checks": [
+    "monorepo-build (ubuntu-latest): pass",
+    "unit-tests: pass",
+    "control-plane-integration: pass",
+    "lint: pass",
+    "static-analysis: pass",
+    "security-scan: pass"
+  ],
+  "merge_method": "squash",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ]
+}

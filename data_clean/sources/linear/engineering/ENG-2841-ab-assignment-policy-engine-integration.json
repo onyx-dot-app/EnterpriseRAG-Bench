@@ -1,0 +1,72 @@
+{
+  "key": "ENG-2841",
+  "team": "engineering",
+  "title": "Integrate route-level A/B experiment configs into policy engine (deterministic assignment + precedence)",
+  "status": "In Review",
+  "priority": "P0",
+  "created_at": "2026-02-05",
+  "updated_at": "2026-02-21",
+  "creator": "Jada Williams",
+  "assignee": "Jordan Lee",
+  "project": "Console Route-level A/B Testing Framework",
+  "cycle": "2026-W07",
+  "estimate": "8",
+  "due_date": "2026-02-24",
+  "labels": [
+    "ab-testing",
+    "policy-engine",
+    "routing",
+    "deterministic-assignment",
+    "perf-sensitive",
+    "beta-blocker"
+  ],
+  "dependencies": [
+    "ENG-2843",
+    "ENG-2842"
+  ],
+  "parent_issue": "",
+  "sub_issues": [
+    "ENG-2845"
+  ],
+  "customer_impact": "high",
+  "release": "console-2026.03",
+  "security_review_required": "true",
+  "description": "Goal\nImplement policy evaluation changes required to support route-level A/B experiments in production routing. The policy engine must (a) recognize experiment configs attached to a route, (b) deterministically assign each eligible request to a variant (A/B/...), and (c) return a routing decision that is stable across retries/stream reconnects and compatible with existing rollout primitives.\n\nContext\nConsole will allow customers to define experiments at the route level (e.g., /v1/chat/completions within a project). The data-plane (gateway/router) consults the policy engine to decide which upstream model/config to use. We already support canary rollouts, model pinning, and fallback routing. Experiments add a new policy type that splits traffic and requires deterministic bucketing.\n\nScope\n1) Policy model + evaluation\n- Add ExperimentPolicy (route-level) to policy engine schema.\n- Implement evaluation step that:\n  - checks eligibility rules (tenant/project/region, route match)\n  - checks schedule state (draft/running/paused/stopped)\n  - calculates deterministic assignment bucket -> variant\n  - returns resolved upstream target (model_id + config profile) for that variant\n\n2) Precedence rules (must be explicit and tested)\n- Precedence order for a given request:\n  1. Hard safety blocks (e.g., disabled route / kill-switch)\n  2. Reliability fallback policies (only on error/timeout/capacity signals; not part of primary assignment)\n  3. Route-level A/B experiment (if running + eligible)\n  4. Canary rollout (if configured)\n  5. Model pinning / default route target\n- Important: experiments are measurement-oriented; they should not silently override an active fallback behavior. Fallbacks are applied after primary selection when triggered.\n\n3) Deterministic assignment integration\n- Use the shared assignment library (introduced in PR #18342) to compute buckets.\n- Inputs should be a stable, privacy-safe key set (see ADR-0187):\n  - tenant_id (required)\n  - project_id (required)\n  - route_id (required)\n  - optional: end_user_id hash header (if present) OR api_key_id fallback\n- Ensure variant stickiness is preserved across:\n  - request retries\n  - streaming reconnects (same request_id if provided)\n- Return in the decision payload:\n  - experiment_id\n  - variant_id (e.g., \"control\", \"treatment\")\n  - assignment_hash_version\n\n4) Failure modes\n- If experiment evaluation fails (bad config, missing variant target, assignment error):\n  - do NOT fail open to an arbitrary variant\n  - fall back to non-experiment route resolution and emit an internal error metric\n- If policy engine is unavailable: existing gateway behavior applies (per current routing fallback).\n\nOut of scope\n- Multi-armed bandits / automated optimization\n- Custom metrics routing\n- Private (on-prem) gating logic beyond feature flag checks\n\nReferences\n- ADR-0187 deterministic assignment at route level\n- ADR-0188 exposure logging + privacy (note: exposure emission is handled in gateway; this ticket only returns decision dimensions)\n- GitHub PRs:\n  - redwood/pr_18342_ab-testing-assignment-core\n  - redwood/pr_18357_policy-engine-support-experiment-config (implements most of this ticket)\n\nOpen questions (tracked here until resolved)\n- Should canary apply inside a variant target (e.g., variant selects a model family and then canary within it)? Current plan: No. Variant target is explicit and fully resolved to avoid conflating experiment measurement with rollout.\n- How do we represent \"paused\" experiments in policy evaluation? Proposed: treat as not applicable; keep config but do not assign.\n\nOwners\n- Policy engine: Jordan Lee\n- Routing review: Mina Haddad / Ravi Menon\n- PM sign-off on precedence semantics: Marissa Cole",
+  "acceptance_criteria": "Functional\n- Policy engine supports ExperimentPolicy in config schema and can evaluate an experiment attached to a route.\n- Deterministic assignment is stable for a given (experiment_id, sticky_key) across repeated requests.\n- Decision response includes experiment_id + variant_id when an experiment applies.\n- Eligibility rules respected (tenant/project/region/route) and schedule state respected (draft not applicable; running applicable; paused/stopped not applicable).\n- On experiment evaluation error, routing falls back to standard non-experiment resolution and increments an internal error counter.\n- Precedence rules enforced exactly as documented:\n  - When experiment is running + eligible, it determines primary target ahead of canary/pinning.\n  - Fallback routing is not used as a primary selector; it only triggers on error/timeout/capacity signals downstream.\n\nTesting\n- Unit tests cover:\n  - bucket distribution correctness (incl. non-50/50 splits)\n  - stickiness with different available keys (end_user_id present vs absent)\n  - paused/stopped behavior\n  - precedence interactions: experiment vs canary vs pinning\n- Integration test (staging) validates:\n  - consistent assignment across gateway retries for the same request_id\n  - correct decision payload fields consumed by gateway\n\nReview/Docs\n- Security/privacy review completed for key inputs used for hashing (confirm no raw PII).\n- Updated policy engine docs include new experiment policy type and precedence description.",
+  "perf_budget": "Policy evaluation overhead (incremental)\n- Added per-request CPU cost in policy evaluation: p99 <= 250\u00b5s at 2k RPS per node (measured in staging perf harness).\n- Memory allocations: no unbounded allocations per request; avoid per-request map growth; prefer precompiled allowlists.\n- Config lookup: O(1) expected for route_id -> experiment mapping.\n- Cardinality: do not add high-cardinality tags in policy-engine internal metrics beyond experiment_id (hashed or truncated if required by observability standards).",
+  "implementation_notes": "Implementation outline\n- Extend policy schema:\n  - ExperimentPolicy { experiment_id, state, start_at, end_at, route_id, eligibility, variants[], traffic_allocation, sticky_key_policy, hash_version }\n  - Variant { variant_id, target_ref (model_id + config_profile_id) }\n- In evaluator:\n  - resolve applicable policies for route\n  - check feature flag / entitlement (Hosted/Dedicated) before applying\n  - if experiment applies, compute sticky_key (per ADR-0187) and call assignment lib\n  - resolve variant target and return decision\n- Precedence encoded as a single ordered evaluation pipeline (avoid scattered if/else across call sites).\n\nNotes from review (routing)\n- Mina: ensure variant target resolution happens before data-plane; gateway should not have to interpret experiment config beyond (experiment_id, variant_id, target).\n- Ravi: do not mix experiment assignment with fallback selection; keep fallback logic separate and only downstream-triggered.\n\nRelated PR\n- PR #18357 contains the bulk of the schema + evaluator changes. This ticket tracks remaining follow-ups: perf benchmarks + precedence tests + final reviews.",
+  "test_plan": "Unit\n- evaluator_experiment_policy_applies_when_running_and_eligible\n- evaluator_experiment_policy_not_applied_when_paused_or_stopped\n- evaluator_experiment_precedence_over_canary\n- evaluator_falls_back_on_invalid_variant_target\n- assignment_stickiness_with_end_user_id\n- assignment_stickiness_with_api_key_fallback\n\nIntegration (staging)\n- Run gateway replay tool to issue 1k identical requests with same request_id and validate stable variant assignment.\n- Run mixed traffic (requests with/without end_user_id header) and verify expected distribution within each cohort.\n\nPerf\n- Run policy-engine perf harness with 10 routes, 3 experiments, 2 variants each; measure incremental p50/p99 vs baseline build and attach results to this ticket before Done.",
+  "rollout_plan": "Rollout\n- Behind feature flag: console.ab_experiments_enabled (control-plane gates config emission; policy engine also checks entitlement).\n- Deploy policy engine changes to staging first; run integration + perf tests.\n- Canary deploy to 5% of Hosted traffic in us-east for internal dogfood projects.\n- Expand to 50% once guardrails (ENG-2845) dashboards show no regression; then 100%.\n\nRollback\n- Disable feature flag to stop emitting/considering experiment policies (policy engine treats experiment configs as non-applicable).\n- If severe regression in policy engine latency, roll back service deployment to previous build; no data migration required (schema is additive and ignored by older builds if not referenced by the gateway config snapshot).",
+  "links": [
+    "Confluence: adr-0187-deterministic-ab-assignment-at-route-level",
+    "Confluence: adr-0188-experiment-exposure-logging-and-privacy",
+    "GitHub: redwood/pr_18342_ab-testing-assignment-core",
+    "GitHub: redwood/pr_18357_policy-engine-support-experiment-config",
+    "Slack: #eng-platform thread 1706904410 (precedence discussion)"
+  ],
+  "comments": [
+    "2026-02-06 \u2014 Jordan Lee: Added initial ExperimentPolicy proto + evaluator stub on branch. Open question: best place to compute sticky_key\u2014policy engine vs gateway. Leaning policy engine so decision payload is fully determined and can be logged consistently; gateway still emits exposure events.",
+    "2026-02-08 \u2014 Mina Haddad: +1 policy engine computing sticky_key/variant; gateway should remain dumb for experiment semantics. Please ensure request_id can influence stickiness on streaming reconnects (some clients reuse TCP but new HTTP req).",
+    "2026-02-10 \u2014 Ravi Menon: Precedence needs to be encoded once. We\u2019ve been burned by canary vs pinning precedence diverging across services. Add tests that demonstrate: experiment primary selection happens before canary, but fallback still applies after primary target if the request errors.",
+    "2026-02-13 \u2014 Marissa Cole: Confirmed product semantics: experiments override canaries for primary selection. Canary is still allowed on the *non-experiment* path. Also, paused experiments should behave as if not configured (no assignment, no exposure).",
+    "2026-02-17 \u2014 Jordan Lee: PR #18357 up. Includes schema + precedence pipeline. Still need perf harness numbers and one more integration test for retry stickiness when end_user_id missing (api_key_id fallback).",
+    "2026-02-20 \u2014 Marcus Lin: Security note: ensure we never ingest raw end_user_id; only accept a pre-hashed header (documented) or hash server-side with a rotating salt that is not shared externally. Please document which mode we\u2019re using in this release.",
+    "2026-02-21 \u2014 Jordan Lee: Addressed security feedback in PR: header must be 'x-rw-user-hash' (already hashed); otherwise we use api_key_id. Added evaluator metric 'experiment_assignment_error_total' (no high-card tags). Perf run scheduled Monday; leaving ticket In Review until results attached."
+  ],
+  "activity_log": [
+    "2026-02-05 Created by Jada Williams",
+    "2026-02-07 Status: Planned -> In Progress",
+    "2026-02-17 Linked PR #18357 and moved to In Review",
+    "2026-02-21 Updated acceptance criteria + security notes"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "perf_budget",
+    "implementation_notes",
+    "test_plan",
+    "rollout_plan",
+    "comments"
+  ]
+}

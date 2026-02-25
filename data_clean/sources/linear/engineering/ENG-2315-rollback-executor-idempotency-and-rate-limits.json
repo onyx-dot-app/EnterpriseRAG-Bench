@@ -1,0 +1,58 @@
+{
+  "key": "ENG-2315",
+  "team": "engineering",
+  "title": "Rollback executor: idempotency keys + per-tenant throttling for repeated SLO breach events",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-02-06",
+  "updated_at": "2025-03-01",
+  "creator": "Benji Okafor",
+  "assignee": "Benji Okafor",
+  "project": "Auto-rollback on SLO breach integration",
+  "cycle": "2025-W07",
+  "estimate": "8",
+  "due_date": "2025-02-21",
+  "labels": [
+    "rollout-controller",
+    "reliability",
+    "auto-rollback",
+    "idempotency",
+    "rate-limits",
+    "safety-guardrails",
+    "oncall"
+  ],
+  "dependencies": [
+    "ENG-2313",
+    "ENG-2314",
+    "ENG-2312"
+  ],
+  "parent_issue": "PM-482",
+  "sub_issues": [
+    "ENG-2317",
+    "ENG-2318"
+  ],
+  "customer_impact": "high",
+  "release": "control-plane-2025.02",
+  "security_review_required": "false",
+  "body": "Context\nWe are adding auto-rollback when latency/error SLOs breach during rollout. This ticket covers the rollback executor safety layer: it must be idempotent under repeated breach events and must throttle rollbacks per tenant (and optionally globally) to avoid cascading changes.\n\nProblem\n- SLO evaluator can emit the same breach verdict repeatedly (polling + overlapping windows) and/or multiple monitors can trip for the same rollout.\n- Control plane can restart or receive duplicate events.\n- Without guardrails, executor can:\n  - re-apply the same rollback repeatedly (no-op but noisy + audit spam)\n  - oscillate (rollback triggered again while traffic split already reverted)\n  - cascade across many tenants during correlated incidents (telemetry issues, region incident)\n\nGoals / requirements\n1) Idempotency\n- A given breach verdict should cause at most one rollback action per rollout target.\n- Duplicate/replayed verdict messages must be safe.\n- Executor must be safe across process restarts and leader changes (no reliance on in-memory state).\n\n2) Rate limiting / throttling\n- Per-tenant throttling: prevent a single tenant from being rolled back repeatedly within a short period (cooldown is policy-level, but executor should enforce a hard safety throttle as well).\n- Provide a global safety limit to avoid triggering rollbacks across too many tenants in a short time window (configurable; can be disabled initially).\n\n3) Safe behavior on repeated breach events\n- If already rolled back to the target stable version, treat as idempotent success (no-op) and emit a trace log only (no paging).\n- If rollout is already aborted/paused, do not attempt rollback; record a decision trace.\n- If verdict is UNKNOWN (monitor stale/unavailable) do not rollback.\n\n4) Auditability\n- Emit a single audit event for an actual state change, not for every duplicate verdict.\n- Persist enough metadata to understand why a rollback occurred (verdict reason + monitor identity + policy id/version).\n\nNon-goals\n- Picking the SLO algorithm (covered by ENG-2314).\n- Console history view/pagination (covered by ENG-2316).\n\nProposed implementation (executor semantics)\nA) Idempotency key\nWe define a stable idempotency key for rollback attempts:\n- idempotency_key = sha256(\"auto_rollback\" + tenant_id + route_id + rollout_id + target_stable_version_id + policy_id + policy_version)\n\nNotes:\n- Including target_stable_version_id avoids treating different targets as duplicates.\n- Including policy_version avoids collisions if policy changes mid-rollout.\n- We intentionally do NOT include window_end timestamp to prevent repeated rollbacks due to shifting windows.\n\nB) Persistent idempotency record\nAdd a small state record in rollout-controller storage (same persistence layer as rollout state) keyed by idempotency_key:\n- created_at\n- last_attempt_at\n- status: STARTED | APPLIED | SKIPPED_NOOP | FAILED\n- applied_rollout_state_version (optimistic concurrency token)\n- verdict_summary (short string) + monitor_identity\n\nExecutor flow:\n1. Validate verdict is actionable:\n   - verdict == BREACH\n   - rollout_state is active AND has a prior stable version\n   - traffic split currently sends >0% to candidate OR rollout is in canary/ab state\n2. Throttle checks:\n   - Per-tenant throttle: if tenant had any APPLIED rollback in last X minutes (hard safety), SKIP with reason THROTTLED_TENANT.\n   - Global throttle (optional, behind flag): if >N rollbacks in last Y minutes, SKIP with reason THROTTLED_GLOBAL.\n3. Acquire idempotency record:\n   - create-if-not-exists; if exists and status in {APPLIED, SKIPPED_NOOP} => return idempotent success.\n   - if exists and status STARTED but last_attempt_at < now-lease => treat as recoverable and continue (handles crash mid-execution).\n4. Apply rollback with CAS:\n   - update routing config / rollout state using optimistic concurrency; ensure we only revert to prior stable version.\n   - set split back to 100% stable (or previous stable split depending on rollout type).\n   - mark rollout as \"aborted_by_policy\" with reason=\"AUTO_ROLLBACK_SLO_BREACH\".\n5. Mark idempotency record APPLIED and emit:\n   - audit event: rollout.auto_rollback.executed\n   - incident-bot notification (Slack) with links\n\nC) No-op detection\nIf traffic split is already 100% stable OR candidate is not receiving traffic:\n- mark idempotency record SKIPPED_NOOP\n- emit decision trace metric but do not page.\n\nD) Metrics / observability (executor-owned)\n- rollout_controller.rollback_executor.attempts_total{result=applied|noop|throttled|failed}\n- rollout_controller.rollback_executor.idempotency_cache_hits_total\n- rollout_controller.rollback_executor.throttle_denied_total{scope=tenant|global}\n- rollout_controller.rollback_executor.cas_conflicts_total\n\nAcceptance criteria\n- [x] Duplicate breach verdicts result in at most one applied rollback.\n- [x] Executor is safe under restarts; repeated execution attempts converge to correct end state.\n- [x] Per-tenant throttle prevents repeated rollbacks within hard safety window (default: 15m; configurable).\n- [x] Audit events are emitted once per applied rollback and include policy id/version + monitor identity.\n- [x] Integration tests cover: duplicate events, CAS conflict, no-op case, throttle deny.\n\nImplementation notes / decisions\n- Hard safety throttle is separate from policy cooldown. Policy cooldown is evaluated upstream; executor throttle is a last line of defense.\n- We will ship global throttle behind a feature flag initially (to tune based on game day + real traffic).\n\nLinks\n- Design context: Auto-rollback SLO integration design spec (Confluence)\n- PR (main): sources/github/redwood/pr-18471.json\n- Follow-up guardrail (unknown/stale monitors): sources/github/redwood/pr-18546.json\n- Related: ENG-2314 (evaluator), ENG-2317 (audit events), ENG-2318 (metrics)\n\nTest plan\n- Unit tests:\n  - idempotency key stability\n  - record create/update transitions\n  - tenant throttle window logic\n- Integration tests (synthetic harness):\n  - send same breach verdict 10x concurrently -> 1 rollback applied\n  - simulate process restart mid-execution -> eventual APPLIED and stable routing\n  - CAS conflict (rollout state changed concurrently) -> retry + eventual consistency\n  - throttle denial -> no routing change + metrics increment\n\nRollout / risk\n- Enable executor behind feature flag: rollout.auto_rollback_executor_enabled\n- Start with internal canaries only, then low-risk tenants.\n- Monitor: cas_conflicts, throttled_total, and audit event volume.\n\nOpen questions\n- Do we want to include region in idempotency key? (Current plan: rollout_id already binds to region-scoped rollout; confirm with Mina/Ravi.)\n- What is the initial hard throttle window per tenant? Proposal: 15m. SRE input requested.\n",
+  "comments": [
+    "2025-02-07 (Miles Thornton): +1 on separate hard safety throttle from policy cooldown. During correlated incidents, policy evaluation can still be noisy; executor must be conservative. Please also ensure no rollback on UNKNOWN verdicts (monitor outage).",
+    "2025-02-08 (Jordan Lee): For idempotency key, include policy_version; we\u2019ve seen config edits mid-rollout. Also recommend treating APPLIED as terminal to avoid audit spam.",
+    "2025-02-10 (Mina Haddad): Routing write path uses CAS; please count CAS conflicts and avoid infinite retry loops. Cap retries and emit reason.",
+    "2025-02-12 (Rafael Mendes): For oncall, no-op should not page. Applied rollbacks should page only for Dedicated/Enterprise tiers; others can be ticket. (Paging policy tracked elsewhere but executor should set appropriate event type/metadata.)",
+    "2025-02-18 (Benji Okafor): Implemented idempotency record + per-tenant throttle. Global throttle behind flag. Added no-op detection when stable already at 100%. Draft PR up for review.",
+    "2025-02-20 (Allison Grant): Please attach monitor identity (route/model/region/tier) in the decision trace. We\u2019ll need it for dashboards and false-positive analysis.",
+    "2025-02-24 (Benji Okafor): PR merged. Added metrics + CAS conflict counter; decision trace logs include monitor identity + policy id/version. Follow-up PR to handle UNKNOWN verdict from stale monitor merged separately."
+  ],
+  "history": [
+    "2025-02-06: Issue created (P0) after architecture review highlighted rollback flapping risk.",
+    "2025-02-12: Scope updated to include persistent idempotency record (not in-memory).",
+    "2025-02-18: Moved to In Review; PR opened.",
+    "2025-02-24: Marked Done after merge + basic integration test coverage; follow-up guardrail tracked in PR-18546."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "comments"
+  ]
+}

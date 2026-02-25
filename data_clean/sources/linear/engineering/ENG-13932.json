@@ -1,0 +1,54 @@
+{
+  "key": "ENG-13932",
+  "team": "engineering",
+  "title": "Add rate limiting + backpressure controls for audit export pipeline to protect primary API latency",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-02-03",
+  "updated_at": "2025-02-18",
+  "creator": "Sean Gallagher",
+  "assignee": "Diego Santos",
+  "project": "SIEM-ready audit export (beta)",
+  "cycle": "2025-W07",
+  "estimate": "8",
+  "due_date": "2025-02-21",
+  "labels": [
+    "siem-export",
+    "reliability",
+    "backpressure",
+    "rate-limiting",
+    "load-shedding",
+    "worker",
+    "control-plane"
+  ],
+  "parent_issue": "ENG-13920",
+  "dependencies": [
+    "ENG-13923",
+    "ENG-13928",
+    "ENG-13931",
+    "ENG-13933"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.18",
+  "security_review_required": "true",
+  "description": "## Context\nSIEM-ready audit export introduces a new delivery pipeline (queue + workers + sink connectors) that runs alongside the primary Redwood API surfaces. During staging soak tests we observed periodic retry storms (connector 429/5xx) that increased CPU and network usage on shared nodes, and correlated with p95 latency regression on unrelated API routes.\n\nThis ticket adds explicit rate limiting and backpressure controls so the export subsystem degrades gracefully under sink-side throttling or internal backlog growth, without impacting the primary inference/control-plane SLOs.\n\n## Problem\nWithout guardrails, the exporter can:\n- Amplify downstream throttling into a retry storm (tight loops, too many in-flight batches)\n- Build unbounded backlog and pressure shared resources (CPU/mem/net, DB/redis/queue IO)\n- Create noisy-neighbor impact on Hosted/Dedicated shared clusters\n- Cause API tail latency regressions due to resource contention, especially when many tenants enable exports simultaneously\n\n## Goals\n1) Protect primary Redwood API latency and availability from exporter load.\n2) Provide predictable exporter behavior under throttling/outage: bounded resource usage + explicit degradation states.\n3) Avoid \"silent failure\": surface backpressure/degraded status to operators and Console.\n4) Define a load-shedding plan that is safe and explainable to customers (at-least-once remains true; delivery latency can increase; destination can be paused).\n\n## Non-goals\n- Exactly-once delivery (explicitly out of scope per ADR-0217).\n- Solving per-tenant audit event generation volume (this ticket is about export delivery controls).\n- Adding new sinks (handled elsewhere).\n\n## Proposed controls (initial implementation)\n### A) Concurrency + in-flight caps (worker level)\n- Per-destination max_in_flight_batches (default 4) and max_in_flight_bytes (default 32MB).\n- Per-worker global cap on concurrent outbound requests, with per-sink sub-limits:\n  - splunk: 20 concurrent requests per cluster (tunable)\n  - datadog: 15 concurrent requests per cluster (tunable)\n  - s3: 30 concurrent multipart puts per cluster (tunable)\n- Hard cap on batch size and batch token count (already partially defined in connector tickets; enforce centrally as well).\n\n### B) Adaptive backoff + circuit breaker (destination level)\n- Backoff is exponential with jitter for retryable classes (429, 408, 5xx, network timeouts), respecting Retry-After when present.\n- Circuit breaker per destination:\n  - Opens when retryable error ratio > 50% over a 5 min window OR consecutive failures > 20.\n  - When open: destination transitions to \"degraded\" state; workers stop pulling new work for that destination for a cooldown window (e.g., 2\u20135 minutes), but continue checkpoint heartbeats.\n  - Half-open: allow limited probe traffic (1 batch per minute) to detect recovery.\n\n### C) Queue/backlog watermarks + load shedding\nDefine watermarks based on backlog depth and age per destination:\n- WARN: backlog_age_p95 > 10 min OR backlog_count > 250k events\n- CRITICAL: backlog_age_p95 > 60 min OR backlog_count > 2M events\n\nActions:\n- WARN: reduce concurrency by 50% for affected destination(s), increase batch size slightly to improve throughput if sink supports it.\n- CRITICAL: pause affected destination(s) automatically if they exceed resource guardrails AND are generating cluster-level contention. Pausing is reversible and should be visible in Console with a clear reason.\n\nImportant: pausing export does not drop events; it stops attempting delivery and allows the backlog to persist until resumed (bounded by queue retention policy).\n\n### D) Cluster resource isolation (Hosted baseline)\n- Run exporter workers in a dedicated Kubernetes node pool (where available) with requests/limits.\n- Apply NetworkPolicy/egress shaping where supported (at minimum: avoid saturating shared NAT gateways).\n\n### E) API protection\n- Ensure audit-export control-plane endpoints (destination CRUD, health endpoints) remain responsive under exporter failure by:\n  - avoiding shared hot locks in state updates\n  - using bounded writes for status updates (rate-limit status persistence to e.g. 1 update / destination / 30s)\n\n## Interfaces / config\n- Add config knobs (server-side defaults; not customer-facing for beta unless needed):\n  - export.worker.max_concurrency_global\n  - export.worker.max_concurrency_by_sink.{splunk,datadog,s3}\n  - export.destination.max_in_flight_batches\n  - export.backpressure.warn_backlog_age_seconds\n  - export.backpressure.critical_backlog_age_seconds\n  - export.circuitbreaker.open_threshold_error_ratio\n  - export.circuitbreaker.cooldown_seconds\n- Ensure health/status API includes:\n  - destination_state: enabled | paused | degraded\n  - degraded_reason: throttling | sink_5xx | backlog | operator_pause | config_error\n  - next_retry_at\n\n## Metrics (must be emitted)\n- export_outbound_requests{sink,code_class}\n- export_retry_attempts{sink,reason}\n- export_backoff_seconds{sink}\n- export_circuitbreaker_state{sink,state}\n- export_backlog_depth{destination}\n- export_backlog_age_seconds_p95{destination}\n- exporter_cpu_seconds_total / exporter_net_bytes_total (cluster-level)\n\n## Acceptance criteria\n- Under synthetic downstream throttling (429s) for Splunk/Datadog, exporter throughput degrades but does not cause >5% regression in primary API p95 latency in shared staging environment.\n- Retry storms are prevented: outbound request rate stays within configured caps and stabilizes within 2 minutes of sustained throttling.\n- Circuit breaker transitions are visible in exporter logs and destination health.\n- Automatic pause triggers only at CRITICAL watermark and logs an operator-actionable reason.\n- Console can display paused/degraded states without flapping (state update rate limited).\n- Runbook update: document how to resume destination, how to tune knobs, and how to replay after pause.\n\n## Rollout plan\n1) Ship as disabled-by-default config flags in staging.\n2) Run soak test from audit-export-test-matrix cases: \"throttle\", \"5xx\", \"slow sink\".\n3) Enable for 1\u20132 internal tenants in Hosted canary.\n4) Expand to beta tenants after SRE sign-off and dashboard readiness.\n\n## Open questions\n- Should automatic pause be cluster-wide or strictly per destination? Current proposal is per destination, with cluster-level guardrail only when shared resource contention is detected.\n- Queue retention: confirm min retention window in beta so pausing doesn\u2019t risk data loss.\n- Private deployments: do we rely solely on concurrency caps (no dedicated node pool) or also require recommended resource isolation in install notes?\n\n## Links\n- Confluence design spec: audit-export filtering + delivery guarantees\n- ADR-0217: delivery semantics (at-least-once)\n- Slack thread: eng-platform retry storm investigation (Jan 2025)\n- Related: ENG-13931 observability + alerts",
+  "comments": [
+    "2025-02-05 (Diego Santos): Reproduced staging issue by forcing Datadog intake mock to return sustained 429. Current worker keeps ~200 concurrent goroutines and ramps retries faster than backoff suggests due to per-batch retry loops. Plan: introduce central limiter + unify retry scheduler to avoid immediate requeue.",
+    "2025-02-07 (Allison Grant): Please ensure we can graph \"circuit breaker open\" and distinguish throttling vs auth vs schema errors. Also add a metric for \"paused_by_system\" vs \"paused_by_operator\" to reduce paging noise.",
+    "2025-02-08 (Sean Gallagher): Primary constraint is protecting inference API p95 and control plane p99. We should consider exporter running on separate node pool for Hosted; for Dedicated/Private, hard caps are mandatory since isolation varies. Add explicit CRITICAL watermark action and page only when backlog age breaches SLO, not on every breaker open.",
+    "2025-02-11 (Diego Santos): Implemented token-bucket limiter for outbound requests (global + per-sink). Added destination max_in_flight_batches; defaulted to 4. Seeing stable outbound RPS under throttle tests. Next: circuit breaker state machine + destination state propagation.",
+    "2025-02-13 (Kevin Osei): Security note: automatic pausing/resuming is an operational change; ensure it writes an audit event (export.destination.state_change) with actor=system and includes reason. This helps with customer trust during incidents.",
+    "2025-02-14 (Diego Santos): Added breaker open/half-open/closed with cooldown and probe requests. Need review on thresholds; currently: open after 20 consecutive retryable failures or 60% retryable over 5 min. Wired degraded_reason in status payload. Pending: rate-limit status DB writes (currently too chatty).",
+    "2025-02-17 (Felix Schneider): Console expects stable enum values for destination_state and degraded_reason. Please keep them aligned with ENG-13928 response schema; propose: destination_state=[enabled,paused,degraded] and degraded_reason=[throttling,sink_5xx,backlog,operator_pause,config_error].",
+    "2025-02-18 (Diego Santos): Implemented status write coalescing (min 30s between writes per destination unless state changes). Starting full soak tonight with mixed Splunk 5xx + Datadog 429. Will report primary API latency deltas from staging dashboards."
+  ],
+  "sub_issues": [
+    "ENG-13928",
+    "ENG-13931"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ]
+}

@@ -66,7 +66,7 @@ JSON document:
 
 # Title field guidance:
 - Sometimes the title field is already called title or something obvious in which case just point to that field.
-- For text type documents, it may be the first sentence of the document. For markdown, it may be the first heading.
+- If there is only text, it may be the first sentence of the document. For markdown, it may be the first heading.
 - For things like discussion threads, it could be the channel name.
 - For things like tickets, it could be the short (not paragraph/long) summary or name of the ticket, and not the UUID. If there is no short title/summary, use the next best thing which would be the UUID.
 - For most documents, this should be fairly obvious.

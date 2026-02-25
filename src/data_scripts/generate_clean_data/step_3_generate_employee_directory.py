@@ -1,5 +1,6 @@
 """Interactive script for generating employee directory with validation."""
 
+import os
 from datetime import datetime
 from io import StringIO
 
@@ -10,6 +11,7 @@ from src.llm.conversation import Conversation
 from src.paths import COMPANY_OVERVIEW_PATH, EMPLOYEE_DIRECTORY_PATH, INITIATIVES_PATH, VISUAL_EMPLOYEE_DIRECTORY_PATH
 from src.prompts.employee_directory import EMPLOYEE_DIRECTORY_SYSTEM_PROMPT
 from src.schemas.employee_directory import EXPECTED_FORMAT, EmployeeDirectory, validate_employee_directory
+from src.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import FinishTool, WriteTool
 
@@ -256,7 +258,27 @@ def run_validation() -> bool:
 # =============================================================================
 
 
+def _confirm_regenerate(data_description: str) -> bool:
+    """Prompt user to confirm regeneration of existing data."""
+    response = input(f"{data_description} already exists. Regenerate? [y/N]: ").strip().lower()
+    return response in ("y", "yes")
+
+
 def main() -> None:
+    # Check if employee directory already exists
+    if os.path.exists(EMPLOYEE_DIRECTORY_PATH):
+        if not _confirm_regenerate("Employee directory"):
+            # Just update statistics and exit
+            print("Updating statistics only...")
+            directory = load_employee_directory()
+            total_employees = sum(len(emps) for emps in directory.departments.values())
+            update_statistics("Step 3: Employee Directory", {
+                "total_employees": total_employees,
+                "departments": len(directory.departments),
+            })
+            print("Statistics updated.")
+            return
+
     # Load context files and build the prompt
     company_overview = load_file(COMPANY_OVERVIEW_PATH)
     initiatives = load_file(INITIATIVES_PATH)
@@ -311,6 +333,13 @@ def main() -> None:
         if finish_tool.finished:
             print("\nFinish signal received. Running validation...")
             if run_validation():
+                # Update aggregate statistics
+                directory = load_employee_directory()
+                total_employees = sum(len(emps) for emps in directory.departments.values())
+                update_statistics("Step 3: Employee Directory", {
+                    "total_employees": total_employees,
+                    "departments": len(directory.departments),
+                })
                 print("\nEmployee directory generation complete!")
                 break
             else:

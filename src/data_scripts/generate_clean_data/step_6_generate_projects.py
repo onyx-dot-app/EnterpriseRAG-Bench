@@ -35,6 +35,7 @@ from src.schemas.project_enrichment import (
     validate_project_enrichment,
     validate_project_people,
 )
+from src.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import (
     GlobTool,
@@ -767,6 +768,19 @@ def populate_project_people(max_parallelization: int = 5) -> None:
             print(f"  - {filename}: {error}")
 
 
+def _has_project_files() -> bool:
+    """Check if there are any project JSON files."""
+    if not os.path.exists(PROJECTS_DIR):
+        return False
+    return any(f.endswith(".json") for f in os.listdir(PROJECTS_DIR))
+
+
+def _confirm_regenerate(data_description: str) -> bool:
+    """Prompt user to confirm regeneration of existing data."""
+    response = input(f"{data_description} already exists. Regenerate? [y/N]: ").strip().lower()
+    return response in ("y", "yes")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate and enrich projects based on company context."
@@ -778,6 +792,18 @@ def main() -> None:
         help="Maximum number of parallel enrichments (default: 5)",
     )
     args = parser.parse_args()
+
+    # Check if projects already exist
+    if _has_project_files():
+        if not _confirm_regenerate("Projects"):
+            # Just update statistics and exit
+            print("Updating statistics only...")
+            project_count = len([f for f in os.listdir(PROJECTS_DIR) if f.endswith(".json")])
+            update_statistics("Step 6: Projects", {
+                "total_projects": project_count,
+            })
+            print("Statistics updated.")
+            return
 
     print("Step 6: Generate Projects")
     print("=" * 40)
@@ -810,6 +836,12 @@ def main() -> None:
     # NOTE: This is necessary as a separate step because the step above is already quite complex
     # and the miss rate when these were combined was too high.
     populate_project_people(max_parallelization=args.max_parallelization)
+
+    # Update aggregate statistics
+    project_count = len([f for f in os.listdir(PROJECTS_DIR) if f.endswith(".json")])
+    update_statistics("Step 6: Projects", {
+        "total_projects": project_count,
+    })
 
 
 if __name__ == "__main__":

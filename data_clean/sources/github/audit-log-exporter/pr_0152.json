@@ -1,0 +1,72 @@
+{
+  "repo": "audit-log-exporter",
+  "pr_number": "152",
+  "title": "Add S3 sink writer (hourly partitions, gzip, SSE-KMS, idempotent object keys)",
+  "author": "Diego Santos",
+  "created_at": "2025-02-11",
+  "updated_at": "2025-02-14",
+  "merged_at": "2025-02-14",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/s3-sink-writer",
+  "reviewers": [
+    "Ethan Park",
+    "Hanae Suzuki",
+    "Rafael Mendes",
+    "Marcus Lin"
+  ],
+  "labels": [
+    "audit-export",
+    "connectors",
+    "s3",
+    "security",
+    "private-deployments"
+  ],
+  "linked_linear": [
+    "ENG-13926",
+    "ENG-13923"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "19",
+  "additions": "1384",
+  "deletions": "112",
+  "body": "Context: This PR implements the S3 sink connector for the audit-export worker. The connector writes Audit Event v1 records as JSONL, compressed with gzip, partitioned by tenant and hour, with optional SSE-KMS encryption. Since overall delivery semantics are at-least-once, the S3 writer also implements an idempotent object naming scheme so retries do not create a new object per attempt.\n\nKey behaviors: 1) Hourly partitions: objects are written under a stable prefix with the following layout: s3://{bucket}/{prefix}/tenant_id={tenant_id}/workspace_id={workspace_id}/env={environment}/dt={YYYY-MM-DD}/hr={HH}/dest={destination_id}/chk={start_seq}-{end_seq}.jsonl.gz. This matches the ADR direction for partitioning and keeps typical SIEM ingestion queries (hourly ranges, per tenant) efficient. 2) Format: newline-delimited JSON (one audit event per line) with schema_version preserved as-is; the writer does not transform or redact fields (redaction remains upstream in the event producer/schema pipeline). 3) Compression: gzip level is configurable (default 6). We emit Content-Type=application/x-ndjson and Content-Encoding=gzip. 4) SSE-KMS: adds support for SSE-S3 and SSE-KMS. When sse_mode=kms, the writer sets x-amz-server-side-encryption=aws:kms and x-amz-server-side-encryption-aws-kms-key-id from config (KMS key ARN or key ID). Also supports bucket keys via x-amz-server-side-encryption-bucket-key-enabled=true (off by default). 5) Idempotent object naming: object key is deterministic based on destination_id + partition hour + checkpoint range (start_seq/end_seq). On retry, the worker attempts to PUT the same key again. If the object already exists, we HEAD the key and compare the stored x-amz-meta-redwood-sha256 to the local payload sha256 (computed over the gzipped bytes). If it matches, we treat the write as success and advance the checkpoint. If it differs, we fail the batch as a hard error (to avoid silently overwriting a different payload for the same checkpoint range). 6) Size limits and batching: writer enforces a max_object_bytes limit (default 25 MiB compressed) and will split large batches into multiple objects by rolling the checkpoint range (e.g., chk=1000-1320, chk=1321-1588). This keeps PUTs bounded and reduces the chance of long retries.\n\nConfig surface (new): s3.bucket (required), s3.region (required for AWS; optional when endpoint_url is set), s3.prefix (default: redwood/audit-export), s3.endpoint_url (optional, for S3-compatible storage / private deployments), s3.sse_mode (none|s3|kms), s3.kms_key_id (optional; required when sse_mode=kms), s3.bucket_key_enabled (optional), s3.max_object_bytes, s3.gzip_level.\n\nFailure classification: Auth/permissions (403), not found/misconfig (404 bucket), throttling (429/503 slow down), transient (5xx, timeouts), and hard errors (checksum mismatch on idempotency check, invalid KMS key, invalid bucket policy). Transient errors are retryable via the worker backoff policy; hard errors go to DLQ with a clear reason.\n\nTests: Adds unit tests for key formatting, partition routing, gzip content and metadata, SSE header selection, and idempotent HEAD behavior (existing object with matching sha => success; mismatch => error). Adds an integration-style test using a mocked S3 server interface (no real AWS calls in CI).\n\nNotes for reviewers: The deterministic key uses the checkpoint range; this assumes the worker produces stable batches per destination checkpoint. If we change checkpointing semantics later (e.g., per-event ACK), we will need to revisit the key scheme. Also: metadata-based sha is used instead of ETag since multipart uploads can make ETag comparisons unreliable.\n\nRollout: feature-gated by destination.type=s3 and not enabled in prod configs by default. Safe to merge behind flag; actual enablement is controlled by the control plane destination configuration.\n\nDocs follow-up: Kira/Elliot will document required bucket policy + KMS key policy in the Terraform examples; this PR only wires the runtime behavior.\n\nChecklist: - [x] Unit tests - [x] Retry classification - [x] Metrics hooks (bytes written, objects written, s3 request latency) - [x] Local dev config example - [x] Security review for SSE-KMS handling\n\nRefs: ENG-13926, ENG-13923",
+  "commits": [
+    "connector/s3: introduce S3SinkConfig and validation (kms key required for SSE-KMS)",
+    "connector/s3: implement JSONL+gzip writer and hourly partition key builder",
+    "connector/s3: idempotency via deterministic object keys + sha256 metadata comparison",
+    "connector/s3: add error taxonomy and retryability mapping",
+    "tests: add unit tests for partitioning, compression, SSE headers, and idempotency behavior",
+    "docs: add sample s3 destination config in README (dev only)"
+  ],
+  "changed_files": [
+    "connectors/s3/config.go",
+    "connectors/s3/writer.go",
+    "connectors/s3/key_format.go",
+    "connectors/s3/errors.go",
+    "connectors/s3/client.go",
+    "connectors/s3/metrics.go",
+    "connectors/s3/writer_test.go",
+    "connectors/s3/key_format_test.go",
+    "connectors/s3/idempotency_test.go",
+    "worker/delivery/sink_registry.go",
+    "worker/delivery/delivery_loop.go",
+    "config/examples/s3_destination.yaml",
+    "README.md"
+  ],
+  "ci_checks": [
+    "build (linux/amd64): pass",
+    "unit-tests: pass",
+    "lint: pass",
+    "go-vet: pass"
+  ],
+  "conversation": "Ethan Park (review): The checkpoint-range key naming makes sense, but I want to be sure we don\u2019t accidentally advance checkpoints on partial writes. Are we only checkpointing after the PUT completes? Diego Santos (author): Yes. The worker calls sink.Deliver(batch) and only commits the checkpoint when Deliver returns success. In the S3 sink, the only success paths are: (1) PUT succeeds or (2) object already exists and sha256 metadata matches the local gz payload. Anything else returns error and the worker will not commit.\n\nHanae Suzuki (review): For SSE-KMS, please ensure we never log the KMS key id/arn at info level with tenant identifiers. Also, what about bucket keys? Diego Santos: Good call. I removed kms_key_id from the info logs; it is only included in debug logs with destination_id redaction (and we already treat destination config fields as secrets in the worker logs). Added bucket_key_enabled support, default false. Also added a validation error that kms_key_id must be present when sse_mode=kms.\n\nMarcus Lin (review): Idempotency check: you\u2019re using x-amz-meta-redwood-sha256. Confirm that metadata is stable and not altered by proxies/SDK behavior. Also, what happens if the object exists but has no metadata (e.g., customer wrote over it)? Diego Santos: Metadata is written by us on PUT and returned by HEAD. If metadata is missing, we treat it as a hard error (non-retryable) because we can\u2019t safely assert equivalence. That failure will land in DLQ with reason=IDEMPOTENCY_METADATA_MISSING so operators can decide whether to replay with a different prefix.\n\nRafael Mendes (review): Please add metrics so we can alert on sustained S3 failures and object write volume. Diego Santos: Added s3_requests_total{status_class,operation}, s3_delivery_latency_seconds histogram, and counters for objects_written_total and bytes_written_total, labeled by destination_id and error_class. (Destination_id labeling is consistent with our other connectors; tenant_id is intentionally not used as a metric label.)\n\nEthan Park (follow-up): How are you splitting batches to respect max_object_bytes? Diego Santos: The writer accumulates events until adding the next event would exceed max_object_bytes (estimated from current gz buffer size + per-event overhead), then flushes an object and starts a new range. The resulting objects have contiguous checkpoint ranges.\n\nApproval: Ethan Park approved. Hanae Suzuki approved with note about logging. Marcus Lin approved. Rafael Mendes approved.\n\nMerge: Squash merged by Diego Santos on 2025-02-14.",
+  "merge_method": "squash",
+  "release_notes": "- Adds S3 destination support for audit export worker (hourly partitioning, gzip JSONL).\n- Supports SSE-S3 and SSE-KMS (optional) with deterministic object naming for idempotent retries.\n- Adds basic S3 sink metrics and error classification.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "conversation",
+    "release_notes"
+  ]
+}

@@ -23,11 +23,14 @@ from src.prompts.document_generation import (
     DOCUMENT_GENERATION_USER_PROMPT,
     FIELD_LABELER_PROMPT,
 )
+from collections import Counter
+
 from src.schemas.field_labels import (
     parse_field_labels,
     validate_field_labels,
     validate_field_labels_against_document,
 )
+from src.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import ReadTool
 
@@ -555,8 +558,6 @@ def process_single_project(
 
 def print_document_statistics() -> None:
     """Print statistics about generated documents per top-level source."""
-    from collections import Counter
-
     source_counts: Counter[str] = Counter()
     total_documents = 0
 
@@ -858,20 +859,20 @@ def main() -> None:
     parser.add_argument(
         "--project-parallelism",
         type=int,
-        default=1,
-        help="Number of projects to process in parallel (default: 1)",
+        default=5,
+        help="Number of projects to process in parallel (default: 5)",
     )
     parser.add_argument(
         "--project-file-parallelism",
         type=int,
-        default=1,
-        help="Number of files to process in parallel within each project (default: 1)",
+        default=5,
+        help="Number of files to process in parallel within each project (default: 5)",
     )
     parser.add_argument(
         "--labeling-parallelism",
         type=int,
-        default=5,
-        help="Number of documents to label in parallel (default: 5)",
+        default=20,
+        help="Number of documents to label in parallel (default: 20)",
     )
     args = parser.parse_args()
 
@@ -880,6 +881,8 @@ def main() -> None:
     print("This script generates individual document files for each project and adds field labels.")
     print("Phase 1: Generate documents based on project overviews")
     print("Phase 2: Add title/content field labels to documents")
+    print()
+    print("Note: If any of the documents fail validation, you may need to rerun the script.")
     print()
 
     # Phase 1: Generate documents
@@ -890,6 +893,22 @@ def main() -> None:
 
     # Phase 2: Label documents
     label_documents(max_parallelism=args.labeling_parallelism)
+
+    # Update aggregate statistics
+    sources_dir = os.path.join(DATA_CLEAN_DIR, "sources")
+    source_counts: Counter[str] = Counter()
+    total_docs = 0
+    for root, _dirs, files in os.walk(sources_dir):
+        for f in files:
+            if f.endswith(".json"):
+                rel_path = os.path.relpath(root, sources_dir)
+                top_level = rel_path.split(os.sep)[0]
+                source_counts[top_level] += 1
+                total_docs += 1
+    update_statistics("Step 7: Documents", {
+        "total_documents": total_docs,
+        "documents_per_source": dict(source_counts),
+    })
 
 
 if __name__ == "__main__":

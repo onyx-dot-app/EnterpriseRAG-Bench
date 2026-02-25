@@ -1,0 +1,54 @@
+{
+  "key": "ENG-3927",
+  "team": "engineering",
+  "title": "Selector v2 telemetry: decision metrics/events, sampling, bucketing, trace annotations",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2026-01-10",
+  "updated_at": "2026-02-18",
+  "creator": "Grace Kim",
+  "assignee": "Logan Wright",
+  "project": "Kernel auto-selection v2",
+  "cycle": "2026-W04",
+  "estimate": "8",
+  "due_date": "2026-02-10",
+  "labels": [
+    "runtime",
+    "observability",
+    "kernel-selector-v2",
+    "metrics",
+    "tracing",
+    "cardinality"
+  ],
+  "parent_issue": "ENG-3921",
+  "dependencies": [
+    "ENG-3923",
+    "ENG-3924",
+    "ENG-3925",
+    "ENG-3926"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.19",
+  "security_review_required": "false",
+  "description": "Goal\nAdd production-safe telemetry for kernel selector v2 so we can:\n- Debug \u201cwhy this kernel was chosen\u201d (model family, seq regime, GPU SKU, selector version, rule/override path)\n- Correlate decision outcomes with latency/cost/correctness (incl. NaNs / shape mismatches)\n- Monitor rollout safely (selector_v2 vs v1 split; fallback frequency; unknown model handling)\n- Avoid blowing up metrics cardinality (controlled labels + bucketing + sampling)\n\nScope\n1) Metrics (Prometheus-style) required for selector v2 rollout and ongoing perf/regression analysis\n2) Structured event logs (sampled) for deep dives, linked to trace/span IDs\n3) Trace annotations (OpenTelemetry attributes) on request spans and kernel execution spans\n4) Sampling & cardinality controls aligned with platform standards\n\nNon-goals\n- Building new dashboards (tracked in ENG-3933 / INT-2331)\n- Changing customer-facing API behavior\n\nProposed instrumentation\nA) Metrics (required)\n- counter: runtime_kernel_selector_decisions_total\n  Labels (strict allowlist):\n  - selector_version: {\"v1\",\"v2\"}\n  - decision_outcome: {\"selected\",\"fallback_v1\",\"fallback_safe_set\",\"override\",\"error\"}\n  - model_family: enum (see registry taxonomy; \"unknown\" allowed)\n  - seq_bucket: {\"prefill_s\",\"prefill_m\",\"prefill_l\",\"decode_s\",\"decode_m\",\"decode_l\"} (exact buckets below)\n  - gpu_sku: normalized enum {\"L4\",\"A10\",\"A100\",\"H100\",\"OTHER\"}\n  - kernel_id: short stable id (bucketed; see kernel_id bucketing below)\n  - tier: {\"hosted\",\"dedicated\",\"private\"}\n- counter: runtime_kernel_selector_unknown_model_family_total\n  Labels: selector_version, gpu_sku, tier\n- counter: runtime_kernel_selector_registry_miss_total\n  (registry has no matching row/column)\n  Labels: selector_version, model_family, gpu_sku, seq_bucket, tier\n- counter: runtime_kernel_selector_fallback_total\n  Labels: selector_version, fallback_reason, model_family, gpu_sku, seq_bucket, tier\n  fallback_reason enum:\n  {\"unknown_family\",\"missing_metadata\",\"gpu_unsupported\",\"shape_unsupported\",\"conformance_blocked\",\"registry_miss\",\"override_disabled_v2\"}\n- histogram: runtime_kernel_selector_decision_latency_ms\n  Labels: selector_version, tier\n  Notes: do NOT label by model_family/gpu/kernel_id; keep low-cardinality.\n- gauge: runtime_kernel_registry_version\n  Labels: tier\n  Value: semantic/monotonic registry version loaded in process (also log on boot)\n\nKernel ID labeling / bucketing\n- Kernel IDs can be high cardinality if we include full internal names. For metrics, we will use:\n  - kernel_id: stable short token (e.g., \"attn_fa2_v3\", \"attn_xformers_v2\", \"attn_safe_v1\")\n  - kernel_variant: (optional) {\"default\",\"gqa\",\"longctx\"} if needed, but only if we can keep it within a small bounded set.\n- Full kernel identifier (including commit hash / compile flags) goes only in sampled events/logs, not metric labels.\n\nSequence length buckets (agreed with Scheduling)\nWe need deterministic, low-cardinality buckets based on selector input context.\n- regime = prefill vs decode (from scheduler signal)\n- effective_seq_len = prompt_len for prefill; context_len for decode (as provided by scheduler/runtime boundary)\nBuckets:\n- prefill_s: [0, 512]\n- prefill_m: (512, 2048]\n- prefill_l: (2048, 8192]\n- decode_s: [0, 128]\n- decode_m: (128, 512]\n- decode_l: (512, 2048]\nNote: anything > max bucket should clamp into *_l to avoid unbounded label values.\n\nGPU SKU normalization\n- Use normalized sku string from ENG-3925 (e.g., \"NVIDIA_L4\" -> \"L4\")\n- If unknown/unmapped, label gpu_sku=\"OTHER\" and include raw sku only in sampled events.\n\nModel family bucketing\n- model_family is from ENG-3922/ENG-3926 taxonomy. Allow only:\n  {\"llama\",\"mistral\",\"qwen\",\"gemma\",\"mixtral\",\"phi\",\"unknown\",\"other\"}\n- Any new family must be added to allowlist + registry mapping to avoid exploding cardinality.\n\nB) Tracing (OpenTelemetry)\nAttach attributes to the request span (or the \u201cinference\u201d span) and to a child \u201ckernel_exec\u201d span if available.\nRequired attributes on request span:\n- redwood.selector.version: \"v1\" | \"v2\"\n- redwood.selector.decision_outcome: enum from above\n- redwood.selector.model_family: allowlisted string\n- redwood.selector.seq_bucket: allowlisted string\n- redwood.selector.gpu_sku: allowlisted string\n- redwood.selector.kernel_id: short stable id (same as metric label)\n- redwood.selector.override_source: {\"none\",\"config_model_family\",\"config_model_exact\",\"emergency_kill_switch\"}\n- redwood.selector.fallback_reason: enum (only if fallback)\n- redwood.registry.version: loaded registry version\n- redwood.selector.explain_code: short reason code (e.g., \"R_MATCH_EXACT\", \"R_MATCH_WILDCARD\", \"R_FALLBACK_SAFE\", \"R_OVERRIDE\")\n\nPII/sensitive\n- Do not attach raw model name, customer id, org name, prompt length exact value, or raw GPU uuid as attributes.\n- If needed for debugging, raw values go to sampled structured logs with appropriate redaction and access controls.\n\nC) Structured events (sampled)\nEmit a structured log event \u201ckernel_selector_decision\u201d with:\n- timestamp, request_id, trace_id, span_id\n- selector_version, registry_version\n- model_family, model_name_hash (stable hash only; no raw string)\n- seq_regime (prefill/decode), effective_seq_len_bucket, effective_seq_len_clamped\n- gpu_sku_norm, gpu_sm (optional), mig_mode (boolean) if available from ENG-3925\n- kernel_id_short, kernel_id_full\n- decision_path: list of steps (strings) with bounded length (max 8 steps)\n- fallback_reason / override_source\n\nSampling policy\n- Success path: 0.5\u20131% sampling (configurable); ensure per-process rate limit.\n- Always log on:\n  - decision_outcome != \"selected\" (fallback/override/error)\n  - conformance guard triggered / NaN guard triggered\n  - unknown model family or registry miss\n- For canary/rollout, allow temporary bump of sampling (e.g., 5%) gated by region + tier config; default back to 1% post-rollout.\n\nAcceptance criteria\n- Runtime exposes metrics above (names final per telemetry standards doc) and they are visible in staging + one canary region.\n- Traces for sampled requests include selector attributes; verified in trace viewer.\n- Cardinality review: label values bounded and verified via staging load test; no per-model-name or per-customer labels.\n- Metrics can power SRE guardrails: selector version split, fallback rate, unknown family rate, decision latency.\n\nImplementation notes / pointers\n- Follow: sources/confluence/architecture-and-standards/performance-standards/kernel-selection-telemetry-standards.json\n- Coordinate with: Thomas Baird (cardinality), Allison Grant (observability standards), Aisha Bello (dashboards/alerts), Omar El-Sayed (runtime integration)\n- Ensure selector v1/v2 parity in telemetry fields to enable comparisons during rollout.\n\nOpen questions\n1) Do we need to distinguish attention kernel vs prefill kernel vs decode kernel in kernel_id? Proposal: kernel_id encodes op family (attn/prefill/decode) already; avoid extra labels unless necessary.\n2) Where to attach \u201ckernel_exec\u201d span attributes in runtime? If too invasive, put all selector fields on request span and add a single \"kernel_id\" attribute on the kernel callsite.\n3) Should \u201ctier\u201d be labeled in metrics or derived from deployment? Proposal: keep tier label; it\u2019s bounded and helpful for Dedicated/Hosted comparison.\n\nLinks\n- Umbrella: ENG-3921\n- PR (telemetry): sources/github/redwood/pr_18493_selector_telemetry_metrics_and_traces.json\n- PR (cardinality follow-up): sources/github/redwood/pr_18519_reduce_metric_cardinality_for_kernel_choice.json\n- Rollout SLO guardrails: sources/confluence/eng-sre/slo-and-error-budgets/selector-v2-rollout-slo-guardrails.json",
+  "comments": [
+    "2026-01-13 (Logan Wright): Drafted metric names/labels + trace attribute set. Flagging kernel_id label risk; will propose short-id mapping and move full ids to sampled logs.",
+    "2026-01-16 (Thomas Baird): Please do NOT label by raw model_name or exact seq_len. Buckets only. Keep decision_latency histogram labels to selector_version+tier max.",
+    "2026-01-20 (Omar El-Sayed): Scheduler can provide prefill/decode and effective_seq_len estimate; will land in ENG-3924. Telemetry should handle missing signal gracefully (seq_bucket=\"prefill_s\" default + fallback_reason=\"missing_metadata\").",
+    "2026-01-24 (Allison Grant): Align with telemetry standards doc; add registry_version gauge and require fallback_reason enum to be stable. Also ensure trace attributes are allowlisted and documented.",
+    "2026-02-02 (Logan Wright): Implemented core metrics + trace attributes behind selector_v2 flag. Added structured event with 1% sampling on success, 100% on non-selected outcomes. PR up: pr_18493.",
+    "2026-02-06 (Sana Farid): Canary analysis needs selector_version breakdown and kernel_choice heatmap. Please ensure kernel_id short list is stable and doesn\u2019t change across builds.",
+    "2026-02-11 (Logan Wright): Post-canary feedback: kernel_id label still too granular (multiple variants). Follow-up PR pr_18519 reduces kernel_id set and moves variant details to sampled event only.",
+    "2026-02-18 (Connor O'Brien): Marking as Done for runtime-1.19. Remaining dashboard work tracked in ENG-3933 / INT-2331."
+  ],
+  "attachments": [
+    "sources/github/redwood/pr_18493_selector_telemetry_metrics_and_traces.json",
+    "sources/github/redwood/pr_18519_reduce_metric_cardinality_for_kernel_choice.json",
+    "sources/google_drive/shared_drives/engineering/serving-runtime/kernel-selector-v2-metrics-cardinality-review.json"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ]
+}

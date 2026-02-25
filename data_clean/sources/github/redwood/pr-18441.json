@@ -1,0 +1,62 @@
+{
+  "repo": "redwood",
+  "pr_number": "18441",
+  "title": "Runtime: make request cancellation barrier-safe to prevent TP group deadlocks (streaming disconnect/timeouts)",
+  "author": "Marcus Reed",
+  "created_at": "2025-02-19",
+  "updated_at": "2025-02-23",
+  "merged_at": "2025-02-23",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "bugfix/tp-cancel-barrier-deadlock",
+  "reviewers": [
+    "Sofia Ivanova",
+    "Julian Moore",
+    "Yuki Sato",
+    "Rafael Mendes"
+  ],
+  "labels": [
+    "runtime",
+    "scheduler",
+    "tp",
+    "bug",
+    "reliability"
+  ],
+  "linked_linear": [
+    "ENG-2403",
+    "ENG-2401"
+  ],
+  "linked_jira": [
+    "SUP-9827",
+    "SUP-9812"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "11",
+  "additions": "312",
+  "deletions": "97",
+  "breaking_change": "false",
+  "body": "Summary\nFixes a scheduler/barrier interaction that can deadlock a tensor-parallel (TP) worker group when a request is cancelled mid-step (common for streaming disconnects and server-side timeouts). The deadlock manifests as 0 forward progress for the TP group (no new tokens emitted, collectives appear idle) while the group continues to be eligible for scheduling.\n\nRoot cause\nWe have a per-step synchronization point in the TP execution loop (\"decode barrier\") that assumes all ranks in the TP group will reach it for a given step_id. When a request is cancelled, one rank can exit early (or skip the remaining step pipeline) and never reaches the barrier. Other ranks then block forever waiting on the barrier, and the scheduler continues to enqueue work onto the stuck group.\n\nThis shows up most often with:\n- long-running streaming responses + client disconnects (cancellation triggered by gateway)\n- server-side timeouts (cancellation triggered by request watchdog)\n- mixed sequence lengths where one rank is delayed and cancellation arrives while others are already entering the barrier\n\nWhat changed\n1) Barrier is now cancellation-aware and cannot wait on ranks that have transitioned out of the current request/step.\n- Introduced a \"step epoch\" and an explicit per-rank arrival state so the barrier can distinguish:\n  a) \"rank has not yet arrived\" vs\n  b) \"rank is cancelled for this step\" (treated as arrived-for-purposes-of-unblocking)\n- Cancellation path now calls tp_group.mark_cancelled(step_id, request_id) before tearing down rank-local decode state.\n- Barrier wait checks cancellation state and unblocks once all ranks are either arrived or cancelled for that step.\n\n2) Cancellation propagation tightened to avoid inconsistent per-rank transitions.\n- When the coordinator cancels a request, it broadcasts the cancel event to all ranks in the group and waits for an ack (best-effort, bounded by timeout) so ranks converge on the same step_id decision.\n- If a rank receives cancellation while inside a barrier wait, it triggers a fast-path wakeup (condition variable notify) rather than waiting for the next scheduler tick.\n\n3) Added a regression test that previously reproduced the deadlock.\n- New test simulates a streaming request, forces rank-2 to lag on decode step N, cancels the request while other ranks are entering the barrier, and asserts:\n  - the request completes with CANCELLED\n  - the TP group can accept a subsequent request and produce tokens\n  - no barrier wait exceeds a small bound (test-level watchdog)\n\nImplementation notes\n- We intentionally treat \"cancelled\" as \"arrived\" for the purpose of barrier completion to avoid hard deadlocks. This is safe because after cancellation we do not require per-rank correctness guarantees for that request; we only require that the group returns to a healthy scheduling state.\n- This PR does not introduce TP group quarantine/reset (that is handled in PR #18432 / ENG-2402 + watchdog PR #18462 / ENG-2407). This PR is focused on correctness of cancellation semantics so we don\u2019t wedge the group in the first place.\n\nFiles / areas touched (high level)\n- runtime/scheduler/tp_decode_loop.cc: barrier participation and cancellation hook\n- runtime/scheduler/tp_group_barrier.{h,cc}: cancellation-aware barrier state + wakeups\n- runtime/scheduler/cancellation_broadcast.cc: bounded broadcast + ack\n- runtime/metrics/runtime_tp_metrics.cc: new counters/histograms\n- runtime/tests/tp_cancel_barrier_deadlock_test.cc: regression test\n\nNew/updated metrics\n- runtime_tp_barrier_wait_ms (histogram, tagged by barrier=decode, outcome=success|cancelled)\n- runtime_tp_cancel_broadcast_ms (histogram)\n- runtime_tp_cancel_barrier_fast_wakeup_total (counter)\n- runtime_tp_barrier_cancelled_participants_total (counter)\n\nTesting\n- Unit: runtime/tests/tp_cancel_barrier_deadlock_test (new)\n- Unit: existing scheduler cancellation tests\n- Local stress: manual repro using tp-hang harness with forced disconnect (see ENG-2403)\n\nRollout\n- Safe to ship behind the existing runtime patch release process. No config changes.\n- Expectation: reduces incidence of \"stuck TP group after streaming disconnect\" signature in SUP-9827.\n\nChecklist\n- [x] Repro written (test)\n- [x] No new sync points added to steady-state decode (only affects cancellation path)\n- [x] Metrics added for visibility\n- [x] Linked ENG-2403\n\nReview conversation (selected)\nSofia Ivanova: Can you confirm we won\u2019t treat a slow rank as cancelled just because the request timed out on another rank? I\u2019m worried about the coordinator getting ahead.\nMarcus Reed (author): Yep \u2014 cancellation is still request-scoped (request_id + step_id). The barrier completion checks \"arrived || cancelled_for(step_id, request_id)\". Timeout triggers cancellation broadcast for that request_id; ranks that never saw the request never participate in that barrier state. Also added a bounded ack wait so we don\u2019t spin forever.\n\nJulian Moore: Please add a metric for \"fast wakeup\" so we can see if we\u2019re hitting the inside-barrier cancel path.\nMarcus Reed: Done: runtime_tp_cancel_barrier_fast_wakeup_total.\n\nYuki Sato: Any chance this interacts with collective error propagation (async NCCL errors) and turns those into silent cancels?\nMarcus Reed: It shouldn\u2019t. This only changes barrier completion conditions when cancellation token is set. Collective failures still surface via the runtime error path (ENG-2406). Added a guard so we don\u2019t mark_cancelled on non-cancel errors.\n\nRafael Mendes: For SRE \u2014 can we get a note in the PR about how to validate in canary?\nMarcus Reed: Added rollout notes + suggested metric to watch: runtime_tp_barrier_wait_ms p99 + cancelled_participants_total correlated with 5xx/timeouts.\n\nApprovals\n- Sofia Ivanova: Approved (after metric + ack bound)\n- Julian Moore: Approved\n- Yuki Sato: Approved\n- Rafael Mendes: Approved\n\nCI\n- build-runtime (linux-x86_64): PASS\n- unit-tests-runtime: PASS\n- scheduler-tests: PASS\n- lint/clang-tidy: PASS\n\nMerge\nSquash merge into main. Included in runtime patch train for 1.19.x (release coordination in eng-releases thread 1739345678).",
+  "commits": [
+    "scheduler: add cancellation-aware TP barrier participant tracking",
+    "runtime: broadcast cancellation to TP ranks w/ bounded ack and barrier wakeup",
+    "tests: add regression test for streaming disconnect -> barrier deadlock",
+    "metrics: expose barrier wait + cancel broadcast histograms"
+  ],
+  "changed_files": [
+    "runtime/scheduler/tp_decode_loop.cc",
+    "runtime/scheduler/tp_group_barrier.h",
+    "runtime/scheduler/tp_group_barrier.cc",
+    "runtime/scheduler/cancellation_broadcast.cc",
+    "runtime/scheduler/cancellation_broadcast.h",
+    "runtime/metrics/runtime_tp_metrics.cc",
+    "runtime/metrics/runtime_tp_metrics.h",
+    "runtime/tests/tp_cancel_barrier_deadlock_test.cc",
+    "runtime/tests/CMakeLists.txt",
+    "runtime/tests/test_fixtures/tp_group_fixture.cc",
+    "docs/internal/runtime/scheduler_cancellation_notes.md"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ]
+}

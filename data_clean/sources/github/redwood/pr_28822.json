@@ -1,0 +1,89 @@
+{
+  "repo": "redwood",
+  "pr_number": "28822",
+  "title": "KMS rotation: dual-read decrypt window with bounded fallback + metrics",
+  "author": "Emily Zhao",
+  "created_at": "2025-03-06",
+  "updated_at": "2025-03-12",
+  "merged_at": "2025-03-12",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/kms-rotation-dual-read-window",
+  "reviewers": [
+    "Marcus Lin",
+    "Vikram Singh",
+    "Sean Gallagher",
+    "Allison Grant",
+    "Ethan Park"
+  ],
+  "labels": [
+    "security",
+    "kms",
+    "rotation",
+    "dataplane",
+    "observability",
+    "reliability"
+  ],
+  "linked_linear": [
+    "ENG-4230"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "612",
+  "deletions": "148",
+  "breaking_change": "false",
+  "release_notes": "- Adds dual-read decrypt behavior during KMS key rotation (new key first, bounded fallback to old key)\n- Adds metrics and tracing attributes to quantify fallback and rotation health\n- Introduces config flags to safely roll out per-environment/tenant",
+  "body": "Context: As part of ENG-4230 we need a low-downtime rotation path for encrypted artifacts without requiring an immediate full re-encryption sweep. During a scheduled or emergency rotation, we will temporarily accept ciphertext that may have been produced with either the newly-selected key version or the previous key version.\n\nThis PR implements a \"dual-read\" window for decrypt operations in the data plane: attempt decrypt using the active (new) key first, then (conditionally) attempt decrypt with the immediately-previous key as a bounded fallback. This is intentionally limited in scope/time to reduce blast radius and avoid masking misconfiguration.\n\nBehavior summary (decrypt path): 1) Determine active encryption key selector from resolved tenant config (key id + pinned version) 2) Attempt decrypt with active selector 3) If decrypt fails with an eligible error class AND dual-read is enabled AND within rotation window, attempt decrypt with previous selector (one additional call max) 4) On success via fallback, emit metrics + trace attributes and include \"fallback_used=true\" in structured logs (sanitized) 5) On failure, return original error (with a synthesized \"rotation_fallback_attempted\" detail for debugging).\n\nBoundaries/guards: - Only one fallback attempt (no chains) - Only to the immediately-previous selector (not arbitrary historical versions) - Fallback only when `kms.rotation.dual_read.enabled` is true and `kms.rotation.dual_read.window_seconds > 0` - Fallback is disabled by default and gated behind a runtime-config flag; additionally can be enabled for a small allowlist of tenants in staging/canary - Error filtering: fallback only triggers on error classes consistent with key mismatch / invalid ciphertext (e.g., InvalidCiphertext/BadRequest for provider wrappers). Explicitly does NOT fallback on throttling/timeouts/AccessDenied to avoid doubling load during outages and to keep IAM/policy problems visible.\n\nMetrics/tracing: - `kms_decrypt_total{provider,tenant_tier,result}` (result=success|failure) - `kms_decrypt_fallback_total{provider,reason}` (reason=invalid_ciphertext|unknown) - `kms_decrypt_fallback_latency_ms` histogram - `kms_rotation_dual_read_window_active` gauge (1 when window is active in process config) - Trace attributes: `kms.key_selector.active`, `kms.key_selector.previous` (hashed), `kms.fallback_used`, `kms.provider_error_code`\n\nNotes: - This PR does not change the encrypt path selection rules; it consumes the control-plane-provided resolved config that includes both active and previous selectors (wired in earlier work). - The previous selector is carried only for the duration of the dual-read window and is not persisted into long-lived caches beyond the configured TTL.\n\nRollout plan: - Stage behind flags in staging, enable for a single canary tenant, verify fallback rates remain <0.5% after the first 24h following rotation, and ensure no p95 decrypt latency regression >5ms when fallback disabled. - Coordinate with SRE (Sean) for alerting thresholds; initial alerts will be on fallback rate spikes and any sustained increase in decrypt errors.\n\nTest plan: - Unit tests for fallback eligibility (error filtering, window boundaries, one-attempt constraint) - Integration test against KMS stub that simulates ciphertext produced by prior key version - Load test verifies no measurable regression when dual-read disabled; verifies bounded overhead when enabled (max +1 KMS call for small % of requests)\n\nFollow-ups: - Wire SRE dashboards/alerts (ENG-4239) to include fallback rates by tenant tier - Document rotation semantics in ADR-0142 and operator runbooks once final thresholds are confirmed",
+  "commits": [
+    "kms: add DualReadDecryptor wrapper with bounded fallback",
+    "kms: classify provider error codes for fallback eligibility",
+    "config: add kms.rotation.dual_read.* flags + tenant allowlist",
+    "metrics: emit fallback counters/histograms + trace attributes",
+    "tests: unit + integration coverage for dual-read window"
+  ],
+  "changed_files": [
+    "services/dataplane/crypto/kms/decryptor.go",
+    "services/dataplane/crypto/kms/errors.go",
+    "services/dataplane/crypto/kms/config.go",
+    "services/dataplane/crypto/kms/metrics.go",
+    "services/dataplane/crypto/kms/decryptor_test.go",
+    "services/dataplane/crypto/kms/integration/dual_read_test.go",
+    "services/dataplane/crypto/kms/README.md",
+    "services/controlplane/contracts/kms_rotation.proto",
+    "services/common/telemetry/trace_attributes.go",
+    "configs/runtime/defaults.yaml",
+    "configs/runtime/flags.md",
+    "tools/kms-stub/server.go",
+    "tools/kms-stub/scenarios/invalid_ciphertext.json",
+    "docs/internal/rotation/dual_read_notes.md"
+  ],
+  "snippet": "Pseudo-code:\n\nfunc (d *DualReadDecryptor) Decrypt(ctx, ciphertext) ([]byte, error) {\n  pt, err := d.active.Decrypt(ctx, ciphertext)\n  if err == nil { return pt, nil }\n  if !d.cfg.Enabled || !d.window.Active() { return nil, err }\n  if !eligibleForFallback(err) { return nil, err }\n  pt2, err2 := d.previous.Decrypt(ctx, ciphertext)\n  if err2 == nil {\n    d.metrics.IncFallback(reasonFrom(err))\n    return pt2, nil\n  }\n  return nil, err\n}\n\nNotes: only one fallback attempt; previous selector is immediate predecessor only.",
+  "conversation": [
+    "Marcus Lin (review): Can we confirm we are NOT falling back on AccessDenied / throttling? We can't double KMS calls during an outage and we don't want IAM regressions masked.",
+    "Emily Zhao (author): Yep. Fallback eligibility is limited to our InvalidCiphertext-like class (provider-specific mapping). Throttle/timeout/AccessDenied short-circuit and return the original error. Added tests to prevent widening this in the future.",
+    "Vikram Singh (review): Please ensure the previous key selector isn't cached longer than the rotation window. If a process never restarts, this could turn into a long-term bypass.",
+    "Emily Zhao (author): Good catch. Previous selector is only present in the resolved config and we apply a hard window check on every decrypt attempt. Also bounded the in-memory selector cache TTL to `min(selector_cache_ttl, window_seconds)` when dual-read is on.",
+    "Allison Grant (review): Metrics look good. Can we add a label or trace attribute to distinguish 'fallback attempted but failed' vs 'fallback succeeded'? Helps during canaries.",
+    "Emily Zhao (author): Added `kms.fallback_attempted` trace attr and a `kms_decrypt_fallback_total{result=success|failure}` split (kept cardinality low; no tenant id).",
+    "Sean Gallagher (review): What happens if ciphertext is corrupted and triggers eligible fallback every time? We could add 1 extra KMS call per request permanently for bad payloads.",
+    "Emily Zhao (author): True during the dual-read window. Outside the window there's no fallback. Within the window, it's bounded to one extra call; also added a local negative cache for (ciphertext_hash -> non-fallbackable) when we see repeated failures that are clearly not key-mismatch. Kept it conservative and scoped to 60s TTL.",
+    "Ethan Park (review): Please add a link in flags.md describing recommended rollout steps + how to scope to canary tenants.",
+    "Emily Zhao (author): Added. Also included a note about keeping window small (default 6h recommended) and monitoring fallback rate thresholds."
+  ],
+  "checks": [
+    "buildkite / monorepo-build (pass)",
+    "buildkite / unit-tests (pass)",
+    "buildkite / integration-tests (pass)",
+    "buildkite / lint (pass)",
+    "buildkite / gofmt (pass)",
+    "security / semgrep (pass)"
+  ],
+  "merge_method": "squash",
+  "merge_commit": "9f4d2a1c0a6f4eaf0c4c5c4f8d3a3f8e0a7c1b22",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes",
+    "conversation"
+  ]
+}

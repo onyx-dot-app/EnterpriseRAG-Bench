@@ -1,0 +1,54 @@
+{
+  "key": "ENG-23111",
+  "team": "engineering",
+  "title": "Define server-side onboarding checklist state model (per org/project) + persistence + API endpoints",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2026-01-22",
+  "updated_at": "2026-02-18",
+  "creator": "Dylan Brooks",
+  "assignee": "Chloe Martin",
+  "project": "Guided onboarding + first production launch checklist (Hosted API)",
+  "cycle": "2026-W05",
+  "estimate": "5",
+  "due_date": "2026-02-06",
+  "labels": [
+    "console",
+    "onboarding",
+    "backend",
+    "api",
+    "postgres",
+    "telemetry-adjacent"
+  ],
+  "dependencies": [
+    "ENG-23110",
+    "PM-482",
+    "PM-483"
+  ],
+  "sub_issues": [
+    "ENG-23113",
+    "ENG-23114",
+    "ENG-23115",
+    "ENG-23117",
+    "ENG-23118",
+    "ENG-23119",
+    "ENG-23124"
+  ],
+  "customer_impact": "medium",
+  "release": "console-2026.03",
+  "security_review_required": "false",
+  "content": "## Context\nWe need a server-side canonical representation of the Guided Onboarding checklist state to support:\n- persistence across devices/sessions\n- validation signals from backend sources (gateway logs/metrics) (e.g., first successful request)\n- cohort rollouts + support/admin workflows (reset)\n- consistent eventing (telemetry can be derived from state changes)\n\nPhase 1 scope is Hosted API, self-serve. State should be tracked **per org + per project** with a checklist version to allow iteration without breaking existing users.\n\nRelated artifacts\n- ADR draft: `confluence/architecture-and-standards/decision-records/adr-0137-onboarding-checklist-state-and-validation`\n- Feature flag + UI shell: ENG-23110 / PR-48211\n- State API implementation follow-up PR: PR-48226 (links below)\n\n## Requirements\n### Functional\n1) Persist checklist state per (org_id, project_id, checklist_version).\n2) Support step-level state with:\n   - `status`: NOT_STARTED | IN_PROGRESS | COMPLETE | SKIPPED | BLOCKED (blocked optional for v1)\n   - timestamps for first completion + last update\n   - `source`: user_action | auto_validator | admin_override (for audit/debug)\n3) Allow server-side validators to mark steps complete idempotently.\n4) UI can read state and update steps that are manually confirmed (where applicable).\n5) Support resetting state for support/admin use (admin-only endpoint).\n\n### Non-functional\n- Low latency for Console (<200ms p95 for reads)\n- Concurrency-safe updates (avoid step regressions)\n- No prompt content / customer data stored in step metadata\n- Minimal schema churn to support adding steps in later iterations\n\n## Proposed data model (v1)\nDecision: **single row per checklist** with JSONB for step states.\n\n### Table: `onboarding_checklists`\n- `id` (uuid, pk)\n- `org_id` (uuid, not null)\n- `project_id` (uuid, not null)\n- `checklist_key` (text, not null)  // e.g., `hosted_api_guided_onboarding`\n- `checklist_version` (int, not null) // start at 1\n- `state` (jsonb, not null)\n- `created_at` (timestamptz)\n- `updated_at` (timestamptz)\n- `updated_by` (text) // system identifier (\"console\", \"validator:first_success\", \"admin\")\n- `etag` (bigint) // monotonic revision for optimistic concurrency\n\nUnique index:\n- `(org_id, project_id, checklist_key, checklist_version)` unique\n\nSuggested `state` JSON shape (documented contract; stored as jsonb):\n```json\n{\n  \"steps\": {\n    \"create_api_key\": {\n      \"status\": \"COMPLETE\",\n      \"completed_at\": \"2026-02-01T18:22:10Z\",\n      \"updated_at\": \"2026-02-01T18:22:10Z\",\n      \"source\": \"user_action\"\n    },\n    \"first_successful_request\": {\n      \"status\": \"COMPLETE\",\n      \"completed_at\": \"2026-02-01T18:23:41Z\",\n      \"updated_at\": \"2026-02-01T18:24:05Z\",\n      \"source\": \"auto_validator\"\n    }\n  },\n  \"meta\": {\n    \"last_viewed_at\": \"2026-02-01T18:25:00Z\"\n  }\n}\n```\nNotes:\n- Step keys must be stable string IDs defined in the checklist definition (owned by PM/Design but implemented in code).\n- `meta.last_viewed_at` is optional; useful for UI nudges, but should not gate completion.\n- We intentionally avoid storing request IDs, prompt text, IPs, or user agents.\n\n### Why JSONB vs normalized step table?\nPros:\n- Easier to add/reorder steps without schema migrations\n- Simple single-row read for UI\n- Works well with PATCH-style semantics\n\nCons / mitigations:\n- Harder analytics directly from DB. Mitigation: rely on telemetry event stream + derived tables for funnel analysis.\n- Potential write conflicts if multiple validators update concurrently. Mitigation: patch endpoint with revision/etag and server-side merge rules.\n\n## API endpoints (Console backend)\nBase: `/v1/orgs/{org_id}/projects/{project_id}/onboarding/checklists/{checklist_key}`\n\n1) **GET** `...?version=1`\n- Returns checklist state, plus server-known step definitions (optional; for v1 UI can ship definitions client-side)\n- Response includes `etag`\n\n2) **PATCH** `...?version=1`\n- Used by Console UI and backend validators\n- Supports partial update with merge semantics:\n  - step `status` can move forward (NOT_STARTED -> IN_PROGRESS -> COMPLETE)\n  - no backward transitions unless `admin_override=true` path\n- Headers:\n  - `If-Match: <etag>` required for UI-initiated updates\n  - Validators may omit If-Match and use server-side atomic update helper (see below)\n- Body (conceptual; actual API should validate allowlist of fields):\n  - `set_steps`: list of step updates\n  - `set_meta`: allowed meta fields\n  - `updated_by`: string\n\n3) **POST** `.../reset?version=1`\n- Admin-only (internal role)\n- Resets to NOT_STARTED for all steps (or deletes row)\n- Emits audit log entry\n\n### Server-side update rules (important)\n- Completion timestamps are only set on first transition to COMPLETE.\n- `updated_at` always updates when a step is touched.\n- Step updates must be idempotent:\n  - If PATCH says set `first_successful_request` COMPLETE and it\u2019s already COMPLETE, do nothing.\n- Merge conflicts:\n  - Prefer COMPLETE over IN_PROGRESS over NOT_STARTED\n  - Prefer `admin_override` source if invoked via reset endpoint\n\n## Validator integration (follow-on but modeled here)\nValidators (e.g., \"first successful request\") will run in backend services that can call the same PATCH endpoint (service-to-service) or directly invoke a shared DB helper. For v1 we\u2019ll use service-to-service PATCH with internal auth.\n\nOpen question (captured for ADR): how much lag is acceptable for validators? Current expectation: up to 2\u20135 minutes depending on metrics availability.\n\n## Acceptance criteria\n- [x] Table + unique index implemented\n- [x] GET endpoint returns deterministic state + etag\n- [x] PATCH endpoint supports forward-only state transitions and merge semantics\n- [x] Admin reset endpoint implemented (permission-checked)\n- [x] Unit tests for merge rules, etag behavior, and idempotent updates\n- [x] Document step ID stability requirements for PM/Design + SDK/docs alignment\n\n## Rollout / migration\n- New checklists created lazily on first GET (server creates row with empty/default state).\n- Existing client-side local storage state (if any) is ignored for beta; server is source of truth behind the feature flag.\n- If we decide to migrate local state later, add one-time \"import\" path gated behind internal allowlist.\n\n## Links\n- GitHub PR (state API + persistence): `sources/github/redwood/pr-48226.json`\n- Feature flag + shell: `sources/github/redwood/pr-48211.json`\n- Admin reset follow-up (separate): `sources/github/redwood/pr-48319.json`\n\n## Risks / mitigations\n- Risk: step definitions drift between Console and backend validators.\n  - Mitigation: central checklist definition file (shared package) + contract tests.\n- Risk: JSONB state becomes a dumping ground.\n  - Mitigation: strict allowlist validation in API; reject unknown keys.\n- Risk: analytics needs raw state.\n  - Mitigation: emit state-change events; build derived funnel dataset (ENG-23119).\n\n## Out of scope\n- Dedicated/Private checklist variants\n- Full RBAC matrix beyond admin reset permission\n- Cross-project rollups (org-level \u201coverall onboarding complete\u201d)",
+  "comments": [
+    "2026-01-24 (Jada Williams): Prefer server-side canonical state (vs localStorage) so validators can update. JSONB step map seems fine; please lock down allowed keys to prevent schema creep.",
+    "2026-01-27 (Nadia Rahman): For analytics, please ensure each state transition emits a telemetry event (step_id, from_status, to_status, source). We should not query JSONB directly for funnel metrics long-term.",
+    "2026-01-30 (Kaitlyn Nguyen): API key steps need to distinguish test vs prod keys. Backend state should support separate step IDs rather than encoding environment in metadata.",
+    "2026-02-04 (Chloe Martin): Implemented etag-based optimistic locking for UI PATCH. Validators will use an internal PATCH that merges server-side without requiring If-Match to reduce conflict failures.",
+    "2026-02-10 (Dylan Brooks): Sync with ENG-23118 (cohort targeting). Checklist row should only be created when the feature flag is enabled for the org/project to avoid DB spam. Outcome: OK to create lazily on first GET from flagged UI; backend validators should no-op if row doesn\u2019t exist.",
+    "2026-02-18 (Chloe Martin): Landed in PR-48226. Added merge rules + tests. Admin reset endpoint added behind internal role; full UI for reset tracked in PR-48319."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "content",
+    "comments"
+  ]
+}

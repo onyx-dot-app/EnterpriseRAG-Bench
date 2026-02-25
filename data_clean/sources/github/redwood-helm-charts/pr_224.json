@@ -1,0 +1,39 @@
+{
+  "repo": "redwood-helm-charts",
+  "pr_number": "224",
+  "title": "private: add rollback annotations + preStop hooks for control-plane + gateway to reduce split-brain on downgrade",
+  "author": "Ines Carvalho",
+  "created_at": "2025-01-20",
+  "updated_at": "2025-01-24",
+  "merged_at": "2025-01-24",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/private-rollback-annotations-prestop",
+  "reviewers": [
+    "Connor O'Brien",
+    "Sean Gallagher",
+    "Ethan Park",
+    "Kenji Nakamura"
+  ],
+  "labels": [
+    "private",
+    "helm",
+    "reliability",
+    "sre"
+  ],
+  "linked_linear": [
+    "ENG-2318",
+    "ENG-2320"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "9",
+  "additions": "214",
+  "deletions": "37",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "body": "Title: private: add rollback annotations + preStop hooks for control-plane + gateway to reduce split-brain on downgrade\n\nContext / Why\nWe saw a class of downgrade/rollback failures in Private rehearsals where we briefly ran two \"active\" instances across versions (old pods coming up while new pods still had active leases / open connections). In practice this shows up as split-brain symptoms: duplicate schedulers, competing leaders, and intermittent 5xx during the window where the rollback is applying chart revisions.\n\nThe installer rollback flow (ENG-2318) is getting stronger guardrails, but we still need chart-level behavior to ensure that when a rollback is initiated, the currently-running pods drain and exit deterministically before the older revision comes up.\n\nThis PR introduces:\n- Explicit annotations on critical workloads to mark rollback ordering constraints for the installer (and for humans during debugging)\n- preStop hooks + terminationGracePeriodSeconds tuning for critical components so Kubernetes terminates old pods cleanly and we reduce the chance of two active leaders\n\nWhat changed\n1) Rollback annotations (opt-in, chart-level)\n- Add annotations to the following Deployments/StatefulSets:\n  - control-plane\n  - gateway\n  - scheduler (if enabled)\n- These are simple Kubernetes metadata annotations, not Helm hooks:\n  - redwood.ai/rollback-priority: \"10\" (lower number = terminate earlier)\n  - redwood.ai/rollback-blocks: \"gateway\" (component names that should not start until this is drained)\n  - redwood.ai/rollback-critical: \"true\"\n\nThe immediate consumer is the redwood-private-installer rollback logic which reads these annotations when building a rollback plan and when deciding which pods to wait on before moving to the next component. This keeps the chart as the source of truth for component criticality.\n\n2) preStop hooks + graceful termination\n- control-plane:\n  - Add lifecycle.preStop that attempts to put the instance into \"draining\" mode before SIGTERM completes.\n  - Increase terminationGracePeriodSeconds from 30s to 90s (configurable) to allow:\n    - readiness to flip\n    - in-flight requests to finish\n    - leader leases to expire cleanly\n- gateway:\n  - Add lifecycle.preStop to stop accepting new connections and wait briefly before shutdown.\n  - Align terminationGracePeriodSeconds to 60s (configurable).\n\nBoth hooks are feature-flagged via values.yaml so we can enable by default for new Private installs first, then roll out to existing environments after validation.\n\n3) Values + docs notes\n- Add values under .privateUpgrade.rollbackSafety.*\n  - enabled\n  - controlPlaneDrainEndpoint\n  - gatewayDrainEndpoint\n  - terminationGracePeriodSeconds overrides\n- README notes in the chart for why/when to enable.\n\nIllustrative snippets\n- control-plane deployment template:\n  lifecycle:\n    preStop:\n      exec:\n        command:\n          - /bin/sh\n          - -c\n          - \"set -e; if [ \\\"${REDWOOD_DRAIN_ENDPOINT:-}\\\" != \\\"\\\" ]; then curl -fsS --max-time 5 \\\"${REDWOOD_DRAIN_ENDPOINT}\\\" || true; fi; sleep 10\"\n  terminationGracePeriodSeconds: {{ .Values.privateUpgrade.rollbackSafety.controlPlaneTerminationGracePeriodSeconds | default 90 }}\n\n- annotations:\n  metadata:\n    annotations:\n      redwood.ai/rollback-critical: \"true\"\n      redwood.ai/rollback-priority: \"10\"\n      redwood.ai/rollback-blocks: \"gateway\"\n\nFiles / areas touched\n- charts/redwood-control-plane/templates/deployment.yaml\n- charts/redwood-control-plane/values.yaml\n- charts/redwood-gateway/templates/deployment.yaml\n- charts/redwood-gateway/values.yaml\n- charts/redwood-scheduler/templates/deployment.yaml\n- charts/redwood-private/values.yaml (wiring defaults for private bundles)\n- charts/redwood-private/README.md\n\nTesting\n- Render tests: helm template for private profile with rollbackSafety enabled/disabled\n- Manual: verified that on kubectl rollout restart, readiness flips before pod termination completes\n- Smoke: rollback rehearsal on staging private cluster (chart-only) shows no overlapping leaders during downgrade window (observed via leader election logs)\n\nRollout plan\n- Keep rollbackSafety.enabled default false at chart-level for now\n- Enable by default in the installer for beta customers (installer will set values for Private profiles)\n- After 1-2 successful rehearsals, we can flip the chart default in a follow-up PR\n\nCI\n- chart-lint: pass\n- unit (helm render): pass\n- integration (kind smoke): pass\n\nReview conversation\n\nConnor O'Brien (Release Eng) \u2014 2025-01-21\n\"Love the direction. Two nits: (1) make sure the annotation names are stable and documented (installer will depend on them), (2) can we avoid a hard failure in preStop if curl isn't present in the image?\"\n\nInes Carvalho (author) \u2014 2025-01-21\n\"Good call. Updated to treat drain call as best-effort and wrapped in '|| true'. Also added a note in chart README + kept annotation keys under redwood.ai/* namespace and added a short comment block in templates.\" \n\nSean Gallagher (SRE) \u2014 2025-01-22\n\"We should be careful about terminationGracePeriodSeconds defaults for existing installs; raising it can extend maintenance windows if something wedges. Can we gate with a values flag and keep current behavior unless enabled?\"\n\nInes Carvalho \u2014 2025-01-22\n\"Yep. Added privateUpgrade.rollbackSafety.enabled (default false). When disabled, templates render exactly as before (no lifecycle/preStop and original grace periods).\"\n\nEthan Park \u2014 2025-01-22\n\"For control-plane drain endpoint: can we define a sane default path but allow override? Also, can we sleep a bit after readiness flips to let load balancers drain?\"\n\nInes Carvalho \u2014 2025-01-23\n\"Added defaults:\n- controlPlaneDrainEndpoint: http://127.0.0.1:8080/admin/drain\n- gatewayDrainEndpoint: http://127.0.0.1:8081/admin/drain\nand made the preStop sequence: call drain (best-effort) + sleep 10. Open to tweaking sleep values later; made it configurable via privateUpgrade.rollbackSafety.drainSleepSeconds (default 10).\"\n\nKenji Nakamura \u2014 2025-01-23\n\"Operator UX note: please ensure the values names read like 'safety', not 'experimental'. 'rollbackSafety' is fine. Also add a short comment in values.yaml describing the tradeoff (slower termination vs fewer split-brain events).\"\n\nInes Carvalho \u2014 2025-01-23\n\"Done. Added comments + linked to ENG-2318 for context.\" \n\nApprovals\n- Connor O'Brien: Approved (2025-01-24)\n- Sean Gallagher: Approved (2025-01-24)\n- Ethan Park: Approved (2025-01-24)\n\nNotes / follow-ups\n- Follow-up PR to enable rollbackSafety by default for private profile once beta rehearsal completes successfully.\n- Installer will consume the rollback annotations (redwood.ai/rollback-*) in its step graph; chart README includes a brief contract description.\n\nChangelog\n- No customer-visible change unless privateUpgrade.rollbackSafety.enabled=true (default false).",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "repo": "redwood-helm-charts",
+  "pr_number": "447",
+  "title": "Private backups: add PDBs + concurrency safeguards to prevent overlapping runs",
+  "author": "Diego Santos",
+  "created_at": "2025-11-05",
+  "updated_at": "2025-11-08",
+  "merged_at": "2025-11-08",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/private-backup-pdb-concurrency",
+  "merge_method": "squash",
+  "reviewers": [
+    "Rafael Mendes",
+    "Sean Gallagher",
+    "Allison Grant",
+    "Michael Nguyen"
+  ],
+  "labels": [
+    "private",
+    "helm",
+    "sre",
+    "reliability",
+    "backup-restore"
+  ],
+  "linked_linear": [
+    "ENG-4853",
+    "ENG-4869"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "9",
+  "additions": "214",
+  "deletions": "41",
+  "body": "Summary: This PR hardens the Private backup CronJobs (added in #433) by (1) preventing overlapping backup executions at the Kubernetes scheduler level and (2) adding PodDisruptionBudgets (PDBs) for control-plane components that back up against Postgres to reduce DB contention / retries during node drains and other voluntary disruptions. Motivation: In DR drill #1 and in a couple of internal soak tests, we saw two recurring issues: overlapping backup jobs when a scheduled run exceeded its window (leading to concurrent pg_dump + WAL archiving contention) and backup/verify jobs flapping during node drains because the control-plane Postgres pod(s) were evicted at the wrong time. While Kubernetes CronJob supports concurrencyPolicy, we weren\u2019t setting it explicitly and our defaults varied across values examples. Additionally, we had no PDB guidance/guardrails, which increased the likelihood of eviction-induced failure during otherwise healthy operations. Changes: (A) Backup CronJobs: set concurrencyPolicy=Forbid by default, expose it as a values override, and add a small amount of defensive config to make schedules safer in real clusters. (B) Add a lightweight \u201cbackup lock\u201d mechanism (optional) via a namespaced Lease to protect against operator-triggered manual backups overlapping with the scheduled CronJob. (This is off by default; enabled via values when clusters run frequent manual drills.) (C) PDBs: add optional PDBs for postgres and the control-plane API deployment, with defaults tuned to keep at least one healthy pod available during voluntary disruptions. The PDBs are gated behind values so customers with single-node/single-replica footprints can disable them if they block drains. Notes on backwards compatibility: No changes are required for existing installs; defaults are safe. For clusters running manual backups via Job templates, enabling the Lease lock is recommended but not required. Files/areas changed (high level): charts/redwood-private/values.yaml (new knobs: backups.concurrencyPolicy, backups.startingDeadlineSeconds, backups.lock.*; pdb.* defaults and enable flags); charts/redwood-private/templates/backup/cronjob.yaml (set concurrencyPolicy, add startingDeadlineSeconds, add optional Lease lock init step); charts/redwood-private/templates/pdb/*.yaml (new PDB manifests for postgres + control-plane api); charts/redwood-private/templates/_helpers.tpl (labels/selectors for PDB targets, name helpers for Lease); charts/redwood-private/README.md (doc updates + guidance on drains and single-replica clusters). Implementation details: Forbid concurrency is enforced using the native CronJob field; this blocks a new scheduled job from starting while a previous run is active. We also set a conservative default startingDeadlineSeconds (15m) to avoid a thundering herd after control-plane downtime. The optional Lease lock is a best-effort guard for the \u201cmanual job + scheduled job\u201d overlap case; it uses coordination.k8s.io/v1 Lease in the release namespace and fails fast with a clear log message if another backup is holding the lock (so operators can re-run later without ambiguity). Illustrative snippet: In templates/backup/cronjob.yaml, we now render: \"concurrencyPolicy: {{ .Values.backups.concurrencyPolicy | default \\\"Forbid\\\" }}\" and \"startingDeadlineSeconds: {{ .Values.backups.startingDeadlineSeconds | default 900 }}\". For the PDB, we render (when enabled): \"minAvailable: 1\" for the postgres StatefulSet selector and \"maxUnavailable: 0\" for single-replica control-plane API (with an override for multi-replica deployments). Testing: helm lint + template tests in CI; validated install/upgrade on k8s 1.27 + 1.29 in the Private staging cluster; simulated overlap by forcing a long-running backup job (sleep) and verified that the next schedule was skipped; simulated node drain and observed PDB behavior (postgres not evicted until a replacement is ready where applicable). Rollout/ops notes: SRE should expect fewer \u2018backup failed: connection reset\u2019 errors during drains. For customers with strict maintenance windows, recommend leaving startingDeadlineSeconds at default to avoid catch-up runs outside the window; they can also set backups.suspend=true during planned downtime. Release note: Private backup CronJobs now default to non-overlapping execution; optional PDBs reduce disruption-related backup flakiness.\n\nCommits: 1) helm(redwood-private): default backup CronJob concurrencyPolicy=Forbid + startingDeadlineSeconds 2) helm(redwood-private): optional Lease lock for backup jobs 3) helm(redwood-private): add PDB templates for postgres + control-plane api 4) docs: values + operational guidance for drains and single-replica clusters\n\nChanged files (selected): - charts/redwood-private/templates/backup/cronjob.yaml - charts/redwood-private/templates/pdb/postgres-pdb.yaml - charts/redwood-private/templates/pdb/control-plane-api-pdb.yaml - charts/redwood-private/values.yaml - charts/redwood-private/README.md\n\nReview conversation (excerpt): Rafael Mendes (SRE): \u201c+1 on concurrencyPolicy=Forbid. Can we ensure manual \u2018backup verify\u2019 doesn\u2019t take the same lock as \u2018backup create\u2019? We don\u2019t want verify to block a create during incidents.\u201d Diego Santos (author): \u201cGood call \u2014 verify does not acquire the lock (lock only wraps create + retention prune). I\u2019ve clarified this in README and in the lock script log output.\u201d Michael Nguyen (DB/migrations): \u201cFor PDB defaults, minAvailable:1 is fine for postgres, but for control-plane api with 1 replica, maxUnavailable:0 will block drains unless there\u2019s surge. Is that intentional?\u201d Diego Santos: \u201cIntentional default for the \u2018don\u2019t evict me during backups\u2019 case, but agreed it can block drains on 1-replica installs. I added values.pdb.controlPlaneApi.enabled=false by default on singleReplica profiles and documented when to disable.\u201d Allison Grant (Observability): \u201cDo we emit a distinct log line when a backup is skipped due to concurrencyPolicy vs lock?\u201d Diego Santos: \u201cConcurrencyPolicy skip is only visible via CronJob status; I added a clear event/log when the Lease lock blocks a manual job. For scheduled skips, I added a note to the runbook to look at `.status.lastScheduleTime` and active jobs; separate metric will land in observability-pack.\u201d Sean Gallagher (SRE sponsor): \u201cShip it after docs tweak: add a one-liner that PDBs only affect voluntary disruptions.\u201d Diego Santos: \u201cDone \u2014 updated README and template comments.\u201d\n\nCI: \u2705 helm-lint \u2705 chart-unit-tests \u2705 kubeval \u2705 render-examples (aws/minio/onprem) \u2705 upgrade-smoke\n\nOutcome: Merged (squash) into main.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ]
+}

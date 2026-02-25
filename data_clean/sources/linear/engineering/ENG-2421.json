@@ -1,0 +1,82 @@
+{
+  "key": "ENG-2421",
+  "team": "engineering",
+  "title": "Implement error budget computation job/service + storage model for dashboards and release gates",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-01-23",
+  "updated_at": "2026-02-24",
+  "creator": "Rafael Mendes",
+  "assignee": "Aisha Bello",
+  "project": "Tiered SLO definitions + error budget policy",
+  "cycle": "2026-W06",
+  "estimate": "8",
+  "due_date": "2026-03-06",
+  "customer_impact": "high",
+  "release": "platform-2026.03",
+  "security_review_required": "false",
+  "labels": [
+    "reliability",
+    "slo",
+    "error-budgets",
+    "observability",
+    "control-plane",
+    "dashboards",
+    "release-gates"
+  ],
+  "dependencies": [
+    "ENG-2418",
+    "ENG-2419",
+    "ENG-2420",
+    "ENG-2424"
+  ],
+  "description": "We need a canonical error budget computation component that continuously computes budget remaining + burn rates for tiered SLOs (Hosted + Dedicated) and powers: (1) SLO/budget dashboards in Console/Grafana, (2) burn-rate alerts, and (3) CI/CD + rollout gates via a budget-check API.\n\nThis ticket covers the computation job/service (scheduled workflow is acceptable for v1), a minimal data model, and a storage plan that supports: latest budget snapshot lookups (low-latency) + short retention history for charts/forecast overlays.\n\nContext:\n- SLO definitions live in Confluence and will be encoded via slo-toolkit tier-aware schema.\n- We need consistent semantics across teams so the same numbers show up in dashboards, alerts, and deploy gates.\n\nLinks:\n- Confluence: Tiered SLO definitions (Hosted vs Dedicated): sources/confluence/eng-sre/slo-and-error-budgets/tiered-slo-definitions-hosted-vs-dedicated.json\n- Confluence: Error budget policy + enforcement: sources/confluence/eng-sre/slo-and-error-budgets/error-budget-policy-and-enforcement.json\n- GitHub (reference libs): sources/github/slo-toolkit/pull_request_118.json, sources/github/slo-toolkit/pull_request_121.json\n- Related: ENG-2422 (gate integration), ENG-2425 (dashboards), ENG-2420 (burn alerts)\n\nOwner notes:\n- Aisha to own implementation + integration with Logan/Nadia for data correctness.\n- Benji/Ethan are consumers via control plane budget-check endpoint + pipeline step; we should align early on query shape + caching semantics.",
+  "acceptance_criteria": [
+    "Given a tier-aware SLO config (Hosted/Dedicated), the system computes: budget_remaining (0..1), budget_burn_rate (per window), and burn alerts can be derived from the same underlying numbers.",
+    "Latest budget status can be fetched for a scope (tier, service, region, route, model, customer_pool where applicable) in <250ms p95 from the budget-check API consumer perspective (can be cached).",
+    "Budget computation supports rolling windows at minimum: 30d (primary), plus 1h/6h/24h burn-rate helper windows needed for multi-window alerting.",
+    "Writes are bounded by cardinality budget guidance (no unbounded per-request IDs; avoid per-customer metrics in Hosted; Dedicated customer pool IDs only where explicitly required).",
+    "Dashboards can plot budget remaining over time for at least 14 days without expensive Prometheus range queries (store computed history).",
+    "Backfill path exists (even if manual) to validate targets and calibrate alert thresholds (ties to ENG-2429).",
+    "Runbook references and owner annotations are included in stored records or emitted metrics labels so alert payloads can include links."
+  ],
+  "proposed_design": "Summary\nWe will implement a small internal service (\"budgetd\") that runs on a fixed schedule (every 60s) to compute error budget remaining + burn rates for each published SLO objective.\n\nInputs\n1) SLO config (tier-aware) from slo-toolkit (checked into repo and deployed with service). v1 expects config changes via PR (not UI).\n2) SLI time series from Prometheus via remote-read (preferred) or pre-aggregated metrics exported by gateway/routing/runtime.\n\nComputation model\n- For each SLO objective O, define:\n  - objective.target (e.g., 99.9% success)\n  - objective.window (e.g., 30d rolling)\n  - objective.sli_query (success / total, or error / total)\n  - objective.dimensions (tier/region/route/model; Dedicated may include pool_id)\n- Compute:\n  - error_budget_total = 1 - target\n  - error_budget_used = max(0, observed_bad_rate - 0) (observed_bad_rate is derived from SLI over the rolling window)\n  - budget_remaining = clamp(1 - (observed_bad_rate / error_budget_total), 0, 1)\n  - burn_rate(window_x) = observed_bad_rate(window_x) / error_budget_total\n\nNote: We will store both observed_good_rate and observed_bad_rate explicitly to reduce ambiguity.\n\nStorage plan\nWe need two types of storage:\nA) Latest snapshot key-value for gates + fast lookups.\nB) Short retention time series for dashboards/overlays.\n\nPlan (v1)\n- Postgres (control plane shared cluster) for latest snapshots + metadata:\n  - slo_objectives (id, name, tier, service, route, model, region, pool_id?, target, window_seconds, owner_team, runbook_url, created_at, updated_at)\n  - budget_snapshots_latest (objective_id, as_of_ts, good_events, bad_events, total_events, observed_bad_rate, budget_remaining, burn_rate_1h, burn_rate_6h, burn_rate_24h, computation_version)\n  - budget_overrides (objective_id, override_state, reason, created_by, approved_by, expires_at, created_at) [used by gates; write path may come later but schema reserved]\n- ClickHouse for timeseries history (14d retention to start):\n  - budget_snapshots_history (objective_id, as_of_ts, budget_remaining, burn_rate_1h, burn_rate_6h, burn_rate_24h, observed_bad_rate, total_events)\n\nWhy ClickHouse?\n- We already use it for high-cardinality observability slices; it is cheaper than long Prometheus range queries for rendering dashboards across many dimensions.\n- It supports fast time-bucket queries for charting budget remaining and correlating with deploy events.\n\nMetrics output\n- budgetd also emits Prometheus gauges so alerting can stay in Prometheus:\n  - redwood_budget_remaining{objective_id,tier,service,region,route,model,pool_id?}\n  - redwood_burn_rate{objective_id,window=\"1h|6h|24h\"...}\n- We will keep label sets aligned with the cardinality proposal (ENG-2424). objective_id will be the stable join key for dashboards.\n\nAPI surface (for gates/dashboards)\n- Internal gRPC/HTTP endpoint (consumed by control plane budget-check endpoint in redwood):\n  - GET /v1/budgets/latest?scope=... returns status for matching objectives\n  - Response includes: objective metadata + budget_remaining + burn rates + as_of_ts + override_state\n- v1 will support only \"latest\" reads; history reads can be served via ClickHouse queries in dashboards backend (or later via a dedicated budgets API).\n\nDeployment\n- budgetd runs in platform cluster, one active instance per environment (prod/staging), with leader election.\n- Schedule: every 60s compute; each run bounded by objective count and query cost.\n\nGuardrails\n- Hard cap the number of objective series computed per run (config validation) to avoid runaway due to accidental dimension explosion.\n- Validate queries at startup and expose a \"computation health\" endpoint with last successful run timestamp + per-objective errors.\n\nOpen question\n- If ClickHouse is not acceptable for v1, fallback is Postgres-only (store 14d of snapshots at 1m granularity = ~20k rows per objective per 14d; likely too large for high objective counts). ClickHouse strongly preferred.",
+  "implementation_plan": [
+    "Finalize storage choice w/ Logan Wright (Telemetry) and get tables approved (Postgres + ClickHouse).",
+    "Define objective_id strategy (hash of normalized objective key fields + config version) to keep stable joins and avoid collisions.",
+    "Implement budgetd core loop (scheduler + per-objective compute) using slo-toolkit library helpers (PR #118).",
+    "Implement Prometheus remote-read client + query templates; add per-query timeout + retry with circuit-breaker to avoid dogpiling Prometheus under incident load.",
+    "Write latest snapshots to Postgres (transactional upsert) and history snapshots to ClickHouse (batched inserts).",
+    "Emit Prometheus gauges from budgetd (optional in v1, but needed for ENG-2420 alerting standardization).",
+    "Add integration contract tests: known synthetic time series -> expected budget_remaining + burn_rate calculations (esp around low volume + division-by-zero).",
+    "Stage rollout in staging with 5-10 objectives (Hosted chat streaming + embeddings + Dedicated readiness), verify against manual query results in SLI validation scratchpad.",
+    "Prod rollout behind feature flag; start with warn-only gate consumers (ENG-2422).",
+    "Add oncall/runbook entry: budgetd failure modes (Prometheus query failures, ClickHouse insert lag, Postgres contention) and what dashboards/gates do when data stale."
+  ],
+  "risks_and_mitigations": "1) Cardinality explosion\nRisk: objective dimensions (tier/region/route/model) multiplied by per-model and per-route breakdown can create thousands of objectives.\nMitigation: enforce config validation caps + require explicit allowlists for model/route splits; align with ENG-2424.\n\n2) Data correctness / attribution\nRisk: mismatch between logs vs metrics, or misclassification of streaming disconnects/timeouts causing false budget burn and bad gate outcomes.\nMitigation: partner with Nadia Rahman to validate against log-based counts; implement per-objective \"data_quality\" tag and do not hard-block gates when data_quality=degraded (warn-only) until validated.\n\n3) Staleness\nRisk: budgetd fails or Prometheus is degraded during incidents, making gates block or dashboards misleading.\nMitigation: include as_of_ts and staleness thresholds; gates should treat stale data as \"unknown\" and follow policy (initially warn-only). Emit 'budgetd_last_success_ts' metric.\n\n4) Performance / load on Prometheus\nRisk: budgetd remote-read queries can overload Prometheus during widespread incidents.\nMitigation: query batching, strict timeouts, and backoff; keep computation frequency configurable; consider pre-aggregated recording rules for heavy objectives.",
+  "open_questions": [
+    "Do we want the \"source of truth\" to be computed from Prometheus metrics only, or can we compute from ClickHouse logs for certain SLIs (e.g., streaming disconnect taxonomy)?",
+    "How do we represent Dedicated customer pools: pool_id only, or (customer_id, pool_id)? Proposal: pool_id only to avoid customer PII and reduce join complexity.",
+    "Do we need separate budgets for TTFT vs end-to-end streaming duration latency SLIs, or only availability/disconnect initially? (Thread ongoing in ENG-2428).",
+    "Retention requirement for budget history: 14d vs 30d. Proposal: 14d now; add downsampled 30d later."
+  ],
+  "activity_log": [
+    "2026-01-23 (Rafael Mendes): Created ticket; split from ENG-2420 to keep budget computation as a standalone deliverable powering alerts + gates.",
+    "2026-01-28 (Aisha Bello): Drafted v1 architecture (budgetd + Postgres latest + ClickHouse history). Requested Telemetry review from Logan/Nadia; flagged staleness behavior for gates.",
+    "2026-02-03 (Nadia Rahman): Requested explicit treatment for low-volume objectives (division-by-zero, sparse traffic). Proposed rule: if total_events < min_events_threshold, mark objective as 'insufficient_data' and do not page; gates remain warn-only.",
+    "2026-02-07 (Logan Wright): Telemetry ok with ClickHouse history table; asked to keep objective_id stable and avoid high-cardinality labels in Prometheus metrics output.",
+    "2026-02-12 (Benji Okafor): Gate consumer requirements: need single-call lookup by (tier, service) and ability to scope to 'current region' for canary. Also need override_state + expires_at surfaced.",
+    "2026-02-18 (Sergio Costa): Dashboard needs: budget remaining over time, plus overlay of deploy markers. Suggested storing computation_version for debugging mismatches.",
+    "2026-02-24 (Aisha Bello): Implementation started; remote-read client and config loader in progress. Next: finalize objective_id normalization and write path to Postgres."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "proposed_design",
+    "implementation_plan",
+    "risks_and_mitigations",
+    "open_questions",
+    "activity_log"
+  ]
+}

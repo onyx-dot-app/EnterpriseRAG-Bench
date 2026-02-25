@@ -1,5 +1,6 @@
 """Interactive script for generating source directory structure."""
 
+import os
 import subprocess
 from datetime import datetime
 
@@ -12,6 +13,7 @@ from src.paths import (
     SOURCES_DIR,
 )
 from src.prompts.source_structure import SOURCE_STRUCTURE_SYSTEM_PROMPT
+from src.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import (
     FinishTool,
@@ -30,6 +32,22 @@ def load_file(path: str) -> str:
     if not content.strip():
         raise ValueError(f"File at {path} is empty")
     return content
+
+
+def count_directories(base_dir: str) -> tuple[int, int]:
+    """
+    Count top-level and total nested directories.
+
+    Returns:
+        (top_level_count, total_count)
+    """
+    top_level = 0
+    total = 0
+    for root, dirs, _files in os.walk(base_dir):
+        if root == base_dir:
+            top_level = len(dirs)
+        total += len(dirs)
+    return top_level, total
 
 
 def write_source_tree() -> None:
@@ -60,7 +78,34 @@ def write_source_tree() -> None:
     print(f"✓ Saved source directory tree to {SOURCE_TREE_PATH}")
 
 
+def _has_source_directories() -> bool:
+    """Check if there are any directories under sources."""
+    if not os.path.exists(SOURCES_DIR):
+        return False
+    entries = os.listdir(SOURCES_DIR)
+    return any(os.path.isdir(os.path.join(SOURCES_DIR, e)) for e in entries)
+
+
+def _confirm_regenerate(data_description: str) -> bool:
+    """Prompt user to confirm regeneration of existing data."""
+    response = input(f"{data_description} already exists. Regenerate? [y/N]: ").strip().lower()
+    return response in ("y", "yes")
+
+
 def main() -> None:
+    # Check if source directories already exist
+    if _has_source_directories():
+        if not _confirm_regenerate("Source directories"):
+            # Just update statistics and exit
+            print("Updating statistics only...")
+            top_level, total = count_directories(SOURCES_DIR)
+            update_statistics("Step 4: Source Structure", {
+                "top_level_directories": top_level,
+                "total_directories": total,
+            })
+            print("Statistics updated.")
+            return
+
     # Load context files and build the prompt
     company_overview = load_file(COMPANY_OVERVIEW_PATH)
     initiatives = load_file(INITIATIVES_PATH)
@@ -128,6 +173,12 @@ def main() -> None:
         # Check if finish tool was called
         if finish_tool.finished:
             write_source_tree()
+            # Update aggregate statistics
+            top_level, total = count_directories(SOURCES_DIR)
+            update_statistics("Step 4: Source Structure", {
+                "top_level_directories": top_level,
+                "total_directories": total,
+            })
             print("\nSource directory structure generation complete!")
             break
 

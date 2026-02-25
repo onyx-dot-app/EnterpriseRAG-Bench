@@ -1,13 +1,21 @@
 """Interactive script for generating company initiatives and roadmap."""
 
+import os
 from datetime import datetime
 
 from src.llm import get_llm
 from src.llm.conversation import Conversation
 from src.paths import COMPANY_OVERVIEW_PATH, INITIATIVES_PATH
 from src.prompts.initiatives import INITIATIVES_SYSTEM_PROMPT
+from src.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import WriteTool
+
+
+def _confirm_regenerate(data_description: str) -> bool:
+    """Prompt user to confirm regeneration of existing data."""
+    response = input(f"{data_description} already exists. Regenerate? [y/N]: ").strip().lower()
+    return response in ("y", "yes")
 
 
 def load_company_overview() -> str:
@@ -20,6 +28,16 @@ def load_company_overview() -> str:
 
 
 def main() -> None:
+    # Check if initiatives already exists
+    if os.path.exists(INITIATIVES_PATH):
+        if not _confirm_regenerate("Initiatives"):
+            print("Updating statistics only...")
+            update_statistics("Step 2: Initiatives", {
+                "status": f"Completed - see file at {INITIATIVES_PATH}",
+            })
+            print("Statistics updated.")
+            return
+
     # Load company overview and build the prompt
     company_overview = load_company_overview()
     current_date = datetime.now().strftime("%B %d, %Y")
@@ -72,6 +90,12 @@ def main() -> None:
         except KeyboardInterrupt:
             print("\nGoodbye!")
             break
+
+    # Update statistics if file was created
+    if os.path.exists(INITIATIVES_PATH):
+        update_statistics("Step 2: Initiatives", {
+            "status": f"Completed - see file at {INITIATIVES_PATH}",
+        })
 
 
 if __name__ == "__main__":

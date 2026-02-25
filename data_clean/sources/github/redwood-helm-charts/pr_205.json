@@ -1,0 +1,40 @@
+{
+  "repo": "redwood-helm-charts",
+  "pr_number": "205",
+  "title": "Add Helm hook jobs for schema migration gating + post-upgrade smoke tests",
+  "author": "Ines Carvalho",
+  "created_at": "2025-01-14",
+  "updated_at": "2025-01-18",
+  "merged_at": "2025-01-18",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/private-upgrade-migration-gating-hooks",
+  "merge_method": "squash",
+  "reviewers": [
+    "Michael Nguyen",
+    "Ethan Park",
+    "Connor O'Brien",
+    "Sean Gallagher",
+    "Marcus Lin"
+  ],
+  "labels": [
+    "private",
+    "helm",
+    "upgrade",
+    "reliability",
+    "sre"
+  ],
+  "linked_linear": [
+    "ENG-2320",
+    "ENG-2314"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "612",
+  "deletions": "88",
+  "body": "## Context\nPrivate upgrades need deterministic ordering around DB/schema migrations and a fast signal that the post-upgrade control plane/runtime are healthy. Today we rely on \u201cbest effort\u201d init containers + operator sequencing, but `helm upgrade` can still roll Deployments before migrations complete (and we don\u2019t get a single gating point that fails the upgrade).\n\nThis PR introduces two hook-based Jobs in the chart:\n1) **Schema migration gating job** that runs as a Helm **pre-upgrade/pre-install hook** and must succeed before the rest of the release is applied.\n2) **Post-upgrade smoke test job** that runs as a Helm **post-upgrade hook** to validate basic APIs and surface failures quickly.\n\nAlso adds documentation for ordering guarantees and operational knobs.\n\n## What changed (high level)\n- New template: `templates/hooks/schema-migrate-job.yaml`\n  - Helm hook: `pre-install,pre-upgrade`\n  - Hook weight: `-10` (runs before other hooks; see ordering notes below)\n  - Fails the Helm operation if migrations fail or timeout.\n  - Optional: can be disabled for break-glass / legacy installs.\n- New template: `templates/hooks/post-upgrade-smoke-test-job.yaml`\n  - Helm hook: `post-upgrade`\n  - Hook weight: `10`\n  - Runs lightweight checks against control plane + gateway endpoints.\n- Values:\n  - `upgrade.migrations.enabled` (default: true)\n  - `upgrade.migrations.timeoutSeconds` (default: 1800)\n  - `upgrade.smokeTest.enabled` (default: true)\n  - `upgrade.smokeTest.timeoutSeconds` (default: 600)\n  - `upgrade.smokeTest.mode` (default: \"basic\"; supports \"basic\" and \"extended\")\n- Docs:\n  - `docs/private-upgrades.md` updated with ordering and troubleshooting\n  - Chart README updated with new values and expected behavior\n\n## Ordering guarantees\nHelm hook ordering is defined by:\n- Hook type ordering (pre-* hooks run before resources are updated; post-* hooks run after)\n- Hook weights (lower runs earlier)\n\nThis PR guarantees:\n- The schema migration Job runs **before** Deployments/StatefulSets for control-plane/runtime components are updated.\n- If the migration Job fails, **the Helm upgrade fails** and no updated workloads should be rolled out by Helm.\n- The smoke test Job runs **after** Helm has applied updated manifests, and failures are visible as a failed hook (and `helm status` shows it).\n\nNon-goals / limitations (documented):\n- Helm hooks do not fully prevent external controllers from restarting workloads (e.g., PDB/evictions) during an upgrade.\n- Helm itself won\u2019t roll back automatically on a failed hook unless the caller uses `--atomic` (installer will set this; tracked in ENG-2314).\n\n## Implementation notes\n### Schema migration job\n- Uses the chart\u2019s existing migration image/entrypoint (no new binary).\n- Runs with the same serviceAccount as the control plane (configurable via values) to access DB creds.\n- Uses `hook-delete-policy: before-hook-creation,hook-succeeded` to avoid accumulating succeeded jobs while keeping failed jobs for debugging.\n\nIllustrative snippet:\n`metadata.annotations`:\n- `helm.sh/hook: pre-install,pre-upgrade`\n- `helm.sh/hook-weight: \"-10\"`\n- `helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded`\n\n### Post-upgrade smoke test job\n- Performs:\n  - control plane `/healthz` and `/readyz`\n  - version endpoint check (ensures we can read the new component versions)\n  - gateway route sanity (HTTP 200 and expected headers)\n- Emits structured JSON to stdout for Support ingestion (installer can capture logs into diagnostics bundle).\n\n## Backwards compatibility\n- Default behavior is safe for existing installs: migration gating and smoke tests are enabled by default, but can be disabled if a customer environment is mid-transition.\n- No required value changes for existing releases; new values are additive.\n\n## How to test\n- `helm template` / `helm lint` passes.\n- Manual:\n  - Install chart, then simulate an upgrade with a migration that intentionally fails -> Helm upgrade fails at pre-upgrade hook.\n  - Upgrade with a healthy migration -> deployments roll, then post-upgrade smoke test runs and succeeds.\n\nCommands used (kind):\n- `helm upgrade --install redwood ./charts/redwood-private -n redwood --create-namespace --atomic --timeout 45m`\n\n## Screenshots / output\n- `helm status redwood -n redwood` shows `pre-upgrade` and `post-upgrade` hook Jobs with clear names and timestamps.\n\n## Checklist\n- [x] Hook jobs respect namespace + labels conventions\n- [x] Values documented\n- [x] Default timeouts conservative for enterprise DB sizes\n- [x] Security review: no secrets in logs; SA/RBAC unchanged by default\n\n---\n\n### Review conversation (highlights)\n**Michael Nguyen:** \"Can we ensure the migration Job uses the same DB connection settings as the control plane? We\u2019ve had drift when charts duplicated env var wiring.\"\n\n**Ines Carvalho (author):** \"Yep \u2014 I refactored to reuse the existing `controlPlane.env` helper template and pass the exact same env var set into the hook job. Added a unit test in `tests/template_test.go` to assert parity for the DB-related vars.\"\n\n**Sean Gallagher:** \"Concern: hook jobs can pile up and clutter namespaces. Also prefer keeping failed jobs for triage.\"\n\n**Ines Carvalho:** \"Configured `hook-delete-policy` to delete on success and before re-creation; failed jobs remain. Added doc note on `kubectl logs job/<name>`.\"\n\n**Marcus Lin:** \"Any chance smoke test prints tokens/headers? We should avoid leaking auth in stdout since installer will scoop logs into diagnostics bundles.\"\n\n**Ines Carvalho:** \"Good call. Updated smoke test script to explicitly redact `Authorization` and to avoid dumping response bodies by default. Docs now say `upgrade.smokeTest.mode=extended` still doesn\u2019t print headers.\"\n\n**Connor O'Brien:** \"Please document the exact ordering guarantee and what it does NOT guarantee (atomic rollback depends on installer flags).\"\n\n**Ines Carvalho:** \"Added a dedicated \u2018Ordering guarantees\u2019 section + mention of `--atomic` requirement. Linked ENG-2314 for installer wiring.\"\n\n## CI\nChecks:\n- `helm-lint`: PASS\n- `chart-tests (kind)`: PASS\n- `yaml-validation`: PASS\n- `security-scan (trivy)`: PASS\n\n## Merge notes\nSquashed as: `charts: gate upgrades on migrations + add post-upgrade smoke test hooks`",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ]
+}
