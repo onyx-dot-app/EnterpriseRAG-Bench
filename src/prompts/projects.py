@@ -1,3 +1,4 @@
+from src.paths import AGENTS_MD_FILE
 from src.schemas.project_enrichment import (
     EXPECTED_FORMAT,
     EXPECTED_FORMAT_DESCRIPTION,
@@ -57,26 +58,26 @@ Similarly, if it's a sales project and there are meeting transcripts in the sour
 If there are high volume discussion channels (like Slack/Discord), there should be a high volume of documents for those sources. For most sources where you are creating hypothetical documents, there should be multiple (to many) documents created. \
 You have a set of tools which you can use liberally to get context before writing the document overviews. At the very end, your task is to output a JSON object as described at the end of this prompt.
 
-## Project details
+## Project Details
 ```
 {{project_description}}
 ```
 
-## Company overview
+## Company Overview
 ```
 {{company_overview_md_contents}}
 ```
 
-## Top level sources directory structure
+## Sources Directory Structure
 ```
 {{source_list}}
 ```
 
 ## Available Tools
 - {TREE_TOOL}: Display the directory tree structure. You may want to use this to get context about the different source types of interest and layouts within the sources.
-- {GLOB_TOOL}: Glob a pattern and return the list of files that match. You can use this to find agents.md files within the file structure (this is much more useful than looking for other non agents.md files). \
-Many directories will not have agents.md files, so just make reasonable assumptions about what should be in those directories. You do not need to read every agents.md file, only for the sources/directories that seem relevant to the project.
-- {READ_TOOL}: Read a file and return its contents. You may want to use this to read agent.md files to get context about the directories.
+- {GLOB_TOOL}: Glob a pattern and return the list of files that match. You can use this to find {AGENTS_MD_FILE} files within the file structure (this is much more useful than looking for other non {AGENTS_MD_FILE} files). \
+Many directories will not have {AGENTS_MD_FILE} files, so just make reasonable assumptions about what should be in those directories. You do not need to read every {AGENTS_MD_FILE} file, only for the sources/directories that seem relevant to the project.
+- {READ_TOOL}: Read a file and return its contents. You may want to use this to read {AGENTS_MD_FILE} files to get context about the directories.
 - {READ_EMPLOYEE_DIRECTORY_TOOL}: Read the employee directory to get information about departments, teams, and reporting structure. You may want to use this to get info about people who might be involved in the project or find potential authors for the documents.
 
 ## Output format
@@ -93,22 +94,22 @@ You are an assistant that helps the user plan out the people for a project. You 
 The end goal is to create a list of people who will be involved in the project. Note that the user names must match exactly with real people in the employee directory. \
 For the number of people involved in each project, consider the scope, size, and complexity of the project.
 
-## Project details
+## Project Details
 ```
 {{project_description}}
 ```
 
-## Company overview
+## Company Overview
 ```
 {{company_overview}}
 ```
 
-Employee Directory:
+## Employee Directory
 ```
 {{employee_directory}}
 ```
 
-## Output format
+## Output Format
 ```json
 {EXPECTED_PEOPLE_FORMAT}
 ```

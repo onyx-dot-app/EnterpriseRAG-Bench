@@ -1,11 +1,12 @@
+from src.paths import AGENTS_MD_FILE
 from src.schemas.field_labels import EXPECTED_FIELD_LABELS_FORMAT
 from src.tools import READ_TOOL
 
-AGENT_MD_FORMAT = """
-agents.md file path: {agents_md_path}
-agents.md file contents:
+AGENT_MD_FORMAT = f"""
+{AGENTS_MD_FILE} file path: {{agents_md_path}}
+{AGENTS_MD_FILE} file contents:
 ```
-{agents_md_contents}
+{{agents_md_contents}}
 ```
 """.strip()
 
@@ -26,7 +27,7 @@ You must output this generated document and associated metadata as a single .jso
 ```
 
 ## Context on the directories
-The following are the contents of the agents.md files for the directories along the path. These give instructions on the contents and metadata for the documents in the directory.
+The following are the contents of the {AGENTS_MD_FILE} files for the directories along the path. These give instructions on the contents and metadata for the documents in the directory.
 {{agents_md_context}}
 
 ## Available Tools
@@ -36,7 +37,7 @@ For most projects, you should not need to read any files. Read at most 2 other f
 ## Important Notes
 - The file should be realistic and consistent with the company context and project goals.
 - If you are including information about people, use the right person from the project details. You do not need to include everyone.
-- Follow any formatting or content guidelines specified in the agents.md files (be sure that the json values are not nested and are all strings or list of strings).
+- Follow any formatting or content guidelines specified in the {AGENTS_MD_FILE} files (be sure that the json values are not nested and are all strings or list of strings).
 - For most documents, there should be one large continuous body of text which is the main content of the document. The metadata fields should be very lightweight.
 - Directly output the raw content of the file (JSON format matching the source type's schema).
 
