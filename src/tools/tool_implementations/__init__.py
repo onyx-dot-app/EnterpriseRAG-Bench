@@ -4,6 +4,7 @@ from src.tools.tool_implementations.mkdir import MkdirTool
 from src.tools.tool_implementations.mvdir import MvdirTool
 from src.tools.tool_implementations.read import ReadTool
 from src.tools.tool_implementations.read_employee_directory import ReadEmployeeDirectoryTool
+from src.tools.tool_implementations.rm import RmTool
 from src.tools.tool_implementations.rmdir import RmdirTool
 from src.tools.tool_implementations.scratchpad import ScratchpadTool
 from src.tools.tool_implementations.tree import TreeTool
@@ -17,6 +18,7 @@ __all__ = [
     "MvdirTool",
     "ReadEmployeeDirectoryTool",
     "ReadTool",
+    "RmTool",
     "RmdirTool",
     "ScratchpadTool",
     "TreeTool",

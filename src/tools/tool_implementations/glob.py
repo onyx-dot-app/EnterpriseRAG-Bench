@@ -10,14 +10,16 @@ from src.tools.interface import ToolInterface
 class GlobTool(ToolInterface):
     """Tool for matching files using glob patterns."""
 
-    def __init__(self, base_dir: str):
+    def __init__(self, base_dir: str, display_name: str | None = None):
         """
         Initialize the GlobTool.
 
         Args:
             base_dir: Base directory to glob within.
+            display_name: Name to show in schema description (defaults to basename of base_dir).
         """
         self._base_dir = base_dir
+        self._display_name = display_name or os.path.basename(base_dir)
 
     @property
     def name(self) -> str:
@@ -28,7 +30,7 @@ class GlobTool(ToolInterface):
         return {
             "type": "function",
             "name": self.name,
-            "description": f"Find files matching a glob pattern within {self._base_dir}.",
+            "description": f"Find files matching a glob pattern within {self._display_name}.",
             "parameters": {
                 "type": "object",
                 "properties": {

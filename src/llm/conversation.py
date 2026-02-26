@@ -1,5 +1,8 @@
+from typing import Callable
+
 from src.llm.interface import LLMInterface, Message, ToolCall
 from src.tools.runner import ToolRunner
+from src.tools.tool_implementations.finish import FinishTool
 
 
 class Conversation:
@@ -88,3 +91,54 @@ class Conversation:
         """
         self.add_user_message(user_input)
         return self.generate_response()
+
+    def run_interactive_loop(
+        self,
+        finish_tool: FinishTool | None = None,
+        on_finish: Callable[[], bool] | None = None,
+    ) -> bool:
+        """
+        Run an interactive conversation loop with user input.
+
+        Handles the common pattern of:
+        1. Check if finish_tool was called
+        2. Get user input (with quit/keyboard interrupt handling)
+        3. Run a conversation turn
+        4. Repeat until finished or quit
+
+        Args:
+            finish_tool: Optional FinishTool to check for completion signal.
+            on_finish: Optional callback when finish_tool signals completion.
+                       Should return True to exit the loop, False to continue
+                       (e.g., after validation failure and reset).
+
+        Returns:
+            True if completed normally (finish_tool or file written),
+            False if user quit early.
+        """
+        while True:
+            # Check if finish tool was called
+            if finish_tool is not None and finish_tool.finished:
+                if on_finish is not None:
+                    should_exit = on_finish()
+                    if should_exit:
+                        return True
+                    # on_finish returned False, continue loop (e.g., validation failed)
+                    continue
+                else:
+                    return True
+
+            try:
+                user_input = input("You: ").strip()
+                if not user_input:
+                    continue
+                if user_input.lower() == "quit":
+                    print("Goodbye!")
+                    return False
+
+                self.run_turn(user_input)
+                print()
+
+            except KeyboardInterrupt:
+                print("\nGoodbye!")
+                return False

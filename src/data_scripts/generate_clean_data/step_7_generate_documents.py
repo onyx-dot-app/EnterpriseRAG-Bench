@@ -3,12 +3,12 @@
 import argparse
 import json
 import os
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tqdm import tqdm
 
-from src.llm import get_llm
-from src.llm.interface import LLMInterface, Message, ToolCall
+from src.llm import Message, get_llm, run_auto_conversation
 from src.paths import (
     AGENTS_MD_FILE,
     COMPANY_OVERVIEW_PATH,
@@ -23,8 +23,6 @@ from src.prompts.document_generation import (
     DOCUMENT_GENERATION_USER_PROMPT,
     FIELD_LABELER_PROMPT,
 )
-from collections import Counter
-
 from src.schemas.field_labels import (
     parse_field_labels,
     validate_field_labels,
@@ -33,50 +31,7 @@ from src.schemas.field_labels import (
 from src.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import ReadTool
-
-
-def load_file(path: str) -> str:
-    """Load a file and return its contents."""
-    with open(path) as f:
-        content = f.read()
-    if not content.strip():
-        raise ValueError(f"File at {path} is empty")
-    return content
-
-
-def _is_simple_value(val: object) -> bool:
-    """Check if a value is a simple string, primitive, or list of strings/primitives."""
-    if isinstance(val, (str, int, float, bool, type(None))):
-        return True
-    if isinstance(val, list):
-        return all(isinstance(item, (str, int, float, bool, type(None))) for item in val)
-    return False
-
-
-def validate_no_nested_dicts(data: dict) -> str | None:
-    """
-    Validate that a JSON dict has no nested dicts.
-
-    All values must be strings, primitives, or lists of strings/primitives.
-
-    Args:
-        data: The parsed JSON dict.
-
-    Returns:
-        None if valid, error message if nested dicts found.
-    """
-    if not isinstance(data, dict):
-        return "Top-level must be a dict"
-
-    nested_keys = []
-    for key, value in data.items():
-        if not _is_simple_value(value):
-            nested_keys.append(key)
-
-    if nested_keys:
-        return f"Nested dicts found in keys: {nested_keys}"
-
-    return None
+from src.utils import extract_json_from_response, load_file, load_json_file, validate_no_nested_dicts, write_json_file
 
 
 def _save_debug_response(
@@ -106,12 +61,6 @@ def _save_debug_response(
         f.write(f"=== Raw LLM response ===\n{raw_response}\n\n")
         if extracted_json is not None:
             f.write(f"=== Extracted JSON (before parsing) ===\n{extracted_json}\n")
-
-
-def load_project_json(path: str) -> dict:
-    """Load a project JSON file."""
-    with open(path) as f:
-        return json.load(f)
 
 
 def get_agents_md_along_path(file_path: str, base_dir: str) -> str:
@@ -151,142 +100,6 @@ def get_agents_md_along_path(file_path: str, base_dir: str) -> str:
         return "(No agents.md files found along the path)"
 
     return "\n\n".join(agents_sections)
-
-
-def run_auto_conversation(
-    llm: LLMInterface,
-    tool_runner: ToolRunner,
-    messages: list[Message],
-    max_tool_cycles: int = 10,
-    max_iterations: int = 30,
-    quiet: bool = False,
-) -> str:
-    """
-    Run a conversation automatically without user input until completion.
-
-    Args:
-        llm: The LLM instance with tools configured.
-        tool_runner: The tool runner with registered tools.
-        messages: The conversation messages (modified in place).
-        max_tool_cycles: Maximum number of tool call cycles before forcing output.
-        max_iterations: Maximum total LLM calls to prevent infinite loops.
-        quiet: If True, suppress LLM status output for fallback LLM.
-
-    Returns:
-        The final text response from the LLM.
-    """
-    tool_cycles = 0
-    current_llm = llm
-
-    for _ in range(max_iterations):
-        full_response = ""
-        tool_calls: list[ToolCall] = []
-
-        for chunk in current_llm.generate(messages):
-            if isinstance(chunk, str):
-                full_response += chunk
-            elif isinstance(chunk, ToolCall):
-                tool_calls.append(chunk)
-
-        # Handle tool calls
-        if tool_calls:
-            tool_cycles += 1
-
-            # Check if we've hit the tool cycle limit
-            if tool_cycles >= max_tool_cycles:
-                messages.append(
-                    Message(
-                        role="user",
-                        content=(
-                            "You have used the maximum number of tool calls. "
-                            "Please output the final document content now."
-                        ),
-                    )
-                )
-                current_llm = get_llm(tools=None, quiet=quiet)
-                continue
-
-            for tool_call in tool_calls:
-                messages.append(
-                    Message(role="tool_call", content="", tool_call=tool_call)
-                )
-                result = tool_runner.run(tool_call.name, **tool_call.args)
-                messages.append(
-                    Message(role="tool_result", content=result, call_id=tool_call.call_id)
-                )
-            continue
-
-        # No tool calls = final response
-        if full_response:
-            messages.append(Message(role="assistant", content=full_response))
-            return full_response
-
-    raise RuntimeError(f"Max iterations ({max_iterations}) exceeded")
-
-
-def extract_json_from_response(response: str) -> str:
-    """
-    Extract JSON from LLM response by finding the outermost JSON structure.
-
-    Tries multiple strategies:
-    1. Find first '{' or '[' and match with last '}' or ']'
-    2. Fallback: Look for JSON in markdown code blocks
-    3. Fallback: Use regex to find JSON object/array
-
-    Args:
-        response: The LLM response text.
-
-    Returns:
-        The extracted JSON string.
-    """
-    import re
-
-    response = response.strip()
-
-    # Strategy 1: Find outermost JSON structure
-    first_brace = response.find("{")
-    first_bracket = response.find("[")
-
-    if first_brace != -1 or first_bracket != -1:
-        if first_brace == -1:
-            start = first_bracket
-            close_char = "]"
-        elif first_bracket == -1:
-            start = first_brace
-            close_char = "}"
-        elif first_brace < first_bracket:
-            start = first_brace
-            close_char = "}"
-        else:
-            start = first_bracket
-            close_char = "]"
-
-        last_close = response.rfind(close_char)
-        if last_close != -1 and last_close >= start:
-            candidate = response[start:last_close + 1]
-            # Validate it's parseable JSON before returning
-            try:
-                json.loads(candidate)
-                return candidate
-            except json.JSONDecodeError:
-                pass  # Fall through to backup strategies
-
-    # Strategy 2 (fallback): Try to find JSON in a markdown code block
-    json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", response)
-    if json_match:
-        candidate = json_match.group(1).strip()
-        try:
-            json.loads(candidate)
-            return candidate
-        except json.JSONDecodeError:
-            pass
-
-    # Strategy 3 (fallback): Regex for JSON object or array
-    json_match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", response)
-    if json_match:
-        return json_match.group(1)
-
-    return response
 
 
 def label_document_fields(document: dict, quiet: bool = False) -> dict:
@@ -414,12 +227,8 @@ def generate_single_file(
             _save_debug_response(file_path, response, json_content)
             return (False, f"Nested dicts: {nested_error}")
 
-        # Ensure parent directory exists
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-
-        # Write the file
-        with open(full_path, "w") as f:
-            json.dump(parsed, f, indent=2)
+        # Write the file (creates parent directories automatically)
+        write_json_file(full_path, parsed)
 
         return (True, "Created")
 
@@ -541,7 +350,7 @@ def process_single_project(
     project_name = os.path.splitext(os.path.basename(project_file))[0]
 
     try:
-        project_json = load_project_json(project_file)
+        project_json = load_json_file(project_file)
     except Exception as e:
         return (project_name, 0, 0, 1, [(project_file, f"Failed to load: {e}")])
 
@@ -622,7 +431,7 @@ def generate_documents(
     existing_files: list[str] = []
     for project_file in project_files:
         try:
-            project_json = load_project_json(project_file)
+            project_json = load_json_file(project_file)
             files = project_json.get("files", [])
             total_files += len(files)
             for file_entry in files:
@@ -777,8 +586,7 @@ def label_single_document(file_path: str, quiet: bool = False) -> tuple[bool, st
         labeled_doc = label_document_fields(document, quiet=quiet)
 
         # Write back
-        with open(full_path, "w") as f:
-            json.dump(labeled_doc, f, indent=2)
+        write_json_file(full_path, labeled_doc)
 
         return (True, "Labeled")
 

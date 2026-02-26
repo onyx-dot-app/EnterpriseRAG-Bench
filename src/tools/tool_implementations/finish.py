@@ -7,6 +7,7 @@ class FinishTool(ToolInterface):
 
     def __init__(self) -> None:
         self._finished = False
+        self._finish_info: str | None = None
 
     @property
     def name(self) -> str:
@@ -17,9 +18,15 @@ class FinishTool(ToolInterface):
         """Returns True if the finish tool has been called."""
         return self._finished
 
+    @property
+    def finish_info(self) -> str | None:
+        """Returns the finish_info passed when finish was called, if any."""
+        return self._finish_info
+
     def reset(self) -> None:
         """Reset the finished state."""
         self._finished = False
+        self._finish_info = None
 
     @property
     def schema(self) -> dict:
@@ -29,12 +36,22 @@ class FinishTool(ToolInterface):
             "description": "Signal that the current step is complete and ready to proceed to the next phase.",
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "finish_info": {
+                        "type": "string",
+                        "description": "Optional information to pass when finishing (e.g., a question or summary).",
+                    },
+                },
                 "required": [],
             },
         }
 
-    def execute(self) -> str:
-        """Mark the step as finished."""
+    def execute(self, finish_info: str | None = None) -> str:
+        """Mark the step as finished.
+
+        Args:
+            finish_info: Optional information to store when finishing.
+        """
         self._finished = True
+        self._finish_info = finish_info
         return "Step marked as complete."

@@ -2,12 +2,12 @@
 
 import os
 import subprocess
-from datetime import datetime
 
 from src.llm import get_llm
 from src.llm.conversation import Conversation
 from src.paths import (
     COMPANY_OVERVIEW_PATH,
+    DATA_CLEAN_DIR,
     INITIATIVES_PATH,
     SOURCE_TREE_PATH,
     SOURCES_DIR,
@@ -23,15 +23,7 @@ from src.tools.tool_implementations import (
     RmdirTool,
     TreeTool,
 )
-
-
-def load_file(path: str) -> str:
-    """Load a file and return its contents."""
-    with open(path) as f:
-        content = f.read()
-    if not content.strip():
-        raise ValueError(f"File at {path} is empty")
-    return content
+from src.utils import confirm_regenerate, get_current_date_formatted, load_file
 
 
 def count_directories(base_dir: str) -> tuple[int, int]:
@@ -56,9 +48,11 @@ def write_source_tree() -> None:
     print("Writing Source Directory Tree")
     print("=" * 40)
 
-    # Run tree command on sources directory (directories only)
+    # Run tree command from data_clean dir with just "sources" as argument
+    # This outputs "sources" as the root instead of "data_clean/sources"
     result = subprocess.run(
-        ["tree", "-d", SOURCES_DIR],
+        ["tree", "-d", "sources"],
+        cwd=DATA_CLEAN_DIR,
         capture_output=True,
         text=True,
     )
@@ -86,18 +80,12 @@ def _has_source_directories() -> bool:
     return any(os.path.isdir(os.path.join(SOURCES_DIR, e)) for e in entries)
 
 
-def _confirm_regenerate(data_description: str) -> bool:
-    """Prompt user to confirm regeneration of existing data."""
-    response = input(f"{data_description} already exists. Regenerate? [y/N]: ").strip().lower()
-    return response in ("y", "yes")
-
-
 def main() -> None:
     # Check if source directories already exist
     if _has_source_directories():
-        if not _confirm_regenerate("Source directories"):
-            # Just update statistics and exit
-            print("Updating statistics only...")
+        if not confirm_regenerate("Source directories"):
+            # Regenerate source_tree.txt and update statistics
+            write_source_tree()
             top_level, total = count_directories(SOURCES_DIR)
             update_statistics("Step 4: Source Structure", {
                 "top_level_directories": top_level,
@@ -109,12 +97,11 @@ def main() -> None:
     # Load context files and build the prompt
     company_overview = load_file(COMPANY_OVERVIEW_PATH)
     initiatives = load_file(INITIATIVES_PATH)
-    current_date = datetime.now().strftime("%B %d, %Y")
 
     prompt = SOURCE_STRUCTURE_SYSTEM_PROMPT.format(
         company_overview_md_contents=company_overview,
         initiatives_md_contents=initiatives,
-        current_date=current_date,
+        current_date=get_current_date_formatted(),
     )
 
     # Create tools
@@ -168,34 +155,20 @@ def main() -> None:
     conversation.generate_response()
     print()
 
+    def on_finish() -> bool:
+        """Handle finish signal."""
+        write_source_tree()
+        # Update aggregate statistics
+        top_level, total = count_directories(SOURCES_DIR)
+        update_statistics("Step 4: Source Structure", {
+            "top_level_directories": top_level,
+            "total_directories": total,
+        })
+        print("\nSource directory structure generation complete!")
+        return True
+
     # Interactive loop
-    while True:
-        # Check if finish tool was called
-        if finish_tool.finished:
-            write_source_tree()
-            # Update aggregate statistics
-            top_level, total = count_directories(SOURCES_DIR)
-            update_statistics("Step 4: Source Structure", {
-                "top_level_directories": top_level,
-                "total_directories": total,
-            })
-            print("\nSource directory structure generation complete!")
-            break
-
-        try:
-            user_input = input("You: ").strip()
-            if not user_input:
-                continue
-            if user_input.lower() == "quit":
-                print("Goodbye!")
-                break
-
-            conversation.run_turn(user_input)
-            print()
-
-        except KeyboardInterrupt:
-            print("\nGoodbye!")
-            break
+    conversation.run_interactive_loop(finish_tool=finish_tool, on_finish=on_finish)
 
 
 if __name__ == "__main__":

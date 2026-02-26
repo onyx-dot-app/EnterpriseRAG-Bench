@@ -9,14 +9,16 @@ from src.tools.interface import ToolInterface
 class TreeTool(ToolInterface):
     """Tool for displaying directory tree structure."""
 
-    def __init__(self, base_dir: str):
+    def __init__(self, base_dir: str, display_name: str | None = None):
         """
         Initialize the TreeTool.
 
         Args:
             base_dir: Base directory to show the tree for.
+            display_name: Name to show in schema description (defaults to basename of base_dir).
         """
         self._base_dir = base_dir
+        self._display_name = display_name or os.path.basename(base_dir)
 
     @property
     def name(self) -> str:
@@ -27,7 +29,7 @@ class TreeTool(ToolInterface):
         return {
             "type": "function",
             "name": self.name,
-            "description": f"Display the directory tree structure under {self._base_dir}.",
+            "description": f"Display the directory tree structure under {self._display_name}.",
             "parameters": {
                 "type": "object",
                 "properties": {

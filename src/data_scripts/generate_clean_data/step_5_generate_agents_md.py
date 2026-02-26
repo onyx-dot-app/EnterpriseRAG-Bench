@@ -14,15 +14,7 @@ from src.prompts.agents_md import AGENTS_MD_SYSTEM_PROMPT
 from src.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import FinishTool, WriteTool
-
-
-def load_file(path: str) -> str:
-    """Load a file and return its contents."""
-    with open(path) as f:
-        content = f.read()
-    if not content.strip():
-        raise ValueError(f"File at {path} is empty")
-    return content
+from src.utils import load_file
 
 
 def find_agents_md_files(base_dir: str) -> list[str]:
@@ -118,33 +110,19 @@ def main() -> None:
     conversation.generate_response()
     print()
 
+    def on_finish() -> bool:
+        """Handle finish signal."""
+        # Update aggregate statistics
+        agents_paths = find_agents_md_files(SOURCES_DIR)
+        update_statistics("Step 5: Agents MD", {
+            "total_agents_md_files": len(agents_paths),
+            "paths": agents_paths,
+        })
+        print(f"\n{AGENTS_MD_FILE} generation complete!")
+        return True
+
     # Interactive loop
-    while True:
-        # Check if finish tool was called
-        if finish_tool.finished:
-            # Update aggregate statistics
-            agents_paths = find_agents_md_files(SOURCES_DIR)
-            update_statistics("Step 5: Agents MD", {
-                "total_agents_md_files": len(agents_paths),
-                "paths": agents_paths,
-            })
-            print(f"\n{AGENTS_MD_FILE} generation complete!")
-            break
-
-        try:
-            user_input = input("You: ").strip()
-            if not user_input:
-                continue
-            if user_input.lower() == "quit":
-                print("Goodbye!")
-                break
-
-            conversation.run_turn(user_input)
-            print()
-
-        except KeyboardInterrupt:
-            print("\nGoodbye!")
-            break
+    conversation.run_interactive_loop(finish_tool=finish_tool, on_finish=on_finish)
 
 
 if __name__ == "__main__":

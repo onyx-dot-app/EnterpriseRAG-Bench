@@ -9,18 +9,13 @@ from src.prompts.company_overview import COMPANY_OVERVIEW_SYSTEM_PROMPT
 from src.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import WriteTool
-
-
-def _confirm_regenerate(data_description: str) -> bool:
-    """Prompt user to confirm regeneration of existing data."""
-    response = input(f"{data_description} already exists. Regenerate? [y/N]: ").strip().lower()
-    return response in ("y", "yes")
+from src.utils import confirm_regenerate
 
 
 def main() -> None:
     # Check if company overview already exists
     if os.path.exists(COMPANY_OVERVIEW_PATH):
-        if not _confirm_regenerate("Company overview"):
+        if not confirm_regenerate("Company overview"):
             print("Updating statistics only...")
             update_statistics("Step 1: Company Overview", {
                 "status": f"Completed - see file at {COMPANY_OVERVIEW_PATH}",
@@ -57,21 +52,7 @@ def main() -> None:
     print()
 
     # Interactive loop
-    while True:
-        try:
-            user_input = input("You: ").strip()
-            if not user_input:
-                continue
-            if user_input.lower() == "quit":
-                print("Goodbye!")
-                break
-
-            conversation.run_turn(user_input)
-            print()
-
-        except KeyboardInterrupt:
-            print("\nGoodbye!")
-            break
+    conversation.run_interactive_loop()
 
     # Update statistics if file was created
     if os.path.exists(COMPANY_OVERVIEW_PATH):

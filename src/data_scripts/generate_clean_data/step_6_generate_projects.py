@@ -8,9 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tqdm import tqdm
 
-from src.llm import get_llm
+from src.llm import Message, get_llm, run_auto_conversation
 from src.llm.conversation import Conversation
-from src.llm.interface import LLMInterface, Message, ToolCall
 from src.paths import (
     COMPANY_OVERVIEW_PATH,
     DATA_CLEAN_DIR,
@@ -44,15 +43,7 @@ from src.tools.tool_implementations import (
     TreeTool,
     WriteTool,
 )
-
-
-def load_file(path: str) -> str:
-    """Load a file and return its contents."""
-    with open(path) as f:
-        content = f.read()
-    if not content.strip():
-        raise ValueError(f"File at {path} is empty")
-    return content
+from src.utils import confirm_regenerate, extract_json_from_response, load_file, load_json_file, write_json_file
 
 
 def parse_project_list(content: str) -> list[tuple[str, str]]:
@@ -141,105 +132,6 @@ def get_source_list(sources_dir: str) -> str:
     entries = sorted(os.listdir(sources_dir))
     dirs = [e for e in entries if os.path.isdir(os.path.join(sources_dir, e))]
     return "\n".join(dirs)
-
-
-def run_auto_conversation(
-    llm: LLMInterface,
-    tool_runner: ToolRunner,
-    messages: list[Message],
-    max_tool_cycles: int = 20,
-    max_iterations: int = 50,
-    quiet: bool = False,
-) -> str:
-    """
-    Run a conversation automatically without user input until completion.
-
-    Args:
-        llm: The LLM instance with tools configured.
-        tool_runner: The tool runner with registered tools.
-        messages: The conversation messages (modified in place).
-        max_tool_cycles: Maximum number of tool call cycles before forcing output.
-        max_iterations: Maximum total LLM calls to prevent infinite loops.
-        quiet: If True, suppress LLM status output for fallback LLM.
-
-    Returns:
-        The final text response from the LLM.
-    """
-    tool_cycles = 0
-    current_llm = llm
-
-    for _ in range(max_iterations):
-        full_response = ""
-        tool_calls: list[ToolCall] = []
-
-        for chunk in current_llm.generate(messages):
-            if isinstance(chunk, str):
-                full_response += chunk
-            elif isinstance(chunk, ToolCall):
-                tool_calls.append(chunk)
-
-        # Handle tool calls
-        if tool_calls:
-            tool_cycles += 1
-
-            # Check if we've hit the tool cycle limit
-            if tool_cycles >= max_tool_cycles:
-                # Add a message telling the LLM to output the JSON now
-                messages.append(
-                    Message(
-                        role="user",
-                        content=(
-                            "You have used the maximum number of tool calls. "
-                            "Please output the final JSON now without any more tool calls."
-                        ),
-                    )
-                )
-                # Create a new LLM instance without tools to force text output
-                current_llm = get_llm(tools=None, quiet=quiet)
-                continue
-
-            for tool_call in tool_calls:
-                messages.append(
-                    Message(role="tool_call", content="", tool_call=tool_call)
-                )
-                result = tool_runner.run(tool_call.name, **tool_call.args)
-                messages.append(
-                    Message(role="tool_result", content=result, call_id=tool_call.call_id)
-                )
-            continue
-
-        # No tool calls = final response
-        if full_response:
-            messages.append(Message(role="assistant", content=full_response))
-            return full_response
-
-    raise RuntimeError(f"Max iterations ({max_iterations}) exceeded")
-
-
-def extract_json_from_response(response: str) -> str:
-    """
-    Extract JSON string from LLM response.
-
-    Args:
-        response: The LLM response text.
-
-    Returns:
-        The extracted JSON string.
-
-    Raises:
-        ValueError: If no JSON found in response.
-    """
-    # Try to find JSON in a code block first
-    json_match = re.search(r"```json\s*(.*?)\s*```", response, re.DOTALL)
-    if json_match:
-        return json_match.group(1)
-
-    # Try to find raw JSON object
-    json_match = re.search(r"\{.*\}", response, re.DOTALL)
-    if json_match:
-        return json_match.group(0)
-
-    raise ValueError(f"No JSON found in response: {response[:500]}...")
 
 
 def enrich_single_project(
@@ -378,12 +270,8 @@ def process_single_project(
             quiet=quiet,
         )
 
-        # Ensure output directory exists
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Write output
-        with open(output_path, "w") as f:
-            json.dump(result, f, indent=2)
+        # Write output (creates parent directories automatically)
+        write_json_file(output_path, result)
 
         return (name, True, f"Created: {filename}")
 
@@ -540,8 +428,12 @@ def enrich_projects(max_parallelization: int = 5) -> None:
     print_document_statistics(PROJECTS_DIR)
 
 
-def run_interactive_generation() -> None:
-    """Run the interactive project list generation phase."""
+def run_interactive_generation() -> bool:
+    """Run the interactive project list generation phase.
+
+    Returns:
+        True if project list was created, False if user quit early.
+    """
     # Load context files
     company_overview = load_file(COMPANY_OVERVIEW_PATH)
     initiatives = load_file(INITIATIVES_PATH)
@@ -577,13 +469,13 @@ def run_interactive_generation() -> None:
     conversation.generate_response()
     print()
 
-    # Interactive loop
+    # Interactive loop - check for file creation after each turn
     while True:
         # Check if project list was written
         if os.path.exists(PROJECT_LIST_PATH):
             print("\nProjects generation complete!")
             print(f"Project list saved to {PROJECT_LIST_PATH}")
-            break
+            return True
 
         try:
             user_input = input("You: ").strip()
@@ -591,14 +483,14 @@ def run_interactive_generation() -> None:
                 continue
             if user_input.lower() == "quit":
                 print("Goodbye!")
-                return  # Exit without enrichment
+                return False
 
             conversation.run_turn(user_input)
             print()
 
         except KeyboardInterrupt:
             print("\nGoodbye!")
-            return  # Exit without enrichment
+            return False
 
 
 def get_projects_without_people(projects_dir: str) -> list[str]:
@@ -649,8 +541,7 @@ def add_people_to_project(
         (success, message) tuple.
     """
     # Load existing project
-    with open(project_path) as f:
-        project_data = json.load(f)
+    project_data = load_json_file(project_path)
 
     project_description = project_data.get("description", "")
 
@@ -690,8 +581,7 @@ def add_people_to_project(
         project_data["people"] = [p.model_dump() for p in valid_people]
 
         # Write back
-        with open(project_path, "w") as f:
-            json.dump(project_data, f, indent=2)
+        write_json_file(project_path, project_data)
 
         return (True, f"Added {len(valid_people)} people")
 
@@ -775,12 +665,6 @@ def _has_project_files() -> bool:
     return any(f.endswith(".json") for f in os.listdir(PROJECTS_DIR))
 
 
-def _confirm_regenerate(data_description: str) -> bool:
-    """Prompt user to confirm regeneration of existing data."""
-    response = input(f"{data_description} already exists. Regenerate? [y/N]: ").strip().lower()
-    return response in ("y", "yes")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate and enrich projects based on company context."
@@ -795,7 +679,7 @@ def main() -> None:
 
     # Check if projects already exist
     if _has_project_files():
-        if not _confirm_regenerate("Projects"):
+        if not confirm_regenerate("Projects"):
             # Just update statistics and exit
             print("Updating statistics only...")
             project_count = len([f for f in os.listdir(PROJECTS_DIR) if f.endswith(".json")])
@@ -822,10 +706,7 @@ def main() -> None:
     else:
         print("Phase 1: Interactive Project List Generation")
         print("-" * 40)
-        run_interactive_generation()
-
-        # Check if generation was completed or user quit
-        if not os.path.exists(PROJECT_LIST_PATH):
+        if not run_interactive_generation():
             print("Project list not generated. Exiting.")
             return
 

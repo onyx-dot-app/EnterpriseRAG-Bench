@@ -17,6 +17,7 @@ class WriteTool(ToolInterface):
         file_path_override: str | None = None,
         validator: ValidatorFunc | None = None,
         expected_format: str | None = None,
+        display_name: str | None = None,
     ):
         """
         Initialize the WriteTool.
@@ -29,11 +30,13 @@ class WriteTool(ToolInterface):
             validator: Optional function to validate content before writing.
                 Should return None if valid, or an error message string if invalid.
             expected_format: Description of expected format to include in error messages.
+            display_name: Name to show in schema description (defaults to basename of base_dir).
         """
         self._base_dir = base_dir
         self._file_path_override = file_path_override
         self._validator = validator
         self._expected_format = expected_format
+        self._display_name = display_name or (os.path.basename(base_dir) if base_dir else None)
 
     @property
     def name(self) -> str:
@@ -55,8 +58,8 @@ class WriteTool(ToolInterface):
     def schema(self) -> dict:
         # Responses API format (name at top level, not nested under "function")
         description = "Write content to a file"
-        if self._base_dir:
-            description += f" under {self._base_dir}"
+        if self._display_name:
+            description += f" under {self._display_name}"
         return {
             "type": "function",
             "name": self.name,

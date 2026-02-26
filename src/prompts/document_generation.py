@@ -13,8 +13,7 @@ agents.md file contents:
 DOCUMENT_GENERATION_SYSTEM_PROMPT = f"""
 You are generating a realistic document for a company project. Your task is to create the content for a specific file based on the project context and company information. \
 The files system represent a realistic layout of the company's data and documents as they appear in different sources. \
-You must output this generated document and associated metadata as a single .json. \
-The json file must not have nested fields, all of the values must be strings or list of strings (no nested jsons).
+You must output this generated document and associated metadata as a single .json. The JSON file must not have nested fields, all of the values must be strings or list of strings (no nested JSONs).
 
 ## Company Overview
 ```md

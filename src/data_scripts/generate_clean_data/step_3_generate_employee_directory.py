@@ -1,7 +1,6 @@
 """Interactive script for generating employee directory with validation."""
 
 import os
-from datetime import datetime
 from io import StringIO
 
 import yaml
@@ -14,15 +13,7 @@ from src.schemas.employee_directory import EXPECTED_FORMAT, EmployeeDirectory, v
 from src.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import FinishTool, WriteTool
-
-
-def load_file(path: str) -> str:
-    """Load a file and return its contents."""
-    with open(path) as f:
-        content = f.read()
-    if not content.strip():
-        raise ValueError(f"File at {path} is empty")
-    return content
+from src.utils import confirm_regenerate, get_current_date_formatted, load_file
 
 
 # =============================================================================
@@ -258,16 +249,10 @@ def run_validation() -> bool:
 # =============================================================================
 
 
-def _confirm_regenerate(data_description: str) -> bool:
-    """Prompt user to confirm regeneration of existing data."""
-    response = input(f"{data_description} already exists. Regenerate? [y/N]: ").strip().lower()
-    return response in ("y", "yes")
-
-
 def main() -> None:
     # Check if employee directory already exists
     if os.path.exists(EMPLOYEE_DIRECTORY_PATH):
-        if not _confirm_regenerate("Employee directory"):
+        if not confirm_regenerate("Employee directory"):
             # Just update statistics and exit
             print("Updating statistics only...")
             directory = load_employee_directory()
@@ -282,12 +267,11 @@ def main() -> None:
     # Load context files and build the prompt
     company_overview = load_file(COMPANY_OVERVIEW_PATH)
     initiatives = load_file(INITIATIVES_PATH)
-    current_date = datetime.now().strftime("%B %d, %Y")
 
     prompt = EMPLOYEE_DIRECTORY_SYSTEM_PROMPT.format(
         company_overview_md_contents=company_overview,
         initiatives_md_contents=initiatives,
-        current_date=current_date,
+        current_date=get_current_date_formatted(),
     )
 
     # Create write tool with validation for employee directory schema
@@ -327,39 +311,26 @@ def main() -> None:
     conversation.generate_response()
     print()
 
+    def on_finish() -> bool:
+        """Handle finish signal with validation."""
+        print("\nFinish signal received. Running validation...")
+        if run_validation():
+            # Update aggregate statistics
+            directory = load_employee_directory()
+            total_employees = sum(len(emps) for emps in directory.departments.values())
+            update_statistics("Step 3: Employee Directory", {
+                "total_employees": total_employees,
+                "departments": len(directory.departments),
+            })
+            print("\nEmployee directory generation complete!")
+            return True
+        else:
+            print("\nValidation failed. Please review and fix the issues.")
+            finish_tool.reset()
+            return False
+
     # Interactive loop
-    while True:
-        # Check if finish tool was called
-        if finish_tool.finished:
-            print("\nFinish signal received. Running validation...")
-            if run_validation():
-                # Update aggregate statistics
-                directory = load_employee_directory()
-                total_employees = sum(len(emps) for emps in directory.departments.values())
-                update_statistics("Step 3: Employee Directory", {
-                    "total_employees": total_employees,
-                    "departments": len(directory.departments),
-                })
-                print("\nEmployee directory generation complete!")
-                break
-            else:
-                print("\nValidation failed. Please review and fix the issues.")
-                finish_tool.reset()
-
-        try:
-            user_input = input("You: ").strip()
-            if not user_input:
-                continue
-            if user_input.lower() == "quit":
-                print("Goodbye!")
-                break
-
-            conversation.run_turn(user_input)
-            print()
-
-        except KeyboardInterrupt:
-            print("\nGoodbye!")
-            break
+    conversation.run_interactive_loop(finish_tool=finish_tool, on_finish=on_finish)
 
 
 if __name__ == "__main__":
