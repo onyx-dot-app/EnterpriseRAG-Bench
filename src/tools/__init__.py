@@ -1,6 +1,7 @@
 FINISH_TOOL = "finish"
 GLOB_TOOL = "glob"
 GREP_TOOL = "grep"
+LS_TOOL = "ls"
 MKDIR_TOOL = "mkdir"
 MVDIR_TOOL = "mvdir"
 READ_TOOL = "read"
@@ -16,6 +17,7 @@ TOOL_NAMES = [
     FINISH_TOOL,
     GLOB_TOOL,
     GREP_TOOL,
+    LS_TOOL,
     MKDIR_TOOL,
     MVDIR_TOOL,
     READ_TOOL,

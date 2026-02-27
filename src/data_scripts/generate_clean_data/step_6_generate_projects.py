@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tqdm import tqdm
@@ -21,6 +22,7 @@ from src.paths import (
     SOURCES_DIR,
 )
 from src.prompts.projects import (
+    PROJECT_DEDUP_PROMPT,
     PROJECT_PEOPLE_PROMPT,
     PROJECTS_ENRICHMENT_PROMPT,
     PROJECTS_SYSTEM_PROMPT,
@@ -428,6 +430,443 @@ def enrich_projects(max_parallelization: int = 5) -> None:
     print_document_statistics(PROJECTS_DIR)
 
 
+def find_file_conflicts(projects_dir: str) -> dict[str, list[tuple[str, int]]]:
+    """
+    Find file path conflicts across all projects.
+
+    Args:
+        projects_dir: Directory containing project JSON files.
+
+    Returns:
+        Dict mapping conflicting file paths to list of (project_filename, file_index) tuples.
+    """
+    # Map file paths to list of (project_filename, file_index)
+    path_to_projects: dict[str, list[tuple[str, int]]] = {}
+
+    if not os.path.exists(projects_dir):
+        return {}
+
+    for filename in os.listdir(projects_dir):
+        if not filename.endswith(".json"):
+            continue
+        filepath = os.path.join(projects_dir, filename)
+        try:
+            data = load_json_file(filepath)
+            files = data.get("files", [])
+            for idx, file_entry in enumerate(files):
+                path = file_entry.get("path", "")
+                if path:
+                    if path not in path_to_projects:
+                        path_to_projects[path] = []
+                    path_to_projects[path].append((filename, idx))
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    # Filter to only conflicts (paths used by more than one project/file)
+    conflicts = {path: projects for path, projects in path_to_projects.items() if len(projects) > 1}
+    return conflicts
+
+
+def get_all_file_paths(projects_dir: str) -> set[str]:
+    """Get all file paths across all projects."""
+    all_paths: set[str] = set()
+
+    if not os.path.exists(projects_dir):
+        return all_paths
+
+    for filename in os.listdir(projects_dir):
+        if not filename.endswith(".json"):
+            continue
+        filepath = os.path.join(projects_dir, filename)
+        try:
+            data = load_json_file(filepath)
+            files = data.get("files", [])
+            for file_entry in files:
+                path = file_entry.get("path", "")
+                if path:
+                    all_paths.add(path)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    return all_paths
+
+
+def find_similar_files(file_path: str, all_paths: set[str]) -> list[str]:
+    """
+    Find files in the same directory that are similarly named (within 2 characters difference).
+
+    Args:
+        file_path: The file path to compare against.
+        all_paths: Set of all existing file paths.
+
+    Returns:
+        List of similar file paths in the same directory.
+    """
+    directory = os.path.dirname(file_path)
+    filename = os.path.basename(file_path)
+
+    similar: list[str] = []
+    for path in all_paths:
+        if path == file_path:
+            continue
+        if os.path.dirname(path) != directory:
+            continue
+
+        other_filename = os.path.basename(path)
+
+        # Check if filenames are within 2 characters difference (same length)
+        if len(filename) == len(other_filename):
+            diff_count = sum(1 for a, b in zip(filename, other_filename) if a != b)
+            if diff_count <= 2:
+                similar.append(path)
+
+        # Also check if length difference is within 2 characters
+        elif abs(len(filename) - len(other_filename)) <= 2:
+            similar.append(path)
+
+    return sorted(similar)
+
+
+def _path_from_dedup_response(response: str) -> str | None:
+    """Extract new_file_path from a dedup proposal response (for rejection user message)."""
+    try:
+        json_str = extract_json_from_response(response)
+        data = json.loads(json_str)
+        return data.get("new_file_path") or None
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def propose_dedup(
+    project_description: str,
+    file_path: str,
+    file_description: str,
+    all_paths: set[str],
+    previous_attempts: list[str] | None = None,
+    quiet: bool = False,
+) -> tuple[str, str, str] | None:
+    """
+    Use LLM to propose a deduplicated file path and description.
+
+    Args:
+        project_description: Description of the project.
+        file_path: Current conflicting file path.
+        file_description: Current file description.
+        all_paths: Set of all existing file paths (to find similar files).
+        previous_attempts: List of actual assistant outputs from previous attempts that failed.
+        quiet: If True, suppress LLM status output.
+
+    Returns:
+        (new_file_path, new_file_description, raw_response) tuple, or None if failed.
+    """
+    # Find similarly-named files in the same directory
+    similar_files = find_similar_files(file_path, all_paths)
+    existing_files_str = "\n".join(similar_files) if similar_files else "(none)"
+
+    prompt = PROJECT_DEDUP_PROMPT.format(
+        existing_files=existing_files_str,
+        project_description=project_description,
+        file_path=file_path,
+        file_description=file_description,
+    )
+
+    llm = get_llm(quiet=quiet)
+    messages: list[Message] = [Message(role="user", content=prompt)]
+
+    # Add previous failed attempts (replay actual agent output)
+    if previous_attempts:
+        for prev_output in previous_attempts:
+            messages.append(Message(role="assistant", content=prev_output))
+            _path = _path_from_dedup_response(prev_output) or "that path"
+            messages.append(Message(role="user", content=f"The proposed file '{_path}' already exists. Please try again with a different filename."))
+
+    response = ""
+    for chunk in llm.generate(messages):
+        if isinstance(chunk, str):
+            response += chunk
+
+    try:
+        json_str = extract_json_from_response(response)
+        data = json.loads(json_str)
+        new_path = data.get("new_file_path", "")
+        new_desc = data.get("new_file_description", "")
+        if new_path and new_desc:
+            return (new_path, new_desc, response)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    return None
+
+
+def try_resolve_conflict(
+    project_filename: str,
+    file_index: int,
+    conflicting_path: str,
+    all_paths: set[str],
+    paths_lock: threading.Lock,
+    project_locks: dict[str, threading.Lock],
+    projects_dir: str,
+    max_attempts: int = 3,
+) -> tuple[bool, str | None]:
+    """
+    Try to resolve a single file conflict automatically.
+
+    Args:
+        project_filename: Name of the project JSON file.
+        file_index: Index of the file in the project's files list.
+        conflicting_path: The conflicting file path.
+        all_paths: Set of all existing file paths (to check for new collisions).
+        paths_lock: Lock for thread-safe access to all_paths.
+        project_locks: Dict of locks for thread-safe access to each project file.
+        projects_dir: Directory containing project JSON files.
+        max_attempts: Maximum number of LLM attempts.
+
+    Returns:
+        (success, new_path) tuple. If failed, new_path is None.
+    """
+    project_path = os.path.join(projects_dir, project_filename)
+
+    # Load project data for the prompt (read-only, no lock needed)
+    project_data = load_json_file(project_path)
+    project_description = project_data.get("description", "")
+    file_entry = project_data["files"][file_index]
+    file_description = file_entry.get("description", "")
+
+    previous_attempts: list[str] = []
+
+    for _attempt in range(max_attempts):
+        # Get a snapshot of all_paths for the LLM prompt (find_similar_files)
+        with paths_lock:
+            current_paths = set(all_paths)
+
+        proposal = propose_dedup(
+            project_description=project_description,
+            file_path=conflicting_path,
+            file_description=file_description,
+            all_paths=current_paths,
+            previous_attempts=previous_attempts if previous_attempts else None,
+            quiet=True,
+        )
+
+        if proposal is None:
+            continue
+
+        new_path, new_desc, raw_response = proposal
+
+        # Atomically check and add the new path
+        with paths_lock:
+            if new_path in all_paths and new_path != conflicting_path:
+                previous_attempts.append(raw_response)
+                continue
+
+            # Reserve the new path immediately
+            all_paths.add(new_path)
+
+        # Success - update the project file with per-project lock
+        # Re-load the file to get the latest version (another worker may have modified it)
+        with project_locks[project_filename]:
+            fresh_project_data = load_json_file(project_path)
+            fresh_project_data["files"][file_index]["path"] = new_path
+            fresh_project_data["files"][file_index]["description"] = new_desc
+            write_json_file(project_path, fresh_project_data)
+
+        return (True, new_path)
+
+    # Failed after max_attempts
+    return (False, None)
+
+
+def apply_manual_dedup(
+    project_filename: str,
+    file_index: int,
+    conflicting_path: str,
+    new_filename: str,
+    projects_dir: str,
+) -> str:
+    """
+    Apply a manual dedup by updating the file path with a new filename.
+
+    Args:
+        project_filename: Name of the project JSON file.
+        file_index: Index of the file in the project's files list.
+        conflicting_path: The original conflicting file path.
+        new_filename: The new filename (just the filename, not full path).
+        projects_dir: Directory containing project JSON files.
+
+    Returns:
+        The new full path.
+    """
+    project_path = os.path.join(projects_dir, project_filename)
+    project_data = load_json_file(project_path)
+
+    # Build new path using the directory from the original path
+    directory = os.path.dirname(conflicting_path)
+    new_path = os.path.join(directory, new_filename)
+
+    # Ensure it ends with .json
+    if not new_path.endswith(".json"):
+        new_path = f"{new_path}.json"
+
+    # Update the project file
+    project_data["files"][file_index]["path"] = new_path
+    write_json_file(project_path, project_data)
+
+    return new_path
+
+
+def deduplicate_file_paths(max_parallelism: int = 10) -> None:
+    """
+    Phase 2.5: Check for and resolve file path conflicts across projects.
+
+    Args:
+        max_parallelism: Maximum number of parallel dedup operations.
+    """
+    print()
+    print("=" * 40)
+    print("Phase 2.5: Deduplicate File Paths")
+    print("=" * 40)
+
+    conflicts = find_file_conflicts(PROJECTS_DIR)
+
+    if not conflicts:
+        print("No file path conflicts found.")
+        return
+
+    # Build list of conflicts to resolve (skip first occurrence of each path)
+    to_resolve: list[tuple[str, str, int]] = []  # (conflicting_path, project_filename, file_index)
+    for conflicting_path, project_refs in conflicts.items():
+        # Keep first occurrence, deduplicate the rest
+        for i, (project_filename, file_index) in enumerate(project_refs):
+            if i == 0:
+                continue
+            to_resolve.append((conflicting_path, project_filename, file_index))
+
+    print(f"Found {len(conflicts)} conflicting paths, {len(to_resolve)} files need deduplication.")
+    print(f"Running automatic deduplication with parallelism={max_parallelism}...")
+    print()
+
+    # Get all current paths for collision checking (thread-safe with lock)
+    all_paths = get_all_file_paths(PROJECTS_DIR)
+    paths_lock = threading.Lock()
+
+    # Create per-project locks to prevent concurrent modifications to the same file
+    unique_projects = {project_filename for _, project_filename, _ in to_resolve}
+    project_locks: dict[str, threading.Lock] = {pf: threading.Lock() for pf in unique_projects}
+
+    resolved = 0
+    failed: list[tuple[str, str, int]] = []  # (conflicting_path, project_filename, file_index)
+
+    with ThreadPoolExecutor(max_workers=max_parallelism) as executor:
+        futures = {
+            executor.submit(
+                try_resolve_conflict,
+                project_filename,
+                file_index,
+                conflicting_path,
+                all_paths,
+                paths_lock,
+                project_locks,
+                PROJECTS_DIR,
+            ): (conflicting_path, project_filename, file_index)
+            for conflicting_path, project_filename, file_index in to_resolve
+        }
+
+        with tqdm(total=len(to_resolve), desc="Deduplicating") as pbar:
+            for future in as_completed(futures):
+                conflicting_path, project_filename, file_index = futures[future]
+                try:
+                    success, _new_path = future.result()
+                    if success:
+                        resolved += 1
+                    else:
+                        failed.append((conflicting_path, project_filename, file_index))
+                        tqdm.write(f"[FAIL] {project_filename}: {conflicting_path}")
+                except Exception as e:
+                    failed.append((conflicting_path, project_filename, file_index))
+                    tqdm.write(f"[FAIL] {project_filename}: {conflicting_path} - {e}")
+                pbar.update(1)
+
+    print()
+    print(f"Automatic deduplication: {resolved} resolved, {len(failed)} failed.")
+
+    # Handle failed dedups - ask user for manual input
+    if failed:
+        print()
+        print("=" * 40)
+        print("Manual Resolution Required")
+        print("=" * 40)
+        print(f"{len(failed)} files need manual filename assignment.")
+        print("For each, enter just the new filename (not the full path).")
+        print("Type 'skip' to skip a file.")
+        print()
+
+        # Refresh all_paths after parallel updates
+        all_paths = get_all_file_paths(PROJECTS_DIR)
+
+        manual_resolved = 0
+        manual_skipped = 0
+
+        for conflicting_path, project_filename, file_index in failed:
+            directory = os.path.dirname(conflicting_path)
+            old_filename = os.path.basename(conflicting_path)
+
+            print(f"\nProject: {project_filename}")
+            print(f"Directory: {directory}/")
+            print(f"Current filename: {old_filename}")
+
+            while True:
+                new_filename = input("New filename (or 'skip'): ").strip()
+
+                if new_filename.lower() == "skip":
+                    print("  Skipped.")
+                    manual_skipped += 1
+                    break
+
+                if not new_filename:
+                    print("  Filename cannot be empty.")
+                    continue
+
+                # Ensure it ends with .json
+                if not new_filename.endswith(".json"):
+                    new_filename = f"{new_filename}.json"
+
+                # Build full path and check for collision
+                new_full_path = os.path.join(directory, new_filename)
+                if new_full_path in all_paths:
+                    print(f"  '{new_filename}' already exists in this directory. Try another.")
+                    continue
+
+                # Apply the change
+                actual_path = apply_manual_dedup(
+                    project_filename=project_filename,
+                    file_index=file_index,
+                    conflicting_path=conflicting_path,
+                    new_filename=new_filename,
+                    projects_dir=PROJECTS_DIR,
+                )
+                all_paths.add(actual_path)
+                print(f"  Updated to: {actual_path}")
+                manual_resolved += 1
+                break
+
+        print()
+        print(f"Manual resolution: {manual_resolved} resolved, {manual_skipped} skipped.")
+
+    # Final summary
+    print()
+    print("=" * 40)
+    total_resolved = resolved + (len(failed) - len([f for f in failed if f]))  # Approximate
+    print(f"Deduplication complete.")
+
+    # Check for remaining conflicts
+    remaining = find_file_conflicts(PROJECTS_DIR)
+    if remaining:
+        remaining_count = sum(len(refs) - 1 for refs in remaining.values())
+        print(f"Warning: {remaining_count} conflicts still remain.")
+    else:
+        print("All conflicts resolved.")
+
+
 def run_interactive_generation() -> bool:
     """Run the interactive project list generation phase.
 
@@ -675,43 +1114,54 @@ def main() -> None:
         default=5,
         help="Maximum number of parallel enrichments (default: 5)",
     )
+    parser.add_argument(
+        "--dedup-parallelism",
+        type=int,
+        default=20,
+        help="Maximum number of parallel deduplication operations (default: 20)",
+    )
     args = parser.parse_args()
-
-    # Check if projects already exist
-    if _has_project_files():
-        if not confirm_regenerate("Projects"):
-            # Just update statistics and exit
-            print("Updating statistics only...")
-            project_count = len([f for f in os.listdir(PROJECTS_DIR) if f.endswith(".json")])
-            update_statistics("Step 6: Projects", {
-                "total_projects": project_count,
-            })
-            print("Statistics updated.")
-            return
 
     print("Step 6: Generate Projects")
     print("=" * 40)
     print("This script generates and enriches projects based on company context.")
     print("Projects are smaller in scope than initiatives - concrete work items for teams.")
     print()
+    print("Phases:")
+    print("  1. Interactive project list generation")
+    print("  2. Enrich projects with file paths and descriptions")
+    print("  2.5. Deduplicate conflicting file paths")
+    print("  3. Populate people for each project")
+    print()
 
-    # Phase 1: Generate project list (interactive) or skip if exists
-    if os.path.exists(PROJECT_LIST_PATH):
-        print(f"Found cached project list at {PROJECT_LIST_PATH}")
-        print("Skipping interactive generation...")
-        with open(PROJECT_LIST_PATH) as f:
-            content = f.read()
-        projects = parse_project_list(content)
-        print(f"Project list contains {len(projects)} projects.")
-    else:
-        print("Phase 1: Interactive Project List Generation")
-        print("-" * 40)
-        if not run_interactive_generation():
-            print("Project list not generated. Exiting.")
-            return
+    # Check if projects already exist
+    skip_generation = False
+    if _has_project_files():
+        if not confirm_regenerate("Projects"):
+            skip_generation = True
+            print("Skipping generation phases, will run validation and completion phases...")
 
-    # Phase 2: Enrich projects
-    enrich_projects(max_parallelization=args.max_parallelization)
+    if not skip_generation:
+        # Phase 1: Generate project list (interactive) or skip if exists
+        if os.path.exists(PROJECT_LIST_PATH):
+            print(f"Found cached project list at {PROJECT_LIST_PATH}")
+            print("Skipping interactive generation...")
+            with open(PROJECT_LIST_PATH) as f:
+                content = f.read()
+            projects = parse_project_list(content)
+            print(f"Project list contains {len(projects)} projects.")
+        else:
+            print("Phase 1: Interactive Project List Generation")
+            print("-" * 40)
+            if not run_interactive_generation():
+                print("Project list not generated. Exiting.")
+                return
+
+        # Phase 2: Enrich projects
+        enrich_projects(max_parallelization=args.max_parallelization)
+
+    # Phase 2.5: Deduplicate file paths (always run to catch conflicts)
+    deduplicate_file_paths(max_parallelism=args.dedup_parallelism)
 
     # Phase 3: Populate people
     # NOTE: This is necessary as a separate step because the step above is already quite complex

@@ -89,6 +89,31 @@ Many directories will not have {AGENTS_MD_FILE} files, so just make reasonable a
 """.strip()
 
 
+PROJECT_DEDUP_PROMPT = """
+You are an assistant that helps the user deduplicate files for projects. Files were created based on high level initiatives and project outlines but there has been a collision in the file names. \
+Based on the project and file description, come up with a different file name in the same directory, keeping things as close to the original file name as possible.\
+You can also modify the description if needed (but it should be a very small modification only to avoid the collision). The file name should remain the same format as the original file name. \
+It is important that the new file name is of the same format as the original file name. For example, a file called pr-3495.json might be modified to pr-3598.json but not pr-3495-new-description.json. \
+Note: It may help to choose a fairly different number instead of incrementing by 1 for files which include these types of IDs.
+
+Here is a list of files in the same directory that are similary named (2 character off from the original file name). These already exist so do not use them!
+{existing_files}
+
+Project Description:
+{project_description}
+
+File Description:
+{file_path}
+{file_description}
+
+Output a JSON object with the following format:
+{{
+  "new_file_path": "sources/relative/path/to/file.json",
+  "new_file_description": "New description of the file."
+}}
+CRITICAL: Output ONLY the JSON content, no markdown code blocks or explanations.
+"""
+
 PROJECT_PEOPLE_PROMPT = f"""
 You are an assistant that helps the user plan out the people for a project. You are provided with a high level description of the project as well as an overview of the company. \
 The end goal is to create a list of people who will be involved in the project. Note that the user names must match exactly with real people in the employee directory. \
