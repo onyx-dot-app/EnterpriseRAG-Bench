@@ -4,6 +4,9 @@ sources/fireflies
 Target number of files:
 10000
 
+File name format:
+The documents must include the date and meeting title in the format of 2025-01-28-meeting-title.json
+
 Content rules:
 - Documents in this directory are Fireflies.ai meeting artifacts, specifically call transcripts.
 - The vast majority of calls are sales-related and fall into these common categories:
