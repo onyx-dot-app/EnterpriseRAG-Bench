@@ -33,7 +33,7 @@ class Conversation:
         """Add a tool result to the conversation."""
         self.messages.append(Message(role="tool_result", content=content, call_id=call_id))
 
-    def generate_response(self) -> str:
+    def generate_response(self, exit_on_tools: list[str] | None = None) -> str:
         """
         Generate a response from the current messages.
 
@@ -41,12 +41,19 @@ class Conversation:
         When parallel tool calls are made, all are executed before
         returning to the LLM.
 
+        Args:
+            exit_on_tools: Optional list of tool names that should cause immediate
+                return after being called (without letting LLM generate more text).
+
         Returns:
             The final assistant response as a string.
         """
+        exit_on_tools = exit_on_tools or []
+
         while True:
             full_response = ""
             tool_calls: list[ToolCall] = []
+            should_exit = False
 
             for chunk in self.llm.generate(self.messages):
                 if isinstance(chunk, str):
@@ -68,6 +75,14 @@ class Conversation:
                         result = self.tool_runner.run(tool_call.name, **tool_call.args)
                         print(f"\n[Tool Result]\n{result}\n[/Tool Result]\n", flush=True)
                         self.add_tool_result(tool_call.call_id, result)
+
+                    # Check if this tool should cause an early exit
+                    if tool_call.name in exit_on_tools:
+                        should_exit = True
+
+                if should_exit:
+                    return full_response
+
                 continue
 
             # Return text response only when there are no tool calls
@@ -76,7 +91,7 @@ class Conversation:
                 self.add_assistant_message(full_response)
                 return full_response
 
-    def run_turn(self, user_input: str) -> str:
+    def run_turn(self, user_input: str, exit_on_tools: list[str] | None = None) -> str:
         """
         Run a single conversation turn.
 
@@ -85,12 +100,14 @@ class Conversation:
 
         Args:
             user_input: The user's input message.
+            exit_on_tools: Optional list of tool names that should cause immediate
+                return after being called (without letting LLM generate more text).
 
         Returns:
             The final assistant response as a string.
         """
         self.add_user_message(user_input)
-        return self.generate_response()
+        return self.generate_response(exit_on_tools=exit_on_tools)
 
     def run_interactive_loop(
         self,

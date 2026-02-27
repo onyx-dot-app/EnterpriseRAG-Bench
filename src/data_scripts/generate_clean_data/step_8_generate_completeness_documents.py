@@ -20,9 +20,11 @@ from src.prompts.completeness_documents import (
     COMPLETENESS_USER_PROMPT_NEW_TYPE,
 )
 from src.statistics import update_statistics
+from src.tools import FINISH_TOOL
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import FinishTool, GlobTool, ReadTool, RmTool, WriteTool
 from src.utils.dataset_id import add_dataset_doc_uuid
+from src.utils.field_labeling import label_single_document
 from src.utils.file_io import delete_file, load_file, load_json_file, write_json_file
 from src.utils.validation import validate_no_nested_dicts
 
@@ -164,6 +166,20 @@ def add_uuids_to_files(file_paths: list[str]) -> list[str]:
     return uuids
 
 
+def label_files(file_paths: list[str]) -> None:
+    """
+    Add field labels (title_field_name, content_field_names) to each file.
+
+    Args:
+        file_paths: List of paths relative to sources (e.g., "sources/confluence/doc.json")
+    """
+    for rel_path in file_paths:
+        full_path = os.path.join(DATA_CLEAN_DIR, rel_path)
+        success, message = label_single_document(full_path, quiet=True)
+        if not success:
+            print(f"  Warning: Failed to label {rel_path}: {message}")
+
+
 def write_question_cache(trace_number: int, question: str, document_uuids: list[str]) -> str:
     """Write a completeness question cache JSON file."""
     os.makedirs(QUESTION_CACHE_DIR, exist_ok=True)
@@ -286,11 +302,8 @@ def main() -> None:
 
         # Add system prompt, then user prompt, and get initial response
         conversation.add_system_message(prompt)
-        conversation.run_turn(user_prompt)
+        conversation.run_turn(user_prompt, exit_on_tools=[FINISH_TOOL])
         print()
-
-        # Interactive loop for this trace
-        trace_complete = False
 
         while True:
             # Check if finish tool was called
@@ -325,13 +338,16 @@ def main() -> None:
                 print("\nAdding dataset_doc_uuid to documents...")
                 document_uuids = add_uuids_to_files(files)
 
+                # Add field labels to documents
+                print("Adding field labels to documents...")
+                label_files(files)
+
                 # Write the question cache with UUIDs
                 cache_path = write_question_cache(trace_number, question, document_uuids)
                 traces_generated += 1
                 print(f"\nSaved to {cache_path}")
                 print(f"  Question: {question}")
                 print(f"  Document UUIDs: {document_uuids}")
-                trace_complete = True
                 break
 
             try:
@@ -343,7 +359,7 @@ def main() -> None:
                     quit_requested = True
                     break
 
-                conversation.run_turn(user_input)
+                conversation.run_turn(user_input, exit_on_tools=[FINISH_TOOL])
 
                 # Sync deleted paths - remove from write_tool tracking
                 for deleted_path in rm_tool.deleted_paths:

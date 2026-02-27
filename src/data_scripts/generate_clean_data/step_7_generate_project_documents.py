@@ -21,17 +21,20 @@ from src.prompts.document_generation import (
     AGENT_MD_FORMAT,
     DOCUMENT_GENERATION_SYSTEM_PROMPT,
     DOCUMENT_GENERATION_USER_PROMPT,
-    FIELD_LABELER_PROMPT,
-)
-from src.schemas.field_labels import (
-    parse_field_labels,
-    validate_field_labels,
-    validate_field_labels_against_document,
 )
 from src.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import ReadTool
-from src.utils import add_dataset_doc_uuid, extract_json_from_response, load_file, load_json_file, validate_no_nested_dicts, write_json_file
+from src.utils import (
+    add_dataset_doc_uuid,
+    extract_json_from_response,
+    get_documents_without_labels,
+    label_single_document,
+    load_file,
+    load_json_file,
+    validate_no_nested_dicts,
+    write_json_file,
+)
 
 
 def _save_debug_response(
@@ -100,55 +103,6 @@ def get_agents_md_along_path(file_path: str, base_dir: str) -> str:
         return "(No agents.md files found along the path)"
 
     return "\n\n".join(agents_sections)
-
-
-def label_document_fields(document: dict, quiet: bool = False) -> dict:
-    """
-    Run field labeling on a document to identify title and content fields.
-
-    Args:
-        document: The parsed document JSON.
-        quiet: If True, suppress LLM status output.
-
-    Returns:
-        Updated document with title_field_name and content_field_names added.
-
-    Raises:
-        ValueError: If field labeling fails validation.
-    """
-    # Build the prompt
-    prompt = FIELD_LABELER_PROMPT.format(
-        json_document=json.dumps(document, indent=2),
-    )
-
-    # Get LLM response (no tools needed)
-    llm = get_llm(quiet=quiet)
-    messages: list[Message] = [Message(role="user", content=prompt)]
-
-    response = ""
-    for chunk in llm.generate(messages):
-        if isinstance(chunk, str):
-            response += chunk
-
-    # Extract and validate JSON
-    json_str = extract_json_from_response(response)
-
-    validation_error = validate_field_labels(json_str)
-    if validation_error:
-        raise ValueError(f"Field labels validation failed: {validation_error}")
-
-    field_labels = parse_field_labels(json_str)
-
-    # Validate that the field names exist in the document
-    doc_validation_error = validate_field_labels_against_document(field_labels, document)
-    if doc_validation_error:
-        raise ValueError(f"Field labels reference invalid keys: {doc_validation_error}")
-
-    # Add the field labels to the document
-    document["title_field_name"] = field_labels.title_field_name
-    document["content_field_names"] = field_labels.content_field_names
-
-    return document
 
 
 def generate_single_file(
@@ -521,79 +475,6 @@ def generate_documents(
 
     # Print statistics
     print_document_statistics()
-
-
-def get_documents_without_labels(sources_dir: str) -> list[str]:
-    """
-    Return list of document JSON files that don't have field labels.
-
-    Args:
-        sources_dir: Directory containing source documents.
-
-    Returns:
-        List of file paths (relative to DATA_CLEAN_DIR) missing field labels.
-    """
-    missing: list[str] = []
-    if not os.path.exists(sources_dir):
-        return missing
-
-    for root, _dirs, files in os.walk(sources_dir):
-        for filename in files:
-            if not filename.endswith(".json"):
-                continue
-            # Skip agents.md files
-            if filename == "agents.md":
-                continue
-
-            filepath = os.path.join(root, filename)
-            try:
-                with open(filepath) as f:
-                    data = json.load(f)
-                # Check if field labels are missing
-                if "title_field_name" not in data or "content_field_names" not in data:
-                    # Get path relative to DATA_CLEAN_DIR
-                    rel_path = os.path.relpath(filepath, DATA_CLEAN_DIR)
-                    missing.append(rel_path)
-            except (json.JSONDecodeError, OSError):
-                continue
-
-    return missing
-
-
-def label_single_document(file_path: str, quiet: bool = False) -> tuple[bool, str]:
-    """
-    Add field labels to a single document file.
-
-    Args:
-        file_path: Path to the document file (relative to DATA_CLEAN_DIR).
-        quiet: If True, suppress LLM status output.
-
-    Returns:
-        (success, message) tuple.
-    """
-    full_path = os.path.join(DATA_CLEAN_DIR, file_path)
-
-    try:
-        # Load existing document
-        with open(full_path) as f:
-            document = json.load(f)
-
-        # Skip if already labeled
-        if "title_field_name" in document and "content_field_names" in document:
-            return (True, "Skipped (already labeled)")
-
-        # Run field labeling
-        labeled_doc = label_document_fields(document, quiet=quiet)
-
-        # Write back
-        write_json_file(full_path, labeled_doc)
-
-        return (True, "Labeled")
-
-    except ValueError as e:
-        return (False, str(e))
-    except Exception as e:
-        return (False, f"Error: {e}")
 
 
 def label_documents(max_parallelism: int = 5) -> None:
