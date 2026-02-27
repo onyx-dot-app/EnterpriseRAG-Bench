@@ -76,8 +76,8 @@ def delete_written_files(file_paths: list[str]) -> None:
 class TrackingWriteTool(WriteTool):
     """WriteTool that tracks all written file paths."""
 
-    def __init__(self, base_dir: str | None = None) -> None:
-        super().__init__(base_dir=base_dir)
+    def __init__(self, base_dir: str | None = None, allow_create_dirs: bool = False) -> None:
+        super().__init__(base_dir=base_dir, allow_create_dirs=allow_create_dirs)
         self._written_paths: list[str] = []
 
     @property
@@ -99,14 +99,23 @@ class TrackingWriteTool(WriteTool):
 
     def execute(self, content: str, file_path: str = "") -> str:
         """Write content and track the path."""
+        # Check if file already exists before writing
+        if self._base_dir and file_path:
+            normalized_path = self._normalize_path(file_path)
+            target_path = os.path.join(self._base_dir, normalized_path)
+            if os.path.exists(target_path):
+                return f"Error: File already exists at {file_path}. Try with a new file name or path."
+
         result = super().execute(content, file_path)
-        if result.startswith("Successfully wrote to"):
-            # Extract the relative path from sources/
-            if self._base_dir:
-                # Normalize the path
-                normalized = self._normalize_path(file_path)
-                # Store path relative to sources directory
-                self._written_paths.append(f"sources/{normalized}")
+        if result.startswith("Successfully wrote to "):
+            # Extract the actual written path from the result
+            actual_path = result.replace("Successfully wrote to ", "")
+            # Convert to relative path from sources/
+            if self._base_dir and actual_path.startswith(self._base_dir):
+                rel_path = actual_path[len(self._base_dir):].lstrip("/")
+                self._written_paths.append(f"sources/{rel_path}")
+            else:
+                self._written_paths.append(actual_path)
         return result
 
 
@@ -174,14 +183,14 @@ def get_question_type_prompt() -> tuple[int, str]:
     Returns:
         (question_type, user_prompt) tuple where question_type is 1-6.
     """
-    question_type = random.randint(1, 6)
+    question_type = random.randint(1, 5)
     if question_type <= 4:
         # Use existing question type
         user_prompt = COMPLETENESS_USER_PROMPT_EXISTING_TYPE.format(
             question_type_number=question_type
         )
     else:
-        # Use new question type (5 or 6)
+        # Use new question type
         user_prompt = COMPLETENESS_USER_PROMPT_NEW_TYPE
     return question_type, user_prompt
 
@@ -238,7 +247,11 @@ def main() -> None:
 
         # Create tools
         write_tool = TrackingWriteTool(base_dir=SOURCES_DIR)
-        glob_tool = GlobTool(base_dir=SOURCES_DIR)
+        glob_tool = GlobTool(
+            base_dir=SOURCES_DIR,
+            required_pattern=r"agents",
+            pattern_error_message="You can only use the glob command on agents.md files.",
+        )
         read_tool = ReadTool(base_dir=SOURCES_DIR)
         rm_tool = RmTool(
             base_dir=SOURCES_DIR,

@@ -5,7 +5,7 @@ from src.tools import GLOB_TOOL, READ_TOOL, WRITE_TOOL, RM_TOOL, FINISH_TOOL
 COMPLETENESS_SYSTEM_PROMPT = f"""
 You are a helpful assistant that helps the user come up with a question and a set of hypothetical documents (3-7 documents) that would be needed to answer the question. The question is specifically a "high-recall" or "completeness" type question which requires exhaustive retrieval. \
 The hard part of the retrieval is that all of the relevant documents must be found to correctly answer the question. These can also be viewed as a type of low-cardinality aggregation question. \
-It is important that the questions are not so specific that the retrieval/search becomes trivial. Do not add too many qualifying filters to the question but it should be specific enough to not have collisions with other documents in the dataset by accident. \
+It is important that the questions are concise and not so specific that the retrieval/search becomes trivial. Do not add too many qualifying filters to the question but it should be specific enough to not have collisions with other documents in the dataset by accident. \
 Your job is to reference the company context and file structure to help the user come up with such a question and then write a set of documents within the file structure that answer the question. \
 The documents exist in a file structure which represents a realistic layout of the company's data and documents as they appear in different sources. There are {AGENTS_MD_FILE} files in the file system which gives information on the contents and metadata for the documents in that directory and below.
 CRITICAL: the documents writtem must be in JSON format that matches the schema for the source type found in the {AGENTS_MD_FILE} file. The JSON file must not have nested fields, all of the values must be strings or list of strings (no nested JSONs).
@@ -47,10 +47,10 @@ IMPORTANT: The examples above are just for clarity, they are not to be treated a
 
 
 COMPLETENESS_USER_PROMPT_EXISTING_TYPE = """
-I want a question of the {question_type_number} type from the `# Question Types` section but don't copy it exactly, make it your own.
+I want a question of the {question_type_number} type from the `# Question Types` section but don't copy it exactly, make it your own. Make sure the question is concise and not so specific that the retrieval/search becomes trivial.
 """.strip()
 
 
 COMPLETENESS_USER_PROMPT_NEW_TYPE = """
-Make sure the question you help me come up with is not one of the 4 question types in the `# Question Types` section.
+Make sure the question you help me come up with is not one of the 4 question types in the `# Question Types` section. Make sure the question is concise and not so specific that the retrieval/search becomes trivial.
 """.strip()

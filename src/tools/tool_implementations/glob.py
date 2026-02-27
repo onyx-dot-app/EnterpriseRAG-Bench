@@ -2,6 +2,7 @@
 
 import glob
 import os
+import re
 
 from src.tools import GLOB_TOOL
 from src.tools.interface import ToolInterface
@@ -10,16 +11,26 @@ from src.tools.interface import ToolInterface
 class GlobTool(ToolInterface):
     """Tool for matching files using glob patterns."""
 
-    def __init__(self, base_dir: str, display_name: str | None = None):
+    def __init__(
+        self,
+        base_dir: str,
+        display_name: str | None = None,
+        required_pattern: str | None = None,
+        pattern_error_message: str | None = None,
+    ):
         """
         Initialize the GlobTool.
 
         Args:
             base_dir: Base directory to glob within.
             display_name: Name to show in schema description (defaults to basename of base_dir).
+            required_pattern: Optional regex pattern that the glob pattern must match.
+            pattern_error_message: Custom error message when pattern doesn't match required_pattern.
         """
         self._base_dir = base_dir
         self._display_name = display_name or os.path.basename(base_dir)
+        self._required_pattern = re.compile(required_pattern) if required_pattern else None
+        self._pattern_error_message = pattern_error_message or "Pattern does not match required format."
 
     @property
     def name(self) -> str:
@@ -65,6 +76,10 @@ class GlobTool(ToolInterface):
         """
         if ".." in pattern:
             return "Error: Pattern cannot contain '..'"
+
+        # Check if pattern matches required regex
+        if self._required_pattern and not self._required_pattern.search(pattern):
+            return f"Error: {self._pattern_error_message}"
 
         pattern = self._normalize_path(pattern)
         full_pattern = os.path.join(self._base_dir, pattern)

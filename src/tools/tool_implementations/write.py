@@ -1,4 +1,5 @@
 import os
+import re
 from collections.abc import Callable
 
 from src.tools import WRITE_TOOL
@@ -6,6 +7,14 @@ from src.tools.interface import ToolInterface
 
 # Validator function type: takes content string, returns error message or None
 ValidatorFunc = Callable[[str], str | None]
+
+# Pattern to match control characters (ASCII 0-31 except tab/newline/carriage return, plus DEL 127)
+_CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _strip_control_chars(content: str) -> str:
+    """Remove control characters from content, preserving tab, newline, and carriage return."""
+    return _CONTROL_CHAR_PATTERN.sub("", content)
 
 
 class WriteTool(ToolInterface):
@@ -18,6 +27,7 @@ class WriteTool(ToolInterface):
         validator: ValidatorFunc | None = None,
         expected_format: str | None = None,
         display_name: str | None = None,
+        allow_create_dirs: bool = True,
     ):
         """
         Initialize the WriteTool.
@@ -31,12 +41,15 @@ class WriteTool(ToolInterface):
                 Should return None if valid, or an error message string if invalid.
             expected_format: Description of expected format to include in error messages.
             display_name: Name to show in schema description (defaults to basename of base_dir).
+            allow_create_dirs: If False, will not create new directories. Instead,
+                files will be written to the nearest existing parent directory.
         """
         self._base_dir = base_dir
         self._file_path_override = file_path_override
         self._validator = validator
         self._expected_format = expected_format
         self._display_name = display_name or (os.path.basename(base_dir) if base_dir else None)
+        self._allow_create_dirs = allow_create_dirs
 
     @property
     def name(self) -> str:
@@ -111,11 +124,33 @@ class WriteTool(ToolInterface):
                     msg += f"\n\nExpected format:\n{self._expected_format}"
                 return msg
 
+        # Strip control characters from content
+        content = _strip_control_chars(content)
+
         try:
-            # Create parent directories if they don't exist
             parent_dir = os.path.dirname(target)
-            if parent_dir:
-                os.makedirs(parent_dir, exist_ok=True)
+            filename = os.path.basename(target)
+
+            if self._allow_create_dirs:
+                # Create parent directories if they don't exist
+                if parent_dir:
+                    os.makedirs(parent_dir, exist_ok=True)
+            else:
+                # Find the nearest existing parent directory
+                original_parent = parent_dir
+                while parent_dir and not os.path.exists(parent_dir):
+                    parent_dir = os.path.dirname(parent_dir)
+
+                # Fall back to base_dir if no parent exists
+                if not parent_dir or not os.path.exists(parent_dir):
+                    if self._base_dir and os.path.exists(self._base_dir):
+                        parent_dir = self._base_dir
+                    else:
+                        return f"Error: No existing directory found for {target}"
+
+                # Update target to use the existing parent directory
+                if parent_dir != original_parent:
+                    target = os.path.join(parent_dir, filename)
 
             with open(target, "w") as f:
                 f.write(content)

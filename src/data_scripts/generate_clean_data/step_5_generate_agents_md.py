@@ -69,8 +69,8 @@ def main() -> None:
         sources_dir_tree=source_tree,
     )
 
-    # Create tools
-    write_tool = WriteTool(base_dir=SOURCES_DIR)
+    # Create tools (allow_create_dirs=False prevents creating new directories)
+    write_tool = WriteTool(base_dir=SOURCES_DIR, allow_create_dirs=False)
     finish_tool = FinishTool()
 
     # Initialize main LLM with tool schemas
