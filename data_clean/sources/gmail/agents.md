@@ -49,6 +49,6 @@ Metadata rules:
   - deal_id: string
   - region: us | eu | apac (if relevant)
   - has_attachments: boolean
-  - attachments: list of {filename, file_type}
+  - attachments: list of file names
   - related_links: list of URLs/ids (HubSpot record ids, shared Drive links, DocuSign links, Jira SUP- keys)
 - Date constraints: last_email_at >= first_email_at; timestamps should be plausible over multiple years.

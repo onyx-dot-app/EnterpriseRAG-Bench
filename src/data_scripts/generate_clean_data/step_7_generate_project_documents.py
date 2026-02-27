@@ -31,7 +31,7 @@ from src.schemas.field_labels import (
 from src.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import ReadTool
-from src.utils import extract_json_from_response, load_file, load_json_file, validate_no_nested_dicts, write_json_file
+from src.utils import add_dataset_doc_uuid, extract_json_from_response, load_file, load_json_file, validate_no_nested_dicts, write_json_file
 
 
 def _save_debug_response(
@@ -660,6 +660,75 @@ def label_documents(max_parallelism: int = 5) -> None:
             print(f"  ... and {len(failed) - 20} more errors")
 
 
+def add_dataset_uuids(max_parallelism: int = 20) -> None:
+    """
+    Phase 3: Add dataset_doc_uuid to all documents that don't have one.
+
+    Args:
+        max_parallelism: Maximum number of parallel operations.
+    """
+    print()
+    print("=" * 40)
+    print("Phase 3: Add Dataset Document UUIDs")
+    print("=" * 40)
+
+    sources_dir = os.path.join(DATA_CLEAN_DIR, "sources")
+
+    # Find all JSON files without dataset_doc_uuid
+    files_to_process: list[str] = []
+    for root, _dirs, files in os.walk(sources_dir):
+        for filename in files:
+            if not filename.endswith(".json"):
+                continue
+            filepath = os.path.join(root, filename)
+            try:
+                data = load_json_file(filepath)
+                if "dataset_doc_uuid" not in data:
+                    files_to_process.append(filepath)
+            except (json.JSONDecodeError, OSError):
+                continue
+
+    if not files_to_process:
+        print("All documents already have dataset_doc_uuid.")
+        return
+
+    print(f"Found {len(files_to_process)} documents without dataset_doc_uuid.")
+    print()
+
+    # Process in parallel
+    added = 0
+    failed: list[tuple[str, str]] = []
+
+    with ThreadPoolExecutor(max_workers=max_parallelism) as executor:
+        futures = {
+            executor.submit(add_dataset_doc_uuid, filepath): filepath
+            for filepath in files_to_process
+        }
+
+        with tqdm(total=len(files_to_process), desc="Adding UUIDs") as pbar:
+            for future in as_completed(futures):
+                filepath = futures[future]
+                try:
+                    future.result()
+                    added += 1
+                except Exception as e:
+                    rel_path = os.path.relpath(filepath, DATA_CLEAN_DIR)
+                    failed.append((rel_path, str(e)))
+                    tqdm.write(f"[FAIL] {rel_path}: {e}")
+                pbar.update(1)
+
+    print()
+    print(f"Complete. {added} UUIDs added, {len(failed)} failed.")
+
+    if failed:
+        print()
+        print(f"Failed documents ({len(failed)}):")
+        for filepath, error in failed[:20]:
+            print(f"  - {filepath}: {error}")
+        if len(failed) > 20:
+            print(f"  ... and {len(failed) - 20} more errors")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate project document files based on enriched project data."
@@ -686,9 +755,10 @@ def main() -> None:
 
     print("Step 7: Generate Project Documents")
     print("=" * 40)
-    print("This script generates individual document files for each project and adds field labels.")
+    print("This script generates individual document files for each project.")
     print("Phase 1: Generate documents based on project overviews")
     print("Phase 2: Add title/content field labels to documents")
+    print("Phase 3: Add dataset_doc_uuid to all documents")
     print()
     print("Note: If any of the documents fail validation, you may need to rerun the script.")
     print()
@@ -701,6 +771,9 @@ def main() -> None:
 
     # Phase 2: Label documents
     label_documents(max_parallelism=args.labeling_parallelism)
+
+    # Phase 3: Add dataset UUIDs
+    add_dataset_uuids(max_parallelism=args.labeling_parallelism)
 
     # Update aggregate statistics
     sources_dir = os.path.join(DATA_CLEAN_DIR, "sources")

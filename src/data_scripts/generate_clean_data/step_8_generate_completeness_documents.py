@@ -1,21 +1,28 @@
 """Interactive script for generating completeness document sets."""
 
+import argparse
 import json
 import os
+import random
 
 from src.llm import get_llm
 from src.llm.conversation import Conversation
 from src.paths import (
     COMPANY_OVERVIEW_PATH,
-    COMPLETENESS_DIR,
     DATA_CLEAN_DIR,
+    QUESTION_CACHE_DIR,
     SOURCE_TREE_PATH,
     SOURCES_DIR,
 )
-from src.prompts.completeness_documents import COMPLETENESS_SYSTEM_PROMPT
+from src.prompts.completeness_documents import (
+    COMPLETENESS_SYSTEM_PROMPT,
+    COMPLETENESS_USER_PROMPT_EXISTING_TYPE,
+    COMPLETENESS_USER_PROMPT_NEW_TYPE,
+)
 from src.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import FinishTool, GlobTool, ReadTool, RmTool, WriteTool
+from src.utils.dataset_id import add_dataset_doc_uuid
 from src.utils.file_io import delete_file, load_file, load_json_file, write_json_file
 from src.utils.validation import validate_no_nested_dicts
 
@@ -104,46 +111,96 @@ class TrackingWriteTool(WriteTool):
 
 
 def count_existing_traces() -> int:
-    """Count existing completeness trace files."""
-    if not os.path.exists(COMPLETENESS_DIR):
+    """Count existing completeness trace files in question_cache."""
+    if not os.path.exists(QUESTION_CACHE_DIR):
         return 0
-    return len([f for f in os.listdir(COMPLETENESS_DIR) if f.startswith("completeness_trace_") and f.endswith(".json")])
+    return len([f for f in os.listdir(QUESTION_CACHE_DIR) if f.startswith("completeness_") and f.endswith(".json")])
 
 
 def get_next_trace_number() -> int:
     """Get the next available trace number."""
-    if not os.path.exists(COMPLETENESS_DIR):
+    if not os.path.exists(QUESTION_CACHE_DIR):
         return 1
     existing = [
-        f for f in os.listdir(COMPLETENESS_DIR)
-        if f.startswith("completeness_trace_") and f.endswith(".json")
+        f for f in os.listdir(QUESTION_CACHE_DIR)
+        if f.startswith("completeness_") and f.endswith(".json")
     ]
     if not existing:
         return 1
     numbers = []
     for f in existing:
         try:
-            num = int(f.replace("completeness_trace_", "").replace(".json", ""))
+            num = int(f.replace("completeness_", "").replace(".json", ""))
             numbers.append(num)
         except ValueError:
             pass
     return max(numbers) + 1 if numbers else 1
 
 
-def write_trace(trace_number: int, question: str, files: list[str]) -> str:
-    """Write a completeness trace JSON file."""
-    os.makedirs(COMPLETENESS_DIR, exist_ok=True)
-    trace_path = os.path.join(COMPLETENESS_DIR, f"completeness_trace_{trace_number}.json")
-    trace_data = {
+def add_uuids_to_files(file_paths: list[str]) -> list[str]:
+    """
+    Add dataset_doc_uuid to each file and return the list of UUIDs.
+
+    Args:
+        file_paths: List of paths relative to sources (e.g., "sources/confluence/doc.json")
+
+    Returns:
+        List of dataset_doc_uuids in the same order as file_paths.
+    """
+    uuids = []
+    for rel_path in file_paths:
+        full_path = os.path.join(DATA_CLEAN_DIR, rel_path)
+        doc_uuid = add_dataset_doc_uuid(full_path)
+        uuids.append(doc_uuid)
+    return uuids
+
+
+def write_question_cache(trace_number: int, question: str, document_uuids: list[str]) -> str:
+    """Write a completeness question cache JSON file."""
+    os.makedirs(QUESTION_CACHE_DIR, exist_ok=True)
+    cache_path = os.path.join(QUESTION_CACHE_DIR, f"completeness_{trace_number}.json")
+    cache_data = {
         "question": question,
-        "files": files,
+        "documents": document_uuids,
     }
-    write_json_file(trace_path, trace_data)
-    return trace_path
+    write_json_file(cache_path, cache_data)
+    return cache_path
+
+
+def get_question_type_prompt() -> tuple[int, str]:
+    """
+    Generate a random question type and return the corresponding user prompt.
+
+    Returns:
+        (question_type, user_prompt) tuple where question_type is 1-6.
+    """
+    question_type = random.randint(1, 6)
+    if question_type <= 4:
+        # Use existing question type
+        user_prompt = COMPLETENESS_USER_PROMPT_EXISTING_TYPE.format(
+            question_type_number=question_type
+        )
+    else:
+        # Use new question type (5 or 6)
+        user_prompt = COMPLETENESS_USER_PROMPT_NEW_TYPE
+    return question_type, user_prompt
 
 
 def main() -> None:
-    # Show existing traces and prompt for count
+    parser = argparse.ArgumentParser(
+        description="Generate completeness document sets for high-recall questions."
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=10,
+        help="Number of completeness traces to generate (default: 10)",
+    )
+    args = parser.parse_args()
+
+    num_to_generate = args.count
+
+    # Show existing traces
     existing_count = count_existing_traces()
     print("Step 8: Completeness Document Generator")
     print("=" * 40)
@@ -151,21 +208,6 @@ def main() -> None:
     print("Each set consists of documents needed to exhaustively answer a question.")
     print()
     print(f"Existing completeness traces: {existing_count}")
-    print()
-
-    # Prompt for number of traces to generate
-    while True:
-        try:
-            num_to_generate = input("How many completeness traces would you like to generate? ").strip()
-            num_to_generate = int(num_to_generate)
-            if num_to_generate <= 0:
-                print("Please enter a positive number.")
-                continue
-            break
-        except ValueError:
-            print("Please enter a valid number.")
-            continue
-
     print()
     print(f"Will generate {num_to_generate} completeness trace(s).")
     print("Type 'quit' at any prompt to exit early.\n")
@@ -188,121 +230,118 @@ def main() -> None:
 
         trace_number = get_next_trace_number()
 
-        # Retry loop for validation failures
+        print()
+        print("=" * 40)
+        print(f"Generating trace {i + 1} of {num_to_generate} (will be saved as completeness_{trace_number}.json)")
+        print("=" * 40)
+        print()
+
+        # Create tools
+        write_tool = TrackingWriteTool(base_dir=SOURCES_DIR)
+        glob_tool = GlobTool(base_dir=SOURCES_DIR)
+        read_tool = ReadTool(base_dir=SOURCES_DIR)
+        rm_tool = RmTool(
+            base_dir=SOURCES_DIR,
+            get_deletable_paths=lambda: write_tool.written_paths,
+        )
+        finish_tool = FinishTool()
+
+        # Initialize LLM with tool schemas
+        llm = get_llm(tools=[
+            glob_tool.schema,
+            read_tool.schema,
+            write_tool.schema,
+            rm_tool.schema,
+            finish_tool.schema,
+        ])
+
+        # Create tool runner and register tools
+        tool_runner = ToolRunner()
+        tool_runner.register(glob_tool)
+        tool_runner.register(read_tool)
+        tool_runner.register(write_tool)
+        tool_runner.register(rm_tool)
+        tool_runner.register(finish_tool)
+
+        # Create conversation with LLM and tool runner
+        conversation = Conversation(llm=llm, tool_runner=tool_runner)
+
+        # Generate random question type and get corresponding user prompt
+        question_type, user_prompt = get_question_type_prompt()
+        print(f"Question type: {question_type} ({'existing type' if question_type <= 4 else 'new type'})")
+        print()
+
+        # Add system prompt, then user prompt, and get initial response
+        conversation.add_system_message(prompt)
+        conversation.run_turn(user_prompt)
+        print()
+
+        # Interactive loop for this trace
+        trace_complete = False
+
         while True:
-            print()
-            print("=" * 40)
-            print(f"Generating trace {i + 1} of {num_to_generate} (will be saved as completeness_trace_{trace_number}.json)")
-            print("=" * 40)
-            print()
+            # Check if finish tool was called
+            if finish_tool.finished:
+                question = finish_tool.finish_info or ""
+                files = write_tool.written_paths
 
-            # Create fresh tools for this attempt
-            write_tool = TrackingWriteTool(base_dir=SOURCES_DIR)
-            glob_tool = GlobTool(base_dir=SOURCES_DIR)
-            read_tool = ReadTool(base_dir=SOURCES_DIR)
-            rm_tool = RmTool(
-                base_dir=SOURCES_DIR,
-                get_deletable_paths=lambda: write_tool.written_paths,
-            )
-            finish_tool = FinishTool()
+                if not question:
+                    print("\nWarning: No question provided with finish. Please provide the question.")
+                    finish_tool.reset()
+                    continue
 
-            # Initialize LLM with tool schemas
-            llm = get_llm(tools=[
-                glob_tool.schema,
-                read_tool.schema,
-                write_tool.schema,
-                rm_tool.schema,
-                finish_tool.schema,
-            ])
+                if not files:
+                    print("\nWarning: No files were written. Please write the documents first.")
+                    finish_tool.reset()
+                    continue
 
-            # Create tool runner and register tools
-            tool_runner = ToolRunner()
-            tool_runner.register(glob_tool)
-            tool_runner.register(read_tool)
-            tool_runner.register(write_tool)
-            tool_runner.register(rm_tool)
-            tool_runner.register(finish_tool)
-
-            # Create conversation with LLM and tool runner
-            conversation = Conversation(llm=llm, tool_runner=tool_runner)
-
-            # Add system prompt and get initial response
-            conversation.add_system_message(prompt)
-            conversation.generate_response()
-            print()
-
-            # Interactive loop for this trace
-            retry_needed = False
-            trace_complete = False
-
-            while True:
-                # Check if finish tool was called
-                if finish_tool.finished:
-                    question = finish_tool.finish_info or ""
-                    files = write_tool.written_paths
-
-                    if not question:
-                        print("\nWarning: No question provided with finish. Please provide the question.")
-                        finish_tool.reset()
-                        continue
-
-                    if not files:
-                        print("\nWarning: No files were written. Please write the documents first.")
-                        finish_tool.reset()
-                        continue
-
-                    # Validate all written files
-                    is_valid, validation_errors = validate_written_files(files)
-                    if not is_valid:
-                        print("\n" + "=" * 40)
-                        print("VALIDATION FAILED")
-                        print("=" * 40)
-                        for error in validation_errors:
-                            print(f"  - {error}")
-                        print()
-                        print("Deleting all files from this step...")
-                        delete_written_files(files)
-                        print()
-                        print("Automatically retrying with a fresh conversation...")
-                        print("=" * 40)
-                        retry_needed = True
-                        break
-
-                    # Write the trace
-                    trace_path = write_trace(trace_number, question, files)
-                    traces_generated += 1
-                    print(f"\n Saved trace to {trace_path}")
-                    print(f"  Question: {question}")
-                    print(f"  Files: {files}")
-                    trace_complete = True
-                    break
-
-                try:
-                    user_input = input("You: ").strip()
-                    if not user_input:
-                        continue
-                    if user_input.lower() == "quit":
-                        print("Exiting early...")
-                        quit_requested = True
-                        break
-
-                    conversation.run_turn(user_input)
-
-                    # Sync deleted paths - remove from write_tool tracking
-                    for deleted_path in rm_tool.deleted_paths:
-                        write_tool.remove_path(deleted_path)
-
+                # Validate all written files
+                is_valid, validation_errors = validate_written_files(files)
+                if not is_valid:
+                    print("\n" + "=" * 40)
+                    print("VALIDATION FAILED")
+                    print("=" * 40)
+                    for error in validation_errors:
+                        print(f"  - {error}")
                     print()
+                    print("Deleting all files from this step...")
+                    delete_written_files(files)
+                    raise ValueError(f"Validation failed for written files: {validation_errors}")
 
-                except KeyboardInterrupt:
-                    print("\nExiting early...")
+                # Add dataset_doc_uuid to each file and get the UUIDs
+                print("\nAdding dataset_doc_uuid to documents...")
+                document_uuids = add_uuids_to_files(files)
+
+                # Write the question cache with UUIDs
+                cache_path = write_question_cache(trace_number, question, document_uuids)
+                traces_generated += 1
+                print(f"\nSaved to {cache_path}")
+                print(f"  Question: {question}")
+                print(f"  Document UUIDs: {document_uuids}")
+                trace_complete = True
+                break
+
+            try:
+                user_input = input("You: ").strip()
+                if not user_input:
+                    continue
+                if user_input.lower() == "quit":
+                    print("Exiting early...")
                     quit_requested = True
                     break
 
-            # Exit retry loop if trace is complete or quit requested
-            if trace_complete or quit_requested:
+                conversation.run_turn(user_input)
+
+                # Sync deleted paths - remove from write_tool tracking
+                for deleted_path in rm_tool.deleted_paths:
+                    write_tool.remove_path(deleted_path)
+
+                print()
+
+            except KeyboardInterrupt:
+                print("\nExiting early...")
+                quit_requested = True
                 break
-            # Otherwise retry_needed is True, loop continues with fresh conversation
 
     # Update statistics
     total_traces = count_existing_traces()
