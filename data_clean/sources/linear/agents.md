@@ -4,6 +4,9 @@ sources/linear
 Target number of files:
 35000
 
+File name format:
+Files should be called the first 3 letters of the team like ABC-12345.json with anywhere from 1 to 5 digits after the team prefix.
+
 Content rules:
 - Linear is Redwood Inference’s internal project management system (planning and executing work), used primarily by:
   - engineering

@@ -4,6 +4,9 @@ sources/github
 Target number of files:
 8000
 
+File name format:
+The files should be called pr-1234.json where "pr-" is always the same and followed by a few digits and ending with .json.
+
 Content rules:
 - This directory represents GitHub artifacts, modeled as pull requests (PRs).
 - Each document corresponds to exactly one pull request.

@@ -334,13 +334,13 @@ def main() -> None:
                     delete_written_files(files)
                     raise ValueError(f"Validation failed for written files: {validation_errors}")
 
-                # Add dataset_doc_uuid to each file and get the UUIDs
-                print("\nAdding dataset_doc_uuid to documents...")
-                document_uuids = add_uuids_to_files(files)
-
-                # Add field labels to documents
-                print("Adding field labels to documents...")
+                # Add field labels to documents (must happen before UUID)
+                print("\nAdding field labels to documents...")
                 label_files(files)
+
+                # Add dataset_doc_uuid to each file and get the UUIDs (always last)
+                print("Adding dataset_doc_uuid to documents...")
+                document_uuids = add_uuids_to_files(files)
 
                 # Write the question cache with UUIDs
                 cache_path = write_question_cache(trace_number, question, document_uuids)

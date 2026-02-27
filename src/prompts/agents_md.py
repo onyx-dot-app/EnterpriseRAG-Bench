@@ -25,6 +25,7 @@ CRITICAL: CREATE 1 {AGENTS_MD_FILE} FILE AT A TIME AND CONFIRM WITH THE USER BEF
 # {AGENTS_MD_FILE} format
 Every {AGENTS_MD_FILE} file should have the following items:
 - Target number of files: a loose estimate of the number of files that might make sense for this directory (and including all the directories below it).
+- File name format: a short description of the format of the file names in the directory. For example for github, it might be pr_1234.json. All files must end with .json.
 - Content rules: rules for the content of the files.
 - Metadata rules: rules for the metadata of the files. For example, most documents will have a title field. This will be strongly tied to the type of sources the directory represents.
 
@@ -35,6 +36,9 @@ sources/engineering/scratchpads
 
 Target number of files:
 1000
+
+File name format:
+Should include a short description of what the scratchpad is used for with dashes in between the words. Example: scratchpad-for-serving-runtime-performance-improvements.json.
 
 Content rules:
 The documents in this directory are personal scratchpads. They tend to be less organized and less formal with occasional phrases instead of always complete sentences.

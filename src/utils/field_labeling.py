@@ -9,6 +9,7 @@ from src.schemas.field_labels import (
     validate_field_labels,
     validate_field_labels_against_document,
 )
+from src.utils.field_ordering import needs_reordering, reorder_document_fields
 from src.utils.file_io import load_json_file, write_json_file
 from src.utils.json_extraction import extract_json_from_response
 
@@ -98,13 +99,14 @@ def label_document_fields(document: dict, quiet: bool = False) -> dict:
     return document
 
 
-def label_single_document(file_path: str, quiet: bool = False) -> tuple[bool, str]:
+def label_single_document(file_path: str, quiet: bool = False, fix_ordering: bool = True) -> tuple[bool, str]:
     """
     Add field labels to a single document file.
 
     Args:
         file_path: Full path to the document file.
         quiet: If True, suppress LLM status output.
+        fix_ordering: If True, reorder fields to ensure correct ordering.
 
     Returns:
         (success, message) tuple.
@@ -112,18 +114,31 @@ def label_single_document(file_path: str, quiet: bool = False) -> tuple[bool, st
     try:
         # Load existing document
         document = load_json_file(file_path)
+        needs_write = False
+        message = ""
 
-        # Skip if already labeled
+        # Check if already labeled
         if "title_field_name" in document and "content_field_names" in document:
-            return (True, "Skipped (already labeled)")
+            message = "Skipped (already labeled)"
+        else:
+            # Run field labeling
+            document = label_document_fields(document, quiet=quiet)
+            needs_write = True
+            message = "Labeled"
 
-        # Run field labeling
-        labeled_doc = label_document_fields(document, quiet=quiet)
+        # Check and fix field ordering
+        if fix_ordering and needs_reordering(document):
+            document = reorder_document_fields(document)
+            needs_write = True
+            if message == "Skipped (already labeled)":
+                message = "Fixed ordering"
+            else:
+                message += ", fixed ordering"
 
-        # Write back
-        write_json_file(file_path, labeled_doc)
+        if needs_write:
+            write_json_file(file_path, document)
 
-        return (True, "Labeled")
+        return (True, message)
 
     except ValueError as e:
         return (False, str(e))

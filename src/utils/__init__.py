@@ -8,6 +8,7 @@ from src.utils.field_labeling import (
     label_document_fields,
     label_single_document,
 )
+from src.utils.field_ordering import needs_reordering, reorder_document_fields
 from src.utils.file_io import delete_file, load_file, load_json_file, write_json_file
 from src.utils.json_extraction import extract_json_from_response
 from src.utils.validation import validate_no_nested_dicts
@@ -25,6 +26,8 @@ __all__ = [
     "label_single_document",
     "load_file",
     "load_json_file",
+    "needs_reordering",
+    "reorder_document_fields",
     "validate_no_nested_dicts",
     "write_json_file",
 ]

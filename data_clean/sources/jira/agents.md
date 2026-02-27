@@ -4,6 +4,9 @@ sources/jira
 Target number of files:
 6000
 
+File name format:
+Files for customer-support should be SUP-12345.json with up to 5 digits. Files for internal support should be INT-12345 with up to 5 digits.
+
 Content rules:
 - Jira at Redwood Inference is used only for support workflows (not project management).
   - Customer-facing support tickets live under sources/jira/customer-support.

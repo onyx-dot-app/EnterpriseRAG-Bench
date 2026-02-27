@@ -4,6 +4,9 @@ sources/google_drive
 Target number of files:
 25000
 
+File name format:
+File names should be short and descriptive with words connected with dashes like mid-term-kpi-planning.json for example.
+
 Content rules:
 - Google Drive is Redwood Inference’s working-area for team-specific documents and in-progress thinking.
 - This directory should contain a mix of formal and informal documents, with informal/working docs being the majority.

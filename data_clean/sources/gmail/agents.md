@@ -4,16 +4,19 @@ sources/gmail
 Target number of files:
 120000
 
+File name format:
+File names should say thread-yearmonthday-sha with year month and day being something like 20250321 and the sha being random 8 characters.
+
 Content rules:
 - This directory contains Gmail exports for a restricted set of Redwood Inference employees:
   - managers
   - sales roles
   - leadership
 - IMPORTANT: The restriction applies to all internal participants in threads.
-  - Every internal sender/recipient/ccd person must be one of the real people represented by the subdirectories under sources/gmail/.
+  - Every internal sender/recipient/cc-d person must be one of the real people represented by the subdirectories under sources/gmail/.
   - External participants (customers, prospects, vendors, partners) are allowed.
 - Each document represents exactly one email thread (conversation).
-  - A thread contains multiple messages (replies/forwards) in chronological order (oldest  newest).
+  - A thread contains multiple messages (replies/forwards) in chronological order (oldest - newest).
   - Preserve realistic email quoting (e.g., "On Tue, ... wrote:") and forwarded-message headers.
 - Emails should look like real Gmail messages:
   - Headers: From, To, Cc (common), Bcc (rare), Date, Subject.
