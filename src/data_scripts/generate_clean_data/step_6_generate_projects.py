@@ -716,14 +716,14 @@ def apply_manual_dedup(
 
 def deduplicate_file_paths(max_parallelism: int = 10) -> None:
     """
-    Phase 2.5: Check for and resolve file path conflicts across projects.
+    Phase 3: Check for and resolve file path conflicts across projects.
 
     Args:
         max_parallelism: Maximum number of parallel dedup operations.
     """
     print()
     print("=" * 40)
-    print("Phase 2.5: Deduplicate File Paths")
+    print("Phase 3: Deduplicate File Paths")
     print("=" * 40)
 
     conflicts = find_file_conflicts(PROJECTS_DIR)
@@ -855,14 +855,25 @@ def deduplicate_file_paths(max_parallelism: int = 10) -> None:
     # Final summary
     print()
     print("=" * 40)
-    total_resolved = resolved + (len(failed) - len([f for f in failed if f]))  # Approximate
-    print(f"Deduplication complete.")
+    print("Deduplication complete.")
 
     # Check for remaining conflicts
     remaining = find_file_conflicts(PROJECTS_DIR)
     if remaining:
         remaining_count = sum(len(refs) - 1 for refs in remaining.values())
-        print(f"Warning: {remaining_count} conflicts still remain.")
+        print()
+        print("=" * 40)
+        print(f"ERROR: {remaining_count} file path conflicts still remain.")
+        print("=" * 40)
+        print()
+        print("Sometimes due to parallel handling of collisions or LLM failures,")
+        print("there may be still remaining file collisions. Please run this step")
+        print("again until there are no collisions or your final dataset may have")
+        print("misleading documents.")
+        print()
+        print("IMPORTANT: You do not need to regenerate the projects.")
+        print()
+        raise RuntimeError(f"File path conflicts remain: {remaining_count} conflicts across {len(remaining)} paths")
     else:
         print("All conflicts resolved.")
 
@@ -1030,14 +1041,14 @@ def add_people_to_project(
 
 def populate_project_people(max_parallelization: int = 5) -> None:
     """
-    Phase 3: Add people to projects that are missing them.
+    Phase 4: Add people to projects that are missing them.
 
     Args:
         max_parallelization: Maximum number of parallel operations.
     """
     print()
     print("=" * 40)
-    print("Phase 3: Populate Project People")
+    print("Phase 4: Populate Project People")
     print("=" * 40)
 
     # Check which projects need people
@@ -1130,8 +1141,8 @@ def main() -> None:
     print("Phases:")
     print("  1. Interactive project list generation")
     print("  2. Enrich projects with file paths and descriptions")
-    print("  2.5. Deduplicate conflicting file paths")
-    print("  3. Populate people for each project")
+    print("  3. Deduplicate conflicting file paths")
+    print("  4. Populate people for each project")
     print()
 
     # Check if projects already exist
@@ -1160,10 +1171,10 @@ def main() -> None:
         # Phase 2: Enrich projects
         enrich_projects(max_parallelization=args.max_parallelization)
 
-    # Phase 2.5: Deduplicate file paths (always run to catch conflicts)
+    # Phase 3: Deduplicate file paths (always run to catch conflicts)
     deduplicate_file_paths(max_parallelism=args.dedup_parallelism)
 
-    # Phase 3: Populate people
+    # Phase 4: Populate people
     # NOTE: This is necessary as a separate step because the step above is already quite complex
     # and the miss rate when these were combined was too high.
     populate_project_people(max_parallelization=args.max_parallelization)
