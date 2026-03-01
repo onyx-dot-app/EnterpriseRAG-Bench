@@ -3,12 +3,15 @@
 import argparse
 import json
 import os
+import random
+import re
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tqdm import tqdm
 
-from src.llm import Message, get_llm
+from src.llm import Message, get_llm, run_auto_conversation
 from src.paths import (
     AGENTS_MD_FILE,
     COMPANY_OVERVIEW_PATH,
@@ -17,16 +20,27 @@ from src.paths import (
     VOLUME_DIR,
 )
 from src.prompts.volume_generation import (
+    CONFLICT_PROMPT,
+    DOCUMENT_GENERATION_PROMPT,
+    DOCUMENT_GENERATION_USER_PROMPT,
     ESTIMATION_OFF_PROMPT,
     ESTIMATION_OFF_PROMPT_SUB_TOPICS,
     RECURSIVE_TOPIC_GENERATION_PROMPT,
     TASKS_PROMPT,
     TOTAL_DOCS_PROMPT,
 )
-from src.utils import confirm_yes_no, extract_json_from_response, load_file
-from src.utils.file_io import write_json_file
+from src.tools.runner import ToolRunner
+from src.tools.tool_implementations import GlobTool, ReadTool, WriteTool
+from src.utils import (
+    add_dataset_doc_uuid,
+    confirm_yes_no,
+    extract_json_from_response,
+    label_single_document,
+    load_file,
+    validate_no_nested_dicts,
+)
+from src.utils.file_io import load_json_file, write_json_file
 from src.utils.statistics import update_statistics
-import re
 
 
 def get_source_types() -> list[str]:
@@ -853,6 +867,516 @@ def split_large_topics(company_overview: str, parallelism: int = 1) -> list[str]
     return all_warnings
 
 
+# =============================================================================
+# Phase 3: Document Generation
+# =============================================================================
+
+# Global lock for volume file updates
+_volume_locks: dict[str, threading.Lock] = {}
+_volume_locks_lock = threading.Lock()
+
+
+def _get_volume_lock(source_type: str) -> threading.Lock:
+    """Get or create a lock for a specific source type's volume file."""
+    with _volume_locks_lock:
+        if source_type not in _volume_locks:
+            _volume_locks[source_type] = threading.Lock()
+        return _volume_locks[source_type]
+
+
+class TrackingWriteTool(WriteTool):
+    """WriteTool that tracks written file paths and prevents overwrites."""
+
+    def __init__(self, base_dir: str | None = None, allow_create_dirs: bool = False) -> None:
+        super().__init__(base_dir=base_dir, allow_create_dirs=allow_create_dirs)
+        self._written_paths: list[str] = []
+
+    @property
+    def written_paths(self) -> list[str]:
+        """Return list of paths written since last reset."""
+        return self._written_paths.copy()
+
+    def reset_tracking(self) -> None:
+        """Clear the list of written paths."""
+        self._written_paths = []
+
+    def execute(self, content: str, file_path: str = "") -> str:
+        """Write content and track the path. Returns error if file exists."""
+        # Check if file already exists before writing
+        if self._base_dir and file_path:
+            normalized_path = self._normalize_path(file_path)
+            target_path = os.path.join(self._base_dir, normalized_path)
+            if os.path.exists(target_path):
+                return f"Error: File already exists at {file_path}. {CONFLICT_PROMPT}"
+
+        result = super().execute(content, file_path)
+        if result.startswith("Successfully wrote to "):
+            # Extract the actual written path
+            actual_path = result.replace("Successfully wrote to ", "")
+            self._written_paths.append(actual_path)
+        return result
+
+
+def collect_leaf_topics(
+    topics: dict[str, dict],
+    topic_path: str = "",
+) -> list[tuple[str, list[str], int, int]]:
+    """
+    Recursively collect all leaf topics that need documents.
+
+    Args:
+        topics: Topics dict from volume JSON.
+        topic_path: Current path (for nested topics).
+
+    Returns:
+        List of (topic_full_path, topic_path_parts, desired, completed) tuples.
+        Only returns topics where desired > completed.
+    """
+    result = []
+
+    for topic_name, topic_data in topics.items():
+        current_path = f"{topic_path} => {topic_name}" if topic_path else topic_name
+        path_parts = current_path.split(" => ")
+
+        if "sub_topics" in topic_data:
+            # Recurse into sub_topics
+            result.extend(collect_leaf_topics(topic_data["sub_topics"], current_path))
+        else:
+            # This is a leaf topic
+            desired = topic_data.get("desired", 0)
+            completed = topic_data.get("completed", 0)
+            if desired > completed:
+                result.append((current_path, path_parts, desired, completed))
+
+    return result
+
+
+def update_volume_completed(
+    source_type: str,
+    topic_path_parts: list[str],
+    increment: int = 1,
+) -> None:
+    """
+    Thread-safe update of completed count for a topic in a volume file.
+
+    Args:
+        source_type: Name of the source type.
+        topic_path_parts: List of topic names to navigate (e.g., ["Parent Topic", "Child Topic"]).
+        increment: Amount to increment completed count by.
+    """
+    lock = _get_volume_lock(source_type)
+    filepath = os.path.join(VOLUME_DIR, f"{source_type}.json")
+
+    with lock:
+        try:
+            data = load_json_file(filepath)
+        except Exception:
+            return
+
+        # Navigate to the correct topic
+        current = data.get("topics", {})
+        for i, part in enumerate(topic_path_parts):
+            if part not in current:
+                return
+
+            if i == len(topic_path_parts) - 1:
+                # This is the leaf topic
+                current[part]["completed"] = current[part].get("completed", 0) + increment
+            else:
+                # Navigate to sub_topics
+                if "sub_topics" not in current[part]:
+                    return
+                current = current[part]["sub_topics"]
+
+        write_json_file(filepath, data)
+
+
+def validate_and_process_document(file_path: str) -> tuple[bool, str | None]:
+    """
+    Validate a written document and add UUID/labels if valid.
+
+    Args:
+        file_path: Path to the written JSON file.
+
+    Returns:
+        (success, error_message) tuple.
+    """
+    if not os.path.exists(file_path):
+        return (False, f"File not found: {file_path}")
+
+    try:
+        data = load_json_file(file_path)
+    except json.JSONDecodeError as e:
+        return (False, f"Invalid JSON: {e}")
+
+    validation_error = validate_no_nested_dicts(data)
+    if validation_error:
+        return (False, f"Validation error: {validation_error}")
+
+    # Add field labels
+    label_single_document(file_path, quiet=True)
+
+    # Add dataset_doc_uuid
+    add_dataset_doc_uuid(file_path)
+
+    return (True, None)
+
+
+def get_existing_docs_for_topic(source_type: str, topic_and_subtopics: str) -> list[str]:
+    """
+    Get list of existing document names for a topic.
+
+    This helps the LLM avoid creating duplicate-sounding documents.
+
+    Args:
+        source_type: Name of the source type.
+        topic_and_subtopics: The full topic path string.
+
+    Returns:
+        List of existing JSON file names in the source directory.
+    """
+    source_path = os.path.join(SOURCES_DIR, source_type)
+    if not os.path.exists(source_path):
+        return []
+
+    existing = []
+    for root, _dirs, files in os.walk(source_path):
+        for filename in files:
+            if filename.endswith(".json"):
+                rel_path = os.path.relpath(os.path.join(root, filename), source_path)
+                existing.append(rel_path)
+
+    # Return a random sample to avoid overwhelming the prompt
+    if len(existing) > 20:
+        return random.sample(existing, 20)
+    return existing
+
+
+def generate_single_document(
+    source_type: str,
+    topic_and_subtopics: str,
+    topic_path_parts: list[str],
+    company_overview: str,
+    source_tree: str,
+    agents_md_contents: str,
+    quiet: bool = False,
+    max_retries: int = 3,
+) -> tuple[bool, str]:
+    """
+    Generate a single document for a topic using LLM.
+
+    Args:
+        source_type: Name of the source type.
+        topic_and_subtopics: Full topic path (e.g., "Parent => Child => Leaf").
+        topic_path_parts: List of topic name parts for volume update.
+        company_overview: Company overview content.
+        source_tree: Directory tree for the source.
+        agents_md_contents: Formatted agents.md contents.
+        quiet: If True, suppress LLM output.
+        max_retries: Maximum retries for conflict resolution.
+
+    Returns:
+        (success, message) tuple.
+    """
+    # Get existing docs to help with diversity
+    existing_docs = get_existing_docs_for_topic(source_type, topic_and_subtopics)
+    existing_docs_str = "\n".join(existing_docs) if existing_docs else "(none yet)"
+
+    # Build the system prompt
+    system_prompt = DOCUMENT_GENERATION_PROMPT.format(
+        company_overview=company_overview,
+        source_type=source_tree,
+        agents_md_contents=agents_md_contents,
+        existing_docs=existing_docs_str,
+        topic_and_subtopics=topic_and_subtopics,
+    )
+
+    # Build the user prompt
+    user_prompt = DOCUMENT_GENERATION_USER_PROMPT.format(
+        topic_and_subtopics=topic_and_subtopics,
+    )
+
+    # Create tools
+    write_tool = TrackingWriteTool(base_dir=SOURCES_DIR, allow_create_dirs=False)
+    glob_tool = GlobTool(
+        base_dir=SOURCES_DIR,
+        required_pattern=r"agents",
+        pattern_error_message="You can only use the glob command on agents.md files.",
+    )
+    read_tool = ReadTool(base_dir=SOURCES_DIR)
+
+    # Initialize LLM with tools
+    llm = get_llm(
+        tools=[
+            glob_tool.schema,
+            read_tool.schema,
+            write_tool.schema,
+        ],
+        quiet=quiet,
+    )
+
+    # Create tool runner
+    tool_runner = ToolRunner()
+    tool_runner.register(glob_tool)
+    tool_runner.register(read_tool)
+    tool_runner.register(write_tool)
+
+    # Build messages
+    messages: list[Message] = [
+        Message(role="system", content=system_prompt),
+        Message(role="user", content=user_prompt),
+    ]
+
+    try:
+        # Run auto conversation until document is written or max retries
+        for _retry in range(max_retries):
+            run_auto_conversation(
+                llm=llm,
+                tool_runner=tool_runner,
+                messages=messages,
+                max_tool_cycles=10,
+                max_iterations=30,
+                quiet=quiet,
+            )
+
+            # Check if a document was written
+            if write_tool.written_paths:
+                # Validate and process each written document
+                for file_path in write_tool.written_paths:
+                    success, error = validate_and_process_document(file_path)
+                    if not success:
+                        # Delete invalid file and retry
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                        messages.append(Message(
+                            role="user",
+                            content=f"The document was invalid: {error}. Please try again with valid JSON.",
+                        ))
+                        write_tool.reset_tracking()
+                        continue
+
+                    # Success! Update the volume completed count
+                    update_volume_completed(source_type, topic_path_parts, 1)
+                    return (True, f"Created {file_path}")
+
+            # No document written, try again
+            messages.append(Message(
+                role="user",
+                content="No document was written. Please use the write tool to create the document.",
+            ))
+
+        return (False, "Max retries exceeded without creating valid document")
+
+    except Exception as e:
+        return (False, f"Error: {e}")
+
+
+def generate_documents_for_source(
+    source_type: str,
+    company_overview: str,
+    parallelism: int = 1,
+    quiet: bool = False,
+) -> tuple[int, int, list[str]]:
+    """
+    Generate all pending documents for a single source type.
+
+    Args:
+        source_type: Name of the source type.
+        company_overview: Company overview content.
+        parallelism: Number of documents to generate in parallel.
+        quiet: If True, suppress LLM output.
+
+    Returns:
+        (success_count, fail_count, errors) tuple.
+    """
+    filepath = os.path.join(VOLUME_DIR, f"{source_type}.json")
+    if not os.path.exists(filepath):
+        return (0, 0, ["Volume file not found"])
+
+    try:
+        data = load_json_file(filepath)
+    except Exception as e:
+        return (0, 0, [f"Error loading volume file: {e}"])
+
+    topics = data.get("topics", {})
+    if not topics:
+        return (0, 0, [])
+
+    # Get source context
+    source_tree = get_source_tree(source_type)
+    agents_md_contents = get_agents_md_for_source(source_type)
+
+    # Collect all leaf topics needing documents
+    leaf_topics = collect_leaf_topics(topics)
+    if not leaf_topics:
+        return (0, 0, [])
+
+    # Calculate total documents needed
+    total_needed = sum(desired - completed for _, _, desired, completed in leaf_topics)
+    if total_needed == 0:
+        return (0, 0, [])
+
+    success_count = 0
+    fail_count = 0
+    errors: list[str] = []
+
+    # Build work items: (topic_path, topic_parts, docs_to_create)
+    work_items = []
+    for topic_path, topic_parts, desired, completed in leaf_topics:
+        docs_to_create = desired - completed
+        for _ in range(docs_to_create):
+            work_items.append((topic_path, topic_parts))
+
+    if parallelism <= 1:
+        # Sequential processing
+        for topic_path, topic_parts in tqdm(
+            work_items,
+            desc=f"Generating docs for {source_type}",
+            leave=False,
+        ):
+            success, message = generate_single_document(
+                source_type=source_type,
+                topic_and_subtopics=topic_path,
+                topic_path_parts=topic_parts,
+                company_overview=company_overview,
+                source_tree=source_tree,
+                agents_md_contents=agents_md_contents,
+                quiet=quiet,
+            )
+            if success:
+                success_count += 1
+            else:
+                fail_count += 1
+                errors.append(f"{topic_path}: {message}")
+    else:
+        # Parallel processing
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            futures = {
+                executor.submit(
+                    generate_single_document,
+                    source_type,
+                    topic_path,
+                    topic_parts,
+                    company_overview,
+                    source_tree,
+                    agents_md_contents,
+                    True,  # quiet=True for parallel
+                ): topic_path
+                for topic_path, topic_parts in work_items
+            }
+
+            with tqdm(
+                total=len(work_items),
+                desc=f"Generating docs for {source_type}",
+                leave=False,
+            ) as pbar:
+                for future in as_completed(futures):
+                    topic_path = futures[future]
+                    try:
+                        success, message = future.result()
+                        if success:
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                            errors.append(f"{topic_path}: {message}")
+                    except Exception as e:
+                        fail_count += 1
+                        errors.append(f"{topic_path}: {e}")
+                    pbar.update(1)
+
+    return (success_count, fail_count, errors)
+
+
+def generate_documents(company_overview: str, parallelism: int = 10) -> None:
+    """
+    Phase 3: Generate documents for all sources based on volume files.
+
+    Args:
+        company_overview: Company overview content.
+        parallelism: Number of documents to generate in parallel per source.
+    """
+    print()
+    print("=" * 40)
+    print("Phase 3: Generate Volume Documents")
+    print("=" * 40)
+    print()
+    print("Note: This phase generates the actual documents based on the topics")
+    print("      in the volume files. This may take a long time depending on")
+    print("      the total number of documents to generate.")
+    print()
+
+    if not os.path.exists(VOLUME_DIR):
+        print("No volume directory found.")
+        return
+
+    # Collect sources with pending documents
+    sources_with_pending = []
+    total_pending = 0
+
+    for filename in sorted(os.listdir(VOLUME_DIR)):
+        if not filename.endswith(".json"):
+            continue
+        filepath = os.path.join(VOLUME_DIR, filename)
+        try:
+            data = load_json_file(filepath)
+            topics = data.get("topics", {})
+            leaf_topics = collect_leaf_topics(topics)
+            pending = sum(desired - completed for _, _, desired, completed in leaf_topics)
+            if pending > 0:
+                source_name = filename.replace(".json", "")
+                sources_with_pending.append((source_name, pending))
+                total_pending += pending
+        except Exception:
+            pass
+
+    if not sources_with_pending:
+        print("No sources have pending documents to generate.")
+        return
+
+    print(f"Found {len(sources_with_pending)} source(s) with {total_pending} pending document(s):")
+    for source_name, pending in sources_with_pending:
+        print(f"  - {source_name}: {pending} documents")
+    print()
+
+    total_success = 0
+    total_fail = 0
+    all_errors: list[str] = []
+
+    for source_type, pending_count in sources_with_pending:
+        print(f"\nProcessing {source_type} ({pending_count} documents)...")
+
+        success, fail, errors = generate_documents_for_source(
+            source_type=source_type,
+            company_overview=company_overview,
+            parallelism=parallelism,
+            quiet=True,
+        )
+
+        total_success += success
+        total_fail += fail
+        all_errors.extend([f"{source_type}/{e}" for e in errors])
+
+        print(f"  Created: {success}, Failed: {fail}")
+
+    print()
+    print("=" * 40)
+    print("Phase 3 Summary")
+    print("=" * 40)
+    print(f"Total documents created: {total_success}")
+    print(f"Total failures: {total_fail}")
+
+    if all_errors and len(all_errors) <= 20:
+        print()
+        print("Errors:")
+        for error in all_errors:
+            print(f"  - {error}")
+    elif all_errors:
+        print()
+        print(f"Errors ({len(all_errors)} total, showing first 20):")
+        for error in all_errors[:20]:
+            print(f"  - {error}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate volume task documents per source type."
@@ -882,6 +1406,7 @@ def main() -> None:
     print("This script generates volume task documents for each source type.")
     print("Phase 1: Generate topics and document counts per source")
     print("Phase 2: Split large topics (>500 docs) into smaller sub-topics")
+    print("Phase 3: Generate actual documents based on the topics")
     print()
     print("Target volume is extracted from each source's agents.md file.")
     print(f"Output directory: {VOLUME_DIR}")
@@ -1000,6 +1525,12 @@ def main() -> None:
         parallelism=args.topic_parallelism,
     )
     estimation_warnings.extend(split_warnings)
+
+    # Phase 3: Generate actual documents
+    generate_documents(
+        company_overview=company_overview,
+        parallelism=args.doc_parallelism,
+    )
 
     # Final warnings
     if estimation_warnings:

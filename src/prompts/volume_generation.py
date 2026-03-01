@@ -110,6 +110,7 @@ The estimation is off by {estimation_off_percentage}% which is too much. Please 
 
 
 # Topic and subtopics look like: "Topic description => subtopic description => subtopic description => ..."
+# Existing docs is a list of file paths/names of the existing documents for this topic.
 DOCUMENT_GENERATION_PROMPT = f"""
 You are an artificial dataset generation expert. You are provide a description of a hypothetical company, the source type of interest, and details about a topic of interest. \
 Your task is to generate a realistic document given all of the context. The directory structure is from a "tree" command of the file system which represents a realistic layout of the source type's documents. \
@@ -131,15 +132,26 @@ The files written must exist in the existing directory structure (you cannot cre
 ## {AGENTS_MD_FILE} file paths and contents
 {{agents_md_contents}}
 
+## Existing docs for this topic
+```
+{{existing_docs}}
+```
+
 ## Topic
 Topic and subtopics: {{topic_and_subtopics}}
 """.strip()
 
-DOCUMENT_GENERATION_USER_PROMPT = """
+
+DOCUMENT_GENERATION_USER_PROMPT = f"""
 Generate me a realistic document for the following topic.
 
 Topics: {{topic_and_subtopics}}
 
 Remember that you must use the {WRITE_TOOL} tool to write the document to the file system. You can only write the file in the existing directory structure. \
 The files must be valid JSON files that match the schema for the source type found in the {AGENTS_MD_FILE} file.
+""".strip()
+
+
+CONFLICT_PROMPT = """
+The document you are trying to write already exists. Please come up with a different name for the document.
 """.strip()
