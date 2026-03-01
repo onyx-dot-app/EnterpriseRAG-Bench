@@ -8,8 +8,9 @@ from openai import OpenAI
 from src.llm.interface import LLMInterface, Message, ReasoningLevel, ToolCall
 
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5.2")
+LLM_API_KEY = os.environ.get("LLM_API_KEY")
+LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "gpt-5.2")
+CHEAP_LLM_MODEL_NAME = os.environ.get("CHEAP_LLM_MODEL_NAME", "gpt-5-mini")
 BRAINTRUST_API_KEY = os.environ.get("BRAINTRUST_API_KEY")
 BRAINTRUST_PROJECT = os.environ.get("BRAINTRUST_PROJECT")
 
@@ -37,18 +38,18 @@ class OpenAILLM(LLMInterface):
         Initialize the OpenAI LLM.
 
         Args:
-            api_key: OpenAI API key. Defaults to OPENAI_API_KEY env var.
-            model: Model to use. Defaults to LLM_MODEL env var or gpt-4o-mini.
+            api_key: OpenAI API key. Defaults to LLM_API_KEY env var.
+            model: Model to use. Defaults to LLM_MODEL_NAME env var or gpt-5.2.
             tools: List of tool schemas in OpenAI format.
             quiet: If True, suppress status print statements.
             reasoning_level: Level of reasoning effort ("low", "medium", "high").
         """
-        self.api_key = api_key or OPENAI_API_KEY
+        self.api_key = api_key or LLM_API_KEY
         if not self.api_key:
             raise ValueError(
-                "OpenAI API key required. Set OPENAI_API_KEY env var or pass api_key."
+                "OpenAI API key required. Set LLM_API_KEY env var or pass api_key."
             )
-        self.model = model or LLM_MODEL
+        self.model = model or LLM_MODEL_NAME
         self.tools = tools
         self.quiet = quiet
         self.reasoning_level = reasoning_level

@@ -8,8 +8,9 @@ import anthropic
 from src.llm.interface import LLMInterface, Message, ReasoningLevel, ToolCall
 
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+LLM_API_KEY = os.environ.get("LLM_API_KEY")
+LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "claude-sonnet-4-6")
+CHEAP_LLM_MODEL_NAME = os.environ.get("CHEAP_LLM_MODEL_NAME", "claude-haiku-4-5")
 BRAINTRUST_API_KEY = os.environ.get("BRAINTRUST_API_KEY")
 BRAINTRUST_PROJECT = os.environ.get("BRAINTRUST_PROJECT")
 
@@ -37,18 +38,18 @@ class AnthropicLLM(LLMInterface):
         Initialize the Anthropic LLM.
 
         Args:
-            api_key: Anthropic API key. Defaults to ANTHROPIC_API_KEY env var.
-            model: Model to use. Defaults to ANTHROPIC_MODEL env var or claude-sonnet-4-20250514.
+            api_key: Anthropic API key. Defaults to LLM_API_KEY env var.
+            model: Model to use. Defaults to LLM_MODEL_NAME env var or claude-sonnet-4-20250514.
             tools: List of tool schemas in OpenAI format (will be converted).
             quiet: If True, suppress status print statements.
             reasoning_level: Level of reasoning effort ("low", "medium", "high").
         """
-        self.api_key = api_key or ANTHROPIC_API_KEY
+        self.api_key = api_key or LLM_API_KEY
         if not self.api_key:
             raise ValueError(
-                "Anthropic API key required. Set ANTHROPIC_API_KEY env var or pass api_key."
+                "Anthropic API key required. Set LLM_API_KEY env var or pass api_key."
             )
-        self.model = model or ANTHROPIC_MODEL
+        self.model = model or LLM_MODEL_NAME
         self.tools = self._convert_tools(tools) if tools else None
         self.quiet = quiet
         self.reasoning_level = reasoning_level
@@ -138,8 +139,8 @@ class AnthropicLLM(LLMInterface):
         if self.tools:
             kwargs["tools"] = self.tools
 
-        # Check if model supports extended thinking
-        if "claude-3-7" in self.model or "claude-sonnet-4" in self.model or "claude-opus-4" in self.model:
+        # Check if model supports extended thinking (Claude 3.7+, 4.x, 4.5, 4.6)
+        if "claude-3-7" in self.model or "claude-sonnet-4" in self.model or "claude-opus-4" in self.model or "claude-haiku-4" in self.model:
             budget_tokens_map = {"low": 2000, "medium": 5000, "high": 10000}
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget_tokens_map[self.reasoning_level]}
             kwargs["temperature"] = 1  # Required for extended thinking
