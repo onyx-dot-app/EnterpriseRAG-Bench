@@ -15,6 +15,7 @@ from src.paths import (
     DATA_CLEAN_DIR,
     DEBUG_DIR,
     PROJECTS_DIR,
+    QUESTION_CACHE_DIR,
     SOURCES_DIR,
 )
 from src.prompts.document_generation import (
@@ -610,6 +611,85 @@ def add_dataset_uuids(max_parallelism: int = 20) -> None:
             print(f"  ... and {len(failed) - 20} more errors")
 
 
+def write_question_cache() -> None:
+    """
+    Phase 4: Write project entries to question_cache directory.
+
+    Each project gets a file like project_1.json with:
+    - project_outline_file: the project JSON filename
+    - description: the project description
+    - documents: list of dataset_doc_uuid values for project documents
+    """
+    print()
+    print("=" * 40)
+    print("Phase 4: Write to Question Cache")
+    print("=" * 40)
+
+    # Ensure question_cache directory exists
+    os.makedirs(QUESTION_CACHE_DIR, exist_ok=True)
+
+    # Get all project JSON files
+    project_files = sorted([
+        f for f in os.listdir(PROJECTS_DIR)
+        if f.endswith(".json")
+    ])
+
+    if not project_files:
+        print("No project files found.")
+        return
+
+    print(f"Found {len(project_files)} projects to write.")
+    print()
+
+    succeeded = 0
+    failed: list[tuple[str, str]] = []
+
+    for i, project_filename in enumerate(project_files, start=1):
+        project_path = os.path.join(PROJECTS_DIR, project_filename)
+
+        try:
+            project_json = load_json_file(project_path)
+            description = project_json.get("description", "")
+            files = project_json.get("files", [])
+
+            # Collect dataset_doc_uuid from each document
+            document_uuids: list[str] = []
+            for file_entry in files:
+                file_path = file_entry.get("path", "")
+                full_path = os.path.join(DATA_CLEAN_DIR, file_path)
+
+                if os.path.exists(full_path):
+                    try:
+                        doc_data = load_json_file(full_path)
+                        uuid = doc_data.get("dataset_doc_uuid", "")
+                        if uuid:
+                            document_uuids.append(uuid)
+                    except Exception:
+                        pass
+
+            # Write cache file
+            cache_data = {
+                "project_outline_file": project_filename,
+                "description": description,
+                "documents": document_uuids,
+            }
+
+            cache_path = os.path.join(QUESTION_CACHE_DIR, f"project_{i:04d}.json")
+            write_json_file(cache_path, cache_data)
+            succeeded += 1
+
+        except Exception as e:
+            failed.append((project_filename, str(e)))
+
+    print(f"Complete. {succeeded} entries written, {len(failed)} failed.")
+
+    if failed:
+        print()
+        print(f"Failed ({len(failed)}):")
+        for project_file, error in failed:
+            print(f"  - {project_file}: {error}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate project document files based on enriched project data."
@@ -640,6 +720,7 @@ def main() -> None:
     print("Phase 1: Generate documents based on project overviews")
     print("Phase 2: Add title/content field labels to documents")
     print("Phase 3: Add dataset_doc_uuid to all documents")
+    print("Phase 4: Write project cache files to question_cache")
     print()
     print("Note: If any of the documents fail validation, you may need to rerun the script.")
     print()
@@ -655,6 +736,9 @@ def main() -> None:
 
     # Phase 3: Add dataset UUIDs
     add_dataset_uuids(max_parallelism=args.labeling_parallelism)
+
+    # Phase 4: Write to question cache
+    write_question_cache()
 
     # Update aggregate statistics
     sources_dir = os.path.join(DATA_CLEAN_DIR, "sources")
