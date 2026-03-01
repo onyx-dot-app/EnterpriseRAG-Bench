@@ -5,7 +5,7 @@ Target number of files:
 6000
 
 File name format:
-Files for customer-support should be SUP-12345.json with up to 5 digits. Files for internal support should be INT-12345 with up to 5 digits.
+File should have a ticket prefix like CUS (for customer support) or INT (for internal support) followed by a few digits and then a description of the high level of the file (e.g. SUP-25485-inference-latency-of-streaming-api.json).
 
 Content rules:
 - Jira at Redwood Inference is used only for support workflows (not project management).

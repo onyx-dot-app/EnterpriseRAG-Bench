@@ -1,0 +1,65 @@
+{
+  "key": "ENG-4825",
+  "team": "engineering",
+  "title": "Fix quota enforcement edge case causing 429 misclassification + inconsistent rate-limit headers",
+  "status": "Done",
+  "priority": "P1",
+  "created_at": "2026-02-06",
+  "updated_at": "2026-02-18",
+  "creator": "Ethan Park",
+  "assignee": "Mina Haddad",
+  "project": "Support Escalation Playbook + Known-Issues Sprint (Q1 2026)",
+  "cycle": "2026-W07",
+  "estimate": "5",
+  "due_date": "2026-02-14",
+  "labels": [
+    "support-escalation",
+    "rate-limits",
+    "quota",
+    "gateway",
+    "fallback-routing",
+    "customer-facing"
+  ],
+  "dependencies": [
+    "ENG-4821",
+    "ENG-4823"
+  ],
+  "customer_impact": "high",
+  "release": "control-plane-2026.02",
+  "security_review_required": "false",
+  "body": "Context\n- Reported by Support during known-issues sprint triage.\n- Primary tickets: SUP-1843 (unexpected 429 after upgrading SDK), SUP-1855 (rate limit headers inconsistent across endpoints).\n- Symptoms: customers see 429s that look like quota exhaustion while dashboard/contracted limits show remaining capacity. Separately, RateLimit headers (and sometimes Retry-After) are inconsistent across endpoints and can differ between initial and fallback-routed responses.\n\nProblem statement\n- We have an edge case in quota enforcement when requests are routed through a fallback path (or when a request hits a per-route limiter after account quota evaluation).\n- In some cases we:\n  (a) classify the 429 as \"quota_exceeded\" even when the failure is a per-route rate limit (burst) or concurrency limiter, and\n  (b) emit RateLimit-* headers computed from a different policy bucket than the one that actually rejected the request (e.g., headers reflect the pre-fallback route or the account-level quota bucket, while the 429 originates from a downstream limiter).\n- Result: customers and Support cannot reliably interpret whether they should retry, reduce burst, or request quota changes. It also increases escalations because headers appear \"wrong\" vs Console limits.\n\nRoot cause (confirmed)\n- Gateway composes the 429 response using a \"best available\" limiter context. Under fallback routing we may lose the original limiter decision metadata and we fall back to account-quota context.\n- The header formatter and the error classifier were not using the same \"source of truth\". Header emission chose the first populated context; classification chose a different branch (quota-first).\n- Some endpoints were on an older header formatter path (legacy RateLimit headers) while others used the new formatter, leading to cross-endpoint inconsistency.\n\nProposed fix\n1) Unify limiter decision + header generation\n- Introduce a single RateLimitDecision object that is produced at the point of rejection and is passed through to response composition.\n- Ensure both classification (error code) and header emission consume the same decision object.\n\n2) Correct classification for 429\n- If rejection source == route limiter / concurrency limiter: classify as rate_limited and include Retry-After when available.\n- If rejection source == account quota: classify as quota_exceeded.\n- If multiple limiters are involved, prefer the rejecting limiter (the one that returned deny).\n\n3) Standardize headers across endpoints\n- Always emit a consistent set:\n  - RateLimit-Limit\n  - RateLimit-Remaining\n  - RateLimit-Reset\n  - Retry-After (only when meaningful; otherwise omit)\n- Add an internal-only debug header for Support/SRE verification:\n  - x-redwood-ratelimit-source: account_quota | route_limiter | concurrency_limiter\n  (flagged behind internal/allowlist so it does not leak broadly)\n\n4) Preserve behavior for clients\n- Status code remains 429.\n- Do not change response schema beyond the error classification string/code (align with existing error envelope).\n\nScope / non-goals\n- Not changing actual quota/rate-limit policies or default thresholds.\n- Not changing plan entitlements or billing.\n- Not retrofitting all historical logs; we will add forward-looking structured logs.\n\nImplementation notes\n- Touch points:\n  - gateway/rate_limit middleware\n  - fallback routing handler (ensure decision metadata preserved)\n  - error classifier mapping\n  - header formatter (remove legacy path; keep compatibility shim)\n- Logging:\n  - Emit structured field ratelimit.source and ratelimit.bucket_id to enable correlation with dashboards.\n\nAcceptance criteria\n- For fallback-routed requests that fail with 429:\n  - error classification matches the rejecting limiter.\n  - RateLimit-* headers reflect the same limiter bucket.\n- Headers are consistent across endpoints (chat/generate/embeddings/rerank).\n- Support can validate rejection source without asking Engineering (via allowlisted debug header + logs).\n- Regression coverage added for:\n  - fallback path\n  - mixed limiter evaluation\n  - legacy endpoint routes\n\nReferences / links\n- Support tickets: SUP-1843, SUP-1855\n- Related work: ENG-4821 (support signal for fallback metrics), ENG-4823 (dashboard links)\n- Docs/KB: workaround-429-quota-mismatch-and-rate-limit-headers (Support article)\n- Code change: PR redwood#19322 (fix rate-limit header consistency + tests)\n\nRollout plan\n- Phase 0 (staging): Validate with synthetic load + forced fallback routing; confirm header consistency and classification.\n- Phase 1 (canary): 5% traffic in us-east for Hosted; monitor 429 rate, Retry-After presence, and support-reported anomalies.\n- Phase 2: Roll to all Hosted regions.\n- Phase 3: Roll to Dedicated control-plane gateways (coordinate with SRE for change window); verify no customer-specific header expectations break.\n- Backout: revert gateway deploy; old behavior returns. No data migrations.\n\nMonitoring\n- Dashboards/alerts:\n  - 429 rate by endpoint + region\n  - ratelimit.source distribution (expect shift: fewer \"quota_exceeded\" classifications for burst-limited cases)\n  - Support escalations tagged \"quota/rate limit confusion\" (qualitative)\n\nSupport enablement\n- Post in #support once canary passes with:\n  - what changed (classification + headers)\n  - how to interpret new behavior\n  - when to escalate (suspected genuine quota mismatch after fix)\n- Update known-issues article to note \"fixed as of control-plane-2026.02\" and keep workaround guidance for older stacks.",
+  "test_plan": "Automated\n- Unit tests:\n  - rate_limit_classifier_prefers_rejecting_limiter\n  - header_formatter_uses_decision_bucket\n  - legacy_routes_use_standard_formatter\n- Integration tests (gateway):\n  - forced_fallback_route_limiter_429_emits_route_bucket_headers\n  - account_quota_429_emits_quota_bucket_headers\n  - concurrency_limiter_429_sets_retry_after_when_available\n\nManual\n- Using internal load tool:\n  - Trigger route limiter on /v1/chat.completions and verify headers + error code.\n  - Trigger fallback routing then trigger limiter; verify headers reflect fallback route bucket.\n  - Compare behavior across endpoints (chat/generate/embeddings/rerank) for consistency.",
+  "rollout_plan": "1) Merge PR redwood#19322 behind feature flag: ratelimit.decision_v2 (default on in staging).\n2) Staging soak (30\u201360 min) with synthetic traffic + forced fallback.\n3) Production canary (us-east, 5%): 1\u20132 hours, watch 429/error classification mix and customer reports.\n4) Global Hosted rollout.\n5) Dedicated/Private: include in next control-plane gateway update window; notify CSMs for accounts with prior tickets.\n6) Update KB + Support macros once rollout complete.",
+  "comments": [
+    "2026-02-06 (Ethan Park): Created after Support escalation review. This is blocking clean guidance for SUP-1843/SUP-1855; customers are interpreting 429s as hard quota exhaustion.",
+    "2026-02-07 (Mina Haddad): I can reproduce via forced fallback in staging; headers reflect pre-fallback route bucket while rejection occurs post-fallback. Agree on passing a single decision object through response composition.",
+    "2026-02-08 (Sean Gallagher): Please ensure classification aligns with paging thresholds/incident comms. If we mislabel as quota_exceeded, Support tends to treat it as account issue vs incident. Add structured logging so we can verify in aggregate.",
+    "2026-02-10 (Priya Shah): Support request: add a reliable signal we can quote in tickets. Internal-only x-redwood-ratelimit-source would be ideal (allowlist).",
+    "2026-02-12 (Mina Haddad): PR up (redwood#19322). Added integration tests for fallback + limiter. Also removed legacy header path for embeddings endpoint that was causing mismatch.",
+    "2026-02-14 (Ethan Park): Canary plan approved. Please post in #support after us-east canary passes so we can update macros and close loop on SUP-1843/1855.",
+    "2026-02-18 (Mina Haddad): Rolled out globally for Hosted. Metrics look stable; classification mix shifted as expected. Follow-up: ensure Dedicated gateway release notes include header standardization to avoid surprises."
+  ],
+  "history": [
+    "2026-02-06: Ticket created (P1) after Support escalation triage; linked to SUP-1843/SUP-1855.",
+    "2026-02-08: Root cause confirmed (fallback path losing limiter decision metadata).",
+    "2026-02-12: Fix implemented + tests added; PR opened (redwood#19322).",
+    "2026-02-14: Staging validation complete; canary approved.",
+    "2026-02-18: Global Hosted rollout complete; ticket marked Done."
+  ],
+  "links": [
+    "Jira SUP-1843: Unexpected 429 after upgrading SDK",
+    "Jira SUP-1855: Rate limit headers inconsistent",
+    "GitHub PR: sources/github/redwood/pr-19322-fix-rate-limit-header-consistency.json",
+    "KB draft: workaround-429-quota-mismatch-and-rate-limit-headers",
+    "Related: ENG-4821 (fallback metrics support signal)",
+    "Related: ENG-4823 (dashboard links for Support)"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "test_plan",
+    "rollout_plan",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_d0c88fbf235240c7b267af2935f97c49"
+}

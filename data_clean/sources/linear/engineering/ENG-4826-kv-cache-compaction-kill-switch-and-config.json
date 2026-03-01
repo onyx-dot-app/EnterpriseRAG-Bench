@@ -1,0 +1,53 @@
+{
+  "key": "ENG-4826",
+  "team": "engineering",
+  "title": "KV cache compaction kill-switch + runtime config plumbing",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2026-01-10",
+  "updated_at": "2026-02-12",
+  "creator": "Talia Benson",
+  "assignee": "Benji Okafor",
+  "project": "KV cache compaction improvements",
+  "cycle": "2026-W03",
+  "estimate": "5",
+  "due_date": "2026-01-31",
+  "release": "runtime-1.22",
+  "customer_impact": "high",
+  "security_review_required": "false",
+  "labels": [
+    "runtime",
+    "kv-cache",
+    "feature-flag",
+    "config",
+    "rollouts",
+    "oncall",
+    "sre-guardrails"
+  ],
+  "parent_issue": "ENG-4821",
+  "dependencies": [
+    "ENG-4822",
+    "ENG-4823",
+    "ENG-4824",
+    "ENG-4825"
+  ],
+  "sub_issues": [
+    "ENG-4830"
+  ],
+  "body": "## Context\nKV cache compaction/eviction introduces new failure modes (stall risk, increased copy overhead, correctness hazards in edge cases, and potential tail-latency spikes if budgets are misconfigured). We need runtime-level knobs + a fast emergency disable path that oncall can use without redeploying.\n\nThis ticket covers:\n- Runtime config flags and defaults (per tier) for compaction + eviction.\n- Rollout knobs for staged enablement (internal canary \u2192 hosted subset \u2192 dedicated pools).\n- Emergency kill-switch semantics + config propagation requirements.\n\n## Goals / requirements\n1) **Emergency disable within minutes**\n   - Oncall can disable compaction/eviction globally (or per-cluster) via feature flag/config change.\n   - Safe-disable semantics: new requests stop participating immediately; in-flight compaction steps stop at the next safe checkpoint; no allocator corruption.\n\n2) **Configurable + tier-aware defaults**\n   - Hosted: conservative budgets + lower fragmentation trigger; Dedicated: higher budgets allowed (if customer opted in / pool configured).\n   - Ability to override by model profile / pool config (internal only for v1).\n\n3) **Config propagation is explicit + observable**\n   - We need an SLO for config propagation time (target p95 < 2 minutes; hard requirement: < 5 minutes) and a way to confirm effective config at runtime.\n\n4) **Guardrails**\n   - Budgets enforced (time/bytes) and clamped to safe ranges.\n   - Kill-switch must always win over other config.\n\n## Proposed config surface (runtime)\nAll values shown are internal names as implemented in runtime config. Final naming can differ but must map 1:1.\n\n### Top-level enablement\n- `kv.compaction.enabled` (bool) \u2014 master enable for compaction worker.\n- `kv.eviction.enabled` (bool) \u2014 master enable for eviction selection.\n- `kv.compaction.kill_switch` (bool) \u2014 **emergency override**. When true, compaction + eviction are disabled regardless of other settings.\n\n### Thresholds / triggers\n- `kv.compaction.fragmentation_trigger_ratio` (float 0..1) \u2014 trigger compaction when fragmentation ratio exceeds this threshold.\n- `kv.compaction.min_free_bytes_trigger` (int bytes) \u2014 optional secondary trigger based on allocator headroom.\n\n### Budget knobs (enforced per scheduler phase)\n- `kv.compaction.budget_ms_per_step` (int ms) \u2014 max wall time allowed per compaction step.\n- `kv.compaction.budget_bytes_per_step` (int bytes) \u2014 max bytes moved per step.\n- `kv.compaction.max_steps_per_decode_tick` (int) \u2014 hard cap to prevent long decode stalls.\n\n### Safety / backpressure integration\n- `kv.compaction.disable_when_overloaded` (bool) \u2014 if overload/backpressure is active, skip compaction.\n- `kv.compaction.pause_on_p99_regression` (bool) \u2014 optional guardrail hook (initially off) that can be wired to rollout controller.\n\n### Eviction knobs (tier-aware LRU)\n- `kv.eviction.max_evictions_per_minute` (int) \u2014 clamp to prevent thrash.\n- `kv.eviction.protect_pinned_sessions` (bool) \u2014 must default true.\n- `kv.eviction.allow_prefix_cache_eviction` (bool) \u2014 default false for first rollout (avoid surprising hit-rate regressions).\n\n## Rollout knobs / control-plane integration\n- Support config scoping at least at: **cluster** and **pool** level.\n- Rollout service needs a single switch for canary cohorts:\n  - `kv.compaction.rollout_percent` (0..100) OR cohort-based assignment via existing rollout mechanism.\n  - If rollout-percent isn\u2019t available in runtime config, we will rely on rollouts tagging + per-host config injection.\n\n## Emergency kill-switch semantics (must be documented in runbook)\n- Kill-switch (`kv.compaction.kill_switch=true`) disables:\n  - compaction worker scheduling\n  - eviction selection logic\n  - any background relocation loops\n- In-flight behavior:\n  - Compaction step must check kill-switch at **safe points** (before move, after move, before free-list mutation).\n  - If kill-switch flips mid-step, step must abort after completing the current atomic move unit and leave allocator invariants intact.\n- Recovery:\n  - Disabling kill-switch returns to prior config (not necessarily enabled; depends on `enabled` flags).\n\n## Observability / operability\nRequired runtime exports:\n- `runtime_config_last_applied_timestamp` (or equivalent)\n- `runtime_config_version` / `config_etag`\n- `kv_compaction_kill_switch_active` (gauge 0/1)\n\nOperator visibility:\n- Add a log line on config apply summarizing effective KV compaction config (redacted if needed).\n- Add a `/debug/runtime-config` dump (if existing debug endpoint supports this) or equivalent console command used by oncall.\n\n## Acceptance criteria\n- [x] Runtime accepts config for KV compaction + eviction + kill-switch; kill-switch overrides.\n- [x] Config can be updated without deploy and is applied within target propagation time.\n- [x] Oncall can validate config application via metric/log and confirm compaction is stopped.\n- [x] Compaction/eviction codepaths check the kill-switch frequently enough to prevent multi-second stalls.\n- [x] Add a basic integration test for config flipping during load (can be a targeted harness test; doesn\u2019t need full perf-canary).\n\n## Implementation notes\n- Prefer using existing runtime config plumbing (same path as batching/caching configs) vs bespoke env vars.\n- Ensure defaults are conservative and aligned with SRE guardrails:\n  - Hosted: enabled in canary only; low budgets.\n  - Dedicated: default off unless explicitly opted-in by pool config.\n\n## Links\n- Epic: sources/linear/engineering/ENG-4821-kv-cache-compaction-epic.json\n- Scheduler budgeting: ENG-4824\n- Core compaction: ENG-4823\n- Eviction policy: ENG-4825\n- PR (config plumbing / kill-switch): sources/github/redwood/pr-19422-kv-compaction-kill-switch-config-plumbing.json\n- SRE thread re: config propagation latency: sources/slack/eng-platform/1768080411.json\n- Canary guardrails: sources/confluence/eng-sre/slo-and-error-budgets/hosted-api-tail-latency-guardrails.json\n\n## Open questions\n1) Do we need per-model overrides in v1, or is per-pool sufficient until Console UI exists?\n2) Should kill-switch be global-only, or allow per-region/per-cluster to avoid disabling healthy regions?\n3) Do we want a separate kill-switch for eviction vs compaction, or keep a single \"KV safety\" switch?\n",
+  "comments": [
+    "2026-01-10 (Talia Benson): Creating ticket as P0 per Mateo/SRE alignment. We need a kill-switch before hosted canary expands. Please coordinate with eng-platform on config propagation latency + auditing.",
+    "2026-01-14 (Benji Okafor): Drafted config keys + scoping proposal. Plan is to reuse existing runtime dynamic config channel (etag-based) and add a hard override `kv.compaction.kill_switch`. Will ensure compaction loop checks switch at safe points (before/after move).",
+    "2026-01-18 (Sean Gallagher): SRE request: include a metric/log that confirms effective config on host. During incident we can\u2019t rely on \"flag set\" in control plane\u2014need \"flag applied\" in runtime. Also require propagation target p95 < 2m, rollback automation will assume this.",
+    "2026-01-22 (Benji Okafor): Posted PR for config plumbing + kill-switch. Added `kv_compaction_kill_switch_active` gauge and config version log on apply. Still need to confirm whether debug endpoint exposes runtime config dump or if we add a minimal one.",
+    "2026-01-27 (Sofia Ivanova): Scheduler integration uses budget knobs; please ensure defaults clamp to prevent decode tick exceeding 1\u20132ms. Also, kill-switch check must happen inside scheduler hook to avoid doing work after disable.",
+    "2026-02-03 (Rafael Mendes): Runbook request: exact steps for oncall to flip kill-switch + verify (dashboard panels + host logs). Please link to release train runtime-1.22 and note who has permission to flip in prod.",
+    "2026-02-12 (Benji Okafor): Landed in runtime-1.22 behind flags. Kill-switch verified in staging: flip disables new compaction steps within one scheduler tick; in-flight step aborts at checkpoint. Added config apply log + gauge; propagation observed p95 ~70s in canary. Marking Done."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_c9c1e47aa6a1455c934aa89b485bf705"
+}

@@ -1,0 +1,93 @@
+{
+  "repo": "redwood",
+  "pr_number": "19371",
+  "title": "runtime/scheduler: enforce KV compaction budget at decode boundaries to avoid stalls",
+  "author": "Sofia Ivanova",
+  "created_at": "2026-01-28",
+  "updated_at": "2026-02-03",
+  "merged_at": "2026-02-03",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/kv-compaction-scheduler-budget",
+  "reviewers": [
+    "Omar El-Sayed",
+    "Samir Qureshi",
+    "Noah Patel",
+    "Sean Gallagher",
+    "Allison Grant",
+    "Julian Moore"
+  ],
+  "labels": [
+    "runtime",
+    "scheduler",
+    "kv-cache",
+    "perf",
+    "observability",
+    "feature-flag"
+  ],
+  "linked_linear": [
+    "ENG-4824",
+    "ENG-4823",
+    "ENG-4822"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "612",
+  "deletions": "188",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "body": "Context: This PR integrates KV-cache compaction budgeting into the scheduler loop to prevent decode-time stalls and tail-latency spikes when compaction/relocation work is triggered under load. It is part of the KV cache compaction improvements epic and builds on the allocator primitives + metrics added in earlier PRs (notably pr-19357 and pr-19342).\n\nProblem: Prior compaction prototype ran relocation work opportunistically when fragmentation crossed a threshold. Under mixed-length workloads, the relocation work could happen during decode hot-path and cause intermittent stalls (visible as p99 spikes and occasional perf-canary failures). We need explicit guardrails so compaction work is budgeted and scheduled only in safe windows.\n\nWhat changed:\n- Introduced scheduler-level compaction budget enforcement with two budgets: time (microseconds) and bytes-moved per scheduling tick.\n- Enforced compaction only at safe boundaries by default: after prefill completion and at decode step boundaries (i.e., between token steps, not mid-kernel).\n- Added a compaction \"work token\" mechanism: scheduler hands the allocator/compactor an explicit budget each tick; compactor must stop when exhausted and return progress + remaining backlog.\n- Added backpressure integration hooks: if the scheduler is in overload mode (high queue depth / p99 guard), compaction budget is reduced to 0 and we rely on eviction instead (handled in follow-up PR for tier-aware eviction).\n- Added tracing spans around \"scheduler_budget_grant\" and \"compaction_step\" to correlate granted budgets with latency spikes (spans are gated by existing runtime tracing sampling).\n- Added config knobs (runtime flags, not customer UI):\n  - kv_compaction.enabled (bool)\n  - kv_compaction.budget_us_per_tick (default: 200us hosted, 500us dedicated; overridable)\n  - kv_compaction.budget_bytes_per_tick (default: 4MiB hosted, 8MiB dedicated; overridable)\n  - kv_compaction.safe_windows (enum: prefill_only | decode_boundaries | always; default: decode_boundaries)\n- Added a \"hard stop\": if a single compaction step would exceed remaining budget, compactor returns without doing partial relocation (avoids half-moved page bookkeeping complexity; allocator keeps candidates queued).\n\nPerformance / correctness:\n- Correctness: compaction work is now driven by scheduler state transitions; we do not attempt to move pages while a sequence is actively decoding within the same tick. The compactor uses existing pinning rules and will skip pinned pages; it reports skipped counts.\n- Benchmarks (A100-80GB, runtime_bench/kv_frag_mixed_len_burst, 20 runs):\n  - Before (allocator-triggered opportunistic compaction): p99 decode latency +14.8% during burst phase; occasional >50ms stalls correlated with bytes_moved spikes.\n  - After (budgeted scheduling): p99 decode latency +1.9% during burst phase; no >50ms stalls observed; throughput -0.4% (within noise).\n  - Fragmentation reduction curve is slower but monotonic; the goal here is tail protection, not fastest defrag.\n- CI: Added perf CI check that fails if p99 regression >5% on kv_frag_mixed_len_burst when kv_compaction.enabled=true (gated behind nightly perf lane; see checks below).\n\nOperational notes:\n- Feature remains behind kv_compaction.enabled and is off by default on main until canary.\n- If oncall sees compaction-caused latency, recommended immediate mitigation is setting budget_us_per_tick=0 (keeps metrics/tracing but disables work), then flipping kv_compaction.enabled=false if needed.\n\nFollow-ups:\n- Tier-aware eviction integration and policy selection (ENG-4825).\n- Dashboard panel updates for budget granted vs bytes moved correlation (ENG-4830).\n\nTest plan:\n- Unit: scheduler budget accounting, compactor stop conditions, safe-window gating.\n- Integration: long-lived sessions + churn with cancellation; verified no mid-step relocation; verified no deadlocks.\n- Perf: benchmark-lab kv_frag_mixed_len_burst and kv_frag_long_lived_chat; perf-canary scenario added in perf-canary repo (tracked separately).\n\nNotes for reviewers: Please focus on (1) correctness around safe windows and state transitions, (2) budget accounting edge cases when ticks are short, and (3) whether the defaults are conservative enough for Hosted while still making fragmentation progress.",
+  "commits": [
+    "scheduler: add CompactionBudget struct and per-tick grant plumbing",
+    "kv/compaction: implement stop-when-budget-exhausted semantics + progress reporting",
+    "scheduler: gate compaction work to safe windows (prefill end / decode boundary)",
+    "runtime/config: add kv_compaction budget knobs and defaults per tier",
+    "tracing: add spans for budget grants + compaction steps",
+    "tests: add scheduler budget accounting unit tests",
+    "perf: wire kv_frag_mixed_len_burst p99 guard into nightly perf lane"
+  ],
+  "changed_areas": [
+    "runtime/scheduler/* (tick loop, phase transitions, overload hooks)",
+    "runtime/kv_cache/compaction/* (budget-aware stepping API)",
+    "runtime/config/flags.yaml (kv_compaction knobs + defaults)",
+    "runtime/observability/tracing/* (new spans)",
+    "runtime/tests/scheduler/* (budget + safe-window tests)",
+    "ci/perf/nightly.yaml (p99 guardrail for kv fragmentation scenario)"
+  ],
+  "ci_checks": [
+    "buildkite: runtime-linux-gpu (pass)",
+    "buildkite: runtime-unit-tests (pass)",
+    "buildkite: runtime-integration-tests (pass)",
+    "buildkite: lint (pass)",
+    "buildkite: perf-nightly-kv-frag-mixed-len-burst (pass; p99 guard < 5% regression)",
+    "buildkite: sanitizer-tsan (pass)"
+  ],
+  "review_conversation": [
+    "2026-01-29 Omar El-Sayed: The safe window gating looks right, but can you confirm we never relocate a page that could still be referenced by an in-flight decode kernel? I want to see the invariant in code comments.",
+    "2026-01-29 Sofia Ivanova: Good call. We only call compactor.step() after the decode step completes and before launching the next token step. I added a comment near Scheduler::run_decode_tick() and a DCHECK that no decode kernels are enqueued when entering the compaction window.",
+    "2026-01-30 Samir Qureshi: Budget accounting: what happens if budget_us_per_tick is non-zero but budget_bytes_per_tick is 0? We should treat that as disabled for bytes-moved or we\u2019ll spin doing bookkeeping only.",
+    "2026-01-30 Sofia Ivanova: Updated logic: both budgets must be >0 to run compaction work (unless safe_windows=prefill_only, in which case we still require bytes>0). Added a unit test for zero-byte budget.",
+    "2026-01-31 Sean Gallagher: Can we clamp the compaction budget under overload automatically? Otherwise perf guardrails depend on operators remembering to tune budgets.",
+    "2026-01-31 Sofia Ivanova: Added hook to OverloadController: if overload_mode=true OR p99_guard_triggered, scheduler grants a 0 budget. This keeps the kill-switch simple and aligns with rollout guardrails.",
+    "2026-02-01 Noah Patel: I\u2019d like an explicit statement about partial relocations: you\u2019re choosing to not do partial work if the next relocation would exceed remaining budget. That reduces complexity but could starve progress if candidates are too large. Any risk?",
+    "2026-02-01 Sofia Ivanova: Candidates are page-granular; worst-case a page move is 2MiB. Defaults bytes budget is >=4MiB so we always can do at least one move per tick when enabled. If a user sets budget < page size, we log a warning and skip work (metric kv_compaction_budget_too_small_total).",
+    "2026-02-02 Allison Grant: Please ensure metric naming aligns with the standard (budget granted vs bytes moved). Also can you add tags for phase (prefill/decode)?",
+    "2026-02-02 Sofia Ivanova: Metrics emitted: kv_compaction_budget_us_granted, kv_compaction_budget_bytes_granted, kv_compaction_bytes_moved, kv_compaction_step_us with label phase=prefill|decode. Naming matches the draft standard; we can update if the standard doc changes.",
+    "2026-02-03 Omar El-Sayed: Approved. This is the missing piece for avoiding decode stalls. Let\u2019s keep defaults conservative for Hosted until canary data is in.",
+    "2026-02-03 Sean Gallagher: Approved from SRE side. The overload clamp + kill-switch path is what we need for rollout."
+  ],
+  "release_notes": "Internal-only (runtime 1.22 candidate): KV compaction work is now scheduler-budgeted and constrained to safe windows to reduce decode-time stalls and tail latency under fragmentation-triggered relocation. Feature remains behind kv_compaction.enabled; defaults conservative for Hosted.",
+  "related_prs": [
+    "pr-19342-add-kv-fragmentation-counters",
+    "pr-19357-kv-cache-compaction-core-allocator-changes",
+    "pr-19405-add-compaction-tracing-spans",
+    "pr-19422-kv-compaction-kill-switch-config-plumbing"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "review_conversation",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_e80c27acb2f94c769fd0478eed0323e0"
+}

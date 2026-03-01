@@ -1,0 +1,49 @@
+{
+  "key": "ENG-19149",
+  "team": "engineering",
+  "title": "Private: baseline log collector config (structured parsing, buffering/backpressure, safe defaults)",
+  "status": "In Review",
+  "priority": "P1",
+  "created_at": "2025-05-14",
+  "updated_at": "2025-06-03",
+  "creator": "Logan Wright",
+  "assignee": "Diego Santos",
+  "project": "Private observability minimum pack",
+  "cycle": "2025-W20",
+  "estimate": "5",
+  "due_date": "2025-06-07",
+  "labels": [
+    "private",
+    "observability",
+    "logging",
+    "helm",
+    "on-prem",
+    "airgap"
+  ],
+  "dependencies": [
+    "PM-842",
+    "ENG-19152",
+    "ENG-19157"
+  ],
+  "sub_issues": [
+    "ENG-19150",
+    "ENG-19151"
+  ],
+  "customer_impact": "medium",
+  "release": "private-2025.07",
+  "security_review_required": "true",
+  "description": "## Context\nPrivate installs (VPC + on-prem/air-gapped) need a supported, repeatable log pipeline so customers and Redwood Support/SRE can debug health/perf issues without bespoke integrations.\n\nThis ticket implements the **baseline log collector** configuration shipped with the Private installer/Helm charts. Focus is on:\n- parsing Redwood\u2019s **structured JSON logs** reliably\n- **bounded buffering** and sensible backpressure behavior when sinks are unavailable\n- safe defaults (no secrets/PII leakage, predictable resource use)\n- packaging friendliness for offline/on-prem\n\nScope includes collector config + Helm values + minimal docs for operators. Export-specific \u201crecipes\u201d (Splunk HEC / Elasticsearch) are tracked in ENG-19150/ENG-19151.\n\n## Decision (v1)\nUse **Fluent Bit** as the default log collector for Private.\nRationale:\n- widely deployed in customer K8s environments (low friction)\n- solid backpressure + buffering controls\n- supports Loki, Splunk HEC, Elasticsearch/OpenSearch, and HTTP outputs; OTLP can be supported via http output/bridge where required\n- straightforward air-gapped packaging (single image + config)\n\n(See ADR-022 for overall log pipeline defaults and supported sinks.)\n\n## What we\u2019re shipping\n### 1) Collector deployment shape\n- `DaemonSet` in `redwood-observability` namespace (configurable)\n- Tails container logs from:\n  - control plane services (gateway, policy/routing, auth/RBAC integration points)\n  - data plane (serving runtime pods)\n  - installer/upgrade controller\n- Adds Kubernetes metadata (pod, namespace, container) for triage\n\n### 2) Structured parsing expectations\nAll Redwood components are expected to log **single-line JSON** records.\nCollector handles:\n- JSON parsing with time extraction (RFC3339 / epoch ms)\n- tolerant parsing: if JSON parse fails, forward as raw with `parse_error=true` (prevents silent loss)\n\nExpected common fields (non-exhaustive):\n- `ts`, `level`, `msg`\n- `service`, `component`, `version`\n- `request_id` (required for supportability)\n- `trace_id` / `span_id` (when present)\n- `route` and `model` (if present; *do not promote to labels*)\n- `tenant_id_hash` (hashed value only; no raw tenant IDs)\n\n### 3) Safe defaults (redaction + label/cardinality control)\n**Redaction / drop rules (collector-side defense-in-depth):**\n- Drop keys if present: `authorization`, `cookie`, `set-cookie`, `x-api-key`, `api_key`, `token`, `id_token`, `refresh_token`, `client_secret`.\n- Drop any field matching `*_secret` and `*_password` (case-insensitive).\n- Ensure we never forward request/response bodies even if an upstream service accidentally logs them: drop keys `prompt`, `messages`, `completion`, `request_body`, `response_body`.\n\n**Label discipline:**\n- For Loki (and any label-based sinks), only label on low-cardinality dimensions:\n  - `namespace`, `pod`, `container`, `service`, `level`, `cluster`\n- Keep `model`, `route`, and `request_id` as *log fields* (not labels) to avoid runaway cardinality.\n\n### 4) Buffering/backpressure behavior\nGoal: avoid collector OOM / noisy neighbor scenarios and keep cluster stable if the sink is down.\n\nDefaults (configurable via Helm values):\n- Memory buffer limits per input (`Mem_Buf_Limit`) set conservatively\n- Enable filesystem buffering where available:\n  - `storage.type=filesystem`\n  - default to `emptyDir` with size cap; allow PVC override for durability\n- Flush interval: 5s (tunable)\n- Retry with backoff; bounded total retries. After limits are hit, drop oldest buffered chunks (documented) rather than crash-loop.\n\nOperational note: we optimize for **cluster health** over perfect log durability in v1, but provide a PVC-backed option for customers that require higher durability.\n\n### 5) Outputs / sinks (baseline)\nSupported sink stubs are included behind feature flags; v1 default is:\n- **Loki in-cluster** if `observability.loki.enabled=true`\n- otherwise: collector is deployed but output defaults to `stdout` (so customers relying on existing node-level logging can still collect), with docs on enabling a supported sink\n\nExport targets are implemented/documented in follow-on tickets:\n- Splunk HEC (ENG-19150)\n- Elasticsearch/OpenSearch (ENG-19151)\n\n### 6) Metrics for the collector\nExpose Fluent Bit metrics endpoint for Prometheus scraping:\n- input records / bytes\n- output errors\n- retries\n- dropped records\n- buffer usage\n\nThese metrics will be wired into minimum pack dashboards/alerts separately, but this ticket ensures the endpoint is enabled and labeled consistently.\n\n## Helm values (proposed)\n`observability.logCollector.enabled`: true|false\n`observability.logCollector.type`: `fluent-bit`\n`observability.logCollector.resources.requests/limits`\n`observability.logCollector.buffer.type`: `memory|filesystem`\n`observability.logCollector.buffer.storageClassName` (optional)\n`observability.logCollector.outputs`: `loki|splunkHec|elasticsearch|stdout|otlpHttp`\n`observability.logCollector.redaction.enabled`: true\n`observability.logCollector.redaction.dropKeys`: override list\n\n## Acceptance criteria\n- [ ] Fluent Bit DaemonSet deploys via `redwood-helm-charts` with default values in both VPC and on-prem reference clusters\n- [ ] Redwood service logs appear in Loki when enabled; dashboards can query by `service` + `level` + `pod`\n- [ ] Backpressure validation: when Loki is unreachable for 30 minutes, collector does not OOM and does not crash-loop; dropped-record behavior is observable in metrics\n- [ ] Redaction validation: synthetic logs containing `authorization`/`token`/`prompt` fields are forwarded with those fields removed\n- [ ] Air-gapped packaging: collector image + config artifacts included in offline bundle manifest (wiring may be completed under ENG-19154)\n- [ ] Security review sign-off on the default redaction policy (ENG-19157)\n\n## Risks / open questions\n- Some customers run restrictive NetworkPolicies; we may need a dedicated doc snippet + installer preflight hint (ENG-19153) to ensure egress to Loki/Splunk/ES endpoints.\n- Loki label strategy must remain stable across upgrades to avoid broken queries.\n- OTLP export for logs varies by customer; keep as \u201csupported but not default\u201d for v1 unless Product requires it.\n\n## Implementation notes\n- Config delivered as a versioned ConfigMap rendered by Helm to keep bundle packaging deterministic.\n- Avoid per-tenant indexing/labels; keep `tenant_id_hash` as a field only.\n- Prefer predictable keys (`service`, `component`, `cluster`) to keep customer-side parsing simple.\n\n## Links\n- ADR-022: Log pipeline defaults (Private)\n- Related: ENG-19150 (Splunk HEC export), ENG-19151 (Elasticsearch/OpenSearch export)\n- Wiring: ENG-19152 (Helm charts wire-in)\n- Security: ENG-19157 (redaction/retention review)\n",
+  "comments": [
+    "2025-05-16 \u2014 Diego Santos: Proposed Fluent Bit DS with filesystem buffering optional. Default output to Loki if enabled, else stdout to avoid surprising customers who already have node-level collectors. Will keep labels minimal to prevent Loki blowups.",
+    "2025-05-20 \u2014 Colin O'Donnell: +1 on stdout default when Loki disabled. Many enterprises mandate central collectors; we should not double-forward by default. Please document how to disable collector entirely if they already run Fluent Bit/Vector globally.",
+    "2025-05-21 \u2014 Marcus Lin: Redaction list should include cookie + set-cookie and a wildcard for *_secret / *_password. Also ensure we never forward request bodies even if accidentally logged upstream.",
+    "2025-05-28 \u2014 Rafael Mendes: For oncall, we need collector metrics exposed and scraped; otherwise we can\u2019t tell if logs are dropping during incidents. Please ensure metrics port is enabled and labeled consistently.",
+    "2025-06-03 \u2014 Diego Santos: Implementation ready for review. Added drop-key filter + parse fallback. Buffer defaults tuned to prevent OOM under sink outage; will validate with failure injection once merged into staging private cluster."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_0a12bdc63211428cadbf997dfb2b1915"
+}

@@ -5,7 +5,7 @@ Target number of files:
 10000
 
 File name format:
-The documents must include the date and meeting title in the format of 2025-01-28-meeting-title.json
+The documents must include the date and meeting title in the format of 2025-01-28-meeting-title.json (e.g. 2024-09-18-redwood-discovery-with-nvidia.json).
 
 Content rules:
 - Documents in this directory are Fireflies.ai meeting artifacts, specifically call transcripts.

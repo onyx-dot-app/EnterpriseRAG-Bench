@@ -1,0 +1,72 @@
+{
+  "repo": "redwood",
+  "pr_number": "19357",
+  "title": "KV cache: core allocator changes + relocation primitives (feature-flagged)",
+  "author": "Samir Qureshi",
+  "created_at": "2026-01-28",
+  "updated_at": "2026-02-04",
+  "merged_at": "2026-02-04",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/kv-compaction-allocator-core",
+  "reviewers": [
+    "Omar El-Sayed",
+    "Sofia Ivanova",
+    "Noah Patel",
+    "Grace Kim",
+    "Allison Grant"
+  ],
+  "labels": [
+    "runtime",
+    "kv-cache",
+    "memory",
+    "performance",
+    "feature-flag"
+  ],
+  "linked_linear": [
+    "ENG-4823",
+    "ENG-4826"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "19",
+  "additions": "1468",
+  "deletions": "612",
+  "body": "Summary\nThis PR lands the core KV arena allocator changes needed to support compaction, plus the first set of relocation primitives. All compaction behavior is gated behind a feature flag and defaults to OFF.\n\nMotivation\nWe\u2019re seeing allocator fragmentation in sustained decode workloads with mixed sequence lengths + high churn. When the free list becomes non-contiguous, we pay increasing allocation overhead and (worse) hit opportunistic evictions/defrag at the wrong times. This PR does NOT attempt to tune compaction triggers/budgets (that\u2019s in the scheduler integration work) \u2014 it provides the underlying memory model + safe relocation steps.\n\nWhat\u2019s included\n- Free-list restructure for KV arena pages\n  - Switch from a single global free list to size-classed bins (by contiguous run length) to reduce scan time and improve best-fit behavior.\n  - Explicit coalescing on free, with O(1) adjacency checks via page metadata (prev/next + run length headers).\n  - New fragmentation accounting helpers (local to allocator; exported metrics are in pr-19342).\n- Relocation primitives (building blocks, not policy)\n  - kv_arena_relocate_run(src_run, dst_run): copies KV pages and updates the owner mapping atomically under the arena lock.\n  - Sequence-side indirection: introduce an internal level of indirection for \u201cwhere is my KV run now?\u201d so we can move pages without touching per-layer pointers all over the decode path.\n  - Safe-point hooks (no scheduler wiring yet): relocation requires the sequence to be in a relocation-safe state (not actively writing into the run). The enforcement is a hard check + guard return; we do not block decode here.\n- Safe compaction step (behind flag)\n  - A single compaction step function that attempts: find a movable run -> find a better-fit destination -> relocate -> free old run -> coalesce.\n  - No background loop, no budgeting in this PR. Intended to be called from a budgeted driver (scheduler hook / background worker in follow-ups).\n- Feature flags / config\n  - runtime.kv_compaction.enabled (default false)\n  - runtime.kv_compaction.relocation_enabled (default false; separate kill switch for move operations)\n  - runtime.kv_allocator.binning_enabled (default true; allocator change can be rolled back independently)\n\nSafety / correctness notes\n- Relocation is implemented as a copy+swap with a single \u201ccommit point\u201d:\n  1) allocate destination run\n  2) memcpy pages (GPU copy path uses existing async copy helper; no new microkernel here)\n  3) validate destination metadata (run headers + checksum of page headers in debug)\n  4) atomically update run mapping (sequence -> run_id -> base address)\n  5) free source run\n- If any step fails, we leave the source run intact and return a non-fatal error (allocator stats incremented). No partial state should be observable.\n- Cancellation: relocation checks the sequence state; if cancelled mid-copy, we abort before commit and free the destination run.\n\nTesting\n- Unit tests:\n  - allocator coalescing + bin invariants\n  - relocate_run commit/abort paths\n  - property-style test: allocate/free churn + periodic relocate, assert no overlaps + run header consistency\n- Stress test (debug): 10k allocate/free cycles + forced relocation; validates arena accounting at end.\n- Local perf sanity: no compaction enabled; verified no regressions in steady-state decode throughput on A100 (single-node, 16 concurrent sequences).\n\nRollout plan\n- Merge behind flags; no production impact by default.\n- Next PRs wire in scheduler budgeting + metrics and then enable on internal canary.\n\nNotes / follow-ups\n- Scheduler safe points: this PR uses a conservative \u201cnot in active write\u201d check; we\u2019ll tighten this when Sofia\u2019s scheduler hook is in.\n- GPU copy: currently uses the generic async copy helper; if we need better packing throughput, kernels team can add a specialized path later.\n\nLinks\n- Linear: ENG-4823 (Implement incremental compaction worker), ENG-4826 (Kill switch + config)\n- Related: pr-19342 (fragmentation counters/metrics), pr-19371 (scheduler integration, upcoming)\n\nChecklist\n- [x] Feature-flagged and default OFF for compaction/relocation\n- [x] Unit tests added\n- [x] Debug asserts for allocator invariants\n- [x] No customer-facing behavior change without flag",
+  "commits": [
+    "kv_arena: introduce run headers + adjacency metadata",
+    "allocator: add size-classed free list bins + coalescing on free",
+    "kv_arena: add relocate_run() primitive + abort/commit semantics",
+    "sequence: add run indirection for relocatable KV base pointers",
+    "tests: allocator invariants + relocation unit tests",
+    "config: add kv_compaction and relocation flags (default off)"
+  ],
+  "changed_areas": [
+    "runtime/kv/kv_arena.{cc,h}",
+    "runtime/kv/kv_allocator_bins.{cc,h}",
+    "runtime/kv/kv_sequence_mapping.{cc,h}",
+    "runtime/config/runtime_flags.yaml",
+    "runtime/tests/test_kv_allocator_invariants.cc",
+    "runtime/tests/test_kv_relocation.cc"
+  ],
+  "ci_checks": [
+    "buildkite/redwood-linux-gpu (cuda12): PASS",
+    "buildkite/redwood-linux-cpu: PASS",
+    "unit-tests (runtime): PASS",
+    "sanitizers (asan/ubsan, cpu): PASS",
+    "perf-smoke (decode throughput microbench): PASS (informational)"
+  ],
+  "review_conversation": [
+    "Omar El-Sayed: The indirection looks right, but can you document the exact commit point? In particular, I want to be sure a reader can\u2019t observe dst before the mapping swap completes.\nSamir Qureshi: Added a comment block in kv_arena_relocate_run() describing the 5-step sequence and clarified that mapping swap is the only externally visible transition; dst is unreachable until then.",
+    "Sofia Ivanova: This currently returns EBUSY if the sequence is in an active write state. That\u2019s fine, but please make sure we don\u2019t accidentally call this from the decode loop and spin.\nSamir Qureshi: Agree \u2014 added a TODO + explicit guard that rejects calls when runtime.kv_compaction.enabled is false, and added a metric counter stub for \u201crelocation_busy\u201d (actual export in metrics PR).",
+    "Noah Patel: Coalescing invariant: after free+coalesce, bins must not contain overlapping runs. Do we have a debug validator?\nSamir Qureshi: Added validate_bins_no_overlap() behind DEBUG and invoked it in allocator tests + optional runtime assert when KV_ALLOCATOR_DEBUG=1.",
+    "Grace Kim: GPU copy path uses the generic async copy helper. Are we synchronizing correctly before the commit swap?\nSamir Qureshi: Yes. The copy helper returns an event; we wait on the event before validating headers and committing the mapping swap. Added an explicit comment and a debug-only check on the stream state.",
+    "Allison Grant: Please add label/flag names to the PR body so SRE can reference them in runbooks.\nSamir Qureshi: Added the three flag names + defaults under \u201cFeature flags / config\u201d."
+  ],
+  "merge_outcome": "Merged via squash merge by Omar El-Sayed into main",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "review_conversation"
+  ],
+  "dataset_doc_uuid": "dsid_6a72151a2901433a8952c8fcfbcad05b"
+}

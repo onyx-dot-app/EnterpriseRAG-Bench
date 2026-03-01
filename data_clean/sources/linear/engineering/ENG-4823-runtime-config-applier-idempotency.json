@@ -1,0 +1,57 @@
+{
+  "key": "ENG-4823",
+  "team": "engineering",
+  "title": "Runtime optimization config applier: idempotency + safe retries + rollback under partial apply",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-10-16",
+  "updated_at": "2026-01-24",
+  "creator": "Ethan Park",
+  "assignee": "Noah Patel",
+  "project": "Safe apply + rollback mechanism (Cost Optimization Automation)",
+  "cycle": "2025-W43",
+  "estimate": "8",
+  "due_date": "2026-01-10",
+  "labels": [
+    "runtime",
+    "safe-apply",
+    "rollback",
+    "idempotency",
+    "reliability",
+    "gameday"
+  ],
+  "dependencies": [
+    "ENG-4821",
+    "ENG-4824",
+    "ENG-4825"
+  ],
+  "sub_issues": [
+    "ENG-4830"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.18",
+  "security_review_required": "false",
+  "description": "Background / problem\nOptimization configs (batching heuristics, caching toggles, quantization profile selection) will now be applied via the control plane as versioned objects. The runtime must handle apply/rollback as a distributed operation across many model workers where:\n- requests can be in-flight\n- workers can be restarted mid-change\n- apply requests can be retried (client timeouts, controller retries)\n- apply and rollback can race\n\nThis ticket covers the runtime-side guarantees and implementation needed so that Apply/Promote/Rollback are safe to retry and never leave long-lived mixed states.\n\nGoals\n1) Idempotent application of an Optimization Config Version per (tenant, model, region, deployment).\n2) Safe retries of apply/rollback operations with at-least-once delivery from the controller.\n3) Defined behavior + recovery when a change is partially applied (some workers updated, others not).\n4) Guardrails against apply/rollback races (ensure monotonic convergence to a single desired target).\n\nNon-goals\n- Fully automated rollback without human confirmation for all customers (controller policy).\n- Cross-subsystem transactional rollbacks beyond the optimization config applier boundary.\n\nProposed runtime model (implementation notes)\nTerminology\n- config_version: immutable Optimization Config version ID (e.g., ocv_01H...)\n- target_generation: monotonic integer representing a control-plane apply intent for a given scope (apply, promote, rollback all increment this).\n\nWorker state\nPersisted locally (survives process restart):\n- last_committed_generation\n- last_committed_config_version\n- last_attempted_generation (optional, for debugging)\n\nIn-memory:\n- desired_generation + desired_config_version (from watcher)\n- apply_in_progress flag + current_stage\n\nIdempotency rule\n- If (desired_generation, desired_config_version) == (last_committed_generation, last_committed_config_version): NO-OP.\n- If desired_generation < last_committed_generation: ignore (stale watch / delayed event).\n- If desired_generation == last_committed_generation but desired_config_version differs: treat as control-plane bug; emit error metric + keep last committed (fail closed).\n\nApply transaction stages\nStage 0: Preflight\n- Fetch config payload for desired_config_version from runtime cache (or control plane), verify signature/hash, schema version, and that it matches the worker\u2019s model architecture constraints.\n- If quantization profile changes: verify the required artifacts are available locally (or prefetch) before proceeding.\n\nStage 1: Quiesce / safe cutover point\n- Do not interrupt in-flight requests. Apply at a safe boundary:\n  - between decode iterations OR\n  - when the worker batch queue is empty OR\n  - after a bounded drain window (configurable; defaults differ for Hosted vs Dedicated).\n- Record metric: optimization_config_apply_drain_seconds.\n\nStage 2: Apply\n- Apply changes in a deterministic order:\n  1) batching scheduler params (limits, heuristics)\n  2) cache toggles / cache sizing\n  3) quantization profile swap (if applicable)\n- All sub-steps must be either:\n  - reversible without restart, OR\n  - guarded by \u201capply requires restart\u201d and explicitly rejected until we support orchestrated restarts.\n\nStage 3: Post-apply validation\n- Run fast local invariants:\n  - scheduler config bounds\n  - cache enabled/disabled matches model support\n  - quant profile loaded and kernel selection succeeds\n- If validation fails: revert to last_committed_config_version immediately and mark apply as failed (do not advance last_committed_generation).\n\nStage 4: Commit\n- Atomically persist (last_committed_generation, last_committed_config_version).\n- Emit structured event/metric with tags: tenant, model, region, config_version, generation, result.\n\nPartial apply recovery\n- On startup, worker loads last_committed_* and starts watcher.\n- If watcher desired_generation > last_committed_generation, proceed with transaction.\n- Mixed state across workers is expected transiently; convergence guarantee relies on:\n  - deterministic NO-OP when already at target\n  - monotonic generation to defeat reordering\n  - controller retries until the fleet reports target reached\n\nRollback behavior (runtime-specific)\n- Rollback is not \u201cspecial\u201d to the worker: it is a new desired (generation, config_version) pair.\n- Same transaction applies. Key requirement: rollback must be safe even if some workers never applied the bad version.\n  - Workers already on rollback target: NO-OP.\n  - Workers on bad version: apply rollback target.\n  - Workers mid-apply of bad version: transaction is serialized by generation check; the newest desired_generation wins.\n\nRace conditions / ordering\n- Watcher must deliver desired target with a generation monotonicity check.\n- Worker must not run concurrent apply transactions. If a new desired target arrives during apply:\n  - set desired_* to newest\n  - allow current stage to complete if safe OR short-circuit at stage boundary and restart transaction toward newest desired\n- Explicitly do NOT allow commit of an older generation once a newer desired_generation is observed.\n\nObservability\nAdd/ensure the following:\n- Counters:\n  - optimization_config_apply_total{result=success|failure|noop}\n  - optimization_config_apply_revert_total\n- Gauges:\n  - optimization_config_committed_generation\n  - optimization_config_committed_version (export as label/value string where supported)\n- Timers:\n  - optimization_config_apply_duration_seconds\n  - optimization_config_apply_drain_seconds\n- Logs:\n  - include generation, desired_version, committed_version, stage, request_id (if provided by controller)\n\nTesting requirements\n- Unit tests:\n  - idempotent NO-OP semantics\n  - stale generation ignored\n  - commit blocked if desired changes mid-apply\n- Integration (fault injection):\n  - controller retries apply due to timeout; workers receive duplicate intents\n  - crash between Stage 2 and Stage 4; ensure restart converges\n  - rollback intent arrives during apply; ensure final committed is rollback target\n- E2E coverage tracked in ENG-4830.\n\nAcceptance criteria\n- Replaying ApplyOptimizationConfig intent (same generation+version) does not change runtime state after the first successful commit.\n- Workers never commit an older generation after observing a newer desired_generation.\n- Rollback converges even if rollout was partial (some workers on old version, some on new).\n- Metrics are tagged with tenant/model/region/config_version and visible in the rollout health dashboard.\n\nNotes / coordination\n- Coordinate with canary controller (ENG-4824) on generation semantics and what the worker reports as \u201capplied\u201d.\n- Coordinate with audit events (ENG-4826) to ensure runtime logs include a request_id/operation_id that can be correlated with audit entries.\n\nReferences\n- Runtime apply pipeline doc: sources/confluence/eng-serving-runtime/runtime-architecture/runtime-optimization-config-apply-pipeline.json\n- Gating signals ADR: sources/confluence/architecture-and-standards/decision-records/adr-safe-apply-gating-signals.json",
+  "comments": [
+    "2025-10-18 (Noah Patel): Drafted worker state machine + generation monotonicity approach. Main risk: commit ordering if watcher updates mid-apply; plan is to re-check desired_generation before commit and abort if superseded.",
+    "2025-10-23 (Omar El-Sayed): For cache toggles, we must avoid hard invalidation causing a latency spike. Proposed: on disable, stop writing new entries and let existing entries age out; on enable, warm gradually. Need to document which cache fields are \u201chot apply\u201d vs \u201crequires restart\u201d.",
+    "2025-11-05 (Sofia Ivanova): Batching scheduler params are safe to hot-apply at batch boundary, but need a drain window for extremely high QPS tenants to avoid starving apply. Please add drain timeout with metric + alert if exceeded.",
+    "2025-11-21 (Sean Gallagher): Please ensure apply emits an annotation-friendly event (config_version, generation, result) so dashboards can mark the change window. Also need a metric for mixed-state duration at the fleet level (handled in controller) but per-worker signals must be clean.",
+    "2025-12-09 (Noah Patel): Implemented staged transaction with commit guard (re-check desired_generation). Added persistent last_committed_* in worker state store. Wired metrics + logs. Beginning fault-injection tests in staging.",
+    "2026-01-12 (Noah Patel): Found race: apply commit could happen after rollback intent observed if rollback arrives during Stage 3. Fixed by making Stage 4 commit conditional on (desired_generation == transaction_generation) at the moment of commit, and by forcing transaction abort if desired_generation changes in Stages 2-3. Added regression tests.",
+    "2026-01-24 (Connor O'Brien): Marking done for runtime-1.18 train. Feature flag remains off by default; enablement gated on controller + console rollout landing and gameday sign-off."
+  ],
+  "links": [
+    "sources/github/redwood/pr-19915-runtime-config-apply-transaction.json",
+    "sources/github/redwood/pr-19918-idempotent-config-applier.json",
+    "sources/github/redwood/pr-20111-fix-rollback-race-condition.json",
+    "sources/linear/engineering/ENG-4824-canary-rollout-controller.json",
+    "sources/linear/engineering/ENG-4825-rollback-api-endpoint.json"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_dd9b734307ae474ba4b46b230f7ecb66"
+}

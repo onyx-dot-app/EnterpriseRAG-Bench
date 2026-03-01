@@ -1,223 +1,255 @@
 {
-  "description": "Project: Multi-GPU (TP) stability fixes (Serving Runtime Performance: Kernel + Scheduling)\n\nGoal\n- Eliminate known runtime hangs/timeouts that occur during tensor-parallel (TP) execution under sustained load, especially in multi-GPU deployments (Dedicated and large Hosted pools).\n- Reduce customer-visible failures (timeouts/5xx) and oncall load by making TP collectives, scheduling barriers, and watchdog behavior robust under partial failures and overload.\n\nProblem statement (current symptoms)\n- Under high concurrency and long-running streams, some TP worker groups enter a stuck state (no forward progress) due to a combination of:\n  - collective operations not surfacing async errors promptly (e.g., NCCL error propagation),\n  - scheduler/barrier interactions that can deadlock a TP group when one rank lags or a request is canceled,\n  - insufficient watchdog + circuit breaker behavior at the TP-group level (stuck groups keep receiving work),\n  - limited observability to quickly distinguish kernel stalls vs comm stalls vs scheduler starvation.\n\nScope\n- In scope:\n  - Runtime scheduler changes: TP group lifecycle, barrier handling, cancellation semantics, backpressure/load-shedding, fairness under mixed sequence lengths.\n  - Kernel/collective execution path hardening: async error handling, timeouts, safer stream/event usage, reduced risk of cross-stream deadlocks.\n  - Observability: new metrics (per-rank progress, collective latency histograms, watchdog triggers), logs, and dashboards/alerts.\n  - Test & repro: deterministic-ish stress harness for TP hangs (fault injection, overload patterns), CI/perf-canary coverage.\n  - Rollout plan: staged canary in Hosted, opt-in in Dedicated, then default-on.\n- Out of scope (for this project):\n  - Major refactor of model-parallel architecture, new comm backend, or full redesign of batching engine.\n  - Customer-specific networking/driver remediation (handled as separate infra/private-deploy work items).\n\nStakeholders and teams\n- Engineering (Serving Runtime):\n  - Mateo Alvarez (VP Engineering, Runtime) \u2013 exec sponsor, prioritization.\n  - Hiro Tanaka (EM, Runtime Kernels) \u2013 kernel/collective changes.\n  - Sofia Ivanova (EM, Runtime Scheduling) \u2013 scheduler + TP group lifecycle.\n  - Runtime ICs: Grace Kim, Yuki Sato, Lena Fischer, Marcus Reed, Julian Moore, Isabella Rossi.\n- SRE:\n  - Sean Gallagher (Director SRE) and Rafael Mendes (SRE Manager) \u2013 incident patterns, SLO alignment, alerting, rollout guardrails.\n- Product:\n  - Henry Cho (Sr PM) \u2013 customer-facing release notes, commitments for Dedicated/Enterprise customers.\n- Support/CS (via Jira): triage incoming timeouts/hangs and coordinate comms.\n\nPhases / timeline (typical 6\u20138 weeks)\n1) Triage + reproduction (Week 1\u20132)\n- Consolidate incident/support evidence, add instrumentation, build stress harness reproducing hang signatures.\n2) Fix implementation (Week 2\u20135)\n- Scheduler deadlock/cancellation fixes, collective timeout/error propagation hardening, TP-group watchdog + quarantine.\n3) Validation + canary (Week 5\u20136)\n- Perf/regression verification, perf-canary scenarios, targeted canary to high-load pools.\n4) Rollout + follow-ups (Week 6\u20138)\n- Dedicated opt-in, documentation/runbooks, close remaining support tickets, postmortem actions.\n\nKey deliverables\n- Design/ADR capturing failure modes and chosen mitigations.\n- Repro + fault-injection suite integrated into perf/CI.\n- Runtime changes: TP-group health model, cancellation-safe barriers, watchdog/quarantine and safe recovery.\n- Observability pack updates: dashboards, metrics, alerts.\n- Runbook + known-issues guidance + release notes.\n\nConstraints / risks\n- Must preserve throughput and latency (avoid heavy synchronization).\n- Avoid introducing new failure modes (false positives in watchdog leading to unnecessary resets).\n- Cross-team coordination required for rollout (SRE, Releases) and customer comms (Support/CS/PM).\n\nHow it fits Redwood\u2019s context\n- Redwood differentiates on production reliability and predictable performance across Hosted/Dedicated/Private. Multi-GPU TP stability is a cornerstone for larger models and enterprise workloads; fixing these hangs improves SLO attainment, reduces escalations, and supports Dedicated/Private growth.",
+  "description": "Project: Multi-GPU (TP) stability fixes (Serving Runtime Performance \u2014 Kernel + Scheduling)\n\nContext / why now:\nRedwood\u2019s largest Dedicated and high-throughput Hosted workloads increasingly run tensor-parallel (TP) across multiple GPUs per replica. Under sustained load (mixed prefill/decode, long context, bursty concurrency), the runtime has known failure modes that manifest as request hangs, GPU stalls, and downstream timeouts. These issues are costly: they inflate p99 latency, trigger autoscaling thrash, and occasionally escalate into Sev1 incidents for enterprise customers.\n\nGoals:\n1) Eliminate known runtime hangs/timeouts in TP execution under load (primary).\n2) Improve detection/diagnostics so future TP stalls are caught early with actionable signals (GPU/collective/scheduler visibility).\n3) Add regression coverage (repro harness + perf canary) to prevent re-introducing TP deadlocks.\n4) Provide safe mitigations: watchdogs, controlled abort/retry paths, and operational runbooks for on-call.\n\nScope (in-scope areas):\n- Runtime scheduler: queue/backpressure interactions, prefill/decode interleaving, multi-stream coordination, and fairness logic that can starve collectives.\n- Kernel + comms boundary: NCCL collective ordering, stream synchronization points, event/graph capture constraints, and \u201csilent stall\u201d scenarios.\n- Memory/KV cache behavior under TP: fragmentation/compaction interactions that can amplify stalls.\n- Observability: metrics, tracing spans, structured logs to identify whether a hang is compute, comms, or scheduler.\n- Reliability controls: watchdog timeouts, circuit breakers/load-shedding hooks, controlled replica drain/restart.\n\nOut of scope:\n- Model quality/evals (unless used only as workload generators).\n- Major architecture rewrite of TP execution; this project focuses on targeted correctness + stability hardening.\n\nStakeholders / teams:\n- Eng Serving Runtime (Kernel + Scheduling): Hiro Tanaka (Mgr Kernels), Sofia Ivanova (Mgr Scheduling), Noah Patel (Sr Staff), Grace Kim, Yuki Sato, Omar El\u2011Sayed, Samir Qureshi, Marcus Reed.\n- SRE: Sean Gallagher (Dir), Rafael Mendes (Mgr), Tom\u00e1\u0161 Nov\u00e1k, Aisha Bello.\n- Product (reliability/rollouts and Dedicated customer impact): Paula Mendes, Lauren Bishop.\n- Customer Success/Support as escalation interface (via Jira/Slack/CS playbooks).\n\nHigh-level plan / phases (6\u20138 weeks total):\n- Phase 0 (Week 1): Triage + reproduce: pick top 2\u20133 hang signatures, build deterministic repro in benchmark-lab/perf-canary, and tag incidents/tickets.\n- Phase 1 (Weeks 2\u20134): Instrumentation + targeted fixes: scheduler ordering fixes, NCCL stream/event ordering hardening, watchdog + safe abort, and KV/cache edge-case handling.\n- Phase 2 (Weeks 4\u20136): Regression tests + canary rollout: perf-canary scenarios, stress suite, staged rollout to Dedicated then Hosted.\n- Phase 3 (Weeks 6\u20138): Operationalization: runbooks, dashboard/alerts, postmortem/incident-review, and finalize known-issues/workarounds.\n\nDeliverables:\n- A set of runtime PRs implementing fixes and instrumentation.\n- Linear initiative + linked subtasks with dependencies and rollout checkpoints.\n- Confluence design/ADR(s), known-issues page updates, runbooks, and an incident review/postmortem if tied to a Sev.\n- Drive working docs: repro notes, benchmark sheets, rollout checklist, and weekly notes.\n- Slack coordination threads and (if applicable) incident channel artifacts.\n- Support artifacts (Jira) and customer-facing coordination (Fireflies/Gmail/HubSpot) for affected enterprise accounts.",
   "files": [
     {
-      "path": "sources/confluence/eng-serving-runtime/kernel-and-scheduling/tp-stability-hangs-root-causes-and-fix-plan.json",
-      "description": "Primary design doc: catalog of observed TP hang/timeouts, suspected root causes (scheduler barriers, cancellation, NCCL async errors), proposed fixes, rollout plan, and success metrics."
+      "path": "sources/linear/engineering/ENG-4821-multi-gpu-tp-stability-fixes-initiative.json",
+      "description": "Umbrella Linear initiative for TP stability: goals, success metrics (hang rate, timeout rate, p99), milestones, owners, and links to sub-issues/PRs/dashboards."
     },
     {
-      "path": "sources/confluence/architecture-and-standards/decision-records/adr-0147-tp-collective-timeouts-and-async-error-propagation.json",
-      "description": "ADR documenting the decision for collective timeout/error handling strategy (e.g., watchdog thresholds, async error checks, when to abort a TP group) and compatibility implications."
+      "path": "sources/linear/engineering/ENG-4822-repro-tp-hang-mixed-prefill-decode.json",
+      "description": "Task to build a deterministic repro workload (mixed prompt lengths + streaming decode) that triggers observed TP stall signature; includes acceptance criteria and artifact links."
     },
     {
-      "path": "sources/confluence/eng-serving-runtime/benchmarking-and-perf-suite/tp-hang-repro-stress-suite.json",
-      "description": "Spec for a stress/repro suite: traffic patterns, fault injection knobs, pass/fail criteria, and how it integrates with CI/perf-canary."
+      "path": "sources/linear/engineering/ENG-4823-add-tp-heartbeat-metrics-and-stall-detectors.json",
+      "description": "Instrumentation ticket: per-rank heartbeat, in-flight collective counters, scheduler queue depth, and stall reason tagging to separate compute vs comms vs scheduler starvation."
     },
     {
-      "path": "sources/confluence/eng-serving-runtime/profiling-playbook/debugging-tp-hangs-playbook.json",
-      "description": "Step-by-step debugging guide: what metrics/logs to check, how to capture rank-level traces, common signatures (comm stall vs kernel stall), and escalation steps."
+      "path": "sources/linear/engineering/ENG-4824-scheduler-fix-collective-ordering-starvation.json",
+      "description": "Scheduling change proposal: ensure collectives are scheduled with consistent ordering and cannot be starved by prefill-heavy batches; includes risk assessment and rollout plan."
     },
     {
-      "path": "sources/confluence/eng-serving-runtime/known-issues/tensor-parallel-hang-timeout-known-issue-and-workarounds.json",
-      "description": "Customer/internal known-issue page: symptoms, impacted versions, mitigations (config flags, timeouts, disabling certain optimizations), and status of the long-term fix."
+      "path": "sources/linear/engineering/ENG-4825-nccl-stream-sync-hardening.json",
+      "description": "Kernel/comms boundary fix: enforce stream/event synchronization around NCCL collectives; notes on CUDA graphs constraints and expected perf impact."
     },
     {
-      "path": "sources/confluence/eng-sre/reliability-initiatives/tp-group-watchdog-and-quarantine-initiative.json",
-      "description": "SRE/Runtime joint initiative doc defining watchdog SLOs, alerting thresholds, quarantine/recovery behavior, and operational ownership."
+      "path": "sources/linear/engineering/ENG-4826-tp-watchdog-timeout-and-safe-abort.json",
+      "description": "Add watchdog for TP steps (decode iteration / collective) with safe abort path that drains replica, surfaces structured error, and avoids global GPU wedging."
     },
     {
-      "path": "sources/confluence/eng-platform/dashboards-and-alerts/tp-collectives-and-scheduler-health-dashboard.json",
-      "description": "Dashboard spec: new panels for collective latency, per-rank progress, watchdog triggers, reset counts, and correlation to 5xx/timeout rates."
+      "path": "sources/linear/engineering/ENG-4827-kv-cache-compaction-interaction-with-tp.json",
+      "description": "Investigate and fix edge cases where KV cache compaction/fragmentation causes TP rank divergence or stalls under memory pressure."
     },
     {
-      "path": "sources/confluence/oncall-and-incident-response/postmortems/2025-02-13-tp-hang-us-east-sev1.json",
-      "description": "Postmortem for a representative Sev1: timeline, detection gaps, contributing factors, mitigations, and action items feeding this project."
+      "path": "sources/linear/engineering/ENG-4828-perf-canary-tp-stress-scenarios.json",
+      "description": "Add TP stress scenarios to perf-canary: long context, bursty concurrency, multi-replica churn; includes expected thresholds and alerting criteria."
     },
     {
-      "path": "sources/confluence/eng-serving-runtime/release-notes/runtime-1-19-tp-stability-fixes.json",
-      "description": "Release note draft describing TP stability improvements, config changes/flags, expected impact, and any known limitations."
+      "path": "sources/linear/engineering/ENG-4829-release-plan-runtime-1-19-tp-stability.json",
+      "description": "Release planning ticket: gating checks, canary schedule, Dedicated-first rollout, rollback criteria, and comms checklist with SRE/Support."
     },
     {
-      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/2025-02-tp-stability-kickoff-notes.json",
-      "description": "Kickoff working doc: problem framing, owners, initial hypotheses, and an execution checklist (less polished than Confluence)."
+      "path": "sources/linear/product-management/PM-911-dedicated-customer-impact-and-rollout-comms-tp.json",
+      "description": "PM ticket tracking customer impact and rollout messaging for Dedicated accounts; includes stakeholder list, comms templates, and coordination with Support/CS."
     },
     {
-      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/tp-hang-signatures-log-samples-and-links.json",
-      "description": "Collation of log snippets, trace screenshots stubs, links to dashboards, and a taxonomy of hang signatures observed in prod/staging."
+      "path": "sources/confluence/eng-serving-runtime/kernel-and-scheduling/tp-stability-fixes-design.json",
+      "description": "Design doc: taxonomy of hang signatures, root-cause hypotheses, proposed scheduler + comms changes, tradeoffs (perf vs safety), and rollout strategy."
     },
     {
-      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/tp-repro-matrix-and-results.json",
-      "description": "Spreadsheet-style table: repro runs by GPU type/driver/runtime version, concurrency, sequence length mix; includes notes on whether hangs reproduced."
+      "path": "sources/confluence/architecture-and-standards/decision-records/adr-0127-tp-watchdog-and-abort-semantics.json",
+      "description": "ADR documenting watchdog/abort semantics: what constitutes a stall, how errors surface to API, retry policy, and why this is preferred over indefinite waits."
     },
     {
-      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/tp-watchdog-thresholds-experiments.json",
-      "description": "Experiment tracking for watchdog thresholds (false positive/negative rates), including recommended defaults per deployment mode."
+      "path": "sources/confluence/eng-serving-runtime/known-issues/tensor-parallel-hangs-under-load.json",
+      "description": "Known-issues page: symptoms, affected models/hardware, detection signals, mitigations (batch limits, concurrency caps), and status of fixes/versions."
     },
     {
-      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/rollout-checklist-tp-stability.json",
-      "description": "Rollout checklist: canary gates, metrics to watch, rollback triggers, Dedicated enablement steps, and comms templates."
+      "path": "sources/confluence/eng-serving-runtime/profiling-playbook/tp-stall-triage-playbook.json",
+      "description": "Profiling playbook entry: step-by-step triage of TP stalls using metrics/logs/traces; includes commands, expected dashboards, and how to capture NCCL debug traces safely."
     },
     {
-      "path": "sources/google_drive/shared_drives/engineering/site-reliability-engineering/oncall-readiness-tp-hang-response.json",
-      "description": "Oncall readiness notes: what SRE needs from runtime, temporary mitigations, paging thresholds, and incident commander guidance."
+      "path": "sources/confluence/eng-serving-runtime/benchmarking-and-perf-suite/tp-stress-suite-spec.json",
+      "description": "Spec for TP stress suite: workload generators, distributions, pass/fail criteria, and how it integrates into CI/perf lab."
     },
     {
-      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/retro-tp-stability-project.json",
-      "description": "Project retro notes: what went well/poorly, tooling gaps, and follow-up action items (draft form)."
+      "path": "sources/confluence/eng-serving-runtime/runbooks/runtime-tp-hang-mitigation.json",
+      "description": "On-call runbook: immediate mitigation steps (drain/replace replicas, reduce concurrency, disable specific kernel paths), escalation checklist, and verification steps."
     },
     {
-      "path": "sources/linear/engineering/ENG-2401.json",
-      "description": "Umbrella Linear issue for the initiative: scope, milestones, owners, and links to design doc/ADR and major sub-issues."
+      "path": "sources/confluence/eng-platform/dashboards-and-alerts/tp-stall-and-timeout-dashboard.json",
+      "description": "Dashboard documentation: panels and alerts for TP heartbeat gaps, request timeouts correlated to replica/rank, and NCCL error rates; ownership and alert routing."
     },
     {
-      "path": "sources/linear/engineering/ENG-2402.json",
-      "description": "Implement TP-group health model in scheduler (states, quarantine, reset semantics) + acceptance criteria and rollout plan."
+      "path": "sources/confluence/eng-sre/incident-review/tp-timeouts-reliability-review.json",
+      "description": "SRE incident-review style doc summarizing repeated TP timeout events, contributing factors, and reliability actions (alerts, mitigations, rollout guardrails)."
     },
     {
-      "path": "sources/linear/engineering/ENG-2403.json",
-      "description": "Fix cancellation + barrier interaction that can deadlock TP groups under streaming disconnects; includes test plan and edge cases."
+      "path": "sources/confluence/oncall-and-incident-response/postmortems/2025-02-17-tp-decode-hang-sev1.json",
+      "description": "Postmortem for a Sev1 caused by TP decode hang: timeline, detection gaps, customer impact, immediate fixes, and long-term prevention items linked to Linear."
     },
     {
-      "path": "sources/linear/engineering/ENG-2404.json",
-      "description": "Add runtime instrumentation: per-rank progress counters, collective latency histograms, and structured logs for hang triage."
+      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/tp-hang-repro-notes-wip.json",
+      "description": "Working notes capturing reproduction attempts, environment configs, commands, partial findings, and links to logs/traces; rough and iterative."
     },
     {
-      "path": "sources/linear/engineering/ENG-2405.json",
-      "description": "Introduce stress/fault-injection harness for TP hangs (overload patterns, forced rank delay, forced cancel) and wire into CI/perf-canary."
+      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/tp-hang-signatures-and-hypotheses.json",
+      "description": "Brainstorm doc listing distinct hang signatures (e.g., collective mismatch, stream wait) with hypotheses, owners, and next experiments."
     },
     {
-      "path": "sources/linear/engineering/ENG-2406.json",
-      "description": "Harden collective error propagation and timeouts: ensure async errors surface, define abort policy, and prevent silent stalls."
+      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/tp-fix-rollout-checklist.json",
+      "description": "Rollout checklist used during canary: preflight metrics, feature flags, rollback triggers, and comms steps with SRE and Dedicated PM."
     },
     {
-      "path": "sources/linear/engineering/ENG-2407.json",
-      "description": "Add watchdog + automatic quarantine for stuck TP groups with clear metrics/alerts; include mitigation for false positives."
+      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/tp-stress-suite-results-sheet.json",
+      "description": "Spreadsheet-style doc summarizing stress suite runs across GPU types and batch/concurrency settings; includes tables and short interpretation of regressions."
     },
     {
-      "path": "sources/linear/engineering/ENG-2408.json",
-      "description": "Dashboard and alerting workstream: define required panels, alert thresholds, and verify oncall usability."
+      "path": "sources/google_drive/shared_drives/engineering/site-reliability-engineering/tp-timeout-incident-tracking.json",
+      "description": "SRE tracking doc for repeated TP timeouts: incident links, mitigation effectiveness, and which runtime versions/hardware were involved."
     },
     {
-      "path": "sources/linear/engineering/ENG-2409.json",
-      "description": "Performance regression validation: ensure fixes don\u2019t degrade throughput/latency; includes benchmark suite updates and acceptance gates."
+      "path": "sources/google_drive/shared_drives/engineering/serving-runtime/weekly-tp-stability-sync-notes.json",
+      "description": "Weekly meeting notes (informal): status updates, blockers, decisions, action items, and links to Linear/PRs/Slack threads."
     },
     {
-      "path": "sources/linear/product-management/PM-512.json",
-      "description": "Customer-facing comms/release coordination: what to tell Dedicated/Enterprise customers, timeline expectations, and release note wording."
+      "path": "sources/slack/eng-runtime/1739784412-tp-hang-repro-on-a100-80gb.json",
+      "description": "Thread coordinating first successful repro on A100: commands, logs, hypotheses about scheduler starvation, and assigning owners for instrumentation."
     },
     {
-      "path": "sources/linear/product-management/PM-513.json",
-      "description": "Policy decision: default enablement plan for watchdog/quarantine in Hosted vs Dedicated vs Private, with opt-out/feature flag strategy."
+      "path": "sources/slack/eng-runtime/1739812205-nccl-collective-ordering-suspected-mismatch.json",
+      "description": "Thread debating NCCL ordering constraints, stream semantics, and whether CUDA graphs are implicated; includes quick code pointers and suggested experiments."
     },
     {
-      "path": "sources/github/redwood/pr-18432.json",
-      "description": "Scheduler: add TP-group state machine and prevent scheduling new work onto quarantined groups; includes unit tests and metrics hooks."
+      "path": "sources/slack/eng-runtime/1739897721-tp-heartbeat-metrics-naming.json",
+      "description": "Thread agreeing on metric names/labels for per-rank heartbeat and stall reason codes; includes review from SRE about alertability."
     },
     {
-      "path": "sources/github/redwood/pr-18441.json",
-      "description": "Runtime: fix request cancellation path to avoid barrier deadlocks (streaming disconnects, timeout cancellation); adds regression test."
+      "path": "sources/slack/eng-runtime/1739973309-watchdog-default-timeout-values.json",
+      "description": "Thread discussing default watchdog thresholds by model size and workload; includes concerns about false positives and plan for progressive rollout."
     },
     {
-      "path": "sources/github/redwood/pr-18455.json",
-      "description": "Collectives: add periodic async error checks and clearer failure propagation to the scheduler; includes config flags and defaults."
+      "path": "sources/slack/architecture/1740018450-adr-review-tp-abort-semantics.json",
+      "description": "Thread reviewing the ADR proposal: how abort propagates to API, retry behavior, and whether to drain replica vs attempt recovery in-process."
     },
     {
-      "path": "sources/github/redwood/pr-18462.json",
-      "description": "Watchdog: implement per-TP-group forward-progress watchdog; triggers quarantine + controlled teardown and increments metrics."
+      "path": "sources/slack/eng-sre/1740071202-alerting-plan-tp-stalls.json",
+      "description": "SRE thread defining alert thresholds, paging policy, and dashboard panels; includes links to draft Confluence dashboard doc and runbook."
     },
     {
-      "path": "sources/github/redwood/pr-18470.json",
-      "description": "Observability: structured logs for collective stalls and scheduler starvation; adds trace/span annotations around collectives."
+      "path": "sources/slack/incidents/1740165551-sev1-dedicated-timeouts-suspected-tp-hang.json",
+      "description": "Incident thread: customer-facing timeouts, triage steps, mitigation (drain replicas, reduce concurrency), and handoff to runtime engineers."
     },
     {
-      "path": "sources/github/redwood/pr-18476.json",
-      "description": "Config: introduce tuning knobs for collective timeout thresholds and watchdog sensitivity; docs/comments for deployment modes."
+      "path": "sources/slack/eng-oncall/1740169022-runbook-gap-tp-hang-mitigation.json",
+      "description": "Oncall thread identifying runbook gaps during the incident and capturing immediate follow-ups (what commands to run, what metrics to check)."
     },
     {
-      "path": "sources/github/redwood/pr-18480.json",
-      "description": "Testing: add deterministic-ish stress scenario runner for TP groups (fault injection for rank delay/cancel) and CI gating."
+      "path": "sources/slack/eng-runtime/1740251033-perf-impact-of-extra-stream-sync.json",
+      "description": "Thread sharing microbench results after adding stream/event sync around collectives; discussion of perf regression risk and conditionalization."
     },
     {
-      "path": "sources/github/benchmark-lab/pr-911.json",
-      "description": "Benchmark lab: add TP hang reproduction scenario definitions and reporting (stall detection, run artifacts)."
+      "path": "sources/slack/eng-runtime/1740339988-feature-flag-for-tp-watchdog.json",
+      "description": "Thread coordinating feature-flag strategy, default off/on by environment, and canary rollout steps aligned with runtime release planning."
     },
     {
-      "path": "sources/github/perf-canary/pr-288.json",
-      "description": "Perf canary: new canary workflow that runs TP overload tests nightly and alerts on watchdog triggers/stalls."
+      "path": "sources/slack/eng-releases/1740401120-runtime-1-19-canary-plan-tp-stability.json",
+      "description": "Release coordination thread: which clusters/accounts get canary, gating checks, rollback triggers, and who is on point during rollout."
     },
     {
-      "path": "sources/github/observability-pack/pr-502.json",
-      "description": "Dashboards/alerts: add panels and alert rules for collective latency, watchdog triggers, and TP-group resets; includes runbook links."
+      "path": "sources/jira/customer-support/SUP-48321-tensor-parallel-hang-dedicated-a100.json",
+      "description": "Customer support ticket: enterprise Dedicated account reporting intermittent hangs/timeouts; includes environment details, logs, impact, and links to incident Slack + mitigation steps."
     },
     {
-      "path": "sources/slack/eng-runtime/thread-1738861123.json",
-      "description": "Thread coordinating initial triage: reports of TP hangs under load, quick hypotheses, and links to traces/logs."
+      "path": "sources/jira/customer-support/SUP-48344-streaming-timeouts-during-peak-load-tp.json",
+      "description": "Support ticket focused on streaming request timeouts correlated with TP replicas; captures reproduction steps and interim workaround (concurrency cap) pending fix."
     },
     {
-      "path": "sources/slack/incidents/thread-1738954401.json",
-      "description": "Incident channel thread for a TP hang event: impact assessment, mitigations (traffic shifting/config changes), and handoff to runtime."
+      "path": "sources/jira/customer-support/SUP-48377-nccl-stall-suspected-in-multi-gpu-replica.json",
+      "description": "Support ticket with NCCL debug logs and suspected collective mismatch; includes escalation to runtime kernels team and references to PRs in progress."
     },
     {
-      "path": "sources/slack/eng-sre/thread-1738961022.json",
-      "description": "SRE \u2194 Runtime thread: define alert thresholds, what constitutes 'stuck' vs 'slow', and immediate mitigations for oncall."
+      "path": "sources/jira/internal-support/INT-2219-enable-extra-nccl-debug-logging-during-canary.json",
+      "description": "Internal helpdesk ticket to enable additional NCCL/runtime debug logging safely for a canary window; includes security/perf considerations and rollback steps."
     },
     {
-      "path": "sources/slack/architecture/thread-1739023344.json",
-      "description": "Design discussion thread: quarantine vs restart strategy, correctness considerations, and failure-domain boundaries (TP group vs host)."
+      "path": "sources/github/redwood/pr-21834-tp-heartbeat-metrics-and-stall-reason-codes.json",
+      "description": "PR adding TP heartbeat metrics, stall reason enums, and structured logs; includes unit tests and dashboard links."
     },
     {
-      "path": "sources/slack/eng-runtime/thread-1739107777.json",
-      "description": "Debug thread: investigation into cancellation/barrier deadlock with repro logs and proposed code paths to change."
+      "path": "sources/github/redwood/pr-21841-scheduler-guardrail-prevent-collective-starvation.json",
+      "description": "PR implementing scheduler ordering/fairness change so collectives can\u2019t be starved by prefill-heavy batches; includes perf comparison results."
     },
     {
-      "path": "sources/slack/eng-releases/thread-1739345678.json",
-      "description": "Release coordination thread: which fixes make the patch release, canary plan, and rollback criteria."
+      "path": "sources/github/redwood/pr-21853-nccl-stream-event-sync-hardening.json",
+      "description": "PR enforcing stream/event synchronization around NCCL collectives; includes notes about CUDA graph capture and conditional behavior."
     },
     {
-      "path": "sources/jira/customer-support/SUP-9812.json",
-      "description": "Customer ticket: Dedicated cluster experiencing intermittent request timeouts during TP workloads; includes logs, environment details, and workaround guidance."
+      "path": "sources/github/redwood/pr-21860-tp-watchdog-timeout-and-replica-drain.json",
+      "description": "PR adding watchdog timers and safe abort/drain path when TP step exceeds threshold; includes feature flag and integration with SRE mitigation hooks."
     },
     {
-      "path": "sources/jira/customer-support/SUP-9827.json",
-      "description": "Customer ticket: streaming requests hang at high concurrency with TP enabled; support \u2194 eng collaboration and linked PRs."
+      "path": "sources/github/redwood/pr-21866-kv-cache-compaction-safety-in-tp.json",
+      "description": "PR fixing KV cache compaction edge-case that can cause rank divergence/stalls; includes stress test coverage."
     },
     {
-      "path": "sources/jira/customer-support/SUP-9841.json",
-      "description": "Customer ticket: suspected NCCL collective stall; requests guidance on timeout settings and rollout timeline for fixes."
+      "path": "sources/github/redwood/pr-21872-add-nccl-collective-counters-to-tracing-spans.json",
+      "description": "PR extending tracing spans to include collective counters and rank ids for correlation; includes minor overhead discussion."
     },
     {
-      "path": "sources/jira/internal-support/INT-611.json",
-      "description": "Internal ticket: request to add/adjust alerts for TP hang detection and to document oncall response steps."
+      "path": "sources/github/redwood/pr-21875-load-shed-on-tp-stall-signal.json",
+      "description": "PR wiring TP stall signals into overload protection so new requests are rejected/redirected rather than piling onto a wedged replica."
     },
     {
-      "path": "sources/jira/customer-support/SUP-9859.json",
-      "description": "Customer escalation: repeated hangs in eu-west; includes coordinated mitigation (traffic shift) and request for a hotfix build."
+      "path": "sources/github/observability-pack/pr-412-add-tp-stall-dashboard-panels.json",
+      "description": "PR adding dashboard panels and alert rules for TP heartbeat gaps, stall reason counts, and request timeout correlation."
     },
     {
-      "path": "sources/fireflies/sales-calls/2025-02-20-technical-deep-dive-tp-stability.json",
-      "description": "Technical deep dive transcript with an enterprise prospect evaluating multi-GPU TP; discussion of observed hangs, Redwood\u2019s mitigation plan, and next steps for a controlled POC."
+      "path": "sources/github/perf-canary/pr-188-add-tp-stress-scenarios-long-context.json",
+      "description": "PR adding TP long-context stress scenarios and thresholds; includes CI gating and documentation updates."
     },
     {
-      "path": "sources/fireflies/customer-success/2025-02-27-customer-escalation-tp-timeouts.json",
-      "description": "Customer success escalation call transcript: impact recap, temporary mitigations, agreement on rollout/canary plan, and support follow-ups."
+      "path": "sources/github/benchmark-lab/pr-97-tp-hang-repro-harness-mixed-workload.json",
+      "description": "PR adding a benchmark harness configuration to reproduce mixed prefill/decode TP hangs with tunable concurrency and sequence distributions."
     },
     {
-      "path": "sources/gmail/sean_gallagher/thread-20250214-a3f4b2c1.json",
-      "description": "Email thread: SRE leadership coordinating post-incident actions, requesting runtime fixes timeline, and aligning on customer comms/credits."
+      "path": "sources/github/redwood/pr-21890-fix-deadlock-on-cancelled-streaming-requests-in-tp.json",
+      "description": "PR addressing a cancellation path bug that could leave collectives waiting; includes reproduction via client disconnect."
     },
     {
-      "path": "sources/gmail/mateo_alvarez/thread-2025-02-18-runtime-1-19-hotfix-go-no-go-tp-stability.json",
-      "description": "Email thread: go/no-go decision for a runtime hotfix release including TP stability changes; includes risk assessment and rollout guardrails."
+      "path": "sources/github/redwood/pr-21897-runtime-config-defaults-concurrency-caps-for-tp.json",
+      "description": "PR adjusting safer defaults/guardrails for TP concurrency and batch sizing (feature-flagged) to reduce hang probability while fixes roll out."
     },
     {
-      "path": "sources/hubspot/kite_ledger.json",
-      "description": "HubSpot company record for an affected/evaluating account: notes on TP workload requirements, recent escalation/meetings, linked support tickets and next steps."
+      "path": "sources/github/redwood/pr-21905-add-tp-stall-simulated-failure-tests.json",
+      "description": "PR adding fault-injection tests to ensure watchdog triggers and abort semantics work as intended; includes CI reliability notes."
+    },
+    {
+      "path": "sources/github/redwood/pr-21912-improve-nccl-error-surfacing-to-api-layer.json",
+      "description": "PR ensuring NCCL stall/abort errors propagate with actionable error codes for routing/fallback and customer-facing diagnostics."
+    },
+    {
+      "path": "sources/github/redwood/pr-21921-dedupe-replica-drain-events-and-reduce-alert-noise.json",
+      "description": "PR reducing alert noise by deduping drain events and adding rate limits to certain stall alerts; coordinated with SRE."
+    },
+    {
+      "path": "sources/confluence/customer-success-and-support/known-issues-and-workarounds/tp-timeouts-workaround-dedicated.json",
+      "description": "Support-facing Confluence doc: recommended temporary mitigations (caps, flags, rollout guidance) and what information to collect from customers."
+    },
+    {
+      "path": "sources/fireflies/customer-success/2025-02-18-dedicated-tp-hang-technical-deep-dive-acme-ai.json",
+      "description": "Technical deep-dive transcript with an enterprise Dedicated customer about TP hangs: symptoms, workload details, requested logs, and agreed mitigations/next steps."
+    },
+    {
+      "path": "sources/fireflies/customer-success/2025-02-25-poc-checkin-stability-and-rollout-plan-acme-ai.json",
+      "description": "Follow-up transcript focused on rollout timeline, canary results, and whether mitigations reduced timeouts; includes next steps and success criteria."
+    },
+    {
+      "path": "sources/hubspot/company-acme-ai.json",
+      "description": "CRM company record for a key affected customer: requirements (throughput/latency), deployment constraints, recent escalation timeline, linked Fireflies meetings, and support tickets."
+    },
+    {
+      "path": "sources/gmail/sean_gallagher/20250217-sev1-tp-hang-customer-escalation.json",
+      "description": "Email thread coordinating Sev1 escalation: internal oncall leadership + runtime VP/EMs, customer comms plan, mitigation approval, and rollout ETA."
+    },
+    {
+      "path": "sources/gmail/marissa_cole/20250303-runtime-1-19-rollout-approval-tp-stability.json",
+      "description": "Email thread for rollout approval: canary readout, risk acceptance, Dedicated vs Hosted sequencing, and go/no-go decision with product + SRE."
     }
   ],
   "people": [
     {
       "name": "Mateo Alvarez",
-      "project_role": "Exec sponsor"
+      "project_role": "Exec sponsor (Runtime)"
     },
     {
       "name": "Talia Benson",
@@ -225,107 +257,123 @@
     },
     {
       "name": "Noah Patel",
-      "project_role": "Runtime architect"
+      "project_role": "Technical lead (runtime architect)"
     },
     {
       "name": "Hiro Tanaka",
-      "project_role": "Kernel/collectives lead"
-    },
-    {
-      "name": "Grace Kim",
-      "project_role": "Kernel hardening IC"
-    },
-    {
-      "name": "Yuki Sato",
-      "project_role": "Kernel stability IC"
-    },
-    {
-      "name": "Isabella Rossi",
-      "project_role": "Kernel microbenchmarks IC"
+      "project_role": "Kernel team lead"
     },
     {
       "name": "Sofia Ivanova",
-      "project_role": "Scheduler/TP lifecycle lead"
+      "project_role": "Scheduling team lead"
     },
     {
-      "name": "Lena Fischer",
-      "project_role": "Backpressure/fairness IC"
+      "name": "Grace Kim",
+      "project_role": "Kernel fixes"
     },
     {
-      "name": "Marcus Reed",
-      "project_role": "Scheduler + perf tests IC"
+      "name": "Yuki Sato",
+      "project_role": "Kernel stability/perf"
     },
     {
-      "name": "Julian Moore",
-      "project_role": "Scheduler instrumentation IC"
+      "name": "Isabella Rossi",
+      "project_role": "Kernel microbenchmarks"
     },
     {
       "name": "Omar El-Sayed",
-      "project_role": "Runtime observability IC"
+      "project_role": "KV cache + runtime observability"
     },
     {
       "name": "Samir Qureshi",
-      "project_role": "Runtime stability IC"
+      "project_role": "Memory/KV compaction stability"
     },
     {
-      "name": "Sean Gallagher",
-      "project_role": "SRE sponsor (SLO/incident patterns)"
+      "name": "Lena Fischer",
+      "project_role": "Backpressure/fairness design"
     },
     {
-      "name": "Rafael Mendes",
-      "project_role": "SRE rollout/guardrails lead"
+      "name": "Marcus Reed",
+      "project_role": "Perf/regression test owner"
     },
     {
-      "name": "Allison Grant",
-      "project_role": "Observability (signals/standards) lead"
+      "name": "Julian Moore",
+      "project_role": "Scheduler instrumentation + load-shedding hooks"
     },
     {
-      "name": "Sergio Costa",
-      "project_role": "Dashboards/alerts implementer"
+      "name": "Kira Volkov",
+      "project_role": "Regression detection + LTS hardening"
     },
     {
-      "name": "Aisha Bello",
-      "project_role": "SLO dashboards IC"
-    },
-    {
-      "name": "Jacob Stein",
-      "project_role": "Automated diagnostics IC"
-    },
-    {
-      "name": "Tom\u00e1\u0161 Nov\u00e1k",
-      "project_role": "Runbooks/paging hygiene IC"
+      "name": "Rina Kobayashi",
+      "project_role": "Repro harness + perf canary scenarios"
     },
     {
       "name": "Connor O'Brien",
-      "project_role": "Release coordination lead"
+      "project_role": "Release/rollout coordination"
     },
     {
       "name": "Sahana Iyer",
-      "project_role": "CI/perf-canary engineer"
+      "project_role": "CI for GPU regression coverage"
     },
     {
-      "name": "Henry Cho",
-      "project_role": "Product owner (customer comms)"
+      "name": "Sean Gallagher",
+      "project_role": "SRE leadership/incident process"
+    },
+    {
+      "name": "Rafael Mendes",
+      "project_role": "SRE project lead (on-call readiness)"
+    },
+    {
+      "name": "Tom\u00e1\u0161 Nov\u00e1k",
+      "project_role": "Runbooks + incident reduction"
+    },
+    {
+      "name": "Aisha Bello",
+      "project_role": "SLO dashboards + alerting"
+    },
+    {
+      "name": "Jacob Stein",
+      "project_role": "Automated diagnostics/log correlation"
+    },
+    {
+      "name": "Allison Grant",
+      "project_role": "Observability standards/trace design"
+    },
+    {
+      "name": "Sergio Costa",
+      "project_role": "Dashboards/alerts implementation"
+    },
+    {
+      "name": "Logan Wright",
+      "project_role": "Telemetry platform coordination"
+    },
+    {
+      "name": "Caleb Johnson",
+      "project_role": "Tracing/metrics ingestion"
     },
     {
       "name": "Paula Mendes",
-      "project_role": "Rollout policy requirements PM"
-    },
-    {
-      "name": "Dev Patel",
-      "project_role": "Support escalation lead"
-    },
-    {
-      "name": "Owen Phillips",
-      "project_role": "Support triage lead"
-    },
-    {
-      "name": "Kira Thompson",
-      "project_role": "Docs/runbook writer"
+      "project_role": "Rollout policy + canary requirements"
     },
     {
       "name": "Lauren Bishop",
-      "project_role": "Dedicated rollout stakeholder"
+      "project_role": "Dedicated customer impact owner"
+    },
+    {
+      "name": "Marissa Cole",
+      "project_role": "Rollouts/canary product owner"
+    },
+    {
+      "name": "Owen Phillips",
+      "project_role": "Support escalation lead"
+    },
+    {
+      "name": "Rachel Kim",
+      "project_role": "Enterprise customer success lead"
+    },
+    {
+      "name": "Liam O'Rourke",
+      "project_role": "Technical account liaison"
     }
   ]
 }

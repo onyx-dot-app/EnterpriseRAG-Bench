@@ -1,0 +1,65 @@
+{
+  "key": "ENG-4823",
+  "team": "engineering",
+  "title": "Implement incremental KV cache compaction worker (budgeted bytes/time + safe stop conditions)",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-01-10",
+  "updated_at": "2026-02-12",
+  "creator": "Omar El-Sayed",
+  "assignee": "Samir Qureshi",
+  "project": "KV cache compaction improvements",
+  "cycle": "2026-W06",
+  "estimate": "8",
+  "due_date": "2026-02-21",
+  "release": "runtime-1.22",
+  "customer_impact": "high",
+  "security_review_required": "false",
+  "labels": [
+    "runtime",
+    "kv-cache",
+    "memory-management",
+    "performance",
+    "tail-latency",
+    "feature-flagged",
+    "needs-benchmarks"
+  ],
+  "parent_issue": "ENG-4821",
+  "dependencies": [
+    "ENG-4822",
+    "ENG-4824",
+    "ENG-4826",
+    "ENG-4827"
+  ],
+  "related_links": [
+    "Confluence (design doc): sources/confluence/eng-serving-runtime/kernel-and-scheduling/kv-cache-compaction-design.json",
+    "ADR (budgeting): sources/confluence/architecture-and-standards/decision-records/adr-kv-cache-compaction-budgeting.json",
+    "Benchmark plan: sources/confluence/eng-serving-runtime/benchmarking-and-perf-suite/kv-fragmentation-benchmark-plan.json",
+    "PR (allocator relocation primitives, WIP base): sources/github/redwood/pr-19357-kv-cache-compaction-core-allocator-changes.json",
+    "PR (scheduler integration, follow-up): sources/github/redwood/pr-19371-scheduler-integration-compaction-budget.json"
+  ],
+  "description": "Context\n- We are seeing burst-driven tail latency spikes (p95/p99) in sustained decode workloads with mixed sequence lengths due to KV arena fragmentation + opportunistic evictions at bad times.\n- This ticket is the core \u201cworker loop\u201d that performs compaction incrementally with strict budgeting, so we can reduce fragmentation without introducing new decode stalls.\n\nGoal\n- Implement an incremental compaction worker that:\n  1) moves KV pages/blocks in small steps,\n  2) enforces a configurable budget (bytes moved and/or time),\n  3) has safe stopping conditions to avoid correctness hazards and latency cliffs,\n  4) exposes metrics and tracing hooks needed for canary + SRE guardrails.\n\nNon-goals (in this ticket)\n- UI/Console configuration (handled via flags/config only, ENG-4826).\n- Final scheduler phase wiring (ENG-4824 owns the scheduling-loop integration; we just provide a worker API that can be called at safe boundaries).\n- Eviction policy logic (ENG-4825). Worker should be able to request/receive an eviction decision, but not implement selection.\n\nProposed approach (incremental worker)\n- Core concept: a compaction \u201cstep\u201d relocates one or a small set of contiguous KV blocks from a fragmented region into a target contiguous region, updating allocator metadata atomically and preserving sequence correctness.\n- The worker runs in short bursts:\n  - invoked from scheduler at prefill/decode boundary OR a background maintenance thread that is gated to safe windows (final gating is ENG-4824).\n  - each invocation consumes a bounded budget and then yields.\n\nInputs / configuration knobs (runtime flags)\n- kv_compaction.enabled: bool (default false until rollout)\n- kv_compaction.trigger_fragmentation_ratio: float (e.g., 0.20\u20130.35 depending tier; default TBD via experiments)\n- kv_compaction.max_bytes_per_step: int (bytes moved cap per invocation)\n- kv_compaction.max_ms_per_step: int (wall time cap per invocation)\n- kv_compaction.max_steps_per_tick: int (additional guardrail to prevent long loops)\n- kv_compaction.min_free_run_bytes_to_target: int (avoid churn on tiny holes)\n- kv_compaction.abort_on_high_decode_pressure: bool (worker checks scheduler signals)\n\nWorker API (internal)\n- CompactionBudget { max_bytes, max_ms, max_steps }\n- CompactionRequest { reason, budget, priority, allow_eviction_hint }\n- CompactionResult { bytes_moved, pages_moved, steps, ms_spent, stop_reason, fragmentation_before, fragmentation_after }\n- StopReason enums (examples):\n  - BudgetExhaustedBytes\n  - BudgetExhaustedTime\n  - NoWorkFound\n  - ArenaLockContention\n  - DecodePressureHigh\n  - EvictionRequiredButDisallowed\n  - RelocationConflict (in-flight seq, pinned, etc.)\n  - Cancelled / Shutdown\n\nSafe stopping conditions (must-have)\n- Hard budget caps:\n  - stop immediately when bytes_moved >= max_bytes_per_step\n  - stop immediately when elapsed_ms >= max_ms_per_step\n  - stop when steps >= max_steps_per_tick\n- Backpressure integration points:\n  - if scheduler reports \u201cdecode behind\u201d / high queue depth / tail latency risk, abort with stop_reason=DecodePressureHigh.\n  - do not start a relocation if remaining budget is below the minimum copy cost for the candidate block.\n- Concurrency/correctness:\n  - never relocate pages for a sequence that is actively being appended to in the current decode microbatch.\n  - relocation must be coordinated with cancellation: if a request is cancelled mid-relocation, worker must either complete metadata swap safely or roll back cleanly (no leaked pages, no double-free).\n  - allocator locks: compaction must not hold the arena lock across long GPU copies; must support a two-phase protocol (select candidate under lock -> copy -> commit metadata under lock) or equivalent.\n\nRelocation protocol (implementation notes)\n- Candidate selection (under arena lock):\n  - identify fragmented region(s) / holes and movable blocks, skipping:\n    - pinned sessions\n    - blocks marked \u201cin decode\u201d / \u201cunsafe_to_move\u201d\n    - blocks with refcount > 1 (if applicable)\n  - choose a destination run large enough to reduce fragmentation meaningfully (min_free_run_bytes_to_target).\n- Copy/pack:\n  - use existing copy path first (memcpy / device-to-device copy) and only add microkernel if profiling shows it\u2019s needed.\n  - copy should be cancellable at the worker level (i.e., we can stop before starting a new block); do not attempt mid-kernel cancellation.\n- Commit:\n  - update block table / page map with a commit marker that is crash-safe for the process lifetime (we don\u2019t persist, but we need consistency under concurrent readers).\n  - release source pages back to free list after commit.\n\nMetrics / tracing (minimal to unblock canary)\n- Counters:\n  - kv_compaction_bytes_moved_total\n  - kv_compaction_pages_moved_total\n  - kv_compaction_steps_total\n  - kv_compaction_abort_total{reason=...}\n- Histograms:\n  - kv_compaction_step_ms\n  - kv_compaction_bytes_per_step\n- Gauges:\n  - kv_fragmentation_ratio (from ENG-4822; worker should log before/after and expose in result)\n- Tracing:\n  - span per invocation with stop_reason, bytes moved, fragmentation_before/after, and whether eviction was requested.\n\nPerf acceptance criteria (must meet before enabling beyond internal canary)\n- No more than +0.5% regression in steady-state throughput on decode-heavy benchmarks when compaction is enabled but not actively triggered.\n- When compaction is triggered under the benchmark plan \u201cmixed length bursts\u201d, compaction overhead should not add >2ms to median decode step on A100/H100 (measured at scheduler boundary), and should reduce fragmentation ratio by >= 10% relative within 5 minutes of sustained load (exact target to be validated with experiments tracker).\n- p99 latency in perf-canary scenario must not regress by >3% versus baseline with compaction enabled at default budgets; if it regresses, stop_reason and traces must make the cause diagnosable (e.g., excessive bytes per step, lock contention).\n\nTest plan\n- Unit tests:\n  - relocation bookkeeping (no double-free, no leaks)\n  - stop condition enforcement (bytes/time/steps)\n  - \u201cno work found\u201d behavior when arena is already contiguous\n- Integration/stress tests (ENG-4827 will add broader coverage; include a minimal version here):\n  - long-lived sessions + churn + cancellations\n  - repeated compaction invocations do not cause fragmentation oscillation (thrash)\n- Benchmark validation:\n  - run benchmark plan scenarios with compaction off/on at varying budgets; capture bytes moved, abort reasons, and p95/p99.\n\nRollout notes\n- Must be behind feature flag (ENG-4826 config plumbing).\n- Default to disabled in all tiers until perf canary passes and SRE guardrails are approved.\n\nOpen questions\n- Budget enforcement priority: prefer bytes cap, time cap, or both? (ADR says both are supported; we need a clear \u201cwhich one ends the step first\u201d semantics.)\n- Candidate selection heuristic: best-first by \u201clargest hole elimination\u201d vs \u201clargest movable block\u201d vs \u201cmost fragmented segment\u201d. Start simple and iterate based on experiments.\n- Interaction with eviction: should the worker ever request eviction proactively when it can\u2019t find a destination run, or leave to scheduler/eviction ticket? Proposal: worker returns stop_reason=EvictionRequiredButDisallowed with a hint and lets ENG-4825 integrate policy.\n\nOwner notes\n- Samir: implement worker loop + stop conditions + two-phase relocation protocol.\n- Sofia (ENG-4824): call points / gating in scheduler; will likely consume CompactionResult for logging + guardrails.\n- Allison/Sean: confirm metrics naming aligns with metrics standard once ENG-4822 lands.",
+  "acceptance_criteria": [
+    "Compaction worker exposes a single entry point that executes <= budget (bytes/ms/steps) and returns a structured stop_reason.",
+    "Relocation protocol does not hold arena lock across GPU copy; no allocator corruption under concurrency (stress test: cancellations + churn).",
+    "Worker can be invoked repeatedly without increasing fragmentation (no thrash) when trigger conditions are not met.",
+    "Tracing/metrics emitted per invocation are sufficient to correlate compaction activity to tail latency spikes in canary (bytes moved, ms spent, stop_reason, frag before/after).",
+    "Perf: throughput regression <= 0.5% in steady decode when enabled but idle; and no >3% p99 regression in perf-canary at default budgets."
+  ],
+  "comments": [
+    "2026-01-10 \u2014 Omar El-Sayed: Creating as the core mechanism ticket. Please keep the worker interface narrow; scheduler integration will come via ENG-4824. Prioritize safe stop conditions over aggressive defrag.",
+    "2026-01-13 \u2014 Samir Qureshi: Drafted the worker API + stop reasons. Plan is 2-phase: pick candidate under arena lock, release lock for D2D copy, re-acquire lock for commit. Need to confirm we can mark blocks 'relocating' so decode path won\u2019t touch them.",
+    "2026-01-17 \u2014 Noah Patel: Correctness note: ensure readers can\u2019t observe partially-updated page maps. Suggest a commit marker/versioned indirection table, or swap pointer atomically once destination pages are fully populated.",
+    "2026-01-22 \u2014 Sofia Ivanova: Scheduler side will only call compaction at microbatch boundaries at first. Please include a fast 'DecodePressureHigh' exit so we can gate via queue depth / behind-schedule signal.",
+    "2026-01-28 \u2014 Allison Grant: Metrics naming should match the standard doc. Please include stop_reason as a label on abort counter; SRE wants to alert on 'ArenaLockContention' and 'BudgetExhaustedTime' spikes during canary.",
+    "2026-02-03 \u2014 Samir Qureshi: WIP implementation locally: candidate selection is simple (largest contiguous free run target + first-fit movable block). Stop conditions wired. Next: cancellation safety + lock contention handling. Planning PR split: (1) worker skeleton + metrics, (2) relocation/commit correctness, (3) perf tuning.",
+    "2026-02-12 \u2014 Rafael Mendes: Oncall ask: ensure there\u2019s a clean 'disabled' behavior (no background thread spin). If enabled and misbehaving, we need an immediate stop with safe teardown; please coordinate with ENG-4826 kill-switch semantics."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_6a9494da271d46cda4d822a466efe0bf"
+}

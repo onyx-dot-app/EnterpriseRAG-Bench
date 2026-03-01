@@ -1,0 +1,64 @@
+{
+  "key": "ENG-9026",
+  "team": "engineering",
+  "title": "Emit route experiment attribution dimensions in OTel traces + metrics (incl. streaming + retries)",
+  "status": "In Review",
+  "priority": "P0",
+  "created_at": "2025-02-04",
+  "updated_at": "2025-03-14",
+  "creator": "Logan Wright",
+  "assignee": "Caleb Johnson",
+  "project": "Route-level A/B testing framework",
+  "cycle": "2025-W10",
+  "estimate": "8",
+  "due_date": "2025-03-15",
+  "release": "console-2025.04",
+  "customer_impact": "high",
+  "security_review_required": "false",
+  "labels": [
+    "telemetry",
+    "otel",
+    "experiments",
+    "metrics-cardinality",
+    "streaming",
+    "retries",
+    "ga-blocker"
+  ],
+  "dependencies": [
+    "ENG-9022",
+    "ENG-9021"
+  ],
+  "sub_issues": [
+    "ENG-9027"
+  ],
+  "links": [
+    "Confluence ADR: adr-048-experiment-metrics-attribution-schema.json",
+    "Confluence ADR: adr-047-deterministic-experiment-bucketing.json",
+    "PR: redwood/pr-28470-add-experiment-id-and-variant-to-request-context",
+    "PR: redwood/pr-28489-emit-experiment-dimensions-in-otel-spans",
+    "PR: redwood/pr-28622-fix-attribution-missing-on-streaming-retries",
+    "PR: redwood/pr-28741-reduce-metrics-cardinality-for-experiment-dimensions",
+    "Working notes: google_drive/engineering/observability/experiment-metrics-taxonomy-working-notes.json",
+    "Analysis: google_drive/engineering/observability/ab-testing-attribution-drop-rate-analysis.json",
+    "Dashboards spec: confluence/eng-platform/dashboards-and-alerts/experiment-health-dashboards-spec.json"
+  ],
+  "content": "## Summary\nWe need consistent experiment attribution across traces and key metrics so Console can slice latency/cost/error by {route_id, experiment_id, variant_id} with low overhead and without blowing up cardinality.\n\nThis ticket covers:\n- Emitting experiment attribution fields in OTel spans (request + model execution spans)\n- Emitting experiment dimensions on a minimal set of metrics (latency, errors, throughput) and ensuring cost attribution pipeline can join on the same identifiers\n- Correctness for streaming, retries, and internal fallbacks\n- Guardrails against high-cardinality tags / accidental per-request explosion\n\n## Motivation / Why now\nRoute-level experiments are gated on trustworthy per-variant metrics. During Phase 1 integration testing we observed attribution drop in staging (esp. streaming + retry paths) and early concerns about cardinality/overhead when tagging OTel + metrics. This is a GA blocker because Console results depend on these dimensions.\n\n## Requirements\n### Canonical dimensions (per ADR-048)\n- route_id (normalized template; not raw path)\n- experiment_id\n- variant_id\n- model_id (already present in many places; ensure consistent naming)\n- region (already present)\n\n### Where to emit\n1) Traces (OTel spans)\n- Always set on the top-level request span and propagate into child spans where relevant.\n- Must be present on:\n  - router decision span (or equivalent)\n  - inference execution span (for latency breakdown)\n  - streaming send loop span(s) or annotate on the parent request span (avoid per-chunk tagging).\n\n2) Metrics\n- Tag a minimal, curated set of metrics with {route_id, experiment_id, variant_id}:\n  - request_latency_ms (histogram)\n  - request_error_total (counter)\n  - request_success_total (counter)\n  - request_throughput_rps (derived)\n- For cost: do NOT tag per-token metrics with experiment dimensions at full fidelity if it will explode. Prefer joining in analytics using request_id -> experiment dims, or sampled expansions (see \"Cardinality strategy\").\n\n### Correctness constraints\n- Deterministic assignment: the experiment_id/variant_id must match the router decision for the request.\n- Retries: experiment dimensions must persist across retry attempts (including streaming retries) so we don\u2019t attribute the retry attempt to \"no experiment\".\n- Fallbacks: when a variant triggers fallback model selection, experiment_id/variant_id should remain the assigned values (the experiment is still the policy that chose the initial variant). Model_id may differ due to fallback.\n- Missing stickiness keys: if a request is bucketed via default key, we still emit attribution; however we must surface warnings elsewhere (Console validation / debug endpoint). This ticket focuses on emission.\n\n### Performance constraints\n- Additional span attributes must be constant-time and avoid allocations in hot paths.\n- Any string formatting must be avoided in the request loop; use stable identifiers already present in request context.\n- Avoid tagging high-volume metrics at per-token granularity with experiment dims.\n\n## Cardinality strategy (must-have)\n- Limit experiment tagging to a curated list of metrics, not all.\n- Ensure route_id is normalized to route template / internal route identifier (not raw request path).\n- Add safeguards:\n  - max length limits for experiment_id/variant_id in telemetry fields\n  - allowlist emission behind a feature flag during beta (route-experiments)\n  - sampling for any detailed per-span child enrichment (if we decide to annotate additional spans)\n\n## Implementation plan\n1) Plumb experiment context\n- Depend on request context plumbing work (see PR 28470).\n- Router sets experiment_id/variant_id and stores them in request context.\n\n2) OTel span attributes\n- For request span: set attributes once, early.\n- For child spans: propagate via context; do not re-compute.\n\n3) Metrics tagging\n- Tag only request-level metrics with experiment dims.\n- Ensure streaming response metrics are attributed to the same request context.\n\n4) Edge cases\n- Streaming retries: ensure context survives into retry pipeline (fix expected; see follow-up PR referenced below).\n- Async spans: ensure we don\u2019t lose attributes when spans are created after request context is moved across goroutines/threads.\n\n5) Validation\n- Add tests:\n  - unit test: for a request assigned to variant A, all expected spans include experiment_id/variant_id\n  - integration test: streaming request with retry emits consistent experiment attribution\n- Add staging smoke test dashboard: attribution drop rate and per-variant request count sanity.\n\n## Acceptance criteria\n- p95 attribution drop rate (missing experiment_id OR variant_id when experiment is active) < 0.5% in staging under streaming + retry workloads.\n- No material increase in metrics ingestion cost or cardinality alerts after enabling beta allowlist.\n- Traces show experiment_id/variant_id on request spans for 99%+ of routed requests in enabled accounts.\n- Documented conventions for attribute names (match existing OTel naming conventions thread) and metric tag keys.\n\n## Notes / Open questions\n- Naming conventions: align exact attribute keys with existing OTel conventions (see Slack thread \"otel-span-tagging-conventions\").\n- Token-level cost: likely join in analytics instead of tagging per-token metrics. Need explicit sign-off from Nadia/Mei on join strategy.\n- How to represent \"no experiment\": omit experiment_id/variant_id vs explicit \"none\". Current recommendation: omit to reduce cardinality and avoid misleading values.\n\n## Rollout\n- Behind feature flag route-experiments (beta allowlist).\n- Enable in staging first, then 1-2 beta accounts, watch:\n  - attribution drop rate\n  - propagation lag correlation\n  - metrics ingestion cardinality\n- Expand allowlist once dashboards stay green for 48h.\n",
+  "comments": [
+    "2025-02-06 - Logan Wright: Flagging as P0 for beta. Console results are only as good as attribution; we\u2019re already seeing drop on streaming paths in staging. Please keep tags minimal (no per-token tagging w/ experiment dims).",
+    "2025-02-07 - Jordan Lee: Confirming router will set experiment context before fallback evaluation (per bucketing evaluator). For fallbacks, experiment_id/variant_id should remain stable; model_id can change. Please ensure we don\u2019t re-run bucketing on retries.",
+    "2025-02-10 - Allison Grant: Please align attribute keys with existing OTel conventions. Proposed: redwood.experiment.id + redwood.experiment.variant_id (or redwood.experiment.variant). Avoid generic keys like experiment_id that collide with customer span attributes.",
+    "2025-02-12 - Caleb Johnson: Implemented span tagging for request span + router decision span. Still investigating missing tags on streaming retry path; looks like retry pipeline creates a new request context without copying experiment fields.",
+    "2025-02-18 - Rafael Mendes: From SRE side: we need an attribution drop-rate metric + alert, otherwise we\u2019ll ship a dashboard that silently lies. Please ensure we have a counter for \"request_missing_experiment_dims_total\" when experiment is active for that route.",
+    "2025-02-25 - Caleb Johnson: PR up for OTel span attributes + minimal metric tags. Added guard to normalize route_id to template. Remaining issue: cardinality risk when customers create many experiments; proposing to only tag request_latency_ms and request_error_total with full dims, everything else keeps experiment dims off.",
+    "2025-03-03 - Logan Wright: +1 on limiting metric tags. The analytics rollups can join cost by request_id; we don\u2019t need per-token metrics with experiment dims. Please document this explicitly so no one adds tags later \"for convenience\".",
+    "2025-03-07 - Caleb Johnson: Fixed streaming retry attribution by persisting experiment context across retry attempts (see bugfix PR reference). Attribution drop in staging went from ~6% to <0.6% on streaming workload replay.",
+    "2025-03-12 - Nadia Rahman: Confirmed cost pipeline can join request->experiment dims via request_context table without tagging token metrics. This is acceptable for beta/GA as long as join lag is < 15m and we backfill when schema changes.",
+    "2025-03-14 - Chloe Martin: Reviewed Console needs: results API expects {route, experiment, variant} consistently and will treat missing dims as \"unattributed\". Please omit explicit 'none' values; we\u2019ll bucket missing separately."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "content",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_17a55335c2c34f30978ac86650939c6d"
+}

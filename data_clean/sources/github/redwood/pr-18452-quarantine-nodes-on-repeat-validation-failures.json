@@ -1,0 +1,75 @@
+{
+  "repo": "redwood",
+  "pr_number": "18452",
+  "title": "Quarantine nodes on repeat validation failures (safe defaults + operator override)",
+  "author": "Jordan Lee",
+  "created_at": "2025-10-11",
+  "updated_at": "2025-10-14",
+  "merged_at": "2025-10-14",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/quarantine-on-repeat-validation-failures",
+  "reviewers": [
+    "Ethan Park",
+    "Rafael Mendes",
+    "Vanessa Ortiz",
+    "Miles Thornton",
+    "Fiona McCarthy"
+  ],
+  "labels": [
+    "infra",
+    "fleet",
+    "reliability",
+    "sre",
+    "control-plane"
+  ],
+  "linked_linear": [
+    "ENG-4825",
+    "ENG-4822"
+  ],
+  "linked_jira": [
+    "SUP-28433"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "19",
+  "additions": "612",
+  "deletions": "98",
+  "breaking_change": "false",
+  "release_notes": "Internal: Nodes that fail post-provision validation repeatedly will be automatically quarantined and excluded from serving pools; operators can override quarantine with an audited reason + TTL.",
+  "body": "## Summary\nThis PR implements automatic quarantine for nodes that repeatedly fail provision-to-ready validation. The goal is to prevent noisy/flaky nodes from looping forever in Validating and then accidentally joining serving pools, while keeping defaults conservative and providing explicit operator override pathways.\n\n## Motivation / Context\nDuring staged rollout we saw a subset of nodes repeatedly failing the same validation step (most commonly: driver parity drift, GPU health/Xid, and NCCL smoke failures). Retrying indefinitely increases time-to-ready, consumes orchestrator capacity, and creates ambiguous operator outcomes (\"is this a transient flake or a bad node?\").\n\nThis change adds:\n- A canonical definition of \"repeat validation failure\" (consecutive failures of the same validation category within a time window)\n- Automatic transition to `Quarantined` after the threshold is exceeded\n- An audited operator override endpoint to unquarantine with a reason + TTL, plus guardrails to prevent silent re-entry\n\n## Behavior changes\n### When we quarantine\nA node is quarantined when ALL of the following are true:\n- The node is currently in `Validating` (or `Provisioning` with post-flight validations enabled)\n- A \"hard\" validation category fails consecutively >= threshold\n- Failures occur within the configured window (default 60 minutes) and are not separated by a successful run of that category\n\n\"Hard\" categories (default):\n- `gpu_health` (ECC/Xid thresholds)\n- `driver_parity` (expected NVIDIA driver/CUDA toolkit mismatch)\n- `nccl_smoke` (fabric/all-reduce sanity)\n\n\"Soft\" categories (default, never auto-quarantine):\n- `artifact_upload` / log bundle upload\n- transient `network_probe` timeouts\n- control-plane write retries\n\n### Safe defaults\n- `QUARANTINE_CONSECUTIVE_FAILURES=3`\n- `QUARANTINE_WINDOW=60m`\n- Quarantine is scoped per node and per validation category, but the quarantine decision is node-level (i.e., we quarantine the node after the threshold in any hard category).\n- Quarantine is only applied when the orchestrator has a stable node identity (node_id assigned) to avoid quarantining \"unknown\" resources.\n\n### Operator override\nAdds internal admin endpoints:\n- `POST /internal/fleet/nodes/{node_id}:unquarantine`\n  - Requires elevated role (fleet-ops) and a non-empty `reason`\n  - Supports optional `ttl_minutes` (default 120, max 1440)\n  - Writes an audit log entry and emits a metric\n\nUnquarantine does NOT auto-mark Ready; it simply moves the node back to `Provisioning` (or `Validating` depending on where it failed) and forces a full re-run of hard validations.\n\n## Implementation notes\n- Adds a small \"failure accumulator\" to the readiness state store. We persist:\n  - last_failed_category\n  - consecutive_failure_count\n  - last_failure_at\n  - quarantine_reason (if quarantined)\n  - quarantined_at\n  - unquarantine_until (if overridden)\n- Updates the state machine transition guard:\n  - `Validating -> Quarantined` when threshold exceeded\n  - `Quarantined -> Provisioning` only via explicit operator action (or TTL expiry with feature flag off; see below)\n- Adds metrics (low-cardinality):\n  - `fleet_readiness_quarantine_total{category,reason_code}`\n  - `fleet_readiness_unquarantine_total{actor}`\n  - `fleet_readiness_validation_consecutive_failures{category}` (gauge)\n\n## Feature flag / rollout\n- Default enabled for Dedicated pools only via existing pool-level staged rollout flag.\n- Kill-switch: `fleet.readiness.quarantine_enabled` (global) and `fleet.readiness.quarantine_enabled_by_pool` (pool override)\n\n## Testing\n- Unit tests for accumulator semantics (windowing + reset on success)\n- State-machine transition tests (no quarantine on soft categories)\n- Authz tests for unquarantine endpoint\n- Manual test plan:\n  - Force driver mismatch -> confirm quarantine after 3 runs\n  - Unquarantine with TTL -> confirm validations re-run and audit event recorded\n\n## Follow-ups\n- Add runbook section with concrete remediation steps per category (reimage vs RMA vs network ticket)\n- Consider auto-creating a Linear incident/task when quarantines spike per pool",
+  "commits": [
+    "control-plane: persist validation failure accumulator in readiness store",
+    "control-plane: add quarantine transition + guardrails in readiness state machine",
+    "api: add internal unquarantine endpoint (RBAC + audit logging)",
+    "metrics: emit quarantine/unquarantine counters and consecutive failure gauge",
+    "tests: state machine + authz + accumulator windowing"
+  ],
+  "changed_areas": [
+    "services/fleet-readiness/ (state store, transitions, internal API)",
+    "services/provisioning-orchestrator/ (quarantine-aware retry loop + stop conditions)",
+    "libs/authz/ (fleet-ops role + endpoint policy)",
+    "observability/metrics/ (new counters and gauges)",
+    "docs/internal/ (operator notes + endpoint usage)"
+  ],
+  "testing": "CI: unit + integration tests. Local: ran readiness service tests and simulated repeated validation failures against a dev node_id; verified quarantine transition and unquarantine TTL behavior.",
+  "rollout_plan": "Ship behind `fleet.readiness.quarantine_enabled_by_pool` (off by default). Enable for us-east A100 dedicated pool during staged rollout window; monitor quarantine_total and ready_rate. Roll back by disabling flag if quarantine rate exceeds baseline or reduces Ready capacity unexpectedly.",
+  "risk": "Primary risk is over-quarantining on flaky checks and causing temporary capacity shortfall. Mitigations: hard/soft category split, conservative threshold (3), time windowing, kill switch, and explicit operator override with TTL + audit trail.",
+  "conversation": [
+    "Ethan Park (review): Can we ensure `Quarantined` nodes can never join serving pools even if a stale Ready write races? I want a hard gate in the transition logic.\nJordan Lee (author): Yes. Updated the Ready transition guard to fail if `quarantined_at` is set, and added a DB constraint-like check in the write path (see commit 2).",
+    "Rafael Mendes (review): Please confirm we won't auto-quarantine on network_probe flakes; we've seen periodic jitter during cluster bring-up.\nJordan Lee (author): Confirmed. network_probe is classified soft and explicitly excluded. Added a test case to prevent regression.",
+    "Vanessa Ortiz (review): Threshold=3 feels okay, but can we make it per-category configurable? Driver parity is nearly always real; NCCL can be flaky early on.\nJordan Lee (author): Added per-category override map in config with defaults (gpu_health=2, driver_parity=2, nccl_smoke=3) but kept global default at 3. Also ensured overrides are low-cardinality and come from static config, not labels.",
+    "Miles Thornton (review): Metrics need to be safe for cardinality. Please do not include node_id in tags.\nJordan Lee (author): Acknowledged. Metrics only tag category + reason_code + actor_role. Node_id is logged only in structured logs and audit event payloads.",
+    "Fiona McCarthy (review): Unquarantine endpoint needs explicit reason + audit event. Also ensure only fleet-ops can call it.\nJordan Lee (author): Implemented required reason, added audit event `fleet.node.unquarantined`, and restricted to fleet-ops role in authz policy. Added tests.",
+    "Sergio Costa (comment): Would be useful to export the consecutive failure count for dashboards.\nJordan Lee (author): Added `fleet_readiness_validation_consecutive_failures{category}` gauge. No per-node dimensions."
+  ],
+  "ci_summary": "Buildkite: build (pass), unit tests (pass), integration tests (pass), lint (pass). One flaky integration test rerun due to timing; rerun passed.",
+  "merge_method": "squash",
+  "merge_outcome": "Merged into main; quarantine flag remains off by default and will be enabled per-pool during staged rollout.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "release_notes",
+    "body",
+    "conversation"
+  ],
+  "dataset_doc_uuid": "dsid_7b6c945f453e42878e02900186d55173"
+}

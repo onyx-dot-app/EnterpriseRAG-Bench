@@ -1,0 +1,58 @@
+{
+  "key": "ENG-4823",
+  "team": "engineering",
+  "title": "Add TP heartbeat metrics + stall detectors (compute vs comms vs scheduler starvation)",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-02-20",
+  "updated_at": "2025-03-01",
+  "creator": "Noah Patel",
+  "assignee": "Omar El-Sayed",
+  "project": "Multi-GPU (TP) stability fixes",
+  "cycle": "2025-W08",
+  "estimate": "8",
+  "due_date": "2025-02-28",
+  "release": "runtime-1.19",
+  "customer_impact": "high",
+  "security_review_required": "false",
+  "labels": [
+    "runtime",
+    "tensor-parallel",
+    "observability",
+    "metrics",
+    "tracing",
+    "reliability",
+    "nccl"
+  ],
+  "dependencies": [
+    "ENG-4822",
+    "ENG-4824"
+  ],
+  "parent_issue": "ENG-4821",
+  "links": [
+    "Slack: https://slack.com/archives/eng-runtime/p1739897721-tp-heartbeat-metrics-naming",
+    "Dashboard doc (draft): sources/confluence/eng-platform/dashboards-and-alerts/tp-stall-and-timeout-dashboard.json",
+    "PR: https://github.com/redwood/redwood/pull/21834",
+    "PR: https://github.com/redwood/redwood/pull/21872",
+    "PR (dashboards): https://github.com/redwood/observability-pack/pull/412"
+  ],
+  "description": "Context\n- We have multiple TP hang signatures in the wild (and at least one Sev1) where the request appears \u201cin-flight\u201d but we can\u2019t tell quickly whether we\u2019re wedged in compute, NCCL collectives, or scheduler starvation (prefill-heavy batches starving decode/collective ordering).\n- Goal of this ticket is to add low-overhead, actionable metrics + trace/log annotations so on-call and runtime engineers can:\n  (1) detect TP stalls early (before p99 explosions / autoscaling thrash)\n  (2) classify stalls (compute vs comms vs scheduler) consistently\n  (3) correlate stalls to replica/rank + in-flight collective state + scheduler backlog.\n\nScope\n1) Per-rank heartbeat\n- Emit a monotonic \u201cI\u2019m making progress\u201d heartbeat per TP rank during: prefill step, decode step, and collective boundaries.\n- Heartbeat must be present even when requests are streaming (decode loop) so we can detect a decode-iteration deadlock.\n\n2) In-flight collective counters\n- Counters/gauges that tell us:\n  - last collective seq/id observed per rank\n  - number of in-flight collectives per replica (and ideally per stream)\n  - time since last collective completion\n\n3) Scheduler queue depth + starvation signals\n- Expose queue depth/backlog for prefill and decode queues, plus \u201ccollective pending\u201d signals so we can detect when collectives are not being scheduled fairly.\n\n4) Stall reason tagging\n- A single \u201cbest-effort\u201d classification emitted as:\n  - metric label on a stall counter (for dashboards/alerts)\n  - structured log event (for incident debugging)\n  - trace span attributes (for correlation with request IDs)\n\nNon-goals\n- This ticket does not attempt to fix the underlying deadlocks (see ENG-4824 / ENG-4825 / ENG-4826). It provides observability + detection so we can prove fixes and catch regressions.\n\nProposed metrics (final names from eng-runtime + SRE review)\n- runtime_tp_rank_heartbeat_seconds{cluster,env,replica_id,model,tp_rank,phase}\n  - Gauge: unix timestamp (seconds) of last progress update.\n  - phase \u2208 {prefill,decode,collective,kv_compaction,unknown}\n\n- runtime_tp_collective_inflight{cluster,env,replica_id,model,collective,tp_group_id}\n  - Gauge: number of collectives currently \u201cin-flight\u201d for the replica.\n  - collective \u2208 {all_reduce,all_gather,reduce_scatter,broadcast,unknown}\n\n- runtime_tp_collective_seq{cluster,env,replica_id,model,tp_rank,tp_group_id}\n  - Gauge: last-seen collective sequence number per rank.\n\n- runtime_scheduler_queue_depth{cluster,env,replica_id,queue}\n  - Gauge: number of items in scheduler queues.\n  - queue \u2208 {prefill,decode,control,unknown}\n\n- runtime_tp_stall_events_total{cluster,env,replica_id,model,reason}\n  - Counter: increments when detector fires.\n  - reason \u2208 {comms_suspected,nccl_collective_stalled,scheduler_starvation,compute_stalled,kv_pressure,unknown}\n\nStall detector (v1) semantics\n- Detector runs in runtime process (replica) and emits a stall event when:\n  A) heartbeat gap > threshold AND there is active work (queue_depth>0 OR inflight_collective>0)\n  B) collective seq has not advanced for > threshold while inflight_collective>0\n  C) decode queue depth continues to grow while prefill dominates and collectives are pending (heuristic for starvation)\n\n- Classification logic (best-effort):\n  - If inflight_collective>0 and collective_seq not advancing -> nccl_collective_stalled\n  - Else if queue_depth_decode>0 and prefill queue dominates and no collectives scheduled -> scheduler_starvation\n  - Else if GPU util high but no heartbeat (rare) -> compute_stalled\n  - Else if kv_pressure signals present (OOM near-misses / compaction loop) -> kv_pressure\n  - Else -> unknown\n\nPerformance/overhead constraints\n- Heartbeat updates must be O(1) and non-blocking; avoid per-token updates.\n- Sampling for trace attributes to avoid cardinality blow-ups; metrics labels MUST NOT include request_id.\n- replica_id is already high-cardinality, but we need it for Dedicated incident response; ensure dashboards can roll up by cluster/model.\n\nDeliverables\n- Runtime metrics + structured logs behind a feature flag where needed.\n- Trace enrichment: span attributes for tp_rank + collective seq and a stall reason tag on the request span when present.\n- Dashboard panels + initial alert rules (owned by SRE/observability pack, but this ticket provides metric contracts).\n\nAcceptance criteria\n- [x] Metrics emitted in Hosted + Dedicated runtimes without crashing when TP is disabled (should no-op or emit minimal).\n- [x] During repro harness (ENG-4822), we can see heartbeat gap and inflight collective state for stuck replicas.\n- [x] A single stuck replica produces a clear stall reason event + structured log including: replica_id, tp_group_id, tp_rank set, phase, collective seq, queue depths.\n- [x] Traces show the stall reason tag and collective counters on spans (sampled), enabling correlation from request timeout -> replica -> stall signature.\n- [x] Unit tests for metric emission + a small fault-injection test that forces \u201ccollective seq not advancing\u201d path (best-effort).\n\nImplementation notes\n- Metrics library: use existing runtime stats registry; export via telemetry pipeline (coord: Logan Wright / Caleb Johnson).\n- Structured logs: emit a single JSON log line per detector fire with a rate limit (e.g., max 1/min per replica per reason) to avoid incident spam.\n- Coordinate label set with SRE (Aisha Bello / Sergio Costa) to ensure alertability and stable aggregation.\n\nRollout plan\n- Land metrics first (default on).\n- Detector event emission default on in canary clusters; alert rules initially in \u201cticket-only / non-paging\u201d mode.\n- After runtime-1.19 canary proves low noise, enable paging for sustained heartbeat gaps correlated with timeouts.\n\nNotes / risks\n- Potential for high-cardinality metrics if we include too many dimensions; keep labels constrained to cluster/env/replica_id/model/tp_rank/phase.\n- False positives during legitimate long prefill for long-context prompts; detector thresholds must be workload-aware (see ENG-4826 for watchdog defaults).",
+  "comments": [
+    "2025-02-20 (Noah Patel): Creating as P0. We keep losing time in incidents debating \u201cis it NCCL, scheduler, or compute?\u201d We need metrics that answer this in <5 minutes. Please coordinate naming w/ SRE so alerts are straightforward.",
+    "2025-02-21 (Omar El-Sayed): Drafted metric names + label sets. Key decision: heartbeat is timestamp gauge (seconds) so alerting uses time() - gauge. Avoid request_id to keep cardinality sane. Will add structured log event with rate limit.",
+    "2025-02-22 (Aisha Bello): +1 on timestamp gauge. Please ensure replica_id label matches what on-call uses in pager payloads. For alerts, we want: \u201cheartbeat_gap > X AND (inflight_collective>0 OR request_timeouts increasing)\u201d. Also add dashboard rollups by model + cluster.",
+    "2025-02-23 (Allison Grant): For tracing, keep tp_rank/collective_seq as span attributes but sample aggressively; avoid attaching to every token span. Suggest: attach to request root span + one decode iteration span per N iterations.",
+    "2025-02-25 (Julian Moore): Added scheduler_queue_depth metrics hooks (prefill/decode/control). For starvation heuristic, we can compute a ratio in the detector (decode_depth growing while prefill_depth stays high). Will keep heuristic behind debug flag until we validate noise.",
+    "2025-02-26 (Omar El-Sayed): Opened PR redwood#21834 with metrics + stall reason enum + structured logs. Added basic unit tests around registry emission and label presence. Next: extend tracing spans with collective counters (separate PR).",
+    "2025-02-27 (Grace Kim): Reviewed PR. One concern: tp_rank label across all ranks may create many time series on 8-GPU+; acceptable for Dedicated but maybe heavy for Hosted. Suggest adding a config to aggregate heartbeat across ranks (min/avg) in Hosted if needed later.",
+    "2025-02-28 (Omar El-Sayed): Addressed review: added optional aggregated heartbeat metric runtime_tp_replica_heartbeat_seconds without tp_rank label (emitted always), kept per-rank behind config for Hosted. Also added log rate limiting (1/min/replica/reason).",
+    "2025-02-28 (Omar El-Sayed): Opened PR redwood#21872 to add collective counters to tracing spans (sampled). Linked dashboard updates to observability-pack#412.",
+    "2025-03-01 (Omar El-Sayed): Merged redwood#21834 and redwood#21872. Verified in perf-canary cluster: can reproduce mixed prefill/decode stall and see inflight_collective>0 + collective_seq not advancing + stall reason = nccl_collective_stalled. Marking done; follow-ups on alert tuning will live under ENG-4828 / SRE alerting thread."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_54782be72aaa417bbe418c08bb027b59"
+}

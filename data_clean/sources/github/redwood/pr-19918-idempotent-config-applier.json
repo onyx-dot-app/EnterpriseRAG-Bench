@@ -1,0 +1,76 @@
+{
+  "repo": "redwood",
+  "pr_number": "19918",
+  "title": "runtime: make optimization config applier idempotent + retry-safe (partial rollout safeguards)",
+  "author": "Noah Patel",
+  "created_at": "2025-12-19",
+  "updated_at": "2026-01-06",
+  "merged_at": "2026-01-06",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/idempotent-optimization-config-applier",
+  "reviewers": [
+    "Omar El-Sayed",
+    "Sofia Ivanova",
+    "Ethan Park",
+    "Benji Okafor",
+    "Sean Gallagher"
+  ],
+  "labels": [
+    "runtime",
+    "reliability",
+    "safe-apply",
+    "observability",
+    "risk"
+  ],
+  "linked_linear": [
+    "ENG-4823",
+    "ENG-4824",
+    "ENG-4827"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "23",
+  "additions": "612",
+  "deletions": "187",
+  "breaking_change": "false",
+  "release_notes": "- Runtime now treats Optimization Config apply as an idempotent operation keyed by (scope, version, apply_operation_id). Retries and duplicate deliveries will no-op safely; partial apply states are detected and repaired.",
+  "description": "Context: As part of Safe apply + rollback for Optimization Configs, the control plane will issue apply operations that may be retried (network timeouts, controller restarts) and can be delivered out-of-order relative to worker restarts and shard movement. Prior implementation applied configs as a best-effort \"set current\" and would re-run side effects on every delivery (cache invalidation, batcher reinit), which increased tail latency and could leave mixed worker states during partial rollout. This PR makes the runtime Optimization Config applier idempotent and resilient to retries, and adds explicit safeguards for partial rollout states.\n\nWhat changed: 1) Introduced apply_operation_id and deterministic apply keying. The runtime now consumes ApplyOptimizationConfig(scope, version, apply_operation_id, reason) and records a durable ApplyRecord per (scope, version). If the same apply_operation_id is delivered again, the operation is treated as a no-op after verifying the recorded checksum. 2) Added a small durable state store (RuntimeOptimizationConfigState) to persist last_desired_version, last_applied_version, last_apply_operation_id, and an apply_status enum (PENDING/APPLIED/FAILED). This survives worker restarts and prevents \"double apply\" side effects after process crashes. 3) Side-effect gating: cache invalidation and batch scheduler resets now run only on transition from one applied version to another, and are skipped on idempotent retries. 4) Partial rollout safeguards: if a worker receives an apply for an older version than its recorded desired_version, it will reject it with a conflict response unless reason=ROLLBACK (explicit rollback) or allow_downgrade=true from control plane. This prevents late/stale apply messages from reintroducing a regressed version mid-rollout. 5) Repair behavior: if apply_status is FAILED for the same (scope, version) and the controller retries with a new apply_operation_id, the runtime will re-attempt apply (previously a failed apply could wedge workers until manual restart). 6) Observability: added metrics and structured logs to make retry/no-op/conflict behavior visible: optimization_config_apply_total{result=applied|noop|conflict|failed}, optimization_config_apply_duration_ms, and optimization_config_state_gauge{state}. All are tagged with tenant/model/region/config_version/apply_operation_id (apply_operation_id only in logs to avoid high cardinality metrics).\n\nWhy this is safe: The new behavior is strictly more conservative. Duplicate deliveries become no-ops, stale messages are rejected, and only explicit rollbacks can downgrade. Persisted state ensures crashes don\u2019t cause reapplication storms (and the associated cache flush latency spikes). Unit + integration tests cover retry ordering, crash/restart, and conflict semantics.\n\nFollow-ups: - Control plane rollout controller will start supplying apply_operation_id everywhere (tracked in ENG-4824). - Console will surface conflict/failed reasons using the error codes introduced here. - We should consider promoting apply_operation_id into trace spans once tracing propagation is in place for the apply pipeline.\n\nRelated: ENG-4823 (idempotency guarantees), PR #19915 (apply transaction checkpoints), PR #19933 (gate hooks/metric tags).",
+  "commits": [
+    "runtime/opt-config: add RuntimeOptimizationConfigState persistent store + migrations",
+    "runtime/opt-config: introduce ApplyRecord + checksum + apply_status",
+    "runtime/opt-config: make apply idempotent (noop on duplicate apply_operation_id)",
+    "runtime/opt-config: add stale apply conflict handling + explicit rollback downgrade path",
+    "runtime/opt-config: gate cache invalidation and batcher resets on version transitions only",
+    "runtime/opt-config: add metrics/logging for apply results and duration",
+    "tests: add concurrency + restart + out-of-order delivery coverage"
+  ],
+  "changed_files": [
+    "runtime/optimization/config_applier.go",
+    "runtime/optimization/config_state_store.go",
+    "runtime/optimization/config_types.go",
+    "runtime/optimization/errors.go",
+    "runtime/optimization/metrics.go",
+    "runtime/optimization/config_applier_test.go",
+    "runtime/optimization/config_state_store_test.go",
+    "proto/controlplane/optimization_config.proto",
+    "gateway/internal/controlplane_client.go",
+    "docs/internal/runtime/optimization-config-applier.md"
+  ],
+  "ci_checks": [
+    "buildkite/redwood-monorepo: runtime-unit (pass)",
+    "buildkite/redwood-monorepo: gateway-unit (pass)",
+    "buildkite/redwood-monorepo: lint (pass)",
+    "buildkite/redwood-monorepo: integration-runtime-smoke (pass)",
+    "buildkite/redwood-monorepo: safe-apply-e2e-staging (pass, rerun once due to flaky gpu node)"
+  ],
+  "conversation": "Omar El-Sayed (review): The state store worries me a bit \u2014 is this per-worker local disk? What happens on ephemeral workers or when a pod is rescheduled? Also please confirm we\u2019re not adding a high-cardinality metric label with apply_operation_id.\n\nNoah Patel (author): Yes, this is local to the runtime pod (same path as other small runtime state; falls back to in-memory if not writable). If the pod is rescheduled, we lose the record, but idempotency still holds per-process; the controller retries will reapply cleanly. The durable store mainly prevents re-running side effects after a crash/restart on the same node and avoids repeated cache flushes. apply_operation_id is logs-only; metrics are tagged with tenant/model/region/config_version and result.\n\nSofia Ivanova (review): Can you clarify the stale apply rule? I\u2019m concerned about a canary controller that pauses and then resumes: will workers start rejecting legitimate apply calls if desired_version advanced?\n\nNoah Patel (author): Rule is: if incoming.version < desired_version, we return CONFLICT unless reason=ROLLBACK (or allow_downgrade). If the controller pauses/resumes the same operation, desired_version doesn\u2019t change, so no conflict. Conflicts happen when a newer version was already declared desired (e.g., fast follow apply or rollback) and an older message arrives late.\n\nEthan Park (review): Please add explicit error codes so the controller can distinguish conflict vs transient failure; otherwise we\u2019ll treat it as retryable and spam the runtime.\n\nNoah Patel (author): Added OptimizationConfigApplyError with codes: CONFLICT_STALE_VERSION, CHECKSUM_MISMATCH, VALIDATION_FAILED, APPLY_FAILED_TRANSIENT. Updated client to propagate codes up.\n\nSean Gallagher (review): Can you add an annotation log line with a stable message for dashboards? We want to key alerts on \"optimization config apply failed\" events.\n\nNoah Patel (author): Added structured log event \"opt_config_apply\" with fields result, scope, version, error_code, and request_id. Metrics also emit result=failed.\n\nBenji Okafor (review): Proto change adds apply_operation_id \u2014 any backwards compat concerns with older runtimes during rollout?\n\nNoah Patel (author): Field is optional; runtime treats missing apply_operation_id as \"legacy\" and derives one from (scope, version, request_id) but marks it non-dedup-safe across retries. The controller will only enable retry semantics after runtime fleet is upgraded (feature flag in control plane). Documented rollout plan in internal runtime doc.\n\nOmar El-Sayed (review): One more request: when checksum mismatch occurs, should we hard fail and require operator intervention? That seems like a data integrity issue.\n\nNoah Patel (author): Agreed \u2014 checksum mismatch returns non-retryable CHECKSUM_MISMATCH and does not change desired/applied state. This should surface as a hard stop in the rollout UI. Added a unit test.\n\nChloe Martin (comment): Thanks \u2014 Console will need the conflict/failed codes surfaced on the rollout timeline. Please ensure error strings are user-safe.\n\nNoah Patel (author): Errors are code-first; messages are short and don\u2019t include internal paths. Console can map codes to friendly text.\n\nFinal approvals: Omar El-Sayed (approved), Sofia Ivanova (approved), Ethan Park (approved).",
+  "merge_method": "squash",
+  "merge_outcome": "Merged to main; rollout guarded behind control plane flag OPT_CONFIG_APPLY_IDEMPOTENT=off by default (to be enabled after canary).",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "conversation",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_01d02d95db18420a97b2f63aa502656e"
+}

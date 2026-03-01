@@ -5,7 +5,7 @@ Target number of files:
 25000
 
 File name format:
-File names should be short and descriptive with words connected with dashes like mid-term-kpi-planning.json for example.
+File names should be short and descriptive with words connected with dashes (e.g. mid-term-kpi-planning-wip.json).
 
 Content rules:
 - Google Drive is Redwood Inference’s working-area for team-specific documents and in-progress thinking.

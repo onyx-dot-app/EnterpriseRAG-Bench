@@ -5,11 +5,11 @@ from typing import Any
 
 from openai import OpenAI
 
-from src.llm.interface import LLMInterface, Message, ToolCall
+from src.llm.interface import LLMInterface, Message, ReasoningLevel, ToolCall
 
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5.2")
 BRAINTRUST_API_KEY = os.environ.get("BRAINTRUST_API_KEY")
 BRAINTRUST_PROJECT = os.environ.get("BRAINTRUST_PROJECT")
 
@@ -31,6 +31,7 @@ class OpenAILLM(LLMInterface):
         model: str | None = None,
         tools: list[dict] | None = None,
         quiet: bool = False,
+        reasoning_level: ReasoningLevel = "medium",
     ):
         """
         Initialize the OpenAI LLM.
@@ -40,6 +41,7 @@ class OpenAILLM(LLMInterface):
             model: Model to use. Defaults to LLM_MODEL env var or gpt-4o-mini.
             tools: List of tool schemas in OpenAI format.
             quiet: If True, suppress status print statements.
+            reasoning_level: Level of reasoning effort ("low", "medium", "high").
         """
         self.api_key = api_key or OPENAI_API_KEY
         if not self.api_key:
@@ -49,6 +51,7 @@ class OpenAILLM(LLMInterface):
         self.model = model or LLM_MODEL
         self.tools = tools
         self.quiet = quiet
+        self.reasoning_level = reasoning_level
 
         # Use Braintrust tracing if configured
         if BRAINTRUST_API_KEY and BRAINTRUST_PROJECT:
@@ -101,7 +104,7 @@ class OpenAILLM(LLMInterface):
             "model": self.model,
             "input": self._build_input(messages),
             "stream": True,
-            "reasoning": {"effort": "medium", "summary": "auto"},
+            "reasoning": {"effort": self.reasoning_level, "summary": "auto"},
         }
         if self.tools:
             kwargs["tools"] = self.tools

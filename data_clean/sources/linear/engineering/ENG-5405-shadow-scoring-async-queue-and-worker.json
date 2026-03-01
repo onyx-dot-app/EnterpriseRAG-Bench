@@ -1,0 +1,52 @@
+{
+  "key": "ENG-5405",
+  "team": "engineering",
+  "title": "Shadow scoring: async queue + worker (retries, dedupe, DLQ) for quality metrics",
+  "status": "In Review",
+  "priority": "P0",
+  "created_at": "2025-12-04",
+  "updated_at": "2026-02-20",
+  "creator": "Nadia Rahman",
+  "assignee": "Olivia Grant",
+  "project": "Shadow traffic tool for eval metrics",
+  "cycle": "2026-W07",
+  "estimate": "8",
+  "due_date": "2026-02-28",
+  "release": "console-2026.03",
+  "customer_impact": "high",
+  "security_review_required": "true",
+  "labels": [
+    "shadow-traffic",
+    "evals",
+    "async-pipeline",
+    "reliability",
+    "dedupe",
+    "dlq",
+    "cost-guardrails",
+    "private-deployments"
+  ],
+  "dependencies": [
+    "ENG-5404",
+    "ENG-5406",
+    "ENG-5411",
+    "ENG-5415"
+  ],
+  "sub_issues": [
+    "ENG-5409"
+  ],
+  "description": "Overview\nWe need an asynchronous scoring pipeline that computes rubric/heuristic quality metrics for shadow outputs without impacting the user request path. This ticket covers the queue + worker subsystem responsible for: (1) consuming shadow pair artifacts (control + shadow outputs + metadata), (2) running scoring (heuristics + model-graded via eval-harness adapter), (3) writing normalized results for aggregation in Console, and (4) providing reliability mechanisms (retries, dedupe, DLQ, backpressure).\n\nGoals / requirements\n- Fail-open: scoring must never block or degrade the user path; if scoring is unhealthy we drop/defer scoring work and surface \u201cdata incomplete / scoring lag\u201d signals.\n- Idempotent + deduped processing: replays and telemetry retries are expected. We must prevent duplicate scoring writes and avoid double-counting in aggregates.\n- Cost-guarded: enforce per-tenant and global budgets (QPS, concurrency, max tokens graded). Worker should degrade to cheaper heuristics when budgets are exceeded (configurable).\n- Multi-deployment aware:\n  - Hosted/Dedicated: managed queue + workers in Redwood infra.\n  - Private: support running the worker near the data; allow alternative sinks/queues; default minimal retention and strict redaction handling.\n\nNon-goals\n- Customer-provided arbitrary code execution (v1 only runs Redwood scoring templates + eval-harness rubrics).\n- Long-term offline replay of historical traffic beyond short retention windows.\n\nProposed architecture (v1)\n1) Input\n- Source events: shadow_pair_completed (from ENG-5404 telemetry ingestion) emits a scoring job referencing stored artifacts.\n- We do NOT ship raw prompts/responses directly through the queue by default; instead we pass artifact refs + hashed identifiers.\n\n2) Queue\n- Topic/queue name (proposed): shadow.scoring.jobs.v1\n- Partition key: tenant_id (to keep noisy tenants isolated and enable per-tenant concurrency controls)\n- Payload fields (high level): tenant_id, shadow_experiment_id, route_id, control_variant_id, shadow_variant_id, request_fingerprint, artifact_ref, rubric_version, created_at, attempt\n\n3) Worker service\n- Service name (proposed): shadow-scoring-worker\n- Reads from shadow.scoring.jobs.v1, fetches artifacts, runs scoring, writes results.\n- Scoring modes:\n  - Heuristics: format adherence, JSON validity/shape, refusal detection, length/verbosity deltas.\n  - Model-graded: uses eval-harness adapter (ENG-5406) with pinned rubric_version.\n- Output table (logical): shadow_scoring_results_v1 keyed by (tenant_id, shadow_experiment_id, request_fingerprint, shadow_variant_id, rubric_version)\n\n4) Dedupe / idempotency\n- Dedupe key: tenant_id + shadow_experiment_id + request_fingerprint + shadow_variant_id + rubric_version\n- Implementation:\n  - First write creates a result row with status=completed and a stable score_hash.\n  - Retries check for existing completed row; if present, ACK and stop.\n  - For in-flight duplicates: use \u201cinsert if not exists\u201d semantics or optimistic concurrency on status.\n\n5) Retries + DLQ\n- Retry policy: exponential backoff with jitter, max_attempts=6 (configurable).\n- Failure classes:\n  - Transient: artifact store timeouts, eval-harness timeouts, upstream rate limiting -> retry.\n  - Permanent: malformed artifact refs, missing required fields, rubric version not found -> DLQ.\n- DLQ topic/queue: shadow.scoring.jobs.dlq.v1 with structured error reason, last_attempt_at.\n\n6) Backpressure and circuit breaking\n- If scoring backlog exceeds threshold (see SLOs), worker reduces concurrency and/or skips model-graded scoring and emits \u201cscoring_degraded=true\u201d signals.\n- If artifact fetch p99 latency spikes, circuit-break artifact store calls to avoid cascading failures.\n\n7) Observability\n- Metrics:\n  - shadow_scoring_jobs_received_total\n  - shadow_scoring_jobs_completed_total\n  - shadow_scoring_jobs_failed_total (by error_class)\n  - shadow_scoring_queue_lag_seconds (p50/p95)\n  - shadow_scoring_worker_latency_ms (end-to-end, plus artifact_fetch, eval_harness, write)\n  - shadow_scoring_dedupe_hits_total\n  - shadow_scoring_degraded_mode_total\n- Tracing: propagate request_fingerprint + experiment_id as trace attributes (cardinality-safe; do not include raw prompt_id).\n\nSLO targets (draft; to finalize with SRE)\n- Availability: worker processes >= 99.0% of valid jobs within the scoring window.\n- Freshness: p95 end-to-end scoring latency <= 10 minutes (from shadow_pair_completed to result write) for default sampling rates.\n- Backlog: alert when p95 queue lag > 30 minutes for 15 minutes.\n\nSecurity / data handling\n- Worker must only fetch artifacts that have passed redaction/transformation (ENG-5411).\n- Ensure all logs redact artifact contents; log only hashed identifiers.\n- RBAC: results are tenant-scoped; do not allow cross-tenant reads.\n\nAcceptance criteria\n- Queue + worker deployed behind feature flag (shadow_scoring_v1).\n- Dedupe works: repeated job delivery does not create multiple scoring result rows or inflate aggregates.\n- Retries + DLQ: transient failures recover; permanent failures land in DLQ with actionable error classification.\n- Degraded mode: when queue lag threshold is crossed, model-graded scoring can be disabled automatically and the system continues to produce heuristic metrics and \u201cdata incomplete\u201d markers.\n- Observability dashboards show queue lag, throughput, error rates, and degraded-mode activations.\n- Load test demonstrates no material impact to user path SLOs (no coupling) and stable behavior at projected beta sampling.\n\nImplementation plan (current)\n- [x] Define job envelope schema + versioning\n- [x] Stand up queue topic + IAM/RBAC for worker\n- [x] Implement worker skeleton: consume -> fetch artifact -> score -> write result\n- [x] Idempotent write path + dedupe key\n- [x] Retry wrapper + error classification\n- [ ] DLQ routing + triage runbook stub\n- [ ] Degraded-mode toggle + per-tenant budget caps\n- [ ] Metrics + dashboards + alert hooks for lag/errors\n- [ ] Private deployment notes (queue abstraction + storage options)\n\nLinks\n- Related: ENG-5404 (telemetry events), ENG-5406 (eval-harness adapter), ENG-5411 (retention/redaction), ENG-5415 (backpressure/circuit breaker)\n- GitHub: eval-harness/pr-812-shadow-output-adapter-and-rubric-runner (dependency)\n- Incident learning: scoring queue backlog during dogfood (see Slack: incidents/1768180020-shadow-scoring-queue-backlog)\n\nOpen questions\n1) Do we require rubric_version in the job payload, or can worker resolve via experiment config? (Leaning: include rubric_version to guarantee reproducibility and allow replays.)\n2) Default timeouts for model-graded scoring per job (proposal: hard timeout 20s for worker step; retry at most 2x for model-graded before falling back to heuristics).\n3) Storage schema ownership: keep results in telemetry warehouse vs product DB for Console queries? (Leaning: write normalized results to analytics store, with a thin index in product DB for \u201cexperiment run state\u201d.)\n4) Private deployments: do we support running scoring without GPU (heuristics-only) as default? (Likely yes for v1; model-graded optional if customer provisions.)",
+  "comments": [
+    "2026-01-07 (Jonas Weber): Please ensure the worker pins rubric_version and stores it with results; we need to compare runs across rubric updates without ambiguity. Also store the grader model version for model-graded metrics.",
+    "2026-01-10 (Sean Gallagher): SRE asks for explicit DLQ + a clear \u201cdrop policy\u201d when backlog is high. We should page on sustained lag, ticket on elevated DLQ volume. Add a kill switch to stop model-graded scoring first.",
+    "2026-01-18 (Logan Wright): Telemetry ingestion will emit artifact_ref + stable fingerprint; do not add route-level labels into worker metrics beyond a small allowlist to avoid cardinality issues.",
+    "2026-02-03 (Olivia Grant): Implemented idempotent writes using dedupe key; added error classification and retry wrapper. Next: DLQ wiring and degraded-mode fallback.",
+    "2026-02-12 (Allison Grant): Please emit shadow_scoring_queue_lag_seconds and shadow_scoring_degraded_mode_total; these will feed the beta oncall dashboard. Add a dimension for deployment_mode (hosted/dedicated/private) only if bounded.",
+    "2026-02-20 (Priya Natarajan): Approve direction. Condition: degraded-mode must be automatic, not manual-only, and needs a clear audit trail for when it toggles (even if only internal logs for v1)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_69ba0bfaee5b4027846277d0a1d0efa5"
+}

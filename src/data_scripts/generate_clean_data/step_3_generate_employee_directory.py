@@ -10,7 +10,7 @@ from src.llm.conversation import Conversation
 from src.paths import COMPANY_OVERVIEW_PATH, EMPLOYEE_DIRECTORY_PATH, INITIATIVES_PATH, VISUAL_EMPLOYEE_DIRECTORY_PATH
 from src.prompts.employee_directory import EMPLOYEE_DIRECTORY_SYSTEM_PROMPT
 from src.schemas.employee_directory import EXPECTED_FORMAT, EmployeeDirectory, validate_employee_directory
-from src.statistics import update_statistics
+from src.utils.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import FinishTool, WriteTool
 from src.utils import confirm_regenerate, get_current_date_formatted, load_file

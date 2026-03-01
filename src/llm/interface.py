@@ -1,8 +1,11 @@
 from abc import ABC, abstractmethod
 from collections.abc import Generator
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
+
+
+ReasoningLevel = Literal["low", "medium", "high"]
 
 
 class ToolCall(BaseModel):

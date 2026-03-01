@@ -22,7 +22,7 @@ from src.prompts.document_generation import (
     DOCUMENT_GENERATION_SYSTEM_PROMPT,
     DOCUMENT_GENERATION_USER_PROMPT,
 )
-from src.statistics import update_statistics
+from src.utils.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import ReadTool
 from src.utils import (

@@ -5,7 +5,7 @@ Target number of files:
 35000
 
 File name format:
-Files should be called the first 3 letters of the team like ABC-12345.json with anywhere from 1 to 7 digits after the team prefix.
+Files names should include 3 letters of the team like DES for design with some digits after for the ticket ID followed by a description of the ticket (eg. DES-7681-centralize-button-component.json).
 
 Content rules:
 - Linear is Redwood Inference’s internal project management system (planning and executing work), used primarily by:

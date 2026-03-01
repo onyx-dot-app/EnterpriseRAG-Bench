@@ -1,0 +1,59 @@
+{
+  "key": "ENG-2414",
+  "team": "engineering",
+  "title": "Add capacity/headroom signal to routing decisions (Hosted + Dedicated)",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2026-01-07",
+  "updated_at": "2026-02-06",
+  "creator": "Miles Thornton",
+  "assignee": "Vanessa Ortiz",
+  "project": "Regional Failover Automation Upgrade",
+  "cycle": "2026-W03",
+  "estimate": "8",
+  "due_date": "2026-02-03",
+  "labels": [
+    "reliability-program",
+    "smart-routing",
+    "capacity",
+    "failover-signals",
+    "feature-flag",
+    "observability"
+  ],
+  "dependencies": [
+    "ENG-2412",
+    "ENG-2413",
+    "ENG-2418",
+    "ENG-2419"
+  ],
+  "customer_impact": "high",
+  "release": "routing-2026.02",
+  "security_review_required": "false",
+  "description": "Integrate fleet/capacity headroom signals into routing decisions for Hosted API and Dedicated. Define thresholds, dampening, and backpressure behavior so regional impairment detection and failover automation do not cascade into overload.\n\nContext\nToday we treat capacity mostly as an SRE/operator concern (dashboards + manual intervention). During real or perceived regional impairment, routing shifts load into a \u201chealthy\u201d region that may not have enough headroom, causing latency spikes, retries, and a thundering herd. This ticket makes capacity a first-class signal for the routing/policy engine and provides explicit, observable gating states.\n\nGoals\n- Provide a low-latency, low-cardinality capacity/headroom signal per region + pool that can be consumed by the policy engine deterministically.\n- Prevent failover automation from shifting traffic into insufficient headroom (avoid cascading overload).\n- Standardize thresholds + backpressure behavior (Hosted vs Dedicated) consistent with ADR-042 signal hierarchy.\n\nNon-goals\n- Replacing autoscaling; this is a routing decision input, not a scaling controller.\n- Multi-cloud rebalancing logic.\n- Per-customer bespoke capacity logic beyond tier and \u201cdedicated pool\u201d boundaries.\n\nProposed signal\n- Name: capacity_headroom_pct\n- Producer: Fleet/Capacity service (Vanessa/Keiko) aggregated into Region Health Service (ENG-2413) for routing consumption.\n- Dimensions (keep low cardinality): region, pool_class, tenant_tier\n  - region: e.g., us-east, eu-west\n  - pool_class: hosted-gpu, dedicated-gpu (optionally model-family bucket if unavoidable; prefer pool_class)\n  - tenant_tier: free, pro, enterprise (no tenant_id)\n- Refresh interval: 5s scrape, 15s publish with jitter; TTL 60s.\n- Semantics: \u201cheadroom\u201d defined as allocatable tokens/sec capacity remaining at current safe utilization target, not raw GPU free count.\n\nThresholds (v1)\n- HEALTHY: headroom >= 20%\n- DEGRADED: 10% <= headroom < 20% (routing may bias away for non-sticky workloads)\n- CRITICAL: headroom < 10% (routing should not increase load; failover controller must treat region as \u2018unsafe destination\u2019)\n- EMERGENCY: headroom < 5% OR queue_depth over hard limit (routing must shed load / apply strict backpressure)\n\nDampening / hold-down\n- Require N=3 consecutive publish intervals to enter CRITICAL/EMERGENCY (to avoid flapping from noisy utilization samples).\n- Hold-down: once CRITICAL/EMERGENCY, maintain for 2 minutes unless headroom >= 20% for 4 consecutive intervals.\n- All transitions must be emitted as audit-able routing events (ties into failover event audit log work).\n\nRouting behavior\nHosted API\n- If destination region is CRITICAL/EMERGENCY for hosted-gpu:\n  - Do not route additional requests into the region unless request is pinned (explicit region pin) or no other regions are eligible.\n  - Prefer alternate region if reachability and 5xx burn signals permit (ADR-042).\n  - If no eligible region exists, return overload response (503) with Retry-After and consistent error code.\n- Bias away during DEGRADED: reduce weight in weighted routing (do not hard-block).\n\nDedicated\n- Dedicated pools are strict boundaries: never route Hosted spillover into Dedicated unless a dedicated customer has explicitly enabled burst-to-hosted (not in scope for v1).\n- For Dedicated customer traffic:\n  - If dedicated-gpu capacity in home region is CRITICAL/EMERGENCY, controller should initiate drain/evacuation workflow only when corroborated by other signals; otherwise apply backpressure and page the dedicated on-call (avoid surprise cross-region moves).\n  - If customer has multi-region dedicated footprint: route to secondary only if secondary is HEALTHY/DEGRADED and customer residency policy permits.\n\nBackpressure behavior (API gateway integration)\n- For EMERGENCY state, gateway should:\n  - Enforce stricter concurrency caps per route.\n  - Prefer fast-fail 503 with Retry-After over long tail timeouts.\n  - Clamp retry budget to avoid exponential client amplification.\n- Ensure streaming requests receive consistent semantics (ties to ENG-2422 but capacity gating must not break idempotency expectations).\n\nMetrics + observability\n- capacity_headroom_pct (gauge) published for routing consumption (low cardinality)\n- routing_capacity_gate_state (enum as gauge: 0 healthy, 1 degraded, 2 critical, 3 emergency)\n- routing_decision_denials_total{reason=\"capacity\"}\n- routing_overload_responses_total{status_code, route_group}\n- Annotate dashboards on state transitions (requested by INT-1149 follow-up; ensure automation-driven annotations are emitted)\n\nRollout plan\n- Feature flag: capacity_signal_routing_v1\n  - Stage 0: emit signal + dashboards only (no routing impact)\n  - Stage 1: DEGRADED weighting changes in staging\n  - Stage 2: CRITICAL hard-block for a limited route_group in staging + perf canary validation\n  - Stage 3: production dry-run mode (emit \u201cwould have blocked\u201d counters)\n  - Stage 4: production enforcement for free/pro tiers, then enterprise, then dedicated (after dedicated runbook refresh)\n\nRisks / edge cases\n- False negatives: headroom appears healthy but region is impaired (must not override reachability/5xx burn).\n- False positives: transient utilization spikes could block routing (dampening + hold-down mitigate).\n- Cardinality explosion if we include model_id or tenant_id (explicitly prohibited in v1).\n- \u201cNo eligible region\u201d cases must produce clear, stable client behavior (Retry-After, consistent error codes).\n\nReferences\n- ADR-042 Failover Trigger Signal Hierarchy (capacity is corroboration + \u2018destination safety\u2019)\n- ENG-2413 Region Health Service (signal ingestion + TTL)\n- ENG-2418 SLO/Burn alerts (capacity should not page by itself; it\u2019s a routing safety gate)\n- Slack: #eng-platform capacity signal integration review (1768540123)\n- GitHub PR (implementation): redwood/pr-19823-integrate-capacity-signal-to-routing\n\nAcceptance criteria\n- [x] Policy engine has deterministic predicate(s): capacity_gate_state(region, pool_class, tier)\n- [x] Routing prevents increasing traffic to CRITICAL/EMERGENCY destinations (under feature flag)\n- [x] Gateway overload behavior documented and validated with load test (Retry-After + reduced timeouts)\n- [x] Metrics added + dashboards updated with annotations\n- [x] Staging rehearsal demonstrates no oscillation under synthetic noisy utilization\n- [x] Production dry-run shows expected \u201cwould block\u201d counts during peak without customer regressions\n- [x] Production enforcement enabled for at least one low-risk route_group with rollback playbook",
+  "comments": [
+    "2026-01-07 (Miles Thornton): Marking this P0 for game day readiness. We cannot run a controlled us-east\u2192eu-west failover without a \u2018destination safety\u2019 gate or we\u2019ll just move the blast radius. Vanessa, can you own the definition of headroom semantics and thresholds? Mina/Ravi will handle policy wiring.",
+    "2026-01-09 (Vanessa Ortiz): Agree. Proposal: headroom should be derived from tokens/sec capacity at safe util target (not GPU free). We can publish per region + pool_class + tier. Avoid model_id labels. Will sync with Allison on metric schema + cardinality guardrails.",
+    "2026-01-10 (Mina Haddad): For routing: we can treat CRITICAL/EMERGENCY as a hard constraint (\u2018region not eligible\u2019) and DEGRADED as weight reduction. Important: capacity must not override reachability/5xx burn priority; it should mostly gate destinations and reduce overload cascades.",
+    "2026-01-13 (Allison Grant): Metric naming + labels look fine. Please do not add tenant_id or route_id. We can add route_group as a controlled dimension on the *denials* counter, not on headroom gauge. Also add annotations on gate_state transitions so game day timelines are readable.",
+    "2026-01-16 (Ravi Menon): Implementation note: policy engine needs deterministic evaluation when multiple signals disagree. Capacity will be checked as \u2018destination safety\u2019 after reachability checks, before weight calc. Also adding hold-down timers to prevent flaps when headroom hovers around 10%.",
+    "2026-01-22 (Keiko Yamamoto): Watch out for autoscaler lag: headroom may stay low for a few minutes after new nodes come up. Suggest hold-down exit requires >=20% for multiple intervals (as described). Also we should publish both headroom_pct and queue_depth_hard_exceeded boolean (fold into EMERGENCY).",
+    "2026-01-29 (Vanessa Ortiz): PR is up: redwood/pr-19823 integrates capacity signal into routing eligibility checks behind capacity_signal_routing_v1. Added dry-run counters and a config file for thresholds. Still need load test to validate gateway Retry-After behavior during EMERGENCY.",
+    "2026-02-03 (Peter Holtz): Ran load test in staging with forced EMERGENCY. Gateway fast-fail reduced p99 from timeouts (~28s) to stable 503 + Retry-After within 500ms. Client retry amplification dropped after clamping retry budget. Looks good; please ensure docs/runbooks mention new overload code path.",
+    "2026-02-06 (Vanessa Ortiz): Merged PR-19823. Production dry-run enabled for free tier in us-east/eu-west route_group=chat-default. No customer tickets observed. Next: coordinate with ENG-2418 to ensure alerts don\u2019t page on capacity alone, and update runbook references in ENG-2423."
+  ],
+  "activity_log": [
+    "2026-01-07: Ticket created; scoped as P0 for game day readiness",
+    "2026-01-10: Thresholds + semantics draft approved by Routing + SRE",
+    "2026-01-16: Policy engine predicate + hold-down approach confirmed",
+    "2026-01-29: Implementation PR opened (PR-19823)",
+    "2026-02-03: Staging load test validated overload/Retry-After behavior",
+    "2026-02-06: PR merged; production dry-run enabled for limited route_group"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "activity_log"
+  ],
+  "dataset_doc_uuid": "dsid_5cbe7e1787f142dc81fce99b47f951a7"
+}

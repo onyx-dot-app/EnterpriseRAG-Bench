@@ -1,0 +1,85 @@
+{
+  "repo": "redwood",
+  "pr_number": "27468",
+  "title": "policy-engine: reduce policy eval latency with request-scope cache + batch lookups",
+  "author": "Jordan Lee",
+  "created_at": "2026-01-07",
+  "updated_at": "2026-01-10",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "perf/policy-eval-cache-batch-lookup",
+  "reviewers": [
+    "Mina Haddad",
+    "Vikram Singh",
+    "Logan Wright",
+    "Cole Summers",
+    "Amara Diallo"
+  ],
+  "labels": [
+    "performance",
+    "control-plane",
+    "routing",
+    "hot-route-protection",
+    "telemetry"
+  ],
+  "linked_linear": [
+    "ENG-4923",
+    "ENG-4924"
+  ],
+  "linked_jira": [
+    "SUP-18421"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "19",
+  "additions": "612",
+  "deletions": "238",
+  "breaking_change": "false",
+  "merged_at": "2026-01-10",
+  "merge_method": "squash",
+  "description": "Context: Hot-route capacity protection adds a policy evaluation hop on the request path (gateway/routing -> policy engine) that must remain low-overhead to avoid shifting tail latency. In canary load tests we were seeing policy eval add ~2.0\u20133.5ms p95 at peak QPS, largely due to repeated lookups (tenant/tier/route-group) and per-check datastore reads for quota + budget state. This PR reduces end-to-end policy eval time by introducing (1) a request-scope evaluation cache and (2) batch retrieval for the quota/budget state used to decide admission/priority.\n\nWhat changed: - Add request-scope cache keyed by (tenant_id, route_group, priority_class, region) for derived policy artifacts: resolved route-group match, tier defaults, priority class mapping, and compiled rule set (post-validation) - Add batch read path to quota/budget state store: evaluator builds a set of required keys (route budget, per-tier budget, per-tenant quota windows) and fetches them in a single call rather than N sequential reads - Short-circuit evaluation for common allow paths (enterprise allowlisted traffic + no overload signal) to avoid constructing unused decision objects and reduce allocations - Add microbench + production-facing metrics: policy_eval_cache_hit, policy_eval_batch_fetch_ms, policy_eval_total_ms, policy_eval_store_calls (guardrails for regression) - Preserve determinism/auditability: decision log still includes resolved rule IDs + store read versions; cache only stores derived artifacts, not mutable state - Add safe fallback: if batch fetch fails or returns partial results, evaluator falls back to prior per-key reads and annotates decision metadata with \"degraded_store_mode=true\"\n\nPerformance results (local bench + canary): - Local microbench (go test -bench): eval p95 improved from 2.8ms -> 1.1ms at 1000 concurrent with synthetic ruleset; allocations/op reduced ~35% - us-east canary (routing -> policy): policy eval overhead improved ~1.9ms -> ~0.7ms p95 at peak; store calls per eval from ~6.2 -> ~1.4 average - No change in decision outcomes in replay tests (golden logs) and integration tests for tiered quota windows\n\nWhy this is safe: - Cache invalidation: request-scope only (lives for the evaluation span); no cross-request stale policy issues - Batch fetch is read-only aggregation; decision semantics unchanged (verified by replay tests) - The fallback path ensures we don\u2019t fail-closed on store hiccups; we keep existing behavior and visibility\n\nRollout plan: - Ship behind feature flag policy.eval.batch_fetch (default OFF) - Enable in us-east canary allowlist first (paired with ENG-4928 rollout guardrails) - Monitor new metrics and alert on policy_eval_store_calls regression + policy_eval_total_ms p95\n\nRelated: - ENG-4923: priority class evaluation + deterministic decision logging - PR #27441: overload reason codes for 429 responses - PR #27427: routing admission control driven by capacity signals\n\nTesting: - Unit tests for cache keys + rule compilation caching - Integration tests covering quota windows and overload/admission behavior unchanged - Added bench tests in policy/engine/evaluator_bench_test.go\n\nNotes for reviewers: Most of the diff is evaluator refactor; please focus on correctness parity (decision equivalence tests) and the store batch API contract. Telemetry naming follows the overload metrics cardinality guidance (no per-tenant high-card tags).",
+  "commits": [
+    "policy-engine: add evaluation context + request-scope cache wrapper",
+    "quota-store: implement BatchGet for quota/budget state with partial results handling",
+    "evaluator: switch to batch fetch + fallback to per-key reads",
+    "telemetry: add policy eval cache/batch metrics + histogram buckets",
+    "tests: golden decision replay + evaluator benchmarks"
+  ],
+  "changed_files": [
+    "policy/engine/evaluator/evaluator.go",
+    "policy/engine/evaluator/cache.go",
+    "policy/engine/evaluator/keys.go",
+    "policy/engine/evaluator/decision_log.go",
+    "policy/engine/evaluator/evaluator_test.go",
+    "policy/engine/evaluator/evaluator_bench_test.go",
+    "policy/store/quota_store.go",
+    "policy/store/quota_store_batch.go",
+    "policy/store/quota_store_test.go",
+    "routing/policyclient/client.go",
+    "routing/policyclient/client_test.go",
+    "telemetry/metrics/policy_eval.go",
+    "telemetry/metrics/metrics_registry.go",
+    "config/flags/policy_eval_flags.yaml",
+    "docs/internal/flags/policy-eval-batch-fetch.md",
+    "build/ci/test-matrix.yaml",
+    "tools/replay/decision_replay.go",
+    "tools/replay/fixtures/hot-route-protection-golden.jsonl",
+    "CHANGELOG/internal/policy-engine.md"
+  ],
+  "ci_checks": [
+    "build (linux/amd64): pass",
+    "unit tests: pass",
+    "integration tests (routing+policy): pass",
+    "lint/go vet: pass",
+    "bench guard (non-blocking): pass",
+    "policy schema validation: pass"
+  ],
+  "conversation": "Mina Haddad (review): Can you confirm the cache is strictly request-scope? I\u2019m worried about stale rules if policy bundles update mid-rollout. Also, do we log whether a decision used cache?\n\nJordan Lee (author): Yep, cache lives inside EvalContext created per request in the policy service handler; it\u2019s dropped after response. No cross-request memoization. Added decision metadata field eval_cache.hit=true/false (not included in customer-facing payload, only internal decision log) so we can debug performance and parity.\n\nVikram Singh (review): BatchGet returning partial results is tricky. In fallback mode, are we potentially double-reading and increasing store load under pressure?\n\nJordan Lee (author): We only fallback for missing keys; we don\u2019t re-fetch keys that were returned. Also we annotate degraded_store_mode so we can quantify it. In normal operation it\u2019s a single call. Under store flakiness this may increase reads but preserves correctness. If it becomes frequent we can choose fail-open for best-effort only, but I\u2019d prefer visibility first.\n\nLogan Wright (review): Metric names look fine but please avoid tagging route_group as raw string if it\u2019s high-card. Can we cap it to protected route groups only or use an enum?\n\nJordan Lee (author): Good call. Updated to tag route_group_class = {protected|unprotected|unknown} and keep the raw route_group only in logs (not metrics). Also added a unit test asserting no tenant_id tag usage.\n\nCole Summers (review): For quotas: we should keep window alignment semantics identical. Does batch path reuse the same rounding logic?\n\nJordan Lee (author): It does; BatchGet keys are built by the same KeyForWindow() helper used by the old per-key reads. Added integration tests comparing decision output for a set of window boundaries.\n\nAmara Diallo (review): Any impact on 429 reason codes? We\u2019ve had customer confusion (SUP-18421).\n\nJordan Lee (author): No behavior change; reason code generation happens after policy decision. This PR should reduce the chance of policy timeouts causing ambiguous 5xx -> which was contributing to confusing client behavior.\n\nCI note: Initial run failed due to flaky integration test (timeout) in routing/policyclient; re-run passed after increasing test server deadline by 2s.\n\nApprovals: Mina (approved), Vikram (approved), Logan (approved w/ metrics change), Cole (approved).\n\nMerged via squash after addressing metric cardinality feedback and adding degraded_store_mode annotation.",
+  "release_notes": "Internal: Reduced policy-engine evaluation overhead via request-scope caching and batch quota/budget reads (behind feature flag policy.eval.batch_fetch). Added metrics to monitor eval latency and store call rate.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "conversation",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_4cc539fac7234f5bab5e817d91c8ac9a"
+}

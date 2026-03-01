@@ -1,0 +1,51 @@
+{
+  "key": "ENG-5815",
+  "team": "engineering",
+  "title": "Policy engine: deterministic compatibility checks + safe fallback for quantization profiles",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-01-23",
+  "updated_at": "2025-03-18",
+  "creator": "Ethan Park",
+  "assignee": "Jordan Lee",
+  "project": "Quantization Profile Library (opt-in)",
+  "cycle": "2025-W07",
+  "estimate": "8",
+  "due_date": "2025-03-07",
+  "labels": [
+    "quantization-profiles",
+    "policy-engine",
+    "determinism",
+    "safety-guardrails",
+    "fallback",
+    "routing"
+  ],
+  "dependencies": [
+    "ENG-5813",
+    "ENG-5814"
+  ],
+  "parent_issue": "",
+  "sub_issues": [
+    "ENG-5819"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.18",
+  "security_review_required": "false",
+  "content": "## Context\nWe\u2019re launching the Quantization Profile Library (opt-in) and need the control-plane policy evaluation to safely resolve a route\u2019s requested quantization profile into a deterministic \u201capplied profile\u201d decision for the runtime.\n\nThis ticket implements:\n1) deterministic compatibility checks for a candidate profile vs the resolved request context, and\n2) safe fallback behavior when incompatible (or when anything is missing/ambiguous).\n\nThis is the primary safety boundary between user-config intent (route settings) and runtime execution.\n\n## Problem statement\nWithout strict compatibility checks, a route can be configured to reference a profile that is:\n- incompatible with the model variant actually being served (including pinned version / alias drift)\n- incompatible with the GPU class/arch in a region or dedicated pool\n- incompatible with runtime capabilities (e.g., FP8 kernels not enabled for a given build)\n- unsafe for a context-length / seq-len regime\n\nAdditionally, non-deterministic resolution (e.g., depending on cache freshness or registry lookup ordering) can cause request-to-request variance, making debugging impossible and breaking our auditability guarantees.\n\n## Goals / non-goals\n### Goals\n- Deterministic policy evaluation outcome for a given (route config, model ref, region/tier, runtime capability set).\n- Explicit \u201cresolution outcome\u201d surfaced to runtime + telemetry: applied vs fallback vs disabled.\n- Safe, conservative fallback to baseline precision (default behavior) when any incompatibility is detected.\n- Guardrail behavior consistent across Hosted, Dedicated, and Private deployments.\n\n### Non-goals\n- Automatic per-customer profile recommendations.\n- Auto-tuning or auto-switching profiles based on live traffic.\n- Default-on enablement.\n\n## Definitions\n- **quantization_profile_ref**: route-level config value. Can be \u201cdefault\u201d (off) or a concrete profile reference.\n- **Resolved profile**: policy output after validation/compat checks (may be null if fallback/disabled).\n- **Compatibility context**: inputs to checks: model_id + variant, model version, GPU SKU class, region, deployment tier, max_context, runtime capability flags.\n\n## Proposed approach\n### 1) Deterministic resolution contract\nPolicy evaluation must be a pure function over:\n- Route config snapshot (including quantization_profile_ref)\n- Model resolution snapshot (model_id, variant, pinned version if applicable)\n- Execution context (region, deployment tier/capacity pool, gpu_sku_class)\n- Policy-engine build/runtime capability set (e.g., supports_fp8_mixed_path=true)\n- Global kill-switch / tenant-level disable (if present in config)\n\nNo \u201cbest effort\u201d partial application: if required compatibility inputs cannot be resolved, we must fallback.\n\n### 2) Compatibility checks (blocklist style)\nFor a candidate profile, fail compatibility if any of the following are true:\n- **Model mismatch**: profile.model_id != resolved_model.model_id OR profile.variant != resolved_model.variant.\n- **Profile status**: profile.status in {deprecated, blocked} (or profile.expiration passed).\n- **Hardware mismatch**: gpu_sku_class not in profile.hardware_constraints.allowed_gpu_classes.\n- **Runtime capability mismatch**: profile.quant_method requires capabilities not present (e.g., fp8 kernels, int8 act quant support).\n- **Context constraints**: resolved max_context > profile.constraints.max_context (or request context-length regime violates constraints).\n- **Known caveats**: profile.caveats contains \u201cno-determinism-risk\u201d or \u201cunstable-kv-cache\u201d flagged as hard-block for v1.\n\nNotes:\n- For v1, treat missing fields in profile constraints as conservative: missing constraint == incompatible unless explicitly documented as optional in schema.\n- We will not implement \u201cpartial compat\u201d (e.g., allow up to N context) in policy. Either compatible or fallback.\n\n### 3) Fallback behavior\nIf incompatible (or config is invalid), policy returns:\n- quantization_enabled=false\n- quant_profile_id=null\n- resolution_outcome=\"fallback\"\n- resolution_reason=one_of(enum)\n\nFallback means baseline precision/default kernels. No retries, no loops.\n\n### 4) Observability outputs (must be stable)\nEmit structured decision fields (to routing/runtime headers and metrics dimensions):\n- quantization.requested_ref (string)\n- quantization.resolved_profile_id (string or empty)\n- quantization.outcome: applied | fallback | disabled\n- quantization.reason: disabled_by_config | kill_switch | model_mismatch | hw_incompatible | runtime_capability_missing | context_incompatible | profile_blocked | profile_not_found | invalid_ref\n\n### 5) Caching and lookup semantics\n- Policy engine may consult the Model Registry for profile metadata, but the decision must be deterministic given the cached snapshot.\n- Cache key must include the exact profile_id + version (not \u201clatest\u201d) to avoid silent changes.\n- If route config uses an alias (e.g., \u201crecommended\u201d), policy must resolve alias -> pinned profile version deterministically at write time (preferred) or at evaluation time with explicit \u201cresolved_version\u201d recorded. (See open question below.)\n\n## Open questions\n1) Do we allow non-versioned aliases (\u201crecommended/latest\u201d) in route config for v1?\n   - Proposal: allow aliases only if they resolve to a specific versioned profile in the config service at write time (so evaluation is stable). If not, block enablement and require explicit version.\n\n## Implementation plan\n- Add CompatContext struct to policy engine (region, tier, gpu_sku_class, model_id/variant/version, max_context, capability flags).\n- Implement profile lookup + schema validation error handling: profile_not_found / invalid_profile.\n- Implement check pipeline in fixed order; first failure wins and sets resolution_reason.\n- Ensure no fallback loop: evaluation should never re-enter profile selection after deciding fallback.\n- Add unit tests for each reason + determinism test (same inputs => same outputs).\n- Add integration test with config service + model registry cache behavior under QPS.\n\n## Acceptance criteria\n- [x] Compatibility checks exist for model/variant, GPU class, runtime capability flags, and context-length constraints.\n- [x] Policy evaluation returns deterministic outcome fields and stable resolution_reason.\n- [x] Any incompatibility leads to baseline fallback without retries/loops.\n- [x] Metrics dimensions and log fields are populated to support dashboards: applied rate, fallback rate, reason breakdown.\n- [x] Unit tests cover all failure modes + \u201cmissing field\u201d conservatism.\n- [x] Integration test demonstrates no thundering herd (cache hit expected) and deterministic alias behavior (or alias blocked).\n\n## Links\n- ADR: adr-0137-route-level-quantization-profile-enablement\n- Serving standard: quantization-profile-compatibility-and-fallbacks\n- Related tickets: ENG-5814 (route config field), ENG-5819 (global kill-switch), ENG-5817 (dashboards)\n\n## Notes for rollout\n- Keep default behavior unchanged when field is unset or set to \u201cdefault\u201d.\n- Ensure fallback reason is visible in internal traces for debugging design partner rollouts.\n- Coordinate with SRE on alert thresholds for fallback_rate spikes (could indicate profile publication issue or registry outage).",
+  "comments": [
+    "2025-01-27 (Jordan Lee): Drafted compat check order + reason enum. Biggest risk is alias semantics (\u201crecommended/latest\u201d) causing silent changes; leaning toward resolving to versioned ID at write-time in config service. Looping in Ethan/Benji.",
+    "2025-02-03 (Ravi Menon): Please ensure we include deployment tier (hosted/dedicated/private) in the compat context. Dedicated pools have mixed SKUs behind a pool name; we should normalize to gpu_sku_class so we don\u2019t bake in per-SKU lists everywhere.",
+    "2025-02-06 (Benji Okafor): Config service can resolve aliases on write and store a fully qualified profile_id@version. That keeps policy pure. Will add a validation endpoint so Console can show why an alias can\u2019t be resolved.",
+    "2025-02-12 (Mina Haddad): Add a guard for max_context mismatch. We saw routes with 8k defaults but some profiles only validated for 4k; fallback reason should be explicit so oncall can triage quickly.",
+    "2025-02-20 (Jordan Lee): Implemented CompatContext + check pipeline behind feature flag. Added determinism unit test: freeze mock registry snapshot + assert stable decision across 1k iterations. Next: integration test w/ registry cache + rate limit protection.",
+    "2025-03-04 (Jordan Lee): Fixed edge case: profile_not_found previously returned invalid_ref; now distinct. Also ensured no secondary lookup after a failure (prevents fallback loops).",
+    "2025-03-11 (Connor O'Brien): For release readiness: we need fallback reason wired to dashboards. Please confirm metric tag names align with ENG-5817 panels: outcome + reason breakdown.",
+    "2025-03-18 (Jordan Lee): Landed + verified in perf-canary env. Fallback loop regression test added. Alias is resolved at write-time (blocked if cannot resolve to concrete version). Marking Done."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "content",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_c6afdfb328ed489d8f04a03d746d6b44"
+}

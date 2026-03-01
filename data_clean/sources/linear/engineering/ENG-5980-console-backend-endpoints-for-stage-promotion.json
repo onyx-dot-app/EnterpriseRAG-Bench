@@ -1,0 +1,73 @@
+{
+  "key": "ENG-5980",
+  "team": "engineering",
+  "title": "Console backend endpoints for Dedicated staged rollouts: timeline, gate evidence, promote/abort (RBAC)",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-02-11",
+  "updated_at": "2025-03-14",
+  "creator": "Jada Williams",
+  "assignee": "Chloe Martin",
+  "project": "Dedicated staged rollouts for reserved pools",
+  "cycle": "2025-W07",
+  "estimate": "8",
+  "due_date": "2025-03-07",
+  "release": "console-2025.03",
+  "customer_impact": "high",
+  "security_review_required": "true",
+  "labels": [
+    "console",
+    "backend",
+    "dedicated",
+    "rollouts",
+    "rbac",
+    "audit-logging",
+    "gates",
+    "api-contract"
+  ],
+  "dependencies": [
+    "ENG-5932",
+    "ENG-5941",
+    "ENG-5966"
+  ],
+  "sub_issues": [
+    "DES-447"
+  ],
+  "description": "Implement Console-facing backend endpoints to support Dedicated staged rollout workflows:\n- Render rollout timeline and stage states for a Dedicated pool\n- Retrieve gate evidence (queries + windows + observed values + pass/fail reasoning)\n- Execute actions (promote/abort/hold/force-promote where allowed) with RBAC + audit logging\n\nThis is the Console backend contract consumed by the stage timeline component and gate evidence panel.",
+  "body": "## Background\nDedicated staged rollouts introduces a first-class staged rollout plan per reserved pool. Console needs a consistent read model (timeline + evidence) and a safe action surface (promote/abort/hold + admin override) with deterministic behavior and full auditability.\n\nThis ticket is specifically about the **Console backend** API layer (BFF) that:\n1) Calls the control-plane rollouts service (DedicatedPoolRollouts) for plan + state.\n2) Calls policy engine / gate evaluation for evidence.\n3) Enforces Console RBAC and ensures **all mutations emit audit events**.\n\n## Goals\n- Provide a stable Console contract for:\n  - Rollout timeline rendering (stages, current stage, state machine, annotations)\n  - Gate evidence drilldown per stage\n  - Allowed actions + guardrails (who can click what, when)\n- Ensure **RBAC** covers:\n  - Customer admin vs Redwood operator vs Redwood admin override\n- Ensure **audit trail completeness**:\n  - create/update handled elsewhere; this ticket focuses on promote/abort/hold/force-promote surfaces\n- Ensure action endpoints are safe under retries (idempotency) and safe under concurrent UI users (optimistic concurrency)\n\n## Non-goals\n- Building the Console UI (tracked separately)\n- Implementing gate evaluation logic (policy engine)\n- Implementing routing split behavior (data plane)\n- Customer-configurable custom gate metrics (v1 is Redwood-defined allowlist)\n\n## API surface (Console BFF)\n**Base:** /console/v1/dedicated/pools/{pool_id}/rollouts/{rollout_id}\n\n### 1) Timeline endpoint\n- GET /timeline\n\nReturns a Console-ready timeline object (stages ordered, current_stage, rollout_state, and per-stage gate summary + stage start/promotion timestamps if available).\n\nResponse fields must be stable for the DES-431 timeline component:\n- rollout_id, pool_id, rollout_state: DRAFT | RUNNING | HELD | ABORTED | COMPLETED\n- stage list (ordered): stage_id, name, allocation (traffic_percent or replica_partition), state: PENDING | ACTIVE | PASSED | FAILED | SKIPPED\n- summary: current_stage_id, created_by, started_at, last_updated_at\n- annotations: last_action, last_actor, last_reason (if present)\n\n### 2) Gate evidence endpoint\n- GET /stages/{stage_id}/gate-evidence\n\nReturns evidence used to decide whether stage gates are passing, including:\n- evaluation_window: start/end timestamps, staleness indicator\n- per-gate results (allowlisted):\n  - error_rate (5xx + policy-defined retryable failures)\n  - p95/p99 latency\n  - saturation/headroom (GPU util, queue depth proxy)\n  - OOM rate\n  - request drops / 429s\n  - optional quality regression metrics where enabled\n- each gate includes: query reference, observed value(s), threshold(s), sample size, pass/fail/unknown + explanation\n\nImportant: evidence must be explicit about **UNKNOWN** due to missing/stale telemetry and must include a recommended operator action (e.g., \u201cTelemetry stale (>3m). Gate evaluation defaulting to fail-closed; use hold or force-promote if approved.\u201d)\n\n### 3) Action endpoints\nAll action endpoints must:\n- Require RBAC checks\n- Emit audit events (actor, role, reason, old/new stage/state)\n- Require an idempotency key (Idempotency-Key header)\n- Use optimistic concurrency via ETag/If-Match on rollout version where supported by control plane\n\nActions:\n- POST /actions/promote\n  - body: reason (required), expected_current_stage_id (optional but recommended)\n- POST /actions/abort\n  - body: reason (required)\n- POST /actions/hold\n  - body: reason (required)\n- POST /actions/resume\n  - body: reason (required)\n\nAdmin-only overrides (if enabled for v1 scope; must be hidden unless permission present):\n- POST /actions/force-promote\n  - body: reason (required), override_ticket (optional), acknowledge_risk (required true)\n\nThe BFF should also expose computed fields on timeline for UI enable/disable:\n- can_promote, can_abort, can_hold, can_force_promote, requires_admin\n- block reasons (strings) when disabled (e.g., \u201cStage gates failing: error_rate\u201d, \u201cTelemetry stale\u201d, \u201cRollout is HELD\u201d, \u201cInsufficient permission\u201d) \n\n## RBAC rules (Console)\nThis ticket uses existing Console authn/authz integration.\n\nProposed permissions (align with Kaitlyn Nguyen review):\n- dedicated.rollouts.view: view timeline + evidence\n- dedicated.rollouts.operate: promote/abort/hold/resume (customer admin + Redwood operator)\n- dedicated.rollouts.override: force-promote (Redwood admin only)\n\nNotes:\n- Customer admins can operate on their own pools only.\n- Redwood operators can operate on pools they have support access to (existing support access controls).\n- Force-promote must require explicit override permission and must always write an audit event with reason.\n\n## Integration details\n- Control-plane service: DedicatedPoolRollouts\n  - used for: get rollout plan/state, perform promote/abort/hold/resume\n- Policy engine gate evaluation:\n  - used for: stage gate summaries + evidence details\n  - ensure we pass (pool_id, rollout_id, stage_id, region) consistently to avoid evidence/timeline mismatches\n\n## Failure handling & determinism\n- Timeline reads should be resilient and return partial data if gate evidence system is temporarily unavailable (e.g., show gates as UNKNOWN with explanation).\n- Mutations must be deterministic:\n  - if promote called twice with same Idempotency-Key, return the same result\n  - if UI is behind and tries to promote from an older stage, return 409 with current stage + guidance\n\n## Observability\n- Emit structured logs for all action calls:\n  - actor_id, account_id, pool_id, rollout_id, stage_id, action, result, latency, upstream request ids\n- Metrics:\n  - console_rollouts_action_total{action,result}\n  - console_rollouts_action_latency_ms{action}\n  - console_rollouts_evidence_fetch_total{result}\n\n## Acceptance criteria\n- Console can render a timeline for any rollout plan (draft/running/held/aborted/completed)\n- Console can fetch gate evidence per stage and see pass/fail/unknown with explanations\n- Promote/abort/hold/resume endpoints enforce RBAC and return clear errors for unauthorized actors\n- Force-promote available only to override permission holders; requires explicit risk acknowledgement\n- All actions generate audit events with required fields (actor, reason, old/new stage/state)\n- Idempotency + optimistic concurrency prevents double-promote under retries\n\n## Test plan\n- Unit tests:\n  - RBAC matrix for each endpoint\n  - idempotency key behavior for action endpoints\n  - 409 on stale stage promotion\n- Integration tests (with rollouts service + policy engine stubs):\n  - create plan elsewhere \u2192 run timeline \u2192 promote \u2192 timeline updates\n  - evidence endpoint returns UNKNOWN when telemetry stale\n- Manual verification:\n  - use beta flag account and validate Console UI can populate both timeline and evidence panels\n\n## Rollout plan\n- Behind feature flag: console.dedicatedStagedRollouts\n- Enable for internal Dedicated pools first\n- Enable for 1\u20132 beta accounts after SRE + Security signoff\n\n## Links\n- Confluence design spec: staged-rollouts-for-dedicated-pools-design-spec\n- ADRs:\n  - adr-gate-evaluation-signals-and-thresholds\n  - adr-rollback-and-abort-semantics-for-dedicated-rollouts\n- Related PR (implementation): github/redwood/pr-28564-console-rollout-timeline-and-gate-evidence-endpoints\n- Follow-up PR (admin overrides): github/redwood/pr-28592-add-force-promote-and-hold-with-admin-guardrails\n",
+  "acceptance_criteria": [
+    "GET timeline returns ordered stage list with rollout state and per-stage gate summary suitable for Console rendering",
+    "GET gate-evidence returns per-gate observed values, thresholds, evaluation window, and explicit UNKNOWN reasons when applicable",
+    "POST promote/abort/hold/resume enforce RBAC and create audit events; return 409 for stale stage promotion attempts",
+    "Action endpoints are idempotent via Idempotency-Key and safe under concurrent callers (optimistic concurrency / version checks)",
+    "Force-promote is admin-only and requires explicit acknowledge_risk=true plus audit logging"
+  ],
+  "comments": [
+    "2025-02-12 (Chloe Martin): Drafted initial endpoint shapes based on DES-431 needs. Waiting on final evidence schema from eng-platform thread; will keep timeline contract stable and version evidence if needed.",
+    "2025-02-14 (Kaitlyn Nguyen): Security note: ensure support-access checks for Redwood operators are enforced server-side (not only UI). Force-promote must be separate permission and always include reason in audit event; no empty reasons.",
+    "2025-02-18 (Jordan Lee): Evidence endpoint should not re-run heavy queries on every request; please add caching (short TTL) keyed by (rollout_id, stage_id, window). Mark evidence with evaluated_at and staleness.",
+    "2025-02-21 (Logan Wright): Telemetry labels: use stage_id (not stage_name) to avoid cardinality drift. Ensure evidence endpoint surfaces the exact tag set used so UI can debug mismatches.",
+    "2025-02-27 (Jada Williams): Please include can_* fields + disable reasons in timeline response. Console shouldn\u2019t need to replicate state machine logic client-side.",
+    "2025-03-03 (Chloe Martin): Implemented timeline + evidence + action endpoints behind flag; added 409 protection on promote when expected_current_stage_id mismatches. Added Idempotency-Key enforcement on actions.",
+    "2025-03-06 (Rafael Mendes): Reviewed error messages: add operator guidance when gates UNKNOWN due to telemetry lag (recommend HOLD rather than force-promote). Also confirm audit events emitted for HOLD/RESUME.",
+    "2025-03-10 (Chloe Martin): PR up: redwood/pr-28564. Includes structured logging + metrics. Pending final review from Kaitlyn for RBAC edge cases.",
+    "2025-03-13 (Kaitlyn Nguyen): Approved with changes: ensure force-promote endpoint is not discoverable via timeline unless permission present; response should omit can_force_promote field entirely or return false + 'admin only'.",
+    "2025-03-14 (Chloe Martin): Merged + verified in staging with internal pool. Marking Done; follow-ups tracked for UI polish and audit export pipeline."
+  ],
+  "resolution": "Merged implementation in PR-28564. Endpoints enabled behind console.dedicatedStagedRollouts flag for internal pools; beta enablement pending program approvals.",
+  "follow_ups": [
+    "INT-1951: audit log export pipeline missing rollout promote events (ensure new event types are included in SIEM export)",
+    "ENG-5995: end-to-end QA automation should cover stale telemetry \u2192 UNKNOWN gates \u2192 HOLD behavior",
+    "SUP-28605: ensure evidence panel empty-state messaging is actionable when tag mismatch occurs"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "body",
+    "acceptance_criteria",
+    "comments",
+    "resolution",
+    "follow_ups"
+  ],
+  "dataset_doc_uuid": "dsid_30c3a94c4d0244c7bb218b72eb9f092e"
+}

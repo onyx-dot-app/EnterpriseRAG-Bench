@@ -1,0 +1,50 @@
+{
+  "repo": "redwood",
+  "pr_number": "21897",
+  "title": "Runtime: safer TP defaults (concurrency + batch guardrails) behind feature flag",
+  "author": "Julian Moore",
+  "created_at": "2025-02-23",
+  "updated_at": "2025-03-03",
+  "merged_at": "2025-03-03",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "bugfix/tp-guardrails-defaults",
+  "reviewers": [
+    "Sofia Ivanova",
+    "Noah Patel",
+    "Rafael Mendes",
+    "Aisha Bello",
+    "Connor O'Brien"
+  ],
+  "labels": [
+    "runtime",
+    "scheduling",
+    "reliability",
+    "tp",
+    "feature-flag",
+    "dedicated"
+  ],
+  "linked_linear": [
+    "ENG-4821",
+    "ENG-4824",
+    "ENG-4826",
+    "ENG-4829"
+  ],
+  "linked_jira": [
+    "SUP-48321",
+    "SUP-48344"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "312",
+  "deletions": "97",
+  "breaking_change": "false",
+  "release_notes": "Adds feature-flagged TP guardrails that cap prefill/decode concurrency and batch sizing to reduce likelihood of TP stalls during rollout of deeper scheduler/NCCL fixes. No behavior change unless enabled via runtime.tp.guardrails.v1 or per-cluster overrides.",
+  "body": "Title: Runtime: safer TP defaults (concurrency + batch guardrails) behind feature flag\n\nContext\nWe have repeated reports of TP replicas hanging under sustained mixed prefill/decode + bursty concurrency (see SUP-48321, SUP-48344; also linked to ongoing ENG-4821/ENG-4824 work). While root-cause fixes are landing (scheduler ordering, NCCL stream sync, watchdog), we still need a low-risk operational mitigation we can roll out quickly to Dedicated canaries.\n\nThis PR introduces a feature-flagged guardrail set for TP replicas that reduces the probability of starvation / collective mismatch scenarios by:\n- capping concurrent decode microbatches per TP replica\n- limiting prefill batch tokens under mixed workloads\n- bounding prefill queue depth / admission to avoid long prefill bursts starving decode + collectives\n\nThe intent is NOT to \"solve\" TP hangs, but to reduce incidence while deeper fixes roll through canary and to provide an easy on/off lever for SRE during incidents.\n\nWhat changed\n- New feature flag: runtime.tp.guardrails.v1\n  - default: OFF globally\n  - intended rollout: Dedicated canary clusters first (release plan tracked in ENG-4829)\n- When enabled for TP replicas, apply guardrail defaults unless explicitly overridden by cluster config:\n  - max_decode_concurrency_per_replica: 2 (was effectively unbounded aside from global worker limits)\n  - max_inflight_prefills_per_replica: 1 (new; prevents prefill pileups)\n  - max_prefill_batch_tokens: 16384 (new; tuned for A100/H100 mixed prompt distributions)\n  - prefill_queue_soft_limit: 8 (new; admission control backpressure)\n  - prefer_decode_on_mixed_load: true (new; small bias to keep decode iterations progressing)\n- Adds structured log event at replica init: tp_guardrails_applied=true/false + the resolved values (so we can correlate outcomes in incident review).\n- Adds metrics:\n  - runtime_tp_guardrails_enabled{cluster,replica}\n  - runtime_tp_admission_rejections_total{reason}\n- Updates docs in code comments + config schema with \"do not enable for non-TP replicas\" guidance.\n\nWhy these numbers\nThese values came out of repro runs from benchmark-lab mixed-workload harness (see ENG-4822 / benchmark-lab PR-97) and align with what oncall has been doing manually during incidents (reduce concurrency; constrain batch sizes). The goal is to keep TP replicas from entering long prefill-only regimes where decode collectives get delayed long enough to trigger downstream timeouts and eventually a stall.\n\nRisk / performance impact\n- Expected: throughput reduction on prefill-heavy workloads when flag enabled (admission control). This is considered acceptable for the canary window because the failure mode we\u2019re trading off against is replica wedging + autoscaling thrash.\n- Decode latency should improve at p95/p99 under bursty concurrency due to reduced queueing.\n- Flag is OFF by default; enabling is per-environment/per-cluster.\n\nRollout plan (high level)\n1) Land behind flag.\n2) Enable in one Dedicated canary cluster for affected account(s) during a low-risk window with SRE support.\n3) Watch: request timeout rate, TP heartbeat gaps, admission rejection rate, and customer-perceived streaming stability.\n4) If stable, expand to additional Dedicated clusters as part of runtime 1.19 canary (ENG-4829).\n\nTesting\n- Unit tests for config resolution precedence (global defaults < guardrails defaults < cluster overrides < per-model overrides)\n- Integration test in runtime config loader for \"flag on only for TP\" behavior\n- Manual validation in staging: enabling flag yields expected structured log + metrics\n\nChangelog / commits\n- 0d4c3c2 runtime/config: add runtime.tp.guardrails.v1 feature flag + schema\n- 4a9bf11 runtime/scheduler: apply tp guardrail defaults to admission control\n- 7c1ae88 runtime/metrics: add guardrails enabled + rejection counters\n- 19d0a6d tests: config precedence coverage + TP-only guardrail test\n- bbe12c9 docs: inline config docs + oncall notes (internal)\n\nFiles / areas touched (high level)\n- runtime/config/schema.yaml\n- runtime/config/loader.cc\n- runtime/scheduler/admission_control.cc\n- runtime/scheduler/replica_limits.h\n- runtime/observability/metrics_runtime_tp.cc\n- runtime/logging/structured_events.cc\n- runtime/tests/config_resolution_test.cc\n\nReviewer notes\n- This PR intentionally keeps guardrails minimal and reversible. We should avoid embedding long-term policy here; once ENG-4824/ENG-4826 land broadly, we can revisit whether any of these should become defaults (or be removed).\n\n---\nConversation (selected)\n\nSofia Ivanova (review): I like the direction. Two concerns: (1) make sure prefill_queue_soft_limit doesn\u2019t affect non-TP replicas; (2) please document precedence when both per-model and per-cluster overrides exist.\n\nJulian Moore (author): Good call. I\u2019ve gated the entire block on tp_world_size > 1 and added a precedence test + comment in loader.cc.\n\nRafael Mendes (review): From SRE perspective, can we get a metric that tells us the flag is actually active on the replica? Also, can we include a log line with resolved values so oncall doesn\u2019t have to grep config dumps.\n\nJulian Moore (author): Added runtime_tp_guardrails_enabled gauge and a structured init event with resolved caps.\n\nNoah Patel (review): The max_prefill_batch_tokens default might be too aggressive for long-context customers. Can we (a) make it explicit that this is a canary mitigation and (b) allow an override without disabling the rest of the guardrails?\n\nJulian Moore (author): Yes\u2014each cap is overrideable independently. The guardrails defaults only apply when the value is unset. Added config docs and an example.\n\nAisha Bello (review): Please include label(s) or tag(s) in metrics to break down rejections by reason so we can alert on pathological rejection loops.\n\nJulian Moore (author): Added reason label (queue_full, prefill_tokens_cap, decode_concurrency_cap).\n\nConnor O'Brien (release): Once merged, I\u2019ll wire this into the runtime 1.19 canary checklist and ensure we have a rollback step (disable flag) in the runbook.\n\n---\nCI\n- build-and-unit (linux) \u2705\n- runtime-integration-tests \u2705\n- lint/config-schema \u2705\n- perf-smoke (staging) \u2705\n\nMerge\nMerged via squash on 2025-03-03.\n\nFollow-ups\n- Coordinate enablement window + cluster list with SRE (ENG-4829)\n- Validate impact in perf-canary TP stress scenarios (ENG-4828)\n- If rejection rate is high, consider dynamic caps keyed off observed queueing/heartbeat (out of scope here)",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_a1071e7298e7467f848dcfb9389a73ac"
+}

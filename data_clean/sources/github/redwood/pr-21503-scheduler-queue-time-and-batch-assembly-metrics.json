@@ -1,0 +1,45 @@
+{
+  "repo": "redwood",
+  "pr_number": "21503",
+  "title": "runtime/scheduler: add queue time, batch assembly, and batch size distribution metrics",
+  "author": "Sofia Ivanova",
+  "created_at": "2026-01-08",
+  "updated_at": "2026-01-11",
+  "merged_at": "2026-01-11",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/scheduler-queue-batch-metrics",
+  "reviewers": [
+    "Sean Gallagher",
+    "Allison Grant",
+    "Noah Patel",
+    "Marcus Reed",
+    "Omar El-Sayed"
+  ],
+  "labels": [
+    "runtime",
+    "scheduling",
+    "perf",
+    "observability",
+    "metrics"
+  ],
+  "linked_linear": [
+    "ENG-4826"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "612",
+  "deletions": "97",
+  "breaking_change": "false",
+  "release_notes": [
+    "Added scheduler metrics to attribute tail latency to queueing vs batch formation vs execution.",
+    "Introduced guardrails (sampling + feature flags + cardinality limits) to keep prod overhead negligible."
+  ],
+  "body": "Title: runtime/scheduler: add queue time, batch assembly, and batch size distribution metrics\n\nContext\nPerf baseline & representative workload suite work (Q1 2026) needs better attribution for TTFT/TPOT regressions: we can currently see end-to-end latency and some GPU-level counters, but we don\u2019t have enough scheduler-level detail to answer: is p99 worse because requests wait longer in the queue, because batch formation takes longer, or because we\u2019re forming suboptimal batches?\n\nThis PR adds low-overhead scheduler instrumentation for:\n- Queue wait time (enqueue -> dequeued into a batch)\n- Batch assembly time (start building batch -> submit to execution)\n- Batch size distributions and \u201cwhy\u201d counters (e.g. flush reason)\n\nThese metrics are used by benchmark-lab/perf-suite runs and will be consumed by baseline dashboards + perf-canary gating. In production, the default configuration is conservative (sampling + coarse histograms + no per-request labels).\n\nWhat\u2019s included\n1) New metrics (runtime)\nAll metrics are emitted from the scheduler loop on the server side. Definitions:\n- redwood_scheduler_queue_wait_ms (histogram)\n  - Measures time a request spent waiting in the scheduler\u2019s pending queue before being admitted into a batch.\n  - Scope: per request, measured at scheduler boundary (server-side only).\n- redwood_scheduler_batch_assembly_ms (histogram)\n  - Measures wall time spent assembling a batch (collecting requests, checking constraints, building the submission payload).\n  - Scope: per batch.\n- redwood_scheduler_batch_size (histogram)\n  - Number of requests per submitted batch.\n- redwood_scheduler_batch_tokens_prefill (histogram)\n  - Total prefill tokens in the batch at submit time.\n- redwood_scheduler_batch_tokens_decode (histogram)\n  - Total decode tokens \u201cbudget\u201d at submit time (best-effort estimate; see notes below).\n- redwood_scheduler_flush_reason_total (counter)\n  - Reasons: max_batch_size, max_tokens, max_queue_delay, no_capacity, fairness_yield, model_mismatch.\n- redwood_scheduler_overload_dropped_total (counter)\n  - Incremented when scheduler load-sheds due to overload/backpressure thresholds (existing behavior; this makes it visible).\n\nTagging (cardinality guardrails)\n- Required tags (always on): model_family, deployment_mode (hosted|dedicated|private), region, gpu_sku\n- Optional tags (off by default; on for perf-suite runs): bench_run_id, workload_name\n- Explicitly NOT tagging by: request_id, tenant/customer_id, route, prompt_length_bin (those are handled elsewhere, or in benchmark harness results)\n\n2) Feature flags / guardrails\n- Default: only batch-level metrics on; request-level queue-wait metrics sampled.\n- New config:\n  - scheduler.metrics.enabled (default true)\n  - scheduler.metrics.request_sample_rate (default 0.01 in prod, 1.0 in benchmark mode)\n  - scheduler.metrics.enable_bench_tags (default false)\n  - scheduler.metrics.histogram_mode (coarse|fine; default coarse)\n- In benchmark mode (env REDWOOD_BENCHMARK_MODE=1), the server:\n  - sets request_sample_rate=1.0\n  - enables bench tags\n  - switches histograms to \u201cfine\u201d bucket set\n\n3) Minimal codepath overhead\n- No allocations in the hot loop for the common case (coarse histograms + no extra tags).\n- Queue-wait timing uses an integer timestamp stored on the Request object at enqueue time; sampled emission avoids per-request histogram updates at 100% QPS.\n- Batch assembly timer uses a single timer per batch.\n\nNotes / measurement boundaries\n- Queue wait starts at scheduler enqueue and ends at admission into a batch. It does not include network receive, request parsing, auth, or model execution.\n- Batch assembly time includes time spent in scheduler checks and building the batch payload, but not time waiting for GPU execution.\n- Decode tokens at batch submit time are an estimate derived from request max_tokens and current phase; it is intended for distribution/trend analysis (not accounting).\n\nIllustrative snippet (for reviewers)\n- Request enqueue timestamp:\n  - request->scheduler_enqueued_at_ns = clock::now_ns();\n- Sampled queue wait:\n  - if (rng.sample(request_sample_rate)) histogram.observe(now - request->scheduler_enqueued_at_ns)\n- Batch assembly:\n  - auto t0 = clock::now_ns();\n  - ... assemble ...\n  - batch_assembly.observe(clock::now_ns() - t0)\n\nFiles / areas changed (high level)\n- runtime/scheduler/\n  - added enqueue timestamp plumbing\n  - batch assembly timer + flush reason counters\n- runtime/metrics/\n  - new metric definitions and bucket sets\n- runtime/config/\n  - scheduler.metrics.* config surface + benchmark-mode defaults\n- docs/internal/\n  - metric definitions + dashboard query examples\n\nTesting\n- Unit tests:\n  - SchedulerMetricsTest.QueueWaitSamplingDoesNotEmitWhenDisabled\n  - SchedulerMetricsTest.FlushReasonCounters\n  - ConfigTest.BenchmarkModeOverrides\n- Load test (local): verified CPU overhead within noise at 50k rps with request_sample_rate=0.01.\n- Benchmark harness: ran representative chat streaming workload; metrics visible and correlate with observed TTFT changes when forcing max_queue_delay.\n\nRollout plan\n- Merge behind conservative defaults.\n- Enable bench tags only in benchmark fleet via REDWOOD_BENCHMARK_MODE.\n- After dashboards land, SRE can choose to temporarily increase sampling for incident triage with a time-bounded config override.\n\nReview conversation (abridged)\n- Sean Gallagher (SRE): \u201cPlease ensure we\u2019re not exploding cardinality in prod. bench_run_id/workload_name must be opt-in.\u201d\n  - Sofia: Updated config to default bench tags OFF; benchmark mode is explicit.\n- Allison Grant (Observability): \u201cHistogram buckets need to match our standards; avoid high-resolution buckets in prod.\u201d\n  - Sofia: Added histogram_mode (coarse|fine) and made coarse default.\n- Noah Patel: \u201cQueue-wait measurement boundary should be documented; otherwise people will misinterpret it as end-to-end latency.\u201d\n  - Sofia: Added \u2018Notes / measurement boundaries\u2019 section and inline comments in code.\n- Marcus Reed: \u201cCan we emit a batch size distribution split by prefill vs decode phase?\u201d\n  - Sofia: Added batch_tokens_prefill and batch_tokens_decode histograms; phase split for batch size itself deferred to follow-up to keep cardinality controlled.\n\nCI\n- Buildkite: runtime-build (pass)\n- Unit tests: runtime-unit (pass)\n- Lint/format: clang-format + bazel lint (pass)\n- Perf smoke (non-gating): scheduler-metrics-smoke (pass)\n\nMerge\n- Squash merged to main.\n\nFollow-ups\n- Wire these metrics into baseline dashboards spec (separate PR in observability-pack).\n- Add trace correlation hook for perf-suite runs (sampled) so dashboard -> trace drill-down is one click.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_ed463c3acff94c5d94e2959eb955d84d"
+}

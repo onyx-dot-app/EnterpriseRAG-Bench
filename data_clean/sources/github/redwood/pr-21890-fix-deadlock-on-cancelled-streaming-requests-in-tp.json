@@ -1,0 +1,93 @@
+{
+  "repo": "redwood",
+  "pr_number": "21890",
+  "title": "Fix deadlock on cancelled streaming requests in tensor-parallel decode",
+  "author": "Noah Patel",
+  "created_at": "2025-02-20",
+  "updated_at": "2025-02-24",
+  "merged_at": "2025-02-24",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "bugfix/tp-streaming-cancel-deadlock",
+  "reviewers": [
+    "Hiro Tanaka",
+    "Sofia Ivanova",
+    "Omar El-Sayed",
+    "Rafael Mendes"
+  ],
+  "labels": [
+    "runtime",
+    "tp",
+    "streaming",
+    "reliability",
+    "nccl",
+    "incident-followup"
+  ],
+  "linked_linear": [
+    "ENG-4821",
+    "ENG-4822",
+    "ENG-4826"
+  ],
+  "linked_jira": [
+    "SUP-48344",
+    "SUP-48377"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "412",
+  "deletions": "167",
+  "release_notes": "Fixes a TP streaming cancellation path that could leave ranks waiting on collectives (client disconnect / request cancel). Improves error surfacing for cancelled streaming requests and adds a repro + regression test.",
+  "breaking_change": "false",
+  "body": "Context: We\u2019ve observed intermittent hangs/timeouts on TP replicas correlated with streaming responses during peak load. One reproducible signature is a client disconnect (or server-side cancellation) mid-decode that triggers an early-exit path on one rank while other ranks continue into the next NCCL collective. Because our TP decode loop assumes all ranks execute an identical sequence of collectives per step, this can leave some ranks waiting indefinitely in ncclGroupEnd()/allReduce while another rank has already unwound. This PR fixes the cancellation path to preserve collective ordering invariants across ranks and to fail fast rather than wedging the replica.\n\nRepro: Added an integration repro that opens a streaming request, reads N chunks, then hard-closes the client connection (RST) and repeats under concurrency against a TP=4 replica with mixed prefill/decode. Prior to this change the replica can wedge with no explicit NCCL error, while request-level timeouts climb and heartbeats stop.\n\nFix overview: (1) Introduce a per-step TP cancellation handshake: when any rank observes request cancellation, it sets a local abort flag and participates in a small control collective (allReduce OR on abort) at a defined synchronization point before the next compute/collective boundary. (2) Ensure we do not return early from the per-rank decode loop until we have either (a) completed the step\u2019s required collectives or (b) performed the abort handshake and transitioned into a uniform abort path that all ranks execute. (3) On abort, mark the request as cancelled with a structured runtime error code and drain the replica if we detect we were mid-step (this aligns with ENG-4826 semantics; draining is guarded and rate-limited).\n\nImplementation details: - Adds TPAbortState tracked per in-flight request group (request_id + tp_group_id). - Adds explicit \u2018cancel_sync\u2019 barrier in the decode step state machine to avoid skipping collectives. - Moves client-disconnect cancellation handling out of the per-token stream writer and into the request lifecycle so it\u2019s visible to the scheduler/TP driver in time. - Ensures CUDA graph capture mode bypasses cancel_sync (graphs require fixed control flow); in graph mode we instead defer cancellation until a safe boundary and return a CANCELLED status without early-exit. - Improves logs/metrics: emits tp_abort_reason=client_disconnect|server_cancel|deadline_exceeded and includes rank, step, and in_flight_collectives counter.\n\nTesting: - New regression test that simulates a client disconnect while streaming (uses a test client that sends RST) and asserts the replica continues to serve subsequent requests without wedging. - Stress test variant that runs cancellation under concurrency with long-context + streaming decode. - Added a fault-injection unit test for the decode step state machine to validate uniform abort path is taken across ranks.\n\nRisk/rollout: Small but safety-sensitive; modifies decode control flow. Change is behind runtime flag runtime.tp.cancel_sync=on by default for canary; we can flip off if we see perf regression (expected overhead ~1 tiny control collective only when cancellation happens; no impact to steady-state decode). If we observe any increase in false replica drains, we\u2019ll tighten the \u2018mid-step\u2019 heuristic and/or route to load-shed instead.\n\nReferences: ENG-4821 (initiative), ENG-4822 (repro harness), SUP-48344/SUP-48377 (customer reports), and the 2025-02-17 incident signature (client disconnect + streaming timeouts on TP replicas).",
+  "commits": [
+    "runtime/tp: add abort state + cancel_sync handshake in decode loop",
+    "runtime/streaming: plumb client disconnect cancellation into request lifecycle",
+    "runtime/errors: add structured CANCELLED_TP_ABORT code + context fields",
+    "tests: add streaming disconnect repro + regression coverage for TP=4",
+    "obs: emit tp_abort_reason + rank/step context in structured logs"
+  ],
+  "changed_files": [
+    "runtime/tp/decode_step.cc",
+    "runtime/tp/decode_step.h",
+    "runtime/tp/tp_group.cc",
+    "runtime/tp/tp_abort_state.cc",
+    "runtime/streaming/stream_writer.cc",
+    "runtime/request/request_lifecycle.cc",
+    "runtime/errors/runtime_error_codes.h",
+    "runtime/metrics/tp_metrics.cc",
+    "runtime/logging/structured_events.cc",
+    "tests/integration/test_streaming_disconnect_tp.py",
+    "tests/stress/tp_cancel_under_concurrency.yaml",
+    "tests/unit/test_tp_decode_abort_state_machine.cc",
+    "docs/runbooks/runtime_tp_hang_mitigation.md",
+    "configs/flags/runtime_defaults.yaml"
+  ],
+  "ci_checks": [
+    "buildkite/redwood-linux-gpu-smoke: PASS",
+    "buildkite/redwood-unit-tests: PASS",
+    "buildkite/redwood-integration-tests: PASS",
+    "buildkite/redwood-lint-clang-tidy: PASS",
+    "buildkite/redwood-perf-microbench: PASS (no baseline regression detected)",
+    "buildkite/redwood-tp-stress-canary (A100-80GB, TP=4): PASS"
+  ],
+  "review_conversation": [
+    "Hiro Tanaka (Kernel) - 2025-02-21: I agree with the diagnosis. Two asks: (1) can you confirm cancel_sync is not in the steady-state path? (2) what happens if cancellation arrives after some ranks have already enqueued the NCCL op on a different stream? Noah Patel - 2025-02-21: (1) cancel_sync only triggers when abort_flag is set; steady-state decode has no extra collectives. (2) we check cancellation at the \u2018step boundary\u2019 before enqueueing any NCCL for the next step; if cancellation arrives mid-step, we finish the step\u2019s required collectives then enter uniform abort path. I added comments + a unit test covering \u2018cancel arrives after logits compute but before reduce\u2019 to ensure we don\u2019t early-exit.",
+    "Sofia Ivanova (Scheduling) - 2025-02-22: Please make sure scheduler can observe cancellation quickly; right now the stream writer is where disconnect is detected. Also, does draining on abort risk turning transient cancels into capacity churn? Noah Patel - 2025-02-22: Moved disconnect detection into request lifecycle and propagate to scheduler via RequestState::cancelled(). Drain only occurs when we detect mid-step abort in TP (risk of rank divergence). Normal cancellations at safe boundary do not drain. Added rate limit: max 1 drain per replica per 60s due to cancel abort.",
+    "Omar El-Sayed - 2025-02-22: Can we add metrics for how often this triggers and distinguish client disconnect vs server-side cancellation vs deadline? Also ensure we don\u2019t log request prompts. Noah Patel - 2025-02-22: Added tp_abort_reason label (client_disconnect|server_cancel|deadline_exceeded) and tp_abort_mid_step boolean; logs include request_id hash + tp_group_id only (no prompt/token content).",
+    "Rafael Mendes (SRE) - 2025-02-23: Please document operational behavior: what error do customers see, and when do we drain? Also add a note to the runbook about identifying this signature. Noah Patel - 2025-02-23: Updated runbook section \u2018Streaming cancellations\u2019 with expected error code CANCELLED_TP_ABORT and how to correlate with tp_abort_reason metrics + drain events. Also added a short note about toggling runtime.tp.cancel_sync if needed during canary.",
+    "Hiro Tanaka - 2025-02-24: Looks good. Approving if you add one more guard for CUDA graph capture mode (avoid dynamic control collectives). Noah Patel - 2025-02-24: Added graph-mode branch: defer cancellation until safe boundary, skip cancel_sync in capture mode, return CANCELLED without early-exit. Added test that runs with graph capture enabled. Hiro approved."
+  ],
+  "merge_outcome": "Merged via squash into main",
+  "linked_artifacts": [
+    "Repro log excerpt: integration test shows client RST at token=37; all ranks enter abort path and complete step barrier; no hanging NCCL calls observed",
+    "Perf note: no measurable steady-state regression; cancellation path adds ~0.3ms on abort events only (A100 TP=4)",
+    "Follow-up: ENG-4826 will unify drain/abort semantics and alerting thresholds across TP stall scenarios"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "review_conversation",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_943434fe130a43479f6d12478d31e433"
+}

@@ -1,0 +1,49 @@
+{
+  "key": "ENG-2413",
+  "team": "engineering",
+  "title": "Implement Region Health Aggregator Service + integrate into routing signal pipeline",
+  "status": "In Review",
+  "priority": "P0",
+  "created_at": "2026-01-06",
+  "updated_at": "2026-02-06",
+  "creator": "Miles Thornton",
+  "assignee": "Ethan Park",
+  "project": "Regional Failover Automation Upgrade",
+  "cycle": "2026-W05",
+  "estimate": "8",
+  "due_date": "2026-02-07",
+  "labels": [
+    "reliability-program",
+    "failover",
+    "routing",
+    "control-plane",
+    "region-health",
+    "observability"
+  ],
+  "parent_issue": "ENG-2411",
+  "dependencies": [
+    "ENG-2412",
+    "ENG-2417",
+    "ENG-2418"
+  ],
+  "customer_impact": "high",
+  "release": "control-plane-2026.02",
+  "security_review_required": "false",
+  "description": "## Context\nToday failover triggers are split across multiple systems (burn alerts, ad-hoc checks, some routing policies) and are hard to validate safely. We need a single, well-defined **Region Health** signal that can be consumed by routing/policy evaluation and by the failover controller.\n\nThis ticket implements a **Region Health Aggregator Service** (control-plane owned) that ingests multiple signal streams, computes a deterministic health state per region (and per \"route\" where relevant), and exposes an API for routing to consume as a first-class signal.\n\nPrimary goals:\n- Provide a single authoritative, low-latency region health view to routing/policy engine.\n- Make signal evaluation deterministic and debuggable (what inputs caused UNHEALTHY?).\n- Prevent stampedes and noisy decisioning via caching/TTL + dampening at the service boundary.\n\nNon-goals:\n- This service does not execute failover actions (that\u2019s the controller).\n- This service does not define final failover trigger hierarchy/rollbacks (ADR-042/043 + ENG-2412/2416).\n\n## Proposed Service Contract\n### Health model\nWe expose both a **state** and **evidence** so operators and automation can explain decisions.\n\n**State enum** (single winner, deterministic):\n- HEALTHY\n- DEGRADED\n- UNHEALTHY\n- UNKNOWN\n\n**Evidence**: a compact list of evaluated signals (normalized) and their last update times.\n\n### Read API (routing consumption)\n- `GET /v1/region-health?regions=us-east,eu-west&product=hosted|dedicated&route=<optional>`\n  - Returns one entry per region:\n    - `state`\n    - `updated_at`\n    - `staleness_ms`\n    - `confidence` (low/med/high)\n    - `reasons` (stable, low-cardinality reason codes)\n\nReason code examples (stable strings):\n- `reachability_failed`\n- `error_burn_critical`\n- `latency_burn_critical`\n- `capacity_exhausted`\n- `control_plane_degraded`\n- `signal_stale`\n\n### Internal ingestion\nSignals are ingested via a mix of pull and push:\n- Perf-canary probe feed (cross-region reachability + latency): push or pull depending on final integration with perf-canary.\n- SLO/burn aggregates: pull from metrics backend (pre-aggregated to keep cardinality low).\n- Capacity headroom: pull from fleet service (Dedicated pools + Hosted shared pools).\n- Control plane / gateway availability: pull from service health endpoints.\n\n## Caching / TTL / Stampede protection\nRequirements:\n- Routing reads happen at high QPS and must not cascade load during partial outages.\n- Health evaluation must be fast and stable under flapping signals.\n\nImplementation plan:\n- In-memory cache per instance keyed by `(product, route?, region)`.\n- Cache TTL: 2s baseline for Hosted, 5s baseline for Dedicated, with \u00b120% jitter.\n- Stale-if-error semantics: if an upstream signal fetch fails, reuse cached last-known evaluation up to a max staleness window (e.g., 30s) and downgrade `confidence` + add `signal_stale` reason.\n- Expose `staleness_ms` and `updated_at` to make this observable.\n\n## Deterministic evaluation (handoff to ADR-042)\nThis service should not own the final cross-signal priority rules long-term, but needs an initial deterministic reducer so routing can consume a single state.\n\nInterim approach (aligned with ADR-042 draft):\n- If reachability is FAILED (N of M probes failing) -> UNHEALTHY\n- Else if 5xx burn is CRITICAL -> UNHEALTHY\n- Else if tail latency burn is CRITICAL -> DEGRADED (or UNHEALTHY if corroborated by errors)\n- Else if capacity headroom below threshold -> DEGRADED\n- Else HEALTHY\n- If all inputs are stale beyond max staleness -> UNKNOWN\n\nImportant: evaluation must record which rule fired so the failover controller and on-call can audit \"why\".\n\n## Integration points\n1) Routing / Policy engine:\n- Add a region_health predicate / signal adapter that calls the service (or reads from local sidecar cache) and supplies a normalized value to policy evaluation.\n- Ensure deterministic behavior: on identical inputs + cached responses, evaluation does not vary across nodes.\n\n2) Failover Controller:\n- Controller uses region health state and evidence as one of its trigger inputs (but controller implements final trigger hierarchy + approvals).\n\n3) Observability:\n- Emit structured logs for evaluations and cache hits/misses.\n- Metrics:\n  - `region_health_state{region,product}` (low-cardinality)\n  - `region_health_confidence{region,product}`\n  - `region_health_cache_hit_total{product}`\n  - `region_health_upstream_fetch_error_total{source}`\n  - `region_health_eval_latency_ms{product}`\n\n## Acceptance criteria\n- [ ] Service deployed in staging with stable API contract.\n- [ ] Cache + jitter implemented; verified routing reads do not cause upstream thundering herd in load test.\n- [ ] Evidence includes stable reason codes and last update timestamps.\n- [ ] Routing integration behind a feature flag; can be enabled per route/tier.\n- [ ] Dry-run failover controller can consume region health state and include it in audit events.\n- [ ] Dashboard panels exist to view state transitions and confidence/staleness.\n\n## Links\n- Confluence service doc (draft): `eng-platform/systems-and-services/region-health-service`\n- ADR-042 (signal hierarchy): `architecture-and-standards/decision-records/adr-042-failover-trigger-signal-hierarchy`\n- GitHub PRs:\n  - `redwood/pr-19810-add-region-health-aggregator-service`\n  - `redwood/pr-19825-region-health-cache-ttl`\n  - `redwood/pr-19835-better-logging-for-region-health-evaluations`\n\n## Open questions\n1) Should `route` be a first-class dimension in v1 API, or do we only support `product + region` and let routing apply route-level logic? (Current proposal: route optional; keep cardinality controlled via allow-list.)\n2) For Dedicated, do we compute health at pool granularity (customer pool) vs region? Proposal: region-level with optional `pool_id` in internal-only endpoint; external API remains region-scoped.\n3) How do we represent \"partial impairment\" in evidence without exploding reason labels? Proposal: stable reason codes + numeric \"severity\" in logs only.\n",
+  "comments": [
+    "2026-01-07 (Ethan Park): Kicked off implementation in control-plane repo. Will keep API minimal for v1: state/confidence/reasons/staleness. Evidence details for humans will be structured logs + console drilldowns rather than bloating response payload.",
+    "2026-01-08 (Allison Grant): Please keep reason codes to a fixed enum and do not add free-form text. For dashboards we need predictable labels; anything verbose should go into logs/audit events.",
+    "2026-01-10 (Ravi Menon): Routing needs a bounded timeout + fallback behavior. Suggest: 50ms deadline per call, fail-open to cached value; if no cached value, return UNKNOWN (do not mark healthy).",
+    "2026-01-13 (Victor Alvarez): Reachability probes must be treated as authoritative for \"UNHEALTHY\" only when failures are cross-AZ and not isolated. Please ensure we require >=2 probe sources (e.g., perf-canary + gateway egress) before flipping to UNHEALTHY on reachability alone.",
+    "2026-01-15 (Miles Thornton): During game day we saw missing signal streams cause controller crash. Region health service should treat missing upstreams as stale signals, not fatal errors, and always return a response with `confidence=low` + `signal_stale` reason. This is a hard requirement.",
+    "2026-01-22 (Vanessa Ortiz): Capacity signal needs hysteresis. If headroom briefly dips below threshold during a drain, we don\u2019t want region health to flap. Add a short hold-down or require sustained low headroom for N seconds before tagging DEGRADED.",
+    "2026-02-03 (Jordan Lee): Policy engine adapter is ready behind flag `region_health_signal_enabled`. Waiting on final endpoint path/version so we can lock config schema.",
+    "2026-02-06 (Ethan Park): PR-19810 + TTL jitter PR are up, logging improvements in progress. Next step: add a small conformance test suite so routing + controller can replay recorded signal snapshots and assert deterministic output."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_9fc877633e624b328668135bc8978a05"
+}

@@ -5,7 +5,7 @@ Target number of files:
 5000
 
 File name format:
-File names should be short and descriptive with words connected with dashes like company-pto-policy-2025.json for example.
+File names should be short and descriptive with words connected with dashes (e.g. company-pto-policy-2025.json).
 
 Content rules:
 - Confluence is Redwood Inference’s formal internal documentation system.

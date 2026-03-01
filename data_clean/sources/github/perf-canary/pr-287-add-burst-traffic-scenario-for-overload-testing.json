@@ -1,0 +1,42 @@
+{
+  "repo": "perf-canary",
+  "pr_number": "287",
+  "title": "Add burst traffic scenario to validate overload shedding vs timeouts",
+  "author": "Christine Wong",
+  "created_at": "2025-11-06",
+  "updated_at": "2025-11-10",
+  "merged_at": "2025-11-10",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/burst-traffic-overload-scenario",
+  "reviewers": [
+    "Rafael Mendes",
+    "Aisha Bello",
+    "Peter Holtz",
+    "Sofia Ivanova"
+  ],
+  "labels": [
+    "perf",
+    "sre",
+    "reliability",
+    "overload-protection",
+    "hosted-api"
+  ],
+  "linked_linear": [
+    "ENG-4821",
+    "ENG-4830"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "7",
+  "additions": "462",
+  "deletions": "38",
+  "linked_jira": [
+    "SUP-2841"
+  ],
+  "body": "Summary: This PR adds a new perf-canary scenario that generates bursty, highly-variable request load (concurrency ramp + prompt-length ramp) against Hosted API routes to validate overload protection behavior. The goal is to ensure we see explicit overload responses (429/503 w/ stable error codes + Retry-After) and graceful degradation instead of tail-latency blowups/timeouts during bursts.\n\nContext: As part of the Hosted circuit breakers + load shedding reliability program (ENG-4821), we need a repeatable canary that exercises the failure mode we see in real incidents: fast concurrency spikes plus long prompts causing prefill pressure and queue backlogs. We previously only had steady-state throughput scenarios, which are not good at catching retry storms/timeouts. This scenario is intended to be used in dark launch + regional canary gates.\n\nWhat\u2019s included: 1) New scenario: burst_overload_ramp. Phases: (a) Warm-up steady load, (b) Concurrency ramp 50 -> 600 over ~6 minutes with jittered arrival, (c) Prompt length ramp (p50 ~600 toks, p95 ~6k toks) while holding concurrency high, (d) Recovery ramp-down to verify breaker close and latency returns. Routes: /v1/chat/completions (streaming ON + OFF variants) and /v1/completions (non-stream) behind a single scenario config switch. Models: configurable, defaulting to the primary hosted chat model and a fallback-eligible model pair when enabled. Regions: parameterized (default us-east) for canary rollouts.\n\n2) Assertions/health checks: - Latency SLO guard: p95 and p99 tracked per-phase; scenario fails if p99 latency exceeds threshold for >N consecutive windows while shed rate remains low (signals we are timing out rather than shedding). - Timeout/transport errors: hard fail if client-side timeouts or connection resets exceed a small budget, since overload should be expressed as an explicit error response. - Overload response contract: when we get 429/503, validate JSON payload contains (a) stable overload error code, (b) request/correlation ID, and (c) recommended retry guidance. Validate Retry-After header is present for overload responses (warn -> fail in phase C if missing). - Retry-storm avoidance: scenario client respects Retry-After and applies exponential backoff + jitter for idempotent retries only; by default, we do not retry streaming requests.\n\n3) Metrics export: - Adds a scenario-local summary of: overload_rate, breaker_open_rate (derived from response codes/payload), timeout_rate, and per-phase latency deltas. - Writes a small JSON summary artifact consumed by the canary runner so SRE can gate rollouts on the key numbers without spelunking logs.\n\n4) Docs: - Adds a short README snippet for running locally and recommended flags for canary environments (region/model overrides, max_rps guardrails, and how to disable retries for incident simulations).\n\nImplementation details: - Workload generation uses our existing arrival scheduler but adds: (a) phase-aware target concurrency, (b) per-request prompt size distribution (log-normal-ish) to mimic real prompt variance, and (c) optional streaming mode toggle. - Response validation looks for overload error codes in the JSON body (string match for now) and validates Retry-After parsing. This is intentionally strict to catch regressions like \u201c429 without header\u201d seen in SUP-2860 and \u201c503 without code\u201d which leads to ambiguous client behavior. - Kept dimensions low to avoid high-cardinality metrics. Scenario emits only per-phase aggregates plus a small set of tagged counters (region, route, streaming=true/false).\n\nFiles changed (high level): - scenarios/burst_overload_ramp.yaml (new) - scenarios/burst_overload_ramp.streaming.yaml (new) - runner/scenario_loader.go (add schema fields: phases, prompt_profile, streaming toggle) - workload/prompt_profile.go (new: prompt length distribution helpers) - validation/overload_contract.go (new: Retry-After + error payload checks) - cmd/perf-canary/README.md (updated) - tests/overload_contract_test.go (new)\n\nHow to run: - Local quick run (safe): perf-canary run --scenario burst_overload_ramp --duration 12m --region us-east --max-rps 120 --dry-run=false - Streaming variant: perf-canary run --scenario burst_overload_ramp.streaming --duration 12m --region us-east - Suggested canary gate: run in canary env with a capped max-rps and compare (timeout_rate + p99) against baseline; overload_rate is expected to increase during peak phases.\n\nRisk/rollout: This only affects perf-canary. The default scenario set is unchanged; the new scenario must be explicitly invoked. We keep conservative defaults (max_rps cap, no retries for streaming) to prevent accidental pressure on prod.\n\nChecklist: - [x] Scenario config reviewed with SRE (Rafael) - [x] Retry/backoff behavior respects Retry-After - [x] Fails on timeouts/connection errors beyond budget - [x] CI green - [x] Added unit tests for Retry-After parsing and payload requirements\n\nReview notes: Rafael Mendes: \u201cCan we make the failure mode explicit? I want the scenario to fail if timeouts rise but shed stays near zero (meaning breaker isn\u2019t firing). Also please ensure we don\u2019t retry streaming; it masks the issue and is not what customers do.\u201d Christine Wong: \u201cDone. Added a guardrail: if p99 spikes + timeout_rate > 0.5% in phase B/C while overload_rate < 0.2%, we fail with a message pointing to the likely regression (breaker not opening / admission not shedding). Also disabled retries for streaming by default; non-stream retries are capped and honor Retry-After.\u201d Aisha Bello: \u201cPlease keep summary dimensions minimal; we\u2019ve had cardinality blowups when scenarios emit per-prompt-length tags.\u201d Christine Wong: \u201cAck. Only emits per-phase aggregates and route/streaming booleans; prompt lengths are only reported as histogram buckets locally in the JSON artifact (not as tagged metrics).\u201d Sofia Ivanova: \u201cPrompt length ramp: can you align to the runtime team\u2019s expectation (long prefill is the pain point). Also, would be great if we track a prefill-like marker even client-side.\u201d Christine Wong: \u201cAdjusted prompt distribution so p95 is long enough to hit prefill pressure and added a client-side \u2018time_to_first_token\u2019 measurement for streaming; included in the summary artifact for phase C.\u201d\n\nCI: - build: pass - unit-tests: pass - lint: pass - integration smoke (staging endpoint): pass\n\nMerge: Squash merged to main.\n\nFollow-ups: - Add optional dependency brownout phase (simulate downstream latency) as part of game day scripts (ENG-4830). - Once ADR-014 error payload is fully rolled out, tighten payload validation from string match -> structured schema validation.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_828fab3f7c104ecea0a4cbfa57077fb8"
+}

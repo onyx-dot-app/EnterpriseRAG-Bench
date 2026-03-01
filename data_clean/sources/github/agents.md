@@ -5,7 +5,7 @@ Target number of files:
 8000
 
 File name format:
-The files should be called pr-1234.json where "pr-" is always the same and followed by a few digits and ending with .json.
+The files should start with "pr-" (since they're all Pull Request) followed by a few digits and a short description of the PR (e.g. pr-18345-address-parallelism-bottleneck-in-gpu-inference.json).
 
 Content rules:
 - This directory represents GitHub artifacts, modeled as pull requests (PRs).

@@ -1,0 +1,61 @@
+{
+  "key": "ENG-5410",
+  "team": "engineering",
+  "title": "Cardinality guardrails for shadow-traffic quality metrics (hard limits + sampling)",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2026-01-14",
+  "updated_at": "2026-02-18",
+  "creator": "Allison Grant",
+  "assignee": "Caleb Johnson",
+  "project": "Shadow traffic tool for eval metrics",
+  "cycle": "2026-W06",
+  "estimate": "8",
+  "due_date": "2026-02-14",
+  "customer_impact": "high",
+  "release": "console-2026.02",
+  "security_review_required": "false",
+  "labels": [
+    "shadow-traffic",
+    "observability",
+    "telemetry",
+    "metrics",
+    "cardinality",
+    "guardrails",
+    "sre"
+  ],
+  "dependencies": [
+    "ENG-5404",
+    "ENG-5411",
+    "ENG-5405"
+  ],
+  "related_prs": [
+    "sources/github/redwood/pr-24872-shadow-telemetry-events-and-ingestion.json",
+    "sources/github/observability-pack/pr-391-add-quality-delta-dashboards.json",
+    "sources/github/redwood/pr-24895-shadow-pipeline-backpressure-and-circuit-breaker.json"
+  ],
+  "links": [
+    "sources/confluence/architecture-and-standards/decision-records/adr-shadow-metrics-data-model-and-cardinality.json",
+    "sources/slack/eng-sre/1768063011-cardinality-risk-review-shadow-dimensions.json",
+    "sources/jira/customer-support/SUP-28510-shadow-traffic-increases-metrics-cardinality-alerts.json"
+  ],
+  "description": "Problem\nShadow traffic introduces several naturally high-cardinality fields (prompt_id, request_fingerprint, route, customer_id, experiment_id, model_version, rubric_version). If emitted naively as metric labels, this can explode time-series count in the metrics backend and trigger ingestion throttling / cardinality alerts (observed during dogfood + early beta).\n\nThis ticket implements hard limits and sampling rules for shadow-traffic metrics dimensions to protect the metrics stack while keeping the deltas actionable.\n\nScope\n1) Enforce a strict allowlist of metric dimensions for shadow metrics (both control and shadow sides).\n2) Replace high-cardinality dimensions with stable, low-cardinality substitutes (bucketing/hashing) where needed.\n3) Add guardrails at two layers:\n   - Client-side (emitter): prevent emitting forbidden dimensions; sample where configured.\n   - Server-side (ingestion): enforce caps and drop/zero out disallowed labels defensively.\n4) Provide visibility: counters for dropped labels/series + dashboards and alerts.\n\nNon-goals\n- Building a full \u201cexamples\u201d datastore here (that lives with the shadow artifacts storage + retention work in ENG-5411).\n- Supporting arbitrary user-provided dimensions (v1 must be fixed/curated).\n\nDecisions (aligned with ADR)\nAllowed metric dimensions (v1)\n- tenant_tier (hosted|dedicated|private) (derived, not raw customer_id)\n- region (coarsened to cloud region / DC code)\n- route_group (see below)\n- request_type (chat|completion|embedding|rerank)\n- shadow_target_kind (model_version|quant_profile|prompt_template|routing_policy)\n- metric_name (format_adherence|refusal_rate|instruction_following|...)\n- rubric_version (low cardinality; pinned per experiment)\n- outcome (ok|error|timeout|dropped)\n\nExplicitly NOT allowed as metric labels\n- prompt_id\n- request_fingerprint\n- raw route_id / route_name (unbounded)\n- customer_id / tenant_id\n- experiment_id (can be unbounded; use a short-lived \u201cexperiment cohort\u201d bucket for dashboards, or query via analytics tables)\n- model_id if it\u2019s user-defined/freeform; only Redwood model slugs from curated catalog are allowed, otherwise bucket to \u201ccustom\u201d\n\nRoute dimension strategy\n- Introduced route_group dimension:\n  - For Hosted: route_group = first path segment + method (e.g., \u201c/v1/chat:POST\u201d), plus an optional \u201cworkspace_route_hash_bucket\u201d for internal debugging.\n  - For Dedicated/Private: route_group = configured logical route key truncated to N chars, with an LRU mapping to a stable hash bucket for overflow.\n- Hard cap: max distinct route_group per tenant per 1h window (default 200). Overflow goes to route_group=\"__other__\" and increments a drop counter.\n\nTenant/customer dimension strategy\n- No customer_id label in metrics.\n- For internal debugging, emit tenant_hash_bucket (0\u2013127) derived from HMAC(tenant_id, metrics_salt) only in internal clusters. This is disabled by default for Dedicated/Private unless explicitly enabled in tenant config (and still bucketed).\n\nSampling strategy\n- Metrics emission sampling is separate from shadow routing sampling.\n- Default sampling (v1):\n  - shadow.pair.count and shadow.scoring.lag: 1.0 (always)\n  - shadow.quality.delta and per-metric aggregates: 0.25 for Hosted, 1.0 for Dedicated beta (lower traffic), configurable.\n- When sampling is active, we record the sampling_rate label (bounded set: {1.0, 0.5, 0.25, 0.1}) so dashboards can scale counts, and we can detect mismatched sampling across deployments.\n\nImplementation notes\nClient-side guardrails (data plane emitter)\n- Added DimensionAllowlist + DimensionNormalizer in the shadow metrics emission library.\n- Any forbidden dimension is dropped and counted via shadow.metrics.dropped_labels_total{label_key=...}.\n- Normalization rules:\n  - route -> route_group (coarsen + truncate + overflow bucket)\n  - tenant_id -> tenant_hash_bucket (optional + bucketed)\n  - model identifier -> model_slug if curated else \u201ccustom\u201d\n\nServer-side guardrails (telemetry ingestion)\n- Enforced schema-level validation: reject or strip disallowed fields at ingest for shadow_* metric events.\n- Added per-tenant/per-hour series limiter:\n  - max_series_per_metric_per_tenant_per_hour (default 50k Hosted, 15k Dedicated, 10k Private)\n  - Behavior: fail-open for user path (never block user request); for telemetry, drop series beyond limit and increment shadow.metrics.series_limited_total.\n- Added backpressure integration points so when ingestion is lagging, we can further reduce sampling via dynamic config (ties into ENG-5415 mechanisms).\n\nObservability additions\n- New internal dashboards (in observability-pack):\n  - Dropped labels / limited series over time (by env, tier)\n  - Top offending route_groups (bounded)\n  - Estimated unique series for shadow metrics (approx)\n- Alerts:\n  - Page: shadow.metrics.series_limited_total > threshold for 10m in prod Hosted\n  - Ticket: dropped_labels_total spike (usually a client emitting bad dimensions)\n\nAcceptance criteria\n- Enabling shadow traffic at 1% routing sample on a high-volume Hosted tenant does not increase metrics backend active series by > 5% (measured via internal cardinality estimate panel).\n- No metric time series contains raw prompt_id, request_fingerprint, or customer_id.\n- When route cardinality exceeds caps, route_group=\"__other__\" is used and a limiter counter increments.\n- Dedicated beta tenants can opt-in to tenant_hash_bucket (bucketed) for debugging; default is off.\n- Runbook references updated to include \u201ccardinality limiter / dropped label\u201d dashboards and how to mitigate (reduce dims, reduce sampling).\n\nTesting / validation\n- Load test: replayed ~20k QPS synthetic traffic with randomized routes/prompt_ids; verified no cardinality explosion and limiter counters behave as expected.\n- Regression test: unit tests for allowlist enforcement and route_group normalization.\n- Dogfood follow-up: addressed SUP-28510 by removing experiment_id label from metrics and coarsening route dimension.\n\nRollout plan\n- Behind feature flag shadow_metrics_cardinality_guardrails (default ON in internal + beta).\n- Phase 1: internal tenants only (48h), monitor dropped/limited counters.\n- Phase 2: Dedicated beta cohort (3 tenants), enable tenant_hash_bucket only on request.\n- Phase 3: Hosted gradual rollout (10% -> 50% -> 100%) with SRE sign-off.\n\nOpen questions / follow-ups\n- Should we support a bounded experiment_cohort label for short-lived comparisons in dashboards (e.g., \u201cA\u201d, \u201cB\u201d), sourced from rollout system, instead of forcing users into analytics tables? (proposed follow-up ENG)\n- Add documentation note in quickstart about why certain fields don\u2019t appear as filters (DevEx follow-up; link to docs PR once merged).",
+  "comments": [
+    "2026-01-14 \u2014 Allison Grant: Creating as P0 after internal dogfood triggered cardinality warnings. We need hard guardrails before expanding Dedicated beta cohort.",
+    "2026-01-16 \u2014 Caleb Johnson: Proposed approach: enforce allowlist at emitter and again at ingestion; add route_group coarsening + overflow bucket. Will align with ADR shadow metrics data model + cardinality constraints.",
+    "2026-01-18 \u2014 Nadia Rahman: +1 on server-side enforcement. We\u2019ve seen older clients keep emitting forbidden fields after deploys; ingestion must strip/limit defensively. Suggest per-tenant per-hour caps and a counter for limited series.",
+    "2026-01-20 \u2014 Sean Gallagher: SRE asks: (1) no raw tenant_id/customer_id label ever in prod metrics, (2) \u201c__other__\u201d bucket for route overflow, (3) alert on limiter counters before metrics backend starts dropping data globally.",
+    "2026-01-23 \u2014 Logan Wright: Please ensure sampling here is independent of routing sample rate; otherwise we can\u2019t safely lower metrics cost without changing shadow evaluation coverage. Also record sampling_rate label from a bounded set only.",
+    "2026-01-29 \u2014 Caleb Johnson: Implemented DimensionAllowlist + normalizer. Dropping experiment_id/prompt_id/request_fingerprint as labels. Added optional tenant_hash_bucket gated by config and only for internal by default.",
+    "2026-02-02 \u2014 Allison Grant: Reviewed dashboards/alert proposals. Please add a panel that shows estimated unique series for shadow metrics (approx) so oncall can quickly confirm we\u2019re within budget.",
+    "2026-02-07 \u2014 Caleb Johnson: Patched per-tenant/per-hour limiter and overflow route_group handling. Verified against SUP-28510 reproduction; limiter counters increment and series count stays stable.",
+    "2026-02-12 \u2014 Sean Gallagher: Oncall readiness: runbook must reference \u2018dropped_labels_total\u2019 and \u2018series_limited_total\u2019 dashboards and include mitigation steps (reduce sampling, disable tenant_hash_bucket, verify route_group mapping).",
+    "2026-02-18 \u2014 Caleb Johnson: Marking Done. Guardrails shipped behind flag and enabled for internal + Dedicated beta. Hosted rollout staged (10% today). Monitoring shows <2% increase in active series with shadow enabled at 1% routing sampling."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_8caf8da7860d4037a7c7961c0499c27d"
+}

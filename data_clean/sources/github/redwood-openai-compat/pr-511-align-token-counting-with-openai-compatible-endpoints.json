@@ -1,0 +1,47 @@
+{
+  "repo": "redwood-openai-compat",
+  "pr_number": "511",
+  "title": "Align token counting + usage semantics with OpenAI-compatible endpoints",
+  "author": "Nadia Rahman",
+  "created_at": "2026-02-09",
+  "updated_at": "2026-02-13",
+  "merged_at": "2026-02-13",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "bugfix/openai-usage-token-counting",
+  "reviewers": [
+    "Logan Wright",
+    "Monica Patel",
+    "Allison Grant",
+    "Leila Farouk"
+  ],
+  "labels": [
+    "openai-compat",
+    "metering",
+    "billing",
+    "telemetry",
+    "bugfix"
+  ],
+  "linked_linear": [
+    "ENG-4430",
+    "ENG-4410",
+    "PM-1842"
+  ],
+  "linked_jira": [
+    "SUP-28451",
+    "SUP-28463"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "612",
+  "deletions": "147",
+  "breaking_change": "false",
+  "release_notes": "OpenAI-compatible endpoints now return usage (prompt_tokens/completion_tokens/total_tokens) computed from the same serialized prompt + sampled completion that feed the billing meter. Streaming usage is emitted once (final chunk) and no longer double-counts tool-call arguments or repeated deltas.",
+  "body": "## Context\nWe\u2019ve had recurring customer confusion + disputes where:\n- Invoice/usage export values don\u2019t match what they see in OpenAI-compatible responses under `usage`.\n- Streaming requests (especially with tool/function calling) report inconsistent or inflated `completion_tokens`.\n- Retries/fallbacks can cause the compat layer to report usage for an attempt that wasn\u2019t the billed attempt.\n\nThis PR aligns OpenAI-compatible `usage` reporting with Redwood\u2019s internal token metering semantics for the Hosted API, using the same tokenization inputs we use for billing.\n\nRelevant threads/tickets: SUP-28451 (invoice tokens do not match usage API), SUP-28463 (double-charged retries), ENG-4430 (double-counting on retry path), PM-1842 (meter sanity KPIs).\n\n## What changes\n### 1) Single source of truth for usage computation\n- Introduces a dedicated `UsageCalculator` for OpenAI-compatible endpoints that takes:\n  - the exact serialized prompt string used for the downstream model call (after messages->prompt formatting), and\n  - the exact completion text/tool payload returned to the client.\n- `usage.prompt_tokens`, `usage.completion_tokens`, `usage.total_tokens` are computed from the model\u2019s tokenizer (not OpenAI\u2019s), but now match the numbers we record for billing for the same request.\n\n### 2) Fix double counting in streaming + tool calls\nPreviously, the compat streaming handler would:\n- count tokens per delta and then also count the final assembled completion, and/or\n- count tool-call arguments once when streamed and again when the final tool call object was emitted.\n\nNew behavior:\n- We only compute usage from the final assembled response object.\n- For streaming responses, we emit `usage` exactly once in the final chunk (OpenAI-style), and we do not update any running token totals in intermediate deltas.\n\n### 3) Retry/fallback alignment\n- If the downstream request is retried or routed to a fallback model, the compat layer now attaches the usage to the billed attempt only.\n- Adds propagation of the internal `metering_attempt_id` / `request_fingerprint` to prevent usage being computed from an abandoned attempt.\n\n### 4) Cache attribution mapping (non-billing)\n- When a request is served from Redwood prefix/KV cache and the billing pipeline reports cached prompt tokens, we now populate OpenAI-style `prompt_tokens_details.cached_tokens` (when available) without changing billed totals.\n- If cached token detail is not available, we do not fabricate it; totals remain correct.\n\n### 5) Tests + golden vectors\n- Adds golden test vectors for:\n  - messages->prompt serialization (system/user/assistant ordering + separators)\n  - tool calls (`tool_calls[].function.arguments`) including structured output JSON\n  - streaming with partial chunks + client disconnect simulation\n  - `n>1` (multiple choices): usage is total across choices, consistent with existing Redwood billing behavior\n\n## Compatibility notes\n- Response shape remains OpenAI-compatible. We only change how the numbers in `usage` are computed.\n- We do not guarantee parity with OpenAI\u2019s tokenizer for OpenAI models; we guarantee internal consistency between compat responses and Redwood billing meters.\n\n## Files / areas changed (high level)\n- `src/handlers/chat_completions_streaming.ts`: stop per-delta token accumulation; emit usage once at end\n- `src/handlers/chat_completions.ts`: unify with shared usage calculator\n- `src/usage/usage_calculator.ts`: new usage computation module + interfaces\n- `src/serialization/messages_to_prompt.ts`: make prompt serialization deterministic and shared by streaming + non-streaming\n- `src/middleware/retry_context.ts`: plumb billed-attempt identifiers\n- `test/golden/usage_*`: golden vectors + regression tests\n\n## Example (before/after)\nScenario: streaming tool call with arguments streamed over multiple chunks.\nBefore: completion_tokens inflated (~1.4x) because arguments were counted per delta and in the final assembled tool call.\nAfter: completion_tokens == tokens in final tool call payload (counted once). Total aligns with billing export for the same request_id.\n\n## Rollout\n- Safe to roll out immediately: compat layer only.\n- Observability: emits `openai_compat_usage_mismatch_total_tokens` counter comparing legacy vs new calculator (sampled at 1%) for one week after merge.\n- If mismatch spikes, we can flip `OPENAI_COMPAT_USAGE_V2=false` to revert calculation while keeping the deterministic serialization helpers.\n\n## Checklist\n- [x] Unit tests for calculator + serialization\n- [x] Integration tests for streaming tool calls\n- [x] Added metric for legacy-vs-v2 delta\n- [x] Verified against 10 invoice discrepancy samples from Finance (Acme + ZenChat cases) using request replays in staging\n\n## Review notes / conversation\n**Logan Wright:** Can you confirm we\u2019re not changing billed totals here, just the compat response usage?\n**Nadia Rahman (author):** Correct. Billing totals are unchanged; this only aligns compat `usage` with the billing meter inputs. Added the legacy-vs-v2 delta metric to watch for surprises.\n\n**Monica Patel:** For streaming, are we always emitting `usage` in the final chunk? Some SDKs assume it\u2019s absent.\n**Nadia Rahman:** Yes, final chunk only. If a client disconnects early, we won\u2019t be able to deliver final usage in-body; in that case we still log usage internally and attach it to the request record for exports (unchanged). Added a test to ensure we don\u2019t emit partial `usage` mid-stream.\n\n**Allison Grant:** The prompt serialization helper changed delimiters\u2014does this match what we actually send to the runtime?\n**Nadia Rahman:** Updated to call the same serializer used in the downstream adapter. Added golden vectors to lock formatting and a staging replay to verify parity.\n\n**Leila Farouk:** Please add a regression case for `n=2` + tool calls; we\u2019ve broken that before.\n**Nadia Rahman:** Added `test/golden/usage_choices_tool_calls_n2.json` and wired it into CI.\n\n## CI\nChecks:\n- build: PASS\n- lint: PASS\n- unit: PASS\n- integration (streaming): PASS\n- compat-contract tests: PASS\n\n## Merge\nSquash merged to `main` as 7a2c3d1.\n\n## Commits (squash summary)\n1) usage: add v2 calculator + shared serialization\n2) streaming: emit usage once (final chunk), remove per-delta counting\n3) retries: plumb billed-attempt context into compat handlers\n4) tests: add golden vectors for tool calls, streaming, n>1\n5) metrics: legacy-vs-v2 mismatch counter (sampled)\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_5152f689a38648e1ad2c8254831cf046"
+}

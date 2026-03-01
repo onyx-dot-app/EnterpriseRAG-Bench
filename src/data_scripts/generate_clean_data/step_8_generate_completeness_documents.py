@@ -19,7 +19,7 @@ from src.prompts.completeness_documents import (
     COMPLETENESS_USER_PROMPT_EXISTING_TYPE,
     COMPLETENESS_USER_PROMPT_NEW_TYPE,
 )
-from src.statistics import update_statistics
+from src.utils.statistics import update_statistics
 from src.tools import FINISH_TOOL
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import FinishTool, GlobTool, ReadTool, RmTool, WriteTool

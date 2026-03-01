@@ -1,0 +1,42 @@
+{
+  "repo": "perf-canary",
+  "pr_number": "20005",
+  "title": "perf-canary: add optimization config safeguards + gate signal publisher for latency regressions",
+  "author": "Aisha Bello",
+  "created_at": "2026-01-08",
+  "updated_at": "2026-01-12",
+  "merged_at": "2026-01-12",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/optimization-safeguards",
+  "reviewers": [
+    "Sean Gallagher",
+    "Allison Grant",
+    "Benji Okafor",
+    "Sofia Ivanova"
+  ],
+  "labels": [
+    "sre",
+    "perf",
+    "observability",
+    "safe-apply",
+    "gating"
+  ],
+  "linked_linear": [
+    "ENG-4827",
+    "ENG-4824"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "612",
+  "deletions": "97",
+  "breaking_change": "false",
+  "release_notes": "Adds a perf-canary job that evaluates canary rollouts of Optimization Config changes and publishes standardized gate signals (latency/error) tagged by tenant/model/region/config_version for safe-apply progression/rollback decisions.",
+  "body": "Title: perf-canary: add optimization config safeguards + gate signal publisher for latency regressions\n\nContext\nSafe apply + rollback for Optimization Configs needs an external, repeatable \u201ccanary judge\u201d that can detect config-induced latency regressions early and produce machine-readable gate signals. Today, on-call relies on dashboards + manual judgement, which slows progression and increases risk (see internal incident notes around p95 spikes after caching/batching tweaks).\n\nWhat this PR does\n- Adds a new scheduled/on-demand canary workflow (\"optimization-safeguard\") that:\n  - Detects active Optimization Config rollout scopes (tenant/model/region + canary %) and config_version.\n  - Pulls baseline vs canary metrics (p95/p99 latency + 5xx rate) for the last N minutes, with warmup handling.\n  - Evaluates against configurable thresholds with sane defaults (latency regression % + absolute ms guard, and error-rate delta).\n  - Publishes gate signals to the control-plane gate ingest endpoint so the rollout controller can pause/fail a stage.\n- Standardizes metric tagging requirements used by the gates: tenant_id, model, region, route, config_version, stage_id.\n- Produces a clear human-readable summary in the job logs for on-call (what scope, what changed, baseline vs canary values, and decision).\n\nDesign notes / decisions\n- Windowing: uses a rolling 10m evaluation window with a 3m warmup skip after stage start to reduce false positives from cache churn. Stage start time is fetched from the rollout controller (if unavailable, falls back to \u201cfirst seen\u201d timestamp for config_version).\n- Baseline selection: baseline is \u201csame tenant/model/region, previous stable config_version\u201d (prefer stage.previous_version; else the most recent version marked stable in history). Baseline comparisons require minimum sample sizes (req_count >= 2,000 or token_count >= 3,000,000) to avoid noisy results.\n- Threshold defaults (overridable per environment):\n  - p95: fail if +12% and +20ms (both) vs baseline\n  - p99: fail if +15% and +35ms (both) vs baseline\n  - 5xx: fail if +0.15% absolute vs baseline or > 0.50% absolute\n- Publishing semantics: the job emits a single gate evaluation per (stage_id, scope) and is idempotent; repeated runs overwrite the same key to avoid \u201cgate spam\u201d.\n\nImplementation overview\n- New job runner: cmd/optimization_safeguard_canary (Go) with a single entrypoint supporting both cron + manual trigger.\n- New query package: internal/metrics/queries/optimization_rollout.go\n  - Uses PromQL (for prod) and a local stub backend for unit tests.\n  - Explicitly filters by config_version for canary and baseline.\n- New gate publisher: internal/gates/publisher.go\n  - Sends GateSignal payloads to /internal/gates/v1/signals (auth via service token + request id header).\n  - Payload includes: decision (pass/fail/insufficient_data), reason, observed metrics, baseline metrics, window, and tags.\n- Configuration: adds OPTIMIZATION_SAFEGUARD_* env vars (window, warmup, thresholds, min sample sizes, dry-run toggle).\n\nIllustrative payload (log excerpt)\nGateSignal{ gate=\"optimization.latency_regression\", stage_id=\"stg_01J...\", scope=\"tenant=t_8d3 model=llama3.1-70b region=us-east-1\", config_version=\"ocv_1742\", decision=\"fail\", reason=\"p95 +18.4% (+42ms) vs baseline ocv_1739\", metrics=\"p95=270ms p99=690ms 5xx=0.22%\", baseline=\"p95=228ms p99=610ms 5xx=0.07%\", window=\"10m\", warmup=\"3m\" }\n\nFiles / areas changed (high level)\n- cmd/optimization_safeguard_canary/main.go (new)\n- internal/metrics/client.go (adds query timeout + request-scoped logger)\n- internal/metrics/queries/optimization_rollout.go (new)\n- internal/gates/publisher.go (new)\n- internal/gates/types.go (adds GateSignalDecision=insufficient_data)\n- deploy/cronjobs/optimization-safeguard.yaml (new)\n- config/env.sample (new vars + docs)\n- tests: internal/metrics/queries/optimization_rollout_test.go, internal/gates/publisher_test.go\n\nWhy perf-canary (vs control plane)\nWe want this logic to be operationally owned by SRE/Obs and to share the same query/patterns as other perf canaries. Control-plane gating stays lightweight: it consumes standardized gate signals.\n\nTesting\n- Unit tests for:\n  - baseline selection (previous stable vs fallback)\n  - warmup skip behavior\n  - min sample size -> insufficient_data\n  - regression decision logic and threshold overrides\n  - publisher idempotency keying\n- Local smoke test:\n  - DRY_RUN=1 OPTIMIZATION_SAFEGUARD_TARGET=staging\n  - Verified log output and query shapes against staging Prometheus.\n\nOperational notes\n- Default is \u201cdry-run\u201d in staging and \u201cpublish enabled\u201d behind a feature flag in prod (PERF_CANARY_OPTIMIZATION_SAFEGUARD_ENABLED).\n- Alerts: not added here; this job is intended to feed rollout gating. Follow-up PR will add an alert on repeated insufficient_data and on publisher errors.\n\nRollout plan\n1) Merge + deploy to staging with dry-run; validate false positive rate during internal beta rollouts.\n2) Enable publishing for internal accounts only (feature flag + allowlist of tenant IDs).\n3) Expand to limited GA accounts.\n\nReview conversation (highlights)\n- Sean Gallagher: \u201cWe need explicit handling for cache invalidation warmup; otherwise this will page us all week.\u201d\n  - Aisha Bello: Added warmup skip + minimum sample size requirement, and included \u2018insufficient_data\u2019 decision so the controller can pause rather than fail.\n- Allison Grant: \u201cPlease ensure metrics are tagged with config_version everywhere; otherwise the baseline/canary split is brittle.\u201d\n  - Aisha Bello: Added an explicit guard that errors if config_version label is missing from query results and logs a structured warning with the rollout scope.\n- Benji Okafor: \u201cGate ingest endpoint requires idempotency; we can\u2019t store an unbounded stream.\u201d\n  - Aisha Bello: Implemented deterministic idempotency_key = sha256(stage_id + tenant + model + region + gate_name).\n- Sofia Ivanova: \u201cLatency % alone is tricky at low baselines; add absolute ms bounds.\u201d\n  - Aisha Bello: Updated thresholds to require both relative and absolute deltas.\n\nCI\n- build: pass\n- lint: pass\n- unit tests: pass\n- docker image build: pass\n\nMerge\nMerged via squash into main.\n\nFollow-ups\n- Add a small library wrapper so control-plane and perf-canary share the same gate rule names/strings.\n- Add explicit alerting on publisher errors and \u2018insufficient_data\u2019 rates by region.\n- Add a \u201cpartial rollout\u201d mode to compare canary shards vs non-canary shards within the same config_version when baseline is unavailable.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_1fc9f4883be64dc28a25d4934febd8b7"
+}

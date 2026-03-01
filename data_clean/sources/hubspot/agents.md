@@ -5,10 +5,10 @@ Target number of files:
 15000
 
 File name format:
-File names should be the literal string "company" + the company name all lowercase with underscores in between such as company_nasa_jpl.json.
+File names should begin with the literal string "company" + the company name all lowercase connected with dashes (e.g. company-nasa-jet-propulsion-labratory.json).
 
 Content rules:
-- This directory represents HubSpot CRM data, but modeled as a single record type:
+- This directory represents HubSpot CRM data, with every document representing a prospective or customer company:
   - Each document corresponds to one Company (account) record.
   - The most interesting parts are the user provided notes.
 - Company records should be CRM-like and structured rather than long narrative documents.

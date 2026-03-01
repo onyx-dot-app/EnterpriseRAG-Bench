@@ -1,0 +1,84 @@
+{
+  "repo": "redwood",
+  "pr_number": "22027",
+  "title": "Expose hardware profile selection metrics + admin debug endpoint for effective runtime config",
+  "author": "Benji Okafor",
+  "created_at": "2025-12-10",
+  "updated_at": "2025-12-12",
+  "merged_at": "2025-12-12",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/profile-selection-metrics-and-debug-endpoint",
+  "reviewers": [
+    "Allison Grant",
+    "Sean Gallagher",
+    "Ethan Park",
+    "Kira Volkov",
+    "Noah Patel"
+  ],
+  "labels": [
+    "runtime",
+    "observability",
+    "sre",
+    "perf",
+    "config",
+    "hardware-profiles"
+  ],
+  "linked_linear": [
+    "ENG-4828",
+    "ENG-4823",
+    "ENG-4830"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "17",
+  "additions": "612",
+  "deletions": "94",
+  "merge_method": "squash",
+  "breaking_change": "false",
+  "release_notes": "- Runtime exports low-cardinality metrics for selected hardware tuning profile and override source\n- Adds admin-only debug endpoint to dump effective hardware-profile-derived knobs for oncall triage",
+  "body": "## Summary\nThis PR adds (1) low-cardinality metrics for hardware tuning profile selection + override source, and (2) an admin-only debug endpoint that prints the effective profile and the key knobs that materially impact scheduling / kernel selection / KV cache behavior.\n\nMotivation: During staged rollouts of the hardware tuning profiles pack (H100/L40S first, B200 gated), oncall needs an immediate way to answer \"which profile did this pod pick, why, and what knobs are actually in effect after overrides?\" without SSHing into nodes or grepping logs. This also gives Perf Canary and dashboards a stable signal to segment tail latency / throughput regressions by profile.\n\nRelated:\n- ENG-4823 (loader + override precedence)\n- ENG-4828 (perf-canary gates / dashboard segmentation)\n- Profile pack rollout runbooks (WIP)\n\n## What changed\n### 1) Metrics\nAdds Prometheus metrics emitted on startup and on config reload:\n- `redwood_runtime_hardware_profile_selected_info{profile_pack_version, profile_name, gpu_sku, deployment_mode}` (1)\n  - `gpu_sku` is normalized (e.g., \"H100\", \"L40S\", \"B200\") using the same normalization logic as the loader.\n  - `deployment_mode` is one of: hosted | dedicated | private.\n  - `profile_name` is the resolved profile after inheritance.\n- `redwood_runtime_hardware_profile_override_source{source}` (gauge)\n  - `source` is one of: default | pack | fleet | pool | customer | env | cli | unknown.\n  - This is emitted as a single series at value=1 (not per knob) to avoid cardinality blowups.\n- `redwood_runtime_hardware_profile_compatibility{status}` (gauge)\n  - `status` is one of: ok | warn | reject.\n  - Mirrors the compatibility decision already computed by the loader (previously only logged).\n\nKey design constraints:\n- No request-level labels. Everything is pod-level / process-level.\n- `profile_name` is limited to the curated set shipped in the pack; we intentionally do not emit arbitrary user-provided names when `--profile-path` is used (it maps to `profile_name=\"custom\"` and includes the pack version if present).\n- Knob values are exposed via the debug endpoint (below) rather than as high-cardinality metrics.\n\n### 2) Admin debug endpoint\nAdds `GET /admin/runtime/hardware-profile` (served on the existing admin listener) returning a JSON payload (redacted) that includes:\n- Selected profile: pack version, profile id/name, normalized SKU, detection inputs (vendor string, device name), and compatibility status.\n- Override summary: which layer won (fleet default vs pool vs customer vs env vs CLI).\n- Key knobs (effective values) grouped into:\n  - Scheduler/batching: `max_inflight_requests`, `queue_limit`, `continuous_batching_enabled`, `prefill_decode_fairness`, `decode_target_tokens_per_step`.\n  - KV cache: `kv_cache_budget_bytes`, `kv_cache_page_size`, `kv_cache_eviction_policy`, `prefix_cache_enabled`.\n  - Kernel selection: `kernel_autoselect_policy`, `seq_len_bucket_boundaries`, `matmul_impl`, `attention_impl`.\n  - Safety toggles: `oom_guardrail_enabled`, `max_context_len_guardrail`.\n\nSecurity / access:\n- Endpoint is behind `runtime.admin_endpoints.enabled=true` AND `runtime.admin_endpoints.require_token=true` (default true in Hosted/Dedicated).\n- Uses the existing admin auth middleware; requires `X-Redwood-Admin-Token`.\n- Binds only to the admin listener (no exposure on the public inference port).\n- Output is explicitly redacted for any secrets (even though this endpoint does not currently include secrets by design). A unit test asserts we never include env var values.\n\nOperational intent:\n- Oncall can quickly confirm whether a regression correlates with an unexpected profile selection, ambiguous SKU detection, or an override that pinned a risky knob.\n- The endpoint output is stable enough to paste into incident threads and support escalations.\n\n## Files / areas touched (high-level)\n- `runtime/observability/metrics/profile_selection_metrics.*`\n- `runtime/admin/endpoints/hardware_profile_debug.*`\n- `runtime/config/profile_loader.*` (plumbing to expose selection + override metadata to metrics/debug)\n- `runtime/config/effective_config_printer.*` (shared formatting used by CLI and debug endpoint)\n- `runtime/tests/integration/test_profile_metrics_and_debug_endpoint.*`\n\n## Example\n### Metrics\n- `redwood_runtime_hardware_profile_selected_info{profile_pack_version=\"2025.12.0\",profile_name=\"h100-balanced-v1\",gpu_sku=\"H100\",deployment_mode=\"hosted\"} 1`\n- `redwood_runtime_hardware_profile_override_source{source=\"pool\"} 1`\n\n### Debug endpoint (redacted excerpt)\n`GET /admin/runtime/hardware-profile`\n- `selected_profile.profile_name: h100-balanced-v1`\n- `override.source: pool`\n- `scheduler.prefill_decode_fairness: 0.35`\n- `kv_cache.kv_cache_budget_bytes: 51539607552`\n- `kernel.kernel_autoselect_policy: seq_len_bucketed`\n\n## Testing\n- Unit tests for metric emission and label normalization.\n- Integration test spins up runtime with a synthetic \"H100\" device string and asserts:\n  - selected_info metric exists with expected labels\n  - override_source emits a single time series\n  - debug endpoint returns 200 only with admin token\n  - debug endpoint contains expected knob keys and redacts sensitive fields\n\n## Rollout\n- No behavior changes to selection logic; this is visibility + introspection.\n- Safe to ship broadly; metrics are low-cardinality.\n- SRE/Observability can start segmenting dashboards by `redwood_runtime_hardware_profile_selected_info`.\n\n## Notes / follow-ups\n- Follow-up PR will wire the debug endpoint into the oncall triage playbook (Confluence) and add dashboard panels (Observability Pack PR already in-flight).\n- If we see label cardinality issues in Hosted (unlikely), we can force `profile_name=\"custom\"` for any non-pack profile in all modes.",
+  "commits": [
+    "runtime/metrics: add hardware profile selection + override source metrics",
+    "runtime/admin: add /admin/runtime/hardware-profile endpoint with auth + redaction",
+    "runtime/config: expose selection + override metadata from loader",
+    "tests: integration coverage for metrics + endpoint; tighten redaction assertions",
+    "docs(internal): add endpoint and metric names to runtime operator notes"
+  ],
+  "changed_areas": [
+    "Serving runtime: config loader plumbing (selection metadata export)",
+    "Observability: Prometheus metrics (pod-level, low cardinality)",
+    "Admin surface: authenticated debug endpoint on admin listener",
+    "Tests: unit + integration coverage for oncall triage path"
+  ],
+  "ci_checks": [
+    "build-and-unit (linux-amd64): PASS",
+    "lint (golangci-lint): PASS",
+    "integration-tests (runtime): PASS",
+    "perf-canary-smoke (no gates): PASS",
+    "security-scan (deps): PASS"
+  ],
+  "review_conversation": [
+    "Allison Grant: Please confirm these metrics are low-cardinality and won\u2019t explode with per-customer overrides. Also prefer *_info for the selected profile metric.",
+    "Benji Okafor: Confirmed. No request labels; override_source is a single series. Mapped non-pack profiles to profile_name=\"custom\". Switched selected metric to *_info with constant value=1.",
+    "Sean Gallagher: Endpoint name is good. Ensure it\u2019s only on admin listener and requires token by default; oncall will paste output into incident threads so redact aggressively.",
+    "Benji Okafor: Bound to admin listener only; requires token unless explicitly disabled. Added redaction helper + unit test that asserts env var values never appear.",
+    "Ethan Park: For compatibility status, please align status strings with loader (ok/warn/reject) and add a small comment about when we emit warn vs reject.",
+    "Benji Okafor: Done; metric mirrors loader enums. Added inline comment + integration test covering warn path (mismatched runtime/profile version).",
+    "Kira Volkov: Can we include normalized gpu_sku label and the raw device string in the endpoint output? That would help with provider SKU variants.",
+    "Benji Okafor: Added gpu_sku normalized label; endpoint output includes raw device name and vendor string under detection inputs.",
+    "Noah Patel: Looks good. One nit: please keep the endpoint response stable (field names) and avoid dumping the entire config blob. Stick to key knobs.",
+    "Benji Okafor: Agreed; endpoint returns a curated knob list only. No full config dump."
+  ],
+  "ci_history": [
+    "2025-12-11: lint FAILED (unused import in hardware_profile_debug.go) \u2192 fixed in follow-up commit",
+    "2025-12-11: integration-tests FAILED (admin auth test missing header) \u2192 fixed + added helper",
+    "2025-12-12: all checks PASS"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes",
+    "review_conversation"
+  ],
+  "dataset_doc_uuid": "dsid_f4ca5b26d1d74562bf621e7023c12af0"
+}

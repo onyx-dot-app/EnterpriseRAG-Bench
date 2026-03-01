@@ -1,0 +1,51 @@
+{
+  "key": "ENG-4825",
+  "team": "engineering",
+  "title": "Implement tier-aware LRU eviction for KV cache (respect pinned sessions + prefix cache)",
+  "status": "In Review",
+  "priority": "P0",
+  "created_at": "2026-01-10",
+  "updated_at": "2026-02-12",
+  "creator": "Talia Benson",
+  "assignee": "Omar El-Sayed",
+  "project": "KV cache compaction improvements",
+  "cycle": "2026-W05",
+  "estimate": "8",
+  "due_date": "2026-02-14",
+  "release": "runtime-1.22",
+  "customer_impact": "high",
+  "labels": [
+    "runtime",
+    "kv-cache",
+    "allocator",
+    "tail-latency",
+    "reliability",
+    "eviction"
+  ],
+  "dependencies": [
+    "ENG-4822",
+    "ENG-4823",
+    "ENG-4824",
+    "ENG-4826"
+  ],
+  "parent_issue": "ENG-4821",
+  "security_review_required": "false",
+  "description": "Goal\nDefine and implement eviction selection logic for KV cache pages/blocks when the allocator is under pressure and compaction alone cannot reclaim contiguous space fast enough. Eviction must be tier-aware and LRU-based, must respect pinned sessions, and must be observable and safe (no correctness regressions).\n\nContext\nKV cache compaction reduces fragmentation but does not eliminate peak memory pressure during bursty decode + churn. Today we have opportunistic evictions in a few places (mostly \u201cbest effort\u201d) that are hard to reason about and can happen at the worst time (mid-decode), creating tail spikes. This ticket formalizes a single eviction policy entry point and selection algorithm aligned with product tiers.\n\nPolicy requirements\n1) Tier-aware\n- Hosted (shared) tiers: eviction allowed for lower-priority traffic first to protect paid tiers and latency commitments.\n- Dedicated: eviction should be conservative; prefer backpressure + compaction before evicting active decode. If eviction is needed, focus on preemptible/prefix-cache artifacts first.\n- Private: default eviction disabled (or only prefix-cache eviction) unless explicitly configured.\n\n2) LRU by sequence/session\n- Primary ordering: least-recently-used \u201csequence group\u201d (a session may have multiple sequences; treat as a unit for eviction fairness).\n- Recency definition: last scheduler touch timestamp (decode step, prefill, or token emission) rather than wall-clock request arrival.\n- Avoid pathological cases: long-running streaming sessions should not be evicted if pinned or high-tier; otherwise they may be evicted if they become cold.\n\n3) Correctness + safety constraints\n- Never evict pinned sessions (see pinned semantics below).\n- Never evict while a relocation/compaction move is in-flight for that sequence (avoid races with page ownership changes).\n- Eviction must be atomic from the scheduler\u2019s perspective: after eviction, the sequence must be either (a) terminated with a clear error path, or (b) forced to recompute from a safe checkpoint (not in scope for initial release). For initial release we will terminate with a retryable error for evicted active sequences; prefix-cache artifacts can be dropped without surfacing an error.\n- Explicitly define what can be evicted:\n  a) Prefix cache pages (safe to drop; may increase compute)\n  b) Inactive/idle sequences (waiting, queued, or disconnected)\n  c) Active decode sequences (last resort; gated by tier + kill-switch)\n\nPinned sessions semantics\n- \u201cPinned\u201d means eviction-protected. Sources of pinning:\n  - Internal: system/reserved workloads (control-plane health checks, eval canaries), enterprise SLO cohorts.\n  - Customer: Dedicated/Private may have pinned workloads (e.g., long-lived agents) via config.\n- Pinning should be implemented as a scheduler-visible attribute on the sequence group (pin_reason, pinned_until optional).\n- Pinned does not mean \u201cinfinite\u201d: if we hit hard OOM territory we must prefer backpressure/request shedding at admission rather than violating pinning. This ticket ensures eviction never breaks pinning; overload handling remains in scheduler/admission.\n\nInterfaces / integration points\n- New eviction entry point: KvArena::evict(target_bytes, policy_ctx) -> EvictResult\n- policy_ctx inputs:\n  - tier (hosted_free/hosted_pro/dedicated/private)\n  - model/profile (for per-model defaults)\n  - allow_active_decode_eviction (bool; default false except hosted_free)\n  - eviction_watermark (soft/hard)\n  - now_ts (monotonic)\n- Scheduler hook: scheduler requests eviction only at safe boundaries (prefill->decode transition, decode step boundary) per ENG-4824. Allocator may request eviction only when it cannot satisfy allocation and compaction budget is exhausted.\n\nSelection algorithm (proposed)\n- Build candidate sets in descending preference:\n  1) Prefix cache artifacts (unshared, then shared; avoid thrashing by applying a minimum age)\n  2) Non-pinned idle sequences in lowest tier first (hosted_free -> hosted_pro -> dedicated)\n  3) Non-pinned active decode sequences only if allow_active_decode_eviction is true and we\u2019re past hard watermark\n- Within each set, order by LRU (oldest last_touch first), break ties by largest bytes to free (greedy) to minimize number of evictions.\n- Enforce per-eviction cap: max_sequences_per_tick and max_bytes_per_tick to avoid long stalls.\n\nObservability (must-have)\n- Counters:\n  - kv_evictions_total{tier,reason,target_type}\n  - kv_evicted_bytes_total{tier,reason,target_type}\n  - kv_eviction_denied_total{reason} (e.g., pinned_only_remaining, in_flight_move, policy_disabled)\n- Histograms:\n  - kv_eviction_duration_ms\n- Tracing span per eviction batch with exemplar linking to tail latency traces.\n\nConfig / kill switches\n- Feature flag: kv.eviction.enabled (default off in Private; on in Hosted with conservative defaults)\n- Flags:\n  - kv.eviction.allow_active_decode\n  - kv.eviction.hard_watermark_ratio\n  - kv.eviction.soft_watermark_ratio\n  - kv.eviction.max_bytes_per_tick\n  - kv.eviction.max_sequences_per_tick\n- All config must be safe to flip at runtime via ENG-4826 plumbing.\n\nTesting plan (correctness-focused)\nUnit tests\n- Candidate selection respects tier ordering.\n- LRU ordering correctness with synthetic timestamps.\n- Pinned sessions are never selected.\n- In-flight move sequences are never selected.\n- Prefix cache eviction does not terminate active sequences.\n\nIntegration / stress tests (Anika + Marcus)\n- Mixed churn + cancellations while eviction occurs (regression for the relocation/cancel race).\n- Long-lived streaming session pinned + background churn: ensure no eviction and no deadlock.\n- Active decode eviction path (when enabled) returns retryable error and cleans up pages; no leaks.\n- Metrics assertions: eviction counters increment; denied counters for pinned-only scenario.\n\nAcceptance criteria\n- Under synthetic hard-pressure scenario, allocator can reclaim target_bytes via eviction without OOM.\n- No pinned session eviction in any test.\n- No crashes / memory leaks in stress suite (10k sequences churn, 30+ minutes run).\n- Clear metrics and traces for each eviction batch.\n- Defaults reviewed by SRE + Product for Hosted/Dedicated behaviors.\n\nLinks\n- ADR (eviction policy): sources/confluence/architecture-and-standards/decision-records/adr-kv-eviction-policy.json\n- Design doc: sources/confluence/eng-serving-runtime/kernel-and-scheduling/kv-cache-compaction-design.json\n- Related tickets: ENG-4822 (metrics), ENG-4823 (compaction worker), ENG-4824 (scheduler hook), ENG-4826 (kill switch/config)\n\nNotes / open questions\n- Should we treat \u201cprefix cache\u201d as a separate tier dimension (e.g., always evict prefix cache before any session KV)? Proposed: yes.\n- For active decode eviction: do we want to attempt resumable retry (recompute) later? Out of scope for runtime-1.22; file follow-up if needed.\n- Dedicated defaults: Product leaning toward allow_active_decode=false always; confirm with Lauren + SRE once benchmark canary results are in.",
+  "comments": [
+    "2026-01-10 (Talia Benson): Created as part of ENG-4821 epic. Please keep policy decisions aligned with ADR; SRE wants explicit metrics names for dashboards.",
+    "2026-01-14 (Omar El-Sayed): Drafted selection sets: prefix-cache first, then idle sequences, then active decode behind gate. Need scheduler to provide safe boundary hooks (ENG-4824) to avoid mid-step evictions.",
+    "2026-01-18 (Sean Gallagher): From SRE side: active-decode eviction must be rare and loud. Please add kv_eviction_denied_total so we can tell the difference between \u201cpolicy prevented\u201d and \u201cno pressure.\u201d Also ensure trace exemplars exist so we can correlate to p99 spikes.",
+    "2026-01-22 (Lauren Bishop): Dedicated: default should not evict active decode. If we must evict, prefer dropping prefix cache and idle sequences only. We can tolerate some recompute; we cannot tolerate user-visible errors for steady workloads.",
+    "2026-01-27 (Samir Qureshi): Added guardrail: skip sequences with in-flight relocation. Without that we can race page ownership changes. We\u2019ll track relocation state in sequence metadata and gate candidates.",
+    "2026-02-02 (Anika Gupta): Test plan suggestion: add adversarial cancellation during eviction selection to ensure cleanup doesn\u2019t double-free. Also add pinned + idle mix to confirm only non-pinned are chosen.",
+    "2026-02-06 (Omar El-Sayed): Implementation mostly complete locally. One nuance: session grouping for LRU. We\u2019ll evict by sequence_group_id (shared across tool calls / streaming reconnect). Need to confirm how scheduler updates last_touch (decode step boundary).",
+    "2026-02-10 (Noah Patel): Review note: define explicit error semantics for active eviction (retryable, not internal error). Also require invariant: eviction cannot occur while a sequence is in 'decoding' critical section unless scheduler boundary says it\u2019s safe. Please ensure we have asserts in debug builds.",
+    "2026-02-12 (Omar El-Sayed): Marking In Review. PR up with tier-aware LRU + pinned gating + metrics. Waiting on Sofia for scheduler boundary confirmation and on Sean for metric name sign-off."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_f974472409fb458b834e4c89dc125035"
+}

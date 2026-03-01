@@ -1,0 +1,57 @@
+{
+  "key": "ENG-4827",
+  "team": "engineering",
+  "title": "Implement SLO gate evaluation (5xx + p95/p99 latency) for safe apply rollouts; enforce required metric tags and override policy",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-10-08",
+  "updated_at": "2026-01-28",
+  "creator": "Aisha Bello",
+  "assignee": "Benji Okafor",
+  "project": "Safe apply + rollback mechanism (Optimization Configs)",
+  "cycle": "Cycle 41",
+  "estimate": "8",
+  "due_date": "2025-12-16",
+  "labels": [
+    "safe-apply",
+    "gating",
+    "slo",
+    "reliability",
+    "observability",
+    "control-plane"
+  ],
+  "dependencies": [
+    "ENG-4824",
+    "ENG-4822",
+    "ENG-4826"
+  ],
+  "customer_impact": "high",
+  "release": "control-plane-2026.02",
+  "security_review_required": "false",
+  "description": "Context\nSafe apply requires progressive rollout with automated gates that pause/stop promotions when we see regressions. This ticket implements gate evaluation for error-rate (5xx) and latency (p95/p99) with consistent metric tagging so we can reliably attribute regressions to a specific Optimization Config version and rollout stage.\n\nGoals\n- Implement gate evaluator used by the canary rollout controller (ENG-4824).\n- Define and enforce required metric tags for all gate queries so results are attributable and debuggable.\n- Provide safe defaults for Hosted/Dedicated and an override policy that prevents unsafe tuning (e.g., widening thresholds silently).\n\nNon-goals\n- Full automated rollback for all customers (early phases use pause/fail with human confirmation; rollback is separate).\n- Building new metrics pipelines; we will consume existing Prometheus/Mimir + Redwood metrics gateway.\n\nRequirements\n1) Gate types\n- Error-rate gate: 5xx rate (HTTP status >= 500) for inference requests.\n  - Default signal: error_rate_5xx = (5xx_count / request_count) over rolling window.\n  - Must support separate gates for gateway errors vs runtime worker errors when possible (to avoid blaming config for unrelated control-plane issues).\n- Latency gates: p95 and p99 end-to-end latency.\n  - Default signal: p95_ms and p99_ms for inference requests.\n  - Prefer end-to-end at gateway (client-visible), with option to include worker-side latency for debugging.\n\n2) Windows + comparisons\n- Windows: configurable (default 10m for canary, 30m for promotion) with a warmup delay (default 2m) after a rollout step begins.\n- Comparison baseline:\n  - For percent-based canaries: compare canary cohort vs control cohort within the same rollout (preferred).\n  - Fallback: compare canary cohort vs last-known-good config_version for same scope (tenant/model/region) if control cohort is not available.\n- Evaluation cadence: every 60s.\n- Failure handling: if metrics are missing/insufficient, treat as INCONCLUSIVE and keep rollout PAUSED until either data appears or operator overrides with justification.\n\n3) Required tags (must be present on metrics used for gates)\nAll gate queries MUST include:\n- tenant_id (or tenant = \"shared\" for global/internal systems)\n- model\n- region\n- config_version (Optimization Config Version ID)\n- rollout_id (unique per apply attempt)\n- rollout_stage (e.g., canary|promote|rollback) OR step_id\n\nAdditional recommended tags (best-effort; do not hard-fail if absent initially):\n- deployment_mode (hosted|dedicated|private)\n- route / endpoint (chat.completions, embeddings, etc.)\n- error_source (gateway|runtime|upstream)\n\nEnforcement\n- Canary controller must not start the step until it can confirm that traffic will be emitted with the required tags.\n- For legacy routes without tags, the evaluator returns INCONCLUSIVE and emits a structured diagnostic error telling the operator which tags are missing and where to look.\n\n4) Default thresholds (safe defaults)\nDefaults apply unless explicitly overridden per-tenant (Hosted/Dedicated) or per-installation (Private).\n- 5xx error-rate gate:\n  - Absolute threshold: canary error_rate_5xx must be <= 0.5% AND must not exceed control by > 0.2% (absolute).\n- Latency gates:\n  - p95: canary p95_ms must be <= 1.10x control p95_ms (10% regression budget)\n  - p99: canary p99_ms must be <= 1.15x control p99_ms (15% regression budget)\n- Minimum volume: require at least N requests in window for both canary and control (default N=500 for Hosted, N=200 for Dedicated) before evaluation is considered VALID.\n\nRationale: these are intentionally conservative to avoid large regressions from optimization toggles. Operators can widen thresholds only via explicit override with approvals.\n\n5) Override policy\nWe need controlled flexibility for special workloads while avoiding \u201cpapering over\u201d regressions.\n- Overrides allowed for:\n  - window size, warmup delay\n  - minimum volume\n  - thresholds within bounded limits\n- Overrides NOT allowed (hard blocked): disabling all gates for production rollouts unless Sev-approved and recorded (see audit event below).\n- Bounded limits (initial proposal):\n  - p95 regression budget cannot exceed 25%\n  - p99 regression budget cannot exceed 35%\n  - error_rate_5xx absolute cannot exceed 1.0% for canary unless tenant is explicitly allowlisted for experimentation\n- Approval / audit requirements:\n  - If override changes thresholds beyond defaults: require \"optimization-change operator\" role + second approver for blast radius >= region OR tenant-wide.\n  - Emit audit events (ENG-4826) including override diff, justification, approver.\n\n6) Outputs / API contract\nGate evaluator returns a deterministic state machine:\n- PASS: safe to proceed\n- FAIL: rollout must stop (controller marks step failed)\n- INCONCLUSIVE: controller pauses and surfaces diagnostics\nEach evaluation response must include:\n- evaluated_at timestamp\n- query window\n- canary vs control values\n- decision + reason code\n- human-readable explanation suitable for Console\n\nImplementation plan\n- Use slo-toolkit rule library where possible (see slo-toolkit PR-20023) to define gate rules (error-rate, p95, p99) with config overrides.\n- Add GateEvaluationService in control plane:\n  - Input: rollout_id, step_id, scope (tenant/model/region), config_version, traffic split metadata\n  - Output: GateResult (PASS/FAIL/INCONCLUSIVE) + detail string\n- Ensure metrics tag contract is implemented by runtime/gateway instrumentation:\n  - Coordinate with runtime team to ensure config_version tag is available at request time (response header propagation is separate).\n- Add structured logs and metrics for the evaluator itself:\n  - gate_evaluation_total{result=pass|fail|inconclusive, gate=...}\n  - gate_evaluation_duration_ms\n\nAcceptance criteria\n- Canary rollout controller can call evaluator and pause/fail based on PASS/FAIL/INCONCLUSIVE.\n- Queries are fully scoped by required tags (tenant/model/region/config_version/rollout_id).\n- Missing tags leads to INCONCLUSIVE with actionable diagnostics (which tag is missing, which metric name).\n- Defaults applied if no override provided; overrides validated against bounded limits.\n- Unit tests for rule evaluation and override validation.\n- Integration test in staging: a synthetic canary that injects latency/5xx regression triggers FAIL within 3 evaluation cycles.\n\nReferences\n- ADR: safe apply gating signals (Confluence)\n- Dashboard spec: required tags include tenant/model/region/config_version (Drive: rollback-dashboard-metrics-spec)\n- Related PRs: redwood/pr-19933-add-slo-gate-hooks, slo-toolkit/pr-20023-rollback-gate-rule-library",
+  "comments": [
+    "2025-10-10 (Aisha Bello): P0 from SRE perspective. We need strict tag requirements; without config_version + rollout_id we can\u2019t debug false positives during gamedays.",
+    "2025-10-16 (Benji Okafor): Drafted GateEvaluationService interface + result state machine (PASS/FAIL/INCONCLUSIVE). Waiting on final tag names from Observability (Allison).",
+    "2025-10-22 (Allison Grant): Confirmed canonical tags: tenant_id, model, region, config_version, rollout_id, rollout_stage. Please do not introduce \"cfg_ver\" aliases; we\u2019ve already standardized dashboards.",
+    "2025-11-03 (Sofia Ivanova): Note batching changes can shift latency distributions; please gate on ratios vs control, not absolute p95 only. Also add minimum-volume guard to avoid noisy early windows.",
+    "2025-11-18 (Benji Okafor): Implemented evaluator using slo-toolkit rule templates; added bounded override validation. INCONCLUSIVE path returns explicit diagnostics listing missing tags and metric names.",
+    "2025-12-02 (Aisha Bello): Ran staging test with injected 5xx at runtime worker. Gate FAILs correctly, but diagnostics were too terse. Please include both canary/control numerators/denominators in detail string for Console.",
+    "2025-12-06 (Benji Okafor): Updated detail string to include window, volumes, and computed rates/percentiles. Added reason codes: MISSING_TAGS, INSUFFICIENT_VOLUME, REGRESSION_DETECTED.",
+    "2026-01-12 (Sean Gallagher): Gameday rehearsal: INCONCLUSIVE correctly paused rollout when rollout_id tag was missing due to a misconfigured gateway job. This is desired behavior; make sure Console copy explains how to fix instrumentation vs telling people to override.",
+    "2026-01-28 (Benji Okafor): Landed + verified in staging with perf-canary job. Marking Done; follow-up tasks filed for widening recommended tags (deployment_mode, route) and better splitting gateway vs runtime error sources."
+  ],
+  "links": [
+    "sources/confluence/architecture-and-standards/decision-records/adr-safe-apply-gating-signals.json",
+    "sources/google_drive/shared_drives/engineering/observability/rollback-dashboard-metrics-spec.json",
+    "sources/github/redwood/pr-19933-add-slo-gate-hooks.json",
+    "sources/github/slo-toolkit/pr-20023-rollback-gate-rule-library.json",
+    "sources/linear/engineering/ENG-4824-canary-rollout-controller.json",
+    "sources/linear/engineering/ENG-4826-audit-log-events-for-config-changes.json"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_53ec49d980b743c29b874811a1bd3383"
+}

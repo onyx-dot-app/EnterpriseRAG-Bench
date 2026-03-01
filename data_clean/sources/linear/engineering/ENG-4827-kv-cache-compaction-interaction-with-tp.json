@@ -1,0 +1,63 @@
+{
+  "key": "ENG-4827",
+  "team": "engineering",
+  "title": "KV cache compaction/fragmentation interaction with TP can cause rank divergence + stalls under memory pressure",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-02-19",
+  "updated_at": "2025-03-06",
+  "creator": "Noah Patel",
+  "assignee": "Samir Qureshi",
+  "project": "Multi-GPU (TP) stability fixes (Serving Runtime Performance \u2014 Kernel + Scheduling)",
+  "cycle": "2025-W08",
+  "estimate": "8",
+  "due_date": "2025-03-04",
+  "labels": [
+    "tensor-parallel",
+    "kv-cache",
+    "memory",
+    "compaction",
+    "stalls",
+    "reliability",
+    "runtime-1.19"
+  ],
+  "parent_issue": "ENG-4821",
+  "dependencies": [
+    "ENG-4822",
+    "ENG-4823"
+  ],
+  "sub_issues": [
+    "ENG-4828",
+    "ENG-4829"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.19",
+  "security_review_required": "false",
+  "description": "Problem\n- We have intermittent TP stalls/timeouts that correlate strongly with KV cache compaction activity and memory pressure (high concurrency + long context + mixed prefill/decode).\n- Symptoms from incidents/support: replicas stop making forward progress (no tokens streamed), GPU utilization drops on a subset of ranks, and eventually requests hit server-side timeouts or watchdog abort.\n\nHypothesis (initial)\n- KV cache compaction/eviction is currently allowed to run \u201clocally\u201d per rank based on allocator pressure.\n- Under certain fragmentation patterns, one rank triggers compaction/relayout earlier than others, causing (a) divergence in page/block mapping and/or (b) different timing/stream ordering around the compaction copy kernels.\n- That divergence can manifest as:\n  1) rank-local enqueue ordering differences that end up changing the sequence of collective participation (NCCL waits), or\n  2) inconsistent metadata for KV block tables leading to bad reads and subsequent hangs/invalid accesses (we\u2019ve seen \u2018silent\u2019 stalls when bad reads propagate to kernels without immediate errors).\n\nWhat we need from this ticket\n1) Reproduce and isolate the compaction-triggered divergence/stall signature.\n2) Identify the minimal correctness fix(es) that make KV compaction TP-safe.\n3) Add regression coverage (stress + fault injection) so we don\u2019t reintroduce it.\n4) Provide mitigations/guardrails for on-call (e.g., disable/limit compaction or adjust thresholds) until runtime-1.19 is broadly rolled out.\n\nScope\n- KV allocator/compaction policies and metadata updates in TP mode\n- Synchronization semantics across ranks for compaction (barrier points, deterministic thresholds)\n- Interaction with decode loop scheduling + CUDA streams (but keep NCCL hardening changes in ENG-4825)\n\nOut of scope\n- Rewriting the KV allocator; prefer small, targeted stabilization.\n\nAcceptance criteria\n- Deterministic repro or high-signal repro harness scenario that triggers the issue pre-fix and does not post-fix.\n- In TP mode, compaction is either:\n  (a) globally coordinated across ranks (same decision + same step boundaries), OR\n  (b) provably safe when performed rank-locally (no divergence in collective ordering or KV metadata) \u2014 with supporting reasoning/tests.\n- No measurable p50/p95 latency regression >2% on standard decode benchmarks; any overhead must be feature-flagged or conditional.\n- Add at least one stress test scenario that hits compaction under pressure and validates progress (no stalls) and correctness (no invalid KV reads).\n- Document known mitigations and the rollout plan (feature flags / defaults) for Dedicated + Hosted.\n\nNotes / investigation plan\n- Start with ENG-4822 repro harness in benchmark-lab; tune to force compaction: long context, high concurrent streaming, and explicit memory pressure (lower KV headroom).\n- Add observability hooks if needed: compaction start/stop events with rank id, bytes moved, block-table version; correlate with ENG-4823 heartbeat gaps.\n- Try to confirm whether divergence is:\n  - decision divergence (some ranks compact, others don\u2019t)\n  - ordering divergence (same ranks compact but at different iteration boundaries)\n  - metadata divergence (block-table version mismatch)\n\nLinks\n- Umbrella initiative: ENG-4821\n- Related instrumentation: ENG-4823\n- Known issues page (for mitigation notes): sources/confluence/eng-serving-runtime/known-issues/tensor-parallel-hangs-under-load.json\n- Perf canary scenarios: ENG-4828\n",
+  "comments": [
+    "2025-02-19 (Noah Patel): Filing as P0 given overlap with Sev1 signature. Assigning to Samir. Please loop Omar for observability hooks if needed and Marcus for stress coverage once we have a repro.",
+    "2025-02-20 (Samir Qureshi): Initial repro attempt using benchmark-lab TP mixed workload. With KV headroom lowered, can force compaction events, but the stall is still intermittent. When it stalls, 1 rank shows allocator pressure spikes + compaction loop running longer while others proceed to next decode iteration. Need more deterministic pressure (maybe constrain max KV blocks to trigger frequent compactions).",
+    "2025-02-21 (Omar El-Sayed): Added temporary structured log locally (not yet PR): kv_compaction_start/kv_compaction_end with fields: rank, step_id, bytes_moved, block_table_version_before/after. In stall cases, observed mismatched block_table_version across ranks at the time the next collective is enqueued. This supports metadata divergence hypothesis.",
+    "2025-02-23 (Samir Qureshi): Root cause appears to be non-deterministic compaction trigger threshold using rank-local free-list fragmentation metrics. Under load, some ranks compact during decode iteration N while others defer to N+1. The block-table version increments are not globally aligned. Downstream, we have a code path that assumes block-table version parity across ranks when building the allreduce payload for attention metadata, leading to a mismatch and an NCCL wait with no explicit error.",
+    "2025-02-24 (Samir Qureshi): Proposed fix direction: in TP mode, only allow compaction at explicit \u201csafe points\u201d and require a lightweight cross-rank agreement (e.g., all ranks compact or none). If any rank requests compaction, we barrier and compact on all ranks in that step boundary. Also enforce that block-table version increments happen in lockstep. Will keep this behind a flag initially (tp_kv_compaction_coordinated=true).",
+    "2025-02-26 (Samir Qureshi): Implemented fix + guardrails and opened PR: sources/github/redwood/pr-21866-kv-cache-compaction-safety-in-tp.json. Includes: (1) coordinated compaction decision via a small allreduce on a \u201cneed_compact\u201d bit, (2) compaction only at decode-step boundary (after finishing current token), (3) explicit stream sync before/after compaction copy kernels to avoid enqueue reordering across ranks, (4) assert + structured error if block-table versions diverge (should be unreachable post-fix).",
+    "2025-02-27 (Marcus Reed): Ran TP stress suite locally with forced compaction. Pre-fix: 2/20 runs stalled within 12\u201318 minutes. Post-fix: 0/30 stalls at same settings. Need to add this scenario to perf-canary/CI gate (will coordinate with ENG-4828).",
+    "2025-02-28 (Grace Kim): Code review: please confirm the additional allreduce won\u2019t meaningfully impact decode throughput. Suggest making coordination conditional: only participate when compaction is likely (e.g., allocator pressure high) to avoid constant overhead. Also, ensure we don\u2019t do the barrier in prefill hot path.",
+    "2025-03-01 (Samir Qureshi): Addressed review: coordination is only invoked when local pressure crosses a high-watermark OR fragmentation ratio > threshold. Prefill path unchanged; decode boundary only. Microbench shows <0.5% overhead in steady state; worst case ~1\u20131.5% when compaction frequent (which is already degraded regime).",
+    "2025-03-03 (Rafael Mendes): From SRE side, please ensure failures surface as a clear error code (not a hang). If the version-divergence assert triggers, it should abort/drain replica and increment stall reason counters so we can alert. Align with ENG-4826 watchdog semantics.",
+    "2025-03-04 (Samir Qureshi): Added error surfacing hook: if divergence detected, emit structured error KV_TP_BLOCK_TABLE_DIVERGENCE and request replica drain (ties into watchdog/abort path). Also added metric kv_block_table_version_skew_detected (counter).",
+    "2025-03-06 (Samir Qureshi): PR merged. Marking ticket Done. Follow-ups: ensure perf-canary includes \u201cforced compaction under pressure\u201d scenario (ENG-4828) and add a short note to runbook on mitigation (temporary: raise KV headroom / disable compaction coordination flag only if necessary; default should be ON in runtime-1.19 Dedicated canary)."
+  ],
+  "attachments": [
+    "sources/github/redwood/pr-21866-kv-cache-compaction-safety-in-tp.json",
+    "sources/github/perf-canary/pr-188-add-tp-stress-scenarios-long-context.json",
+    "sources/confluence/eng-serving-runtime/runbooks/runtime-tp-hang-mitigation.json",
+    "sources/confluence/eng-serving-runtime/benchmarking-and-perf-suite/tp-stress-suite-spec.json"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_017787f4428d4a81815b519f9c50cdee"
+}

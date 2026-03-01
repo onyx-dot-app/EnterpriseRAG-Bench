@@ -1,0 +1,74 @@
+{
+  "repo": "redwood",
+  "pr_number": "19871",
+  "title": "Fix FP8 KV cache alignment edge case impacting decode correctness + perf",
+  "author": "Grace Kim",
+  "created_at": "2026-02-16",
+  "updated_at": "2026-02-17",
+  "merged_at": "2026-02-17",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "bugfix/fp8-kv-cache-alignment-edge-case",
+  "reviewers": [
+    "Yuki Sato",
+    "Isabella Rossi",
+    "Noah Patel",
+    "Julian Moore"
+  ],
+  "labels": [
+    "runtime",
+    "kernels",
+    "fp8",
+    "perf",
+    "bug",
+    "sprint-fp8-int8"
+  ],
+  "linked_linear": [
+    "ENG-7428",
+    "ENG-7429",
+    "ENG-7423"
+  ],
+  "linked_jira": [
+    "SUP-31844"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "9",
+  "additions": "312",
+  "deletions": "97",
+  "breaking_change": "false",
+  "body": "Context: During the FP8/INT8 kernel benchmarking sprint we saw a bimodal behavior on FP8 decode for a subset of shapes (most visible on H100, but reproducible on A100). In some runs decode throughput dropped ~8\u201315% vs baseline, and in worse cases we observed occasional correctness mismatches (rare, but repeatable) when running with certain max_seq_len + page size combinations. This was correlated with a KV cache layout where the K/V page base pointer could be misaligned relative to the vectorized load/store assumptions in the FP8 decode path.\n\nRoot cause: The FP8 KV cache decode kernel assumes the K/V page base is aligned to 16 bytes (and that the per-head stride preserves this alignment). When the cache is allocated with a base alignment of 16 but the page offset is computed in bytes and then cast to the vector type, some page offsets produce a misaligned pointer (e.g. when page_size * element_size does not preserve 16B alignment after accounting for per-layer/per-head packing). On H100 this mostly manifested as degraded performance due to unaligned memory transactions; on a narrower set of cases we also hit an incorrect vectorized path in the dequant/load sequence (we were effectively reading across a boundary when the pointer wasn\u2019t aligned as expected).\n\nFix: (1) Make the alignment contract explicit at the KV cache allocator and layout layer: ensure page base pointers and per-page offsets are aligned to 16B for FP8 mode (and 8B for the fallback scalar path). (2) Add a guarded fallback in the FP8 decode kernel: if alignment is not satisfied at runtime, route to the scalar/packed load path (still correct; slightly slower) rather than executing the vectorized path. (3) Add coverage: a unit test that constructs KV caches with page sizes / seq lengths that previously produced misalignment and verifies decode outputs against the baseline FP16 path (tolerances consistent with existing FP8 decode tests).\n\nPerf impact: On the cases that regressed, this restores the expected decode throughput (we saw +7\u201312% tokens/s vs the broken FP8 path; net +4\u20139% vs baseline, depending on scheduler mix). No measurable impact on the common aligned cases.\n\nNotes: This change is intentionally conservative. We keep the vectorized path fast when alignment holds, and we never silently execute it when alignment doesn\u2019t. This should reduce benchmark variance from cache-shape quirks and avoid canary correctness incidents. Follow-up work (separate PR) will tighten shape constraints in the kernel registry so we avoid selecting FP8 decode kernels for unsupported alignment regimes.\n\nTesting: - Added unit tests under runtime/tests/gpu for KV cache alignment edge cases. - Ran the benchmark harness on H100 (sm90) and A100 (sm80) for a representative decode-heavy workload (short prefill, long decode). - Ran correctness sanity suite (golden prompts) locally for FP8 mode.\n\nRollout: No flag changes. This is a bugfix under the existing FP8 decode flag. Safe to ship; canary should show reduced variance and elimination of the observed mismatch case.\n\nChecklist: [x] Repro case captured and attached (see logs in artifacts link) [x] Fix includes correctness guardrails [x] Unit test added [x] Bench rerun on H100/A100 [x] SRE notified for canary expectations (reduced variance)\n\nArtifacts: - Benchmark run IDs: benchlab://runs/2026-02-16/fp8-kv-align-hotfix (H100), benchlab://runs/2026-02-16/fp8-kv-align-hotfix-a100 (A100) - Nsight snippet: benchlab://profiles/2026-02-16/fp8-kv-align-case3 (shows reduced unaligned transactions after fix)",
+  "commits": [
+    "runtime/kv_cache: document + enforce 16B alignment contract for FP8 pages",
+    "runtime/kernels/fp8_decode: add alignment check + scalar fallback path",
+    "tests: add KV cache alignment edge-case correctness test",
+    "bench: add debug counters for alignment/fallback rate (behind BENCH_DEBUG)"
+  ],
+  "changed_files": [
+    "runtime/src/kv_cache/kv_cache_layout.cc",
+    "runtime/src/kv_cache/kv_cache_allocator.cc",
+    "runtime/src/kernels/fp8/fp8_decode_attention.cu",
+    "runtime/src/kernels/fp8/fp8_load_store.h",
+    "runtime/src/runtime_flags.cc",
+    "runtime/tests/gpu/test_fp8_decode_kv_cache_alignment.cu",
+    "runtime/tests/gpu/testdata/fp8_kv_alignment_cases.json",
+    "runtime/bench/harness/collect_runtime_metadata.py",
+    "docs/internal/runtime/fp8_decode_known_constraints.md"
+  ],
+  "ci_checks": [
+    "build (linux x86_64) \u2014 pass",
+    "unit tests (cpu) \u2014 pass",
+    "gpu correctness smoke (a10) \u2014 pass",
+    "lint/format \u2014 pass",
+    "bench harness validation \u2014 pass"
+  ],
+  "review_conversation": "Yuki Sato: Can we guarantee allocator alignment across all KV layouts, or are we relying on page_size being friendly? I\u2019m worried we\u2019ll still hit misalignment if a future layout changes.\nGrace Kim (author): Good call. This PR enforces alignment in two places: allocator ensures page base alignment; layout rounds per-page stride to preserve 16B alignment in FP8 mode. I also left the runtime kernel guard so if we ever regress the contract we still stay correct.\n\nIsabella Rossi: Please add a metric/debug counter so we can see if we\u2019re unexpectedly hitting the scalar fallback in benchmarks.\nGrace Kim: Added BENCH_DEBUG counter + metadata field in artifact export. It\u2019s off in production.\n\nNoah Patel: The correctness issue is scary \u2014 do we know if it\u2019s actual wrong bytes or numeric drift? Also, please confirm this doesn\u2019t change default kernel selection.\nGrace Kim: It\u2019s wrong bytes in the vectorized load path under misalignment (confirmed by reading back K/V and comparing). Kernel selection is unchanged; we just avoid executing the unsafe path.\n\nJulian Moore: Scheduler might change effective alignment rate due to different page reuse patterns. Do we need to gate by scheduler config?\nGrace Kim: Not needed; alignment is a property of layout + offsets. Scheduler affects reuse, but shouldn\u2019t affect alignment itself. The fallback counter should help validate we\u2019re not hitting unexpected paths.\n\nApprovals: Yuki Sato (approved), Isabella Rossi (approved), Noah Patel (approved).",
+  "merge_outcome": "Merged via squash into main by Connor O'Brien. Squash commit message: \"Fix FP8 KV cache alignment edge case impacting decode correctness + perf (#19871)\"",
+  "release_notes": "Runtime: FP8 decode KV cache alignment bugfix. Prevents rare correctness mismatches and restores expected decode throughput for affected shapes by enforcing alignment and adding a safe fallback path.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "review_conversation",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_0b04d367b5fb49619e0b080f65e1f955"
+}

@@ -1,0 +1,48 @@
+{
+  "key": "ENG-3928",
+  "team": "engineering",
+  "title": "Rollout controller: block canary promotion on Optimize quality-gate failure",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-12-06",
+  "updated_at": "2026-02-18",
+  "creator": "Paula Mendes",
+  "assignee": "Hannah Rivera",
+  "project": "Quality guardrails gating for optimize",
+  "cycle": "2026-W06",
+  "estimate": "8",
+  "due_date": "2026-02-14",
+  "labels": [
+    "rollouts",
+    "quality-gates",
+    "optimize",
+    "safety",
+    "canary",
+    "blocker",
+    "hosted-api"
+  ],
+  "dependencies": [
+    "ENG-3921",
+    "ENG-3922",
+    "ENG-3925",
+    "ENG-3927"
+  ],
+  "customer_impact": "high",
+  "release": "console-2026.02",
+  "security_review_required": "true",
+  "description": "Context\nOptimize can propose cost-saving config diffs (batching, caching, quantization profiles) that can change outputs. Quality gates are required before applying a recommendation. This ticket wires those gate results into the rollout controller so that we cannot accidentally promote canaries (or complete rollouts) when gates failed / are missing.\n\nScope\n- Enforce gate status at rollout-controller promotion boundaries (canary -> 10%/25% -> 50% -> 100%, depending on policy).\n- Define halt/rollback behavior when a gate fails or becomes invalid mid-rollout.\n- Notifications: who gets notified, where, and with what context (gate run link + failure reasons).\n- Defense-in-depth: even if Optimize UI/API is bypassed, rollout controller must still prevent unsafe promotion.\n\nNon-goals\n- Designing new rollout UI components in Console (tracked in ENG-3925 / DES-611).\n- Full Private/on-prem automation (initially manual workflow per PRD).\n\nProposed policy (MVP)\nGate enforcement applies to rollouts that include Optimize-owned config diffs of type: batching policy, prefix/KV cache settings, quant profile.\n\nPromotion checks\nAt each promotion event, rollout controller must evaluate:\n1) Gate required?\n- Determine based on: config-diff contains gated knobs AND route/account tier policy (see per-route policy work).\n- If unknown: default to \u201crequired\u201d for gated knobs in hosted API.\n\n2) Gate state allowed?\n- ALLOW promotion only if gate_state in {PASSED, OVERRIDDEN}.\n- BLOCK promotion if gate_state in {PENDING, RUNNING, FAILED, CANCELED, TIMEOUT, UNKNOWN, NOT_FOUND}.\n\n3) Gate freshness / applicability\n- Gate result must match (config_diff_hash, baseline_ref, model_version, hardware_sku where applicable).\n- Gate result must be within TTL (default 7 days) OR explicitly pinned to this rollout (preferred).\n- If config diff changes (even semantically equivalent) after gate run started: treat as NOT_FOUND and block.\n\n4) Override handling\n- OVERRIDDEN allowed only if:\n  - override not expired\n  - override reason provided\n  - override recorded with approver + scope (route, diff hash)\n- If override expires mid-rollout, further promotions block (existing traffic stays at current canary percentage). Operator can: (a) extend override, (b) run gates again, (c) roll back.\n\nHalt and rollback behavior\n- If a promotion attempt is blocked due to missing/failed gate:\n  - Do not change traffic weights.\n  - Mark rollout step as \u201cHALTED_QUALITY_GATE\u201d with reason codes.\n  - Emit audit event and notify.\n\n- If gate fails while canary is already running (i.e., gate execution overlaps with early canary):\n  - Immediately halt further promotion.\n  - For canary weights > 0: trigger automatic rollback to previous stable config if policy says \u201cauto_rollback_on_gate_fail=true\u201d.\n  - Default for hosted API MVP: auto rollback ON for self-serve tiers; OFF for enterprise (halt + require human decision) to avoid surprising changes, but strongly recommend rollback in the UI.\n\n- If rollback fails (e.g., config apply fails):\n  - Escalate to oncall (SRE + platform) and keep rollout halted.\n\nState machine integration points\n- Rollout controller currently uses states: CREATED -> CANARY_RUNNING -> PROMOTING -> COMPLETED / HALTED / ROLLED_BACK.\n- Add new terminal-ish halt reason: HALTED_QUALITY_GATE.\n- Add structured reason codes:\n  - QUALITY_GATE_NOT_FOUND\n  - QUALITY_GATE_PENDING\n  - QUALITY_GATE_FAILED\n  - QUALITY_GATE_TIMEOUT\n  - QUALITY_GATE_MISMATCH (diff hash / baseline / model version mismatch)\n  - QUALITY_GATE_OVERRIDE_EXPIRED\n\nAPI / data requirements\n- Rollout controller must be able to query Optimize service for gate summary by (route_id, rollout_id, config_diff_hash).\n- Minimum response needed:\n  - gate_run_id\n  - gate_state\n  - started_at / completed_at\n  - gate_tier (smoke/full)\n  - failure_reasons (top-level)\n  - override: status, expires_at, approver\n  - artifacts_url (for Console deep link)\n\n- For MVP, polling is acceptable at promotion time (no continuous stream). Cache for 30s to avoid thundering herd during batch promotions.\n\nNotifications\n- Slack: post to #eng-sre for auto-rollbacks; post to #eng-ml for repeated failures by prompt set; post to #product for blocked customer-facing rollouts > 2h.\n- Pager: only when rollback is attempted and fails OR gate-related block rate spikes (handled via alerting ticket).\n- Include in payload:\n  - route, model, region\n  - rollout_id\n  - config diff summary (redacted for secrets)\n  - gate_run_id + Console link\n  - reason code and top 3 failure reasons\n\nObservability / audit\n- Emit events:\n  - rollout.promotion_blocked (reason_code, gate_state)\n  - rollout.auto_rollback_triggered (reason_code)\n  - rollout.auto_rollback_failed (error)\n- Ensure events include stable identifiers: route_id, account_id (if applicable), model_family, model_version, diff_hash.\n- These events should be referenced by audit log pipeline (ENG-3927).\n\nAcceptance criteria\n- Promotion is blocked when gate is FAILED / NOT_FOUND / PENDING / RUNNING.\n- Promotion succeeds only when gate PASSED or OVERRIDDEN (with non-expired override).\n- If gate fails after canary begins and auto_rollback_on_gate_fail is enabled, rollback to previous stable is initiated within 2 minutes.\n- All blocks/rollbacks emit an audit event with reason codes and can be correlated to gate_run_id.\n- Console can show a user-readable failure reason derived from reason codes + gate summary.\n\nTesting plan\n- Unit tests: gate decision logic (states, mismatch, TTL, override expiry).\n- Integration tests (staging):\n  - Start rollout with canary at 1%, gate pending -> promotion attempt blocked.\n  - Gate passes -> promotion unblocks.\n  - Gate fails with canary live and auto rollback enabled -> rollback executed.\n  - Override granted, then expires -> further promotions blocked.\n- Chaos-ish test: Optimize service briefly unavailable at promotion time -> rollout remains halted (no promotion), retries backoff.\n\nImplementation notes\n- Coordinate with Jordan Lee / Benji Okafor on policy evaluation surface (per-route tier defaults).\n- Coordinate with Chloe Martin / Felix Schneider on deep link format for Console (gate_run_id + rollout_id).\n- Security review: confirm no sensitive prompt/eval artifacts are leaked to unauthorized viewers; links should be authorized through Console (not direct object store URLs).\n\nLinks\n- Confluence PRD: sources/confluence/product-docs/requirements/optimize-quality-guardrails-gating-prd.json\n- System design: sources/confluence/product-docs/design-specs/optimize-quality-gates-system-design.json\n- Related tickets: ENG-3921, ENG-3927, ENG-3925\n- Implementation PR: sources/github/redwood/pr-19544-rollout-controller-respect-quality-gate-for-promotion.json\n\nRollout plan\n- Stage in internal beta: enforce on 2 internal routes (one batching change, one quant profile change).\n- Limited production rollout: enforce for hosted API subset (self-serve) with auto rollback on gate fail.\n- Expand to enterprise once override/audit + support tooling is stable.",
+  "comments": [
+    "2025-12-09 (Paula Mendes): We need defense-in-depth here. Optimize UI blocking is not enough; rollout controller must refuse to promote without a PASSED/OVERRIDDEN gate. Please prioritize reason codes so Support can explain blocks without digging through logs.",
+    "2025-12-17 (Sean Gallagher): For MVP, do NOT page on \u201cpromotion blocked\u201d unless it affects >N active rollouts or lasts >2h. Page only on rollback failure. Add a metric for blocked promotions by reason_code to feed alerts.",
+    "2026-01-08 (Hannah Rivera): Implemented gate lookup at promotion time with 30s cache + exponential backoff when Optimize service is unavailable. Unknown/NOT_FOUND defaults to block. Added HALTED_QUALITY_GATE and reason codes.",
+    "2026-01-21 (Jonas Weber): Please ensure mismatch detection includes baseline_ref and model_version, not just diff hash. We\u2019ve seen accidental reuse of a gate run across different baselines in early testing.",
+    "2026-02-06 (Marcus Lin): Security note: artifact links must be Console-authz\u2019d. Rollout controller should store artifact IDs or Console deep links, not raw object storage URLs. Approved approach in PR-19544.",
+    "2026-02-18 (Hannah Rivera): Marking Done. Merged PR-19544. Staging verification complete: (1) pending gate blocks promotion, (2) failed gate triggers halt, (3) auto rollback works for self-serve policy, (4) override expiry blocks subsequent promotions. Follow-up: ensure dashboards pick up new reason_code tags (tracked in ENG-3926)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_0b6b21691d334b2386f42e91b47afe8c"
+}

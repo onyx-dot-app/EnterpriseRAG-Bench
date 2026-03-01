@@ -6,7 +6,7 @@ from src.llm import get_llm
 from src.llm.conversation import Conversation
 from src.paths import COMPANY_OVERVIEW_PATH, INITIATIVES_PATH
 from src.prompts.initiatives import INITIATIVES_SYSTEM_PROMPT
-from src.statistics import update_statistics
+from src.utils.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import WriteTool
 from src.utils import confirm_regenerate, get_current_date_formatted, load_file

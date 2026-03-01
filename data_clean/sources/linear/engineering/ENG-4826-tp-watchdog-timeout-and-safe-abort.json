@@ -1,0 +1,55 @@
+{
+  "key": "ENG-4826",
+  "team": "engineering",
+  "title": "TP watchdog: timeout + safe abort that drains replica and surfaces structured error",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-02-19",
+  "updated_at": "2025-03-03",
+  "creator": "Talia Benson",
+  "assignee": "Grace Kim",
+  "project": "Multi-GPU (TP) stability fixes (Serving Runtime Performance \u2014 Kernel + Scheduling)",
+  "cycle": "2025-W08",
+  "estimate": "8",
+  "due_date": "2025-03-01",
+  "labels": [
+    "runtime",
+    "tensor-parallel",
+    "reliability",
+    "watchdog",
+    "incident-followup",
+    "dedicated"
+  ],
+  "parent_issue": "ENG-4821",
+  "dependencies": [
+    "ENG-4823",
+    "ENG-4825",
+    "ENG-4824"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.19",
+  "security_review_required": "false",
+  "description": "Background / why:\nWe are seeing TP replicas enter a \u201csilent stall\u201d state under sustained mixed prefill/decode (esp. long context + bursty concurrency). Today the runtime can wait indefinitely on a decode step / NCCL collective. This manifests as:\n- Request hangs \u2192 downstream timeouts\n- Autoscaling thrash (new replicas spin while wedged replicas remain \u201chealthy\u201d)\n- Hard-to-diagnose GPU stalls with no actionable error surface to routing/fallback\n\nGoal:\nAdd a watchdog for TP execution steps (decode iteration and/or collective boundaries) that:\n1) Detects lack of forward progress within a configurable timeout.\n2) Performs a safe abort path (no global GPU wedging): stop accepting new work, drain the replica, and restart/replace it.\n3) Surfaces a structured error code up the stack so the API layer can trigger retry/fallback rather than opaque timeouts.\n4) Produces clear observability signals for oncall (metrics + structured logs).\n\nNon-goals:\n- Perfect in-process recovery from a stuck NCCL call (generally not safe); preferred behavior is drain + restart.\n- Changing scheduler batching strategy (handled in ENG-4824).\n\nProposed behavior (high level):\n- Introduce a TP watchdog that monitors \u201cprogress\u201d for each TP replica and step type:\n  - Decode step progress: monotonically increasing decode_step_id / tokens_generated\n  - Collective boundary progress: monotonically increasing in_flight_collective_seq (from instrumentation in ENG-4823)\n- If no progress for > timeout, trigger: (a) mark replica unhealthy (b) reject/redirect new requests (c) abort in-flight requests with a structured error and (d) initiate drain/restart.\n\nTimeout semantics:\n- Two thresholds:\n  - soft_timeout_ms: emits warning logs/metrics, starts drain prep (stop scheduling new batches)\n  - hard_timeout_ms: triggers abort + drain + restart\n- Defaults are conservative and model-size aware (proposal):\n  - 7B/8B: soft 10s, hard 30s\n  - 13B: soft 15s, hard 45s\n  - 70B (TP>=4): soft 20s, hard 60s\n- All timeouts configurable via runtime config; guarded by feature flag.\n\nSafe abort / drain plan:\n- Feature-flagged watchdog: runtime.tp_watchdog.enabled\n- On hard timeout:\n  1) Emit structured event: tp_watchdog_triggered{reason=decode_no_progress|collective_no_progress, tp_degree, model, gpu_type}\n  2) Flip replica state to DRAINING:\n     - stop accepting new requests\n     - shed load (integrate with overload/routing hooks; see ENG-4823/PR followups)\n  3) Fail all in-flight requests with structured error:\n     - error_code: RW_TP_STALL_ABORTED\n     - retryable: true\n     - message includes reason + last known step ids + hints to check dashboard\n  4) Terminate worker process/container to ensure CUDA/NCCL state is fully reset (avoid attempting to \u201cunstick\u201d GPU in-process).\n\nNotes / constraints:\n- If stall is inside NCCL call, we cannot rely on cooperative cancellation. Draining must be outside the stuck execution context (supervisor thread/process).\n- Ensure watchdog logic does not take locks that can be held by stalled worker threads.\n- Avoid high-frequency polling overhead; use coarse periodic check (e.g., 250ms\u20131s) based on perf constraints.\n\nAcceptance criteria:\n- In repro harness (ENG-4822) where we induce a stall, watchdog triggers within hard_timeout_ms + 2s.\n- Replica drains and is replaced; cluster returns to steady-state without manual intervention.\n- Client sees structured error RW_TP_STALL_ABORTED (not just request timeout).\n- Metrics exist and are alertable (TP heartbeat gap + watchdog triggers + drain counts).\n- No measurable p50 latency regression >1% when watchdog enabled (target); p99 impact acceptable if limited to stall scenarios.\n\nTesting:\n- Add fault-injection test to simulate no progress (e.g., block collective progression in a test build) and verify:\n  - watchdog triggers\n  - error surface is structured\n  - drain/restart path is invoked\n- E2E in perf-canary: enable watchdog on TP stress scenarios (ENG-4828) with induced failure case.\n\nRollout plan:\n- Land behind feature flag (default off).\n- Canary in Dedicated A100 cluster for a small set of replicas; enable extra NCCL/runtime debug logging via INT-2219 for a limited window.\n- Expand to Hosted high-throughput clusters once Dedicated shows reduced hang-induced timeouts.\n\nReferences:\n- ADR: adr-0127-tp-watchdog-and-abort-semantics\n- Incident: 2025-02-17 TP decode hang Sev1 postmortem\n- Related PR (planned): PR-21860-tp-watchdog-timeout-and-replica-drain",
+  "comments": [
+    "2025-02-19 (Noah Patel): Aligning on semantics with SRE: we should treat \u201cwatchdog triggers\u201d as a reliability mechanism, not a bug workaround. Preference is to always drain+restart rather than attempting partial recovery. We\u2019ll rely on routing/fallback to keep customer traffic flowing. Please ensure structured error is retryable and includes a reason code we can aggregate.",
+    "2025-02-20 (Rafael Mendes): +1 on drain+restart. Oncall pain point from Sev1: wedged replicas stayed in rotation. We need a hard guarantee that once watchdog fires, the replica is removed from LB immediately. Also please add a dedupe/rate-limit so we don\u2019t page every minute for the same replica flapping.",
+    "2025-02-21 (Grace Kim): Implementation approach: supervisor thread monitors atomic progress counters updated by the TP step boundary. On hard timeout, we emit event + set state to DRAINING and ask the worker process to exit (SIGTERM). If worker doesn\u2019t exit in grace period, SIGKILL. This avoids deadlocking on internal runtime locks. Will gate on runtime.tp_watchdog.enabled + timeout config.",
+    "2025-02-24 (Aisha Bello): Metrics naming proposal consistent with ENG-4823 thread: redwood_runtime_tp_watchdog_triggers_total{reason,model,tp_degree,gpu_type}, redwood_runtime_replica_drains_total{cause=tp_watchdog}, and a gauge for seconds since last tp progress. Please ensure labels are bounded (model should be canonical name, not full revision hash).",
+    "2025-02-26 (Hiro Tanaka): Watch out for CUDA graph capture. If we update progress counters only outside capture, decode steps may look \u201cstalled\u201d while in a long captured region. Suggest: also track wall-clock time per decode iteration entry/exit; for graph capture mode, update a per-iteration heartbeat on host before launching the captured graph.",
+    "2025-02-28 (Grace Kim): PR up: https://sources/github/redwood/pr-21860-tp-watchdog-timeout-and-replica-drain. Includes feature flag, soft/hard timeouts, structured error RW_TP_STALL_ABORTED, and drain path. Added unit tests for timeout logic + integration hook to mark replica unhealthy. Pending review from SRE + API error mapping follow-up (Noah coordinating).",
+    "2025-03-01 (Connor O'Brien): For runtime-1.19 gating, we\u2019re okay to ship watchdog code default-off. Enabling in canary requires release checklist update + SRE signoff. Please add rollout notes to ENG-4829 once merged.",
+    "2025-03-03 (Grace Kim): PR-21860 merged. Follow-up created to tune defaults per model (pending canary data) and to reduce alert noise once we see real-world trigger rates."
+  ],
+  "attachments": [
+    "https://sources/github/redwood/pr-21860-tp-watchdog-timeout-and-replica-drain",
+    "sources/confluence/architecture-and-standards/decision-records/adr-0127-tp-watchdog-and-abort-semantics.json",
+    "sources/confluence/eng-serving-runtime/runbooks/runtime-tp-hang-mitigation.json"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "attachments"
+  ],
+  "dataset_doc_uuid": "dsid_a902aa0dd4d2436f883660d3a1fcb813"
+}

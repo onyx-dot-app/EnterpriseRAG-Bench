@@ -5,7 +5,7 @@ from typing import Any
 
 import anthropic
 
-from src.llm.interface import LLMInterface, Message, ToolCall
+from src.llm.interface import LLMInterface, Message, ReasoningLevel, ToolCall
 
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -31,6 +31,7 @@ class AnthropicLLM(LLMInterface):
         model: str | None = None,
         tools: list[dict] | None = None,
         quiet: bool = False,
+        reasoning_level: ReasoningLevel = "medium",
     ):
         """
         Initialize the Anthropic LLM.
@@ -40,6 +41,7 @@ class AnthropicLLM(LLMInterface):
             model: Model to use. Defaults to ANTHROPIC_MODEL env var or claude-sonnet-4-20250514.
             tools: List of tool schemas in OpenAI format (will be converted).
             quiet: If True, suppress status print statements.
+            reasoning_level: Level of reasoning effort ("low", "medium", "high").
         """
         self.api_key = api_key or ANTHROPIC_API_KEY
         if not self.api_key:
@@ -49,6 +51,7 @@ class AnthropicLLM(LLMInterface):
         self.model = model or ANTHROPIC_MODEL
         self.tools = self._convert_tools(tools) if tools else None
         self.quiet = quiet
+        self.reasoning_level = reasoning_level
 
         # Use Braintrust tracing if configured
         if BRAINTRUST_API_KEY and BRAINTRUST_PROJECT:
@@ -137,7 +140,8 @@ class AnthropicLLM(LLMInterface):
 
         # Check if model supports extended thinking
         if "claude-3-7" in self.model or "claude-sonnet-4" in self.model or "claude-opus-4" in self.model:
-            kwargs["thinking"] = {"type": "enabled", "budget_tokens": 5000}
+            budget_tokens_map = {"low": 2000, "medium": 5000, "high": 10000}
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget_tokens_map[self.reasoning_level]}
             kwargs["temperature"] = 1  # Required for extended thinking
 
         tool_calls: list[ToolCall] = []

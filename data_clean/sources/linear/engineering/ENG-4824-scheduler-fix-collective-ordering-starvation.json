@@ -1,0 +1,53 @@
+{
+  "key": "ENG-4824",
+  "team": "engineering",
+  "title": "Scheduler guardrail: prevent TP collective ordering starvation under prefill-heavy load",
+  "status": "In Review",
+  "priority": "P0",
+  "created_at": "2025-02-20",
+  "updated_at": "2025-03-03",
+  "creator": "Sofia Ivanova",
+  "assignee": "Lena Fischer",
+  "project": "Multi-GPU (TP) stability fixes (Serving Runtime Performance \u2014 Kernel + Scheduling)",
+  "cycle": "2025-W08",
+  "estimate": "8",
+  "due_date": "2025-03-06",
+  "release": "runtime-1.19",
+  "customer_impact": "high",
+  "labels": [
+    "serving-runtime",
+    "scheduler",
+    "tensor-parallel",
+    "reliability",
+    "deadlock",
+    "fairness",
+    "p99-latency"
+  ],
+  "parent_issue": "ENG-4821",
+  "dependencies": [
+    "ENG-4822",
+    "ENG-4823"
+  ],
+  "related_links": [
+    "Confluence (design): sources/confluence/eng-serving-runtime/kernel-and-scheduling/tp-stability-fixes-design.json",
+    "Slack thread (repro): sources/slack/eng-runtime/1739784412-tp-hang-repro-on-a100-80gb.json",
+    "Slack thread (NCCL ordering): sources/slack/eng-runtime/1739812205-nccl-collective-ordering-suspected-mismatch.json",
+    "GitHub PR (implementation): sources/github/redwood/pr-21841-scheduler-guardrail-prevent-collective-starvation.json"
+  ],
+  "description": "Problem\n- Under sustained TP load with mixed prefill + decode (especially long-context prefill bursts), we observe intermittent stalls that look like \u201cNCCL hang\u201d but are frequently scheduler-induced: one or more ranks enter a collective later than peers because they remain busy executing prefill-heavy work.\n- Once collective ordering diverges or a subset of ranks fails to reach the same collective within a bounded time window, the whole replica can wedge: streaming responses time out, p99 explodes, autoscaling thrashes, and we end up draining replicas as mitigation.\n\nHypothesis / contributing factors\n- Prefill-heavy batches can dominate the scheduler\u2019s compute streams and token budget, causing decode steps to miss their intended \u201csync points\u201d.\n- Our current fairness logic is request-centric (throughput-optimized), but collectives are rank-wide coordination points and should be treated as high priority barriers.\n- In mixed workloads, the scheduler can inadvertently reorder microbatches such that some ranks progress into the next step while others are still servicing earlier prefill work.\n\nGoal\nEnsure collectives are scheduled with consistent ordering and cannot be starved by prefill-heavy batches.\n- Primary: reduce hang / timeout rate attributable to scheduler starvation.\n- Secondary: preserve as much throughput as possible (avoid a blanket concurrency cap as the only solution).\n\nProposal (scheduler changes)\n1) Introduce a \u201ccollective-critical section\u201d concept in the runtime scheduler\n   - When a TP group is approaching a collective boundary for an active decode step, the scheduler must guarantee forward progress to that boundary across all ranks.\n   - Implementation detail: a per-TP-group \u201ccollective pending\u201d signal that elevates priority of tasks required to reach the next collective.\n\n2) Add a starvation guardrail: bounded prefill admission when decode/collectives are pending\n   - If decode step(s) are ready but blocked by outstanding prefill work, throttle new prefill microbatches for that TP group until decode reaches its barrier.\n   - This is explicitly NOT \u201cdisable prefill\u201d; it is a limiter to prevent unbounded queue growth and rank drift.\n\n3) Enforce deterministic collective ordering at the scheduler boundary\n   - Maintain a monotonic \u201ccollective sequence id\u201d for TP replicas.\n   - Disallow scheduling work that would advance the local rank past the expected sequence id unless the TP group is aligned.\n   - If we detect drift (rank ahead/behind), emit structured logs + stall reason tag (ties into ENG-4823).\n\n4) Add configurable knobs (feature-flagged)\n   - max_prefill_bytes_or_tokens_while_collective_pending\n   - decode_priority_boost (relative weight)\n   - max_scheduler_wait_for_collective_alignment_ms (initially informational; watchdog handles abort path separately in ENG-4826)\n\nAcceptance criteria\n- Repro harness (ENG-4822) no longer wedges the replica over N=50 runs on A100 80GB with TP=4/8 under mixed prompt lengths + streaming decode.\n- Perf canary (ENG-4828) shows:\n  - Hang rate: 0 in canary window (or below current baseline by >= 10x, depending on how we count \u201cstall\u201d events).\n  - p99 latency: no regression > 3% in steady-state decode-only workloads; mixed workloads may trade a small throughput hit for stability (target <= 5% throughput impact).\n- Observability (ENG-4823) indicates reduced \u201cscheduler_starvation\u201d stall reason counts and reduced heartbeat gaps.\n\nImplementation plan\n- Phase A: Add scheduling primitives + drift detection (no behavior change)\n  - Introduce collective sequence id tracking per TP group.\n  - Emit debug-only logs when rank drift would occur.\n- Phase B: Enable guardrail behind feature flag\n  - Decode priority boost + prefill admission throttling when collective pending.\n  - Conservative defaults (off by default in Hosted; opt-in in Dedicated canary).\n- Phase C: Tighten invariants\n  - Optionally block scheduling of \u201cadvance past collective\u201d work when alignment conditions not met.\n\nRisks / trade-offs\n- Throughput regression risk\n  - Throttling prefill can reduce peak tokens/s on prompt-heavy traffic. Mitigation: limit guardrail activation to when collectives are pending and to the affected TP group; keep thresholds configurable.\n- False positives / unnecessary throttling\n  - If the \u201ccollective pending\u201d signal is too broad, we may reduce batching efficiency. Mitigation: keep the pending window narrow (only when the next barrier is imminent), and gate with metrics.\n- Interaction with CUDA graphs / kernel-level ordering\n  - Scheduler ordering fixes reduce chances of mismatch, but kernel/stream sync issues still exist (ENG-4825). This change is complementary, not a substitute.\n- Operational complexity\n  - New knobs require documentation and safe defaults; coordinate with SRE runbook updates (runtime-tp-hang-mitigation).\n\nRollout plan\n- Feature flag: runtime.tp.scheduler_collective_starvation_guardrail\n  - Default: OFF everywhere.\n- Canary steps\n  1) Enable in benchmark-lab + perf-canary for TP stress scenarios (ENG-4828).\n  2) Dedicated canary: 1\u20132 internal clusters + 1 low-risk Dedicated account (aligned with ENG-4829).\n  3) Expand Dedicated: 10% -> 50% -> 100% with rollback if any of:\n     - increased timeout rate, increased drain events, or p99 regression > agreed threshold.\n  4) Hosted: staged rollout by region + model tier after Dedicated is stable.\n- Monitoring / gating\n  - Must watch: tp_heartbeat_gap, tp_stall_reason{reason=\"scheduler_starvation\"}, request_timeouts, replica_drain_events, and p99 latency per model.\n  - Rollback trigger: any increase in hang/stall events vs baseline, or major perf regression.\n\nNotes\n- This ticket focuses on scheduler fairness and deterministic ordering at the scheduler boundary. NCCL stream/event correctness is tracked in ENG-4825. Watchdog/abort path tracked in ENG-4826.\n\nOwners / reviewers\n- Owner: Lena Fischer (Scheduling)\n- Reviewers: Sofia Ivanova, Noah Patel, Julian Moore\n- SRE consult: Rafael Mendes (for alerting impact + canary guardrails)\n",
+  "comments": [
+    "2025-02-20 \u2014 Sofia Ivanova: Creating this as a dedicated ticket because the hang signature we\u2019re seeing in the A100 repro looks like classic starvation \u2192 ranks drift \u2192 collective mismatch. We need a scheduler-level invariant here, not just more logging. Please keep perf impact measurable; we\u2019ll need a clear canary story for Dedicated.",
+    "2025-02-22 \u2014 Lena Fischer: Drafted proposal: (1) collective pending signal, (2) prefill admission throttle while pending, (3) per-TP-group sequence id to prevent drift. Will prototype with behavior change behind feature flag; first land drift detection only so we can measure how often we\u2019d have blocked.",
+    "2025-02-24 \u2014 Noah Patel: +1 on sequence id; make sure it\u2019s tied to actual collective boundaries (not just \u201cdecode iteration\u201d). Also: please ensure we don\u2019t deadlock ourselves by blocking prefill when decode queue is empty; guardrail should activate only when decode is runnable but waiting on compute budget.",
+    "2025-02-26 \u2014 Julian Moore: Suggest wiring \u201ccollective pending\u201d into queue weights rather than hard blocking; e.g., boost decode lane and cap prefill lane tokens per tick. Hard blocks can create tail-lat spikes if the signal flaps. If we do block, add a max wait and emit stall reason so SRE can see it.",
+    "2025-02-28 \u2014 Lena Fischer: Implemented weighted-lane approach in PR-21841 (decode priority boost + prefill cap while collective pending). Also added drift-detection log: scheduler_collective_drift_detected with labels (tp_group, rank, seq_expected, seq_local). Default OFF. Need review on thresholds + naming to align with ENG-4823 metric plan.",
+    "2025-03-01 \u2014 Rafael Mendes (SRE): From oncall perspective, prefer: (a) clear metric counters when guardrail engages, (b) rate-limited logs, (c) dashboard panel showing guardrail engagement vs timeouts. Rollout: Dedicated first with explicit rollback trigger if we see p99 regression. Please add flag to allow quick disable without restart if possible.",
+    "2025-03-03 \u2014 Sofia Ivanova: Marking In Review pending perf numbers. Request: include a microbench result for decode-only throughput and a mixed workload run (repro harness). Also update ENG-4829 with canary gating criteria once merged."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_a32223b0b96b43bf84cb7e5313f4ea47"
+}

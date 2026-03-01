@@ -11,7 +11,7 @@ from src.paths import (
     SOURCES_DIR,
 )
 from src.prompts.agents_md import AGENTS_MD_SYSTEM_PROMPT
-from src.statistics import update_statistics
+from src.utils.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import FinishTool, WriteTool
 from src.utils import load_file

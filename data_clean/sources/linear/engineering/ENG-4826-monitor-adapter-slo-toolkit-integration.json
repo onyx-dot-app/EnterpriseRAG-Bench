@@ -1,0 +1,39 @@
+{
+  "key": "ENG-4826",
+  "team": "engineering",
+  "title": "Monitor adapter: integrate slo-toolkit burn-rate query + staleness + caching",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-08",
+  "updated_at": "2026-02-24",
+  "creator": "Ethan Park",
+  "assignee": "Logan Wright",
+  "project": "Auto-rollback on SLO breach integration",
+  "cycle": "2026-W08",
+  "estimate": "8",
+  "due_date": "2026-03-06",
+  "labels": [
+    "rollouts",
+    "slo",
+    "observability",
+    "control-plane",
+    "reliability",
+    "cache",
+    "staleness"
+  ],
+  "dependencies": [
+    "ENG-4821",
+    "ENG-4822",
+    "ENG-4861",
+    "sources/confluence/architecture-and-standards/decision-records/adr-0127-slo-breach-evaluation-and-debounce.json",
+    "sources/github/slo-toolkit/pr-221-burn-rate-endpoint-for-rollout-scoped-slos.json"
+  ],
+  "customer_impact": "high",
+  "security_review_required": "false",
+  "description": "Implement the rollout-scoped SLO query adapter used by the rollout controller\u2019s SLO evaluator. Adapter must call slo-toolkit burn-rate endpoint(s), enforce staleness rules, and add caching to keep evaluation loops from overloading telemetry/query infra.\n\nContext\n- Rollout controller needs low-latency access to: burn-rate status (fast/slow windows), sample sizes / request volume, and \"data freshness\" for the exact rollout scope (route/service, model version, region, customer tier).\n- We have learned from simulation/postmortem that missing/stale monitors must be detectable and must not trigger unsafe rollbacks.\n\nScope / Deliverables\n1) Adapter interface + implementation\n- Create MonitorAdapter implementation (go package `rollouts/slo/adapter` or equivalent per repo conventions) that can:\n  - Resolve monitor identifier(s) for a rollout scope (by labels) OR take explicit monitor IDs from policy.\n  - Query slo-toolkit burn-rate API for:\n    - fast-window burn rate + slow-window burn rate\n    - error budget remaining (if provided)\n    - request counts/sample sizes per window (or sufficient proxies)\n    - last data timestamp / freshness info\n  - Return a normalized response type for the evaluator (so controller logic stays provider-agnostic).\n\n2) Staleness handling\n- Define staleness signal and return codes the evaluator can act on:\n  - `OK`: data is fresh enough\n  - `STALE`: data timestamp older than threshold (see defaults below)\n  - `MISSING`: no monitor found for scope OR endpoint returns 404/empty\n  - `ERROR`: query failed (5xx/timeouts) with retryable flag\n- Default staleness thresholds (to align with SRE expectations; exact numbers may change after review):\n  - If slo-toolkit provides `dataTimestamp` per series/window, consider data stale if now - dataTimestamp > 2m for fast window OR > 10m for slow window.\n  - If only `asOf` timestamp exists, use same thresholds.\n  - If no timestamps are available, treat as `STALE` (do not allow rollback on unknown freshness).\n- Behavior when stale/missing:\n  - Do not directly trigger rollback.\n  - Emit `rollout_slo_eval_result{result=\"monitor_stale\"|\"monitor_missing\"}` (metric already tracked elsewhere; just ensure adapter exposes this state).\n  - Provide enough details for audit trail: monitor id(s), query params, staleness age, error codes.\n\n3) Caching + rate limiting\n- Add per-scope caching in adapter (keyed by rollout scope + SLO type + window config + region/tier labels).\n- Requirements:\n  - TTL: 15s default for OK results; 5s for ERROR results (to avoid stampeding but still recover quickly).\n  - Negative caching: cache MISSING/STALE for 30s to avoid repeated expensive lookups when monitors are absent.\n  - Concurrency: singleflight/dedup in-flight queries for identical keys.\n  - Max size: bounded (e.g., 10k keys) with LRU eviction.\n  - Metrics: cache hit rate + in-flight dedup count.\n\n4) Observability\n- Adapter should log structured events (debug/info) with:\n  - rollout_id (if available), route, model_version, region, customer_tier\n  - monitor_id(s)\n  - query latency\n  - outcome (OK/STALE/MISSING/ERROR)\n- Emit adapter-level metrics (names tbd; ensure alignment with observability standards doc):\n  - `rollout_slo_query_requests_total{outcome=...}`\n  - `rollout_slo_query_latency_ms` histogram\n  - `rollout_slo_query_cache_hits_total` / `...misses_total`\n\nNon-goals\n- Building new SLOs/monitors. This ticket assumes monitors exist and slo-toolkit can answer the queries.\n- UI/Console surfaces.\n\nAcceptance Criteria\n- Adapter can query slo-toolkit for a rollout scope and returns normalized burn-rate + sample info.\n- Staleness and missing-monitor conditions are deterministically detected and exposed to evaluator.\n- Cache prevents >1 query per 15s per unique scope under normal evaluation loop.\n- Unit tests cover:\n  - OK -> fresh data\n  - STALE based on timestamps\n  - MISSING monitor\n  - ERROR with retries and cached error behavior\n  - singleflight dedup under concurrent calls\n- Integration test (can be in staging E2E later) can simulate endpoint returning stale and confirm no rollback is executed.\n\nReferences / Links\n- PRD: sources/confluence/product-docs/requirements/auto-rollback-slo-integration-prd.json\n- Design: sources/confluence/product-docs/design-specs/rollout-controller-slo-monitoring-integration-design.json\n- Postmortem note: sources/confluence/oncall-and-incident-response/postmortems/2026-02-17-rollout-latency-regression-auto-rollback-gaps.json\n- slo-toolkit endpoint work: sources/github/slo-toolkit/pr-221-burn-rate-endpoint-for-rollout-scoped-slos.json\n- Related tickets: ENG-4821 (controller hook), ENG-4861 (min sample + debounce)\n\nOpen Questions\n- Confirm whether slo-toolkit will provide per-window `dataTimestamp` or only a single `asOf`. If only `asOf`, can we also get per-window request counts?\n- For Dedicated/Private, do we need different staleness thresholds due to longer aggregation windows or lower traffic?\n\nImplementation Notes (initial)\n- Prefer using existing http client with standard timeouts (2s) and retries (max 2) with jitter.\n- Ensure adapter does not log PII or customer content; only labels/ids.\n\nUpdates / Comments\n- 2026-02-10 (Logan Wright): Kicked off spike. slo-toolkit PR-221 adds `GET /v1/burn_rate` with label selectors. Waiting on final response schema (esp. timestamps + counts). Proposed caching strategy (TTL 15s/negative 30s) seems fine; will align with Allison\u2019s cardinality guidance for metrics labels.\n- 2026-02-12 (Sean Gallagher): Strong preference: if freshness can\u2019t be established, treat as STALE and suppress rollback (notify only). We should alert on `monitor_missing`/`monitor_stale` because that\u2019s an unsafe blind spot.\n- 2026-02-14 (Jordan Lee): Evaluator expects adapter to return both fast+slow window results in one call to keep decision logic simple. If slo-toolkit requires two calls, adapter should aggregate + still apply singleflight.\n- 2026-02-18 (Aisha Bello): Please include query latency histogram; we saw prior rollout evaluations causing thundering herd during incident simulation. Also ensure negative caching for 404/empty results.\n- 2026-02-21 (Logan Wright): Implemented adapter skeleton + cache interface locally. Next: wire to slo-toolkit client once PR-221 merges. Need to decide on key normalization (sorted labels) to avoid duplicate cache keys.\n- 2026-02-24 (Ethan Park): Marking P0 due to staging E2E timeline. If we slip, controller will have to run in \u201cpause-only + missing monitors suppress\u201d mode longer. Please prioritize staleness detection + negative caching first; richer metrics can follow in ENG-4837 if needed.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description"
+  ],
+  "dataset_doc_uuid": "dsid_399d27e792094d6fbe7d1298357f5346"
+}

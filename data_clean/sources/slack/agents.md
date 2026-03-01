@@ -5,7 +5,7 @@ Target number of files:
 200000
 
 File name format:
-The documents are named some timestamp.json in unix time, just a single number with no underscore etc. (e.g., 1234567890.json)
+The documents are named some timestamp.json in unix time (just a single number with no underscore etc.) followed by a description of the thread (e.g., 1740535447-v2-api-rollout-blockers.json).
 
 Content rules:
 - Each document represents exactly one Slack thread.

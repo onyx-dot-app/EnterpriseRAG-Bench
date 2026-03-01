@@ -1,0 +1,76 @@
+{
+  "key": "SUP-48377",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "NCCL stall suspected in multi-GPU (TP) replica \u2014 possible collective mismatch / stream ordering issue",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev2",
+  "created_at": "2025-02-20",
+  "updated_at": "2025-03-03",
+  "reporter": "Owen Phillips",
+  "assignee": "Liam O'Rourke",
+  "customer_company": "Acme AI",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "scheduler",
+    "kernel",
+    "observability"
+  ],
+  "labels": [
+    "tensor-parallel",
+    "nccl",
+    "stall",
+    "timeouts",
+    "a100",
+    "dedicated",
+    "needs-eng-escalation"
+  ],
+  "environment": "prod us-east",
+  "affected_models": [
+    "llama-70b-instruct (TP=4)",
+    "mixtral-8x7b-instruct (TP=2)"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "first_response_due_at": "2025-02-20",
+  "sla_due_at": "2025-02-21",
+  "linked_issues": [
+    "SUP-48321",
+    "SUP-48344",
+    "INT-2219"
+  ],
+  "related_incident_id": "INC-2025-02-17-DEDICATED-TP-HANG",
+  "related_github_prs": [
+    "github:redwood/pr-21853-nccl-stream-event-sync-hardening",
+    "github:redwood/pr-21841-scheduler-guardrail-prevent-collective-starvation",
+    "github:redwood/pr-21912-improve-nccl-error-surfacing-to-api-layer",
+    "github:redwood/pr-21860-tp-watchdog-timeout-and-replica-drain"
+  ],
+  "related_confluence_pages": [
+    "confluence:eng-serving-runtime/known-issues/tensor-parallel-hangs-under-load",
+    "confluence:eng-serving-runtime/runbooks/runtime-tp-hang-mitigation",
+    "confluence:eng-serving-runtime/profiling-playbook/tp-stall-triage-playbook"
+  ],
+  "description": "Issue summary\nAcme AI is seeing intermittent request hangs/timeouts on their Dedicated cluster when running multi-GPU tensor-parallel replicas (A100 80GB, TP=4). During the affected windows, we captured NCCL debug output indicating a suspected collective mismatch / out-of-order collective sequence across ranks. Symptoms align with \u201csilent stall\u201d scenarios: GPU utilization drops to near-idle on one or more ranks, in-flight requests stop making progress, and the API layer eventually returns timeouts.\n\nCustomer impact\n- Streaming chat requests hang (no tokens emitted) and then time out.\n- p99 latency spikes + elevated 504s from gateway for the affected route.\n- Incident-level impact during peak hours; Acme AI has implemented a temporary concurrency cap but is still seeing sporadic stalls under burst.\n\nEnvironment\n- Deployment: Dedicated (customer VPC peering)\n- Region: us-east\n- Hardware: A100 80GB (4 GPUs per replica)\n- Runtime version: 1.18.6-redwood (customer pinned), canary candidate 1.19.0-rc2 available\n- Models: llama-70b-instruct (TP=4), mixtral-8x7b-instruct (TP=2)\n- Workload pattern: mixed prompt lengths (2k\u201316k), streaming enabled, bursty concurrency (spikes), cancellations observed (client disconnects)\n\nWhat we collected\n1) NCCL debug logs (sanitized) from an affected replica (rank 0 and rank 3). These were captured during a canary debug window (see INT-2219). Notable lines below.\n2) Runtime structured logs showing TP step progress halting on a collective boundary.\n3) Request IDs and approximate timestamps to correlate with tracing.\n\nNCCL debug excerpts (sanitized)\nTimestamp window: 2025-02-20 18:31:02\u201318:33:10 UTC\n\nRank 0:\n- \"NCCL INFO Launch mode: Group\"\n- \"NCCL INFO comm 0x7f2a... rank 0 nranks 4 cudaDev 0 busId 0000:2b:00.0\"\n- \"NCCL INFO Ring 00 : 0 -> 1 -> 2 -> 3 -> 0\"\n- \"NCCL INFO AllReduce: opCount 184467 count 2097152 datatype 7 op 0 root -1\"\n- \"NCCL WARN [Service thread] Connection closed by peer\"\n- \"NCCL INFO Abort COMPLETE\"\n\nRank 3:\n- \"NCCL INFO comm 0x7f93... rank 3 nranks 4 cudaDev 3 busId 0000:b1:00.0\"\n- \"NCCL INFO AllReduce: opCount 184466 count 2097152 datatype 7 op 0 root -1\"\n- \"NCCL INFO AllGather: opCount 184467 count 524288 datatype 7\"\n- (No further progress; no matching AllGather on rank 0 at same opCount)\n\nInterpretation (tentative)\n- Rank 3 appears to advance to a different collective (AllGather) while rank 0 is still at AllReduce for the same opCount+1 boundary. This is consistent with a collective ordering divergence between ranks (could be stream/event ordering, conditional path in kernel code, cancellation/early-exit path, or scheduler starvation causing one rank to enter a different phase).\n- The \u201cConnection closed by peer\u201d and abort is likely a downstream symptom once one rank times out/aborts; we need to determine the first divergence trigger.\n\nCurrent hypothesis (needs Eng confirmation)\n- Ordering/synchronization issue around NCCL collectives on separate CUDA streams when mixed prefill/decode interleaving occurs, potentially amplified by request cancellation and/or CUDA graph capture constraints.\n- Alternate hypothesis: scheduler fairness/starvation causes one rank to delay a collective while others advance, leading to mismatch.\n\nAsks / next steps\n- Eng Kernels (Hiro/Grace/Yuki): validate whether current TP implementation can hit divergent collective ordering under mixed workloads and where stream/event sync is missing.\n- Eng Scheduling (Sofia/Julian/Lena): evaluate starvation risk in prefill-heavy batches preventing collective alignment.\n- SRE (Rafael/Aisha): confirm alerting signals available for \u201cheartbeat gaps per rank\u201d and whether this was visible during incident windows.\n\nTemporary mitigations (currently applied / recommended)\n- Apply concurrency cap per replica (Acme currently set to 24; previously 48).\n- Disable CUDA graph capture on TP routes (if enabled) for stability testing.\n- Prefer Dedicated-first canary on runtime 1.19 with NCCL stream/event sync hardening + stall detectors once available.\n\nReferences\n- Slack incident thread: #incidents (1740165551-sev1-dedicated-timeouts-suspected-tp-hang)\n- Slack runtime thread: #eng-runtime (1739812205-nccl-collective-ordering-suspected-mismatch)\n- In-flight fixes: PR-21853 (stream/event sync hardening), PR-21841 (scheduler guardrail), PR-21912 (error surfacing), PR-21860 (watchdog/drain)\n\nAttachments\n- Redacted NCCL log bundle uploaded to support case (internal link): support-attachments/SUP-48377/nccl-debug-logs-2025-02-20.tgz\n- Correlation sheet (request ids + timestamps): support-attachments/SUP-48377/request-correlation.csv",
+  "comments": [
+    "2025-02-20 19:02 UTC \u2014 Owen Phillips (Support): Created from Acme escalation + logs received. Initial read suggests collective mismatch: rank 3 advances to AllGather while rank 0 still on AllReduce (opCount skew). Looping in runtime kernels + scheduling. Linked to INC-2025-02-17-DEDICATED-TP-HANG and related tickets SUP-48321/SUP-48344.",
+    "2025-02-20 19:25 UTC \u2014 Liam O'Rourke (TAM/CS liaison): Confirmed with Acme: workload is bursty, streaming enabled, and they do see client disconnects at peak (front-end retries). They can keep concurrency cap at 24 for 48 hours, but want an ETA for a stability build. Requested we provide a recommended set of env flags (NCCL debug, async error handling) that won\u2019t materially degrade throughput.",
+    "2025-02-20 20:10 UTC \u2014 Rafael Mendes (SRE): We can enable extra NCCL/runtime debug logging for a bounded canary window (1\u20132h) but want a rollback plan + confirmation it won\u2019t emit sensitive payloads. Please track under INT-2219. Also: during the Feb 17 window, GPU metrics showed one rank dropping to ~0% SM while others stayed moderate, consistent with a stall at a sync boundary.",
+    "2025-02-20 21:03 UTC \u2014 Grace Kim (Kernel Eng): The opCount skew is suspicious. Two common paths: (1) missing stream sync before ncclGroupEnd when upstream work is on another stream, (2) conditional collective in code (e.g., different branch taken) caused by early-exit/cancellation. Can you confirm whether these logs correspond to a period with client cancellations? If yes, please correlate request ids around 18:31\u201318:33 UTC.",
+    "2025-02-21 00:18 UTC \u2014 Owen Phillips (Support): Correlated timestamps: there were 17 client disconnects (HTTP/2 stream resets) in the 2-minute window prior to the first observed stall. Also saw a spike in \"request_cancelled\" events on the same route. Added correlation CSV to attachments. This aligns with cancellation path possibly leaving ranks out of sync.",
+    "2025-02-21 09:40 UTC \u2014 Hiro Tanaka (Mgr Kernels): Acknowledged. We have a hardening PR in flight around stream/event sync at NCCL boundaries (PR-21853) and a separate cancellation deadlock fix (PR-21890). For this ticket, we need to verify whether cancellation can cause ranks to skip a collective (mismatch) vs just hang waiting. We\u2019ll run the benchmark-lab repro with induced cancels once Rina posts the harness config.",
+    "2025-02-24 16:12 UTC \u2014 Yuki Sato (Kernel Eng): Early repro in lab: with mixed prefill/decode + forced cancellations at ~1\u20132% rate, saw a stall once in ~90 minutes on A100 TP=4. Not yet a clean deterministic repro, but traces show a stream wait preceding the NCCL call on rank 0. This points toward missing event sync (matches PR-21853 intent).",
+    "2025-02-26 18:55 UTC \u2014 Aisha Bello (SRE): Draft alerting plan: heartbeat gap per rank + in-flight collective counters. Once PR-21834 and dashboard panels merge, we can page on \u201cheartbeat gap > 30s\u201d correlated with request timeout rate. For Acme, we\u2019ll route alerts to SRE oncall + tag runtime oncall. Added notes to incident follow-ups.",
+    "2025-03-03 10:22 UTC \u2014 Liam O'Rourke (TAM/CS liaison): Shared interim guidance with Acme: keep concurrency cap at 24; disable CUDA graphs for TP routes; schedule a 1.19 canary once approved. Acme agreed to provide another 24h window for debug logs during canary if needed, but prefers a \u201cfix-first\u201d approach rather than more logging."
+  ],
+  "resolution": "",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_88190b8e4cf74d4c9eb272a75340c70e"
+}

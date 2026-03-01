@@ -36,7 +36,7 @@ from src.schemas.project_enrichment import (
     validate_project_enrichment,
     validate_project_people,
 )
-from src.statistics import update_statistics
+from src.utils.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import (
     GlobTool,

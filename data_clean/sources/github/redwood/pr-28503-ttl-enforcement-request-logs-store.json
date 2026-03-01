@@ -1,0 +1,46 @@
+{
+  "repo": "redwood",
+  "pr_number": "28503",
+  "title": "TTL enforcement for request/response logs store (batched purge + safety limits)",
+  "author": "Logan Wright",
+  "created_at": "2025-02-24",
+  "updated_at": "2025-03-03",
+  "merged_at": "2025-03-03",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/ttl-request-logs-ttl-enforcement",
+  "reviewers": [
+    "Sean Gallagher",
+    "Allison Grant",
+    "Nadia Rahman",
+    "Ethan Park",
+    "Kevin Osei"
+  ],
+  "labels": [
+    "observability",
+    "sre",
+    "security",
+    "data-retention",
+    "db"
+  ],
+  "linked_linear": [
+    "ENG-18433",
+    "PM-842"
+  ],
+  "linked_jira": [
+    "SUP-4021"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "17",
+  "additions": "913",
+  "deletions": "176",
+  "breaking_change": "false",
+  "release_notes": "- Enforce tenant retention policies for request/response logs via background purge jobs with batching + throttling. - Adds operational guardrails (caps, backoff, kill-switch) to prevent DB pressure during large backlogs.",
+  "body": "## Context\nWe store request/response logs (aka request logs) for debugging, usage analysis, and customer support. As part of the Retention controls initiative, we need to enforce customer-configured TTLs in this store with predictable DB impact.\n\nThis PR wires TTL enforcement into the request logs store and adds a batched, rate-limited purge implementation built on the purge job framework introduced in pr-28489.\n\n## What changed\n- Adds a `request_logs_ttl_purger` job that deletes expired request/response logs based on the evaluated retention policy (effective TTL per tenant + region).\n- Implements safe, batched deletion using an index-friendly query path to avoid long-running DELETEs and excessive lock contention.\n- Introduces guardrails to cap work per run, and to throttle when DB load is elevated.\n- Adds an operator-facing kill switch and dry-run mode.\n\n## Purge algorithm (high level)\n- Determine `cutoff_ts = now - effective_ttl` for each (tenant_id, region) partition.\n- Select candidate row ids in small chunks using an index on `(tenant_id, region, created_at)`:\n  - `SELECT id FROM request_logs WHERE tenant_id = ? AND region = ? AND created_at < ? ORDER BY created_at ASC LIMIT :batch_size`\n- Delete by primary key to keep the delete statement bounded:\n  - `DELETE FROM request_logs WHERE id = ANY(:ids)`\n- Repeat until one of the safety limits is hit.\n\n## Safety limits / DB pressure controls\nDefaults are conservative and configurable via runtime config:\n- `max_rows_per_run` (default: 250k)\n- `max_batches_per_run` (default: 500)\n- `batch_size` (default: 500)\n- `max_runtime_per_run` (default: 10m)\n- `inter_batch_sleep_ms` (default: 50ms)\n- `db_cpu_soft_limit` (optional; when enabled, the job self-throttles using the existing DB load signal)\n\nIf the job hits a limit, it exits cleanly and will continue on the next scheduled run.\n\n## Observability\n- Emits per-run counters and timings:\n  - `request_logs_purge_rows_deleted_total{tenant,region}`\n  - `request_logs_purge_batches_total{tenant,region}`\n  - `request_logs_purge_errors_total{tenant,region,reason}`\n  - `request_logs_purge_run_duration_seconds`\n- Logs structured events on start/stop with fields: tenant_id, region, cutoff_ts, rows_deleted, batches, exit_reason.\n\nNote: standardized retention verification metrics (ttl lag, backlog sizing) are tracked separately (see ENG-18452 / pr-28540). This PR focuses on safe deletion mechanics for the request logs store.\n\n## Files / areas touched (high level)\n- `services/request-logs/ttl/purger.go`: store-specific purge logic + batching\n- `services/request-logs/ttl/config.go`: runtime config + defaults + kill switch\n- `services/request-logs/db/queries.sql`: new indexed select path (id-first)\n- `services/control-plane/retention/client.go`: fetch effective TTL (uses cached evaluator)\n- `cmd/worker/jobs/request_logs_ttl_purger.go`: job registration + schedule\n- `docs/internal/runbooks/request-logs-ttl.md`: operator notes + debugging\n\n## Testing\n- Unit tests for:\n  - batching loop exit conditions (row cap, runtime cap, batch cap)\n  - retry/backoff behavior on transient DB errors\n  - cutoff computation and tenant/region partitioning\n- Integration test (nightly) using a seeded table with ~1M rows to validate:\n  - deletes remain bounded (no single statement > batch_size)\n  - job exits under `max_runtime_per_run`\n\nManual verification:\n- Ran purge against staging with a simulated 30-day TTL and a synthetic backlog; confirmed steady delete rate and no elevated lock wait times.\n\n## Rollout plan\n- Ship behind `request_logs_ttl_enforcement_enabled` (default OFF).\n- Enable in internal envs for 48h, then enable for design partners.\n- Gradually increase `max_rows_per_run` once SRE signs off on DB load profile.\n\n## Risks / mitigations\n- Risk: backlog accumulation could cause long catch-up windows.\n  - Mitigation: job is incremental; caps prevent DB overload; can temporarily raise caps during low-traffic windows.\n- Risk: accidental over-deletion due to cutoff bugs.\n  - Mitigation: uses server-side time; cutoff derived from effective TTL; includes dry-run mode and logs exit summaries.\n\n## Checklist\n- [x] Bounded deletes (batch size enforced)\n- [x] Configurable safety caps\n- [x] Idempotent / retryable behavior\n- [x] Metrics + structured logs\n- [x] Runbook stub added\n\n## Commits\n- feat(request-logs): add TTL purger job and config defaults\n- refactor(db): implement id-first selection for safe batched deletes\n- test(request-logs): add purge loop unit tests and integration fixture\n- docs(runbooks): add request logs TTL operator notes\n\n## Review notes\nAllison Grant: Can we avoid emitting high-cardinality labels in metrics? tenant_id label will explode.\nLogan Wright (author): Good catch. Removed `tenant_id` from Prometheus metric labels; kept tenant_id in structured logs only. Region label remains.\n\nSean Gallagher: Need a hard runtime cap + explicit exit reasons, otherwise on-call won\u2019t know if we\u2019re throttling vs erroring.\nLogan Wright (author): Added `max_runtime_per_run` and `exit_reason` (row_cap|runtime_cap|batch_cap|no_work|error). Also added a log event at exit with summary.\n\nEthan Park: Make sure we\u2019re using the control plane effective policy evaluation and not duplicating TTL rules here.\nLogan Wright (author): Wired via `retention/client` (cached evaluator) and added a guard for tenants with request logging disabled.\n\nKevin Osei: Please align naming with retention policy data class `request_response_logs`.\nLogan Wright (author): Updated config keys + comments to use `request_response_logs` terminology and added migration note in the doc.\n\n## CI\n- Initial run failed: `go test ./...` (flake in integration test timing)\n- Re-run passed after increasing test timeout and removing a time-dependent assertion\n\n## Merge\nMerged via squash to `main`.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_0ea491963e7d44aeaf39bde12390bd18"
+}

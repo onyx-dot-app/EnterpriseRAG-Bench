@@ -5,7 +5,7 @@ Target number of files:
 120000
 
 File name format:
-File names should say thread-yearmonthday-sha with year month and day being something like 20250321 and the sha being random 8 characters.
+File names should include the date in a concatenated style followed by a description of the topic of the thread (e.g. 20250625-marketing-kpi-review.json).
 
 Content rules:
 - This directory contains Gmail exports for a restricted set of Redwood Inference employees:

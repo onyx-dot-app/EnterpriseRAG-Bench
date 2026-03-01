@@ -1,0 +1,71 @@
+{
+  "key": "ENG-5941",
+  "team": "engineering",
+  "title": "Policy engine support for stage gates (deterministic eval, caching, failure semantics)",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-02-06",
+  "updated_at": "2025-03-14",
+  "creator": "Priya Natarajan",
+  "assignee": "Jordan Lee",
+  "project": "Dedicated staged rollouts for reserved pools",
+  "cycle": "2025-W07",
+  "estimate": "8",
+  "due_date": "2025-03-08",
+  "labels": [
+    "dedicated",
+    "rollouts",
+    "policy-engine",
+    "gates",
+    "reliability",
+    "determinism",
+    "observability"
+  ],
+  "dependencies": [
+    "ENG-5932",
+    "ENG-5950",
+    "ENG-5966"
+  ],
+  "sub_issues": [
+    "ENG-5966",
+    "ENG-5980"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.18",
+  "security_review_required": "true",
+  "body": "## Context\nDedicated staged rollouts introduce explicit rollout stages (e.g., 1%/10%/50%/100% traffic or replica partitions) for Dedicated pools. Promotion between stages must be gated on objective signals (error rate, p95/p99 latency, saturation/headroom, GPU health, OOM, drops/429, etc.).\n\nThis ticket adds *first-class gate evaluation* to the policy engine so that:\n- Gate results are deterministic and auditable.\n- The system behaves predictably under telemetry lag/outages (failure handling semantics are explicit).\n- Evaluation is cheap enough to run continuously without impacting request routing latency.\n\nNon-goal: building a general experimentation system. Gates are used strictly to decide whether a rollout stage is eligible for promotion / should auto-abort.\n\n## Requirements\n### Functional\n1) Implement gate evaluation for DedicatedPoolRolloutPlan stages in the policy engine.\n   - Inputs: (account_id, pool_id, rollout_plan_id, stage_id, stage_start_ts, eval_time) + gate definitions (signal + threshold + window + min samples) + rollout tier.\n   - Outputs: per-gate result (PASS/FAIL/UNKNOWN) and overall decision.\n\n2) Provide deterministic evaluation:\n   - Given identical inputs (same eval_time rounded to bucket, same data availability), evaluator must produce identical results.\n   - Eliminate nondeterminism from query ranges: all time windows are derived from eval_time with fixed rounding rules.\n   - Explicit handling for missing data and partial data.\n\n3) Failure handling semantics (per ADR + leadership direction):\n   - Default behavior for telemetry staleness / missing required signals: **fail-closed** (gate => UNKNOWN/FAIL blocks promotion) with operator override (force-promote) gated by RBAC + audit.\n   - Avoid flapping: require consecutive PASS evaluations (configurable) before promotion becomes available.\n   - Define \"UNKNOWN\" consistently (e.g., missing series, insufficient samples, stale metrics) and propagate to UI.\n\n4) Caching and performance:\n   - Gate evaluation must not add noticeable latency to the routing hot path. Evaluation runs asynchronously and writes results to a store the Console / control plane can read.\n   - Cache expensive query results with a bounded TTL and deterministic cache keys.\n   - Provide rate limiting / backoff to avoid thundering herds when many rollouts evaluate at once.\n\n5) Auditability:\n   - Record evaluation inputs/outputs sufficient to reconstruct why a gate passed/failed (query template id, window, observed value, threshold, sample count, staleness flags).\n   - Ensure evaluation events are attributable to a rollout_plan_id + stage_id and can be correlated with promote/abort audit events.\n\n### Integration points\n- Control plane rollout service triggers evaluation on schedule and on stage transitions (stage start / hold / resume).\n- Telemetry pipeline must emit stage-tagged metrics (stage_id or stage_partition) so gates can evaluate the canary cohort (depends on ENG-5966).\n- Console backend fetches gate evidence for display (ENG-5980), using the evaluator output schema.\n\n## Proposed implementation (v1)\n### 1) Gate model in policy engine\nAdd a GateEvaluator module:\n- GateDefinition: {gate_type, signal, threshold, comparison, window, min_samples, aggregation, required, fail_behavior}\n- GateResult: {status PASS|FAIL|UNKNOWN, observed_value, threshold, comparison, window_start, window_end, sample_count, staleness_seconds, reason_code, reason_detail, query_id}\n- GateDecision: {overall_status, gates: [GateResult], computed_at}\n\nGate types supported in v1:\n- Error rate (5xx + internal errors) over window\n- p95 / p99 latency over window\n- Saturation/headroom (GPU util + queue depth proxy)\n- OOM rate / CUDA OOM counter\n- Request drop / 429 rate\n- GPU health (node taints/ECC/thermal throttle) (pass-through initially; see notes)\n\n### 2) Determinism details\n- eval_time is rounded to the nearest 60s boundary (configurable constant). All query windows align to that boundary.\n- Use a fixed lookback window per gate (default 15m). For bursty workloads, min_samples enforces we don\u2019t promote on noise.\n- When telemetry arrives late, evaluator uses window_end = rounded(eval_time) and explicitly marks staleness based on ingest watermark.\n- All floating point comparisons use a fixed epsilon and explicit rounding (e.g., observed_value rounded to 4 decimals for the decision record; raw value retained in trace logs).\n\n### 3) Missing data and staleness\nDefine reason codes:\n- INSUFFICIENT_SAMPLES: sample_count < min_samples\n- SERIES_MISSING: required series absent for the window\n- TELEMETRY_STALE: ingest watermark older than (window_end - staleness_budget)\n- QUERY_ERROR: backend query failure/timeouts\n\nSemantics:\n- Required gates: UNKNOWN blocks promotion (treated as FAIL for overall decision)\n- Optional gates: UNKNOWN is ignored for overall decision but shown in evidence\n\n### 4) Caching\nTwo-tier caching:\n- QueryResultCache keyed by (query_id, account_id, pool_id, stage_id, window_start, window_end)\n  - TTL = 90s; max entries bounded; negative caching for SERIES_MISSING\n- GateDecisionCache keyed by (rollout_plan_id, stage_id, window_end)\n  - TTL = 60s; ensures Console refresh doesn\u2019t re-query everything\n\n### 5) Execution model\n- Evaluations run in policy engine worker pool (NOT request thread).\n- Triggered by:\n  - periodic scheduler (every 60s per active rollout stage)\n  - explicit trigger on stage start / resume\n- Results written to GateDecisionStore with monotonic timestamps and idempotency:\n  - primary key: (rollout_plan_id, stage_id, window_end)\n  - write is upsert; retain last N decisions per stage for evidence history\n\n### 6) Outputs / API contract (consumed by control plane + Console)\nProvide an internal endpoint / method used by rollout service:\n- EvaluateStageGates(rollout_plan_id, stage_id, eval_time) => GateDecision\n- GetLatestStageGateDecision(rollout_plan_id, stage_id) => GateDecision\n\nSchema must include:\n- gate status, observed value, threshold, min_samples, window, time range\n- staleness indicator + watermark age\n- reason string suitable for UI (human readable but stable)\n\n## Acceptance criteria\n- [x] Policy engine can compute gate decision for a stage using stage-tagged metrics.\n- [x] Deterministic results: repeated evaluation in the same minute bucket returns identical decisions.\n- [x] Missing metrics behave per spec (fail-closed for required gates) and are surfaced as UNKNOWN with reason codes.\n- [x] Caching reduces duplicate queries (validated via metrics: cache hit rate > 70% during steady-state evaluations).\n- [x] Evaluation cannot impact routing latency (p99 routing decision latency unchanged in canary).\n- [x] Decision records are available to Console backend for evidence display.\n- [x] Unit + integration tests cover: missing data, stale data, query timeout, flapping prevention.\n\n## Testing plan\n- Unit tests: window rounding, reason codes, threshold comparisons, min_samples.\n- Golden tests: fixed synthetic timeseries -> expected PASS/FAIL/UNKNOWN outputs.\n- Integration tests in simulated Dedicated pool environment (paired with ENG-5995/PR integration):\n  - Telemetry lag injection -> UNKNOWN -> promotion blocked\n  - Error spike -> FAIL -> auto-abort trigger downstream\n  - Metric backend timeout -> QUERY_ERROR -> promotion blocked\n\n## Links\n- ADR: sources/confluence/architecture-and-standards/decision-records/adr-gate-evaluation-signals-and-thresholds.json\n- Slack thread: missing metrics fail-open vs fail-closed: sources/slack/eng-platform/1738702219-missing-metrics-fail-open-vs-fail-closed.json\n- Gate query drafts: sources/google_drive/shared_drives/engineering/platform-engineering/gate-evaluation-query-drafts.json\n- Dependent tickets: ENG-5932 (rollout plan APIs), ENG-5966 (stage-tagged telemetry)\n\n## Notes / open items\n- GPU health gates in v1: start with \"node unhealthy percentage\" aggregated per stage partition. More granular signals (ECC bursts, thermal throttle) may require separate pipelines and tighter freshness guarantees.\n- Cardinality: stage_id is allowed, but tag allowlist must prevent exploding dimensions (account_id not allowed in global metrics; use internal partition keys).\n- Promotion requires N consecutive PASS results (proposed N=2) to reduce flapping; confirm with SRE.\n",
+  "comments": [
+    "2025-02-07 (Sean Gallagher): Please make sure missing telemetry is NOT interpreted as PASS. We\u2019ve had multiple incidents where dashboards went blank and automation did the wrong thing. I\u2019m in favor of fail-closed + explicit override, with audit required.",
+    "2025-02-08 (Logan Wright): Re: caching\u2014be careful with negative caching for SERIES_MISSING during low QPS pools. If a stage only gets traffic intermittently, you can end up blocking promotion longer than needed. Suggest short TTL (<= 60\u201390s) and always include min_samples logic to avoid promoting on 1 request.",
+    "2025-02-10 (Mina Haddad): Confirming routing will not call gate evaluation in the request path. We\u2019ll read the latest decision state from control plane when deciding whether a stage is promotable / abortable.",
+    "2025-02-11 (Kaitlyn Nguyen): Override semantics need RBAC: force-promote and hold should be admin-only (operator role), customer admins can view evidence but not override by default. Ensure reason text is captured and emitted to audit trail.",
+    "2025-02-14 (Rafael Mendes): Recommend window=15m for latency/error, but require minimum 5m elapsed since stage start before evaluating as PASS (otherwise can promote immediately after stage switch). Can policy engine expose stage_age_seconds in decision so Console can message 'warming up'?",
+    "2025-02-18 (Jordan Lee): Plan: implement deterministic rounding to 60s buckets and store decisions keyed by (rollout_plan_id, stage_id, window_end). This should make 'why did it change' auditable. For stage warmup, we\u2019ll set decision=UNKNOWN with reason INSUFFICIENT_SAMPLES until min_samples and min_elapsed are met.",
+    "2025-03-03 (Chloe Martin): For Console evidence panel, we need query window + observed value + threshold + reason string. Please keep reason_code stable; UI will map codes to copy.",
+    "2025-03-12 (Jordan Lee): Implementation merged behind feature flag. Next step is enabling telemetry stage tags in beta pools; without that, evaluator returns SERIES_MISSING (expected)."
+  ],
+  "activity": [
+    "2025-02-06: Ticket created (split out of larger rollout initiative).",
+    "2025-02-12: Design aligned with SRE on fail-closed and reason codes; added explicit UNKNOWN state.",
+    "2025-02-21: Added cache layer and decision store; validated no request-path impact in staging.",
+    "2025-03-05: Connected to control plane evaluator triggers; added golden tests for determinism.",
+    "2025-03-14: Marked Done after PR merged and staging validation completed."
+  ],
+  "related_prs": [
+    "sources/github/redwood/pr-28476-policy-engine-gate-evaluation-v1.json",
+    "sources/github/redwood/pr-28521-emit-stage-tags-in-metrics-and-traces.json"
+  ],
+  "blocked_by": [
+    "ENG-5966"
+  ],
+  "unblocks": [
+    "ENG-5980",
+    "ENG-5995"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_7a734d163bf7471ea7ae8f5faf46ae4c"
+}

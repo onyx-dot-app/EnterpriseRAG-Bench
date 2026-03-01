@@ -1,0 +1,47 @@
+{
+  "key": "ENG-5423",
+  "team": "engineering",
+  "title": "Integrate saturation signals (GPU util, queue depth, KV cache pressure) into Incident Bot v2 + define thresholds",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-02-14",
+  "updated_at": "2025-03-06",
+  "creator": "Miles Thornton",
+  "assignee": "Jacob Stein",
+  "project": "Incident bot + diagnostics improvements",
+  "cycle": "2025-W09",
+  "estimate": "8",
+  "due_date": "2025-03-15",
+  "labels": [
+    "incident-bot-v2",
+    "reliability",
+    "observability",
+    "saturation",
+    "telemetry-guardrails",
+    "hosted",
+    "dedicated"
+  ],
+  "dependencies": [
+    "ENG-5427",
+    "ENG-5429"
+  ],
+  "customer_impact": "high",
+  "release": "incident-bot-2025.03",
+  "security_review_required": "false",
+  "body": "## Context\nDuring recent Sev1/Sec0s we\u2019ve repeatedly lost time answering the same first questions:\n- Are we GPU-saturated vs request burst vs a deploy regression?\n- Is the scheduler queue backing up (admission control/backpressure) or are we just hot on GPUs?\n- Is KV cache pressure causing evictions / long-tail latency?\n\nIncident Bot v2 needs a consistent \u201cSaturation\u201d context card that:\n1) Summarizes the most actionable saturation signals (GPU, queue, KV cache)\n2) Highlights when a signal is beyond threshold\n3) Provides deep links to the standard dashboards\n4) Stays bounded in query cost and is resilient under partial telemetry outages\n\nThis ticket covers wiring the signals into the bot + defining highlight thresholds (warning/critical) and aggregation rules.\n\n---\n\n## Scope\n### Signals (initial GA set)\n**GPU saturation (per pool/region/service)**\n- GPU compute utilization (avg + p95): `gpu.sm_utilization` (0\u2013100)\n- GPU memory utilization (avg + p95): `gpu.mem_utilization` (0\u2013100)\n- Optional (if already available, otherwise follow-up): GPU active time vs stalled time\n\n**Queueing/backpressure (scheduler/serving layer)**\n- Scheduler queue depth (avg + max): `scheduler.queue_depth`\n- Queue wait time (p95): `scheduler.queue_wait_ms_p95`\n- Admission control/backpressure rate: `scheduler.backpressure_rate`\n\n**KV cache pressure (runtime)**\n- KV cache utilization ratio (avg + p95): `runtime.kv_cache_utilization` (0\u20131)\n- KV cache evictions per minute: `runtime.kv_cache_evictions_per_min`\n- Optional follow-up: prefill vs decode time ratio for tail latency correlation\n\n### Aggregation + cardinality constraints\n- Aggregate at **service + region + pool** (Hosted shared pools, Dedicated pools) with a bounded label set.\n- No per-tenant breakdown in the bot card (tenant-safe). If/when we add tenant-aware slices, they must be behind privileged scopes and default to \u201clinks only.\u201d\n- Query window defaults:\n  - \u201cLast 10m\u201d for the summary values\n  - \u201cLast 60m\u201d deep link for context\n- Values to compute:\n  - average + p95 for utilization-like metrics\n  - p95 for latency/wait metrics\n  - max for depth metrics\n\n### Bot UX requirements\n- Card title: **Saturation (last 10m)**\n- Show up to 6 lines (to avoid noise), with status highlighting:\n  - `OK` / `WARN` / `CRIT`\n- If telemetry queries time out, degrade gracefully:\n  - show \u201cTelemetry unavailable (timeout)\u201d\n  - include dashboard links\n  - use cached values if present (ENG-5427)\n\n---\n\n## Threshold proposal (v1)\nThresholds are tuned for \u201cactionable\u201d paging/triage, not strict SLO enforcement.\n\n### GPU utilization\n- **WARN**: `gpu.sm_utilization_avg >= 85%` for 10m\n- **CRIT**: `gpu.sm_utilization_avg >= 92%` for 10m OR `gpu.sm_utilization_p95 >= 97%`\n- **WARN**: `gpu.mem_utilization_avg >= 85%`\n- **CRIT**: `gpu.mem_utilization_avg >= 92%` (typically correlates with OOM risk / poor batching flexibility)\n\nRationale: responders generally need a \u201cwe are genuinely compute-bound\u201d signal. We\u2019ve seen false positives when using 70\u201380% due to batch size fluctuations.\n\n### Queueing / backpressure\n- **WARN**: `scheduler.queue_depth_avg >= 1.0 * target_concurrency` OR `queue_wait_ms_p95 >= 250ms`\n- **CRIT**: `scheduler.queue_depth_avg >= 2.0 * target_concurrency` OR `queue_wait_ms_p95 >= 1000ms` OR `backpressure_rate >= 5%`\n\nNotes:\n- If `target_concurrency` is not available in metrics, use absolute depth thresholds per pool type:\n  - Hosted shared: WARN 250, CRIT 500\n  - Dedicated: WARN 100, CRIT 250\n- Prefer relative thresholds when available to avoid re-tuning per pool size.\n\n### KV cache pressure\n- **WARN**: `runtime.kv_cache_utilization_p95 >= 0.80` OR `kv_cache_evictions_per_min >= 10`\n- **CRIT**: `runtime.kv_cache_utilization_p95 >= 0.90` OR `kv_cache_evictions_per_min >= 50`\n\nNotes:\n- High KV cache utilization alone isn\u2019t always bad; we highlight when sustained and/or evictions spike.\n\n### Card \u201cheadline\u201d logic\n- If any CRIT triggers, card header shows `CRIT` and includes the top 3 offending signals.\n- Else if any WARN triggers, header shows `WARN`.\n- Else `OK`.\n\n---\n\n## Implementation plan\n1) **Telemetry query definitions**\n- Add query templates in telemetry-query service (or bot-side if still centralized) with bounded selectors: `{service, region, pool}`.\n- Ensure queries are pre-aggregated on the server side (no raw series fanout to the bot).\n\n2) **Bot card rendering**\n- Extend incident context payload schema to include:\n  - `saturation.status`\n  - `saturation.window`\n  - `saturation.signals[]` (name, value, unit, threshold_state)\n  - `saturation.links[]` (dashboards, logs/traces if applicable)\n\n3) **Dashboard deep links**\n- Link to:\n  - \u201cSaturation overview (service/region/pool)\u201d\n  - \u201cScheduler queue + backpressure\u201d\n  - \u201cKV cache pressure\u201d\n- Parameters: service, region, pool, time range (last 60m ending now)\n\n4) **Guardrails**\n- Timeouts: 2.5s per query group, 6s overall budget for the card\n- Retries: 1 retry with jitter only if error is transient and we have remaining budget\n- Cache: rely on ENG-5427 for request coalescing + 60s TTL\n\n---\n\n## Acceptance criteria\n- Bot posts a Saturation card for incidents triggered via #incidents / #eng-oncall workflows.\n- Card includes GPU util, queue depth/wait, KV cache utilization/evictions for the incident\u2019s service/region/pool.\n- Thresholds map to OK/WARN/CRIT with documented rules above.\n- Card produces deep links that land on the correct service/region/pool and a 60m window.\n- Query cost is bounded (no unbounded label selectors; worst-case bot interaction does not exceed defined budgets).\n- If telemetry times out/unavailable, card degrades to cached values (if present) + links; does not block other cards.\n\n---\n\n## Open questions\n- Do we have a canonical `pool` identifier across Hosted + Dedicated already exposed in metrics, or do we need a mapping layer?\n- Can we source `target_concurrency` consistently? If not, confirm absolute queue depth thresholds per pool class with SRE + runtime.\n- Any regions/pools where KV cache metrics are missing today (and need backfill)?\n\n---\n\n## References\n- Runbook: GPU saturation triage (Confluence) \u2014 eng-serving-runtime/runbooks/gpu-saturation-triage\n- Related tickets: ENG-5427 (telemetry query cache), ENG-5429 (load shedding)\n- Related PR: incident-bot PR-1851 (saturation signal queries)\n",
+  "comments": [
+    "2025-02-14 \u2014 Miles Thornton: Marking P0 based on Feb 7 postmortem follow-ups. Primary objective is faster differentiation between deploy regression vs capacity/saturation. Jacob to drive thresholds + payload wiring; Logan to sanity-check query costs.",
+    "2025-02-18 \u2014 Jacob Stein: Drafted initial thresholds (see body). Need confirmation on whether `scheduler.queue_wait_ms_p95` exists in both hosted and dedicated metrics; Nadia mentioned it\u2019s only in hosted today.",
+    "2025-02-20 \u2014 Logan Wright: Please avoid any selectors that include `tenant_id` or `model_variant` for the bot path. We had cardinality blowups on similar dashboards. I can help set up pre-aggregated rollups keyed on (service, region, pool).",
+    "2025-02-24 \u2014 Aisha Bello: Thresholds look directionally right but we should also consider a \u201cqueue wait p95 >= 1s\u201d CRIT even if GPU util isn\u2019t pegged. That pattern shows up when admission control is misconfigured.",
+    "2025-02-27 \u2014 Jacob Stein: Implementing headline logic: CRIT > WARN > OK. Also adding a single-line explanation when CRIT is due to queue/backpressure (responders were missing it in the beta).",
+    "2025-03-03 \u2014 Devon Price: From a Slack UX perspective, keep it to 5\u20136 rows max, otherwise responders scroll past it. Prefer putting extra detail behind \u201cView details\u201d modal (pagination).",
+    "2025-03-06 \u2014 Jacob Stein: In progress\u2014wired metrics queries behind the same overall card budget. Still blocked on a clean pool mapping for Dedicated (waiting on control plane registry lookup). Might need a short-term mapping table in the query service."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_ed332711898d47f2b0f2bb9bf976fcc0"
+}

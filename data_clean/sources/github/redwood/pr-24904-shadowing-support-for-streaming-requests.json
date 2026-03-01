@@ -1,0 +1,81 @@
+{
+  "repo": "redwood",
+  "pr_number": "24904",
+  "title": "Shadow traffic: support mirroring for streaming requests (partial capture + termination semantics)",
+  "author": "Vikram Singh",
+  "created_at": "2026-01-29",
+  "updated_at": "2026-02-03",
+  "merged_at": "2026-02-03",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/shadow-traffic-streaming-semantics",
+  "reviewers": [
+    "Ravi Menon",
+    "Mina Haddad",
+    "Sean Gallagher",
+    "Nadia Rahman",
+    "Chloe Martin"
+  ],
+  "labels": [
+    "shadow-traffic",
+    "routing",
+    "streaming",
+    "sre",
+    "observability"
+  ],
+  "linked_linear": [
+    "ENG-5414",
+    "ENG-5402",
+    "ENG-5415"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "18",
+  "additions": "612",
+  "deletions": "147",
+  "breaking_change": "false",
+  "release_notes": "Shadow traffic mirroring now supports streaming requests with explicit partial-capture rules and cancellation/timeout semantics. Shadow path remains fail-open and never blocks the client stream.",
+  "description": "Context\nWe already mirror a sampled subset of non-streaming generation requests to one or more shadow targets. For streaming requests, we need deterministic, safe behavior that (a) does not impact the user-visible stream, (b) keeps compute/capture costs bounded, and (c) yields usable artifacts for async scoring.\n\nThis PR defines and implements the streaming shadowing semantics in the router. Key goals are: fail-open, bounded overhead, and predictable capture/cancellation.\n\nWhat this PR does\n- Adds streaming-aware mirroring behavior for shadow traffic.\n- Introduces partial capture modes for shadow outputs (so we can score something even if we don\u2019t wait for full completion).\n- Defines termination semantics for shadow streams (timeouts, cancellation on client disconnect, and max-capture limits).\n- Extends telemetry to record whether a shadow artifact is partial vs complete and why it terminated.\n\nBehavior changes / semantics\n1) Control stream is always authoritative\n- We continue to stream the control response to the client exactly as before.\n- The shadow request is dispatched asynchronously and never participates in the client backpressure path.\n\n2) Shadow request dispatch for streaming\n- For streaming control requests, we send the same normalized request payload to shadow targets.\n- We request streaming from the shadow target (so we can stop early without waiting for full generation), but we buffer shadow chunks internally (never forwarded to client).\n\n3) Partial capture modes (configurable)\nNew policy fields (plumbed from shadow policy \u2192 router config):\n- shadow_stream_capture_mode: one of\n  - \"none\" (don\u2019t capture output; still emit request-level telemetry)\n  - \"first_n_tokens\" (capture up to shadow_stream_max_tokens)\n  - \"first_t_seconds\" (capture until shadow_stream_max_duration_ms)\n  - \"until_control_done\" (capture until the control stream completes, then cancel shadow)\n- shadow_stream_max_tokens (default: 256)\n- shadow_stream_max_duration_ms (default: 1500)\n- shadow_stream_max_bytes (default: 64KiB) cap across all buffered chunks\n\nNotes:\n- \"until_control_done\" is the default for internal dogfood because it tends to match user-perceived latency windows while bounding tail exposure. If the shadow is still running when control finishes, we cancel it.\n- \"first_n_tokens\" is recommended for high-QPS routes where we mostly care about format adherence and early safety/refusal signals.\n\n4) Termination semantics (always fail-open)\nShadow streams can be terminated for several reasons; we persist a termination_reason for downstream scoring/analytics:\n- completed: shadow model ended normally\n- cancel_control_done: control stream ended (until_control_done mode)\n- cancel_client_disconnect: client disconnected early (we propagate cancellation to shadow to avoid wasted compute)\n- timeout: exceeded shadow_stream_max_duration_ms\n- max_tokens: exceeded shadow_stream_max_tokens\n- max_bytes: exceeded shadow_stream_max_bytes\n- circuit_open: router circuit breaker open for shadow path\n- shadow_error: shadow target errored (recorded, but user path unaffected)\n\nImplementation detail: cancellation uses the existing request context cancellation token; we ensure shadow cancellation does not cancel the control context.\n\n5) Telemetry additions\n- Emits shadow_streaming_summary event with:\n  - is_streaming=true\n  - capture_mode\n  - captured_tokens (best-effort estimate)\n  - captured_bytes\n  - termination_reason\n  - shadow_latency_ms (until termination)\n- For partial captures, we still emit artifact references so eval workers can score what was captured (with \"partial\" flag).\n\nFiles / areas touched (high level)\n- router/shadowing:\n  - streaming mirror worker + buffered chunk accumulator\n  - termination controller (time/tokens/bytes)\n  - cancellation semantics + error handling\n- config:\n  - ShadowTrafficPolicy schema updated with streaming capture options\n- telemetry:\n  - adds termination_reason/capture_mode dimensions (cardinality-safe; fixed enum)\n- tests:\n  - unit tests for termination controller\n  - integration tests covering: client disconnect, control completion cancellation, max-bytes, timeout\n\nIllustrative snippet\n- Termination reason propagation (simplified):\n  - if bytes >= max_bytes => terminate(\"max_bytes\")\n  - else if tokens >= max_tokens => terminate(\"max_tokens\")\n  - else if now-start >= max_duration => terminate(\"timeout\")\n  - else if control_done && capture_mode==until_control_done => terminate(\"cancel_control_done\")\n\nWhy these defaults\n- 256 tokens / 1.5s / 64KiB keeps artifacts useful for v1 quality metrics (refusal/format/instruction-following proxy) while protecting costs.\n- Cancellation on client disconnect is important for cost control for high-volume streaming customers.\n\nRisk / rollout\n- Feature gated behind shadow_traffic_streaming_enabled.\n- If anything goes wrong, router treats shadow dispatch as best-effort and drops shadowing (records circuit_open / shadow_error) without affecting control.\n\nFollow-ups (not in this PR)\n- Wire capture_mode defaults into Console creation UX (currently policy-only; Console shows whatever policy sets).\n- Add scoring templates that explicitly understand partial artifacts (some rubrics should treat partial as \"unknown\" rather than negative).\n- Extend per-chunk shadow telemetry (intentionally deferred due to cardinality/volume).\n\nTesting\n- Unit: router_shadow_stream_termination_controller_test\n- Integration: shadow_streaming_cancel_on_control_done, shadow_streaming_cancel_on_client_disconnect, shadow_streaming_max_bytes\n- Load test: ran local perf-canary scenario (streaming chat, 5% sampling) \u2014 no measurable change to control p99, shadow worker CPU +3\u20135% in the router process at 2k rps.\n\nLinks\n- Linear: ENG-5414\n- Related: ENG-5402 (base mirroring), ENG-5415 (backpressure/circuit breaker hardening)\n\nChecklist\n- [x] Fail-open behavior verified (shadow errors do not impact control)\n- [x] Bounded capture (tokens/time/bytes)\n- [x] Telemetry includes termination reason\n- [x] Docs comments in policy schema\n",
+  "commits": [
+    "router: add streaming shadow mirror worker with buffered capture",
+    "router: implement termination controller (time/tokens/bytes) + cancellation wiring",
+    "policy: add streaming capture config fields + defaults",
+    "telemetry: emit shadow_streaming_summary with termination_reason",
+    "tests: add unit + integration coverage for streaming shadowing"
+  ],
+  "changed_files": [
+    "router/src/shadow/mirror_streaming.rs",
+    "router/src/shadow/termination.rs",
+    "router/src/shadow/mod.rs",
+    "control-plane/schema/shadow_traffic_policy.json",
+    "telemetry/events/shadow_streaming_summary.proto",
+    "telemetry/ingest/shadow_events.rs",
+    "router/tests/integration/shadow_streaming_cancel_test.rs",
+    "router/tests/unit/termination_controller_test.rs"
+  ],
+  "conversation": [
+    "Ravi Menon (review): Can we clarify if we request streaming from the shadow target or do a non-streaming call and just cap max_tokens? If we do streaming, we must ensure no coupling to client backpressure.",
+    "Vikram Singh (author): We request streaming from the shadow target but consume it on a detached task with its own bounded buffer. Nothing is written to the client stream. Added a comment in mirror_streaming.rs and a test that simulates a slow client while shadow completes quickly.",
+    "Mina Haddad (review): Default capture mode \u2014 I\u2019d prefer first_n_tokens rather than until_control_done for cost predictability. until_control_done can be long for long-running streams.",
+    "Vikram Singh (author): Agreed it\u2019s workload-dependent. I left router-side defaults as until_control_done but capped by max_duration_ms (1.5s) and max_tokens (256). So worst-case is still bounded. Also added a note in schema docs: set first_n_tokens for very long streams.",
+    "Sean Gallagher (review): Cancellation semantics: do we cancel shadow on client disconnect? That\u2019s important for cost, but ensure we don\u2019t accidentally cancel the control context in shared code paths.",
+    "Vikram Singh (author): Yes. Shadow uses a child cancellation token. Client disconnect cancels shadow token; control token is unchanged. Added an integration test that disconnects at chunk 3 and asserts control path completes without errors while shadow terminates with cancel_client_disconnect.",
+    "Nadia Rahman (review): Telemetry dimensions look OK, but please keep termination_reason as a fixed enum and avoid recording raw error strings as labels.",
+    "Vikram Singh (author): Done. termination_reason is an enum; error strings go only into sampled debug logs and the structured event payload (not as metric labels).",
+    "Chloe Martin (review): For Console drilldowns we\u2019ll want to show whether artifacts are partial. Is that recorded in the artifact metadata or only in the summary event?",
+    "Vikram Singh (author): Both. The artifact metadata now includes partial=true/false plus termination_reason; the summary event includes the same so aggregations can be computed without fetching artifacts."
+  ],
+  "ci_checks": [
+    "build-and-unit-tests (linux-x86_64): pass",
+    "router-integration-tests: pass",
+    "lint (rustfmt/clippy): pass",
+    "telemetry-schema-compat: pass",
+    "perf-canary-smoke: pass"
+  ],
+  "merge_outcome": "Merged via squash commit into main by Ravi Menon; branch deleted.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "conversation"
+  ],
+  "dataset_doc_uuid": "dsid_21326adbbe95469b99d03938d83f6a4d"
+}

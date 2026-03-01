@@ -1,0 +1,48 @@
+{
+  "repo": "redwood",
+  "pr_number": "29210",
+  "title": "DB migrations: add guardrails (idempotency checks, lock timeouts, safer defaults) for Private upgrades",
+  "author": "Michael Nguyen",
+  "created_at": "2025-05-29",
+  "updated_at": "2025-06-07",
+  "merged_at": "2025-06-07",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/migration-guardrails-private-upgrades",
+  "reviewers": [
+    "Ethan Park",
+    "Sean Gallagher",
+    "Rafael Mendes",
+    "Irene Choi",
+    "Naomi Feldman"
+  ],
+  "labels": [
+    "private",
+    "migrations",
+    "reliability",
+    "sre",
+    "security",
+    "release-blocker"
+  ],
+  "linked_linear": [
+    "ENG-4844",
+    "ENG-4821",
+    "PM-812"
+  ],
+  "linked_jira": [
+    "SUP-18421"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "23",
+  "additions": "684",
+  "deletions": "219",
+  "breaking_change": "false",
+  "release_notes": "- Adds migration safety guardrails used during Private upgrades: advisory locks, lock/statement timeouts, idempotency validation, and \"safe default\" patterns for schema changes.\n- Improves migration logging and surfaces actionable errors to upgrade tooling.\n- No user-facing API changes; behavior change is limited to migration execution and failure mode (fail-fast with clearer remediation).",
+  "body": "Title: DB migrations: add guardrails (idempotency checks, lock timeouts, safer defaults) for Private upgrades\n\nContext\nWe\u2019ve had multiple upgrade-related incidents/near-misses where a migration either (a) blocked application traffic for longer than expected due to long lock waits, (b) partially applied and then re-ran in an unsafe way, or (c) took a non-backward-compatible path that required perfect ordering across control-plane/data-plane rollouts. The most recent customer-visible case is SUP-18421 (upgrade failed during DB migration; required manual intervention and extended downtime).\n\nThis PR adds a set of guardrails to make migrations safer by default in Private environments:\n- predictable lock acquisition behavior (timeouts + fail-fast)\n- explicit idempotency checks (detect partial/duplicate application earlier)\n- safer schema patterns (additive/expand-then-contract defaults, avoid non-null without backfill, avoid table rewrites)\n- better structured logging so installer can present actionable remediation and so SRE can correlate upgrade windows\n\nGoals\n- Reduce upgrade-induced outages by preventing migrations from waiting indefinitely on locks.\n- Make reruns safe and detectable (idempotency validation + consistent bookkeeping).\n- Encourage backward-compatible schema evolution so CP/DP phase separation remains valid.\n- Keep changes compatible with existing migration tooling and deployment modes.\n\nNon-goals\n- Rewriting existing historical migrations.\n- Introducing multi-hop migration automation across many majors.\n\nWhat changed\n1) Migration execution guardrails (Postgres)\n- Enforce lock timeout and statement timeout for all migration sessions.\n  - Default lock_timeout: 5s\n  - Default statement_timeout: 15m\n  - Both are configurable via env/config for Private deployments.\n- Acquire an advisory lock keyed by (service, schema) before applying any migrations to prevent concurrent migration runners during rollouts.\n- Ensure all migration steps run in a controlled transaction mode (transactional where possible; explicit non-transactional allow-list).\n\n2) Idempotency & partial-apply detection\n- Validate migration history before applying:\n  - Detect duplicate version entries.\n  - Detect checksum mismatch for already-applied migrations (when a migration file changed between builds).\n  - Detect \u201cdirty\u201d state from interrupted runs and fail with explicit remediation steps.\n- Add a small helper that marks a migration as \"started\" and \"completed\" with timestamps for better debugging, while remaining compatible with the existing schema_migrations table (no breaking schema change).\n\n3) Backward-compatible schema defaults\n- New helpers/patterns used by upcoming Private upgrade work:\n  - Add columns as nullable + backfill + set default + then (optionally) enforce NOT NULL in a later release.\n  - Avoid blocking index creation (use CONCURRENTLY where supported and safe).\n  - Prefer additive enums/polymorphic refs rather than destructive renames.\n- Update a handful of existing in-tree migrations that were in-flight (unreleased) to follow the safer patterns (no changes to already-shipped migration versions).\n\n4) Observability & operator UX\n- Structured logs emitted per migration:\n  - migration_version, migration_name, phase (acquire_lock/apply/verify), duration_ms\n  - lock_timeout_ms, statement_timeout_ms\n  - blocked_by_pid (when available) for lock timeouts\n- Errors are categorized with remediation text intended for installer surface area:\n  - LOCK_TIMEOUT: \"retry after clearing blocking transaction; see query to identify blocker\"\n  - DIRTY_STATE: \"manual verification required; see steps\"\n  - CHECKSUM_MISMATCH: \"artifact mismatch; verify bundle/version pin\"\n\nImplementation details\n- Config keys\n  - REDWOOD_DB_MIGRATIONS_LOCK_TIMEOUT (default: 5s)\n  - REDWOOD_DB_MIGRATIONS_STATEMENT_TIMEOUT (default: 15m)\n  - REDWOOD_DB_MIGRATIONS_ADVISORY_LOCK (default: enabled)\n- Advisory lock key is derived from a stable hash of (db_name + schema_name + service_name) to avoid collisions across services sharing a cluster.\n- Lock timeout handling\n  - We set local session settings at the start of each migration transaction.\n  - On lock timeout, we emit the blocker info when obtainable and abort without retrying in-process (retry is handled by upgrade orchestration to keep behavior deterministic).\n\nFiles / areas touched (high level)\n- services/control-plane/db/migrate/*\n- services/common/db/migrations_runner/*\n- services/common/db/postgres/lock_helpers.*\n- docs/internal/private-upgrades/migration-guardrails.md\n- tests/db/migrations_guardrails_test.*\n\nCommits (summary)\n- db: add advisory lock + timeout config for migration runner\n- db: add migration history validation + dirty state detection\n- db: structured logs + categorized errors for upgrade surfaces\n- migrations: refactor unreleased migrations to use safe additive patterns\n- tests: add integration tests for lock timeout and checksum mismatch cases\n- docs: add \"Migration guardrails\" guidance for Private upgrade runbook\n\nTesting\n- Unit tests for history validation, checksum mismatch detection, and advisory lock behavior.\n- Integration test (Postgres) that simulates:\n  - long-running transaction holding an exclusive lock -> migration fails with LOCK_TIMEOUT and prints blocker pid query\n  - dirty state -> fails with DIRTY_STATE and remediation text\n  - checksum mismatch -> fails with CHECKSUM_MISMATCH (useful for air-gapped bundle mismatch debugging)\n- Manual: applied on staging Private environment with synthetic traffic during upgrade window; verified CP/DP phased rollout does not deadlock.\n\nRollout / risk\n- Low-to-medium risk: touches migration execution path. Mitigated by:\n  - conservative timeouts + config overrides\n  - fail-fast behavior (previous behavior was indefinite waiting)\n  - additional logging for quick diagnosis\n- Intended to be a prerequisite for the Private upgrade + rollback mechanism work (installer will treat these error categories as deterministic failure modes).\n\nReviewer notes / requests\n- SRE asked that failure modes be explicit and that we don\u2019t auto-retry inside the runner.\n- Security asked that we avoid logging query contents or sensitive data; this PR only logs metadata and pids.\n\nReview conversation (highlights)\n- Sean Gallagher (SRE): \"Can we ensure we never wait forever on locks? Also want the blocker PID surfaced so oncall can act quickly.\" Author: \"Yes; lock_timeout is enforced via SET LOCAL; on timeout we attempt to query pg_locks/pg_stat_activity and include a suggested query with the blocker pid when available. No auto-retry in runner.\" Requested changes: add docs snippet to SRE runbook and ensure log fields are stable. Addressed in commit 4/6.\n- Ethan Park: \"Advisory lock keying: make sure multi-tenant DBs don\u2019t collide and that services with separate schemas don\u2019t block each other.\" Author: \"Key includes db + schema + service; also added a unit test for key derivation stability.\" Approved after changes.\n- Irene Choi: \"Timeout defaults feel aggressive for large customers. Can we make them configurable and document recommended overrides?\" Author: \"Added env/config + docs table with guidance. Default statement timeout 15m; lock timeout 5s.\" Approved.\n- Naomi Feldman: \"Double-check logs don\u2019t include SQL text or customer identifiers.\" Author: \"Confirmed; only versions/names/timeouts/pids.\" Approved.\n- Rafael Mendes: \"How does this interact with installer rollback?\" Author: \"Fail-fast allows installer to stop before DP rollouts proceed; categorized errors map to planned remediation. This PR doesn\u2019t implement rollback but is a dependency for deterministic upgrade state.\" Approved.\n\nCI\n- build-and-unit-tests: pass\n- db-integration-tests: pass (added ~3m)\n- lint: pass\n- security-scan: pass\n\nMerge\nMerged via squash on 2025-06-07 by Connor O\u2019Brien after approvals from Platform + SRE + Security. Follow-ups tracked in ENG-4844 to align installer surfaces with the new categorized errors and to ensure support bundles collect migration logs during upgrade windows.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "release_notes",
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_9ea7bd9fc3c94b5da4ba3bae843f85e3"
+}

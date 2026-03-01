@@ -1,0 +1,52 @@
+{
+  "repo": "observability-pack",
+  "pr_number": "613",
+  "title": "Add ingestion-side cardinality guards for cache telemetry",
+  "author": "Caleb Johnson",
+  "created_at": "2025-03-11",
+  "updated_at": "2025-03-14",
+  "merged_at": "2025-03-14",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/cache-metrics-cardinality-guards",
+  "reviewers": [
+    "Nadia Rahman",
+    "Logan Wright",
+    "Allison Grant",
+    "Sean Gallagher"
+  ],
+  "labels": [
+    "observability",
+    "telemetry",
+    "sre",
+    "metrics",
+    "runtime"
+  ],
+  "linked_linear": [
+    "ENG-4821",
+    "ENG-4824"
+  ],
+  "linked_jira": [
+    "SUP-3927"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "612",
+  "deletions": "141",
+  "merge_method": "squash",
+  "breaking_change": "false",
+  "release_notes": "- Enforced cardinality policy for cache telemetry at ingestion (drop/aggregate disallowed label keys/values)\n- Added visibility metrics for dropped/rewritten series and a small dashboard panel stub for monitoring guard impact",
+  "body": "## Summary\nThis PR implements ingestion-side cardinality guards for the new prefix/KV cache telemetry emitted by the runtime and tagged by the gateway. The goal is to prevent accidental series explosions (per-tenant/per-route/per-request-shape label combinations) while preserving the ability to break down cache signals by the dimensions we actually operate on (model, route, deployment mode, region, and prompt-length/token bins).\n\nThis is the ingestion counterpart to runtime tagging + allowlists (see redwood/pr-18426) and ensures that even if a client or misconfigured gateway emits unexpected label keys/values, we either (a) rewrite to a safe aggregated bucket, or (b) drop with explicit counters so we can diagnose.\n\n## Context / Motivation\nDuring early canary of cache telemetry dashboards we saw a few failure modes:\n- `tenant_id` and raw `route` occasionally showing up due to legacy gateway mappings -> high cardinality.\n- model/version fields not consistently normalized -> multiple spellings causing unnecessary series multiplication.\n- prompt/token histogram tags are safe only when bucketed; unbucketed token counts are not.\n\nThis PR codifies the policy from the cache metrics standards doc and makes the enforcement explicit in the ingestion pipeline. It also addresses SUP-3927 (customer saw \"zero hits\" because the old temporary guard was dropping whole samples without surfacing why).\n\n## What this PR does\n- Adds a cache-telemetry-specific label guard stage in the metrics ingestion pipeline (remote-write receiver path).\n- Enforces an allowlist of label keys for cache metrics (by metric name prefix `redwood_cache_*`).\n- Enforces normalization/rewrites for a subset of label values:\n  - `deployment_mode`: normalize to `hosted|dedicated|private|unknown`\n  - `region`: normalize to our region IDs; unknown -> `unknown`\n  - `model_family` / `model`: require match to known catalog pattern; unknown -> `other`\n  - `model_version`: if missing or malformed -> `unknown` (do not attempt to parse arbitrary hashes)\n  - `route_id`: allow only gateway-generated stable IDs (format `rt_*`); otherwise -> `unknown`\n  - `prompt_len_bucket`, `prefill_tokens_bucket`, `decode_tokens_bucket`: must be one of the configured buckets; otherwise -> `overflow`\n- Drops samples when disallowed label keys are present (e.g. `tenant_id`, `user_id`, `request_id`, `prompt_hash`, `raw_route`) rather than attempting to partially salvage (to avoid implicit joins that look valid but aren\u2019t).\n- Adds explicit ingestion visibility metrics:\n  - `redwood_metrics_guard_dropped_samples_total{reason,metric}`\n  - `redwood_metrics_guard_rewritten_samples_total{rewrite,metric}`\n  - `redwood_metrics_guard_active{guard=\"cache_cardinality\"}=1`\n- Adds a small dashboard snippet (panel-only) for guard drop/rewrites so SRE can quickly determine whether a hit-rate dip is real vs missing telemetry.\n\n## Policy encoded (high level)\n- Cache metrics are allowed to be sliced by: `model`, `model_family`, `model_version` (coarse), `route_id` (stable), `deployment_mode`, `region`, and bucketed request shape dimensions.\n- Cache metrics are NOT allowed to include per-tenant labels at ingestion. Tenant/route/customer views must be served via analytics aggregates or controlled rollups, not raw high-cardinality metrics.\n\n## Implementation notes\n- Guard runs as part of the ingest pipeline stage `LabelGuardProcessor` before relabeling + storage write.\n- Rules are applied only to a configured metric name prefix list (currently cache metrics only). Non-cache metrics are unaffected.\n- Drop vs rewrite strategy:\n  - Disallowed label keys -> drop sample (reason: `forbidden_label_key`)\n  - Missing required labels -> rewrite to `unknown` where safe; do not drop (reason: `missing_required_label` increments rewrite counter)\n  - Out-of-range bucket values -> rewrite to `overflow`\n\n## Tests\n- Unit tests for:\n  - forbidden keys cause drops + correct reason counter\n  - value normalization + rewrite counters\n  - bucket enforcement\n  - metric scoping (only applies to `redwood_cache_*`)\n- Golden tests for a few representative runtime metric payloads (KV hit/miss, prefix reuse histograms, eviction pressure gauges).\n\n## Rollout / Safety\n- Default enabled in staging; prod rollout is controlled via values.yaml flag `ingest.guards.cacheCardinality.enabled`.\n- Adds a hard cap for drop logging to avoid log storms.\n- Includes a runbook note link in the dashboard panel description.\n\n## Follow-ups\n- Align with gateway migration plan to ensure `route_id` is always stable and backfilled for older routes (ENG-4823).\n- Consider adding a controlled, sampled per-tenant view in analytics for Dedicated customers (separate effort).\n\n## Screenshots\nN/A (panel stub only; full dashboard work is in pr-612).\n\n## Commits (squash summary)\n- ingest: add cache metric label allowlist + enforcement hooks\n- ingest: add drop/rewrite counters and reasons\n- charts: wire guard config flags + defaults for staging\n- tests: add unit/golden coverage for cache guard\n- dashboards: add guard health panel stub\n\n## Changed areas / files (high level)\n- services/metrics-ingest/guard/cache_guard.go\n- services/metrics-ingest/guard/cache_guard_test.go\n- services/metrics-ingest/config/guards.yaml\n- charts/metrics-ingest/values.yaml\n- charts/metrics-ingest/templates/configmap.yaml\n- dashboards/cache/cache-telemetry-guard-overview.json\n\n---\n## Review conversation (highlights)\n**Nadia Rahman:** Can we avoid dropping the whole sample when a forbidden key exists? Maybe strip it and continue.\n**Caleb Johnson (author):** I\u2019d prefer drop. Stripping silently makes the metric look valid but changes join semantics; also it encourages accidental leakage. Added explicit counters + panel so we can detect and fix upstream quickly.\n\n**Allison Grant:** Please add a single panel we can pin to the cache dashboards to answer \"are we dropping cache telemetry right now?\"\n**Caleb:** Added `cache-telemetry-guard-overview` panel with drop/rewrite rate and top reasons.\n\n**Sean Gallagher:** Make sure unknown region/model collapse doesn\u2019t mask real regressions.\n**Caleb:** Agree; rewrites are only for malformed values, not for legitimate new regions/models. Also emitting rewritten counters so we can see when we\u2019re collapsing.\n\n**Logan Wright:** Need a specific reason for SUP-3927: label-drop misconfig caused all cache metrics to disappear.\n**Caleb:** Added reason taxonomy and ensured we never drop due to \"missing model_version\" \u2014 we rewrite to `unknown` so the metric still shows up.\n\nApprovals:\n- Nadia Rahman: Approved (requested dashboard panel; addressed)\n- Allison Grant: Approved\n- Sean Gallagher: Approved (rollout flag + visibility metrics)\n- Logan Wright: Approved\n\n## CI\n- unit-tests: pass\n- lint: pass\n- helm-template: pass\n- integration-smoke (staging): pass\n\nMerged via squash to `main`.",
+  "related_prs": [
+    "observability-pack/pr-612-add-cache-hit-rate-dashboard-panels",
+    "redwood/pr-18426-propagate-route-and-model-version-into-runtime-metrics",
+    "redwood/pr-18425-cache-telemetry-sampling-and-rate-limits",
+    "redwood/pr-18431-reconcile-prefix-cache-vs-kv-cache-naming"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_7de41f389d0d45d09dc7c7a9ee2d18f6"
+}

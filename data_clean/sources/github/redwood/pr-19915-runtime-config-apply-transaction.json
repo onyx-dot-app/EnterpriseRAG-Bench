@@ -1,0 +1,89 @@
+{
+  "repo": "redwood",
+  "pr_number": "19915",
+  "title": "runtime: treat optimization config apply as a transactional operation with checkpoints",
+  "author": "Noah Patel",
+  "created_at": "2025-12-12",
+  "updated_at": "2025-12-18",
+  "merged_at": "2025-12-18",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/runtime-config-apply-transaction",
+  "reviewers": [
+    "Omar El-Sayed",
+    "Sofia Ivanova",
+    "Ethan Park",
+    "Sean Gallagher",
+    "Benji Okafor"
+  ],
+  "labels": [
+    "runtime",
+    "reliability",
+    "optimize",
+    "sre",
+    "control-plane-integration"
+  ],
+  "linked_linear": [
+    "ENG-4823",
+    "ENG-4824",
+    "ENG-4827"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "23",
+  "additions": "1187",
+  "deletions": "402",
+  "release_notes": "Runtime now applies Optimization Config versions using a checkpointed transaction protocol (prepare/apply/commit) to reduce partial-apply states and make rollback safe under retries and worker churn.",
+  "breaking_change": "false",
+  "body": "Context: As part of Safe apply + rollback for Optimization Configs (batching/caching/quant profiles), the runtime needs stronger guarantees than \u201cbest effort apply\u201d. We\u2019ve seen partial rollout states when workers restart mid-apply or when concurrent apply/rollback requests overlap. This PR updates the runtime apply pipeline to treat config application as a checkpointed transaction, with idempotent steps and durable progress markers.\n\nWhat\u2019s in this PR: 1) Introduce a checkpointed apply state machine in the worker: PREPARE -> APPLY -> COMMIT (plus ABORT for failures). Each phase is idempotent and can be retried safely. PREPARE fetches the target config version and validates runtime compatibility (model arch, quant profile support, cache toggles). APPLY performs the actual config materialization (batching heuristics, cache policy, quant kernel selection) into a staged slot. COMMIT swaps staged -> active atomically and emits a \u201cconfig_active\u201d metric/event with tags {tenant, model, region, config_version}. 2) Add an ApplyTransaction ID (tx_id) carried through logs/metrics. The controller can retry the same tx_id without causing repeated COMMIT or repeated cache invalidations. 3) Add durable local checkpoint storage (per worker) so that in-flight applies resume after restart instead of starting from scratch. Checkpoints are stored with (tx_id, config_version, phase, started_at, last_updated_at, error_code). 4) Make rollback safe under partial apply: if a rollback arrives while an apply is in PREPARE/APPLY, the worker ABORTs the in-flight tx and reverts to the last committed active version; if the apply is already COMMITed, rollback starts a new tx toward the previous version (no \u201cin-place undo\u201d). 5) Add guardrails to avoid thundering-herd cache invalidation: COMMIT can optionally perform a bounded \u201csoft invalidate\u201d (mark prefixes stale and lazily evict) for caching toggles, rather than immediate full flush. Defaults are conservative; can be tuned later via the Optimization Config fields. 6) Tests: unit tests for phase idempotency, restart resumption, and concurrent apply/rollback ordering; integration test harness that simulates worker restart between APPLY and COMMIT.\n\nWhy this approach: We want distributed, eventually consistent workers, but with per-worker correctness and observability. The checkpoint protocol makes the apply pipeline resilient to retries, worker restarts, and controller replays. It also creates a clear definition of \u201crolled out\u201d at the runtime layer: active version is only updated on COMMIT.\n\nOperational notes: - Metrics: runtime_config_apply_phase_total{phase, outcome}, runtime_config_active_version{tenant, model, region}, runtime_config_apply_duration_seconds{phase}. - Logging: All apply/rollback logs include tx_id + config_version + previous_version. - Failure behavior: If PREPARE fails (schema/compat), worker reports failure and keeps current active version. If APPLY fails (e.g., kernel init), worker ABORTs and keeps current active version.\n\nFollow-ups (not in this PR): - Controller-side semantics for pausing rollouts on \u201cstuck in APPLY\u201d for >N minutes (tracked in ENG-4824). - Wiring quality gate signals for quant profiles (Applied ML gating) into controller decisions (tracked in ENG-4827).",
+  "commits": [
+    "runtime/config: add ApplyTransaction + ApplyPhase state machine",
+    "runtime/config: implement durable local checkpoints and resume on restart",
+    "runtime/config: stage-and-swap commit path for batching/cache/quant settings",
+    "runtime/config: handle concurrent rollback by aborting in-flight tx",
+    "runtime/metrics: add phase + active version metrics tagged with config_version",
+    "tests: restart-between-phases integration test + ordering unit tests",
+    "docs: internal comments on transaction semantics and failure modes"
+  ],
+  "changed_files": [
+    "runtime/src/optimization/apply_transaction.rs",
+    "runtime/src/optimization/checkpoint_store.rs",
+    "runtime/src/optimization/config_applier.rs",
+    "runtime/src/optimization/config_staging.rs",
+    "runtime/src/optimization/rollback.rs",
+    "runtime/src/metrics/optimization_config_metrics.rs",
+    "runtime/src/worker/worker_lifecycle.rs",
+    "runtime/src/control_plane/optimization_config_client.rs",
+    "runtime/tests/optimization_config_apply_restart_test.rs",
+    "runtime/tests/optimization_config_concurrent_rollback_test.rs",
+    "runtime/README.md"
+  ],
+  "conversation": [
+    "Omar El-Sayed (review): The staged slot approach looks good. One concern: COMMIT swaps batching heuristics + cache policy together; do we ever want to commit them independently? Also, can you confirm that APPLY does not mutate any global scheduler state visible to other in-flight requests?",
+    "Noah Patel (author): Good call. For now we treat the Optimization Config as an atomic unit since canary + rollback are version-based. APPLY only builds a staged \u201ceffective config\u201d and initializes any needed kernel handles; scheduler state switches only happen during COMMIT at the request boundary (next dispatch tick). Added a comment + ensured we don\u2019t update the shared scheduler config until commit() returns ok.",
+    "Sofia Ivanova (review): On the soft invalidate: can we ensure that enabling caching doesn\u2019t cause a latency spike due to immediate allocations? Also, for disabling caching, do we risk holding onto too much memory if lazy eviction is slow?",
+    "Noah Patel (author): Implemented bounded soft invalidation only for toggles that would otherwise flush. For disable-cache, COMMIT marks caches non-writable and schedules a background eviction with a cap per second; we also add a safety \u201chard cap\u201d where if cache bytes > threshold, we evict aggressively. I added metrics runtime_cache_eviction_backlog and a warning log when backlog persists > 5m.",
+    "Ethan Park (review): From control plane perspective, we need a crisp definition of success for apply. Is worker \u2018applied\u2019 once it reaches COMMIT? Please make sure failure reasons are structured so the controller can categorize (compat vs transient).",
+    "Noah Patel (author): Yes\u2014worker only advertises the new version as active after COMMIT. I added error codes: COMPAT_VALIDATION_FAILED, FETCH_FAILED, KERNEL_INIT_FAILED, CHECKPOINT_IO_FAILED, COMMIT_SWAP_FAILED. These surface in the apply outcome metric + logs. Controller wiring comes in ENG-4824/ENG-4827.",
+    "Sean Gallagher (SRE review): Love the phase metrics. Please ensure they include tenant/model/region/config_version tags (required for the rollout health dashboard) and that we don\u2019t cardinality explode on tx_id.",
+    "Noah Patel (author): Tags added for tenant/model/region/config_version. tx_id is log-only; metrics do not include tx_id. Also added sampling on debug logs in APPLY loop.",
+    "Omar El-Sayed (approval): Approved after latest changes. The resume-on-restart test is a nice catch.",
+    "Sean Gallagher (approval): Approved; metrics/tags meet dashboard needs."
+  ],
+  "ci_checks": [
+    "buildkite/redwood-main (pass)",
+    "unit-tests/runtime (pass)",
+    "integration-tests/runtime (pass)",
+    "lint/rustfmt (pass)",
+    "static-analysis/clippy (pass)"
+  ],
+  "merge_method": "squash",
+  "linked_jira": [
+    "SUP-18421"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "conversation"
+  ],
+  "dataset_doc_uuid": "dsid_786db9d7bc9d4ab2a862b78309515e0c"
+}
