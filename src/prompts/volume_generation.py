@@ -138,14 +138,14 @@ The files written must exist in the existing directory structure (you cannot cre
 ```
 
 ## Topic
-Topic and subtopics: {{topic_and_subtopics}}
+Topic (and subtopics): {{topic_and_subtopics}}
 """.strip()
 
 
 DOCUMENT_GENERATION_USER_PROMPT = f"""
 Generate me a realistic document for the following topic.
 
-Topics: {{topic_and_subtopics}}
+Topic: {{topic_and_subtopics}}
 
 Remember that you must use the {WRITE_TOOL} tool to write the document to the file system. You can only write the file in the existing directory structure. \
 The files must be valid JSON files that match the schema for the source type found in the {AGENTS_MD_FILE} file.

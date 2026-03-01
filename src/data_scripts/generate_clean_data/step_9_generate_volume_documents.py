@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tqdm import tqdm
 
-from src.llm import Message, get_llm, run_auto_conversation
+from src.llm import Message, get_cheap_llm, get_llm, run_auto_conversation
 from src.paths import (
     AGENTS_MD_FILE,
     COMPANY_OVERVIEW_PATH,
@@ -19,6 +19,7 @@ from src.paths import (
     SOURCES_DIR,
     VOLUME_DIR,
 )
+from src.prompts.json_recovery import JSON_RECOVERY_PROMPT
 from src.prompts.volume_generation import (
     CONFLICT_PROMPT,
     DOCUMENT_GENERATION_PROMPT,
@@ -30,7 +31,7 @@ from src.prompts.volume_generation import (
     TOTAL_DOCS_PROMPT,
 )
 from src.tools.runner import ToolRunner
-from src.tools.tool_implementations import GlobTool, ReadTool, WriteTool
+from src.tools.tool_implementations import WriteTool
 from src.utils import (
     add_dataset_doc_uuid,
     confirm_yes_no,
@@ -954,14 +955,16 @@ def collect_leaf_topics(
 def update_volume_completed(
     source_type: str,
     topic_path_parts: list[str],
+    created_file_path: str,
     increment: int = 1,
 ) -> None:
     """
-    Thread-safe update of completed count for a topic in a volume file.
+    Thread-safe update of completed count and created_files for a topic in a volume file.
 
     Args:
         source_type: Name of the source type.
         topic_path_parts: List of topic names to navigate (e.g., ["Parent Topic", "Child Topic"]).
+        created_file_path: Path of the newly created file to add to created_files list.
         increment: Amount to increment completed count by.
     """
     lock = _get_volume_lock(source_type)
@@ -988,15 +991,60 @@ def update_volume_completed(
                     return
                 current = current[part]["sub_topics"]
 
+        # Add created file path to the top-level created_files list
+        if "created_files" not in data:
+            data["created_files"] = []
+        data["created_files"].append(created_file_path)
+
         write_json_file(filepath, data)
 
 
-def validate_and_process_document(file_path: str) -> tuple[bool, str | None]:
+def try_recover_json(broken_json: str, quiet: bool = True) -> str | None:
     """
-    Validate a written document and add UUID/labels if valid.
+    Attempt to recover broken JSON using cheap LLM.
+
+    Args:
+        broken_json: The broken JSON string.
+        quiet: If True, suppress LLM output.
+
+    Returns:
+        Recovered JSON string or None if recovery failed.
+    """
+    prompt = JSON_RECOVERY_PROMPT.format(broken_json_string=broken_json)
+    llm = get_cheap_llm(tools=None, quiet=quiet)
+    messages: list[Message] = [Message(role="user", content=prompt)]
+
+    response = ""
+    for chunk in llm.generate(messages):
+        if isinstance(chunk, str):
+            response += chunk
+
+    response = response.strip()
+
+    # Try to parse the response
+    try:
+        json.loads(response)
+        return response
+    except json.JSONDecodeError:
+        # Try to extract JSON from the response
+        try:
+            extracted = extract_json_from_response(response)
+            json.loads(extracted)
+            return extracted
+        except Exception:
+            return None
+
+
+def validate_and_process_document(
+    file_path: str,
+    quiet: bool = True,
+) -> tuple[bool, str | None]:
+    """
+    Validate a written document with JSON recovery, then add UUID/labels if valid.
 
     Args:
         file_path: Path to the written JSON file.
+        quiet: If True, suppress LLM output.
 
     Returns:
         (success, error_message) tuple.
@@ -1004,11 +1052,35 @@ def validate_and_process_document(file_path: str) -> tuple[bool, str | None]:
     if not os.path.exists(file_path):
         return (False, f"File not found: {file_path}")
 
+    # Read raw content
     try:
-        data = load_json_file(file_path)
-    except json.JSONDecodeError as e:
-        return (False, f"Invalid JSON: {e}")
+        with open(file_path) as f:
+            raw_content = f.read()
+    except Exception as e:
+        return (False, f"Error reading file: {e}")
 
+    # Try to parse JSON
+    data = None
+    try:
+        data = json.loads(raw_content)
+    except json.JSONDecodeError as parse_error:
+        # Attempt JSON recovery
+        recovered = try_recover_json(raw_content, quiet=quiet)
+        if recovered:
+            try:
+                data = json.loads(recovered)
+                # Write recovered JSON back to file
+                with open(file_path, "w") as f:
+                    f.write(recovered)
+            except json.JSONDecodeError:
+                return (False, f"JSON recovery failed: {parse_error}")
+        else:
+            return (False, f"Invalid JSON and recovery failed: {parse_error}")
+
+    if data is None:
+        return (False, "Failed to parse JSON")
+
+    # Validate no nested dicts
     validation_error = validate_no_nested_dicts(data)
     if validation_error:
         return (False, f"Validation error: {validation_error}")
@@ -1022,34 +1094,33 @@ def validate_and_process_document(file_path: str) -> tuple[bool, str | None]:
     return (True, None)
 
 
-def get_existing_docs_for_topic(source_type: str, topic_and_subtopics: str) -> list[str]:
+def get_existing_docs_for_topic(source_type: str) -> list[str]:
     """
-    Get list of existing document names for a topic.
+    Get list of existing document paths from the volume JSON's created_files.
 
     This helps the LLM avoid creating duplicate-sounding documents.
 
     Args:
         source_type: Name of the source type.
-        topic_and_subtopics: The full topic path string.
 
     Returns:
-        List of existing JSON file names in the source directory.
+        List of created file paths (one per line for the prompt).
     """
-    source_path = os.path.join(SOURCES_DIR, source_type)
-    if not os.path.exists(source_path):
-        return []
+    lock = _get_volume_lock(source_type)
+    filepath = os.path.join(VOLUME_DIR, f"{source_type}.json")
 
-    existing = []
-    for root, _dirs, files in os.walk(source_path):
-        for filename in files:
-            if filename.endswith(".json"):
-                rel_path = os.path.relpath(os.path.join(root, filename), source_path)
-                existing.append(rel_path)
+    with lock:
+        try:
+            data = load_json_file(filepath)
+        except Exception:
+            return []
+
+        created_files = data.get("created_files", [])
 
     # Return a random sample to avoid overwhelming the prompt
-    if len(existing) > 20:
-        return random.sample(existing, 20)
-    return existing
+    if len(created_files) > 50:
+        return random.sample(created_files, 50)
+    return created_files
 
 
 def generate_single_document(
@@ -1073,13 +1144,13 @@ def generate_single_document(
         source_tree: Directory tree for the source.
         agents_md_contents: Formatted agents.md contents.
         quiet: If True, suppress LLM output.
-        max_retries: Maximum retries for conflict resolution.
+        max_retries: Maximum retries for validation failures (restarts from scratch).
 
     Returns:
         (success, message) tuple.
     """
     # Get existing docs to help with diversity
-    existing_docs = get_existing_docs_for_topic(source_type, topic_and_subtopics)
+    existing_docs = get_existing_docs_for_topic(source_type)
     existing_docs_str = "\n".join(existing_docs) if existing_docs else "(none yet)"
 
     # Build the system prompt
@@ -1096,40 +1167,28 @@ def generate_single_document(
         topic_and_subtopics=topic_and_subtopics,
     )
 
-    # Create tools
-    write_tool = TrackingWriteTool(base_dir=SOURCES_DIR, allow_create_dirs=False)
-    glob_tool = GlobTool(
-        base_dir=SOURCES_DIR,
-        required_pattern=r"agents",
-        pattern_error_message="You can only use the glob command on agents.md files.",
-    )
-    read_tool = ReadTool(base_dir=SOURCES_DIR)
+    for retry in range(max_retries):
+        # Create fresh tools for each retry
+        write_tool = TrackingWriteTool(base_dir=SOURCES_DIR, allow_create_dirs=False)
 
-    # Initialize LLM with tools
-    llm = get_llm(
-        tools=[
-            glob_tool.schema,
-            read_tool.schema,
-            write_tool.schema,
-        ],
-        quiet=quiet,
-    )
+        # Initialize cheap LLM with only the write tool
+        llm = get_cheap_llm(
+            tools=[write_tool.schema],
+            quiet=quiet,
+        )
 
-    # Create tool runner
-    tool_runner = ToolRunner()
-    tool_runner.register(glob_tool)
-    tool_runner.register(read_tool)
-    tool_runner.register(write_tool)
+        # Create tool runner
+        tool_runner = ToolRunner()
+        tool_runner.register(write_tool)
 
-    # Build messages
-    messages: list[Message] = [
-        Message(role="system", content=system_prompt),
-        Message(role="user", content=user_prompt),
-    ]
+        # Build fresh messages for each retry
+        messages: list[Message] = [
+            Message(role="system", content=system_prompt),
+            Message(role="user", content=user_prompt),
+        ]
 
-    try:
-        # Run auto conversation until document is written or max retries
-        for _retry in range(max_retries):
+        try:
+            # Run auto conversation until document is written
             run_auto_conversation(
                 llm=llm,
                 tool_runner=tool_runner,
@@ -1140,35 +1199,33 @@ def generate_single_document(
             )
 
             # Check if a document was written
-            if write_tool.written_paths:
-                # Validate and process each written document
-                for file_path in write_tool.written_paths:
-                    success, error = validate_and_process_document(file_path)
-                    if not success:
-                        # Delete invalid file and retry
-                        if os.path.exists(file_path):
-                            os.remove(file_path)
-                        messages.append(Message(
-                            role="user",
-                            content=f"The document was invalid: {error}. Please try again with valid JSON.",
-                        ))
-                        write_tool.reset_tracking()
-                        continue
+            if not write_tool.written_paths:
+                # No document written, retry from beginning
+                continue
 
-                    # Success! Update the volume completed count
-                    update_volume_completed(source_type, topic_path_parts, 1)
-                    return (True, f"Created {file_path}")
+            # Validate the written document (with JSON recovery if needed)
+            file_path = write_tool.written_paths[0]
+            success, error = validate_and_process_document(file_path, quiet=quiet)
 
-            # No document written, try again
-            messages.append(Message(
-                role="user",
-                content="No document was written. Please use the write tool to create the document.",
-            ))
+            if not success:
+                # Delete invalid file and retry from beginning
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                continue
 
-        return (False, "Max retries exceeded without creating valid document")
+            # Validation passed! Update the volume completed count and add file path
+            update_volume_completed(source_type, topic_path_parts, file_path, 1)
+            return (True, f"Created {file_path}")
 
-    except Exception as e:
-        return (False, f"Error: {e}")
+        except Exception as e:
+            # On exception, clean up any written files and retry
+            for path in write_tool.written_paths:
+                if os.path.exists(path):
+                    os.remove(path)
+            if retry == max_retries - 1:
+                return (False, f"Error: {e}")
+
+    return (False, "Max retries exceeded without creating valid document")
 
 
 def generate_documents_for_source(
