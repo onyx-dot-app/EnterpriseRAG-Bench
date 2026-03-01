@@ -16,8 +16,14 @@ from src.paths import (
     SOURCES_DIR,
     VOLUME_DIR,
 )
-from src.prompts.volume_generation import ESTIMATION_OFF_PROMPT, TASKS_PROMPT, TOTAL_DOCS_PROMPT
-from src.utils import extract_json_from_response, load_file
+from src.prompts.volume_generation import (
+    ESTIMATION_OFF_PROMPT,
+    ESTIMATION_OFF_PROMPT_SUB_TOPICS,
+    RECURSIVE_TOPIC_GENERATION_PROMPT,
+    TASKS_PROMPT,
+    TOTAL_DOCS_PROMPT,
+)
+from src.utils import confirm_yes_no, extract_json_from_response, load_file
 from src.utils.file_io import write_json_file
 from src.utils.statistics import update_statistics
 import re
@@ -465,22 +471,418 @@ def generate_volume_for_source(
         return (False, f"Error: {e}", None, False)
 
 
+# =============================================================================
+# Phase 2: Recursive Topic Splitting
+# =============================================================================
+
+MAX_TOPIC_SIZE = 500
+
+
+def split_topic(
+    topic_name: str,
+    topic_count: int,
+    source_type: str,
+    company_overview: str,
+    source_tree: str,
+    agents_md_contents: str,
+    quiet: bool = False,
+    max_attempts: int = 5,
+) -> tuple[list[dict], bool]:
+    """
+    Split a single topic into smaller sub-topics using LLM.
+
+    Args:
+        topic_name: Name of the topic to split.
+        topic_count: Desired document count for the topic.
+        source_type: Name of the source type.
+        company_overview: Company overview content.
+        source_tree: Directory tree for the source.
+        agents_md_contents: Formatted agents.md contents.
+        quiet: If True, suppress LLM status output.
+        max_attempts: Maximum attempts to get accurate split.
+
+    Returns:
+        (sub_topics, estimation_failed) tuple where sub_topics is a list of
+        {"name": str, "desired": int, "completed": 0} dicts.
+    """
+    prompt = RECURSIVE_TOPIC_GENERATION_PROMPT.format(
+        company_overview=company_overview,
+        target_data_source=source_type,
+        source_tree_contents=source_tree,
+        agents_md_contents=agents_md_contents,
+        original_topic=topic_name,
+        original_count=topic_count,
+    )
+
+    llm = get_llm(tools=None, quiet=quiet)
+    messages: list[Message] = [Message(role="user", content=prompt)]
+
+    estimation_failed = False
+
+    for attempt in range(max_attempts):
+        response = ""
+        for chunk in llm.generate(messages):
+            if isinstance(chunk, str):
+                response += chunk
+
+        messages.append(Message(role="assistant", content=response))
+
+        try:
+            json_str = extract_json_from_response(response)
+            data = json.loads(json_str)
+
+            # Handle the expected format: {"topics": [{"name": count}, ...]}
+            topics_list = data.get("topics", [])
+            if not topics_list:
+                continue
+
+            # Parse sub-topics
+            sub_topics = []
+            total = 0
+            for topic_entry in topics_list:
+                for name, count in topic_entry.items():
+                    count_int = int(count)
+                    sub_topics.append({
+                        "name": name,
+                        "desired": count_int,
+                        "completed": 0,
+                    })
+                    total += count_int
+
+            # Check estimation accuracy
+            is_accurate, off_percentage = check_estimation_accuracy(total, topic_count)
+
+            if is_accurate:
+                return (sub_topics, False)
+
+            # Retry if inaccurate
+            if attempt < max_attempts - 1:
+                correction = ESTIMATION_OFF_PROMPT_SUB_TOPICS.format(
+                    estimated_total_docs=total,
+                    original_count=topic_count,
+                    estimation_off_percentage=round(off_percentage, 1),
+                )
+                messages.append(Message(role="user", content=correction))
+            else:
+                estimation_failed = True
+                return (sub_topics, estimation_failed)
+
+        except Exception:
+            if attempt == max_attempts - 1:
+                # Return original topic as single sub-topic on failure
+                return ([{"name": topic_name, "desired": topic_count, "completed": 0}], True)
+
+    # Fallback: return original topic
+    return ([{"name": topic_name, "desired": topic_count, "completed": 0}], True)
+
+
+def recursively_split_topics(
+    topics: dict[str, dict],
+    source_type: str,
+    company_overview: str,
+    source_tree: str,
+    agents_md_contents: str,
+    quiet: bool = False,
+) -> tuple[dict[str, dict], list[str]]:
+    """
+    Recursively split all topics larger than MAX_TOPIC_SIZE.
+
+    Sub-topics are nested under the original topic with a "sub_topics" key.
+
+    Args:
+        topics: Current topics dict {name: {"desired": int, "completed": int, "sub_topics"?: {...}}}.
+        source_type: Name of the source type.
+        company_overview: Company overview content.
+        source_tree: Directory tree for the source.
+        agents_md_contents: Formatted agents.md contents.
+        quiet: If True, suppress LLM status output.
+
+    Returns:
+        (new_topics, warnings) tuple where warnings is list of topic names
+        that had estimation issues.
+    """
+    warnings = []
+    result_topics = {}
+
+    for topic_name, topic_data in topics.items():
+        desired = topic_data.get("desired", 0)
+        completed = topic_data.get("completed", 0)
+        has_sub_topics = "sub_topics" in topic_data
+
+        if desired <= MAX_TOPIC_SIZE or has_sub_topics:
+            # Topic is small enough or already split, keep as-is
+            result_topics[topic_name] = topic_data
+        else:
+            # Split this topic
+            sub_topics, estimation_failed = split_topic(
+                topic_name=topic_name,
+                topic_count=desired,
+                source_type=source_type,
+                company_overview=company_overview,
+                source_tree=source_tree,
+                agents_md_contents=agents_md_contents,
+                quiet=quiet,
+            )
+
+            if estimation_failed:
+                warnings.append(topic_name)
+
+            # Convert sub_topics list to dict
+            sub_topics_dict = {
+                st["name"]: {"desired": st["desired"], "completed": st["completed"]}
+                for st in sub_topics
+            }
+
+            # Recursively split any sub-topics that are still too large
+            split_sub_topics, sub_warnings = recursively_split_topics(
+                topics=sub_topics_dict,
+                source_type=source_type,
+                company_overview=company_overview,
+                source_tree=source_tree,
+                agents_md_contents=agents_md_contents,
+                quiet=quiet,
+            )
+
+            warnings.extend(sub_warnings)
+
+            # Nest sub-topics under the original topic
+            result_topics[topic_name] = {
+                "desired": desired,
+                "completed": completed,
+                "sub_topics": split_sub_topics,
+            }
+
+    return (result_topics, warnings)
+
+
+def _needs_splitting(topic_data: dict) -> bool:
+    """Check if a topic needs splitting (large and not already split)."""
+    desired = topic_data.get("desired", 0)
+    has_sub_topics = "sub_topics" in topic_data
+    return desired > MAX_TOPIC_SIZE and not has_sub_topics
+
+
+def split_large_topics_for_source(
+    source_type: str,
+    company_overview: str,
+    quiet: bool = False,
+) -> tuple[bool, str, list[str]]:
+    """
+    Split large topics for a single source type.
+
+    Args:
+        source_type: Name of the source type.
+        company_overview: Company overview content.
+        quiet: If True, suppress LLM status output.
+
+    Returns:
+        (modified, message, warnings) tuple.
+    """
+    filepath = os.path.join(VOLUME_DIR, f"{source_type}.json")
+    if not os.path.exists(filepath):
+        return (False, "File not found", [])
+
+    try:
+        with open(filepath) as f:
+            data = json.load(f)
+    except Exception as e:
+        return (False, f"Error loading: {e}", [])
+
+    topics = data.get("topics", {})
+    if not topics:
+        return (False, "No topics", [])
+
+    # Check if any topics need splitting (large and not already split)
+    large_topics = [name for name, t in topics.items() if _needs_splitting(t)]
+    if not large_topics:
+        return (False, "No large topics", [])
+
+    # Get source context
+    source_tree = get_source_tree(source_type)
+    agents_md_contents = get_agents_md_for_source(source_type)
+
+    # Recursively split
+    new_topics, warnings = recursively_split_topics(
+        topics=topics,
+        source_type=source_type,
+        company_overview=company_overview,
+        source_tree=source_tree,
+        agents_md_contents=agents_md_contents,
+        quiet=quiet,
+    )
+
+    # Update the data
+    data["topics"] = new_topics
+    data["total_docs_in_topics"] = sum(t["desired"] for t in new_topics.values())
+    data["remaining_doc_count"] = max(
+        0, data["total_docs_in_topics"] - data.get("pre_existing_doc_count", 0)
+    )
+
+    # Write back
+    write_json_file(filepath, data)
+
+    return (True, f"Split {len(large_topics)} large topic(s)", warnings)
+
+
+def split_large_topics(company_overview: str, parallelism: int = 1) -> list[str]:
+    """
+    Phase 2: Split large topics (>500) across all sources.
+
+    Args:
+        company_overview: Company overview content.
+        parallelism: Number of sources to process in parallel.
+
+    Returns:
+        List of source types that had estimation warnings.
+    """
+    print()
+    print("=" * 40)
+    print(f"Phase 2: Split Large Topics (>{MAX_TOPIC_SIZE} docs)")
+    print("=" * 40)
+    print()
+    print("Note: Depending on the volume of documents, this phase may take some time")
+    print("      as it recursively splits topics until all are under 500 docs.")
+    print()
+
+    if not os.path.exists(VOLUME_DIR):
+        print("No volume directory found.")
+        return []
+
+    # Find sources with large topics (that haven't been split yet)
+    sources_to_process = []
+    for filename in sorted(os.listdir(VOLUME_DIR)):
+        if not filename.endswith(".json"):
+            continue
+        filepath = os.path.join(VOLUME_DIR, filename)
+        try:
+            with open(filepath) as f:
+                data = json.load(f)
+            topics = data.get("topics", {})
+            large_count = sum(1 for t in topics.values() if _needs_splitting(t))
+            if large_count > 0:
+                source_name = filename.replace(".json", "")
+                sources_to_process.append((source_name, large_count))
+        except Exception:
+            pass
+
+    if not sources_to_process:
+        print("No sources have topics larger than 500 documents.")
+        return []
+
+    total_large = sum(count for _, count in sources_to_process)
+    print(f"Found {len(sources_to_process)} source(s) with {total_large} large topic(s).")
+    print()
+
+    all_warnings: list[str] = []
+
+    if parallelism <= 1:
+        # Sequential processing
+        for source_type, large_count in tqdm(sources_to_process, desc="Splitting topics"):
+            modified, message, warnings = split_large_topics_for_source(
+                source_type=source_type,
+                company_overview=company_overview,
+                quiet=False,
+            )
+            if warnings:
+                all_warnings.extend([f"{source_type}/{w}" for w in warnings])
+    else:
+        # Parallel processing
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            futures = {
+                executor.submit(
+                    split_large_topics_for_source,
+                    source_type,
+                    company_overview,
+                    True,  # quiet=True for parallel
+                ): source_type
+                for source_type, _ in sources_to_process
+            }
+
+            with tqdm(total=len(sources_to_process), desc="Splitting topics") as pbar:
+                for future in as_completed(futures):
+                    source_type = futures[future]
+                    try:
+                        modified, message, warnings = future.result()
+                        if warnings:
+                            all_warnings.extend([f"{source_type}/{w}" for w in warnings])
+                    except Exception as e:
+                        tqdm.write(f"[FAIL] {source_type}: {e}")
+                    pbar.update(1)
+
+    # Check if any topics still need splitting (not yet split)
+    still_large = []
+    for filename in sorted(os.listdir(VOLUME_DIR)):
+        if not filename.endswith(".json"):
+            continue
+        filepath = os.path.join(VOLUME_DIR, filename)
+        try:
+            with open(filepath) as f:
+                data = json.load(f)
+            topics = data.get("topics", {})
+            for name, t in topics.items():
+                if _needs_splitting(t):
+                    source_name = filename.replace(".json", "")
+                    still_large.append(f"{source_name}/{name}")
+        except Exception:
+            pass
+
+    if still_large:
+        print()
+        print(f"WARNING: {len(still_large)} topic(s) still exceed {MAX_TOPIC_SIZE} docs:")
+        for topic in still_large[:10]:
+            print(f"  - {topic}")
+        if len(still_large) > 10:
+            print(f"  ... and {len(still_large) - 10} more")
+
+    print()
+    print("Phase 2 complete.")
+    print()
+    print("=" * 40)
+    print("Please review the generated volume files to ensure you're happy with the")
+    print("topic breakdown. You can make manual modifications if needed.")
+    print(f"Volume files are located in: {VOLUME_DIR}")
+    print()
+    print("If you want to make changes, you can exit now and rerun the script later")
+    print("to continue from where you left off.")
+    print()
+
+    if not confirm_yes_no("Do you want to continue?", retry_on_invalid=True):
+        print("Exiting. You can rerun the script later to continue.")
+        raise SystemExit(0)
+
+    return all_warnings
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate volume task documents per source type."
     )
     parser.add_argument(
-        "--parallelism",
+        "--source-parallelism",
         type=int,
         default=5,
-        help="Number of source types to process in parallel (default: 5)",
+        help="Number of source types to process in parallel in Phase 1 (default: 5)",
+    )
+    parser.add_argument(
+        "--topic-parallelism",
+        type=int,
+        default=5,
+        help="Number of topics to expand in parallel in Phase 2 (default: 5)",
+    )
+    parser.add_argument(
+        "--doc-parallelism",
+        type=int,
+        default=10,
+        help="Number of documents to generate in parallel in Phase 3 (default: 10)",
     )
     args = parser.parse_args()
 
     print("Step 9: Generate Volume Documents")
     print("=" * 40)
     print("This script generates volume task documents for each source type.")
-    print("Each document contains topics and their target document counts.")
+    print("Phase 1: Generate topics and document counts per source")
+    print("Phase 2: Split large topics (>500 docs) into smaller sub-topics")
+    print()
     print("Target volume is extracted from each source's agents.md file.")
     print(f"Output directory: {VOLUME_DIR}")
     print()
@@ -493,7 +895,9 @@ def main() -> None:
         return
 
     print(f"Found {len(source_types)} source types: {', '.join(source_types)}")
-    print(f"Parallelism: {args.parallelism}")
+    print(f"Source parallelism: {args.source_parallelism}")
+    print(f"Topic parallelism: {args.topic_parallelism}")
+    print(f"Document parallelism: {args.doc_parallelism}")
     print()
 
     # Load context files
@@ -514,87 +918,100 @@ def main() -> None:
     print(f"Pending: {len(pending)} to generate, {skipped} already exist.")
     print()
 
-    if not pending:
-        print("All volume documents already generated.")
-        _print_statistics()
-        return
-
-    succeeded = 0
-    failed = 0
-    errors: list[tuple[str, str]] = []
-    estimation_warnings: list[str] = []
-
-    if args.parallelism <= 1:
-        # Sequential processing
-        for source_type in tqdm(pending, desc="Processing sources"):
-            success, message, _data, estimation_failed = generate_volume_for_source(
-                source_type=source_type,
-                company_overview=company_overview,
-                initiatives=initiatives,
-                source_list=source_list,
-                quiet=False,
-            )
-            if success:
-                succeeded += 1
-                if estimation_failed:
-                    estimation_warnings.append(source_type)
-            else:
-                failed += 1
-                errors.append((source_type, message))
-                tqdm.write(f"[FAIL] {source_type}: {message}")
-    else:
-        # Parallel processing
-        with ThreadPoolExecutor(max_workers=args.parallelism) as executor:
-            futures = {
-                executor.submit(
-                    generate_volume_for_source,
-                    source_type,
-                    company_overview,
-                    initiatives,
-                    source_list,
-                    True,  # quiet=True for parallel
-                ): source_type
-                for source_type in pending
-            }
-
-            with tqdm(total=len(pending), desc="Processing sources") as pbar:
-                for future in as_completed(futures):
-                    source_type = futures[future]
-                    try:
-                        success, message, _data, estimation_failed = future.result()
-                        if success:
-                            succeeded += 1
-                            if estimation_failed:
-                                estimation_warnings.append(source_type)
-                        else:
-                            failed += 1
-                            errors.append((source_type, message))
-                            tqdm.write(f"[FAIL] {source_type}: {message}")
-                    except Exception as e:
-                        failed += 1
-                        errors.append((source_type, str(e)))
-                        tqdm.write(f"[FAIL] {source_type}: {e}")
-                    pbar.update(1)
-
-    # Summary
     print()
     print("=" * 40)
-    print(f"Generation complete. {succeeded} created, {skipped} skipped, {failed} failed.")
+    print("Phase 1: Generate Volume Documents")
+    print("=" * 40)
 
-    if errors:
+    estimation_warnings: list[str] = []
+
+    if not pending:
+        print("All volume documents already generated.")
+    else:
+        succeeded = 0
+        failed = 0
+        errors: list[tuple[str, str]] = []
+
+        if args.source_parallelism <= 1:
+            # Sequential processing
+            for source_type in tqdm(pending, desc="Processing sources"):
+                success, message, _data, estimation_failed = generate_volume_for_source(
+                    source_type=source_type,
+                    company_overview=company_overview,
+                    initiatives=initiatives,
+                    source_list=source_list,
+                    quiet=False,
+                )
+                if success:
+                    succeeded += 1
+                    if estimation_failed:
+                        estimation_warnings.append(source_type)
+                else:
+                    failed += 1
+                    errors.append((source_type, message))
+                    tqdm.write(f"[FAIL] {source_type}: {message}")
+        else:
+            # Parallel processing
+            with ThreadPoolExecutor(max_workers=args.source_parallelism) as executor:
+                futures = {
+                    executor.submit(
+                        generate_volume_for_source,
+                        source_type,
+                        company_overview,
+                        initiatives,
+                        source_list,
+                        True,  # quiet=True for parallel
+                    ): source_type
+                    for source_type in pending
+                }
+
+                with tqdm(total=len(pending), desc="Processing sources") as pbar:
+                    for future in as_completed(futures):
+                        source_type = futures[future]
+                        try:
+                            success, message, _data, estimation_failed = future.result()
+                            if success:
+                                succeeded += 1
+                                if estimation_failed:
+                                    estimation_warnings.append(source_type)
+                            else:
+                                failed += 1
+                                errors.append((source_type, message))
+                                tqdm.write(f"[FAIL] {source_type}: {message}")
+                        except Exception as e:
+                            failed += 1
+                            errors.append((source_type, str(e)))
+                            tqdm.write(f"[FAIL] {source_type}: {e}")
+                        pbar.update(1)
+
+        # Phase 1 Summary
         print()
-        print(f"Errors ({len(errors)}):")
-        for source_type, error in errors:
-            print(f"  - {source_type}: {error}")
+        print(f"Phase 1 complete. {succeeded} created, {skipped} skipped, {failed} failed.")
 
+        if errors:
+            print()
+            print(f"Errors ({len(errors)}):")
+            for source_type, error in errors:
+                print(f"  - {source_type}: {error}")
+
+    # Phase 2: Split large topics
+    split_warnings = split_large_topics(
+        company_overview=company_overview,
+        parallelism=args.topic_parallelism,
+    )
+    estimation_warnings.extend(split_warnings)
+
+    # Final warnings
     if estimation_warnings:
         print()
         print("=" * 40)
-        print(f"WARNING: {len(estimation_warnings)} source(s) have inaccurate estimations (>10% off):")
-        for source_type in estimation_warnings:
-            print(f"  - {source_type}")
+        print(f"WARNING: {len(estimation_warnings)} topic(s) have inaccurate estimations (>10% off):")
+        for warning in estimation_warnings[:20]:
+            print(f"  - {warning}")
+        if len(estimation_warnings) > 20:
+            print(f"  ... and {len(estimation_warnings) - 20} more")
         print()
-        print("You may want to manually review and adjust the volume files for these sources.")
+        print("You may want to manually review and adjust the volume files.")
         print(f"Volume files are located in: {VOLUME_DIR}")
 
     # Print and update statistics

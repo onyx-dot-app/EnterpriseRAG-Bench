@@ -1,6 +1,6 @@
 """Utility functions."""
 
-from src.utils.cli import confirm_regenerate
+from src.utils.cli import confirm_regenerate, confirm_yes_no
 from src.utils.dataset_id import add_dataset_doc_uuid, generate_dataset_doc_uuid, get_dataset_doc_uuid
 from src.utils.dates import get_current_date_formatted
 from src.utils.field_labeling import (
@@ -16,6 +16,7 @@ from src.utils.validation import validate_no_nested_dicts
 __all__ = [
     "add_dataset_doc_uuid",
     "confirm_regenerate",
+    "confirm_yes_no",
     "delete_file",
     "extract_json_from_response",
     "generate_dataset_doc_uuid",

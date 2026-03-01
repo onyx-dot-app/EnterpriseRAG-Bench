@@ -14,7 +14,7 @@ from src.prompts.agents_md import AGENTS_MD_SYSTEM_PROMPT
 from src.utils.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import FinishTool, WriteTool
-from src.utils import load_file
+from src.utils import confirm_yes_no, load_file
 
 
 def find_agents_md_files(base_dir: str) -> list[str]:
@@ -42,8 +42,7 @@ def _has_agents_md_files() -> bool:
 
 def _confirm_generate_more() -> bool:
     """Prompt user to confirm generating more agents.md files."""
-    response = input("agents.md files already exist. Generate more? [y/N]: ").strip().lower()
-    return response in ("y", "yes")
+    return confirm_yes_no("agents.md files already exist. Generate more?", default=False)
 
 
 def main() -> None:
