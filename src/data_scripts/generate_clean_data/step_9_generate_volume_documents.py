@@ -19,7 +19,6 @@ from src.paths import (
     SOURCES_DIR,
     VOLUME_DIR,
 )
-from src.prompts.json_recovery import JSON_RECOVERY_PROMPT
 from src.prompts.volume_generation import (
     CONFLICT_PROMPT,
     DOCUMENT_GENERATION_PROMPT,
@@ -886,7 +885,7 @@ def _get_volume_lock(source_type: str) -> threading.Lock:
 
 
 class TrackingWriteTool(WriteTool):
-    """WriteTool that tracks written file paths and prevents overwrites."""
+    """WriteTool that validates JSON, tracks written file paths, and prevents overwrites."""
 
     def __init__(self, base_dir: str | None = None, allow_create_dirs: bool = False) -> None:
         super().__init__(base_dir=base_dir, allow_create_dirs=allow_create_dirs)
@@ -902,13 +901,24 @@ class TrackingWriteTool(WriteTool):
         self._written_paths = []
 
     def execute(self, content: str, file_path: str = "") -> str:
-        """Write content and track the path. Returns error if file exists."""
+        """Write content after validating JSON. Returns error if invalid or file exists."""
         # Check if file already exists before writing
         if self._base_dir and file_path:
             normalized_path = self._normalize_path(file_path)
             target_path = os.path.join(self._base_dir, normalized_path)
             if os.path.exists(target_path):
                 return f"Error: File already exists at {file_path}. {CONFLICT_PROMPT}"
+
+        # Validate JSON before writing
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as e:
+            return f"Error: Invalid JSON - {e}. Please fix the JSON and try again."
+
+        # Validate no nested dicts
+        validation_error = validate_no_nested_dicts(data)
+        if validation_error:
+            return f"Error: {validation_error}. All values must be strings, primitives, or lists of strings/primitives. Please fix and try again."
 
         result = super().execute(content, file_path)
         if result.startswith("Successfully wrote to "):
@@ -999,91 +1009,21 @@ def update_volume_completed(
         write_json_file(filepath, data)
 
 
-def try_recover_json(broken_json: str, quiet: bool = True) -> str | None:
+def process_written_document(file_path: str) -> tuple[bool, str | None]:
     """
-    Attempt to recover broken JSON using cheap LLM.
+    Add labels and UUID to a written document.
 
-    Args:
-        broken_json: The broken JSON string.
-        quiet: If True, suppress LLM output.
-
-    Returns:
-        Recovered JSON string or None if recovery failed.
-    """
-    prompt = JSON_RECOVERY_PROMPT.format(broken_json_string=broken_json)
-    llm = get_cheap_llm(tools=None, quiet=quiet)
-    messages: list[Message] = [Message(role="user", content=prompt)]
-
-    response = ""
-    for chunk in llm.generate(messages):
-        if isinstance(chunk, str):
-            response += chunk
-
-    response = response.strip()
-
-    # Try to parse the response
-    try:
-        json.loads(response)
-        return response
-    except json.JSONDecodeError:
-        # Try to extract JSON from the response
-        try:
-            extracted = extract_json_from_response(response)
-            json.loads(extracted)
-            return extracted
-        except Exception:
-            return None
-
-
-def validate_and_process_document(
-    file_path: str,
-    quiet: bool = True,
-) -> tuple[bool, str | None]:
-    """
-    Validate a written document with JSON recovery, then add UUID/labels if valid.
+    Note: JSON validation happens at write time in TrackingWriteTool,
+    so this function assumes the file contains valid JSON.
 
     Args:
         file_path: Path to the written JSON file.
-        quiet: If True, suppress LLM output.
 
     Returns:
         (success, error_message) tuple.
     """
     if not os.path.exists(file_path):
         return (False, f"File not found: {file_path}")
-
-    # Read raw content
-    try:
-        with open(file_path) as f:
-            raw_content = f.read()
-    except Exception as e:
-        return (False, f"Error reading file: {e}")
-
-    # Try to parse JSON
-    data = None
-    try:
-        data = json.loads(raw_content)
-    except json.JSONDecodeError as parse_error:
-        # Attempt JSON recovery
-        recovered = try_recover_json(raw_content, quiet=quiet)
-        if recovered:
-            try:
-                data = json.loads(recovered)
-                # Write recovered JSON back to file
-                with open(file_path, "w") as f:
-                    f.write(recovered)
-            except json.JSONDecodeError:
-                return (False, f"JSON recovery failed: {parse_error}")
-        else:
-            return (False, f"Invalid JSON and recovery failed: {parse_error}")
-
-    if data is None:
-        return (False, "Failed to parse JSON")
-
-    # Validate no nested dicts
-    validation_error = validate_no_nested_dicts(data)
-    if validation_error:
-        return (False, f"Validation error: {validation_error}")
 
     # Add field labels
     label_single_document(file_path, quiet=True)
@@ -1203,17 +1143,18 @@ def generate_single_document(
                 # No document written, retry from beginning
                 continue
 
-            # Validate the written document (with JSON recovery if needed)
+            # Process the written document (add labels and UUID)
+            # Note: JSON validation already happened at write time
             file_path = write_tool.written_paths[0]
-            success, error = validate_and_process_document(file_path, quiet=quiet)
+            success, error = process_written_document(file_path)
 
             if not success:
-                # Delete invalid file and retry from beginning
+                # Processing failed, delete file and retry
                 if os.path.exists(file_path):
                     os.remove(file_path)
                 continue
 
-            # Validation passed! Update the volume completed count and add file path
+            # Success! Update the volume completed count and add file path
             update_volume_completed(source_type, topic_path_parts, file_path, 1)
             return (True, f"Created {file_path}")
 
