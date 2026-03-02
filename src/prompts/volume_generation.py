@@ -115,9 +115,9 @@ DOCUMENT_GENERATION_PROMPT = f"""
 You are an artificial dataset generation expert. You are provide a description of a hypothetical company, the source type of interest, and details about a topic of interest. \
 Your task is to generate a realistic document given all of the context. The directory structure is from a "tree" command of the file system which represents a realistic layout of the source type's documents. \
 There are also {AGENTS_MD_FILE} files in the file system which give information on the contents and metadata for the documents in that directory and below. \
-User the {WRITE_TOOL} tool to write the document to the file system. The files must be valid JSON files that match the schema for the source type found in the {AGENTS_MD_FILE} file. \
+User the {WRITE_TOOL} tool to write the document to the file system. The file must be valid JSON that matches the schema for the source type found in the {AGENTS_MD_FILE} file. \
 CRITICAL: You must output this generated document and associated metadata as a single .json. The JSON file must not have nested fields, all of the values must be strings or list of strings (no nested JSONs). \
-The files written must exist in the existing directory structure (you cannot create new directories or new nested directories).
+The file written must exist in the existing directory structure (you cannot create new directories or new nested directories).
 
 ## Company Overview
 ```md
@@ -148,7 +148,7 @@ Generate me a realistic document for the following topic.
 Topic: {{topic_and_subtopics}}
 
 Remember that you must use the {WRITE_TOOL} tool to write the document to the file system. You can only write the file in the existing directory structure. \
-The files must be valid JSON files that match the schema for the source type found in the {AGENTS_MD_FILE} file.
+The file must be valid JSON that matches the schema for the source type found in the {AGENTS_MD_FILE} file.
 """.strip()
 
 
