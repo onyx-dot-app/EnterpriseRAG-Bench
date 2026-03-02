@@ -5,7 +5,7 @@ You must keep the contents as faithful as possible to the original JSON string, 
 
 Broken JSON string:
 ```
-{{broken_json_string}}
+{broken_json_string}
 ```
 
 CRITICAL: Output ONLY the corrected/fixed JSON string, do not wrap it in markdown code blocks or provide any explanations.
