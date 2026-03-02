@@ -19,6 +19,7 @@ from src.paths import (
     SOURCES_DIR,
     VOLUME_DIR,
 )
+from src.prompts.json_recovery import JSON_RECOVERY_PROMPT
 from src.prompts.volume_generation import (
     CONFLICT_PROMPT,
     DOCUMENT_GENERATION_PROMPT,
@@ -884,8 +885,63 @@ def _get_volume_lock(source_type: str) -> threading.Lock:
         return _volume_locks[source_type]
 
 
+class JsonRecoveryError(Exception):
+    """Raised when JSON recovery fails after all attempts."""
+    pass
+
+
+def try_recover_json(broken_json: str, max_attempts: int = 3) -> str:
+    """
+    Attempt to recover broken JSON using cheap LLM with conversation history.
+
+    Args:
+        broken_json: The broken JSON string.
+        max_attempts: Maximum number of recovery attempts.
+
+    Returns:
+        Recovered JSON string.
+
+    Raises:
+        JsonRecoveryError: If recovery fails after all attempts.
+    """
+    prompt = JSON_RECOVERY_PROMPT.format(broken_json_string=broken_json)
+    llm = get_cheap_llm(tools=None, quiet=True)
+    messages: list[Message] = [Message(role="user", content=prompt)]
+
+    for attempt in range(max_attempts):
+        response = ""
+        for chunk in llm.generate(messages):
+            if isinstance(chunk, str):
+                response += chunk
+
+        response = response.strip()
+
+        # Try to parse the response
+        try:
+            json.loads(response)
+            return response
+        except json.JSONDecodeError as e:
+            # Try to extract JSON from the response
+            try:
+                extracted = extract_json_from_response(response)
+                json.loads(extracted)
+                return extracted
+            except Exception:
+                pass
+
+            # If not last attempt, add to conversation and retry
+            if attempt < max_attempts - 1:
+                messages.append(Message(role="assistant", content=response))
+                messages.append(Message(
+                    role="user",
+                    content=f"That JSON is still invalid: {e}. Please fix it and output only valid JSON.",
+                ))
+
+    raise JsonRecoveryError(f"JSON recovery failed after {max_attempts} attempts")
+
+
 class TrackingWriteTool(WriteTool):
-    """WriteTool that validates JSON, tracks written file paths, and prevents overwrites."""
+    """WriteTool that validates JSON with recovery, tracks written file paths, and prevents overwrites."""
 
     def __init__(self, base_dir: str | None = None, allow_create_dirs: bool = False) -> None:
         super().__init__(base_dir=base_dir, allow_create_dirs=allow_create_dirs)
@@ -901,7 +957,7 @@ class TrackingWriteTool(WriteTool):
         self._written_paths = []
 
     def execute(self, content: str, file_path: str = "") -> str:
-        """Write content after validating JSON. Returns error if invalid or file exists."""
+        """Write content after validating JSON (with recovery). Returns error if invalid or file exists."""
         # Check if file already exists before writing
         if self._base_dir and file_path:
             normalized_path = self._normalize_path(file_path)
@@ -909,18 +965,23 @@ class TrackingWriteTool(WriteTool):
             if os.path.exists(target_path):
                 return f"Error: File already exists at {file_path}. {CONFLICT_PROMPT}"
 
-        # Validate JSON before writing
+        # Validate JSON before writing, with recovery attempts
+        final_content = content
+        data = None
+
         try:
             data = json.loads(content)
-        except json.JSONDecodeError as e:
-            return f"Error: Invalid JSON - {e}. Please fix the JSON and try again."
+        except json.JSONDecodeError:
+            # Attempt JSON recovery using LLM (raises JsonRecoveryError if all attempts fail)
+            final_content = try_recover_json(content)
+            data = json.loads(final_content)
 
         # Validate no nested dicts
         validation_error = validate_no_nested_dicts(data)
         if validation_error:
             return f"Error: {validation_error}. All values must be strings, primitives, or lists of strings/primitives. Please fix and try again."
 
-        result = super().execute(content, file_path)
+        result = super().execute(final_content, file_path)
         if result.startswith("Successfully wrote to "):
             # Extract the actual written path
             actual_path = result.replace("Successfully wrote to ", "")
@@ -969,12 +1030,12 @@ def update_volume_completed(
     increment: int = 1,
 ) -> None:
     """
-    Thread-safe update of completed count and created_files for a topic in a volume file.
+    Thread-safe update of completed count and files list for a leaf topic in a volume file.
 
     Args:
         source_type: Name of the source type.
         topic_path_parts: List of topic names to navigate (e.g., ["Parent Topic", "Child Topic"]).
-        created_file_path: Path of the newly created file to add to created_files list.
+        created_file_path: Path of the newly created file to add to the leaf topic's files list.
         increment: Amount to increment completed count by.
     """
     lock = _get_volume_lock(source_type)
@@ -993,18 +1054,16 @@ def update_volume_completed(
                 return
 
             if i == len(topic_path_parts) - 1:
-                # This is the leaf topic
+                # This is the leaf topic - update completed and add file
                 current[part]["completed"] = current[part].get("completed", 0) + increment
+                if "files" not in current[part]:
+                    current[part]["files"] = []
+                current[part]["files"].append(created_file_path)
             else:
                 # Navigate to sub_topics
                 if "sub_topics" not in current[part]:
                     return
                 current = current[part]["sub_topics"]
-
-        # Add created file path to the top-level created_files list
-        if "created_files" not in data:
-            data["created_files"] = []
-        data["created_files"].append(created_file_path)
 
         write_json_file(filepath, data)
 
@@ -1034,17 +1093,18 @@ def process_written_document(file_path: str) -> tuple[bool, str | None]:
     return (True, None)
 
 
-def get_existing_docs_for_topic(source_type: str) -> list[str]:
+def get_existing_docs_for_topic(source_type: str, topic_path_parts: list[str]) -> list[str]:
     """
-    Get list of existing document paths from the volume JSON's created_files.
+    Get list of existing document paths from a specific leaf topic's files list.
 
     This helps the LLM avoid creating duplicate-sounding documents.
 
     Args:
         source_type: Name of the source type.
+        topic_path_parts: List of topic names to navigate to the leaf topic.
 
     Returns:
-        List of created file paths (one per line for the prompt).
+        List of file paths from that topic (one per line for the prompt).
     """
     lock = _get_volume_lock(source_type)
     filepath = os.path.join(VOLUME_DIR, f"{source_type}.json")
@@ -1055,12 +1115,22 @@ def get_existing_docs_for_topic(source_type: str) -> list[str]:
         except Exception:
             return []
 
-        created_files = data.get("created_files", [])
+        # Navigate to the correct topic
+        current = data.get("topics", {})
+        for i, part in enumerate(topic_path_parts):
+            if part not in current:
+                return []
 
-    # Return a random sample to avoid overwhelming the prompt
-    if len(created_files) > 50:
-        return random.sample(created_files, 50)
-    return created_files
+            if i == len(topic_path_parts) - 1:
+                # This is the leaf topic - get its files
+                return current[part].get("files", [])
+            else:
+                # Navigate to sub_topics
+                if "sub_topics" not in current[part]:
+                    return []
+                current = current[part]["sub_topics"]
+
+    return []
 
 
 def generate_single_document(
@@ -1089,8 +1159,8 @@ def generate_single_document(
     Returns:
         (success, message) tuple.
     """
-    # Get existing docs to help with diversity
-    existing_docs = get_existing_docs_for_topic(source_type)
+    # Get existing docs for this specific topic to help with diversity
+    existing_docs = get_existing_docs_for_topic(source_type, topic_path_parts)
     existing_docs_str = "\n".join(existing_docs) if existing_docs else "(none yet)"
 
     # Build the system prompt
