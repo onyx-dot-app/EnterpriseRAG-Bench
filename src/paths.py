@@ -2,20 +2,20 @@
 
 AGENTS_MD_FILE = "agents.md"
 
-DATA_CLEAN_DIR = "data_clean"
+GENERATED_DATA_DIR = "generated_data"
 
-COMPANY_OVERVIEW_PATH = f"{DATA_CLEAN_DIR}/company_overview.md"
-INITIATIVES_PATH = f"{DATA_CLEAN_DIR}/initiatives.md"
-EMPLOYEE_DIRECTORY_PATH = f"{DATA_CLEAN_DIR}/employee_directory.yaml"
-VISUAL_EMPLOYEE_DIRECTORY_PATH = f"{DATA_CLEAN_DIR}/visual_employee_directory.txt"
-SOURCES_DIR = f"{DATA_CLEAN_DIR}/sources"
-SOURCE_TREE_PATH = f"{DATA_CLEAN_DIR}/source_tree.txt"
+COMPANY_OVERVIEW_PATH = f"{GENERATED_DATA_DIR}/company_overview.md"
+INITIATIVES_PATH = f"{GENERATED_DATA_DIR}/initiatives.md"
+EMPLOYEE_DIRECTORY_PATH = f"{GENERATED_DATA_DIR}/employee_directory.yaml"
+VISUAL_EMPLOYEE_DIRECTORY_PATH = f"{GENERATED_DATA_DIR}/visual_employee_directory.txt"
+SOURCES_DIR = f"{GENERATED_DATA_DIR}/sources"
+SOURCE_TREE_PATH = f"{GENERATED_DATA_DIR}/source_tree.txt"
 
-PROJECTS_DIR = f"{DATA_CLEAN_DIR}/projects"
-PROJECT_LIST_PATH = f"{DATA_CLEAN_DIR}/project_list.txt"
+PROJECTS_DIR = f"{GENERATED_DATA_DIR}/projects"
+PROJECT_LIST_PATH = f"{GENERATED_DATA_DIR}/project_list.txt"
 
-DEBUG_DIR = f"{DATA_CLEAN_DIR}/debug"
-AGGREGATE_STATISTICS_PATH = f"{DATA_CLEAN_DIR}/aggregate_statistics.txt"
-COMPLETENESS_DIR = f"{DATA_CLEAN_DIR}/completeness"
-VOLUME_DIR = f"{DATA_CLEAN_DIR}/volume"
+DEBUG_DIR = f"{GENERATED_DATA_DIR}/debug"
+AGGREGATE_STATISTICS_PATH = f"{GENERATED_DATA_DIR}/aggregate_statistics.txt"
+COMPLETENESS_DIR = f"{GENERATED_DATA_DIR}/completeness"
+VOLUME_DIR = f"{GENERATED_DATA_DIR}/volume"
 QUESTION_CACHE_DIR = "question_cache"

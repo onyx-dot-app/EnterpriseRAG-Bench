@@ -9,7 +9,7 @@ from src.llm import get_llm
 from src.llm.conversation import Conversation
 from src.paths import (
     COMPANY_OVERVIEW_PATH,
-    DATA_CLEAN_DIR,
+    GENERATED_DATA_DIR,
     QUESTION_CACHE_DIR,
     SOURCE_TREE_PATH,
     SOURCES_DIR,
@@ -42,8 +42,8 @@ def validate_written_files(file_paths: list[str]) -> tuple[bool, list[str]]:
     errors = []
 
     for rel_path in file_paths:
-        # Convert sources/... to data_clean/sources/...
-        full_path = os.path.join(DATA_CLEAN_DIR, rel_path)
+        # Convert sources/... to generated_data/sources/...
+        full_path = os.path.join(GENERATED_DATA_DIR, rel_path)
 
         if not os.path.exists(full_path):
             errors.append(f"File not found: {rel_path}")
@@ -70,7 +70,7 @@ def delete_written_files(file_paths: list[str]) -> None:
         file_paths: List of paths relative to sources (e.g., "sources/confluence/doc.json")
     """
     for rel_path in file_paths:
-        full_path = os.path.join(DATA_CLEAN_DIR, rel_path)
+        full_path = os.path.join(GENERATED_DATA_DIR, rel_path)
         if delete_file(full_path):
             print(f"  Deleted: {rel_path}")
 
@@ -160,7 +160,7 @@ def add_uuids_to_files(file_paths: list[str]) -> list[str]:
     """
     uuids = []
     for rel_path in file_paths:
-        full_path = os.path.join(DATA_CLEAN_DIR, rel_path)
+        full_path = os.path.join(GENERATED_DATA_DIR, rel_path)
         doc_uuid = add_dataset_doc_uuid(full_path)
         uuids.append(doc_uuid)
     return uuids
@@ -174,7 +174,7 @@ def label_files(file_paths: list[str]) -> None:
         file_paths: List of paths relative to sources (e.g., "sources/confluence/doc.json")
     """
     for rel_path in file_paths:
-        full_path = os.path.join(DATA_CLEAN_DIR, rel_path)
+        full_path = os.path.join(GENERATED_DATA_DIR, rel_path)
         success, message = label_single_document(full_path, quiet=True)
         if not success:
             print(f"  Warning: Failed to label {rel_path}: {message}")

@@ -231,7 +231,7 @@ def get_sources_tree(base_dir: str, max_depth: int = 4) -> str:
         )
         output = result.stdout
         # Replace the full path with just "sources" so LLM sees correct paths
-        # e.g., "data_clean/sources" -> "sources"
+        # e.g., "generated_data/sources" -> "sources"
         output = output.replace(sources_dir, "sources", 1)
         return output
     except Exception:

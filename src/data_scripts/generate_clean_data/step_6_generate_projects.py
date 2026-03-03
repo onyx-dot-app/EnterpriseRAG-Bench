@@ -13,7 +13,7 @@ from src.llm import Message, get_llm, run_auto_conversation
 from src.llm.conversation import Conversation
 from src.paths import (
     COMPANY_OVERVIEW_PATH,
-    DATA_CLEAN_DIR,
+    GENERATED_DATA_DIR,
     EMPLOYEE_DIRECTORY_PATH,
     INITIATIVES_PATH,
     PROJECT_LIST_PATH,
@@ -208,7 +208,7 @@ def enrich_single_project(
         if validation_error is None:
             # Valid - parse, filter invalid paths, and return
             result = parse_project_enrichment(json_str)
-            result = filter_invalid_paths(result, DATA_CLEAN_DIR)
+            result = filter_invalid_paths(result, GENERATED_DATA_DIR)
             return result.model_dump()
 
     except ValueError as e:
@@ -232,7 +232,7 @@ def enrich_single_project(
         if validation_error is None:
             # Valid on retry - parse, filter invalid paths, and return
             result = parse_project_enrichment(json_str)
-            result = filter_invalid_paths(result, DATA_CLEAN_DIR)
+            result = filter_invalid_paths(result, GENERATED_DATA_DIR)
             return result.model_dump()
 
         # Still invalid after retry

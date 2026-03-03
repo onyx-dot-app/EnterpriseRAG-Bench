@@ -136,7 +136,7 @@ class WriteTool(ToolInterface):
                 if parent_dir:
                     os.makedirs(parent_dir, exist_ok=True)
             else:
-                # Find the nearest existing parent directory
+                # Find the nearest existing parent directory that is a leaf
                 original_parent = parent_dir
                 while parent_dir and not os.path.exists(parent_dir):
                     parent_dir = os.path.dirname(parent_dir)
@@ -148,8 +148,14 @@ class WriteTool(ToolInterface):
                     else:
                         return f"Error: No existing directory found for {target}"
 
-                # Update target to use the existing parent directory
+                # Only allow recovery if the parent directory is a leaf (no subdirectories)
                 if parent_dir != original_parent:
+                    has_subdirs = any(
+                        os.path.isdir(os.path.join(parent_dir, entry))
+                        for entry in os.listdir(parent_dir)
+                    )
+                    if has_subdirs:
+                        return f"Error: Parent directory does not exist and nearest existing directory '{parent_dir}' is not a leaf directory"
                     target = os.path.join(parent_dir, filename)
 
             with open(target, "w") as f:

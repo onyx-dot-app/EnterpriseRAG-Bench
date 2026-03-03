@@ -7,7 +7,7 @@ import random
 import re
 import subprocess
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 
 from tqdm import tqdm
 
@@ -1239,129 +1239,59 @@ def generate_single_document(
     return (False, "Max retries exceeded without creating valid document")
 
 
-def generate_documents_for_source(
-    source_type: str,
-    company_overview: str,
-    parallelism: int = 1,
-    quiet: bool = False,
-) -> tuple[int, int, list[str]]:
+def get_pending_work_items(
+    source_contexts: dict[str, dict],
+    active_topics: set[tuple[str, tuple[str, ...]]],
+    active_lock: threading.Lock,
+) -> list[tuple[str, str, list[str]]]:
     """
-    Generate all pending documents for a single source type.
+    Get pending work items (1 per leaf topic that needs docs and isn't active).
+
+    Prioritizes same-source parallelization by sorting by source type.
 
     Args:
-        source_type: Name of the source type.
-        company_overview: Company overview content.
-        parallelism: Number of documents to generate in parallel.
-        quiet: If True, suppress LLM output.
+        source_contexts: Pre-loaded source contexts.
+        active_topics: Set of currently active (source_type, topic_parts_tuple) keys.
+        active_lock: Lock for accessing active_topics.
 
     Returns:
-        (success_count, fail_count, errors) tuple.
+        List of (source_type, topic_path, topic_parts) tuples, sorted by source_type.
     """
-    filepath = os.path.join(VOLUME_DIR, f"{source_type}.json")
-    if not os.path.exists(filepath):
-        return (0, 0, ["Volume file not found"])
+    work = []
 
-    try:
-        data = load_json_file(filepath)
-    except Exception as e:
-        return (0, 0, [f"Error loading volume file: {e}"])
+    for source_type in sorted(source_contexts.keys()):
+        filepath = os.path.join(VOLUME_DIR, f"{source_type}.json")
+        if not os.path.exists(filepath):
+            continue
 
-    topics = data.get("topics", {})
-    if not topics:
-        return (0, 0, [])
+        try:
+            data = load_json_file(filepath)
+        except Exception:
+            continue
 
-    # Get source context
-    source_tree = get_source_tree(source_type)
-    agents_md_contents = get_agents_md_for_source(source_type)
+        topics = data.get("topics", {})
+        leaf_topics = collect_leaf_topics(topics)
 
-    # Collect all leaf topics needing documents
-    leaf_topics = collect_leaf_topics(topics)
-    if not leaf_topics:
-        return (0, 0, [])
+        for topic_path, topic_parts, desired, completed in leaf_topics:
+            if desired > completed:
+                topic_key = (source_type, tuple(topic_parts))
+                with active_lock:
+                    if topic_key not in active_topics:
+                        work.append((source_type, topic_path, topic_parts))
 
-    # Calculate total documents needed
-    total_needed = sum(desired - completed for _, _, desired, completed in leaf_topics)
-    if total_needed == 0:
-        return (0, 0, [])
-
-    success_count = 0
-    fail_count = 0
-    errors: list[str] = []
-
-    # Build work items: (topic_path, topic_parts, docs_to_create)
-    work_items = []
-    for topic_path, topic_parts, desired, completed in leaf_topics:
-        docs_to_create = desired - completed
-        for _ in range(docs_to_create):
-            work_items.append((topic_path, topic_parts))
-
-    if parallelism <= 1:
-        # Sequential processing
-        for topic_path, topic_parts in tqdm(
-            work_items,
-            desc=f"Generating docs for {source_type}",
-            leave=False,
-        ):
-            success, message = generate_single_document(
-                source_type=source_type,
-                topic_and_subtopics=topic_path,
-                topic_path_parts=topic_parts,
-                company_overview=company_overview,
-                source_tree=source_tree,
-                agents_md_contents=agents_md_contents,
-                quiet=quiet,
-            )
-            if success:
-                success_count += 1
-            else:
-                fail_count += 1
-                errors.append(f"{topic_path}: {message}")
-    else:
-        # Parallel processing
-        with ThreadPoolExecutor(max_workers=parallelism) as executor:
-            futures = {
-                executor.submit(
-                    generate_single_document,
-                    source_type,
-                    topic_path,
-                    topic_parts,
-                    company_overview,
-                    source_tree,
-                    agents_md_contents,
-                    True,  # quiet=True for parallel
-                ): topic_path
-                for topic_path, topic_parts in work_items
-            }
-
-            with tqdm(
-                total=len(work_items),
-                desc=f"Generating docs for {source_type}",
-                leave=False,
-            ) as pbar:
-                for future in as_completed(futures):
-                    topic_path = futures[future]
-                    try:
-                        success, message = future.result()
-                        if success:
-                            success_count += 1
-                        else:
-                            fail_count += 1
-                            errors.append(f"{topic_path}: {message}")
-                    except Exception as e:
-                        fail_count += 1
-                        errors.append(f"{topic_path}: {e}")
-                    pbar.update(1)
-
-    return (success_count, fail_count, errors)
+    return work
 
 
 def generate_documents(company_overview: str, parallelism: int = 10) -> None:
     """
     Phase 3: Generate documents for all sources based on volume files.
 
+    Parallelizes across topics (max 1 document per leaf topic at a time).
+    Prioritizes same-source parallelization, but includes other sources if needed.
+
     Args:
         company_overview: Company overview content.
-        parallelism: Number of documents to generate in parallel per source.
+        parallelism: Maximum number of documents to generate in parallel.
     """
     print()
     print("=" * 40)
@@ -1372,59 +1302,119 @@ def generate_documents(company_overview: str, parallelism: int = 10) -> None:
     print("      in the volume files. This may take a long time depending on")
     print("      the total number of documents to generate.")
     print()
+    print(f"Parallelism: {parallelism} (max 1 per leaf topic at a time)")
+    print()
 
     if not os.path.exists(VOLUME_DIR):
         print("No volume directory found.")
         return
 
-    # Collect sources with pending documents
-    sources_with_pending = []
+    # Pre-load source contexts
+    source_contexts: dict[str, dict] = {}
     total_pending = 0
 
     for filename in sorted(os.listdir(VOLUME_DIR)):
         if not filename.endswith(".json"):
             continue
+        source_type = filename.replace(".json", "")
         filepath = os.path.join(VOLUME_DIR, filename)
+
         try:
             data = load_json_file(filepath)
             topics = data.get("topics", {})
             leaf_topics = collect_leaf_topics(topics)
             pending = sum(desired - completed for _, _, desired, completed in leaf_topics)
+
             if pending > 0:
-                source_name = filename.replace(".json", "")
-                sources_with_pending.append((source_name, pending))
+                source_contexts[source_type] = {
+                    "tree": get_source_tree(source_type),
+                    "agents_md": get_agents_md_for_source(source_type),
+                    "pending": pending,
+                }
                 total_pending += pending
         except Exception:
             pass
 
-    if not sources_with_pending:
+    if not source_contexts:
         print("No sources have pending documents to generate.")
         return
 
-    print(f"Found {len(sources_with_pending)} source(s) with {total_pending} pending document(s):")
-    for source_name, pending in sources_with_pending:
-        print(f"  - {source_name}: {pending} documents")
+    print(f"Found {len(source_contexts)} source(s) with {total_pending} pending document(s):")
+    for source_type, ctx in source_contexts.items():
+        print(f"  - {source_type}: {ctx['pending']} documents")
     print()
 
+    # Track active topics and results
+    active_topics: set[tuple[str, tuple[str, ...]]] = set()
+    active_lock = threading.Lock()
     total_success = 0
     total_fail = 0
     all_errors: list[str] = []
 
-    for source_type, pending_count in sources_with_pending:
-        print(f"\nProcessing {source_type} ({pending_count} documents)...")
+    with ThreadPoolExecutor(max_workers=parallelism) as executor:
+        futures: dict = {}
+        pbar = tqdm(total=total_pending, desc="Generating documents")
 
-        success, fail, errors = generate_documents_for_source(
-            source_type=source_type,
-            company_overview=company_overview,
-            parallelism=parallelism,
-            quiet=True,
-        )
+        while True:
+            # Get pending work items (sorted by source for same-source priority)
+            pending_work = get_pending_work_items(source_contexts, active_topics, active_lock)
 
-        total_success += success
-        total_fail += fail
-        all_errors.extend([f"{source_type}/{e}" for e in errors])
+            # Submit new work up to available slots
+            available_slots = parallelism - len(futures)
+            submitted = 0
 
-        print(f"  Created: {success}, Failed: {fail}")
+            for source_type, topic_path, topic_parts in pending_work:
+                if submitted >= available_slots:
+                    break
+
+                topic_key = (source_type, tuple(topic_parts))
+                with active_lock:
+                    if topic_key in active_topics:
+                        continue
+                    active_topics.add(topic_key)
+
+                ctx = source_contexts[source_type]
+                future = executor.submit(
+                    generate_single_document,
+                    source_type,
+                    topic_path,
+                    topic_parts,
+                    company_overview,
+                    ctx["tree"],
+                    ctx["agents_md"],
+                    True,  # quiet
+                )
+                futures[future] = (source_type, topic_path, topic_parts)
+                submitted += 1
+
+            # If no futures and no new work, we're done
+            if not futures:
+                break
+
+            # Wait for at least one to complete
+            done, _ = wait(futures.keys(), return_when=FIRST_COMPLETED)
+
+            for future in done:
+                source_type, topic_path, topic_parts = futures.pop(future)
+                topic_key = (source_type, tuple(topic_parts))
+
+                with active_lock:
+                    active_topics.discard(topic_key)
+
+                try:
+                    success, message = future.result()
+                    if success:
+                        total_success += 1
+                    else:
+                        total_fail += 1
+                        all_errors.append(f"{source_type}/{topic_path}: {message}")
+                except Exception as e:
+                    total_fail += 1
+                    all_errors.append(f"{source_type}/{topic_path}: {e}")
+
+                pbar.update(1)
+
+        pbar.close()
 
     print()
     print("=" * 40)

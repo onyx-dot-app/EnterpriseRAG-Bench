@@ -7,7 +7,7 @@ from src.llm import get_llm
 from src.llm.conversation import Conversation
 from src.paths import (
     COMPANY_OVERVIEW_PATH,
-    DATA_CLEAN_DIR,
+    GENERATED_DATA_DIR,
     INITIATIVES_PATH,
     SOURCE_TREE_PATH,
     SOURCES_DIR,
@@ -48,11 +48,11 @@ def write_source_tree() -> None:
     print("Writing Source Directory Tree")
     print("=" * 40)
 
-    # Run tree command from data_clean dir with just "sources" as argument
-    # This outputs "sources" as the root instead of "data_clean/sources"
+    # Run tree command from generated_data dir with just "sources" as argument
+    # This outputs "sources" as the root instead of "generated_data/sources"
     result = subprocess.run(
         ["tree", "-d", "sources"],
-        cwd=DATA_CLEAN_DIR,
+        cwd=GENERATED_DATA_DIR,
         capture_output=True,
         text=True,
     )
