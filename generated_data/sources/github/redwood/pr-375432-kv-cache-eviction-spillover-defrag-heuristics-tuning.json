@@ -1,0 +1,91 @@
+{
+  "repo": "redwood",
+  "pr_number": "375432",
+  "title": "kv-cache: tune eviction/defrag heuristics to reduce spillover and fragmentation",
+  "author": "Aisha Khan",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-02-18",
+  "merged_at": "2026-02-18",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/kv-evict-defrag-heuristics-tuning",
+  "reviewers": [
+    "Marcus Li",
+    "Priya Patel",
+    "Sofia Berg"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kv-cache",
+    "memory",
+    "backport-candidate"
+  ],
+  "linked_linear": [
+    "ENG-2491",
+    "ENG-2768"
+  ],
+  "linked_jira": [
+    "SUP-1124"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "6",
+  "additions": "420",
+  "deletions": "132",
+  "breaking_change": "false",
+  "description": "Motivation: In high-concurrency serving workloads we observed increased KV cache spillover and fragmentation under long-tail sequence length distributions. Spillover increases host-side paging and degrades throughput for concurrent in-flight requests. This PR introduces a set of coordinated heuristic changes to eviction scoring, fragmentation tracking, adaptive compaction windows, and spillover backpressure to reduce total spillover bytes and improve steady-state memory utilization.\n\nWhat this change does (summary):\n- Introduces a new eviction_score that combines recency, size, and fragmentation_penalty to prefer compact, large entries for eviction.\n- Tracks per-slab fragmentation metrics and exposes \"fragmentation_ratio\" counters to the runtime for smarter decisions.\n- Adds an adaptive_compaction window: when fragmentation_ratio for a slab exceeds a threshold we compact proactively instead of waiting for full eviction.\n- Implements spillover_backpressure in the scheduler: when device memory pressure is high, new KV insertions are rate-limited and compressed candidates are preferred.\n- Adds unit and benchmark tests, and a short docs entry describing heuristic knobs.\n\nDesign notes:\n- Eviction score is computed as: score = alpha*LRU_age + beta*(size_bytes) + gamma*(fragmentation_penalty). alpha/beta/gamma are runtime-configurable. We default to alpha=1, beta=0.8, gamma=1.5 after tuning against the microbenchmarks.\n- Fragmentation_penalty is a lightweight estimate (free_slots/total_slots) per slab; we avoid full defragmentation during hot paths.\n- Adaptive compaction runs opportunistically with a capped CPU budget (percent of core cycles) to avoid stealing cycles from inference.\n\nTesting and results:\n- Benchmarks (local perf infra) across realistic request traces show spillover bytes reduced by ~48% at 95th percentile load, tail p99 latency unaffected (+/- <1%), and a net 6% increase in throughput under stress tests with mixed sequence lengths.\n- All unit tests and integration benches added to CI. Initial bench job failed due to a flaky compaction race; fixed by adding a lightweight CAS in the compactor.\n\nRollout plan:\n- Canary deploy to Dedicated pools (~5% traffic) for 48 hours, observe spillover, memory pressure, and latency.\n- Increase to 25% for 24 hours, then 100% if no regressions.\n- Expose alpha/beta/gamma and fragmentation thresholds as runtime flags for quick rollback/tuning.\n\nChecklist:\n- [x] Eviction scoring implementation and config parsing\n- [x] Fragmentation tracking counters + metrics export\n- [x] Adaptive compaction implementation with CPU cap\n- [x] Spillover backpressure in scheduler\n- [x] Unit tests + benches\n- [x] Docs update (docs/kv-eviction.md)\n\nNotes for reviewers: pay attention to the compaction code path and the CAS added to avoid races when two threads attempt compaction on the same slab. The compaction is best-effort and non-blocking w.r.t. serving fastpath.\n\nRelated: previous work on spillover-defrag heuristics (see PRs pr-272846, pr-296112, pr-341500).",
+  "commits": [
+    "perf(kv): extract eviction_score calculation and make tunable (Aisha Khan)",
+    "kv: add fragmentation tracking counters + metric exports (Aisha Khan)",
+    "kv: implement adaptive_compaction window with CPU cap (Aisha Khan)",
+    "scheduler: add spillover_backpressure and insertion rate limiting (Aisha Khan)",
+    "tests: add regression benchmarks and unit tests for compaction and eviction (Aisha Khan)"
+  ],
+  "files_changed": [
+    "src/serving/kv_cache/eviction.rs",
+    "src/serving/kv_cache/compactor.rs",
+    "src/serving/kv_cache/scheduler.rs",
+    "tests/kv_cache_eviction.rs",
+    "benchmarks/kv_spillover_bench.rs",
+    "docs/kv-eviction.md"
+  ],
+  "diff_snippets": [
+    "--- a/src/serving/kv_cache/eviction.rs\n+++ b/src/serving/kv_cache/eviction.rs\n@@ -102,6 +102,28 @@\n pub fn choose_eviction_candidate(...) {\n-    // old LRU-only logic\n+    // new score-based eviction (LRU + size + fragmentation penalty)\n+    let score = alpha * lru_age as f64 + beta * size_bytes as f64 + gamma * frag_penalty;\n+    // prefer higher score for eviction\n }",
+    "--- a/src/serving/kv_cache/compactor.rs\n+++ b/src/serving/kv_cache/compactor.rs\n@@ -10,6 +10,34 @@\n+// best-effort proactive compaction when fragmentation_ratio exceeds threshold\n+pub fn try_compact_slab(slab_id: SlabId) {\n+    if get_fragmentation_ratio(slab_id) < COMPACT_THRESHOLD { return; }\n+    if !cpu_budget.try_claim() { return; }\n+    // CAS to ensure single compactor operates per-slab\n+    if slab_compaction_flag.compare_and_swap(false, true) {\n+       // perform compaction; minimize allocations on hot path\n+    }\n+}",
+    "--- a/src/serving/kv_cache/scheduler.rs\n+++ b/src/serving/kv_cache/scheduler.rs\n@@ -220,6 +220,21 @@\n+// when device memory pressure high, start backpressuring KV insertions\n+if device_memory_pressure() > BACKPRESSURE_THRESHOLD {\n+   rate_limiter.set_capacity(reduced_capacity);\n+}\n"
+  ],
+  "review_comments": [
+    "Marcus Li: Can you explain the default alpha/beta/gamma values and how sensitive perf is to them? Suggest adding an integration test that validates no p99 regression at default knobs.",
+    "Aisha Khan: Added integration bench and sensitivity sweep to benchmarks/kv_spillover_bench.rs; results included in PR description. Default knobs chosen from the sweep; we also make them runtime-configurable for quick tuning.",
+    "Priya Patel: The compaction CAS looks fine but please ensure the flag is cleared on early returns and on panic paths. Also add a metric for compaction CPU time.",
+    "Aisha Khan: Added RAII guard to clear flag and added compaction_cpu_ms metric (exported via runtime metrics).",
+    "Sofia Berg: I saw the initial bench fail on CI due to a race; can you summarize the fix?",
+    "Aisha Khan: The fix was to serialize compaction start using the CAS + RAII guard and to avoid triggering compaction while the slab is being resized. I re-ran the bench job and it passed."
+  ],
+  "ci_checks": [
+    "build: pass",
+    "unit-tests: pass",
+    "benchmarks: pass (initial run failed; rerun after race fix passed)",
+    "lint: pass",
+    "e2e: pass",
+    "perf-regression: pass"
+  ],
+  "merge_method": "squash",
+  "merge_commit": "abc123def4567890abcdef1234567890abcdef12",
+  "merge_notes": "Squashed and merged after approval from Marcus Li and Priya Patel. Canary rollout scheduled; flags exposed for tuning.",
+  "release_notes": "- Reduce KV cache spillover by ~48% at 95th percentile workload\n- Add tunable eviction scoring (LRU+size+fragmentation)\n- Add adaptive compaction and spillover backpressure to improve memory utilization\n- Expose runtime knobs for rapid tuning/rollback",
+  "hotfix_incident_ref": "INC-2026-047",
+  "rollout_plan": "Canary 5% -> 25% -> 100% with metrics monitoring (spillover_bytes, fragmentation_ratio, p99 latency). Runtime flags available for immediate rollback.",
+  "notes": "This is safe to backport to the latest maintenance branches if customers report high spillover; flagged as backport-candidate.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_comments",
+    "diff_snippets",
+    "release_notes",
+    "merge_notes",
+    "rollout_plan",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_6b3d4131cf38444fb24ad1834bb2a250"
+}
