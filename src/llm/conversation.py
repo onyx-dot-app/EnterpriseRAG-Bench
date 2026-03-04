@@ -1,8 +1,41 @@
-from typing import Callable
+import os
+from contextlib import contextmanager
+from typing import Any, Callable, Generator
 
 from src.llm.interface import LLMInterface, Message, ToolCall
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations.finish import FinishTool
+
+
+BRAINTRUST_API_KEY = os.environ.get("BRAINTRUST_API_KEY")
+BRAINTRUST_PROJECT = os.environ.get("BRAINTRUST_PROJECT")
+
+
+@contextmanager
+def _braintrust_span(name: str, span_type: str | None = None) -> Generator[Any, None, None]:
+    """Context manager for Braintrust span, no-op if not configured."""
+    if BRAINTRUST_API_KEY and BRAINTRUST_PROJECT:
+        try:
+            from braintrust import start_span
+
+            kwargs: dict[str, Any] = {"name": name}
+            if span_type:
+                kwargs["type"] = span_type
+            with start_span(**kwargs) as span:
+                yield span
+        except Exception:
+            yield None
+    else:
+        yield None
+
+
+def _log_to_span(span: Any, **kwargs: Any) -> None:
+    """Log data to a Braintrust span if available."""
+    if span is not None:
+        try:
+            span.log(**kwargs)
+        except Exception:
+            pass
 
 
 class Conversation:
@@ -12,6 +45,7 @@ class Conversation:
         self.llm = llm
         self.tool_runner = tool_runner
         self.messages: list[Message] = []
+        self._step_count = 0
 
     def add_system_message(self, content: str) -> None:
         """Add a system message to the conversation."""
@@ -51,16 +85,31 @@ class Conversation:
         exit_on_tools = exit_on_tools or []
 
         while True:
+            self._step_count += 1
             full_response = ""
             tool_calls: list[ToolCall] = []
             should_exit = False
 
-            for chunk in self.llm.generate(self.messages):
-                if isinstance(chunk, str):
-                    print(chunk, end="", flush=True)
-                    full_response += chunk
-                elif isinstance(chunk, ToolCall):
-                    tool_calls.append(chunk)
+            with _braintrust_span(f"llm_step_{self._step_count}", span_type="llm") as step_span:
+                for chunk in self.llm.generate(self.messages):
+                    if isinstance(chunk, str):
+                        print(chunk, end="", flush=True)
+                        full_response += chunk
+                    elif isinstance(chunk, ToolCall):
+                        tool_calls.append(chunk)
+
+                # Log LLM output to span
+                _log_to_span(
+                    step_span,
+                    input=[{"role": m.role, "content": m.content[:500]} for m in self.messages[-3:]],
+                    output=full_response if full_response else None,
+                    metadata={
+                        "tool_calls": [
+                            {"name": tc.name, "args": tc.args, "call_id": tc.call_id}
+                            for tc in tool_calls
+                        ] if tool_calls else None,
+                    },
+                )
 
             # Handle all tool calls before returning to LLM
             if tool_calls:
@@ -72,7 +121,13 @@ class Conversation:
                         print(f"\n[Tool Result]\n{error_msg}\n[/Tool Result]\n", flush=True)
                         self.add_tool_result(tool_call.call_id, error_msg)
                     else:
-                        result = self.tool_runner.run(tool_call.name, **tool_call.args)
+                        with _braintrust_span(tool_call.name, span_type="tool") as tool_span:
+                            result = self.tool_runner.run(tool_call.name, **tool_call.args)
+                            _log_to_span(
+                                tool_span,
+                                input=tool_call.args,
+                                output=result,
+                            )
                         print(f"\n[Tool Result]\n{result}\n[/Tool Result]\n", flush=True)
                         self.add_tool_result(tool_call.call_id, result)
 
