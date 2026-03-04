@@ -1,0 +1,42 @@
+{
+  "repo": "redwood",
+  "pr_number": "140123",
+  "title": "kv-cache: adaptive eviction + spillover + defrag improvements to reduce fragmentation and OOMs",
+  "author": "Hannah Zhao",
+  "created_at": "2026-01-15",
+  "updated_at": "2026-02-02",
+  "merged_at": "2026-02-02",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/kv-eviction-v18",
+  "reviewers": [
+    "Diego Morales",
+    "Priya Nair",
+    "Ethan Kim"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kv-cache",
+    "memory",
+    "infra"
+  ],
+  "linked_linear": [
+    "ENG-2145",
+    "ENG-2210"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "9",
+  "additions": "712",
+  "deletions": "284",
+  "release_notes": "Improved KV cache memory management: adaptive eviction tiers, proactive defragmentation, host-memory spillover, and new tuning knobs to reduce fragmentation-related OOMs and latency tail spikes.",
+  "breaking_change": "false",
+  "body": "Summary: This PR implements a set of coordinated changes to the KV cache memory manager to reduce fragmentation, avoid OOMs under high sharded-cache pressure, and make eviction decisions more workload-aware. Changes include: (1) an adaptive multi-tier eviction policy that combines recency+frequency heuristics with page-coalescing priority, (2) proactive in-GPU defragmentation when fragmentation crosses threshold, (3) a host-memory spillover path for cold KV pages with soft-eviction semantics, (4) integrated scheduling signals to defer large defrag/eviction jobs during latency-sensitive windows (continuous batching backpressure), and (5) new observability and operator knobs in config/defaults.yaml and ops docs. Motivation: We have observed production incidents (see linked linear ENG-2145) where long-lived fragmentation from many small per-request KV allocations caused devices to report available memory while still being unable to satisfy contiguous allocation requests, triggering OOMs and heavy tail latency. Prior fixes focused on passive LRU eviction which did not address fragmentation or prioritized wrong victims under mixed workloads. Design and details: - Adaptive eviction tiers: we introduced 3 logical tiers: HOT (recent + high-frequency keys), WARM (recent or moderately frequent), and COLD (rare). Eviction scoring combines recency score and frequency decay with a fragmentation impact factor: score = alpha*recency + beta*frequency - gamma*fragmentation_cost. Keys that free contiguous runs score higher for immediate eviction to reduce fragmentation. - Proactive defragmentation: when the fragmentation metric (percent of free bytes in runs < 8KB) exceeds 18% AND free_total < target_low_watermark, a background defrag job will coalesce adjacent free runs using buddy-like merging. The defrag runs are scheduled at low priority and respect a runtime \"defrag_budget_ms\" to avoid affecting token generation latency. - Host spillover: cold pages are now candidates for asynchronous migration to host-pinned memory instead of immediate deletion. The spillover path writes a compacted page to host and marks the GPU slot as reclaimable; on a subsequent miss we stream the page back. Spillover uses a capped pool and backpressure: if spillover pool is full, eviction falls back to compact delete and logging. - Integration with continuous batching/scheduling: large defrag or migration tasks register with the serving scheduler and receive a low-priority token; the scheduler can stall them if tail latency SLOs are at risk. We also added an on-path heuristic: if a request's expected KV allocations exceed per-request allocation threshold, we preemptively avoid launching defrag. - New metrics + ops docs: metrics added: kv_frag_percent, kv_free_run_histogram, kv_spill_bytes_total, kv_defrag_runs_total, kv_eviction_score_distribution. Documentation includes recommended knob values and how to interpret alerts. Commits (high level): - 1f4a3b5: initial adaptive eviction implementation and tests - 6b7c9d2: fragmentation heuristics and defrag worker - da12e8f: host spillover path and host-pinned page format - 9c3b7f1: scheduler integration and defrag throttling tokens - e7d4b6a: metrics, benchmarks, and docs Updates to code surface (high level): - src/serving/kv_cache/manager.cpp (new eviction pipeline + defrag job orchestration) - src/serving/kv_cache/heuristics.h (eviction scoring, fragmentation metrics) - src/serving/kv_cache/pager.cpp (host spillover read/write path) - src/serving/kv_cache/defrag_worker.cpp (background defrag logic) - include/serving/kv_cache/config.h (new knobs: defrag_budget_ms, frag_threshold_pct, spill_pool_size) - tests/kv_cache_test.cpp (unit + deterministic defrag/evict regressions) - benchmarks/kv_eviction_bench.py (microbench for fragmentation heavy workloads) - docs/ops/kv-eviction.md (operator guidance and runbooks) Small illustrative snippet: \"EvictionPlan plan = compute_eviction_plan(requested_bytes); if (plan.should_spill) { spill_to_host(plan.pages); } else { evict_pages(plan.pages); }\" Benchmarks: On a synthetic workload with 60% small-key churn and many long-lived sparse keys, we see: - 99th percentile generation latency dropped from 420ms -> 320ms (approx -24%) at 95% GPU utilization - OOM events reproducible prior to change no longer occur in 100 runs - Average memory reclaimed per defrag run: 12MB (coalesced runs) - Spillover path increased effective working set by ~18% with modest CPU cost (~3% CPU on host) Testing and CI: - Unit tests added to verify eviction scoring and deterministic defrag behavior in edge cases. - End-to-end bench runs added as a nightly microbenchmark. - Initial CI run had a flaky test kv_cache.eviction_score_test that failed on Windows runner due to timing; fixed by making deadline-tolerant assertion. Review thread (condensed): - Diego Morales: \"LGTM overall; please add a knob to disable spillover for sensitive environments.\" -> Author: \"added config flag kv_spill_enabled (default true) and documented tradeoffs.\" - Priya Nair: \"Defrag worker looks good but worried about head-of-line latency when fragmentation triggers during bursts.\" -> Author: \"scheduler integration added; defrag_budget_ms default 50ms with dynamic scaling based on 95th latency window.\" - Ethan Kim: \"Can we avoid copying hot pages to host when we can instead compact in place?\" -> Author: \"We attempt in-GPU compaction first; spill is a fallback for cold pages where compaction cost outweighs benefit.\" - CI: initial run: build passed, unit tests passed, one flaky eviction_score_test failed; re-run passed. Merge: squash-and-merge after approvals from Diego and Priya. Changelog/release notes included for ops. Rollout plan: staged rollout on Dedicated clusters with kv_spill_enabled=false for first 48h, then enable spillover in opt-in flavor; monitor kv_frag_percent and kv_spill_bytes_total. Backwards compatibility: no public API changes; config knobs new but default preserves prior behavior (spill disabled for earlier branches). Related work: ties to ENG-2145 (immediate incident), follow-up ENG-2210 to instrument GC events in telemetry. Known limitations and follow-ups: - Current defrag algorithm is eager for coalescing small runs; a future follow-up (ENG-2301) will add adaptive compaction intensity based on model sequence length distribution. - Spillover introduces host CPU and network pressure for very large working sets; ops docs include recommended caps. Files changed (high level diff summary): - src/serving/kv_cache/manager.cpp (+320 -84) - src/serving/kv_cache/heuristics.h (+118 -10) - src/serving/kv_cache/pager.cpp (+210 -115) - src/serving/kv_cache/defrag_worker.cpp (+142 -0) - include/serving/kv_cache/config.h (+34 -2) - tests/kv_cache_test.cpp (+86 -22) - benchmarks/kv_eviction_bench.py (+120 -0) - docs/ops/kv-eviction.md (+210 -0) CI logs: Build: pass; Unit tests: pass; Bench (nightly): added; Lint: pass; Flaky test fixed and rerun. Merge outcome: merged into main via squash-and-merge by Priya Nair after approvals.",
+  "file_path": "github/redwood/pr-140123-kv-cache-eviction-spillover-memory-defrag-optimizations.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_0cda0a1095034809883b37bd421d77fb"
+}
