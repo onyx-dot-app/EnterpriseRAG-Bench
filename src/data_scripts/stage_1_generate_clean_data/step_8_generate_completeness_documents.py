@@ -183,7 +183,7 @@ def label_files(file_paths: list[str]) -> None:
 def write_question_cache(trace_number: int, question: str, document_uuids: list[str]) -> str:
     """Write a completeness question cache JSON file."""
     os.makedirs(QUESTION_CACHE_DIR, exist_ok=True)
-    cache_path = os.path.join(QUESTION_CACHE_DIR, f"completeness_{trace_number}.json")
+    cache_path = os.path.join(QUESTION_CACHE_DIR, f"completeness_{trace_number:04d}.json")
     cache_data = {
         "question": question,
         "documents": document_uuids,
@@ -257,7 +257,7 @@ def main() -> None:
 
         print()
         print("=" * 40)
-        print(f"Generating trace {i + 1} of {num_to_generate} (will be saved as completeness_{trace_number}.json)")
+        print(f"Generating trace {i + 1} of {num_to_generate} (will be saved as completeness_{trace_number:04d}.json)")
         print("=" * 40)
         print()
 

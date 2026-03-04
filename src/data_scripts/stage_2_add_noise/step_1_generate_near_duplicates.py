@@ -6,7 +6,7 @@ import os
 import random
 import subprocess
 
-from src.llm import Message, get_cheap_llm
+from src.llm import Message, get_llm
 from src.paths import (
     QUESTION_CACHE_DIR,
     SOURCES_DIR,
@@ -200,7 +200,7 @@ def generate_new_file_path(
         source_directory_structure=source_tree,
     )
 
-    llm = get_cheap_llm(tools=None, quiet=False)
+    llm = get_llm(tools=None, quiet=False)
     messages: list[Message] = [Message(role="user", content=prompt)]
 
     for attempt in range(max_attempts):
@@ -368,7 +368,7 @@ def generate_new_file_contents(
         new_file_path=new_file_path,
     )
 
-    llm = get_cheap_llm(tools=None, quiet=False)
+    llm = get_llm(tools=None, quiet=False)
     messages: list[Message] = [
         Message(role="system", content=system_prompt),
         Message(role="user", content=NEW_DUPLICATE_FILE_USER_PROMPT),

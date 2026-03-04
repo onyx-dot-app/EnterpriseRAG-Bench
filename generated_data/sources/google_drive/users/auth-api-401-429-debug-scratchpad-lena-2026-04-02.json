@@ -1,0 +1,36 @@
+{
+  "title": "auth-api-401-429-debug-scratchpad-lena-2026-04-02",
+  "owner": "Lena Hart",
+  "drive_area": "users",
+  "path": "users",
+  "doc_type": "doc",
+  "created_at": "2026-04-02",
+  "last_modified": "2026-04-02",
+  "collaborators": [
+    "Samir Shah",
+    "Oliver Nguyen"
+  ],
+  "team": "eng-sre",
+  "status": "draft",
+  "tags": [
+    "auth",
+    "401",
+    "429",
+    "rate-limit",
+    "quota",
+    "debugging",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "JIRA:RED-5421",
+    "Slack:#prod-api-alerts (thread TS:1612345678)",
+    "Confluence:Auth-API-runbook-id-923"
+  ],
+  "content": "Goal: quickly gather breadcrumbs for recurring 401/429 patterns hitting the hosted API from multiple customers. This is a personal scratchpad - notes, commands tried, hypotheses, and immediate next steps.\n\nSummary of observed behaviour:\n- Two customers (cust-A, cust-B) reported intermittent 401s followed by bursts of 429s when their apps retry aggressively.\n- Errors spike around 08:00-09:30 UTC and 21:00-22:00 UTC (customer regional peaks).\n- No obvious config change in their projects; they claim using the same client code for weeks.\n- Logs show a mix of: \"401 Unauthorized: invalid API key\" and \"429 Too Many Requests: rate limit exceeded\". Sometimes 401s appear first, then 429s for the same API key.\n\nCommands / quick repro attempts (local):\n1) Validate token introspection endpoint (internal):\n$ curl -s -X POST https://internal-auth.redwood/v1/introspect -H \"Content-Type: application/json\" -d '{\"api_key\":\"pk_live_...\"}' | jq\n- Response: {\"active\": true, \"scope\": \"text:generate\", \"last_used\": \"2026-04-02T08:14:02Z\"} (for cust-A key)\n\n2) Simple call to hosted inference endpoint with known-good key:\n$ curl -i -X POST https://api.redwood.ai/v1/generate \\n  -H 'Authorization: Bearer pk_live_valid' \\n  -H 'Content-Type: application/json' \\n  -d '{\"model\":\"rw1-small\",\"input\":\"test\"}'\n- Got 200 OK consistently from my laptop (us-west)\n\n3) Replay at higher RPS to simulate bursts (using hey):\n$ hey -n 500 -c 50 -H 'Authorization: Bearer pk_live_...custA' -m POST -T application/json -d '{\"model\":\"rw1-small\",\"input\":\"x\"}' https://api.redwood.ai/v1/generate\n- Results: many 429s after ~120 concurrent requests; 401s did not appear locally with same key.\n\n4) Minted a short-lived key via customer-managed KMS integration to test rotation flow (cust-B):\n- Called token refresh flow repeatedly (10s TTL) and exercised endpoints. Observed 401s only when token rotation lagged (client using cached old token) - expected.\n\nServer-side logs / snippets (pulled from prod slices, anonymized):\n- 2026-04-02T08:12:59Z custA pk_live_xxx /v1/generate 401 \"invalid_api_key: signature mismatch\" src=lb-03\n- 2026-04-02T08:13:01Z custA pk_live_xxx /v1/generate 429 \"rate_limit: route=generate key=pk_live_xxx limit=120/1m\" src=serve-07\n- 2026-04-02T08:13:41Z custA pk_live_xxx /v1/generate 200 \"ok\" src=serve-09\n- 2026-04-02T08:14:05Z custB pk_live_yyy /v1/generate 401 \"key_revoked\" src=lb-02\n- 2026-04-02T08:14:10Z custB pk_live_yyy /v1/generate 429 \"rate_limit: short_burst_exceeded\" src=serve-02\n\nHypotheses (ranked):\n1) Client-side token rotation race: clients sometimes send expired/stale tokens during rotation; front-end LB does an auth check that returns 401, then retries that land on a different LB/edge which applies rate limiting and returns 429 due to retries.\n2) Propagation delay for key revocation / update across a multi-region LB pool: some edges still accept an old key as \"valid-ish\" causing inconsistent 401 messages, then the traffic pattern triggers a rate limit elsewhere.\n3) Misbehaving SDKs: the customer SDK may be catching 401 and performing tight retry loops (no exponential backoff), converting a token error into a burst that triggers 429.\n4) A subtle bug in LB auth plugin: occasional malformed signature verification returns 401 for some requests (race with reloading key cache), subsequent requests count toward rate limit even if auth failed on LB (because counting happens later).\n\nEvidence for/against hypotheses:\n- Hypothesis 1: supported by token rotation repro for cust-B (401s when token rotation lagged). Logs show sequences 401 -> 429 for same key.\n- Hypothesis 2: need to check key cache invalidation across edge fleet; currently last rotation timestamps show ~2s propagation in control plane, but metrics for auth cache misses spike concurrently with incidents.\n- Hypothesis 3: customer claim they use official SDK v1.2.3 - but many customers are on older pinned versions. Ask for SDK version and whether they implemented retries.\n- Hypothesis 4: LB logs show occasional \"signature verification timeout\" on lb-03 earlier; need LB auth plugin logs.\n\nImmediate next steps / TODOs:\n- Ask both customers for SDK version, exact client configs, and whether they use automatic retries/backoff. (Samir to confirm)\n- Pull LB auth plugin logs for lb-02/03 around 08:10-08:20 UTC (Oliver).\n- Run a controlled replay from a VM in same AZ as LB to see if 401s can be reproduced under rotation + concurrent retries (Lena).\n- Add additional logging to rate limiter to record whether a request counted toward quota when auth failed (quick PR to serve runtime: add boolean auth_valid in rate limit line). Low-risk change, pinned for canary.\n- Check key propagation metrics: when we rotate keys for a customer, track per-edge ack times.\n\nNotes / misc:\n- Observed the customers that have client-side load balancers (multiple IPs) get more inconsistent results.\n- For cust-A we saw source IPs alternating between 34.21.x.x and 34.21.y.y; could be NAT gateway churn.\n- Consider temporary mitigation: bump rate limiting window for affected keys or enable stricter 401->no-retry guidance to SDKs.\n\nShort-term hypothesis test plan (1 hour):\n1) Reproduce rotation race: spin a short TTL key and rotate every 5s while a client sends 10 RPS; see if 401s appear.\n2) Replay with aggressive retry loop (tight 50ms backoff) to check conversion to 429.\n3) Confirm whether the rate limiter counts auth-failed requests as quota usage.\n\nSlack draft to send to customers:\nHi - thanks for the report. We're investigating. Quick asks: please send the SDK version and client retry config, and whether you use any client-side proxies/load-balancers. We're running targeted tests and will follow up in ~1-2 hours with findings.\n\nOpen questions for infra/product:\n- Should rate limiter ignore requests that fail auth at the LB layer? Pros: reduces false rates for legitimate token races. Cons: could allow replay attacks if LB auth check is bypassed. Security team should weigh in. (cc @security)\n- Is there appetite for improving SDK default retry backoff to exponential with jitter? (cc @devexp)\n\nLog references (IDs):\n- incident_slice_2026-04-02-08-12 (internal id)\n- lb-03-auth-plugin:trace-9821\n\nEnd of scratchpad. Will update after LB logs and customer SDK info come in.",
+  "plain_text_preview": "(scratchpad) 401 then 429 pattern; token rotation and retries suspected; next steps: get LB logs, customer SDK info, add logging to rate limiter",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_9f7684e924864ed9974377cfaa2d6bae"
+}
