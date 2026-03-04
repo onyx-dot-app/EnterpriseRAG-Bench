@@ -2,6 +2,7 @@
 
 import json
 import os
+import tempfile
 from typing import Any
 
 
@@ -38,9 +39,11 @@ def load_json_file(path: str) -> dict[str, Any]:
 
 
 def write_json_file(path: str, data: dict[str, Any]) -> None:
-    """Write data to a JSON file with standard formatting.
+    """Write data to a JSON file with standard formatting using atomic write.
 
-    Creates parent directories if they don't exist.
+    Uses atomic write (write to temp file, then rename) to prevent corruption
+    if the process is killed during write. Creates parent directories if they
+    don't exist.
 
     Args:
         path: Path to the JSON file to write.
@@ -49,8 +52,23 @@ def write_json_file(path: str, data: dict[str, Any]) -> None:
     parent_dir = os.path.dirname(path)
     if parent_dir:
         os.makedirs(parent_dir, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+
+    # Write to a temp file in the same directory (same filesystem for atomic rename)
+    fd, temp_path = tempfile.mkstemp(
+        suffix=".tmp",
+        prefix=".write_",
+        dir=parent_dir if parent_dir else ".",
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        # Atomic rename - if process is killed here, temp file is orphaned but original is intact
+        os.replace(temp_path, path)
+    except Exception:
+        # Clean up temp file on error
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
 
 
 def delete_file(path: str) -> bool:
