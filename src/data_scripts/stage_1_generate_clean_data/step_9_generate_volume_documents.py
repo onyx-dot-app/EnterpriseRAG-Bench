@@ -846,8 +846,20 @@ def _get_volume_lock(source_type: str) -> threading.Lock:
         return _volume_locks[source_type]
 
 
-class TrackingWriteTool(WriteTool):
-    """WriteTool that validates JSON with recovery, tracks written file paths, and prevents overwrites."""
+class JsonDocumentWriteTool(WriteTool):
+    """
+    WriteTool for writing JSON documents to the sources directory.
+
+    Validates that:
+    - File path ends with .json
+    - File is in a subdirectory (not directly in sources root)
+    - Parent directory exists
+    - File doesn't already exist
+    - Content is valid JSON (with LLM-based recovery if needed)
+    - JSON has no nested dicts (flat structure only)
+
+    Tracks all written file paths for later reference.
+    """
 
     def __init__(self, base_dir: str | None = None, allow_create_dirs: bool = False) -> None:
         super().__init__(base_dir=base_dir, allow_create_dirs=allow_create_dirs)
@@ -863,11 +875,28 @@ class TrackingWriteTool(WriteTool):
         self._written_paths = []
 
     def execute(self, content: str, file_path: str = "") -> str:
-        """Write content after validating JSON (with recovery). Returns error if invalid or file exists."""
-        # Check if file already exists before writing
-        if self._base_dir and file_path:
-            normalized_path = self._normalize_path(file_path)
+        """Write JSON content after validating path and content. Returns error if invalid."""
+        # Validate file path format
+        if not file_path:
+            return "Error: No file path provided. Please specify a valid .json file path."
+
+        if not file_path.endswith(".json"):
+            return f"Error: File path must end with .json, got: {file_path}. Please use a .json extension."
+
+        # Check path has proper directory structure (not directly in base dir)
+        normalized_path = self._normalize_path(file_path) if self._base_dir else file_path
+        path_parts = normalized_path.replace("\\", "/").split("/")
+        if len(path_parts) < 2:
+            return f"Error: File must be in a subdirectory, not directly in sources root. Got: {file_path}"
+
+        # Validate parent directory exists
+        if self._base_dir:
             target_path = os.path.join(self._base_dir, normalized_path)
+            parent_dir = os.path.dirname(target_path)
+            if not os.path.isdir(parent_dir):
+                return f"Error: Parent directory does not exist: {parent_dir}. Please use an existing directory path."
+
+            # Check if file already exists
             if os.path.exists(target_path):
                 return f"Error: File already exists at {file_path}. {CONFLICT_PROMPT}"
 
@@ -1060,7 +1089,7 @@ def generate_single_document(
 
     for retry in range(max_retries):
         # Create fresh tools for each retry
-        write_tool = TrackingWriteTool(base_dir=SOURCES_DIR, allow_create_dirs=False)
+        write_tool = JsonDocumentWriteTool(base_dir=SOURCES_DIR, allow_create_dirs=False)
 
         # Initialize cheap LLM with only the write tool
         llm = get_cheap_llm(

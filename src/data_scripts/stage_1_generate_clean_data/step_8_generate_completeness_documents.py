@@ -75,8 +75,18 @@ def delete_written_files(file_paths: list[str]) -> None:
             print(f"  Deleted: {rel_path}")
 
 
-class TrackingWriteTool(WriteTool):
-    """WriteTool that tracks all written file paths."""
+class JsonDocumentWriteTool(WriteTool):
+    """
+    WriteTool for writing JSON documents to the sources directory.
+
+    Validates that:
+    - File path ends with .json
+    - File is in a subdirectory (not directly in sources root)
+    - Parent directory exists
+    - File doesn't already exist
+
+    Tracks all written file paths for later reference.
+    """
 
     def __init__(self, base_dir: str | None = None, allow_create_dirs: bool = False) -> None:
         super().__init__(base_dir=base_dir, allow_create_dirs=allow_create_dirs)
@@ -100,11 +110,27 @@ class TrackingWriteTool(WriteTool):
                 return
 
     def execute(self, content: str, file_path: str = "") -> str:
-        """Write content and track the path."""
-        # Check if file already exists before writing
-        if self._base_dir and file_path:
-            normalized_path = self._normalize_path(file_path)
+        """Write JSON content after validating path. Returns error if path invalid or file exists."""
+        # Validate file path format
+        if not file_path:
+            return "Error: No file path provided. Please specify a valid .json file path."
+
+        if not file_path.endswith(".json"):
+            return f"Error: File path must end with .json, got: {file_path}. Please use a .json extension."
+
+        # Check path has proper directory structure (not directly in base dir)
+        normalized_path = self._normalize_path(file_path) if self._base_dir else file_path
+        path_parts = normalized_path.replace("\\", "/").split("/")
+        if len(path_parts) < 2:
+            return f"Error: File must be in a subdirectory, not directly in sources root. Got: {file_path}"
+
+        # Validate parent directory exists and file doesn't already exist
+        if self._base_dir:
             target_path = os.path.join(self._base_dir, normalized_path)
+            parent_dir = os.path.dirname(target_path)
+            if not os.path.isdir(parent_dir):
+                return f"Error: Parent directory does not exist: {parent_dir}. Please use an existing directory path."
+
             if os.path.exists(target_path):
                 return f"Error: File already exists at {file_path}. Try with a new file name or path."
 
@@ -262,7 +288,7 @@ def main() -> None:
         print()
 
         # Create tools
-        write_tool = TrackingWriteTool(base_dir=SOURCES_DIR)
+        write_tool = JsonDocumentWriteTool(base_dir=SOURCES_DIR)
         glob_tool = GlobTool(
             base_dir=SOURCES_DIR,
             required_pattern=r"agents",

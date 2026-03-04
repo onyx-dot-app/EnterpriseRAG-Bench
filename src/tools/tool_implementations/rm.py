@@ -24,7 +24,7 @@ class RmTool(ToolInterface):
             base_dir: Base directory for file operations. Paths will be resolved
                 relative to this directory.
             get_deletable_paths: Function that returns the list of paths that can be
-                deleted (typically from a TrackingWriteTool). Paths should be relative
+                deleted (typically from a JsonDocumentWriteTool). Paths should be relative
                 to base_dir (e.g., "confluence/doc.json").
             display_name: Name to show in schema description (defaults to basename of base_dir).
         """
