@@ -1,0 +1,36 @@
+{
+  "title": "observability trace drop debug notes - priya wip",
+  "owner": "Priya Singh",
+  "drive_area": "users",
+  "path": "users/observability-trace-drop-debug-notes-priya-wip",
+  "doc_type": "doc",
+  "created_at": "2025-11-09",
+  "last_modified": "2025-11-11",
+  "collaborators": [
+    "Eli Park",
+    "Maya Johnson",
+    "Arjun Rao"
+  ],
+  "team": "eng-observability",
+  "status": "draft",
+  "tags": [
+    "tracing",
+    "ingestion",
+    "otel",
+    "tempo",
+    "debug",
+    "logs",
+    "kafka"
+  ],
+  "linked_artifacts": [
+    "JIRA-OBS-1123",
+    "https://github.com/redwood-inference/observability/pull/487",
+    "confluence:observability-pipeline-architecture"
+  ],
+  "content": "Incident summary:\\n- 2025-11-10 03:12 UTC: alert firing: observability.trace_drop_rate > 0.05 (5% of incoming spans being dropped)\\n- Affected services: api-gateway, inference-runtime (high throughput); drop spikes correlated with background deploys but persisted after deploys finished.\\n\\nWhat I saw (quick notes):\\n- Prometheus rule 'trace_drop_rate' jumped at 03:10 and stayed elevated for ~45m.\\n- Grafana dashboard shows ingestion lag for otel-collector (consumer backlog).\\n- Jaeger/Tempo: many traces missing spans (root present, many child spans dropped).\\n- Loki: no obvious spikes in log errors from otel-collector prior to 03:10, but after restart collectors logged \\\"ERROR: failed to decode OTLP batch - resource limits hit\\\"\\n\\nCommands I ran (outputs trimmed):\\n- kubectl -n observability get pods\\n  otel-collector-0   1/1 Running   0    12d\\n  tempo-0            1/1 Running   0    5d\\n\\n- kubectl logs -n observability deploy/otel-collector -c collector | tail -n 120\\n  2025-11-10T03:11:57Z ERROR otel_collector exporter/kafka: failed to produce message: kafka: message too large\\n  2025-11-10T03:12:12Z WARN  otel_collector pipeline: dropping span batch, reason: queue full\\n\\n- curl -X POST http://localhost:4318/v1/traces -d @sample-otlp-batch.json -H 'Content-Type: application/octet-stream'\\n  -> POST accepted locally, but consumer group lag increased by ~2000\\n\\n- kafka-consumer-groups --bootstrap-server kafka.observability.svc:9092 --group observability-ingester --describe\\n  CURRENT-OFFSET  LAG  CONSUMER-ID\\n  1248923         2200 consumer-1\\n\\n- kubectl exec -n observability otel-collector-0 -- cat /etc/otel/config.yaml | sed -n '1,180p'\\n  receivers:\\n    otlp:\\n      protocols:\\n        grpc: {}\\n        http: {}\\n  processors:\\n    batch: {}\\n    memory_limiter:\\n      limit_mib: 512\\n      spike_limit_mib: 128\\n      check_interval: 5s\\n  exporters:\\n    kafka:\\n      brokers: [\\\"kafka.observability.svc:9092\\\"]\\n      topic: \\\"otel-spans\\\"\\n      max_message_bytes: 1000000\\n\\n- kubectl top pods -n observability\\n  otel-collector-0   620m  1.8Gi\\n  tempo-0             240m  1.2Gi\\n\\nError snippets (copied):\\n- \\\"failed to produce message: kafka: message too large\\\"\\n- \\\"dropping span batch, reason: queue full\\\"\\n- \\\"memory limiter triggered; rejecting spans\\\"\\n- \\\"ERROR: failed to decode OTLP batch - unknown resource schema\\\"\\n\\nHypotheses (ranked):\\n1) Configuration regression: max_message_bytes or batching changes in last deploy (PR #487) increased batch sizes -> kafka producers hitting max_message_bytes -> messages rejected -> queue fills -> spans dropped.\\n2) Memory pressure on otel-collector: memory_limiter configured to 512Mi but ingestion burst exceeded this -> processor started rejecting/ dropping.\\n3) Kafka broker-side retention or request-size limit decreased (ops or infra change) causing producer errors.\\n4) Sampling changes in instrumentation causing many large spans (compressed payloads bigger).\\n\\nWhat I checked / evidence: \\n- PR history: https://github.com/redwood-inference/observability/pull/487 merged 2025-11-09 22:04 UTC - this PR increased batch size in pipeline config (batch/timeout changed).\\n- Config in cluster still shows max_message_bytes: 1000000 (1MB). Some generated spans ~800k uncompressed + OTLP overhead -> hitting 1MB after proto framing.\\n- Kafka broker logs around 03:11 show: \\\"Request too large\\\" on broker-2 (ops asked for more detail, awaiting logs).\\n- Resource usage: collector memory peaked ~1.8Gi -> memory_limiter tripped -> logs show \\\"memory limiter rejecting spans\\\"\\n\\nImmediate mitigations tried:\\n- Rolled back PR #487 on staging earlier today (works), performed rollback to previous config in prod at 04:05 UTC -> drop rate returned to normal within ~3m. (Rollback notes in linked PR).\\n- Increased otel-collector deployment replicas from 1 -> 3 (kubectl scale deploy/otel-collector --replicas=3) to spread ingestion while rollback completing. Dropped lag but not fully fixed until rollback.\\n- Temporarily set kafka exporter.max_message_bytes to 2.5MB on a single collector for testing (hotfix) -> producer accepted batch, but not a long-term solution; also increased memory pressure.\\n\\nFollowups / TODOs:\\n- [ ] Audit recent config PRs for batching/size changes (owner: Arjun) -> reopen PR-487 review thread about safe defaults.\\n- [ ] Add a pre-merge CI step to simulate large-span batches and run producer Kafka checks (size, retries).\\n- [ ] Add alert: 'kafka_producer_message_rejects_total' or instrument exporter to export metric when producer returns 'message too large'.\\n- [ ] Tune memory_limiter config (increase limit to 2Gi on collectors) and test under load before rolling out.\\n- [ ] Put a collector-side post-processor to split very large spans/batches if feasible.\\n- [ ] Coordinate with infra for broker max.request.bytes and replica configs; increase broker-side limits if needed.\\n\\nNotes / breadcrumbs for later:\\n- trace_id: 9f1b2d3a4c5e6f7890abcdeffedcba12 (example of dropped trace observed where child spans missing)\\n- correlate with log lines: kafka-broker-2 stderr 2025-11-10T03:11:58Z \\\"Request too large from producer id: x\\\"\\n- Related tickets: JIRA-OBS-1123 (incident), JIRA-OBS-1126 (postmortem/outage review)\\n\\nQuick wins I can do today:\\n- Add metric emit for producer errors in kafka exporter (small code change)\\n- Increase memory_limiter to 1.5Gi on prod collectors behind feature flag for 24h to observe behavior\\n- Add a note to PR template reminding to consider kafka/exporter settings when changing batch config\\n\\nOpen questions:\\n- Why did the batch size increase so much? Is it instrumentation change at service side (many attributes, long sql statements in span)?\\n- Should we implement chunking at exporter level or enforce stricter per-span size limit?\\n- What's the long-term approach: smaller batches vs. increasing broker limits vs. splitting spans?\\n\\nReferences:\\n- PR: https://github.com/redwood-inference/observability/pull/487\\n- Incident ticket: JIRA-OBS-1123\\n- Quick repro: samples/sample-otlp-batch-large.json (attached to this doc in Drive)\\n\\nLast edit notes: 2025-11-11 09:12 UTC - added broker log snippet from ops and confirmed rollback timeline.\\n\\n-- Priya\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_e020154efa1c46f2b680427ee103777f"
+}

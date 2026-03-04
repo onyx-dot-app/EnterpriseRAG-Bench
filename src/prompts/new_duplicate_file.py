@@ -49,6 +49,7 @@ You should update the contents so that the majority of the contents is the same 
 Depending on the source type, the amount of the content that is kept from the original file may vary. \
 As an example, there may be an initial PRD document which outlines the requires for a feature. The new document may be a discussion thread which just invalidates or updates one of the requirements. \
 It may not mention the rest of the requirements. Or if the new document is a new PRD document, it may contain basically all of the major points of the original PRD but with some updates. \
+If the document has a last updated time or something similar, the new document should have a newer last updated time. \
 You must output this generated document and associated metadata as a single .json. The JSON file must not have nested fields, all of the values must be strings or list of strings (no nested JSONs).
 
 # Current File path

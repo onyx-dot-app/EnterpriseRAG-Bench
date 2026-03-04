@@ -1,0 +1,58 @@
+{
+  "title": "cpu-side-bottlenecks-tokenization-request-parsing-rootcause-analysis",
+  "owner": "Aisha Kapoor",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/cpu-side-bottlenecks-tokenization-request-parsing-rootcause-analysis.json",
+  "doc_type": "doc",
+  "created_at": "2024-10-20",
+  "last_modified": "2024-11-01",
+  "collaborators": [
+    "Miguel Alvarez",
+    "Xin Li",
+    "Ethan Brooks"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "tokenization",
+    "request-parsing",
+    "python",
+    "profiling",
+    "thread-pools",
+    "latency",
+    "cpu-bottleneck"
+  ],
+  "linked_artifacts": [
+    "PR: github.com/redwood-inference/serving-runtime/pull/842",
+    "JIRA: SRV-4567",
+    "Confluence: /display/SRV/Tokenization+Perf+Playbook"
+  ],
+  "summary": "Investigation into recurring high tail latency for inference requests attributed to CPU-side work: tokenization, JSON/request parsing, and Python threadpool/GIL effects. This doc captures profiling runs, flamegraph observations, hypotheses, and recommended mitigations with an implementation plan.",
+  "background": "Over the last quarter we've observed P95/P99 request latency regressions on medium-size models under moderate QPS (50-200 RPS). GPU token generation is within expected ranges but end-to-end latency shows 10-40ms overhead on CPU-heavy paths. Alerts and customer reports point to spikes when concurrent small requests (short contexts) hit the hosted API. Goal: identify primary CPU-side contributors and propose low-risk, high-impact fixes.",
+  "methods": "Workloads: replayed production traffic (anonymized) and synthetic microbenchmarks. Environments: dedicated replica with 8 vCPU, Python 3.11, uvicorn+gunicorn (uvloop worker), tokenizers: HuggingFace tokenizers (rust-bindings) and fallback Python tokenizer in legacy codepath. Tools: py-spy (sampling), linux perf, perf-tools/flamegraph, flamebearer, psutil, strace for syscall hotspots. Collected: flamegraphs for single-request cold path, warm path, and 50/200 concurrent clients. Also instrumented time.time() spans around parse/tokenize/serialize in the request handler.",
+  "findings": "High-level:\n- Tokenization accounts for 30-65% of CPU time on short-context requests. Impact increases with higher QPS because tokenizers are not being reused across requests and memory churn is visible.\n- JSON request parsing (body->dict->pydantic validation) accounts for 10-25% and shows large variance depending on payload size and structure.\n- Python threadpool and GIL contention: when we offload blocking IO/CPU tasks to concurrent.futures.ThreadPoolExecutor, py-spy shows many threads spinning in native -> GIL acquire/release; under high concurrency the Python interpreter overhead and lock contention add 5-20ms per request.\n- Synchronous copying/cloning of request metadata and context objects is non-trivial; several allocations observed in hotspots.\n- Legacy pure-Python tokenizer codepath (used for some small tokensets) is much slower than Rust bindings; but we still fall back to it in ~8% of requests due to model-config inconsistencies.\n\nSpecific evidence (representative numbers):\n- Cold single short-request (1-5 input tokens): total CPU pre-GPU = 22ms; tokenization = 11ms, parsing+validation = 5ms, thread scheduling/handlers = 6ms.\n- Warm steady-state (50 RPS): per-request pre-GPU median = 18ms, P95 = 34ms. Tokenization P95 spikes to 22ms due to repeated tokenizer init.\n- Under 200 RPS burst: observed threadpool queueing and >40ms tail in pre-GPU work; py-spy shows many frames in _tokenize.py:tokenize and json.loads.",
+  "flamegraphs_and_evidence": "Links to artifacts (internal): flamegraph cold: https://internal-artifacts/redwood/flamegraphs/tokenize_cold_2024-10-25.svg ; flamegraph 200rps: https://internal-artifacts/redwood/flamegraphs/200rps_pre_gpu_2024-10-28.svg ; perf snapshots: s3://redwood-perf/srv/snapshots/2024-10-28-tokenize-perf.data . Key stack samples observed repeatedly: python3.11 -> _tokenize.py -> Tokenizer.encode -> RustTokenizer::encode (FFI) -> memcpy, and python3.11 -> json -> scanner -> raw_decode.",
+  "root_causes": "1) Tokenizer lifecycle: we create a new tokenizer instance per request in our legacy handler for isolation, which causes repeated FFI init and per-request memory allocation. 2) Mixed tokenizer implementations: some routes still route to the Python fallback due to missing model metadata; the fallback is 3-5x slower. 3) Request parsing pipeline uses pydantic v1 with full validation on every request; some fields are validated that are unused downstream. 4) ThreadPoolExecutor sizing and usage pattern causes GIL thrash: CPU-bound tasks are incorrectly dispatched to threadpools (instead of process pool or native rust worker), increasing contention. 5) Copies of request headers/body and JSON re-serialization for telemetry add measurable CPU overhead.",
+  "recommendations": "Short-term (low risk):\n- Reuse tokenizer instances: move tokenizer to per-worker singleton (lifetime tied to worker process) and reuse across requests. Simple change in handler initialization should yield immediate improvement (~30-50% tokenization reduction).\n- Enforce use of HuggingFace Rust tokenizers for all routes by normalizing model metadata at admission; add a health-check assert and fallback alerting instead of silent fallback.\n- Trim validation: convert pydantic models to allow extra='ignore' for fields not used in inference path and switch heavy validators to lazy checks behind a feature flag.\n- Increase ThreadPoolExecutor max_workers cautiously and add instrumentation; however, prefer to avoid CPU-bound work on threadpools.\n\nMedium-term (higher impact):\n- Move tokenization to native Rust microservice or worker process (IPC) to eliminate Python GIL impact and FFI init cost; or use the tokenizers rust bindings initialized once per process and avoid per-call allocations.\n- Add a lightweight process pool (multiprocessing or daemonized tokenization processes) for truly CPU-bound preprocessing.\n- Implement request-level pre-tokenization cache for repeated prompts (LRU keyed by prompt text hash) in Redis/local LRU. This helps chat-like workloads with repeated prefixes.\n- Adopt pydantic v2 or fastapi's new validation approach to reduce validation overhead; or hand-roll minimal parse for the hot path.\n\nLonger-term / infra:\n- Consider a dedicated CPU-preproc tier for ultra-low-latency customers where tokenization and parsing happen on dedicated vCPU nodes colocated with GPUs.\n- Add admission control/rate limiting by estimated pre-GPU CPU cost to avoid SLO violations during bursts.",
+  "quick_wins_results": "We implemented tokenizer reuse in a canary (worker image v2024-10-30-canary). Measurements: median pre-GPU tokenization cost dropped from 9.8ms to 4.6ms on short requests (54% reduction). P95 pre-GPU dropped from 34ms to 19ms in the canary endpoint under 50 RPS. CPU utilization per worker decreased ~18%. Canary link: PR #842 (see linked_artifacts).",
+  "risks_and_open_questions": "- Tokenizer reuse increases memory per-worker (one tokenizer instance holds token-to-id maps). We need to quantify memory impact for smallest instance sizes. - Some customers rely on per-request modification of tokenizer settings (rare). How to opt them out? - Redis LRU cache adds complexity and potential cache staleness if prompts change; need TTLs and eviction policies. - Offloading to process pool increases inter-process latency; need end-to-end latency tests.",
+  "action_items": "1) (Aisha) Merge tokenizer reuse PR to staging and run 72h soak (ETA: 2024-11-05). 2) (Miguel) Normalize model metadata admission to force rust tokenizer (PR: #851) (ETA: 2024-11-08). 3) (Xin) Spike process-pool tokenization prototype and benchmark vs Rust FFI reuse (ETA: 2024-11-15). 4) (Ethan) Add telemetry spans around JSON parse/validation and count per-route skipped validations (ETA: 2024-11-03). 5) (Eng-SRE) Run memory impact analysis for per-worker tokenizer (ETA: 2024-11-07).",
+  "notes": "This doc is a working investigation; there are still follow-ups to reconcile telemetry with customer traces. If you reproduce locally, use the canary replay harness: tools/replay/README and set REPLAY_TOKENIZER_CANARY=1. Slack thread: #srv-tokenization-perf. See also the earlier investigation docs in the drive that partially overlap.",
+  "references": "Related docs in drive: cpu-side-bottlenecks-tokenization-threadpools-action-plan.json, cpu-side-bottlenecks-tokenization-request-parsing-threadpools-python-investigation.json. Internal benchmarks: s3://redwood-perf/benchmarks/tokenizer/2024-10/*. Results exported to Confluence page (linked above).",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "background",
+    "methods",
+    "findings",
+    "flamegraphs_and_evidence",
+    "root_causes",
+    "recommendations",
+    "quick_wins_results",
+    "risks_and_open_questions",
+    "action_items",
+    "notes",
+    "references"
+  ],
+  "dataset_doc_uuid": "dsid_60785695e4c64cd697b881339f25742f"
+}
