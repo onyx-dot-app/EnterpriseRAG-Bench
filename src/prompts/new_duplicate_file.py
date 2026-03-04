@@ -26,6 +26,14 @@ CRITICAL: output ONLY the new file path with the .json name, no markdown code bl
 """.strip()
 
 
+FILE_RENAME_PROMPT = f"""
+Here's are some {AGENTS_MD_FILE} files for the source type and path which describe the contents and naming conventions for the documents in their directories:
+{{agents_md_contents}}
+
+Output a new file name which follows the naming conventions for the source type and path. ONLY OUTPUT THE NEW FILE NAME, NO OTHER TEXT.
+""".strip()
+
+
 FILE_PATH_INVALID_RESPONSE = """
 The new file path is invalid. Please try again.
 """.strip()

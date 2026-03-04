@@ -1,0 +1,34 @@
+{
+  "title": "Auth/API 401/429 debug scratchpad - Zoe",
+  "owner": "Zoe Martinez",
+  "drive_area": "users",
+  "path": "users/zoe/auth-api-401-429-debug-scratchpad-zoe-2026-03-31",
+  "doc_type": "doc",
+  "created_at": "2026-03-29",
+  "last_modified": "2026-03-31",
+  "collaborators": [
+    "Lena Park",
+    "Samir Patel"
+  ],
+  "team": "eng-sre",
+  "status": "draft",
+  "tags": [
+    "auth",
+    "401",
+    "429",
+    "rate-limits",
+    "debug",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "JIRA-ENG-2145",
+    "https://confluence.redwood.ai/pages/auth-rate-limit-playbook",
+    "https://github.com/redwood-inference/infra/pull/987"
+  ],
+  "content": "Quick scratchpad for the recurring 401/429 pattern we see for some customer API keys. Mostly notes-to-self + commands tried. Will iterate and then move into a proper runbook.\n\nSummary of issue (observed):\n- Intermittent 401s and 429s for the hosted API from a handful of API keys (customer-facing). Pattern: 401 spikes first, followed by more frequent 429s within the same hour window.\n- Affected endpoints: /v1/generate, /v1/embeddings (mostly generation traffic).\n- First noticed: 2026-03-27 23:40 UTC by Alerts (rate-limit alert). Repro window: ~2026-03-28 02:00-03:30 UTC and again 2026-03-30 14:10-14:35 UTC.\n\nLogs / examples collected:\n- Curl repro showing 401 (redacted token):\n  curl -v -H \"Authorization: Bearer sk_live_XXXX_REDACTED\" -H \"Content-Type: application/json\" \\\n    -d '{\"model\":\"gpt-xl\",\"input\":\"hello\"}' https://api.redwood.ai/v1/generate\n  -> HTTP/1.1 401 Unauthorized\n  <- {\"error\":\"invalid_api_key\",\"message\":\"API key expired or revoked\"}\n  Response headers: x-request-id: req_0a1b2c3d, date: Sat, 28 Mar 2026 02:11:12 GMT\n\n- Another sample showing 429 with headers:\n  HTTP/1.1 429 Too Many Requests\n  {\n    \"error\":\"rate_limit_exceeded\",\n    \"message\":\"Requests per minute exceeded for key\"\n  }\n  Response headers: x-rate-limit-limit: 120, x-rate-limit-remaining: 0, x-rate-limit-reset: 2026-03-28T02:12:00Z, x-request-id: req_9f8e7d6c\n\n- SDK call stack (Node) from customer logs (partial):\n  Error: Request failed with status code 401\n    at createHttpError (.../node_modules/axios/index.js:...)\n    at instance.request (...)\n    at Object.generate (redwood-sdk/lib/client.js:123:45)\n\nHypothesis list (ranked):\n1) Key rotation / expiry pipeline: keys are expiring unexpectedly due to an automated rotation job that revokes old keys before the client fetches new one. Evidence: 401s often precede 429s and are short-lived.\n2) Client-side caching of credentials: clients using long-lived token cached in warm instances -> when key is rotated they keep using old token causing 401 spikes.\n3) Per-key quota is small and we do aggressive retries: client retries (exponential backoff not implemented) cause burst that flips 401 to 429 when a new key is created and historical requests replay.\n4) Mis-routed traffic to a regional rate limiter (edge case): requests get routed to a different region where quota has already been consumed.\n5) SDK auth bug: older SDK versions signed requests incorrectly (we saw a customer using v0.9.1 vs recommended 1.x).\n\nCommands / checks I ran (timestamps UTC):\n- 2026-03-28 02:14: curl -v to reproduce (see above)\n- 2026-03-28 02:20: pulled internal audit logs for key sk_live_XXXX_REDACTED: found automated rotation event at 2026-03-28 02:11:05 (metadata: rotated_by=key-rotation-service, reason=schedule)\n- 2026-03-28 02:25: queried quota service:\n  GET /internal/quotas?key_id=key_abc123 -> {\"limit_minute\":120, \"used_minute\":118}\n- 2026-03-28 02:27: inspected CDN/edge traces for req_0a1b2c3d -> routed through edge-eu-1 (odd: customer is NA)\n- 2026-03-30 14:18: asked customer for SDK version; they replied v0.9.1 and said they rely on env var rotation that updates process env every 10m (no graceful restart)\n\nImmediate notes from above:\n- The rotation event at 02:11:05 matches the 401 at 02:11:12 (7s later) -> likely race where key revoked while client still sending previous key.\n- x-rate-limit-remaining: 0 indicates the key hit a per-minute limit after a burst (maybe client retried quickly after expiry).\n- Edge routing mismatch suggests our smart routing may be sending some traffic to non-optimal region; if quota counts are region-scoped this could explain per-region exhaustion.\n\nReproduction plan (manual):\n1) Simulate rotation race locally:\n   - Start a small script that uses the old key and continues to send requests while rotation job runs.\n   - Confirm 401s during transitional window.\n2) Simulate retry storm:\n   - Make a test client that retries immediately on 401 (no backoff) and observe whether the same API key hits 429 soon after.\n3) Test with latest SDK vs v0.9.1 to check signing/auth differences.\n\nNext immediate actions (TODOs):\n- [ ] Add more detailed logging to the key-rotation service (timestamp of revoke, affected key ids, region tags). (owner: infra/key-rotation)\n- [ ] Add a short grace window (30s) where rotated keys remain accepted to avoid immediate 401s during rollout. Quick mitigation if approved. (owner: infra)\n- [ ] Contact customer and ask them to upgrade SDK to 1.x and implement exponential backoff for 401->retry path. (owner: CS)\n- [ ] Create an alert rule that correlates 401 spikes followed by 429 within 10 minutes for the same key (owner: SRE)\n- [ ] For suspected region routing issue: run a trace for next incident and route to local quota service for validation. (owner: networking)\n- [ ] Open a support ticket with request IDs: req_0a1b2c3d and req_9f8e7d6c and include audit logs.\n\nNotes-to-self / loose thoughts:\n- Grace window may mask real compromised key problems \u2014 need to limit to rotating keys only (tagged) and have strict audit trail.\n- Could we also return a more specific header on 401 that indicates \"revoked\" vs \"expired\"? That helps customers decide whether to retry or re-fetch token.\n- Investigate whether our SDKs should automatically pick up env VAR changes (signal-based reload) instead of relying on process restart.\n\nAttachments to add later:\n- raw log snippets (redacted), timelines, screenshots of quota dashboard, customer's SDK version and sample code.\n\nIf I forget: escalate to infra on-call and include this doc link + request IDs.\n\nEnd of scratchpad.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_cea2913af72d44e8bf3ea8b3f94fbd6c"
+}

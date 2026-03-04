@@ -1,0 +1,35 @@
+{
+  "title": "smart-routing-fallback-debug-scratchpad-jordan-reyes",
+  "owner": "Jordan Reyes",
+  "drive_area": "users",
+  "path": "users/smart-routing-fallback/debug-scratchpad-jordan-reyes",
+  "doc_type": "doc",
+  "created_at": "2025-09-18",
+  "last_modified": "2025-09-20",
+  "collaborators": [
+    "Ethan Park",
+    "Maya Chen",
+    "Arjun Patel",
+    "Zoe Martinez"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "incident",
+    "smart-routing",
+    "regional-failover",
+    "debug",
+    "fallback-policy"
+  ],
+  "linked_artifacts": [
+    "JIRA-INFRA-789",
+    "CONFLUENCE:smart-routing-runbook",
+    "https://github.com/redwood-inference/routing/commit/3a7b2f1"
+  ],
+  "content": "Context:\n- Small production incident on 2025-09-17 23:12 UTC where smart routing triggered a regional failover for eu-west-1 -> us-east-1 for a handful of requests.\n- Impact: ~0.2% of requests saw 2-5x latency increase and ~120 errors (503 / model-variant errors) over a 14-minute window.\n- Alerting: SLO page spike + automatic fallback kicked in but traffic was routed to a model variant that returned tokenization errors for a subset of customers.\n\nWhat I saw (quick timeline):\n- 23:11: healthcheck notices small drop in capacity for eu-west-1 pool (GC / eviction events in node logs).\n- 23:12: smart-routing controller evaluated policy: prefer-low-latency -> eu-west-1 degraded -> failover to us-east-1.\n- 23:12:20: some requests start erroring with tokenizer/mismatch errors (see snippets).\n- 23:26: fallback policy rolled back to degraded region, traffic normalized.\n\nCommands I ran / outputs (most useful ones):\n- curl to health endpoints\n  $ curl -sS https://infra-eu-west-1.health.redwood.local/health | jq .\n  {\n    \"gpu_pools\": {\"available\": 6, \"pending_evictions\": 2},\n    \"runtime_ok\": true\n  }\n\n- kubectl logs (serving-router) around 23:12\n  $ kubectl -n routing logs deploy/smart-router-2 -c controller --since=30m | grep -i \"failover\" -n\n  134: 2025-09-17T23:12:17Z controller: initiating failover region=eu-west-1 target=us-east-1 reason=pool_capacity_drop\n  137: 2025-09-17T23:12:20Z router: routed request request_id=rr-0x7a token_count=240 target_variant=redwood-v2-q8 mismatch=true\n\n- sample error snippet from serving logs (tokenizer mismatch):\n  ERROR [2025-09-17T23:12:20.456Z] serve: request=rr-0x7a variant=redwood-v2-q8 err=\"tokenizer: vocab mismatch: expected 50265 tokens, got 50002\"\n\n- query to routing meta store (Redis) to check variant metadata TTLs\n  $ redis-cli -h routing-meta-1 GET variant:redwood-v2-q8:tokenizer_hash\n  \"abc123-def456\"  \n  (note: eu-west-1 had stale variant metadata for redwood-v2-q8 with older tokenizer hash)\n\nHypotheses (ranked):\n1) Stale variant metadata in the routing metadata store (Redis/Consul) caused controller to consider the us-east-1 variant compatible, but runtime on us-east-1 had a different tokenizer build -> tokenization errors.\n   - Evidence: tokenizer_hash mismatch in logs and redis GET returned an older hash for the variant used in failover.\n2) Race between model rollout and region tagging: a new quantized build (q8) was pushed to us-east-1 but automation did not update the variant compatibility tags consistently across regions.\n   - Evidence: recent CI deploy (see GH commit) touches build steps + tagging script.\n3) Capacity estimation bug: short-lived pod evictions in eu-west-1 triggered failover even though local prefix-cache could have healed latency.\n   - Evidence: GC/eviction logs show 2 pending evictions but average latency per node remained below SLO for 95% of requests.\n4) Time skew / clock drift causing TTLs to appear expired in controller evaluation window.\n\nRepro steps (dev environment):\n- Setup two-region dev cluster with variant metadata mismatch:\n  1) deploy variant redwood-test-v1 with tokenizer_hash=H1 in region A, H2 in region B\n  2) force controller to prefer A then simulate capacity drop in A (kill a replica)\n  3) confirm failover routes to B and observe tokenizer mismatch errors\n\nQuick experiments tried (results):\n- Forcing metadata refresh on routing nodes in us-east-1 fixed immediate errors:\n  $ redis-cli -h routing-meta-1 SET variant:redwood-v2-q8:tokenizer_hash \"abc123-def456\" (match)\n  -> errors stopped within ~10s for new requests.\n- Rolling restart of controller nodes prevented new failovers for ~30 minutes but not root cause.\n- Replaying traffic with header X-Region-Prefer:eu-west-1 returned expected latency profile (sanity check).\n\nImmediate mitigations (done):\n- Added a temporary pre-failover check: require tokenizer_hash equality across candidate variants before sending traffic. (hotfix deployed to controller at 2025-09-18 02:30 UTC)\n- Backfilled missing metadata in routing meta store for redwood-v2-q8 across regions.\n- Opened urgency ticket JIRA-INFRA-789 and notified release-eng + applied ops.\n\nNext steps / TODOs:\n- Patch: add strong consistency write/verify step in release pipeline to ensure variant metadata (tokenizer_hash, vocab_size, tokenizer_version) are atomically updated across regions (PR: https://github.com/redwood-inference/routing/pull/342).\n- Long-term: change fallback policy to prefer model-compatibility checks (tokenizer+vocab) before region selection; currently policy is capacity/latency-first.\n- Investigate capacity estimator heuristics; ensure short GC/eviction blips don't trigger full-region failover unless sustained > X minutes.\n- Add integration test in canary pipeline: cross-region metadata mismatch scenario should fail the rollout.\n- Postmortem draft: assign to Maya and Ethan; target publish by 2025-09-22.\n\nNotes to self / followups: \n- Check time skew on controller nodes (chrony/ntpd): ran ntpq -p on eu-west nodes, need to check us-east nodes too.\n- Verify Redis replication lag during incident window (could explain stale read).\n- Confirm whether fallback policy logs include variant metadata snapshot at decision time; if not, add it for future breadcrumbs.\n\nPieces of interest / links: \n- GH commit that probably introduced tagging race: https://github.com/redwood-inference/routing/commit/3a7b2f1\n- JIRA: JIRA-INFRA-789 (incident owner: Jordan)\n- Confluence runbook: CONFLUENCE:smart-routing-runbook\n\nOpen questions (for postmortem):\n- Should we change priority: compatibility checks vs latency SLAs? Is 99.9th latency more important than correctness for fallback?\n- What is acceptable window for metadata consistency across regions for fast rollouts?\n\nScratch / quick commands for followups:\n- redis-cli -h routing-meta-1 HGETALL variant:redwood-v2-q8\n- kubectl -n routing exec -it smart-router-2 -- curl -sS localhost:8080/decision?req=rr-0x7a\n- aws elbv2 describe-target-health --target-group-arn <tg> --query 'TargetHealthDescriptions[*].{Id:Target.Id,State:TargetHealth.State}'\n\nEnd of notes.\n\n(rough, keep iterative. will clean for postmortem draft.)",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_0729a96ef82b4684ac657c69346bb9b1"
+}

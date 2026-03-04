@@ -19,7 +19,6 @@ from src.paths import (
     SOURCES_DIR,
     VOLUME_DIR,
 )
-from src.prompts.json_recovery import JSON_RECOVERY_PROMPT
 from src.prompts.volume_generation import (
     CONFLICT_PROMPT,
     DOCUMENT_GENERATION_PROMPT,
@@ -36,8 +35,10 @@ from src.utils import (
     confirm_yes_no,
     extract_json_from_response,
     get_agents_md_for_source,
+    JsonRecoveryError,
     load_file,
     process_written_document,
+    try_recover_json,
     validate_no_nested_dicts,
 )
 from src.utils.file_io import load_json_file, write_json_file
@@ -843,61 +844,6 @@ def _get_volume_lock(source_type: str) -> threading.Lock:
         if source_type not in _volume_locks:
             _volume_locks[source_type] = threading.Lock()
         return _volume_locks[source_type]
-
-
-class JsonRecoveryError(Exception):
-    """Raised when JSON recovery fails after all attempts."""
-    pass
-
-
-def try_recover_json(broken_json: str, max_attempts: int = 3) -> str:
-    """
-    Attempt to recover broken JSON using cheap LLM with conversation history.
-
-    Args:
-        broken_json: The broken JSON string.
-        max_attempts: Maximum number of recovery attempts.
-
-    Returns:
-        Recovered JSON string.
-
-    Raises:
-        JsonRecoveryError: If recovery fails after all attempts.
-    """
-    prompt = JSON_RECOVERY_PROMPT.format(broken_json_string=broken_json)
-    llm = get_cheap_llm(tools=None, quiet=True)
-    messages: list[Message] = [Message(role="user", content=prompt)]
-
-    for attempt in range(max_attempts):
-        response = ""
-        for chunk in llm.generate(messages):
-            if isinstance(chunk, str):
-                response += chunk
-
-        response = response.strip()
-
-        # Try to parse the response
-        try:
-            json.loads(response)
-            return response
-        except json.JSONDecodeError as e:
-            # Try to extract JSON from the response
-            try:
-                extracted = extract_json_from_response(response)
-                json.loads(extracted)
-                return extracted
-            except Exception:
-                pass
-
-            # If not last attempt, add to conversation and retry
-            if attempt < max_attempts - 1:
-                messages.append(Message(role="assistant", content=response))
-                messages.append(Message(
-                    role="user",
-                    content=f"That JSON is still invalid: {e}. Please fix it and output only valid JSON.",
-                ))
-
-    raise JsonRecoveryError(f"JSON recovery failed after {max_attempts} attempts")
 
 
 class TrackingWriteTool(WriteTool):

@@ -1,0 +1,38 @@
+{
+  "title": "observability-pipeline-debug-notes-jordan-wip",
+  "owner": "Jordan Kim",
+  "drive_area": "users",
+  "path": "users/observability-pipeline-debug-notes-jordan-wip.json",
+  "doc_type": "doc",
+  "created_at": "2026-02-20",
+  "last_modified": "2026-03-03",
+  "collaborators": [
+    "Priya Desai",
+    "Eli Thompson",
+    "Maya Gupta"
+  ],
+  "team": "eng-observability",
+  "status": "draft",
+  "tags": [
+    "observability",
+    "tracing",
+    "metrics",
+    "logs",
+    "ingestion",
+    "debugging",
+    "otel-collector"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-OBS-PIP-1234",
+    "JIRA-OBS-987",
+    "https://github.com/redwood-inference/otel-config/pull/42",
+    "slack:#observability thread ts:1677722000.000100"
+  ],
+  "content": "Context:\n- Intermittent metrics drops observed starting 2026-02-18 02:30 UTC. Affected teams: hosted-api, dedicated-routing. Traces continue to ingest but metrics ingestion has gaps (prometheus remote_write targets show spike in 5xx).\n- Related to recent otel-collector config change (PR #42) that introduced an extra filters/stats processor. Hypothesis: filter/processors path is dropping some metric families or causing backpressure to downstream forwarder.\n\nWhat I saw (high-level):\n- grafana: prometheus_remote_write_errors spiked from 0 -> ~220/min.\n- metrics-aggregator queue length increased; pod restarts noted for metrics-forwarder in cluster obs-prod-1.\n- logs show: \"failed to send batch: 503 ServiceUnavailable upstream\" from metrics-forwarder; curl to remote endpoint returns 200 but with slow responses (~1.2s).\n\nCommands & snippets tried (timeline + output extracts):\n1) Check otel-collector logs (metrics path)\n$ kubectl -n observability logs deploy/otel-collector -c otel-collector --since=2h | grep -i metrics\n2026-02-18T02:32:11Z ERROR metricsprocessor: failed to process metrics: dropped 12/68 \"metric family not supported\"\n2026-02-18T02:35:02Z WARN  pipeline: send failed: upstream=metrics-forwarder code=503 \n\n2) Check metrics-forwarder pod restarts and logs\n$ kubectl -n observability get pods -l app=metrics-forwarder -o wide\nmetrics-forwarder-5fd7c    2/3     CrashLoopBackOff   6          3h\n$ kubectl -n observability logs metrics-forwarder-5fd7c -c forwarder --tail=200\n2026-02-18T02:33:00Z ERROR forwarder: failed to send batch to prometheus-remote (url=https://metrics-prod.company.internal/api/v1/write): 503 \n2026-02-18T02:33:00Z ERROR forwarder: response body: \"{\"error\":\"upstream overloaded\"}\"\n\n3) Trace check to ensure traces still flowing\n$ kubectl -n observability logs deploy/trace-router -c trace-router --since=4h | grep 4acb1d\n2026-02-18T02:32:10Z INFO span-received trace_id=4acb1d8aef2b0c7 span_id=1a2b3c\n-> traces look OK for same timeframe (we have span samples)\n\n4) Confirm remote endpoint health from a pod in same AZ\n$ curl -kv https://metrics-prod.company.internal/api/v1/health -I\nHTTP/1.1 200 OK\nServer: envoy\nX-Envoy-Upstream-Service-Time: 1200ms\n\nObservations: slow slow (1.1-1.4s) responses from remote.\n\n5) Local repro: push a small batch from otel-collector debug endpoint\n- Inserted a tiny metric family and watched otel-collector pipeline. No immediate drop. But when load increased (simulated with 50 concurrent pushes), observed 503 from forwarder and then otel logged dropped metrics.\n\nError snippets copied for context:\n- \"metricsprocessor: failed to process metrics: dropped 12/68 \"metric family not supported\"\"\n- \"failed to send batch to prometheus-remote (url=...): 503\"\n- \"response body: {\"error\":\"upstream overloaded\"}\"\n- otel-collector WARN: \"failed to enqueue batch: queue is full\"\n\nHypotheses (ranked):\n1) Upstream prometheus-remote endpoint is transiently overloaded and returning 503s under burst -> forwarder retries/backpressure cause queue growth -> otel drops metrics when internal queue full. (Likely)\n2) New metrics processor filter (PR #42) mis-classifies some metric families, causing them to get dropped earlier in pipeline. Error text \"metric family not supported\" aligns with this. (Possible)\n3) Network path: AZ-local egress/ENI issues causing slow responses from the remote endpoint. (Less likely; would expect other services to show same pattern)\n4) Memory leak in metrics-forwarder causing restarts under load leading to temporary loss. (Check container memory OOMs)\n\nQuick checks to validate hypotheses (done / pending):\n- Done: confirmed 503s from forwarder logs and slow X-Envoy-Upstream-Service-Time header on health check to remote -> supports hypothesis 1.\n- Done: otel-collector logs contain explicit \"metric family not supported\" lines -> supports hypothesis 2 for a subset of metrics. Need to correlate which families.\n- Pending: check pod OOM and memory metrics for metrics-forwarder over the period (prometheus query to inspect container_memory_rss_bytes).\n- Pending: run load test from another AZ to see if problem AZ-specific.\n\nDebug steps taken and results:\n- Rolled back PR #42 in staging; metrics flows restored in staging. (Staging repro matched: applying PR causes metrics drops under moderate load)\n- Created a temporary rate limit on otel-collector -> reduced forwarder 503s but still observed drops when rate limit hits.\n- Captured pcap between otel-collector and forwarder in staging -> saw TCP retransmits during high-load window.\n\nNext actionable items (short term):\n- [ ] Correlate which metric families are reported as \"not supported\" and map to services (use stackdriver/logs or add more verbose otel logging).\n- [ ] Check memory and OOM events for metrics-forwarder pods (kubectl describe pod + metrics query).\n- [ ] Engage infra (network) to check for AZ egress latency anomalies around 2026-02-18 02:30 UTC. Include packet loss summary.\n- [ ] Add a temporary retry/backoff tweak in forwarder (lower max in-flight) to surface backpressure earlier instead of dropping silently.\n- [ ] Consider a circuit-breaker in otel-collector pipeline for metrics-forwarder failures so we don't drop unrelated metrics families.\n\nNotes / random breadcrumbs: \n- Found a Slack thread: slack:#observability ts:1677722000.000100 where infra mentioned a maintenance window at 2026-02-18 02:00 UTC for a specific load-balancer. Need to confirm correlates with our timeframe.\n- PR #42 changeset: added stats-processor that drops empty-series and rewrites some label sets. Suspect label rewrite produced an unsupported metric type for remote.\n- Example trace id to follow in logs: 4acb1d8aef2b0c7 (span sample present but metrics for same request missing)\n\nLonger-term thoughts:\n- We should have end-to-end integration tests for collector->forwarder->remote under load that exercise new processors. Staging caught this, but it was quiet in staging until load increased. Need better load shaping.\n- Improve visibility: emit a metric for \"dropped_metric_families_total\" from otel-collector when a processor drops families so we can alert.\n\nIf anyone picks this up: start with correlating the \"metric family not supported\" messages to actual metric names and timestamp in logs. I left temporary verbose logging enabled on a single otel-collector instance (otel-collector-debug-1) in staging for 48h; use that to grep the full metric names.\n\nAttachments / artifacts to check:\n- otel config (PR #42) -> https://github.com/redwood-inference/otel-config/pull/42\n- metrics-forwarder logs: kubernetes pod metrics-forwarder-5fd7c (logs archived to s3://redwood-obs-archives/2026-02-18/metrics-forwarder-5fd7c.log)",
+  "notes_version": "v0.9",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_45c4640d569f4a7ba588143c31278c9d"
+}

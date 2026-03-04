@@ -6,51 +6,118 @@ import os
 import random
 import subprocess
 
-from tqdm import tqdm
-
 from src.llm import Message, get_cheap_llm
 from src.paths import (
+    QUESTION_CACHE_DIR,
     SOURCES_DIR,
     SOURCE_TREE_PATH,
 )
-from src.prompts.json_recovery import JSON_RECOVERY_PROMPT
 from src.prompts.new_duplicate_file import (
     FILE_MOVE_PROMPT,
     FILE_PATH_INVALID_RESPONSE,
+    FILE_RENAME_PROMPT,
     NEW_DUPLICATE_FILE_PROMPT,
     NEW_DUPLICATE_FILE_USER_PROMPT,
 )
 from src.utils import (
     extract_json_from_response,
     get_agents_md_for_path,
+    get_dataset_doc_uuid,
+    JsonRecoveryError,
     load_file,
     process_written_document,
+    try_recover_json,
     validate_no_nested_dicts,
+    write_json_file,
 )
 
 
-class JsonRecoveryError(Exception):
-    """Raised when JSON recovery fails after all attempts."""
-    pass
+# =============================================================================
+# File Selection
+# =============================================================================
 
 
-def get_all_json_files() -> list[str]:
+def dir_has_json_files(dir_path: str) -> bool:
     """
-    Get all JSON files from the sources directory.
+    Check if a directory has any JSON files anywhere underneath it.
+
+    Args:
+        dir_path: Absolute path to the directory.
 
     Returns:
-        List of file paths relative to SOURCES_DIR.
+        True if there are JSON files under this directory, False otherwise.
     """
-    json_files = []
-
-    for root, _dirs, files in os.walk(SOURCES_DIR):
+    for _root, _dirs, files in os.walk(dir_path):
         for filename in files:
             if filename.endswith(".json"):
-                full_path = os.path.join(root, filename)
-                rel_path = os.path.relpath(full_path, SOURCES_DIR)
-                json_files.append(rel_path)
+                return True
+    return False
 
-    return json_files
+
+def select_random_file_hierarchical(base_dir: str) -> str | None:
+    """
+    Select a random JSON file using hierarchical random walk.
+
+    At each directory level, lists subdirs and JSON files, filters out
+    subdirs with no JSON files underneath, then picks randomly with equal
+    probability between remaining items. If a file is picked, returns it.
+    If a dir is picked, recurses into it.
+
+    Args:
+        base_dir: Absolute path to the directory to start from.
+
+    Returns:
+        Path to a JSON file relative to SOURCES_DIR, or None if no files found.
+    """
+    try:
+        entries = os.listdir(base_dir)
+    except OSError:
+        return None
+
+    # Separate into subdirs and JSON files
+    subdirs = []
+    json_files = []
+
+    for entry in entries:
+        full_path = os.path.join(base_dir, entry)
+        if os.path.isdir(full_path):
+            # Only include dirs that have JSON files underneath
+            if dir_has_json_files(full_path):
+                subdirs.append(entry)
+        elif entry.endswith(".json") and os.path.isfile(full_path):
+            json_files.append(entry)
+
+    # Combine valid options
+    options = subdirs + json_files
+
+    if not options:
+        return None
+
+    # Pick randomly with equal probability
+    choice = random.choice(options)
+    full_choice_path = os.path.join(base_dir, choice)
+
+    if os.path.isdir(full_choice_path):
+        # Recurse into the directory
+        return select_random_file_hierarchical(full_choice_path)
+    else:
+        # It's a file - return relative path
+        return os.path.relpath(full_choice_path, SOURCES_DIR)
+
+
+def count_json_files() -> int:
+    """Count total JSON files in sources directory."""
+    count = 0
+    for _root, _dirs, files in os.walk(SOURCES_DIR):
+        for filename in files:
+            if filename.endswith(".json"):
+                count += 1
+    return count
+
+
+# =============================================================================
+# Source Tree
+# =============================================================================
 
 
 def get_source_tree() -> str:
@@ -76,6 +143,11 @@ def get_source_tree() -> str:
     return result.stdout
 
 
+# =============================================================================
+# Path Validation
+# =============================================================================
+
+
 def validate_file_path(file_path: str) -> bool:
     """
     Validate that a file path is valid (parent directory exists).
@@ -91,54 +163,9 @@ def validate_file_path(file_path: str) -> bool:
     return os.path.exists(parent_dir) and os.path.isdir(parent_dir)
 
 
-def try_recover_json(broken_json: str, max_attempts: int = 3) -> str:
-    """
-    Attempt to recover broken JSON using cheap LLM with conversation history.
-
-    Args:
-        broken_json: The broken JSON string.
-        max_attempts: Maximum number of recovery attempts.
-
-    Returns:
-        Recovered JSON string.
-
-    Raises:
-        JsonRecoveryError: If recovery fails after all attempts.
-    """
-    prompt = JSON_RECOVERY_PROMPT.format(broken_json_string=broken_json)
-    llm = get_cheap_llm(tools=None, quiet=True)
-    messages: list[Message] = [Message(role="user", content=prompt)]
-
-    for attempt in range(max_attempts):
-        response = ""
-        for chunk in llm.generate(messages):
-            if isinstance(chunk, str):
-                response += chunk
-
-        response = response.strip()
-
-        # Try to parse the response
-        try:
-            json.loads(response)
-            return response
-        except json.JSONDecodeError as e:
-            # Try to extract JSON from the response
-            try:
-                extracted = extract_json_from_response(response)
-                json.loads(extracted)
-                return extracted
-            except Exception:
-                pass
-
-            # If not last attempt, add to conversation and retry
-            if attempt < max_attempts - 1:
-                messages.append(Message(role="assistant", content=response))
-                messages.append(Message(
-                    role="user",
-                    content=f"That JSON is still invalid: {e}. Please fix it and output only valid JSON.",
-                ))
-
-    raise JsonRecoveryError(f"JSON recovery failed after {max_attempts} attempts")
+# =============================================================================
+# Generation Functions
+# =============================================================================
 
 
 def generate_new_file_path(
@@ -150,6 +177,10 @@ def generate_new_file_path(
     """
     Generate a new file path for a near-duplicate file.
 
+    Two-step process:
+    1. Generate a new directory path (may have any filename)
+    2. Rename the file to follow naming conventions for the target source type
+
     Args:
         file_path: Original file path relative to SOURCES_DIR.
         file_contents: Original file contents as string.
@@ -159,20 +190,29 @@ def generate_new_file_path(
     Returns:
         New file path relative to SOURCES_DIR, or None if all attempts fail.
     """
+    print("\n" + "=" * 40)
+    print("Phase 1a: Generate New File Path")
+    print("=" * 40)
+
     prompt = FILE_MOVE_PROMPT.format(
         file_path=file_path,
         file_contents=file_contents,
         source_directory_structure=source_tree,
     )
 
-    llm = get_cheap_llm(tools=None, quiet=True)
+    llm = get_cheap_llm(tools=None, quiet=False)
     messages: list[Message] = [Message(role="user", content=prompt)]
 
     for attempt in range(max_attempts):
+        if attempt > 0:
+            print(f"\nAttempt {attempt + 1}/{max_attempts}...")
+
         response = ""
         for chunk in llm.generate(messages):
             if isinstance(chunk, str):
+                print(chunk, end="", flush=True)
                 response += chunk
+        print()
 
         response = response.strip()
 
@@ -187,16 +227,108 @@ def generate_new_file_path(
         if not new_path.endswith(".json"):
             new_path += ".json"
 
-        # Validate the path
+        # Validate the parent directory exists
         if validate_file_path(new_path):
-            # Also check it's not the same as the original
-            if new_path != file_path:
-                # Check the file doesn't already exist
-                full_new_path = os.path.join(SOURCES_DIR, new_path)
-                if not os.path.exists(full_new_path):
-                    return new_path
+            print(f"\nValid directory path: {os.path.dirname(new_path)}")
+
+            # Add response to messages for context
+            messages.append(Message(role="assistant", content=response))
+
+            # Now rename the file using naming conventions
+            final_path = _rename_file_for_source(
+                new_path=new_path,
+                file_path=file_path,
+                messages=messages,
+                llm=llm,
+                max_attempts=max_attempts,
+            )
+
+            if final_path:
+                return final_path
+
+            # Rename failed, retry from the beginning
+            print("\nRename failed, retrying path generation...")
+        else:
+            print(f"\nInvalid path (parent dir doesn't exist): {new_path}")
 
         # Invalid path, retry
+        if attempt < max_attempts - 1:
+            messages.append(Message(role="assistant", content=response))
+            messages.append(Message(role="user", content=FILE_PATH_INVALID_RESPONSE))
+
+    print("\nFailed to generate valid path after all attempts")
+    return None
+
+
+def _rename_file_for_source(
+    new_path: str,
+    file_path: str,
+    messages: list[Message],
+    llm: object,
+    max_attempts: int = 3,
+) -> str | None:
+    """
+    Rename a file to follow the naming conventions of the target source type.
+
+    Args:
+        new_path: Initial new path (directory is valid but filename may not follow conventions).
+        file_path: Original file path (to avoid returning the same path).
+        messages: Conversation history to continue from.
+        llm: LLM instance to use.
+        max_attempts: Maximum attempts to generate a valid filename.
+
+    Returns:
+        Final valid path or None if all attempts fail.
+    """
+    print("\n" + "=" * 40)
+    print("Phase 1b: Rename File for Source Type")
+    print("=" * 40)
+
+    # Get the target directory
+    target_dir = os.path.dirname(new_path)
+
+    # Get agents.md for the target source type
+    agents_md_contents = get_agents_md_for_path(new_path)
+
+    # Build the rename prompt
+    rename_prompt = FILE_RENAME_PROMPT.format(agents_md_contents=agents_md_contents)
+    messages.append(Message(role="user", content=rename_prompt))
+
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            print(f"\nRename attempt {attempt + 1}/{max_attempts}...")
+
+        response = ""
+        for chunk in llm.generate(messages):
+            if isinstance(chunk, str):
+                print(chunk, end="", flush=True)
+                response += chunk
+        print()
+
+        response = response.strip()
+
+        # Clean up the response (remove any markdown, quotes, etc.)
+        new_filename = response.strip("`\"' \n")
+
+        # Ensure it ends with .json
+        if not new_filename.endswith(".json"):
+            new_filename += ".json"
+
+        # Build the full path
+        final_path = os.path.join(target_dir, new_filename) if target_dir else new_filename
+
+        # Validate the final path
+        if final_path != file_path:
+            full_final_path = os.path.join(SOURCES_DIR, final_path)
+            if not os.path.exists(full_final_path):
+                print(f"\nValid final path: {final_path}")
+                return final_path
+            else:
+                print(f"\nFile already exists: {final_path}")
+        else:
+            print("\nSame as original path")
+
+        # Invalid, retry
         if attempt < max_attempts - 1:
             messages.append(Message(role="assistant", content=response))
             messages.append(Message(role="user", content=FILE_PATH_INVALID_RESPONSE))
@@ -222,6 +354,10 @@ def generate_new_file_contents(
     Returns:
         New file contents as JSON string, or None if all attempts fail.
     """
+    print("\n" + "=" * 40)
+    print("Phase 2: Generate New File Contents")
+    print("=" * 40)
+
     # Get agents.md for the new file path's source type
     agents_md_contents = get_agents_md_for_path(new_file_path)
 
@@ -232,17 +368,22 @@ def generate_new_file_contents(
         new_file_path=new_file_path,
     )
 
-    llm = get_cheap_llm(tools=None, quiet=True)
+    llm = get_cheap_llm(tools=None, quiet=False)
     messages: list[Message] = [
         Message(role="system", content=system_prompt),
         Message(role="user", content=NEW_DUPLICATE_FILE_USER_PROMPT),
     ]
 
     for attempt in range(max_attempts):
+        if attempt > 0:
+            print(f"\nAttempt {attempt + 1}/{max_attempts}...")
+
         response = ""
         for chunk in llm.generate(messages):
             if isinstance(chunk, str):
+                print(chunk, end="", flush=True)
                 response += chunk
+        print()
 
         response = response.strip()
 
@@ -257,37 +398,49 @@ def generate_new_file_contents(
             except Exception:
                 # Try JSON recovery
                 try:
-                    response = try_recover_json(response)
+                    response = try_recover_json(response, quiet=False)
                     data = json.loads(response)
                 except JsonRecoveryError:
                     if attempt < max_attempts - 1:
                         messages.append(Message(role="assistant", content=response))
-                        messages.append(Message(
-                            role="user",
-                            content="That was not valid JSON. Please output only valid JSON with no nested objects.",
-                        ))
+                        messages.append(
+                            Message(
+                                role="user",
+                                content="That was not valid JSON. Please output only valid JSON with no nested objects.",
+                            )
+                        )
                     continue
 
         # Validate no nested dicts
         validation_error = validate_no_nested_dicts(data)
         if validation_error:
+            print(f"\nValidation error: {validation_error}")
             if attempt < max_attempts - 1:
                 messages.append(Message(role="assistant", content=response))
-                messages.append(Message(
-                    role="user",
-                    content=f"Error: {validation_error}. All values must be strings, primitives, or lists of strings. Please fix and try again.",
-                ))
+                messages.append(
+                    Message(
+                        role="user",
+                        content=f"Error: {validation_error}. All values must be strings, primitives, or lists of strings. Please fix and try again.",
+                    )
+                )
             continue
 
+        print("\nValid JSON generated")
         return response
 
+    print("\nFailed to generate valid contents after all attempts")
     return None
+
+
+# =============================================================================
+# Main Generation Loop
+# =============================================================================
 
 
 def generate_near_duplicate(
     file_path: str,
     source_tree: str,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str | None, str | None]:
     """
     Generate a near-duplicate file for a given source file.
 
@@ -296,7 +449,8 @@ def generate_near_duplicate(
         source_tree: Directory tree structure.
 
     Returns:
-        (success, message) tuple.
+        (success, message, old_file_path, new_file_path) tuple.
+        On failure, old_file_path and new_file_path are None.
     """
     full_path = os.path.join(SOURCES_DIR, file_path)
 
@@ -304,7 +458,7 @@ def generate_near_duplicate(
     try:
         file_contents = load_file(full_path)
     except Exception as e:
-        return (False, f"Error loading file: {e}")
+        return (False, f"Error loading file: {e}", None, None)
 
     # Generate new file path
     new_file_path = generate_new_file_path(
@@ -314,7 +468,14 @@ def generate_near_duplicate(
     )
 
     if not new_file_path:
-        return (False, "Failed to generate valid new file path")
+        return (False, "Failed to generate valid new file path", None, None)
+
+    # Print the selected path between the two prompts
+    print("\n" + "=" * 40)
+    print("Selected Paths")
+    print("=" * 40)
+    print(f"Original: {file_path}")
+    print(f"New:      {new_file_path}")
 
     # Generate new file contents
     new_contents = generate_new_file_contents(
@@ -324,22 +485,25 @@ def generate_near_duplicate(
     )
 
     if not new_contents:
-        return (False, "Failed to generate valid new file contents")
+        return (False, "Failed to generate valid new file contents", None, None)
 
     # Write the new file
     full_new_path = os.path.join(SOURCES_DIR, new_file_path)
     try:
         with open(full_new_path, "w") as f:
             f.write(new_contents)
+        print(f"\nWrote file: {new_file_path}")
     except Exception as e:
-        return (False, f"Error writing file: {e}")
+        return (False, f"Error writing file: {e}", None, None)
 
     # Add field labels and UUID
-    success, error = process_written_document(full_new_path)
+    print("\nProcessing document (labels + UUID)...")
+    success, error = process_written_document(full_new_path, quiet=False)
     if not success:
-        return (False, f"Error processing document: {error}")
+        return (False, f"Error processing document: {error}", None, None)
+    print("Document processed")
 
-    return (True, f"Created {new_file_path}")
+    return (True, f"Created {new_file_path}", file_path, new_file_path)
 
 
 def main() -> None:
@@ -349,8 +513,8 @@ def main() -> None:
     parser.add_argument(
         "--count",
         type=int,
-        default=10,
-        help="Number of near-duplicate files to generate (default: 10)",
+        default=20,
+        help="Number of near-duplicate files to generate (default: 20)",
     )
     parser.add_argument(
         "--seed",
@@ -371,46 +535,105 @@ def main() -> None:
         random.seed(args.seed)
         print(f"Random seed: {args.seed}")
 
-    # Get all JSON files
-    json_files = get_all_json_files()
+    # Count JSON files
+    total_files = count_json_files()
 
-    if not json_files:
+    if total_files == 0:
         print("No JSON files found in sources directory.")
         return
 
-    print(f"Found {len(json_files)} JSON files in sources.")
+    print(f"Found {total_files} JSON files in sources.")
     print(f"Will generate {args.count} near-duplicate(s).")
     print()
 
     # Get source tree
     source_tree = get_source_tree()
 
-    # Select random files to create duplicates from
-    if args.count > len(json_files):
-        print(f"Warning: Requested {args.count} duplicates but only {len(json_files)} files available.")
-        selected_files = json_files
+    # Ensure question cache directory exists
+    os.makedirs(QUESTION_CACHE_DIR, exist_ok=True)
+
+    # Find the next duplication number
+    existing_duplications = [
+        f for f in os.listdir(QUESTION_CACHE_DIR)
+        if f.startswith("duplication_") and f.endswith(".json")
+    ]
+    if existing_duplications:
+        max_num = max(
+            int(f.replace("duplication_", "").replace(".json", ""))
+            for f in existing_duplications
+        )
+        duplication_counter = max_num + 1
     else:
-        selected_files = random.sample(json_files, args.count)
+        duplication_counter = 1
 
     success_count = 0
     fail_count = 0
     errors: list[str] = []
+    used_source_files: set[str] = set()
 
-    for file_path in tqdm(selected_files, desc="Generating near-duplicates"):
-        success, message = generate_near_duplicate(file_path, source_tree)
+    for i in range(args.count):
+        print("\n" + "#" * 60)
+        print(f"# Near-Duplicate {i + 1} of {args.count}")
+        print("#" * 60)
 
-        if success:
+        # Select a random file using hierarchical random walk
+        file_path = select_random_file_hierarchical(SOURCES_DIR)
+
+        if not file_path:
+            print("Failed to select a file")
+            fail_count += 1
+            errors.append("Failed to select a file")
+            continue
+
+        # Try to avoid selecting the same source file twice
+        attempts = 0
+        while file_path in used_source_files and attempts < 10:
+            file_path = select_random_file_hierarchical(SOURCES_DIR)
+            attempts += 1
+            if file_path is None:
+                break
+
+        if file_path is None:
+            print("Failed to select a file")
+            fail_count += 1
+            errors.append("Failed to select a file")
+            continue
+
+        print(f"\nSelected source file: {file_path}")
+
+        success, message, old_path, new_path = generate_near_duplicate(file_path, source_tree)
+
+        if success and old_path and new_path:
             success_count += 1
-            tqdm.write(f"[OK] {file_path} -> {message}")
+            used_source_files.add(file_path)
+
+            # Get UUIDs from both files
+            old_full_path = os.path.join(SOURCES_DIR, old_path)
+            new_full_path = os.path.join(SOURCES_DIR, new_path)
+
+            old_uuid = get_dataset_doc_uuid(old_full_path)
+            new_uuid = get_dataset_doc_uuid(new_full_path)
+
+            # Write duplication cache file
+            cache_filename = f"duplication_{duplication_counter:04d}.json"
+            cache_path = os.path.join(QUESTION_CACHE_DIR, cache_filename)
+            cache_data = {
+                "document_old": old_uuid,
+                "document_new": new_uuid,
+            }
+            write_json_file(cache_path, cache_data)
+            print(f"\nWrote cache: {cache_filename}")
+
+            duplication_counter += 1
+            print(f"\nSUCCESS: {message}")
         else:
             fail_count += 1
             errors.append(f"{file_path}: {message}")
-            tqdm.write(f"[FAIL] {file_path}: {message}")
+            print(f"\nFAILED: {message}")
 
-    print()
-    print("=" * 40)
+    print("\n" + "=" * 60)
     print("Summary")
-    print("=" * 40)
+    print("=" * 60)
     print(f"Successfully created: {success_count}")
     print(f"Failed: {fail_count}")
 

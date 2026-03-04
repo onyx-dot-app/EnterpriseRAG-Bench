@@ -1,0 +1,37 @@
+{
+  "title": "e2e-latency-profiling-traces-2026-03-16",
+  "owner": "Aisha Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/e2e-latency-profiling-traces-2026-03-16.json",
+  "doc_type": "doc",
+  "created_at": "2026-03-16",
+  "last_modified": "2026-03-18",
+  "collaborators": [
+    "Marco Hernandez",
+    "Liang Zhao",
+    "Katherine O'Neill"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "latency",
+    "profiling",
+    "e2e",
+    "p95",
+    "p99",
+    "bottleneck",
+    "kv-cache"
+  ],
+  "linked_artifacts": [
+    "JIRA-INF-342",
+    "https://confluence.redwood.com/display/INF/E2E+Latency+Investigation",
+    "https://github.com/redwood-inference/serving-runtime/pull/1284"
+  ],
+  "content": "Summary:\n\nThis doc contains the raw findings and trace-level notes from the March 16 2026 end-to-end latency profiling run for the serving runtime. Purpose: identify dominant contributors to p50/p95/p99 tail latency, surface reproducible traces, and propose short-term mitigations.\n\nContext and workload:\n- Model: redwood-40b-quant-v2 (8-bit), seq_len target ~1024 tokens, typical incoming prompt size ~80 tokens.\n- Traffic shape: synthetic replay from production request-sampler, mix: 70% single-turn generation, 20% multi-turn chat (with KV reuse), 10% long-context (>512) single-turn.\n- Deployment: dedicated GPU pool (A100-80GB equiv), runtime version: v2026.03.10-kernel-optimized.\n- Metrics source: distributed traces collected via internal tracing (span-level timestamps) + per-stage counters pulled from Prometheus scrape at 10s.\n\nOverall E2E latency (observed):\n- p50: 210 ms\n- p95: 680 ms\n- p99: 1,720 ms\n- 99.9th: 3,900 ms (very sparse cases, see notes below)\n\nNotes: p50 is healthy for our target SLAs, but p95/p99 tails are higher than expected vs. baseline from 2026-02 (p95 520 ms). We focused on per-stage breakdowns to find regressions.\n\nPer-stage median/tail breakdown (representative percentiles, numbers are in ms):\n- Network ingress (LB + TLS): p50 18, p95 46, p99 120\n- Request routing & auth (control-plane checks): p50 6, p95 15, p99 40\n- Request deserialization / tokenizer prep: p50 12, p95 35, p99 90\n- KV-cache lookup (prefix + session lookup): p50 4, p95 120, p99 580\n- Kernel scheduling / queue wait (GPU queue): p50 30, p95 240, p99 980\n- Kernel execution (inference forward passes): p50 95, p95 180, p99 260\n- KV-cache writeback / response assembly: p50 10, p95 25, p99 70\n- Response serialization + network egress: p50 35, p95 60, p99 180\n\nKey observations from per-stage data:\n1) KV-cache lookup shows dramatic tail at p99 (up to ~580 ms). On correlated traces, high KV-cache latency is caused by occasional cache-miss fallback to the state-store (Redis cluster) which, under bursty async load, exhibits 50-400 ms spikes. Cache-miss rate during this run was ~7% for multi-turn requests.\n\n2) GPU scheduling / queue wait has an outsized contribution to p95/p99. Kernel-exec time itself is reasonably bounded (p99 ~260 ms) but queue wait (scheduling + batching delays) peaks up to ~980 ms for tail cases. These traces show long periods where kernel had to wait for batching windows or for batch-compatibility matching.\n\n3) Network ingress and egress contribute but are not dominant for p95; however, small but frequent ingress spikes increase contention for our ingress thread-pools, amplifying queue waits.\n\nRepresentative problematic trace (trace id: trace-20260316-4532):\n- total: 2,064 ms\n- timeline: ingress 38 ms -> auth 12 ms -> deserialize 28 ms -> KV-cache lookup 440 ms (miss -> redis fallback 420 ms) -> enqueue wait 780 ms -> kernel_exec 175 ms -> assemble 32 ms -> egress 60 ms\n- tags: long-context=true, reused_kv_attempts=1\n\nRoot cause hypotheses (ranked):\nA. Redis cluster transient latency under cold/misaligned access pattern causes KV-cache fallback spikes. We should validate if Redis is being saturated by background jobs or long GC cycles.\nB. Batching policy is too aggressive on batch compatibility heuristic, causing long waits for perfectly-matchable requests. The runtime waits up to configured batch_timeout_ms (default 600 ms) before dispatching; observed queue waits often close to this timeout.\nC. Ingress worker saturation due to TLS handshake pressure and CPU scheduling at the node-level when many small requests arrive simultaneously.\nD. Rare kernel preemption/recovery causing temporary slowdowns (less common; one trace shows a GPU driver micro-issue followed by kernel retry - requires vendor logs).\n\nImmediate mitigations (low effort, testable):\n- Short-term: Reduce batch_timeout_ms from 600 -> 200 for latency-sensitive customer pools to cut queue wait tail. Run A/B to measure throughput impact.\n- Add circuit-breaker for Redis latency: if redis_p95 > 50 ms, return local in-memory fallback for small KV lookups for up to 1s, and mark key as hot for prefetch.\n- Increase ingress worker threads on dedicated nodes with observed high ingress p95, and enable TLS session reuse aggressively (server-side config).\n\nMedium-term changes (engineering work):\n- Implement partial dispatch: send existing partial batches earlier if no higher-compatibility requests arrive in X ms (adaptive timeout based on recent wait distribution).\n- Replace Redis fallback path for KV-cache misses with a fast-path read-through cache (local LRU + async refresh) for multi-turn sessions.\n- Instrument and dashboard per-key hotness to avoid hot-key amplification on Redis side.\n\nData collection notes / commands used:\n- Tracing capture command: trace-capture --env prod-sampler --duration 30m --filter serving-runtime:inference --out trace-bundle-20260316.tar.gz\n- Prometheus queries used: 1) histogram_quantile(0.95, sum(rate(span_duration_seconds_bucket[5m])) by (le, stage))  2) sum(rate(redis_command_duration_seconds_count[5m])) by (instance)\n- Synthetic replay: sampler-replay --bundle trace-bundle-20260316.tar.gz --replay-rate 1x --seed 20260316 --dest dedicated-pool-3\n\nNext steps / action items:\n- (Owner: Marco) Run targeted Redis load test against the cluster during off-hours to reproduce p95 spikes and check for GC/cluster re-balance events. Timeline: by 2026-03-20. Linked: JIRA-INF-342.\n- (Owner: Liang) Short-term config change: reduce batch_timeout_ms to 200 for canary pool and measure p95/p99 delta. Timeline: by 2026-03-19.\n- (Owner: Aisha) Instrument additional tracing annotations for batch-compatibility decisions and KV-cache miss cause. Timeline: by 2026-03-22.\n\nAppendix: quick checklist for reproducing a high-tail trace\n- Use long-context sample (seq_len ~1024), ensure session state requires KV lookup (multi-turn).\n- Replay at 1x with bursts (sustained 40 rps burst for 30s) to induce Redis tail.\n- Enable detailed span-level logs on serving node (level=debug) and capture /var/log/nvidia/* and dmesg for kernel preemption signs.\n\nComments welcome - please add notes inline or link to the Confluence page for formal write-up.\n\n",
+  "_reserved": "do not edit",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_e73d3e3e3c0e49399542db0ccac5fd65"
+}

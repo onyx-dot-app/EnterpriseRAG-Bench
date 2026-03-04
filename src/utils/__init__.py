@@ -13,6 +13,7 @@ from src.utils.field_labeling import (
 from src.utils.field_ordering import needs_reordering, reorder_document_fields
 from src.utils.file_io import delete_file, load_file, load_json_file, write_json_file
 from src.utils.json_extraction import extract_json_from_response
+from src.utils.json_recovery import JsonRecoveryError, try_recover_json
 from src.utils.validation import validate_no_nested_dicts
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "get_current_date_formatted",
     "get_dataset_doc_uuid",
     "get_documents_without_labels",
+    "JsonRecoveryError",
     "label_document_fields",
     "label_single_document",
     "load_file",
@@ -34,6 +36,7 @@ __all__ = [
     "needs_reordering",
     "process_written_document",
     "reorder_document_fields",
+    "try_recover_json",
     "validate_no_nested_dicts",
     "write_json_file",
 ]
