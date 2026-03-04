@@ -1,0 +1,85 @@
+{
+  "repo": "redwood",
+  "pr_number": "18399",
+  "title": "continuous-batching: scheduler tuning to improve queueing fairness and prevent starvation",
+  "author": "Asha Patel",
+  "created_at": "2026-01-12",
+  "updated_at": "2026-01-20",
+  "merged_at": "2026-01-20",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/continuous-batching/scheduler-fairness-tuning",
+  "reviewers": [
+    "Miguel Santos",
+    "Liam O'Connor",
+    "Priya Rao"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "scheduling",
+    "kv-cache",
+    "stability"
+  ],
+  "linked_linear": [
+    "ENG-2148",
+    "ENG-2201"
+  ],
+  "linked_jira": [
+    "SUP-447"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "6",
+  "additions": "512",
+  "deletions": "148",
+  "merge_method": "squash",
+  "breaking_change": "false",
+  "description": "Context: continuous-batching in the serving runtime improved throughput but we've observed latency tail regressions for low-volume customers and starvation for small, long-lived requests when high-volume prefixes dominate the batch window. This PR tunes the scheduler heuristics to balance batching efficiency with fairness and bounded latency.\n\nMotivation: customer-facing incident SUP-447 showed that a minority of long-polling requests were never scheduled during heavy traffic patterns, causing 99th-percentile latency to spike and impacting SLAs. We need safeguards to avoid starvation while preserving the benefits of grouping similar requests.\n\nWhat this PR does (high level):\n- Introduces a per-queue aging score: requests accrue priority the longer they wait, allowing the scheduler to prefer older requests once they cross age thresholds.\n- Adds a max-wait timeout that forces a batch flush for any queue once the oldest request reaches the configured limit (configurable via runtime config).\n- Implements fairness-aware weight normalization across tenant queues so one tenant cannot monopolize GPU batches; weight decay keeps short bursts from permanently crowding out other queues.\n- Adds a soft cap on batch width for high-throughput queues to leave slots for small important queues (prioritized via aging score).\n- Small API: exposes new runtime flags batching.max_wait_ms, batching.age_priority_steps, batching.queue_weight_limits for tuning.\n- Unit/integration tests and a perf benchmark harness to validate fairness and throughput trade-offs.\n\nDesign notes:\n- The aging score is computed as a linear ramp that upgrades queue priority in discrete steps (age_priority_steps) to avoid noisy frequent re-sorts.\n- Max-wait flush is implemented in the queue manager; it is conservative and only triggers when the estimate of next batch completion exceeds the threshold.\n- Weight normalization uses a moving average of tokens processed per tenant to adapt to shifting workloads.\n\nChecklist:\n- [x] design approved (ENG-2148)\n- [x] unit tests added for queue aging and max-wait behavior\n- [x] integration tests for multi-tenant fairness and starvation scenarios\n- [x] perf benchmark results attached\n- [x] docs updated (docs/perf/continuous-batching.md)\n\nTesting/Results:\n- Microbenchmarks show ~3% throughput drop at extreme configs but 40-90% reduction in 99th-percentile latency for starved queues in mixed workloads. See perf/bench/continuous-batching-report-2026-01-18.md for details.\n- CI: initial run failed a test around batch flush timing; fixed race in queue_manager by batching the timer reset operations (see commit 3).\n\nRollout plan: staged rollout behind feature flag runtime.flags.enable_scheduler_fairness. Start with internal Dedicated clusters for 48h, then opt-in customers, then global. Monitor token-level latency, batch utilization, and queue fairness metrics (new metrics added: batching.queue_age_seconds, batching.queue_weight, batching.max_wait_flush_count).\n\nNotes: this PR touches hot paths in the scheduler; changes are intentionally conservative. Further tuning will be driven by telemetry after rollout.",
+  "commits": [
+    "a1f3b2e: add aging score and aging steps config",
+    "b4d8c9f: implement max-wait flush in queue_manager and tests",
+    "c7e2a11: add tenant weight normalization and moving average metric",
+    "d2f9b5a: fix race in timer reset uncovered by CI",
+    "e9a0f3c: docs and perf report + config defaults"
+  ],
+  "changed_files": [
+    "runtime/batching/scheduler.go",
+    "runtime/batching/queue_manager.go",
+    "runtime/batching/weight_normalizer.go",
+    "runtime/tests/batching_scheduler_test.go",
+    "docs/perf/continuous-batching.md",
+    "perf/bench/continuous-batching-report-2026-01-18.md"
+  ],
+  "diff_snippets": [
+    "--- a/runtime/batching/scheduler.go\n+++ b/runtime/batching/scheduler.go\n@@ -120,6 +120,34 @@ func pickBatch(...) {\n+    // apply aging priority: buckets with older requests get boosted in selection\n+    for _, q := range queues {\n+        q.score += q.agingScore(now)\n+    }\n+    // enforce soft cap on batch width to preserve slots for small queues\n+    if selected.width > cfg.BatchWidthSoftCap && q.isHighThroughput() {\n+        selected.width = cfg.BatchWidthSoftCap\n+    }\n }",
+    "--- a/runtime/batching/queue_manager.go\n+++ b/runtime/batching/queue_manager.go\n@@ -45,6 +45,22 @@ func enqueue(req) {\n+// maxWaitFlush checks oldest request age and triggers a flush if threshold exceeded\n+func (qm *QueueManager) maxWaitFlush() {\n+    qm.mu.Lock()\n+    defer qm.mu.Unlock()\n+    if qm.oldestRequestAge() >= qm.cfg.MaxWaitMs {\n+        qm.triggerFlushLocked()\n+    }\n+}\n+\n+// timer handling consolidated to avoid races when reset during flush paths\n+func (qm *QueueManager) resetTimerLocked() {\n+    if qm.timer != nil {\n+        qm.timer.Stop()\n+    }\n+    qm.timer = time.AfterFunc(qm.cfg.TimerInterval, qm.timerCb)\n+}\n",
+    "--- a/runtime/batching/weight_normalizer.go\n+++ b/runtime/batching/weight_normalizer.go\n@@ -1,0 +1,48 @@\n+package batching\n+\n+// moving average of tokens per tenant used to normalize weights\n+type weightNormalizer struct {\n+    mu sync.Mutex\n+    avg map[string]float64\n+}\n+\n+func (w *weightNormalizer) Update(tenant string, tokens float64) {\n+    w.mu.Lock(); defer w.mu.Unlock()\n+    prev := w.avg[tenant]\n+    w.avg[tenant] = prev*0.9 + tokens*0.1\n+}\n",
+    "--- a/runtime/tests/batching_scheduler_test.go\n+++ b/runtime/tests/batching_scheduler_test.go\n@@ -200,6 +200,36 @@ func TestNoStarvationUnderLoad(t *testing.T) {\n+    // assert starved queue gets scheduled within max wait\n+    start := time.Now()\n+    waitTimeout := time.Millisecond * 200\n+    for time.Since(start) < waitTimeout {\n+        if scheduler.SawRequestFrom(\"tenant-small\") {\n+            return\n+        }\n+        time.Sleep(time.Millisecond * 5)\n+    }\n+    t.Fatalf(\"tenant-small was starved beyond max-wait\")\n }",
+    "--- a/docs/perf/continuous-batching.md\n+++ b/docs/perf/continuous-batching.md\n@@ -1,5 +1,28 @@\n+## Scheduler fairness tuning\n+Added new config flags: batching.max_wait_ms, batching.age_priority_steps, batching.queue_weight_limits.\n+Guidance: start with defaults; reduce max_wait_ms for latency-sensitive tenants."
+  ],
+  "review_comments": [
+    "Miguel Santos: Overall design LGTM. Can you add a small note on how aging interacts with prefix caching? We should avoid evicting KV cache too aggressively when flushing partial batches.",
+    "Asha Patel: Good point \u2014 added comment and ensured flush does not evict prefix entries; flush only schedules currently-cached KV. See queue_manager.go commit.",
+    "Liam O'Connor: There's a potential race on timer reset; CI flagged a flake. I recommend consolidating timer reset under the same lock (see inline).",
+    "Asha Patel: Fixed in commit d2f9b5a; timer reset now under qm.mu and added deterministic test exercising the race.",
+    "Priya Rao: Tests look solid. Did you run the perf harness across Dedicated nodes? Curious about impact on batch utilization metrics.",
+    "Asha Patel: Yes \u2014 added perf report. Utilization drops ~3% in microbench for worst-case fairness configs; 99p latency improved significantly for small tenants."
+  ],
+  "notes": [
+    "Metrics added: batching.queue_age_seconds, batching.queue_weight, batching.max_wait_flush_count",
+    "Feature flag: runtime.flags.enable_scheduler_fairness",
+    "Rollout: internal -> opt-in -> global with telemetry gates"
+  ],
+  "perf_report": "perf/bench/continuous-batching-report-2026-01-18.md",
+  "release_notes": "Tuned continuous-batching scheduler: improves fairness and prevents starvation by introducing queue aging, max-wait flushes, and tenant weight normalization. Config flags: batching.max_wait_ms, batching.age_priority_steps, batching.queue_weight_limits. Release behind feature flag.",
+  "changelog": "Implemented scheduler fairness heuristics and max-wait flush to reduce starvation; added unit/integration tests and perf report.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_comments",
+    "notes",
+    "release_notes",
+    "changelog"
+  ],
+  "dataset_doc_uuid": "dsid_6842220955e047a696cc70cea2acb458"
+}

@@ -1,0 +1,38 @@
+{
+  "title": "customer-x-incident-timeline-scratchpad",
+  "owner": "Jamie Chen",
+  "drive_area": "users",
+  "path": "users/jamie-chen/debugging/",
+  "doc_type": "doc",
+  "created_at": "2026-02-28",
+  "last_modified": "2026-03-03",
+  "collaborators": [
+    "Luis Martinez",
+    "Priya Kapoor",
+    "Connor O'Neill"
+  ],
+  "team": "customer-success",
+  "status": "draft",
+  "tags": [
+    "incident",
+    "debug",
+    "customer-x",
+    "latency",
+    "kv-cache",
+    "redis",
+    "fallback",
+    "timeline"
+  ],
+  "linked_artifacts": [
+    "JIRA-INC-1847",
+    "confluence:Customer-X-Incident-Overview",
+    "https://github.com/redwood-inference/runtime/pull/309"
+  ],
+  "content": "Quick scratchpad for Customer X (acct: customer-x, prod region: us-west-2) \u2014 internal breadcrumbs and comms draft.\n\nHigh-level summary:\n- On 2026-03-01 ~09:20 PST we started seeing increased 95th/99th latency for text-generation routes for Customer X (route: /v1/generate, model pinned: redwood-llama-70b-8q).\n- Errors: intermittent 503s and stream disconnects; also observed per-request token-generation stalls (~>10s per token).\n- Customer reported elevated error rate to their SRE at 09:35 PST.\n- Mitigation: rolled model fallback to smaller variant (redwood-llama-13b-8q) at 10:05 PST which reduced errors but did not eliminate tail latency.\n\nTimeline (raw notes)\n- 2026-03-01 09:12: initial alert from internal monitoring: route /v1/generate 99th latency jumped to 4.2s (baseline ~1.0s).\n- 2026-03-01 09:20: customer slack -> reports \"sudden timeouts and many partial responses\"\n- 2026-03-01 09:28: I ssh'd into the serving pool (dedicated pool cust-x-1) to check GPU utilization: nvidia-smi shows 60-80% GPU utilization but CPU on the host at 95% (spikes).\n- 2026-03-01 09:32: checked runtime logs for PID 11245 (model loader loop): found repeated lines: \"kv-cache miss, falling back to full forward\" and occasional GC pauses logged by runtime.\n- 2026-03-01 09:40: observed Redis latency spikes on prefix cache (redis://kv-cache-1:6379) \u2014 p50 2ms -> p99 250ms.\n- 2026-03-01 09:50: attempted graceful restart of one inference worker (svc-custx-worker-3) \u2014 no immediate effect on aggregated tail latency.\n- 2026-03-01 10:02: rolled policy to route new requests to redwood-llama-13b-8q (smaller model) as a workaround. Error rate dropped by ~60% but tail latency still elevated.\n- 2026-03-01 10:20: open ticket with infra: suspected contention on redis prefix/shard.\n\nCommands tried (not exhaustive)\n- curl check (simulating API, short prompt):\n  curl -s -X POST https://api.redwood.test/v1/generate -H \"Authorization: Bearer TOKEN\" -d '{\"model\":\"redwood-llama-70b-8q\",\"input\":\"Hello\"}'\n  -> sometimes returns HTTP 503, sometimes returns delayed streaming response.\n\n- runtime log tail (on node):\n  sudo journalctl -u redwood-runtime -f | sed -n '1,200p'\n  found repeated pattern:\n  [2026-03-01T09:31:02Z] WARN kv_cache.lua: cache miss for prefix 0x7a4f\n  [2026-03-01T09:31:02Z] INFO runtime.scheduler: falling back to full forward for request req=0x112e4\n  [2026-03-01T09:31:03Z] WARN runtime.gc: minor GC pause 180ms\n\n- redis latency check (from pod):\n  redis-cli -h kv-cache-1 ping; redis-cli -h kv-cache-1 latency latest\n  -> observed high spikes: \"peak_usec: 250000\" around 09:38\n\n- heap/profile snapshot (quick):\n  curl http://127.0.0.1:9001/debug/pprof/heap > /tmp/heap-0900.pb\n  (uploaded to S3: s3://redwood-dev-dumps/customer-x/heap-0900.pb)\n\nError snippets copied from runtime logs\n- \"WARN kv_cache.lua: cache miss for prefix 0x7a4f\"\n- \"INFO runtime.scheduler: falling back to full forward for request req=0x112e4\"\n- \"ERROR stream: write failed: write tcp 10.12.3.45:443->10.0.0.7:52344: write: connection reset by peer\"\n- \"WARN runtime.gc: minor GC pause 180ms\"\n- \"redis: IO error - read tcp 10.1.2.11:6379: i/o timeout\"\n\nHypotheses (brainstorm)\n- Hypothesis A (kv-cache contention): Redis prefix shard experienced temporary network/IO spikes causing many cache misses; runtime falls back to full forward which increases CPU/GPU pressure and causes GC and stalls. Evidence: redis latency spikes aligned with kv_cache miss logs.\n- Hypothesis B (model-specific kernel path): The 70b quantized execution path has a known edge-case where certain sequence lengths trigger slower kernels on our current CUDA/driver combo \u2014 but this would be model-path specific; fallback to 13b helping suggests cache/pressure rather than kernel bug.\n- Hypothesis C (host-level resource contention): CPU saturation on host (95%) causing scheduler delays in the runtime leading to tail stalls observed as minor GC pauses.\n\nImmediate next steps (TODO)\n- [ ] Get full redis slowlog for the timeframe 09:20-10:10 and correlate with request IDs (ask infra for shard logs). Linked ticket: JIRA-INC-1847.\n- [ ] Run targeted simulation: replay a sample of Customer X traffic against a staging pool with 70b model and artificially throttle redis to replicate behavior. (Assigned to Priya)\n- [ ] Upload and analyze pprof CPU profiles from affected workers (s3 path above). Priority: get CPU flamegraphs for 09:30 window. (Connor)\n- [ ] Confirm network metrics between serving nodes and redis (packet drops, retransmits). Ask infra to look at the ENI in us-west-2b.\n- [ ] Draft internal comms to CS/Eng/SRE describing timeline and temporary workaround (see draft below).\n\nDraft internal comms (for review)\nSubject: [INC-1847] Customer X - elevated tail latency on /v1/generate (timeline + next steps)\n\nTL;DR: Customer X experienced elevated 95/99 latency and intermittent 503s for text-generation starting ~09:20 PST on 2026-03-01. Immediate mitigation: routed new requests to a smaller model at 10:05 PST which reduced error rate. Current hypothesis: transient kv-cache/redis latency spike causing cache misses and expensive full forwards.\n\nWhat happened:\n- Spike in redis latency caused a surge of kv-cache misses logged by the runtime. Many requests fell back to full forward path (heavier CPU/GPU work) which increased host CPU and triggered minor GC pauses -> tail latency.\n\nActions taken:\n- 10:05 PST: routed Customer X to redwood-llama-13b-8q as a temporary mitigation.\n- Collected heap/cpu profiles and pprof dumps; uploaded to s3 for analysis.\n- Opened infra ticket to investigate redis shard IO and network path (JIRA-INC-1847).\n\nNext steps:\n- Correlate redis slowlog + request ids to identify whether a specific prefix or key range was hot.\n- Replay traffic in staging with throttled redis to reproduce and confirm root cause.\n- If redis contention is root, consider: re-sharding, client-side request coalescing, or adaptive retry/backoff in runtime to reduce fallbacks.\n\nQuick notes to self:\n- Keep Customer X PM/SRE updated every 2 hours until resolved.\n- If we see recurrence after redis fix, re-evaluate kernel path hypothesis and collect low-level CUDA logs.\n\nConversation snippets to include for audit (internal):\n- customer slack: \"We are seeing partial responses and the UI shows spinning for some responses\" (09:35)\n- on-call SRE: \"There were significant retransmits on ENI usw2b-eni-28 around 09:36\" (captured in infra DM)\n\nFile refs / dump locations:\n- s3://redwood-dev-dumps/customer-x/heap-0900.pb\n- s3://redwood-dev-dumps/customer-x/cpu-pprof-0930.pb\n\nNotes end. Will update as infra and Priya/Connor add analysis.\n\n-- Jamie",
+  "notes": "",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_29c5e72fad1c499e81dfd35e1a30baeb"
+}

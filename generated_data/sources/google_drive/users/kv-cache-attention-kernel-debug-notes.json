@@ -1,0 +1,33 @@
+{
+  "title": "KV cache + attention kernel + seq length debug notes",
+  "owner": "Jordan Patel",
+  "drive_area": "users",
+  "path": "google_drive/users/kv-cache-attention-kernel-debug-notes.json",
+  "doc_type": "doc",
+  "created_at": "2024-11-21",
+  "last_modified": "2024-12-02",
+  "collaborators": [
+    "Priya Shah",
+    "Liam O'Connor"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "kv-cache",
+    "attention-kernel",
+    "debug",
+    "seq-length",
+    "investigation"
+  ],
+  "linked_artifacts": [
+    "GH PR #5123",
+    "JIRA INF-987",
+    "confluence:kv-cache-runbook"
+  ],
+  "body": "Goal: track down a recurring regression where long-context requests (>=12k tokens) either show huge latency spikes or return garbled completions. Suspect interplay between KV cache lifetime, attention kernel selection heuristics, and an off-by-one in sequence-length bucketing.\n\nSummary of behaviour observed:\n- Problem reproducible with open-model-v2 (decoder only, 16k max) on p4d instance.\n- When request seq_len ~12000, initial tokens stream fine, then around token ~12240 server stalls for 1500-3000ms, then resumes but with strange token duplication or context loss.\n- Not seen for seq_len <8k. Intermittent for 8k-12k.\n\nWhat I tried (commands + outputs):\n1) Local repro (server-local) with synthetic prompt (repeat A * 12000):\n   ./run_infer.sh --model open-model-v2 --input-file tests/long_prompt.txt --max-tokens 1024 --device cuda:0  \n   -> logs: served batch id=1123 seq_len=12244 kernel=attn_fused_v2 kv_cache_mode=auto\n   -> stderr snippet: WARNING: kv_cache: eviction threshold crossed (policy=auto, free_slots=8)\n   -> result: duplicated phrases after stall\n\n2) Force kernel to legacy (no fused):\n   ./run_infer.sh --model open-model-v2 --kernel legacy_attn --input-file tests/long_prompt.txt\n   -> logs: kernel=legacy_attn seq_len=12244 kv_cache_mode=auto\n   -> result: much longer latency but no token duplication; suggests kernel-specific bug\n\n3) Disable KV cache completely:\n   ./run_infer.sh --model open-model-v2 --kv-cache=disabled --input-file tests/long_prompt.txt\n   -> result: performance drops but no duplication/stall. Latency consistent ~1.8x baseline.\n\n4) Reproduce on dedicated-staging (p4d cluster) using canary build with added debug prints:\n   Observed: cache eviction log emitted exactly when stall happens. Eviction log lines: \"evicting kv slab id=7 start_idx=8192 end_idx=12288\" then immediately \"kv_fetch_miss for seq_offset=12240\".\n\nHypotheses:\n- H1: Kernel swap race: when kernel selection switches to optimized fused attention for large seq_len, it expects contiguous KV layout; eviction during/after the swap leaves pointers stale -> duplication.\n- H2: Off-by-one in sequence bucketing: eviction uses exclusive end but kernel uses inclusive boundaries causing last token to be fetched twice or skipped.\n- H3: KV cache compaction path has a bug for slabs that cross 8k boundaries (internal slab size=4096?).\n\nQuick checks to run next:\n- Add strong assertions around KV pointers before/after kernel selection (addresses + generation id). If assertion triggers, capture full slab map.\n- Re-run canary forcing kernel to fused_v2 but disable eviction for the relevant slab range (introduce config kv.eviction_disabled_until_seq=14000) to see if stall disappears.\n- Add sequence length unit test that simulates slab boundary crossing (create fake KV with end_idx exactly at 12288).\n- Binary search which slab size triggers issue: 2048, 4096, 8192.\n\nNotes about implementation points I checked:\n- Kernel selection: serving_runtime/kernel_selector.cc picks kernel by max(seq_len, kv_span) and hardware capability. There is a fallback path that does a memcpy-based layout conversion if current KV layout != expected.\n- KV manager: kv_cache_manager.cpp uses slab_size constant 4096 for now (TODO: make configurable). eviction policy is LRU with generation counter.\n- I saw one odd code path in kv_compact() where it sets target_end = slab_end - 1 when compacting last slab. That seems like a potential off-by-one.\n\nLogs to attach to ticket: (copied snippets)\n- \"evicting kv slab id=7 start_idx=8192 end_idx=12288\"\n- \"kv_fetch_miss for seq_offset=12240 slab_id=7\"\n- \"kernel selected: attn_fused_v2 (requires contiguous=true)\"\n- \"memcpy layout convert: src_stride=256 dest_stride=256 length=12288\"\n\nImmediate mitigation ideas for Prod:\n- Pin kernel selection to legacy_attn for requests with seq_len > 10k until root cause fixed. (Config flag: runtime.kernel_policy.pin_large_seq=legacy_attn)\n- Increase eviction buffer so we avoid compacting slabs until seq_offset > max_seen + 8192. (kv.eviction_guard=8192)\n\nAction items (who/when):\n- Jordan: add assert + logging in kv_fetch() to capture pointer gen ids (today)\n- Priya: try canary with eviction disabled for slabs crossing 8k boundary (tomorrow)\n- Liam: prepare rollback toggle to pin legacy kernel in prod (ASAP)\n\nUnresolved questions:\n- Is slab_size always 4096 in all deployments? If not, need to correlate erring instances.\n- Does this affect encoder-decoder models that shard KV differently? Quick check: ran test on t5-like checkpoint (encoder-decoder) -> no repro so far.\n\nNotes to self: keep this as a short-lived scratchpad. If we confirm H1 or H2, file a PR with tests in serving-runtime/unit/kv_tests and add flag to kernel_selector to double-check contiguous property before swap.\n\nRelated tickets: INF-987 (tracking), GH #5123 (WIP PR for kernel pin), TODO: follow up with ops to get flame graphs for the stall periods.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_8cd9f57b87b24fa687bfaacebfdea8d9"
+}

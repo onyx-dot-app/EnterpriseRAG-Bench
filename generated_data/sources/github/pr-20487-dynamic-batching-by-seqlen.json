@@ -1,0 +1,78 @@
+{
+  "repo": "redwood",
+  "pr_number": "20487",
+  "title": "dynamic batching: sequence-length bucketing and padding-minimization heuristics",
+  "author": "Ava Chen",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-02-25",
+  "merged_at": "2026-02-25",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/runtime/dynamic-batching-seqlen",
+  "reviewers": [
+    "Miguel Ortiz",
+    "Priya Nair",
+    "Liam Patel"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "scheduling",
+    "kv-cache",
+    "benchmark"
+  ],
+  "linked_linear": [
+    "ENG-1734",
+    "ENG-1751"
+  ],
+  "linked_jira": [
+    "SUP-982"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "478",
+  "deletions": "126",
+  "breaking_change": "false",
+  "release_notes": "Improves throughput and latency by introducing sequence-length aware dynamic batching with bucketing and padding-minimization heuristics. No API changes. Backwards-compatible runtime behavior. Rollout gated by canary flags.",
+  "merge_method": "squash",
+  "description": "Context: continuous batching in the serving runtime reduces per-token cost but suffers when request sequence lengths are highly variable. Large padding overhead both increases compute and worsens tail latency. This PR introduces a sequence-length aware dynamic batching strategy: (1) bucketing by length ranges, (2) padding-minimization within buckets, and (3) an adaptive bucket reshaping heuristic driven by online request distribution. The goals are: reduce wasted tokens, improve end-to-end throughput, and keep p95/p99 latency stable for mixed workloads.\n\nWhat changed (high level):\n- Added a new Batcher module: seqlen_bucketed_batcher that groups inflight requests into buckets by sequence length ranges and emits minibatches that minimize internal padding.\n- Implemented an adaptive bucket resizing policy: the runtime collects a lightweight histogram of recent request lengths and periodically rebuckets boundaries to match observed percentiles (configurable window size).\n- Tight integration with KV cache: batching decisions now account for whether requests can reuse cached KV states (we prioritize co-batching requests that share KV warmness to avoid cache thrashing).\n- Scheduler improvements: when generating batches across buckets we now allow cross-bucket merge only when the expected padding cost is below a configurable threshold; this prevents pathological merges that spike latency.\n- Kernel selection hooks: the batcher exposes per-batch stats (max_seq, total_tokens) to the kernel selection layer so the runtime can choose optimized kernels for the batch shape (reduces inefficiency for extremely wide/narrow batches).\n- Metrics and observability: new runtime metrics (batch.bucket_size, batch.padding_waste_tokens, batch.rebucket_events) and dashboard panels added in observability-pack for quick diagnosis.\n- Tests and benchmarks: unit tests for bucket assignment, e2e perf harness updates, and canary benchmark scripts under perf-canary.\n\nWhy this approach:\n- Static bucketing reduces padding at the cost of misaligned load as distributions drift. Adaptive bucketing provides a middle ground: we maintain low padding while remaining robust to distribution shifts. Combining bucket-aware scheduling and KV-awareness keeps both compute and cache locality high.\n\nPerformance (canary results):\n- Mixed production-like workload (tokens/sec distribution from internal trace): throughput +18% on average, p95 latency -12%, p99 latency -6%, measured on a 4xA100 serving pool in the benchmark lab.\n- Synthetic skewed-short workload: padding waste reduced by ~45%, TPU/GPU utilization improved correspondingly.\n- Microbenchmarks: kernel-selection optimization reduced per-token wallclock by ~2-4% for long sequences.\n\nBackward compatibility and rollout plan:\n- Default behavior: the feature is behind a runtime feature-flag (runtime.dynamic_batching.seqlen_bucketing) disabled by default for all tenants.\n- Rollout steps: internal canary (perf-canary) -> 10% controlled rollout on dedicated -> scale to hosted API if metrics stable for 48h.\n- Fallbacks: if padding_waste or p99 latency regresses beyond configured thresholds, the controller auto-disables the new batcher and reverts to previous continuous-batcher.\n\nFiles changed (high level):\n- redwood/runtime/batcher/seqlen_bucketed_batcher.{cpp,h} - core algorithm and adaptive rebucketing logic.\n- redwood/runtime/scheduler/scheduler.cpp - integration points and cross-bucket merge policy.\n- redwood/runtime/kernel_selector/kernel_selector.cpp - added hints and selection paths for common batch shapes.\n- redwood/runtime/kv_cache/kv_policy.cpp - KV-aware co-batching heuristics.\n- perf-canary/benchmarks/dynamic_batching_bench.py - bench harness and workload configs.\n- observability-pack/dashboards/batching_overview.json - dashboard with new metrics.\n- tests/unit/test_seqlen_bucketed_batcher.cpp - unit and fuzz tests.\n\nCommits (summary):\n- Initial draft of seqlen_bucketed_batcher with static buckets and unit tests.\n- Add adaptive rebucketing and histogram-based boundary computation.\n- KV cache awareness and scheduler merge heuristics.\n- Kernel selector hooks and minor perf improvements.\n- Benchmarks, dashboards, and documentation.\n- Fixes from review: increased histogram window, edge-case handling for single-request batches, and additional test coverage.\n\nReview timeline and conversation (summary):\n- Miguel Ortiz (review): asked for clarity on how rebucketing impacts in-flight batches and possible latency spikes during boundary changes. Requested a graceful rebucket transition to avoid mid-batch reshuffles.\n- Author (Ava): implemented a two-phase rebucket where new boundaries apply only to newly accepted requests; in-flight batches continue with previous mapping. Added tests and noted the change in the description.\n- Priya Nair (review): requested metrics for rebucket churn and suggested a lower default rebucket frequency; also asked to expose the feature-flag and thresholds via runtime config.\n- Author: exposed runtime.dynamic_batching.* flags, added observability counters and lowered rebucket default to 5-minute window.\n- Liam Patel (perf review): requested bench numbers with KV-warm and KV-cold mixes; found small regression in 1% tail on extreme long-sequence workloads and suggested limiting cross-bucket merges for batches where max_seq > 4x median.\n- Author: implemented the extra merge threshold and re-ran canary; updated numbers in this description.\n\nCI and checks: all CI checks passed after final fixes. Key CI items: clang-tidy, unit tests, integration/perf-canary smoke tests, and dashboard lint. One flaky unit test (test_batch_timeout_edge) failed initially and was fixed (race condition) in the follow-up commit.\n\nMigration and configuration docs: added a short doc section in redwood-docs under runtime/batching.md explaining new flags, recommended thresholds, and how to interpret new metrics.\n\nRisk and mitigation:\n- Risk: misconfigured buckets could increase latency for rare long requests. Mitigation: conservative default bucket boundaries, rebucket cooldown, and automatic rollback thresholds.\n- Risk: interaction with KV cache could cause cache-locality regression. Mitigation: KV-aware scoring prevents co-batching when it would reduce KV reuse.\n\nNext steps:\n- Monitor production canaries for two weeks and tune default bucket boundaries based on more traffic profiles.\n- Explore ML-based boundary prediction for non-stationary traffic.\n- Expose an admin API to suggest tenant-specific bucket profiles for large customers.\n\nNotes: references to internal Linear tickets and benchmark harness included. This PR focuses on the runtime path and intentionally defers any SDK/API changes.",
+  "review_comments": [
+    "Miguel Ortiz: Please clarify rebucketing semantics for in-flight batches \u2014 could this cause a spike? Recommend two-phase commit to apply new boundaries only to new requests.",
+    "Ava Chen: Implemented two-phase rebucketing; in-flight batches remain on old mapping. Added unit test to cover transition.",
+    "Priya Nair: Suggest exposing rebucket frequency and padding threshold via config; add metrics for rebucket churn.",
+    "Ava Chen: Exposed runtime.dynamic_batching.* flags and added batch.rebucket_events metric. Default rebucket window set to 5min.",
+    "Liam Patel: Include KV-warm vs KV-cold bench results. Noted a small p99 regression on extreme long-seq workloads; limit cross-bucket merge when max_seq > 4x median.",
+    "Ava Chen: Added merge threshold and re-ran canary. Updated perf numbers in PR description."
+  ],
+  "ci_checks": [
+    "clang-tidy: pass",
+    "unit-tests: pass",
+    "integration-smoke: pass",
+    "perf-canary: pass",
+    "dashboard-lint: pass"
+  ],
+  "files_changed": [
+    "redwood/runtime/batcher/seqlen_bucketed_batcher.cpp",
+    "redwood/runtime/batcher/seqlen_bucketed_batcher.h",
+    "redwood/runtime/scheduler/scheduler.cpp",
+    "redwood/runtime/kernel_selector/kernel_selector.cpp",
+    "redwood/runtime/kv_cache/kv_policy.cpp",
+    "perf-canary/benchmarks/dynamic_batching_bench.py",
+    "observability-pack/dashboards/batching_overview.json",
+    "tests/unit/test_seqlen_bucketed_batcher.cpp",
+    "redwood-docs/runtime/batching.md"
+  ],
+  "notes": [
+    "Feature gated: runtime.dynamic_batching.seqlen_bucketing (off by default)",
+    "Canary harness configs added under perf-canary",
+    "No customer-visible API changes",
+    "Follow-up: tenant-specific bucket tuning (ENG-1751)"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes",
+    "review_comments"
+  ],
+  "dataset_doc_uuid": "dsid_5df473de0f7043ab8713a07673ebb9ed"
+}
