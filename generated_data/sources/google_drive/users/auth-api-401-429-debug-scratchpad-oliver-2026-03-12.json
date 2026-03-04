@@ -1,0 +1,35 @@
+{
+  "title": "Auth/API key 401/429 debugging scratchpad",
+  "owner": "Oliver Chen",
+  "drive_area": "users",
+  "path": "users/auth-api-401-429-debug-scratchpad-oliver-2026-03-12.json",
+  "doc_type": "doc",
+  "created_at": "2026-03-11",
+  "last_modified": "2026-03-12",
+  "collaborators": [
+    "Aisha Rahman",
+    "Michael Torres"
+  ],
+  "team": "eng-infrastructure",
+  "status": "draft",
+  "tags": [
+    "auth",
+    "api-key",
+    "401",
+    "429",
+    "rate-limiting",
+    "debug",
+    "quota"
+  ],
+  "linked_artifacts": [
+    "JIRA:ENG-1423",
+    "GH:redwood/inference#987",
+    "Slack:#infra-auth-incident/archives/C03XXXXXX"
+  ],
+  "content": "Context:\n- Intermittent 401 and 429 errors reported by a small subset of customers (hosted API).\n- Errors started ~2026-03-10 22:00 UTC after a rollout of a token-rotation helper in the proxy layer.\n- Repro rate low: ~5% of requests to /v1/generate returned 401; 429s occur in spikes immediately after bursts.\n\nSymptoms observed:\n- 401 patterns: immediate 401 response with body: '{\"error\":{\"message\":\"Unauthorized\",\"type\":\"invalid_api_key\"}}'\n- 429 patterns: response body: '{\"error\":{\"message\":\"Rate limit exceeded\"}}' and headers include Retry-After and X-RateLimit-* in some cases.\n- Affected customers mostly on dedicated and some high-traffic hosted customers.\n\nCommands / reproductions tried (local + curl):\n- Basic request that fails reproducibly for cust A (token replaced with <REDACTED>):\n  curl -i -X POST https://api.redwood.ai/v1/generate \\\n    -H \"Authorization: Bearer <REDACTED>\" \\\n    -H \"Content-Type: application/json\" \\\n    -d '{\"model\":\"redwood-13b\",\"input\":\"hello\"}'\n\n  -> HTTP/1.1 401 Unauthorized\n  Date: Wed, 11 Mar 2026 09:14:22 GMT\n  Content-Type: application/json\n  Content-Length: 92\n\n  {\"error\":{\"message\":\"Unauthorized\",\"type\":\"invalid_api_key\"}}\n\n- Same request with a different key (works): 200 + tokens returned.\n- Replaced the key with one from the same customer (rotated, different key id) -> request succeeds.\n- Observed one case where key worked for several minutes then started returning 401.\n\n- 429 reproduction (artificial bursts):\n  for i in {1..120}; do \\\n    curl -s -o /dev/null -w \"%{http_code}\\n\" -H \"Authorization: Bearer $KEY\" -X POST \\\n    https://api.redwood.ai/v1/embeddings -d '{\"model\":\"embed-2\",\"input\":\"x\"}' &\n  done\n\n  -> observed many 200s then a block of 429 responses. Example headers when 429 returned:\n  HTTP/1.1 429 Too Many Requests\n  Retry-After: 30\n  X-RateLimit-Limit: 60\n  X-RateLimit-Remaining: 0\n  X-RateLimit-Reset: 170... (epoch)\n\nObservations from logs (proxy + auth-service + rate-limiter):\n- Proxy logs show token id mapping and decision tree: if key marked revoked -> immediate 401.\n- For some affected requests token verification path shows: token looked up in cache (redis) -> not found -> call to auth-service -> auth-service returns 401 (invalid) -> proxy logs 401.\n- In auth-service traces for a particular key id: auth-service queried k/v store (postgres) and returned 200 for key status \"active\". But proxy still treated as invalid in same minute.\n- Found occasional race where token-rotation job sets key status to 'revoked' then quickly to 'active' again (classic double-write race + cache TTL mismatch).\n- Rate-limiter: per-key token bucket implemented in redis with lua script. On heavy bursts the script latencies spike; sometimes script returns ERR and code falls back to defensive 429s.\n\nError snippets and timestamps:\n- 2026-03-10T22:01:12Z proxy: tokenId=kj12sx: cache MISS -> auth-call start\n- 2026-03-10T22:01:12Z auth: tokenId=kj12sx -> db status=active (SELECT 1)\n- 2026-03-10T22:01:12Z proxy: tokenId=kj12sx -> allowed=false -> 401 to client\n\n- Rate limiter error (redis lua):\n  2026-03-11T08:59:03Z rl: script_eval ERR Error running script (call to f_...): NOSCRIPT No matching script.\n  -> fallback increments in-memory counters -> many simultaneous requests see 0 remaining -> 429 sent.\n\nHypotheses (ranked):\n1) Token rotation race: when rotating keys we briefly mark new/old keys and update cache TTLs; if propagation order wrong, proxy cache and auth DB disagree -> transient 401s. Evidence: keys that fail then succeed after small delay; rotation job logs show quick successive status flips.\n2) Cache inconsistency TTL: Redis cache TTL for token metadata too long/short relative to PG updates; when backfill/repair runs, entries can be inconsistent.\n3) Rate-limiter script eviction: redis script cache eviction (NOSCRIPT) under node restarts or failovers causes rate-limiter fallback to error path returning 429.\n4) Client-side: some SDKs may be reusing stale embedded keys (less likely given server logs).\n\nImmediate mitigation actions taken:\n- Rolled back token-rotation helper to previous safe version (2026-03-10 23:00 UTC). Monitoring shows 401 occurrences dropped to baseline.\n- Put guard in proxy: if auth-service returns \"active\" but proxy would reject due to cache mismatch, consider short-circuit recheck (sync call) as temporary fix.\n- Added NOSCRIPT handling for rate-limiter: automatically re-load lua script on NOSCRIPT rather than fallback-to-error.\n\nPlanned next steps / TODOs:\n- [ ] Add stronger invariants to token-rotation job: write-order guarantees and post-write cache invalidation. (Owner: Aisha)\n- [ ] Increase visibility: emit token-change events to infra-logs and trace id linking (Owner: Michael).\n- [ ] Harden rate-limiter: ensure lua script SHA persisted and reloaded on reconnects; add metrics for lua script misses. (Owner: Oliver).\n- [ ] Add canary traffic for token rotation job (limit to 1% of keys for first hour).\n- [ ] Create regression test that simulates rotate+burst to reproduce race in CI.\n\nNotes to self:\n- Watch for patterns where 401s correlate with specific region proxies (us-west-2). Could be redis cluster partitioning.\n- Check cloud provider maintenance windows around 2026-03-10 21:55-22:15 UTC.\n- Follow up with customer success for impacted customers: provide incident writeup and timeline after fix.\n\nQuick links (internal):\n- rotation job: GH:dotorg/infra-scripts/tree/token-rotate-helper (PR linked: GH:...#987)\n- auth-service schema: confluence/?pageid=auth-schema\n- infra dashboard: Grafana -> Auth -> TokenVerifications\n\nScratch observations (informal):\n- Felt guilty about deploying rotation helper without canary. Note to future self: small canaries only.\n- If we keep getting NOSCRIPT -> might need to pin redis version or reduce ephemeral restarts.\n\nEnd of scratchpad.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_01c13f56578f4027803c61f4108270ec"
+}

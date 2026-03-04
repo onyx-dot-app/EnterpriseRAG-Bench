@@ -1,0 +1,33 @@
+{
+  "title": "throughput-regression-continuous-batching-debug-scratchpad-8",
+  "owner": "Asha Patel",
+  "drive_area": "users",
+  "path": "users/asha-p/throughput-regression-continuous-batching-debug-scratchpad-8.doc",
+  "doc_type": "doc",
+  "created_at": "2026-01-15",
+  "last_modified": "2026-02-28",
+  "collaborators": [
+    "Ethan Rivera",
+    "Lina Zhou"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "throughput",
+    "continuous-batching",
+    "debug",
+    "kv-cache",
+    "perf-regression"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/482",
+    "JIRA-RI-1297",
+    "confluence:perf/continuous-batching-debugging"
+  ],
+  "content": "Purpose:\nQuick personal scratchpad capturing commands, logs, hypotheses while tracking the recent throughput regression affecting continuous batching on staging/dedicated clusters. Not a polished incident report \u2014 notes to self and collaborators.\n\nSynopsis:\n- Regression surfaced 2026-01-14 after deploy of batching refactor (PR 482).\n- Observed ~25-40% drop in tokens/sec on 2x worst-case routes (seq_len 1024, bursty short requests).\n- Latency P95 increased ~30-40ms and tail behaviour worsened.\n\nTimeline (high level):\n- 2026-01-14 03:10 UTC: Deployment of batching refactor (feature flag: continuous-batching-v2).\n- 2026-01-14 03:45 UTC: Alerts for throughput drop and SLO violations.\n- 2026-01-14 04:10 UTC: Rollback to continuous-batching-v1, partial improvement.\n- 2026-01-15 -> ongoing: Re-enable on canary nodes to reproduce.\n\nWhat I reproduced locally:\n- Repro script: python tools/load_test.py --qps 200 --seq 1024 --model rwd-llama-13b --duration 10m\n- With continuous-batching-v2 enabled: tokens/sec ~ 125k\n- With v1 (old batching): tokens/sec ~ 170k\n\nCommands I ran:\n- kubectl -n staging get pods -l app=inference -o wide\n- kubectl logs -f deployment/inference --since=1h | grep \"batch\" | tail -n 200\n- curl -s -X POST \"http://staging-infer/api/v1/streams\" -d '{\"input\": \"test\"}' | jq .\n- python -m tools/bench/compare --config configs/continuous-batching-v2.yaml\n- docker exec -it runtime-node bash -c \"ps aux | grep inference_worker\"\n- nvidia-smi --query-gpu=utilization.gpu,utilization.memory --format=csv -l 5\n\nPrometheus / Metrics queries I used:\n- avg(rate(tokens_generated_total[1m])) by (model)\n- sum(rate(requests_total{route=\"/v1/generate\"}[1m])) by (pod)\n- histogram_quantile(0.95, sum(rate(request_duration_seconds_bucket[5m])) by (le,route))\n- Observed that tokens_generated_total per GPU dropped roughly in line with tokens/sec from the bench.\n\nKey log excerpts (simplified):\n- \"INFO continuous_batcher: assembled batch size=6 latency_ms=12 kv_cache_hit=false\"\n- \"WARN batching_scheduler: flush_timer expired code=forced_flush reason=idle_timeout\n  worker_queue_len=3 pending_batches=1\"\n- \"ERROR runtime_executor: failed to merge kv cache segment id=0 size=0 expected>0\n  trace_id=abc123\"\n\nHypotheses (ranked):\n1) Unexpected forced flush/idle timeout behavior in v2 batching scheduler causing smaller-than-expected batches in bursty traffic. (Most likely)\n2) KV-cache merging bug (see ERROR above) causing per-request extra overhead or retries.\n3) Kernel selection path change in v2 leads to non-optimal CUDA kernels for some sequence-length combos.\n4) Telemetry aggregation bug makes tokens/sec look lower (less likely \u2014 metrics verified on host-level counters).\n\nEvidence supporting (1):\n- Logs show many forced_flush events during bursty windows.\n- Canary when run with artificially steady traffic (no bursts) achieves similar throughput to v1.\n\nEvidence supporting (2):\n- ERROR runtime_executor: failed to merge kv cache segment \u2014 reproduces occasionally under high concurrency.\n- When I disabled kv_cache merging (dev flag: KV_CACHE_MERGE=false) throughput improved ~8% but not full delta.\n\nQuick tests and results:\n- Toggle continuous-batching-v2 on single canary pod -> throughput down 30% on that pod.\n- Set KV_CACHE_MERGE=false on canary + v2 -> throughput down only 20% (improved).\n- Increase batch_window_ms from 5 -> 12 (v2) -> batch sizes increased from median 4 -> median 7 and tokens/sec improved ~12%.\n\nTemporary mitigations tried:\n- Rollback to v1 (rolled to 50% of fleet) -> customer impact reduced but wanted root cause.\n- Increase batch_window_ms on v2 to allow slightly longer batching; helped but increases tail latency.\n- Disable KV cache merging (not safe long-term).\n\nOpen questions / TODOs:\n- Why does v2's scheduler trigger forced_flush more aggressively? Check new heuristics in PR 482 (look at flush_threshold logic).\n- Inspect PR 482 diff for changes around time-based flush vs size-based flush.\n- Replicate ERROR around kv cache merging with deterministic repro (need a replay harness for concurrent requests).\n- Check CUDA kernel selection logs (enable runtime.DEBUG=kernel_selector) on canary and compare kernel ids between v1 and v2.\n- Add finer-grained tracing around flush_timer events and record batch size distribution per flush.\n\nNotes / snippets for follow-up commands:\n- Grep for flush logic: git --no-pager grep -n \"flush_timer\" -S -- serving-runtime/ | sed -n '1,120p'\n- Run bench with csv output: python tools/load_test.py --qps 200 --seq 1024 --duration 10m --out results/v2-run.csv\n- Enable kernel selector debug: kubectl set env deployment/inference RUNTIME_DEBUG=kernel_selector --namespace=staging --record\n- Reproduce kv-merge error: python tools/repro/kv_merge_race.py --concurrency 128 --seq 512 --duration 5m\n\nNotes-to-self (style):\n- Keep this doc rough. Capture timestamps and any new commands here.\n- After root cause narrowed, convert into clean postmortem draft in confluence.\n\nLast manual snapshot:\n- 2026-01-26 11:33 UTC: Ran long-run 1h ramp test with v2 + batch_window_ms=12 -> tokens/sec still 8% below v1 baseline (so changes help but not full fix).\n\nNext immediate step (today):\n- Add extra logging around forced_flush reason and worker_queue_len for one canary node; collect 30m of data during peak.\n- Pair with Lina to step through PR 482 heuristics.\n\nReferences:\n- PR: https://github.com/redwood-inference/serving-runtime/pull/482\n- JIRA: JIRA-RI-1297 (internal)\n\n-- Asha\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_c586777aa43e4a599888b5cf0a8b6ea6"
+}

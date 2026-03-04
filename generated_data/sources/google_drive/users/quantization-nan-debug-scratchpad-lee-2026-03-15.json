@@ -1,0 +1,35 @@
+{
+  "title": "Quantization NaN debug scratchpad (INT8/FP8/BF16)",
+  "owner": "Lee Chen",
+  "drive_area": "users",
+  "path": "shared_drives/google_drive/users/lee/quantization-nan-debug-scratchpad-2026-03-15",
+  "doc_type": "doc",
+  "created_at": "2026-03-14",
+  "last_modified": "2026-03-15",
+  "collaborators": [
+    "Maya Patel",
+    "Carlos Rivera"
+  ],
+  "team": "eng-applied-ml",
+  "status": "draft",
+  "tags": [
+    "quantization",
+    "nan",
+    "int8",
+    "fp8",
+    "bf16",
+    "debug",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/4123",
+    "CONFLUENCE-1234",
+    "JIRA-QUANT-78"
+  ],
+  "content": "Context:\n- Reproducing intermittent NaNs in generation when using INT8/FP8 quantized weights on the 7B family. Happens more often on longer sequences (>512) but not strictly correlated to length.\n- Baseline BF16 full-precision run is clean. INT8/FP8 runs sometimes produce NaN tokens mid-generation and crash runtime.\n\nObserved behaviour (notes + snippets):\n- Minimal reproduction command (local dev machine):\n  python -m torchrun --nproc_per_node=1 tools/generate.py \\\n    --model checkpoints/7b-qint8 --quantize int8 --seq_len 1024 --batch_size 1 \\\n    --prompt-file tests/long_prompt.txt\n\n- Example runtime output around failure:\n  === BEGIN LOG ===\n  token 342: generated token id 5021 -> logit inf\n  RuntimeError: value cannot be converted to finite floating point (got inf)\n  Traceback (most recent call last):\n    File \"tools/generate.py\", line 214, in <module>\n      outputs = model.generate(inputs)\n    File \"/opt/venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1190, in __call__\n      return forward_call(*input, **kwargs)\n  ...\n  === END LOG ===\n\n- Another run with full debug prints on matmul shows some rows with huge values before softmax. Suspect out-of-range activations.\n\nCommands tried / quick experiments:\n- Re-run with different quantization backends:\n  QUANT_BACKEND=fbgemm python -m ... --quantize int8  # no improvement\n  QUANT_BACKEND=fx2trt python -m ... --quantize int8  # occasionally different failure point\n- Force BF16 activation casts before attention matmul:\n  patched attention: q = q.to(torch.bfloat16); k = k.to(torch.bfloat16) -> reduces frequency of NaN but not eliminated.\n- Disable fused kernels (to narrow down source):\n  export DISABLE_FUSED_KERNS=1; python -m ... --quantize int8 -> still see NaNs but different stack.\n- Per-channel vs per-tensor quantization test:\n  quantize --per_channel true -> slightly better stability (fewer NaNs).\n- Calibration dataset size scaling: small cal set (100 samples) vs larger (2k) changed distribution; larger cal improved stability in some runs.\n\nHypotheses (ranked):\n1) Activation overflow due to scale mismatch between weight quantization and activation dynamic range (INT8/FP8 scales too small -> matmul produces large vals).\n2) LayerNorm / RMSNorm quantization is lossy and causes occasional divide-by-zero or extreme scaling when epsilon handling differs across kernels.\n3) KV-cache reuse + quantization rounding accumulates error across many past tokens -> grows magnitude and triggers NaN.\n4) Fused attention kernel bug for certain sequence lengths / batch shapes when using mixed FP8/INT8 pathway.\n5) Per-tensor quantization not capturing per-channel variance in older linear layers -> single bad channel saturates.\n\nEvidence / supporting notes:\n- Per-channel quant seems to reduce rate of NaN (supports #5).\n- Casting activations to BF16 before matmul reduces frequency (supports #1/#2).\n- NaNs more common after cache length > 256 tokens (supports #3).\n- Different quant backends fail at different points (points to backend-specific fused kernel bug for some runs)\n\nImmediate next steps / experiments to run (short):\n- Add per-layer debug dump that logs max/min/std of Q/K/V activations and weight scales every forward pass (write to local tmp) to pinpoint which layer explodes.\n- Re-run with disabled KV-cache to test hypothesis #3: --disable-kv-cache flag.\n- Run with deterministic RNG and seed to try to reproduce consistently: torch.manual_seed(42); set OMP_NUM_THREADS=1.\n- Try strict BF16-only path for attention: force activation casts and remove INT8 path to see if NaN disappears.\n- Add clipping of activations before softmax: torch.clamp(x, -1e4, 1e4) as a temporary mitigant.\n\nLonger experiments / infra work:\n- Build instrumented model with hooks logging layernorm eps values and whether any zeros in denominator.\n- Add unit test that generates long sequence and asserts no NaN for 100 seeds.\n- Create small canary on Dedicated infra to check if hardware (A100 vs H100) affects rate.\n\nNotes on potential fixes to try if hypothesis confirmed:\n- Use per-channel scales for problematic linear layers; tighten calibration procedure (percentile range instead of min/max).\n- Adjust quantization zero_point handling for int8 symmetric/asymmetric mismatch.\n- Increase layernorm epsilon in FP8/INT8 codepaths to avoid divide-by-zero.\n- Accumulate KV in BF16 while keeping weights INT8 (hybrid approach).\n\nQuick checklist (for me):\n- [ ] Add per-layer activation logging hook (priority high).\n- [ ] Run --disable-kv-cache reproducer (priority medium).\n- [ ] Try per-channel quant globally and compare failure rate across 50 runs (priority high).\n- [ ] Open PR with activation clamps as a short-term fix (priority low, discuss w/ runtime team).\n- [ ] Sync with Carlos on fused kernel test matrix (priority high).\n\nScratch console history (most relevant):\n- git checkout -b quant/nan-debug\n- python -m tools/generate.py --model ckpts/7b-int8 --quantize int8 --seed 42 --seq_len 1024\n- python -c \"import torch; print(torch.get_default_dtype(), torch.cuda.is_available())\"\n- QUANT_BACKEND=fbgemm python -m ...\n\nRandom observations / hypotheses to keep in mind:\n- Some older layers with very small weights (close to zero) may produce large reciprocal scales during calibration -> numerical instability.\n- FP8 dynamic range is narrower than expected for rare high-magnitude tokens in long context.\n- If scaling steps differ between encoder/decoder style layers we might be mixing incompatible quant params.\n\nLinks / refs:\n- internal PR with quant util changes: https://github.com/redwood-inference/serving-runtime/pull/4123\n- similar incident notes from Maya: docs/quantization/quantization-nan-incident-maya-2026-03-09\n- ticket: JIRA-QUANT-78 (investigation task)\n\nIf I get a solid reproduction (deterministic/seeded), next action is to capture a minimal repro and open a dedicated bug with stack trace + offending layer dump.\n\n-- Lee\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_bf2cd6f2bf334676a9b03909837e2428"
+}

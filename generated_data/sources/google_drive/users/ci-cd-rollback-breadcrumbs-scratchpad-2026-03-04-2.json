@@ -1,0 +1,35 @@
+{
+  "title": "ci-cd rollback breadcrumbs - canary failure investigation",
+  "owner": "Samir Patel",
+  "drive_area": "users",
+  "path": "users/ci-cd-rollback-breadcrumbs-scratchpad-2026-03-04-2.json",
+  "doc_type": "doc",
+  "created_at": "2026-03-03",
+  "last_modified": "2026-03-04",
+  "team": "release-engineering",
+  "status": "draft",
+  "collaborators": [
+    "Maya Lopez",
+    "Liam O'Connor"
+  ],
+  "tags": [
+    "ci-cd",
+    "rollback",
+    "canary",
+    "k8s",
+    "debugging",
+    "infra"
+  ],
+  "linked_artifacts": [
+    "JIRA: REL-4321",
+    "https://github.com/redwood-inference/infra/pull/789",
+    "https://confluence.redwood.ai/display/RE/Canary+Rollout+Notes",
+    "ArgoCD: https://argocd.redwood.ai/app/infra-app"
+  ],
+  "content": "Context:\\n- Canary deployment of runtime-change-2026-03-02 (image: registry.redwood.ai/runtime:v2026-03-02) rolled out to 5% traffic at 2026-03-03T09:10 UTC via Argo rollouts.\\n- Metrics: overall success rate dropped from ~99.8% to 87% for canary shard within 45m. Error type: partial generation failures / hung token streams; some requests return 502 after ~6s.\\n- Affected routes: /v1/chat (large seqs, >1024 tokens) and /v1/generate (streaming).\\n\\nWhat I observed (timeline):\\n- 09:10 \u2014 canary started (5% traffic).\\n- 09:45 \u2014 first spike in 5xx (502) from canary hosts; error budget alarm fired.\\n- 09:50 \u2014 increased 5xx to ~12% of canary requests.\\n- 09:55 \u2014 manually routed additional traffic from canary to baseline; errors persisted on canary instances in logs.\\n- 10:05 \u2014 started collecting core logs + kubectl describe + dmesg from canary pods.\\n\\nCommands I ran (most useful):\\n- kubectl -n inference get pods -l rollout=canary-runtime-2026-03-02 -o wide  # confirmed pod restarts count=0, multiple backends up\\n- kubectl -n inference logs pod/runtime-canary-5a7b -c runtime --since=15m | sed -n '1,200p'  # see partial token stream errors and abrupt stream close\\n- kubectl -n inference exec -it pod/runtime-canary-5a7b -- /bin/bash -c 'cat /var/log/runtime/runtime.log | tail -n 200' - Observed repeated: \"ERROR: kv_cache: unexpected invalidation while serving request\"\\n- kubectl -n inference describe pod runtime-canary-5a7b - Events show OOMKilled? No. Node memory pressure: No.\\n- sudo dmesg on node (via bastion): no OOM killer entries around timestamps.\\n- curl -s -v https://canary-host.internal/health -> 200, but POST /v1/chat calls fail intermittently with 502 and incomplete chunked body.\\n\\nRelevant log snippets (redacted):\\n[2026-03-03T09:38:11Z] rpc: stream closed unexpectedly: context canceled\\n[2026-03-03T09:38:11Z] runtime: model inference loop aborted: kv_cache invalidation at token=120; expected seq=119\\n[2026-03-03T09:39:02Z] http: write tcp 10.10.45.13:443->10.0.2.21:51234: write: broken pipe\\n\\nHypotheses (ranked):\\n1) Incompatible kernel/quantization interaction: new runtime has a change that alters KV cache lifecycle (PR: infra#789). For long contexts, cache invalidation triggers inconsistent sequence numbers and aborts. Explains only long-sequence failures.\\n2) Race in streaming path: change to batching logic leads to context cancel while stream still writing to client (broken pipe). Race manifests under real traffic load and streaming endpoints.\\n3) Memory fragmentation causing intermittent allocation failure (less likely: no OOM in dmesg).\\n4) External dependency (feature flag service) added latency causing client timeouts, but logs show runtime side errors, so lower probability.\\n\\nQuick reproduction steps (local):\\n- Run unit-level repro harness: ./tools/repro/run_stream_repro --image registry.redwood.ai/runtime:v2026-03-02 --seq-length 1500 --concurrency 16 - Reproduces ~30% failures locally in 30m test (matches canary). Logs show kv_cache invalidation.\\n\\nMitigation tried (and result):\\n- Scale canary to 0 (Argo rollback to baseline image v2026-02-28) -> immediately error rate drops to baseline.\\n- Attempted live patch: toggled streaming-batching flag off via remote config -> partial reduction but not full fix (errors down to ~6% then creeping back up).\\n- Manual rollback command used (successful):\\n  - kubectl -n inference set image deployment/runtime runtime=registry.redwood.ai/runtime:v2026-02-28 --record  (rolled back pods; rollouts status ok)\\n  - argo rollouts promote infra-app --previous (to revert to previous stable)\\n\\nPlanned rollback procedure (for future):\\n1) If canary error rate > 5% sustained for >15m, auto-trigger: argo rollout abort + set image to last-stable tag.\\n2) Add immediate traffic diversion: promote baseline with stepdown (route 100% away from canary).\\n3) Collect artifacts: pod logs, core dumps (if any), full request traces (trace ids), and store under REL-4321.\\n4) Notify release-eng + SRE + on-call model team.\\n\\nPostmortem notes (to expand):\\n- Suspect root cause in PR infra#789 : changes to kv_cache invalidation timing + a subtle sequence-number increment bug. Model-serving runtime changes exposed for longer seqs.\\n- Hotfix options: revert PR (fast rollback) OR patch kv_cache to add stricter seq-checks and retry semantics.\\n- Longer term: add regression test in e2e harness for >1024 token streaming that validates chunked streaming and kv_cache consistency under concurrency.\\n\\nAction items (short):\\n- [ ] Create rollback automation playbook (owner: Maya) -- link to playbook draft in Confluence.\\n- [ ] Add e2e test case to infra/tests/streaming_long_context (owner: Liam)\\n- [ ] Patch PR to add additional metrics around kv_cache invalidation events (owner: Samir)\\n- [ ] Postmortem writeup (owner: Samir) and link to REL-4321.\\n\\nNotes & traces:\\n- Repro harness output: gist: https://gist.github.com/samirp/stream-repro-2026-03-03\\n- Infra PR: https://github.com/redwood-inference/infra/pull/789\\n- Jira: REL-4321\\n- Confluence draft: https://confluence.redwood.ai/display/RE/Canary+Rollout+Notes\\n\\nShort-term decision: rollback complete to v2026-02-28 (stable). Start hotfix branch and add regression test before next canary.\\n\\nMisc (notes to self):\\n- Check if GPU driver update rolled out on nodepool this week (nodepool-3). If so, correlate with canary pod node allocation.\\n- Keep a low friction way to pin old image tags in Argo app CRs.\\n\\nEnd of scratchpad.\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_9d7e1da400c045958472157c77147e44"
+}

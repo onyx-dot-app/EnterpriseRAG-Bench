@@ -1,0 +1,34 @@
+{
+  "title": "auth-api-401-429-debug-scratchpad-lena-2026-03-22",
+  "owner": "Lena Park",
+  "drive_area": "users",
+  "path": "shared_drives/users/auth-api-401-429-debug-scratchpad-lena-2026-03-22",
+  "doc_type": "doc",
+  "created_at": "2026-03-22",
+  "last_modified": "2026-03-23",
+  "collaborators": [
+    "Samir Khan",
+    "Oliver Diaz"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "auth",
+    "rate-limit",
+    "401",
+    "429",
+    "investigation",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "JIRA:INF-2345",
+    "Confluence:api-rate-limits",
+    "GH:github.com/redwood-inference/platform/issues/987"
+  ],
+  "content": "Objective: quick scratchpad for the 401/429 behaviour observed across hosted API endpoints. Use this to collect commands, logs, hypotheses and next steps before filing a cleaner incident report.\n\nSymptoms observed:\n- Intermittent 401 responses starting ~2026-03-21 22:18 UTC for client X (prod key). Happens ~1-2% of requests, mostly to /v1/chat/completions.\n- 429 spikes later in the day (2026-03-22) after deploy, broader client base. 429s include Retry-After header sometimes, sometimes not.\n- Other endpoints (embeddings, rerank) less affected.\n- No obvious billing failure in account dashboard.\n\nCommands / repro attempts I ran:\n1) Capture response headers with curl (raw):\n   curl -i -X POST https://api.redwood.ai/v1/chat/completions \\n     -H \"Authorization: Bearer $API_KEY\" \\n     -H \"Content-Type: application/json\" \\n     -d '{\"model\":\"openchat-7b\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}'\n\n   Observed sample 401 response (curl -i):\n   HTTP/1.1 401 Unauthorized\n   Date: Sun, 22 Mar 2026 22:43:10 GMT\n   Content-Type: application/json\n   Content-Length: 123\n   Connection: keep-alive\n\n   {\"error\":{\"message\":\"Invalid API key\",\"type\":\"auth_error\",\"param\":null,\"code\":null}}\n\n2) Same call with -v to see TLS and connection: no TLS errors, handshake fine.\n\n3) Tried passing key as query param (not recommended) to test backend path:\n   curl -i \"https://api.redwood.ai/v1/chat/completions?key=$API_KEY\" \\n     -H \"Content-Type: application/json\" -d '{...}'\n   -> 401 as well. Indicates auth check happens in front of route.\n\n4) Python requests quick-check: (used requests.session to reuse conn)\n   import requests\n   s = requests.Session()\n   r = s.post('https://api.redwood.ai/v1/chat/completions', headers={'Authorization':f'Bearer {API_KEY}'}, json={...})\n   print(r.status_code, r.headers.get('x-request-id'))\n   -> 401, x-request-id: req-6f4a2b\n\n5) Checked header casing/whitespace: trimmed token, ensured no stray quotes. Same result.\n\n6) Rate-limit repro: I wrote a small loop to send ~200 requests/min with valid API key: observed 429s after ~120 requests within a 60s window. Sample 429 payload: {\"error\":{\"message\":\"Rate limit exceeded\",\"type\":\"rate_limit_error\"}}\n   Response headers when 429 provided (varies):\n     Retry-After: 10\n     X-RateLimit-Limit: 120\n     X-RateLimit-Remaining: 0\n     X-RateLimit-Reset: 17110826\n\n   However some 429s showed none of the limit headers (frontend drop).\n\nLogs / correlated IDs I pulled:\n- req-6f4a2b (401) 2026-03-22T22:43:10Z client_ip=35.187.12.4 client_id=acct-prod-42 route=/v1/chat/completions auth_check=failure reason=key_not_found\n- req-7a9c1d (429) 2026-03-22T23:02:05Z client_ip=35.187.12.4 client_id=acct-prod-42 route=/v1/chat/completions quota_window=60s used=121 limit=120\n\nNotes from logs: some 401s show reason=key_revoked and some say key_not_found. Timestamps overlap with a key rotation event recorded in GH ops-log (see linked artifact).\n\nHypotheses (ranked):\n1) Key rotation / partial rollout: a subset of our edge servers got an updated key mapping where some keys are missing or outdated \u2014 explains intermittent 401 with key_not_found / key_revoked.\n2) Incorrect or stale cache in auth-service: auth-service caches tenant->key mapping and may have stale entries after a database migration. Explains sudden 401 spike correlated with deploy.\n3) Rate limit config mismatch: chat endpoint has a stricter per-minute limit (120/min) vs embeddings (higher). A sudden traffic shift (cron job on client using chat) led to 429s. Some edge proxies drop headers when they hit global rate limit bucket, hence missing X-RateLimit-* headers.\n4) Billing/blocked account for some clients: but dashboards show account active \u2014 low probability.\n5) Downstream auth-db replication lag causing transient key_not_found.\n\nImmediate mitigations tried / suggested:\n- Recreate repro with curl using suspect key and capture x-request-id; forwarded to SRE with timestamp + id.\n- Scoped test: rotated a non-prod key and saw consistent 401 until rotation fully propagated -> suggests rotation propagation issue.\n- Added exponential backoff retries for 429s in client to reduce load.\n- Temporary quota bump for acct-prod-42 requested via internal console (pending).\n\nClient-side recommendations to ship quickly:\n- Implement client-side retries for 429 with exponential backoff and jitter. Use Retry-After header when present.\n- Avoid bursty cron-style requests to chat endpoint; batch or stagger.\n\nNext steps / action items:\n- [ ] Add full list of affected request-ids and timestamps to JIRA INF-2345 (Samir doing).\n- [ ] Check auth-service cache invalidation logs around 2026-03-21 22:00-23:00 UTC (Oliver).\n- [ ] Confirm whether key rotation job had partial failures (release-engineering). Link: GH issue in linked_artifacts.\n- [ ] Add better observability: surface X-RateLimit-* headers in frontend responses even when global bucket rejects (Product/Platform).\n- [ ] Short-term: issue org-level quota increase for acct-prod-42 if customer impact continues.\n\nOpen questions / things to verify:\n- Why do some 429s not return rate-limit headers? proxy vs global limiter? Need SRE to confirm.\n- Why do 401 reasons vary between key_not_found and key_revoked? Are we mixing rotated+reclaimed keys?\n- Any traffic pattern change on client side? confirm with customer.\n\nScratch notes / quick commands saved: \n- capture headers with curl: curl -i -H \"Authorization: Bearer $K\" -d @payload.json https://api.redwood.ai/v1/chat/completions | sed -n '1,20p'\n- get request-id and call internal logs: ./infra-tools/logs --id req-6f4a2b --since 1h\n\nTail thought: this feels like two related but separate issues \u2014 auth mapping/rotation causing 401, and unrelated but concurrent rate-limit saturation causing 429. Both surfaced because traffic shifted to chat endpoint after a deploy.\n\nI'll keep adding request-ids and timestamps here. Once we have a clean list we'll attach to INF-2345 and loop in SRE + release-engineering.\n\n-- Lena",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_7445550ad2b843b9979a2bd71c1cd718"
+}

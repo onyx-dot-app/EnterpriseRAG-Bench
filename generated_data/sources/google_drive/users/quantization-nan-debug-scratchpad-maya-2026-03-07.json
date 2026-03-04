@@ -1,0 +1,42 @@
+{
+  "title": "quantization-nan-debug-scratchpad-maya-2026-03-07",
+  "owner": "Maya Chen",
+  "drive_area": "users",
+  "path": "users/quantization-nan-debug-scratchpad-maya-2026-03-07",
+  "doc_type": "doc",
+  "created_at": "2026-03-07",
+  "last_modified": "2026-03-08",
+  "collaborators": [
+    "Ethan Patel",
+    "Diego Ruiz"
+  ],
+  "team": "eng-applied-ml",
+  "status": "draft",
+  "tags": [
+    "quantization",
+    "int8",
+    "fp8",
+    "bf16",
+    "nan",
+    "debug",
+    "repro"
+  ],
+  "linked_artifacts": [
+    "GH:repo/PR#842",
+    "JIRA:INF-1284",
+    "confluence:quantization-playbook"
+  ],
+  "content": "Scratchpad: NaN / quality regression when switching to INT8 (and sometimes FP8) with zeta-3b model.\n\nSummary / symptom:\n- Intermittent NaNs in logits during decode with int8-quantized model.\n- Behavior: first few tokens are fine, then at some step softmax returns NaN and generation stops (or torch throws RuntimeError: value nan in loss).\n- Observed more frequently with long contexts (>1024) and with KV cache enabled.\n- BF16 runs OK, FP32 OK. FP8 sometimes reproduces depending on exponent config (e4m3 vs e5m2).\n\nEnvironments tested:\n- Local dev (A100 40GB, CUDA 12.1, torch 2.2.0), small infra node (p4d-like).\n- Repro script: repo: tools/quant-repro/run_repro.py (model.load_quantized(...), generate loop with max_new_tokens=256).\n\nCommands tried (most recent):\n1) baseline FP32 (stable):\n   python run_repro.py --model zeta-3b --dtype fp32 --max_new_tokens 256 --seed 42\n2) bf16 (works):\n   python run_repro.py --model zeta-3b --dtype bf16 --max_new_tokens 256 --seed 42\n3) int8 (failing often):\n   python run_repro.py --model zeta-3b --quantize int8 --qtype per_channel --calib_steps 200 --max_new_tokens 256 --seed 42\n   -> NaN at step ~37 (non-deterministic, reproducible ~60% with same seed)\n4) fp8 attempt (flaky):\n   python run_repro.py --model zeta-3b --quantize fp8 --fp8-config e4m3 --max_new_tokens 256\n   -> some runs fine, others NaN (fp8 slightly more stable than int8 but flaky)\n\nObserved logs / stack snippets:\n- Runtime error when loss computed: RuntimeError: value nan in loss.\n- Traceback (trimmed):\n  File \"/home/maya/projects/quant-repro/runner.py\", line 143, in step\n    logits = model.forward(input_ids, past_key_values=past)\n  File \"/opt/venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1190, in _call_impl\n    return forward_call(*args, **kwargs)\n  RuntimeError: value nan in loss\n- Dumped intermediate activations show inf/NaN in attention scores (pre-softmax). Example: attention_logits[12, :, :] contains 1.2e+38 or nan.\n\nHypotheses / notes:\n- Quant scale mismatch: per-tensor vs per-channel scales could create extreme scale values for small-magnitude weights -> overflow in matmul -> huge logits.\n- KV cache accumulation: casting cached keys/values to lower precision (int8 path) and accumulating across steps leads to drift/growth and eventual overflow.\n- Rotary embeddings / position encoding interactions: rotary uses float sin/cos; quantization might zero small values or introduce large relative errors at high positions.\n- Softmax overflow due to very large logits; FP8 sometimes helps because of exponent range (e4m3 > int8 dynamic), but not consistent.\n- Calibration distribution not representative: clip thresholds too tight; outliers saturate and blow up downstream when rescaled.\n\nWhat I tried / observations:\n- Calibration steps: 200 -> frequent NaN; 2000 -> fewer NaNs but still occasional.\n- Per-channel quantization reduces NaN frequency vs per-tensor.\n- Symmetric quantization slightly better than affine with zero_point in our tests.\n- Enabling float32 accumulation (in GEMM / matmul) reduces failures; need to verify which kernels used (triton vs cutlass) and accumulation flags.\n- Clipping activations pre-softmax prevents NaN (band-aid) but heavily alters outputs.\n- Deterministic algorithms (torch.use_deterministic_algorithms(True)) reduces variance but doesn't remove NaN.\n\nRepro artifacts / scripts:\n- tools/quant-repro/repro_int8_nan.py -> minimal loop to trigger NaN, dumps attention_logits to repro/artifacts/ for analysis.\n- artifacts contain .npy dumps of: attention_logits_step_*.npy, kv_stats.json (mean/std per-layer), weight_scale_hist.npy.\n- Add quick script to compare scales: tools/quant-repro/inspect_scales.py (per-layer histograms).\n\nImmediate next steps (todo):\n- Add guard checks in runtime: after matmul, check for inf/nan and log layer id + max/min values (fast path to fail loudly).\n- Force float32 accumulation in GEMM for int8 path and run 1000 repro runs to see stability.\n- Instrument KV cache: log norm of keys/values each step to see drift pattern.\n- Try per-channel symmetric quant + larger calibration dataset (logs from prod prompts, ~5k).\n- Run targeted test where rotary embeddings are replaced with identity (sanity check) to isolate if position rotations cause amplification.\n- Try fp8 with e5m2 config (larger exponent) to compare stability.\n- Cross-check with reference CPU matmul in float32 after dequantize to confirm whether problem originates pre or post-gemm.\n\nQuestions / things to ask folks:\n- @Ethan: can you dump kernel selection logs for the failing runs? suspect some matmuls falling back to less-precise kernel.\n- @Diego: can you re-run calibration with 5k prod-ish prompts and push new scales?\n- @Runtime team: how do we force float32 accumulation on A100 kernels in our runtime (cutlass/triton flags)?\n\nNotes from quick chat with Diego (2026-03-07 15:10):\n- Diego saw similar NaN on a separate model variant (zeta-6b) but only when sequence length >2048 and with long chat histories. Thinks cache accumulation is probable.\n- Suggested to try incremental decode with periodic re-centering of cache (re-encode every N tokens) as mitigation to test hypothesis.\n\nRelated artifacts / tickets:\n- JIRA INF-1284: quantization NaN incidents (linked).\n- GH PR#842: changes to per-channel quant routine (might be related).\n- confluence: quantization-playbook (doc with calibration best-practices).\n\nShort log of experiments (chronological):\n- 2026-03-05: initial repro on zeta-3b int8, frequent NaNs.\n- 2026-03-06: tried per-channel and symmetric quant -> improvement but still flaky.\n- 2026-03-07: instrumented dumps and verified attention logits blow up; asked runtime/kernel owners for accumulation flags.\n- 2026-03-08: increased calibration to 2k steps; run longer batch of 200 runs overnight (results pending).\n\nNotes-to-self:\n- Keep repro seed consistent but expect nondeterminism from kernels.\n- When attaching artifacts to ticket, include small nparrays for attention logits (masked to first 128 steps) to keep upload size small.\n- If we find root cause near KV accumulation, consider short-term mitigation: rebase KV to float32 after every N steps or use running mean subtraction to prevent drift.\n\nBottom line: plausible root causes: (1) poor calibration/clipping producing extreme scales; (2) accumulation/precision loss in KV cache; (3) kernel selection/accumulation type causing reduced dynamic range. Next actions: instrument more, force float32 accumulation, larger calibration, and isolate rotary/kv effects.\n",
+  "content_short": "Notes + commands for debugging NaN in INT8/FP8 quantization; reproducible on zeta-3b; hypotheses: scale mismatch, kv-cache accumulation, softmax overflow; calibration and per-channel help partially; next steps: instrument kernels, force float32 accumulation, larger calib set.",
+  "notes_tags": [
+    "repro",
+    "investigation",
+    "action_items"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "content",
+    "content_short"
+  ],
+  "dataset_doc_uuid": "dsid_1e097ac647c748b3a146835513d41804"
+}

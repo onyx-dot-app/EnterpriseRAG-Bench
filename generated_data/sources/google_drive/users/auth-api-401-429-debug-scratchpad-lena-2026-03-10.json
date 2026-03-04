@@ -1,0 +1,35 @@
+{
+  "title": "auth-api-401-429-debug-scratchpad",
+  "owner": "Lena Park",
+  "drive_area": "users",
+  "path": "users/lena-park/debug/auth-api-401-429-debug-scratchpad",
+  "doc_type": "doc",
+  "created_at": "2026-03-06",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Michael Chen",
+    "Aisha Khan"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "auth",
+    "api-key",
+    "rate-limit",
+    "401",
+    "429",
+    "debug",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "https://redwood.atlassian.net/browse/INF-2345",
+    "https://company.slack.com/archives/C12345/p1677712345678"
+  ],
+  "content": "Context:\n- Intermittent 401 + 429 errors observed for hosted API (mostly prod, occasional staging) starting 2026-03-05 18:30 UTC. Reports from 3 customers (small spike) + internal synthetic monitors. Impact: short-lived failures (~30s-2m) causing retries and some downstream errors in callers.\n\nObserved patterns:\n- 401s tend to cluster around the same minute as 429 bursts in some traces (not always).\n- 401 payloads returned to clients: {\"error\":\"Unauthorized\",\"message\":\"Invalid API key\"} or plain 401 with empty body.\n- 429 responses include headers in some cases: Retry-After: 3, X-RateLimit-Limit: 1000, X-RateLimit-Remaining: 0, X-RateLimit-Reset: <unix-ts>.\n- Synthetic monitor (eu-prod-synth1) showed 401s at 2026-03-05T18:31:02Z and 18:31:04Z then recovered.\n\nCommands / repro attempts:\n1) Basic request with good key (worked):\n   curl -i -X POST 'https://api.redwood.com/v1/generate' \\n     -H 'Authorization: Bearer $GOOD_KEY' \\n     -H 'Content-Type: application/json' \\n     -d '{\"model\":\"redwood-1\",\"input\":\"hello\"}'\n\n   -> HTTP/1.1 200 OK\n\n2) Using an obviously bad key (repro 401):\n   curl -i -X POST 'https://api.redwood.com/v1/generate' \\n     -H 'Authorization: Bearer BAD_KEY' \\n     -H 'Content-Type: application/json' \\n     -d '{\"model\":\"redwood-1\",\"input\":\"hello\"}'\n\n   -> HTTP/1.1 401 Unauthorized\n   Body: {\"error\":\"Unauthorized\",\"message\":\"Invalid API key\"}\n\n3) When we saw 401s in prod, I pulled headers from failing requests (via proxy logs):\n   - Host: api.redwood.com\n   - Authorization: Bearer <redacted>\n   - request-id: 01FJ3X...\n   - user-agent: curl/7.82\n\n4) 429 reproduction (rate limit header present):\n   - Spammed endpoint from loadgen -> got 429 with Retry-After=2 and X-RateLimit-Remaining=0.\n\nServer-side log excerpts (sanitized):\n- 2026-03-05T18:31:02Z host=api-route-3 req_id=01FJ3X user_id=acct_123 api_key_id=key_abc status=401 reason=invalid_signature\n- 2026-03-05T18:31:02Z host=ratelimiter-1 req_id=01FJ3X api_key_id=key_abc limit=1000 remain=0 reset=1700000000 status=429\n- 2026-03-05T18:31:04Z host=auth-proxy req_id=01FJ3Y api_key_id=key_def cache_hit=false oauth_state=unknown status=401\n\nInitial observations / hypotheses:\n- Hypothesis A: Partial key rotation churn (some service updated key store earlier) -> transient invalid_signature / invalid_key between services (auth-proxy vs kv-store) -> 401s.\n  - Evidence: some 401 logs show reason=invalid_signature and api_key_id present. Also saw a deployment of key-sync-job ~18:30.\n- Hypothesis B: Rate limiter mis-attribution where when a key hits global limit, some path incorrectly returns 401 instead of 429 (bug in error translation or middleware).\n  - Evidence: 429 entries appear for same req_id close in time; some proxies downstream return 401 for clients even though ratelimiter emitted 429.\n- Hypothesis C: Edge / CDN caching edge-case: stale cached 401 responses returned for certain Authorization header patterns (unlikely but possible).\n- Hypothesis D: Client-side: some clients sending truncated Authorization header due to proxy (rare).\n\nThings I've tried / checked so far:\n- Checked key-sync job logs around 18:28-18:34 -> one run completed with a warning about a TTL refresh; rollout to 2 nodes delayed 20s. (suspicious)\n- Verified API key metadata in account service for key_abc/key_def -> active, not revoked, usage within quota.\n- Queried rate-limiter metrics -> small spike at 18:31 but within expected for minute window; per-key metrics show key_abc hit limit then dropped back.\n- Correlated request-ids across auth proxy and gateway -> found sequences where gateway logged 429 then auth-proxy logged 401 for same req_id (translation mismatch).\n- Looked at proxy code that maps limiter error -> translation layer returns 401 for some error codes (open PR in 2026-02 but not released?).\n\nImmediate next steps (TODO):\n- [ ] Confirm which commit was deployed to auth-proxy and gateway around 18:28-18:32 (ask infra/release). + Michael to check.\n- [ ] Reproduce locally with same key sync cadence: run key-sync job and issue requests concurrently to see race (I have a small test harness).\n- [ ] Add extra logging at translation boundary to capture original limiter error & final response code (hotfix if possible).\n- [ ] Temporarily increase rate-limiter per-key throttle for affected accounts (mitigation) -> needs SRE approval.\n- [ ] Check CDN/edge caches for any caching rules keyed on Authorization header (unlikely, but check config).\n- [ ] Contact customers affected with short postmortem once root cause nailed.\n\nShort-term mitigations tried/planned:\n- Throttle smoothing: configure gateway to prefer 429 semantics consistently and not normalize to 401. (config patch queued)\n- Roll back recent auth-proxy change if we reproduce correlation with the key-sync timing.\n\nNotes for postmortem / debugging breadcrumbs to capture later:\n- Timeline of deploys and key-sync runs mapped to 1s resolution.\n- Full chain trace for example req_id that exhibited 429->401.\n- Copy of rate-limiter config & recent PRs modifying error codes mapping.\n- Any rollback of CDN config in last week.\n\nLinks / refs:\n- Jira INF-2345 (investigate 401/429 translation bug)\n- Slack thread: #prod-issues thread from 2026-03-05 (link above)\n- Key-sync job: infra repo, job id key-sync-v2 (recent deploy 2026-03-05 18:27)\n\nScratchy hypotheses summary (for later):\n- Most likely: race between key-store refresh and auth-proxy reads causing transient invalid_signature -> 401s.\n- Also likely: translation bug where ratelimiter errors get mapped to 401 in some code paths.\n\nOwner / next owner: Lena (me). Michael helping with deploy logs. Aisha to check customer impact comms.\n\nNotes-to-self: keep this doc lightweight; move final timeline + evidence to Jira ticket INF-2345 when we have a root cause.\n\n",
+  "file_path": "sources/google_drive/users/auth-api-401-429-debug-scratchpad-lena-2026-03-10.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_7f828ad27fd747be87f5b439d96b7507"
+}

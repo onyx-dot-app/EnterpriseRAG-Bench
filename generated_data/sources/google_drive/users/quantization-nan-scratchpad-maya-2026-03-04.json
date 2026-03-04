@@ -1,0 +1,35 @@
+{
+  "title": "quantization-nan-scratchpad-maya-2026-03-04",
+  "owner": "Maya Rivera",
+  "drive_area": "users",
+  "path": "users/quantization-nan-scratchpad-maya-2026-03-04",
+  "doc_type": "doc",
+  "created_at": "2026-03-02",
+  "last_modified": "2026-03-04",
+  "collaborators": [
+    "Ethan Cole",
+    "Priya Nair"
+  ],
+  "team": "eng-applied-ml",
+  "status": "draft",
+  "tags": [
+    "int8",
+    "fp8",
+    "bf16",
+    "nan",
+    "quantization",
+    "debug",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-Quantization-Investigation",
+    "JIRA-ML-4321",
+    "https://github.com/redwood-inference/runtime/pull/987"
+  ],
+  "content": "Summary / goal:\n- Track debugging notes for intermittent NaNs and quality regressions observed after enabling INT8/FP8 quantization profiles on the 7B/13B family.\n- Primary symptom: occasional NaN logits and 'loss: nan' during short evals; more frequent when using fp8-mantissa optimized kernels and per-tensor scales on some layers.\n\nRepro notes (high level):\n- Model: rwd-7b-v1 (transformer, RMSNorm + rotary).\n- Baselines: FP32 and BF16 run cleanly.\n- Quant modes tried: INT8 per-channel (weights only), INT8 per-tensor, FP8 E4M3, BF16 activation-only.\n- Failures primarily when enabling activation quantization + FP8 kernels.\n\nCommands I ran:\n- python tools/quantize.py --model checkpoints/rwd-7b-v1 --out quant/rwd-7b-int8-pc --bits 8 --scheme per_channel --calib-dataset data/calib_small.json\n- python run_eval.py --model quant/rwd-7b-int8-pc --dtype int8 --batch 4 --prompt-file eval/prompts.txt --dump-activations activations/int8-pc/\n- python run_eval.py --model quant/rwd-7b-fp8-e4m3 --dtype fp8 --batch 1 --prompt-file eval/prompts.txt --trace-level debug\n- (internal) ri-run --model rwd-7b-v1 --quant=fp8 --kernel=fast-fp8 --trace /tmp/trace.log\n\nObserved error snippets / traces:\n- eval run (int8 activation + per-tensor) stdout:\n  Step 12/50 loss: 8.271\n  Step 13/50 loss: nan\n  RuntimeWarning: overflow encountered in exp (softmax)\n  RuntimeError: NaN encountered in attention_scores at layer 8\n\n- trace.log (fp8 run):\n  [2026-03-03T14:22:10Z] layer12: att_scores max=1.2e+38 min=-1.1e+38 -> after softmax produced inf/nan\n  [2026-03-03T14:22:10Z] kernel fast-fp8: scale_factor=2.3e-2, clip_threshold=127\n  [2026-03-03T14:22:10Z] fallback to fp16 path not available (dedicated kernel mismatch)\n\nHypotheses (ranked):\n1) Quantization scales are too coarse for some attention layers -> softmax exponent overflows -> NaN. Per-tensor scale for activations causes dynamic range loss; per-channel reduced but not eliminated.\n2) Loss of precision in RMSNorm / layernorm (small denominators) when using fp8 -> division leads to inf -> propagated NaN.\n3) Kernel bug in fast-fp8 path: incorrect clamp/round order or missing denorm handling.\n4) Calibration dataset not representative -> out-of-distribution activation ranges at inference time.\n5) KV cache accumulation with quantized activations leads to progressive growth due to rounding bias.\n\nQuick checks I ran (results):\n- Re-run with BF16 activations: problem disappeared in short evals -> suggests precision / dynamic range issue.\n- INT8 per-channel weights + FP32 activations: no NaNs -> points to activation quantization being suspect.\n- INT8 per-tensor activations + per-channel weights: intermittent NaNs -> per-tensor activations are risky.\n- Dumped layer stats for run that produced NaN: layer 8 att_scores max ~ 1.2e+38 -> suggests overflow.\n- Re-ran with smaller batch size (1) and no fp8 kernel: stable.\n\nDebug steps / TODO (next actions):\n- [ ] Add NaN/Inf sanitizer early in runtime to dump first NaN-producing tensor + layer id + pre-quantization stats. (quick patch)\n- [ ] Re-run calibration using larger, high-diversity dataset (include long tails and punctuation-heavy prompts).\n- [ ] Compare per-channel vs per-tensor activation ranges: script to compute histograms per-layer across calibration set (scripts/activation_stats.py).\n- [ ] Add temporary clamping in softmax input (e.g., clamp logits to +/- 50) to see whether NaN disappears; if yes, it's overflow.\n- [ ] Instrument RMSNorm: dump variances near zero and add epsilon increase to test stability.\n- [ ] Run with denorms flushed and IEEE flags set to trap FP exceptions (gdb/UBSAN) on kernel failing run.\n- [ ] Reproduce failing run under ASAN/TSAN on CPU emulation if possible (to catch misordered memory ops).\n- [ ] File a runtime bug if fast-fp8 kernel shows missing denorm handling: attach trace + minimal reproducer.\n\nShort-term mitigations applied so far:\n- Disabled fast-fp8 kernel on staging: no regressions after disable (patch reverted to safer fp16 fallback).\n- Enabled per-channel activation scaling for suspect layers 6-10 as a band-aid.\n\nNotes / ideas:\n- Might be worthwhile to use symmetric vs asymmetric quantization and check zero-point behavior for attention softmax inputs. Asymmetric zero-point errors can shift logits and cause one side of distribution to blow up after exp.\n- Consider calibrating with outlier-aware scale (e.g., percentile 99.999) and then use dynamic activation clipping during first N tokens.\n- For fp8, check exponent bias/overflow threshold used by our kernels; E4M3 vs E5M2 has different dynamic ranges. We may be using E4M3 but thought E5M2 could be safer for attention layers.\n\nScratch timeline / breadcrumbs:\n- 2026-03-02: First NaN observed in A/B eval after enabling FP8 in canary (staging).\n- 2026-03-03: Reproduced locally with --trace, found layer 8 att_scores huge. Disabled fast-fp8 kernel, temporary fix.\n- 2026-03-04: Start deeper instrumentation + plan for calibration rerun.\n\nAttachments / where I put dumps:\n- activations/int8-pc/ (layer-wise dumps from failing run)\n- traces/trace-2026-03-03.log (fp8 fast kernel trace)\n\nUseful commands for follow-up:\n- python tools/activation_stats.py --input activations/int8-pc/ --out stats/int8-pc-layer-stats.json\n- python -c \"import numpy as np; a=np.load('activations/layer8.npy'); print(a.max(), a.min(), np.isnan(a).any())\"\n\nQuestions for the team:\n- Priya: do we have a recommended fp8 format for attention-heavy models? E4M3 or E5M2 in practice?\n- Ethan: can infra build an image with FP exception traps enabled for one staging node?\n\nImmediate decision: keep fast-fp8 disabled in staging and disable activation quantization by default until we have robust per-layer calibration and NaN sanitizer in place.\n\n-- Maya\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_9ebefa3968754f1c889ee9fabb93a676"
+}

@@ -1,0 +1,59 @@
+{
+  "meeting_id": "ff-20260330-datascribe-ooms-01",
+  "recorded_at": "2026-03-30T15:00:00-07:00",
+  "duration_minutes": "54",
+  "call_type": "technical_deep_dive",
+  "title": "Redwood technical deep dive: OOMs, timeouts, CUDA errors & retry semantics",
+  "redwood_owner": "Alex Morgan",
+  "redwood_attendees": [
+    "Alex Morgan - Account Executive",
+    "Priya Shah - Solutions Engineer"
+  ],
+  "customer_company": "DataScribe Labs",
+  "customer_attendees": [
+    "Carlos Vega - ML Infrastructure",
+    "Maya Singh - Platform Engineering",
+    "Evan Li - CTO"
+  ],
+  "transcription_quality": "medium",
+  "competitors_mentioned": [
+    "Anthropic",
+    "AWS Bedrock",
+    "OpenAI"
+  ],
+  "crm_deal_id": "CRM-DS-4821",
+  "summary": "Deep dive on intermittent OOMs and CUDA timeouts observed during large-context inference. Covered KV cache sizing, batching behavior, quantization tradeoffs, retry semantics, and VPC implications. Agreed next steps to run targeted benchmarks, collect per-kernel logs, and test retry/backoff changes in staging.",
+  "topics": [
+    "OOM root cause hypotheses (KV cache, batch packing, long sequences)",
+    "CUDA timeouts and driver/kernel watchdog interactions",
+    "Retry semantics: idempotency, partial outputs, and client-visible effects",
+    "Batching and tail latency tradeoffs",
+    "Quantization effects on memory and OOM risk",
+    "Private deployment / VPC networking considerations for retries and observability"
+  ],
+  "attachments": [
+    "https://redwood.company/decks/oom-debugging-playbook.pdf",
+    "https://redwood.company/benchmarks/datascribe-ooms-2026-03.csv"
+  ],
+  "next_steps": [
+    "Priya to run targeted 8k/16k sequence benchmarks with KV cache disabled/enabled and share results by 2026-04-06",
+    "Carlos to share recent kube logs, nvidia-smi snapshots and pod yaml (resource limits) by 2026-04-02",
+    "Alex to send security docs and private deployment checklist by 2026-04-01",
+    "Schedule follow-up 30-min sync week of 2026-04-13 to review results"
+  ],
+  "action_items": [
+    "Priya: run perf/oom benchmarks on staging (8k/16k) \u2014 due 2026-04-06",
+    "Carlos: collect and upload kube logs + nvidia-smi history \u2014 due 2026-04-02",
+    "Alex: share Redwood private deployment security summary + pricing options \u2014 due 2026-04-01"
+  ],
+  "transcript": "Meeting Header:\nDate: 2026-03-30\nStart: 15:00 PDT\nDuration: 54 minutes\nAttendees: Alex (Redwood AE), Priya (Redwood SE), Carlos (DataScribe ML infra), Maya (Platform Eng), Evan (CTO)\n\n[00:00] Alex: Hey everyone, thanks for doing this deep dive, we wanted to focus on the intermittent OOMs and the CUDA driver timeouts you saw last week. quick agenda \u2014 root cause hypotheses, what we can instrument, and next steps.\n[00:18] Carlos: Thanks Alex, yeah we've been seeing pods crash on heavy inference workloads, usually long sequences (8k+) but sometimes shorter when batching spikes. the symptoms: container restarts, CUDA errors in logs, and occasional weird partial outputs.\n[00:35] Priya: okay, couple quick clarifications \u2014 when you say partial outputs, do you mean truncated responses mid-token or malformed JSON?\n[00:44] Maya: mostly truncation. we get a chunk of text then the connection resets, and the client gets an RPC error. sometimes the process OOMs, other times it's a driver timeout.\n[00:57] Priya: got it. that mismatch (OOM vs driver timeout) often points to two things \u2014 either memory pressure (KV cache + batching + long seq) or a kernel hang causing watchdog timeouts. we'll walk through both.\n[01:12] Evan: important context \u2014 we're running on dedicated Gpus in our VPC, using k8s, node pool of p4d instances, pod limits: 180Gi mem, 8 vCPU, exclusive gpu.\n[01:24] Alex: thanks. and are you using quantization (int8/q4) for these workloads?\n[01:29] Carlos: yes we've tried q4_0 for cost reduction, but we've also tested float16. OOMs seemed worse with q4 in some runs \u2014 surprised us.\n[01:38] Priya: that can happen \u2014 quantization reduces model weight memory but can increase temporary workspace or change kernel selection which may spike peak memory. also different kernels can allocate intermediate buffers differently, so q4 isn't always lower peak memory for long contexts.\n[01:52] Carlos: interesting \u2014 we assumed quantization was always safer for memory.\n[01:56] Priya: common assumption. two hypotheses to test: 1) KV cache growth combined with aggressive batch packing causes memory spikes; 2) a specific kernel path for quantized inference triggers a hang under certain sequence lengths, leading to driver timeouts.\n[02:12] Maya: can you explain the KV cache sizing? we use dynamic KV cache based on batch and sequence length. is there a known worst-case multiplier?\n[02:21] Priya: yes, KV cache is roughly proportional to batch_size * max_seq_len * kv_entry_size (model dependent). if you do packing that puts multiple user contexts in same batch the effective memory can be much higher than single-session runs. also if we keep KV cached across many concurrent sessions, the sum can exceed pod memory.\n[02:39] Alex: and note Redwood has an automatic prefix/KV cache; for some customers we've suggested bounded per-session KV and eviction policies to avoid runaway growth.\n[02:49] Carlos: currently we set cache to 'session' and we don't evict until session end. maybe that's the issue.\n[02:54] Priya: that would explain sustained high memory. couple instrument suggestions: add per-pod KV size metric (bytes), track batch packing histogram, and capture per-request max_seq_len.\n[03:06] Maya: ok we'll add those. what about the CUDA timeouts?\n[03:11] Priya: driver timeouts often show as watchdogs killing the process when a kernel runs longer than the driver's watchdog threshold, especially on GPUs attached to a display driver (less common on datacenter instances) or when a kernel deadlocks. we should collect kernel logs: cudaLaunch failures, smem alloc errors, and the exact driver messages.\n[03:28] Carlos: logs show 'CUDA_ERROR_LAUNCH_TIMEOUT' in a few cases plus a few 'cuCtxSynchronize' failures.\n[03:35] Priya: that aligns. another possible cause is excessive sequential host-to-device transfers blocking progress or a kernel hitting an unexpected control flow leading to long runtime. For quantized kernels we sometimes see different launch configurations.\n[03:48] Evan: how do retries work in Redwood? our clients surface retries as errors now, which is bad for UX.\n[03:54] Alex: Redwood's default is a best-effort retry for internal transient errors at the runtime level with configurable backoff. important nuance: we only auto-retry idempotent generation requests where the client hasn't consumed streaming tokens. if a partial stream has been sent we avoid automatic retries to prevent duplicate output.\n[04:12] Priya: so we need to consider what your clients do \u2014 if they stream tokens to end-users, automatic retries won't help; for non-streaming RPCs we can often retry safely. we can also provide a 'retryable' flag in the request meta.\n[04:27] Carlos: a lot of our services stream straight to the app. that explains visible errors. we'd prefer the runtime to avoid dropping connections mid-stream.\n[04:35] Priya: for streaming workloads the better approach is to avoid the failure cause: control memory growth, tighten kernel time budgets (smaller batch sizes), and set conservative per-request timeouts with graceful fallback.\n[04:48] Maya: you mentioned batching \u2014 what's the tradeoff? we're seeing higher throughput with larger batches but spikes in tail latency and these OOMs.\n[04:57] Priya: exactly. batching improves throughput and amortizes kernel overhead but increases peak memory per step and can induce stragglers if a heavy request is packed with light ones. Redwood supports workload-aware batching \u2014 you can pin certain routes to max_batch=1 or lower batch sizes for long-context routes. Also we have adaptive batch shapers that try to limit total tokens in-flight rather than count of requests.\n[05:18] Carlos: that sounds useful. is there tracing or per-kernel timeline we can export?\n[05:24] Priya: yes, we can enable per-token kernel profiling in staging (it adds overhead) and capture per-request memory high-water marks. we'll share a profiling artifact.\n[05:32] Evan: what about node-level OOM killer vs application OOM? we've seen 'OOMKilled' in kube events.\n[05:38] Priya: kube's OOMKilled means kernel killed the process due to exceeding cgroup memory limit. if container memory limit is too tight relative to expected peak (including KV cache + workspace) you'll see that. we recommend reserving headroom (e.g., 10-20%) and using requests/limits wisely. Also enabling swap isn't great for GPU memory but can help CPU-side memory.\n[05:56] Carlos: currently limits are 180Gi and spikes to 175 before OOM. maybe we need to raise the limit or reduce memory usage.\n[06:02] Priya: raising helps short term; long term prefer eviction/paging of KV, better batch shaping, and kernel selection tuning. some models have memory-friendly kernels for long context, we can try alternate kernel paths.\n[06:13] Alex: quick question on private deployments \u2014 any VPC networking implications for retries or observability?\n[06:19] Priya: in private deployments we rely on customer KMS and network policies; retries still function but observability (S3 push, STATSD) may need endpoints allowed. and if you're using sidecars for logging/tracing ensure they don't get OOM'd as well. also watch out for MTU fragmentation if you stream large payloads.\n[06:36] Maya: good call, our sidecar crashed once during an OOM event, losing logs.\n[06:40] Priya: that's a cascade risk. make sure logging sidecars have separate resource limits.\n[06:45] Carlos: any quick experiments to run to narrow root cause?\n[06:48] Priya: yes \u2014 1) run an isolated long-context single-client test (no batching) to see baseline KV growth; 2) run batched packing test with same total tokens but varying pack strategies; 3) compare float16 vs q4 runs while capturing per-kernel memory high-water marks; 4) enable profiling to capture kernel durations to correlate with CUDA timeouts.\n[07:09] Alex: we'll coordinate test harness and share scripts.\n[07:13] Evan: about retry policy changes \u2014 can you expose a per-route config so we can disable runtime retries for streaming routes?\n[07:20] Priya: yes, per-route retry config exists. we can set retry_on=[internal_transient] and disable for streaming routes or set max_attempts=0. we'll include recommended configs in the follow-up doc.\n[07:33] Maya: also request logging \u2014 can we get a sample id per request to trace across retries?\n[07:38] Priya: absolutely, Redwood emits request_id and kernel_trace_id. we'll ensure they're included in the profiling artifact.\n[07:46] Alex: okay let's recap actions and owners (quick).\n[07:50] Priya: I'll run the benchmark matrix in staging and collect per-kernel logs and memory high-water.\n[07:55] Carlos: I'll pull kube logs, pod yamls, nvidia-smi snapshots and upload them.\n[07:58] Alex: I'll send the private deployment checklist and security docs and schedule the follow-up.\n[08:03] Evan: thanks everyone.\n\n[08:10] End meeting.\n\nNotes on transcription quality: some proper nouns (kernels, model names) may be mis-transcribed. timestamps are approximate.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "topics",
+    "next_steps",
+    "action_items",
+    "transcript"
+  ],
+  "dataset_doc_uuid": "dsid_c9c1482b6e744d3f9d769fe37b198cef"
+}

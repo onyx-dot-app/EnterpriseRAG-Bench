@@ -1,0 +1,87 @@
+{
+  "repo": "redwood",
+  "pr_number": "90123",
+  "title": "continuous-batcher: scheduler tuning for queueing fairness, starvation prevention, and timeouts",
+  "author": "Asha Patel",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-02-18",
+  "merged_at": "2026-02-18",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/continuous-batcher-scheduler-tuning-queueing-fairness",
+  "reviewers": [
+    "Liam O'Connor",
+    "Sofia Chen",
+    "Daniel Kim"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "scheduler",
+    "kv-cache",
+    "infra"
+  ],
+  "linked_linear": [
+    "ENG-2345",
+    "ENG-2410"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "842",
+  "deletions": "269",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "merge_commit": "a3f9b7d6c8e2b5f1e4d7c9a0",
+  "description": "Motivation: the continuous-batcher scheduler had several operational issues under mixed workloads: (1) short low-latency requests were occasionally starved by long, high-throughput requests; (2) queueing fairness between tenants/models was uneven, causing head-of-line blocking on some GPUs; (3) soft timeouts were not consistently enforced which led to wasted work and degraded p95 latency during contention. This PR tunes the scheduler to address queueing, fairness and starvation prevention, adds configurable timeout semantics, and improves KV-cache pinning behavior to reduce wasted recomputation. Summary of changes: - Introduces a dual-queue scheduling model (fast-path / bulk-path) with configurable thresholds (scheduler.fast_path_max_tokens / scheduler.fast_path_max_latency_ms). - Adds an aging-based fairness weight (scheduler.fairness_window_seconds) and per-model weight overrides to ensure requests that waited longer gain scheduling priority. - Implements starvation detection and soft-cancel for long-waited items (scheduler.starvation_threshold_ms + scheduler.soft_timeout_ms) with optional fallback routing. - Adds a preemptible execution flag for batches so that fast-path requests can preempt queued bulk batches when starvation threshold is met. - Integrates KV-cache pinning for requests routed to fast-path to avoid cold-cache penalties when a request flips between queues. - Exposes new telemetry: continuous_batcher.queue_wait_ms, continuous_batcher.starvation_events, continuous_batcher.preemptions, continuous_batcher.fast_path_hit_rate. - Adds unit and integration tests for scheduler heuristics and a reproducible load test used for benchmarking. Backwards compatibility and config: default values preserve current behavior (no breaking changes). New flags are behind runtime-config and can be enabled per-deployment or per-model via rollout flags. Performance/evaluation: - Local e2e load test (mixed workload: 10% short chat requests, 90% completion) on a 4xA100 node: p95 latency for short requests improved from 420ms -> 210ms (50% reduction) under sustained load. - Aggregate throughput dropped by ~3% at peak due to additional preemption overhead but unit cost per short-request improved substantially. - Starvation events reduced from ~18/hour -> ~1/hour in synthetic multi-tenant tests. Testing and rollout: - Unit tests for fairness aging and starvation logic added. - Integration test harness updated to simulate mixed-length workload and verify metrics and correctness. - Canary rollout plan: enable on staging -> 10% production routing -> 50% -> full, with automatic rollback on increased p95 or error rate. Checklist: - [x] Scheduler algorithm implementation - [x] Telemetry + dashboards - [x] Unit & integration tests - [x] Load test results attached - [x] Config flags and rollout plan Reasoning/implementation notes: - The dual-queue model keeps the fast-path latencies bounded while allowing bulk-path to retain high throughput. We use an exponentially-weighted aging score to adjust weights so that no tenant can be starved indefinitely while avoiding thrashing. - Preemption is implemented as a soft cancel of the bulk batch; the cancelled batch will either be retried on bulk-path or routed to a fallback model variant if configured. This minimizes wasted GPU cycles while preserving correctness. - KV-cache pinning: when a request is promoted to fast-path, its keyset is pinned on the target worker for a short TTL to avoid cold misses on immediate subsequent requests. This is conservative and can be tuned per-model. Rollout notes and operational guidance: - Defaults are conservative: fast_path_max_tokens=256, fast_path_max_latency_ms=100, starvation_threshold_ms=1200, soft_timeout_ms=5000. - Operators should monitor continuous_batcher.starvation_events and continuous_batcher.preemptions. A rise in preemptions with steady p95 indicates thresholds too aggressive. - If workloads are highly homogeneous, the gains are small; disable the feature for single-model dedicated fleets. Related: addresses ENG-2345 (scheduler fairness incidents), ties into ENG-2410 (kv-cache cold starts).",
+  "commits": [
+    "7d2a1f1  Implement dual-queue scheduling and fast-path/bulk-path routing",
+    "b8c3e5a  Add aging-based fairness weights and per-model overrides",
+    "c9f7a44  Implement starvation detection and soft-cancel + fallback routing",
+    "e1d4b2f  KV-cache pinning support for fast-path requests",
+    "a4f0c12  Add telemetry counters and dashboard templates",
+    "f2b8d99  Unit + integration tests for scheduler heuristics",
+    "d3e6a5b  Update README and operator docs with config guidance"
+  ],
+  "changed_files": [
+    "serving/continuous_batcher/scheduler.rs",
+    "serving/continuous_batcher/queue.rs",
+    "serving/continuous_batcher/metrics.rs",
+    "serving/continuous_batcher/config.toml",
+    "serving/continuous_batcher/kv_cache.rs",
+    "serving/continuous_batcher/tests/scheduler_integration_test.rs",
+    "infra/runtime-config/defaults.toml",
+    "docs/operator/continuous-batcher.md",
+    "console/dashboards/continuous-batcher.json",
+    "loadtests/mixed_workload/run.sh",
+    "loadtests/mixed_workload/results/2026-02-15.md",
+    "Makefile"
+  ],
+  "patch_snippets": [
+    "--- a/serving/continuous_batcher/scheduler.rs\n+++ b/serving/continuous_batcher/scheduler.rs\n@@\n-    // previous FIFO selection\n-    select_next_batch(&mut queue)\n+    // new dual-queue: prefer fast-path if available, otherwise select bulk batch with aging weights\n+    if let Some(fast) = fast_queue.pop_if_below_latency(threshold_ms) {\n+        return fast;\n+    }\n+    select_weighted_bulk_batch(&mut bulk_queue, &aging_weights);",
+    "--- a/serving/continuous_batcher/kv_cache.rs\n+++ b/serving/continuous_batcher/kv_cache.rs\n@@\n+// pin keysets for promoted fast-path requests to avoid cold misses\n+pub fn pin_keyset(worker_id: WorkerId, keyset: &KeySet, ttl_ms: u64) {\n+    // best-effort pin; eviction still allowed\n+}",
+    "--- a/serving/continuous_batcher/metrics.rs\n+++ b/serving/continuous_batcher/metrics.rs\n@@\n+meter.counter(\"continuous_batcher.starvation_events\").register();\n+meter.histogram(\"continuous_batcher.queue_wait_ms\").register();"
+  ],
+  "review_comments": [
+    "Liam O'Connor: Nice work \u2014 the dual-queue model makes sense. A couple of questions: 1) how do we ensure preemption doesn't cause thrash? 2) can we expose per-tenant opt-outs?",
+    "Asha Patel (author): For thrash mitigation we use an exponential backoff on requeueing bulk batches and a small hysteresis window for preemption. Per-tenant opt-outs are supported via per-model config overrides (added to config.toml).",
+    "Sofia Chen: Can the KV pinning create memory pressure on GPUs? We should make pin TTL configurable and add an eviction metric.",
+    "Asha Patel: Agreed \u2014 pin TTL is configurable (defaults conservative) and we added continuous_batcher.kv_pin_evictions metric."
+  ],
+  "tests_and_benchmarks": [
+    "Unit tests: scheduler::aging_weight_tests, scheduler::starvation_detection_tests",
+    "Integration: mixed_workload/scheduler_integration_test.rs simulates 10/90 short/bulk split",
+    "Load test: loadtests/mixed_workload/run.sh produced p95 improvements documented in results/2026-02-15.md"
+  ],
+  "release_notes": "Improves continuous-batcher scheduling: reduced p95 for short requests, starvation prevention, new telemetry and config flags. Backwards compatible defaults; enable via runtime-config.",
+  "operational_guidance": [
+    "Start with canary: enable on staging and monitor continuous_batcher.queue_wait_ms and continuous_batcher.starvation_events.",
+    "If preemptions are high and p95 increases, relax fast_path_max_tokens or increase fairness_window_seconds.",
+    "Disable KV pinning for memory-constrained fleets or reduce kv_pin_ttl_ms."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_comments"
+  ],
+  "dataset_doc_uuid": "dsid_4d6686f5322d4cf2889107baed8c9efb"
+}

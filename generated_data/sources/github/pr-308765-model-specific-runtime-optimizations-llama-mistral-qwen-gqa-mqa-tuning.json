@@ -1,0 +1,84 @@
+{
+  "repo": "redwood",
+  "pr_number": "308765",
+  "title": "Model-specific runtime optimizations: Llama/Mistral/Qwen quirks + GQA/MQA tuning",
+  "author": "Asha Patel",
+  "created_at": "2026-02-15",
+  "updated_at": "2026-02-20",
+  "merged_at": "2026-02-21",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/runtime/model-optimizations-llama-mistral-qwen-gqa-mqa",
+  "reviewers": [
+    "Daniel Kim",
+    "Sofia Martinez",
+    "Liam O'Connor"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "gpu",
+    "kv-cache",
+    "batching"
+  ],
+  "linked_linear": [
+    "ENG-3421",
+    "ENG-3499"
+  ],
+  "linked_jira": [
+    "SUP-1182"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "1456",
+  "deletions": "372",
+  "merge_method": "squash",
+  "breaking_change": "false",
+  "description": "Motivation: We observed model-specific performance cliffs for recent open models (Llama family rotary edge cases, Mistral groupnorm/attention ordering, and Qwen attention tensor layout) when using the generic kernel selection and KV-cache layout. Additionally, GQA/MQA quantized variants were not landing on optimal GEMM/attention kernels for mid-length sequences (64-512), causing 10-30% latency regressions in real workloads. This PR introduces targeted heuristics, kernel variants, and KV-cache layout changes to address those quirks and a set of scheduler/batching tweaks to improve continuous-batching efficiency while preserving low tail latency for short requests.\n\nSummary of changes (high-level): Adds model-specific kernel selection heuristics and tuned kernels for GQA/MQA; introduces a new fused attention variant for MQA that reduces memory traffic for 4-bit grouped quantization; aligns KV cache pages to 128B for improved memcpy throughput on Ampere+; improves batching scheduler with padding-aware batch formation and KV-prefetch for hot cache entries; fixes Llama rotary masking for odd-length sequences when using cached past-key/values; adds Mistral attention ordering fallback when groupnorm pre-layer behavior is detected at runtime.\n\nCommits: \"kernel: add gqa_mqa kernel selector heuristics\"; \"attention: fused_mqa_attention kernel (cu) + tests\"; \"kv_cache: 128B alignment + faster memcpy path\"; \"batching: padding-aware scheduler + kv-prefetch\"; \"llama: rotary masking fix for cached sequences\"; \"mistral: attention-ordering fallback\"; \"perf: add perf benchmarks and CI checks\"; \"tests: add model-specific regression tests and microbench harness\".\n\nFiles changed (high-level): runtime/kernel_selector.cc, runtime/attention/fused_attention_mqa.cu, runtime/attention/fused_attention_gqa.cu, runtime/kv_cache/layout.h, runtime/kv_cache/fast_memcpy.cc, runtime/batching/scheduler.cc, runtime/batching/padding_tracker.h, runtime/model_signatures/model_hints.cc, tests/perf/bench_mqa.py, tests/regressions/llama_rotary_cached.py, docs/perf/README.md, scripts/ci/perf_matrix.yml.\n\nDetailed notes:\n- Kernel selection: Introduced a lightweight runtime model-hint mechanism (model_signatures/model_hints.cc) so the selector can prefer fused attention/GEMM kernels for known layouts (Qwen's 3D-attention layout, Mistral's pre-layer normalization pattern). The selector still falls back to the generic path if an ABI mismatch is detected. This is conservative: we only prefer specialized kernels when the model ID and weight layout checks pass.\n\n- GQA/MQA tuning: Added a fused_mqa_attention kernel that uses blocked GEMM with 128x64 tiles, interleaved load/store, and quant-dequant paths optimized for grouped 4-bit layouts. For GQA we tuned GEMM block sizes and thread mappings to improve occupancy on A100/RTX6000-class GPUs. Microbenchmarks show ~18% throughput improvement on Qwen-type models for tokens > 128 and ~12% improvement in end-to-end latency for typical chat sequences (median length 96).\n\n- KV cache layout: Changed in-memory KV layout to 128B-aligned pages and add a fast memcpy path that uses aligned vector loads/stores for contiguous ranges. This reduces memcpy overhead when prefetching batched KV for continuous batching and improves L2/L1 read throughput. Benchmarks indicate a 20-35% reduction in KV copy time for large past lengths (>2048 tokens).\n\n- Llama rotary fix: There was an edge-case where cached rotary positions for odd-length prefix + current tokens produced incorrect rotation when the cached past was used across heterogeneous requests. Fixed rotation index computation and added regression tests (tests/regressions/llama_rotary_cached.py) reproducing the bug.\n\n- Mistral fallback: Mistral variants with pre-layer groupnorm require a different attention ordering (query-key interleave). We detect the pattern via model hints and either select the specialized kernel or fall back to the stable generic attention path when pattern detection fails.\n\n- Batching and scheduling: Implemented padding-aware batch formation: short requests that would otherwise be padded up to long-sequence shapes are grouped to preserve latency. Added a KV-prefetch hint for hot cache entries (requests that share recent prefixes) so the scheduler will prefetch contiguous KV pages asynchronously. Introduced a small scheduler heuristic to prioritize short low-token requests to meet tail-latency SLOs during high load.\n\nTesting and CI: Added microbenchmarks and regression tests to CI perf matrix (scripts/ci/perf_matrix.yml). Initial CI run showed a flaky test in tests/perf/bench_mqa.py due to a nondeterministic GPU scheduling order; we added a deterministic seed and re-ran. Full CI: build (pass), unit tests (pass), perf-micro (pass after rerun), lint (pass).\n\nReview conversation (high level): Daniel: requested stronger guardrails in kernel selector to avoid ABI mismatch and asked for a feature-flag gate for MQA fused kernel. Action: added conservative checks and an env var (REDWOOD_ENABLE_MQA_FUSED=1) to enable the new kernel explicitly; default off for older deployments. Sofia: asked for perf numbers and added benchmarks; asked to include a release note. Liam: approved after CI green and added a small comment about KV alignment on older hw; we added fallback to old memcpy path when alignment not supported.\n\nPerformance results (representative): Qwen-type model, seq_len=256, batch=8: end-to-end latency down 15%, tokens/sec up 18%. Llama-7B, mixed workloads with cached past up to 2048 tokens: KV copy time down 30% and tail latency (95th) down 12% when scheduling heuristics enabled. Mistral inference: stable throughput with the fallback enabled; specialized path gives ~8% throughput gain when detected.\n\nBackward compatibility and rollout: Changes are backward compatible; all specialized kernels are behind runtime detection and a feature flag for MQA fused kernel. Provided migration notes in docs/perf/README.md. Operators can enable the MQA fused kernel via REDWOOD_ENABLE_MQA_FUSED for canary clusters before broader rollout.\n\nRelease notes: \"Performance: model-specific kernel and KV-cache optimizations for Llama/Mistral/Qwen; GQA/MQA tuning reduces latency for 4-bit grouped quantized variants; batching scheduler and KV-prefetch improves continuous-batching efficiency. Includes safety gates and feature flag for MQA fused kernel.\"\n\nKnown limitations: The MQA fused kernel currently targets Turing/Ampere+ architectures and is disabled on older GPUs; we will add additional fallbacks for pre-Ampere when needed. Some long-sequence pathological patterns still prefer the generic kernel.",
+  "commits": [
+    "kernel: add gqa_mqa kernel selector heuristics",
+    "attention: fused_mqa_attention kernel + tests",
+    "kv_cache: 128B alignment + faster memcpy path",
+    "batching: padding-aware scheduler + kv-prefetch",
+    "llama: rotary masking fix for cached sequences",
+    "mistral: attention-ordering fallback",
+    "perf: add perf benchmarks and CI checks",
+    "tests: add model-specific regression tests and microbench harness"
+  ],
+  "checks_summary": [
+    "build: pass",
+    "unit-tests: pass",
+    "lint: pass",
+    "perf-micro: pass (after one rerun)"
+  ],
+  "files_changed": [
+    "runtime/kernel_selector.cc",
+    "runtime/attention/fused_attention_mqa.cu",
+    "runtime/attention/fused_attention_gqa.cu",
+    "runtime/kv_cache/layout.h",
+    "runtime/kv_cache/fast_memcpy.cc",
+    "runtime/batching/scheduler.cc",
+    "runtime/batching/padding_tracker.h",
+    "runtime/model_signatures/model_hints.cc",
+    "tests/perf/bench_mqa.py",
+    "tests/regressions/llama_rotary_cached.py",
+    "docs/perf/README.md",
+    "scripts/ci/perf_matrix.yml"
+  ],
+  "release_notes": [
+    "Performance: model-specific kernel and KV-cache optimizations for Llama/Mistral/Qwen",
+    "GQA/MQA tuning reduces latency for 4-bit grouped quantized variants",
+    "Batching scheduler and KV-prefetch improves continuous-batching efficiency",
+    "MQA fused kernel gated behind feature flag REDWOOD_ENABLE_MQA_FUSED"
+  ],
+  "notes": [
+    "Default behavior is conservative: specialized kernels require model hint and layout checks",
+    "Feature flag for MQA fused kernel to allow canary rollout",
+    "Fallbacks preserved for pre-Ampere GPUs and ABI mismatches"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description"
+  ],
+  "dataset_doc_uuid": "dsid_06ee5da01b484c59b1e771775d76a4c7"
+}
