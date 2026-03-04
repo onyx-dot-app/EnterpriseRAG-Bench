@@ -1,0 +1,91 @@
+{
+  "repo": "redwood",
+  "pr_number": "82756",
+  "title": "Reduce streaming token latency: kernel scheduling + KV cache hot-path + adaptive flush/backpressure",
+  "author": "Maya Patel",
+  "created_at": "2026-02-12",
+  "updated_at": "2026-02-20",
+  "merged_at": "2026-02-20",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/streaming-latency-kernel-sched-kv-batching",
+  "reviewers": [
+    "Evan Ross",
+    "Priya Kapoor",
+    "Luca Moretti"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kv-cache",
+    "batching",
+    "sre"
+  ],
+  "linked_linear": [
+    "ENG-1342",
+    "ENG-1379"
+  ],
+  "linked_jira": [
+    "SUP-4123"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "9",
+  "additions": "612",
+  "deletions": "184",
+  "breaking_change": "false",
+  "description": "Context: Streaming token generation latency is a top customer pain point for low-latency chat use-cases. This PR applies a set of coordinated changes across kernel scheduling, the KV-cache hot-path, and continuous-batching/flush cadence to reduce median and tail per-token latency for streaming responses. Motivation: customers reported 50-200ms token stalls under bursty small-request workloads (incidents: SUP-4123). The root causes were (1) suboptimal kernel scheduling that caused small single-token workloads to wait behind long kernel dispatches, (2) KV cache reads/writes on the hot-path that allocated/locked per-token, and (3) a conservative flush cadence and rigid backpressure logic that increased inter-token spacing under partial batches. Summary of changes: 1) Kernel scheduling: introduce priority-aware fast-path for short token-generation kernels and non-blocking kernel dispatch for small requests. Added a lightweight token-priority queue and early preemption for long-running kernels. 2) KV cache: refactor KV cache hot-path to use lock-free read fast-path (per-shard read-copy) and reduce allocations by reusing slab-allocated buffers; added microbenchmarks and correctness asserts. 3) Continuous batching & flush cadence: implement adaptive flush cadence that measures queue latency and dynamically lowers flush interval for small-batch workloads; improved backpressure heuristics to avoid full-queue stalls by allowing opportunistic partial flushes when latency SLOs degrade. 4) Metrics & observability: new per-request token latency metric, kernel-sched histogram, KV-cache hit/miss timing, and an end-to-end streaming latency dashboard. Benchmarks: microbench (gpt2-small synthetic) shows median per-token latency improvement: 24% (from 48ms -> 36.5ms) and p95 improvement: 31% (from 120ms -> 83ms) under bursty single-token workloads. End-to-end on internal chat load (75% small messages) showed median token latency down 18% and p95 down 25%. Backwards compatibility: no API changes; all changes gated behind runtime flags and rollout will be canaried. Checklist: - [x] Unit tests for KV-cache fast-path - [x] Integration tests for streaming correctness - [x] Microbench harness updates - [x] End-to-end perf dashboard panels - [x] Feature-flag and rollout plan",
+  "commits": [
+    "b6a3f8a: kernel: add priority token-queue and preemptible dispatch (core/runtime/kernel_scheduler.cc)",
+    "c1d2e4f: kvcache: implement lock-free read fast-path and buffer reuse (core/runtime/kv_cache_hotpath.cc)",
+    "d9f7a21: batching: adaptive flush cadence and opportunistic partial flush (core/runtime/continuous_batcher.cc)",
+    "e3b4c6a: metrics: add token_latency_ms, kernel_sched_hist, kv_cache_timing (observability/metrics_registry.cc)",
+    "f5a7b9c: tests: add kv-cache unit tests and streaming integration tests (tests/runtime)",
+    "squash: address review feedback and tune thresholds"
+  ],
+  "files_changed": [
+    "core/runtime/kernel_scheduler.cc",
+    "core/runtime/kernel_scheduler.h",
+    "core/runtime/kv_cache_hotpath.cc",
+    "core/runtime/kv_cache_hotpath.h",
+    "core/runtime/continuous_batcher.cc",
+    "core/runtime/continuous_batcher.h",
+    "observability/metrics_registry.cc",
+    "tests/runtime/kv_cache_fastpath_test.cc",
+    "tests/integration/streaming_latency_test.cc"
+  ],
+  "diff_snippets": [
+    "--- a/core/runtime/kernel_scheduler.cc\n+++ b/core/runtime/kernel_scheduler.cc\n@@ -210,6 +210,28 @@\n+// fast-path: small token kernels go through priority queue to reduce head-of-line blocking\n+if (is_small_kernel(job)) {\n+  priority_queue_.push(job);\n+  try_preempt_long_kernel();\n+  return;\n+}",
+    "--- a/core/runtime/kv_cache_hotpath.cc\n+++ b/core/runtime/kv_cache_hotpath.cc\n@@ -44,7 +44,26 @@\n- std::lock_guard<std::mutex> lg(shard_mutex_);\n- Value v = shard_lookup(key);\n+ // lock-free fast-path reads: use atomic pointer and read-copy if needed\n+ auto ptr = shard_atomic_ptr_.load(std::memory_order_acquire);\n+ if (likely(ptr && ptr->contains(key))) {\n+  Value v = ptr->get_no_alloc(key, &scratch_buffer_);\n+  return v;\n+ }\n+ // fallback to locked path\n+ std::lock_guard<std::mutex> lg(shard_mutex_);\n+ Value v = shard_lookup(key);",
+    "--- a/core/runtime/continuous_batcher.cc\n+++ b/core/runtime/continuous_batcher.cc\n@@ -80,6 +80,34 @@\n+// adaptive flush: lower interval when queue-latency exceeds threshold for small batches\n+if (queue_latency_ms > target_latency && pending_size < optimal_batch) {\n+  flush_interval_ms = std::max(min_flush_ms, flush_interval_ms / 2);\n+}\n+// allow opportunistic partial flushes when latency SLOs degrade\n+if (pending_size > 0 && estimated_latency > slo_ms * 0.8) {\n+  flush();\n+}",
+    "--- a/observability/metrics_registry.cc\n+++ b/observability/metrics_registry.cc\n@@ -12,6 +12,12 @@\n+REGISTER_HISTOGRAM(\"streaming.token_latency_ms\");\n+REGISTER_HISTOGRAM(\"kernel.sched_ms\");\n+REGISTER_TIMER(\"kv_cache.lookup_ms\");"
+  ],
+  "review_comments": [
+    "Evan Ross: Please add a regression test that ensures ordering is preserved when we preempt kernels \u2014 streaming correctness is critical.",
+    "Maya Patel: Added ordering test in streaming_latency_test.cc and included assertions on sequence ids.",
+    "Priya Kapoor: The lock-free path is nice; please double-check memory reclamation and add a comment about epoch-based freeing.",
+    "Maya Patel: Added epoch-based reclamation and comments; added unit test simulating concurrent rebuilds.",
+    "Luca Moretti: Can we expose the adaptive flush thresholds as runtime knobs behind a flag? Ops may want to tune per-customer.",
+    "Maya Patel: Exposed flags, documented defaults, and added rollout plan to the PR description."
+  ],
+  "ci_checks": [
+    "linux-build: pass",
+    "unit-tests: pass",
+    "integration-tests/streaming: pass",
+    "perf-check: pass (20% median improvement on microbench)",
+    "lint: pass"
+  ],
+  "merge_method": "squash",
+  "release_notes": "Runtime: Reduced streaming token latency via kernel scheduling improvements, KV-cache hot-path optimizations, and adaptive flush/backpressure. Expect ~18-24% median token latency reduction and ~25-31% p95 improvements for small-message streaming workloads. Feature is behind rollout flag.",
+  "rollout_plan": "Canary on 10% of traffic for 48h, monitor streaming.token_latency_ms and kernel.sched_ms, then 50% for 24h, then full rollout. Abort if p95 increases or error rate >0.1%",
+  "post_merge_actions": [
+    "ship dashboard panels to perf team",
+    "enable canary flag for test cluster",
+    "monitor SUP-4123 metrics and close incident if stable"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_comments"
+  ],
+  "dataset_doc_uuid": "dsid_88344038e2bc4d84bd69cdd06f9a2962"
+}

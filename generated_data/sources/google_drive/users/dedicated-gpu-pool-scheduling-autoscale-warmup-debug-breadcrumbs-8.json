@@ -1,0 +1,35 @@
+{
+  "title": "dedicated-gpu-pool-scheduling-autoscale-warmup-debug-breadcrumbs-8",
+  "owner": "Alex Chen",
+  "drive_area": "users",
+  "path": "users/alex.chen/dedicated-gpu-pool-scheduling-autoscale-warmup-debug-breadcrumbs-8",
+  "doc_type": "doc",
+  "created_at": "2026-02-25",
+  "last_modified": "2026-03-01",
+  "collaborators": [
+    "Priya Nair",
+    "Samir Patel",
+    "Rosa Martinez"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "autoscale",
+    "dedicated-gpu",
+    "warmup",
+    "incident",
+    "debug",
+    "scheduling"
+  ],
+  "linked_artifacts": [
+    "JIRA-INC-4721",
+    "github.com/redwood-inference/runtime/pull/813",
+    "confluence.redwood.ai/pages/viewpage.action?pageId=98765432"
+  ],
+  "content": "Context:\n- User-reported latency spikes and increased cold-start tail latency on dedicated GPU pool for model-family `redwood-13b-opt` during growth hours (US-east peak). Suspect autoscale warmup / scheduling thrash.\n- Incident started ~2026-02-24 21:10 UTC; noisy neighbor? scheduling controller flapping nodes through the night.\n\nWhat I've tried so far (commands + snippets):\n1) Check pool and node state\n- kubectl get pods -n dedicated-pool-13b --selector=pool=dedicated-13b -o wide\\  <-- shows pods in CrashLoopBackOff and Pending intermittently\n\n2) Describe recent scheduling events for a sample pod:\n- kubectl describe pod redwood-13b-serve-72k4 -n dedicated-pool-13b\\  Events show repeated FailedScheduling: \"Insufficient resources: cpu, nvidia.com/gpu\" followed by SuccessfulScheduling after a few minutes.\n\n3) Check autoscaler controller logs (controller-agg) around incident window:\n- kubectl logs controller-manager-0 -n infra --since=3h | egrep \"autoscale|scale|warmup|provision\"\n  Output (truncated):\n  2026-02-24T20:59:07Z INFO autoscaler: scaling up pool dedicated-13b desired=6->9 reason=queue_backlog\n  2026-02-24T21:02:12Z WARN autoscaler: provision_timeout for batch-reqs, marking nodes as degraded\n  2026-02-24T21:06:48Z INFO scheduler: allocating instance g4dn.xlarge (warmup=false) to pool dedicated-13b\n  2026-02-24T21:08:00Z INFO autoscaler: successful warmup detected for 2 nodes\n  2026-02-24T21:10:15Z INFO autoscaler: scaling down pool dedicated-13b desired=9->5 reason=low_utilization\n  2026-02-24T21:12:03Z ERROR autoscaler: attempt to remove node node-az1-7 failed: active pods > 0\n\n4) Node warmup probe logs (from infra metrics):\n- warmup_probe_counter{node=\"node-az1-7\"} 0\n- model_kv_cache_loaded{node=\"node-az1-7\", model=\"redwood-13b-opt\"} 0\n  -> suggests model weights not fully warmed/cached before traffic routed.\n\n5) Recent scheduling policy changes: rolling config applied 2026-02-23 02:00 UTC to reduce warmup threshold from 120s -> 30s (PR: github.com/.../pr/813). Might be too aggressive.\n\nErrors / snippets captured in logs:\n- \"Failed to attach GPU: device busy\" (kubelet)\n- \"eviction: node under memory pressure\" repeated during scale events\n- \"model load timeout after 45s\" from serving-runtime (expected threshold previously 120s)\n\nHypotheses:\n- H1: Warmup threshold reduction (120s->30s) causes autoscaler to mark nodes ready sooner and then scale-down prematurely because probes show no active KV cache, leading to repeated cold starts and increased tail latency.\n- H2: Provision timeout path marking nodes as degraded prevents proper reuse, causing thrash between scale-up and scale-down.\n- H3: Placement constraints (anti-affinity) + AZ imbalance cause scheduling delays and GPU attachment failures under churn.\n- H4: Workload burstiness interacts with autoscaler cooldowns -> autoscaler oscillates (see desired=6->9->5 sequence).\n\nImmediate next steps (to validate / mitigate):\n- Roll back warmup threshold change in a canary: set warmup threshold back to 120s for a single pool and observe. (PR rollback prepared: github.com/.../pr/820)\n- Disable aggressive scale-down (increase scale-down cooldown from 60s -> 300s) for dedicated-13b pool to reduce thrash.\n- Add temporary leash: prevent autoscaler from touching nodes flagged as \"degraded\" for 10m.\n- Force probe run: trigger model prewarm job for 3 nodes in pool dedicated-13b (kubectl exec prewarm-job) and observe model_kv_cache_loaded metrics.\n\nQuestions to ask / followups:\n- @Priya: can infra increase node boot logging duration to capture attachment failures?\n- @Samir: do we have historical node warmup metrics for last 30 days to compare success rates?\n- Should we add a server-side circuit-breaker to avoid routing traffic to nodes without KV cache?\n\nNotes on mitigation timeline:\n- T+0 (now): increase scale-down cooldown and queue a prewarm job for 3 nodes (safe, low-risk).\n- T+30m: monitor tail latency p95/p99 and node churn rate.\n- T+2h: if improvement, roll warmup threshold rollback to staging and run A/B.\n\nObservations from user reports:\n- Several customers in account CS-209 reported 10-30% higher median latency for a short window each night.\n- Cost increase due to repeated node warmups (more provisioning events).\n\nRaw commands used (copyable):\n- kubectl get pods -n dedicated-pool-13b --selector=pool=dedicated-13b -o wide\n- kubectl describe pod <pod> -n dedicated-pool-13b\n- kubectl logs controller-manager-0 -n infra --since=4h | egrep \"autoscale|scale|warmup|provision\"\n- kubectl exec -n infra deploy/prewarm-job -- /bin/sh -c 'curl -sS http://localhost:8080/prewarm?model=redwood-13b-opt'\n\nPotential follow-ups to convert into runbook items:\n- Define safe warmup threshold defaults per model size/class (e.g., 30s for 7B, 120s for 13B+).\n- Autoscaler heuristic: only allow scale-down if model_kv_cache_loaded metric > 0 for N nodes OR node uptime > X minutes.\n- Add circuit-breaker to route only to nodes that report KV cache ready or have served at least one request.\n\nSticky notes / TODOs (for me):\n- [ ] Run prewarm on 3 nodes and capture model_kv_cache_loaded after 10/30/60s.\n- [ ] Apply temporary cooldown tweak and monitor for 1h.\n- [ ] Collate metrics for last 30 days for warmup success rate and churn frequency.\n- [ ] Draft quick incident summary for morning ops channel (include customer impacts).\n\nReferences / links:\n- Incident ticket: JIRA-INC-4721\n- PR that changed warmup threshold: github.com/redwood-inference/runtime/pull/813\n- Rollback PR: github.com/redwood-inference/runtime/pull/820\n- Slack thread: slack.com/archives/C01ABCDEF/p1677223345678\n\nLast run of probes (metrics snapshot):\n- time=2026-02-24T21:15:00Z p95_latency_pool_dedicated-13b=312ms p99=1.2s node_churn=6 events/10m\n\nEnd notes: this is a working scratchpad. Will update after prewarm results and after we apply the cooldown tweak.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_7d03f07686414b5c857bfd1b57ce8391"
+}
