@@ -20,99 +20,18 @@ from src.prompts.new_duplicate_file import (
     NEW_DUPLICATE_FILE_USER_PROMPT,
 )
 from src.utils import (
+    count_json_files,
     extract_json_from_response,
     get_agents_md_for_path,
     get_dataset_doc_uuid,
     JsonRecoveryError,
     load_file,
     process_written_document,
+    select_random_file_hierarchical,
     try_recover_json,
     validate_no_nested_dicts,
     write_json_file,
 )
-
-
-# =============================================================================
-# File Selection
-# =============================================================================
-
-
-def dir_has_json_files(dir_path: str) -> bool:
-    """
-    Check if a directory has any JSON files anywhere underneath it.
-
-    Args:
-        dir_path: Absolute path to the directory.
-
-    Returns:
-        True if there are JSON files under this directory, False otherwise.
-    """
-    for _root, _dirs, files in os.walk(dir_path):
-        for filename in files:
-            if filename.endswith(".json"):
-                return True
-    return False
-
-
-def select_random_file_hierarchical(base_dir: str) -> str | None:
-    """
-    Select a random JSON file using hierarchical random walk.
-
-    At each directory level, lists subdirs and JSON files, filters out
-    subdirs with no JSON files underneath, then picks randomly with equal
-    probability between remaining items. If a file is picked, returns it.
-    If a dir is picked, recurses into it.
-
-    Args:
-        base_dir: Absolute path to the directory to start from.
-
-    Returns:
-        Path to a JSON file relative to SOURCES_DIR, or None if no files found.
-    """
-    try:
-        entries = os.listdir(base_dir)
-    except OSError:
-        return None
-
-    # Separate into subdirs and JSON files
-    subdirs = []
-    json_files = []
-
-    for entry in entries:
-        full_path = os.path.join(base_dir, entry)
-        if os.path.isdir(full_path):
-            # Only include dirs that have JSON files underneath
-            if dir_has_json_files(full_path):
-                subdirs.append(entry)
-        elif entry.endswith(".json") and os.path.isfile(full_path):
-            json_files.append(entry)
-
-    # Combine valid options
-    options = subdirs + json_files
-
-    if not options:
-        return None
-
-    # Pick randomly with equal probability
-    choice = random.choice(options)
-    full_choice_path = os.path.join(base_dir, choice)
-
-    if os.path.isdir(full_choice_path):
-        # Recurse into the directory
-        return select_random_file_hierarchical(full_choice_path)
-    else:
-        # It's a file - return relative path
-        return os.path.relpath(full_choice_path, SOURCES_DIR)
-
-
-def count_json_files() -> int:
-    """Count total JSON files in sources directory."""
-    count = 0
-    for _root, _dirs, files in os.walk(SOURCES_DIR):
-        for filename in files:
-            if filename.endswith(".json"):
-                count += 1
-    return count
 
 
 # =============================================================================
@@ -487,11 +406,14 @@ def generate_near_duplicate(
     if not new_contents:
         return (False, "Failed to generate valid new file contents", None, None)
 
-    # Write the new file
+    # Write the new file with noise marker
     full_new_path = os.path.join(SOURCES_DIR, new_file_path)
     try:
+        # Add dataset_noise_document field before writing
+        data = json.loads(new_contents)
+        data["dataset_noise_document"] = True
         with open(full_new_path, "w") as f:
-            f.write(new_contents)
+            json.dump(data, f, indent=2)
         print(f"\nWrote file: {new_file_path}")
     except Exception as e:
         return (False, f"Error writing file: {e}", None, None)
@@ -577,7 +499,7 @@ def main() -> None:
         print("#" * 60)
 
         # Select a random file using hierarchical random walk
-        file_path = select_random_file_hierarchical(SOURCES_DIR)
+        file_path = select_random_file_hierarchical()
 
         if not file_path:
             print("Failed to select a file")
@@ -588,7 +510,7 @@ def main() -> None:
         # Try to avoid selecting the same source file twice
         attempts = 0
         while file_path in used_source_files and attempts < 10:
-            file_path = select_random_file_hierarchical(SOURCES_DIR)
+            file_path = select_random_file_hierarchical()
             attempts += 1
             if file_path is None:
                 break
