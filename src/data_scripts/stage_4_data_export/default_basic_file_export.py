@@ -1,6 +1,7 @@
 """Export generated data to plain text files with optional zip packaging."""
 
 import argparse
+import json
 import os
 import shutil
 import zipfile
@@ -16,13 +17,19 @@ from src.utils import (
 )
 
 
+# Environment variable to enable Onyx metadata format
+ONYX_FORMAT_ENV_VAR = "EXPORT_IN_ONYX_FORMAT"
+
+
 class ExportConfig(BaseModel):
     """Configuration for the export process."""
 
     sources: list[str] | None = None
     create_zip: bool = False
     max_files_per_zip: int | None = None
+    max_files: int | None = None
     split_by_source: bool = False
+    onyx_format: bool = False
 
 
 class ExportStats(BaseModel):
@@ -34,13 +41,18 @@ class ExportStats(BaseModel):
     errors: list[str] = []
 
 
-def is_directory_non_empty(path: str) -> bool:
-    """Check if a directory exists and contains any files or subdirectories."""
-    if not os.path.exists(path):
-        return False
-    if not os.path.isdir(path):
-        return False
-    return len(os.listdir(path)) > 0
+class FileMetadata(BaseModel):
+    """Metadata for a single exported file (for Onyx format)."""
+
+    filename: str  # Just the filename (for .onyx_metadata.json output)
+    id: str
+    title: str
+    full_path: str = ""  # Internal: full relative path for zip filtering
+
+
+def directory_exists(path: str) -> bool:
+    """Check if a directory exists."""
+    return os.path.exists(path) and os.path.isdir(path)
 
 
 def validate_document(data: dict) -> tuple[bool, str | None]:
@@ -69,17 +81,21 @@ def validate_document(data: dict) -> tuple[bool, str | None]:
     return True, None
 
 
-def convert_to_text(data: dict) -> str:
+def convert_to_text(data: dict, include_title: bool = True) -> str:
     """
     Convert a document to plain text format.
 
-    Format:
+    Format (with title):
     - First line: title
     - Two newlines
     - Content fields separated by newlines (without field name headers)
 
+    Format (without title, for Onyx format):
+    - Content fields separated by newlines (title is in metadata file)
+
     Args:
         data: The document data.
+        include_title: Whether to include title in the text output.
 
     Returns:
         The plain text content.
@@ -98,7 +114,10 @@ def convert_to_text(data: dict) -> str:
         else:
             contents.append(str(content))
 
-    return f"{title}\n\n{chr(10).join(contents)}"
+    if include_title:
+        return f"{title}\n\n{chr(10).join(contents)}"
+    else:
+        return chr(10).join(contents)
 
 
 def get_export_filename(uuid: str, original_filename: str) -> str:
@@ -116,7 +135,7 @@ def get_export_filename(uuid: str, original_filename: str) -> str:
     return f"{uuid}__{base_name}.txt"
 
 
-def export_files(config: ExportConfig) -> ExportStats:
+def export_files(config: ExportConfig) -> tuple[ExportStats, list[FileMetadata]]:
     """
     Export all JSON files to plain text format.
 
@@ -124,9 +143,10 @@ def export_files(config: ExportConfig) -> ExportStats:
         config: Export configuration.
 
     Returns:
-        Export statistics.
+        Tuple of (export statistics, list of file metadata for Onyx format).
     """
     stats = ExportStats()
+    file_metadata_list: list[FileMetadata] = []
 
     # Clean and create export directory
     if os.path.exists(EXPORT_DATA_DIR):
@@ -139,16 +159,28 @@ def export_files(config: ExportConfig) -> ExportStats:
         source_dirs = [s for s in source_dirs if s in config.sources]
 
     # Process each source
+    max_reached = False
     for source in sorted(source_dirs):
+        if max_reached:
+            break
+
         source_path = os.path.join(SOURCES_DIR, source)
         if not os.path.isdir(source_path):
             continue
 
         # Walk through all JSON files in this source
         for root, _dirs, files in os.walk(source_path):
+            if max_reached:
+                break
+
             for filename in files:
                 if not filename.endswith(".json"):
                     continue
+
+                # Check if we've reached max files limit
+                if config.max_files and stats.exported_files >= config.max_files:
+                    max_reached = True
+                    break
 
                 stats.total_files += 1
                 file_path = os.path.join(root, filename)
@@ -163,11 +195,14 @@ def export_files(config: ExportConfig) -> ExportStats:
                         stats.errors.append(f"{file_path}: {error}")
                         continue
 
-                    # Convert to text
-                    text_content = convert_to_text(data)
+                    # Get title and UUID
+                    title, _ = extract_document_content(data)
+                    uuid = data["dataset_doc_uuid"]
+
+                    # Convert to text (exclude title if in Onyx format)
+                    text_content = convert_to_text(data, include_title=not config.onyx_format)
 
                     # Generate new filename with UUID
-                    uuid = data["dataset_doc_uuid"]
                     new_filename = get_export_filename(uuid, filename)
 
                     # Determine export path (mirror directory structure)
@@ -181,20 +216,35 @@ def export_files(config: ExportConfig) -> ExportStats:
                     with open(export_path, "w", encoding="utf-8") as f:
                         f.write(text_content)
 
+                    # Track metadata for Onyx format
+                    if config.onyx_format:
+                        # Store both the full path (for zip filtering) and just filename (for metadata)
+                        full_rel_path = os.path.join(rel_path, new_filename)
+                        file_metadata_list.append(FileMetadata(
+                            filename=new_filename,  # Just the filename, not full path
+                            id=uuid,
+                            title=title,
+                            full_path=full_rel_path,  # Internal: for filtering files in zip
+                        ))
+
                     stats.exported_files += 1
 
                 except Exception as e:
                     stats.errors.append(f"{file_path}: {e}")
 
-    return stats
+    return stats, file_metadata_list
 
 
-def create_zip_archives(config: ExportConfig) -> list[str]:
+def create_zip_archives(
+    config: ExportConfig,
+    metadata_list: list[FileMetadata] | None = None,
+) -> list[str]:
     """
     Create zip archives from the exported files.
 
     Args:
         config: Export configuration.
+        metadata_list: Optional list of file metadata for Onyx format.
 
     Returns:
         List of created zip file paths.
@@ -232,12 +282,12 @@ def create_zip_archives(config: ExportConfig) -> list[str]:
                     chunk = files[chunk_start : chunk_start + config.max_files_per_zip]
                     zip_name = f"{source}_slice_{i:04d}.zip"
                     zip_path = os.path.join(EXPORT_DATA_DIR, zip_name)
-                    _create_single_zip(zip_path, chunk, EXPORT_DATA_DIR)
+                    _create_single_zip(zip_path, chunk, EXPORT_DATA_DIR, metadata_list)
                     zip_files.append(zip_path)
             else:
                 zip_name = f"{source}.zip"
                 zip_path = os.path.join(EXPORT_DATA_DIR, zip_name)
-                _create_single_zip(zip_path, files, EXPORT_DATA_DIR)
+                _create_single_zip(zip_path, files, EXPORT_DATA_DIR, metadata_list)
                 zip_files.append(zip_path)
     else:
         # Collect all files
@@ -254,18 +304,23 @@ def create_zip_archives(config: ExportConfig) -> list[str]:
                 chunk = all_files[chunk_start : chunk_start + config.max_files_per_zip]
                 zip_name = f"dataset_slice_{i:04d}.zip"
                 zip_path = os.path.join(EXPORT_DATA_DIR, zip_name)
-                _create_single_zip(zip_path, chunk, EXPORT_DATA_DIR)
+                _create_single_zip(zip_path, chunk, EXPORT_DATA_DIR, metadata_list)
                 zip_files.append(zip_path)
         else:
             # Single zip for everything
             zip_path = os.path.join(EXPORT_DATA_DIR, "dataset.zip")
-            _create_single_zip(zip_path, all_files, EXPORT_DATA_DIR)
+            _create_single_zip(zip_path, all_files, EXPORT_DATA_DIR, metadata_list)
             zip_files.append(zip_path)
 
     return zip_files
 
 
-def _create_single_zip(zip_path: str, files: list[str], base_dir: str) -> None:
+def _create_single_zip(
+    zip_path: str,
+    files: list[str],
+    base_dir: str,
+    metadata_list: list[FileMetadata] | None = None,
+) -> None:
     """
     Create a single zip file from a list of files.
 
@@ -273,11 +328,29 @@ def _create_single_zip(zip_path: str, files: list[str], base_dir: str) -> None:
         zip_path: Path for the zip file.
         files: List of file paths to include.
         base_dir: Base directory for relative paths in the zip.
+        metadata_list: Optional list of file metadata for Onyx format.
     """
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for file_path in files:
             arcname = os.path.relpath(file_path, base_dir)
             zf.write(file_path, arcname)
+
+        # Add .onyx_metadata.json if metadata is provided
+        if metadata_list:
+            # Build metadata lookup from full paths in this zip
+            files_in_zip = {os.path.relpath(f, base_dir) for f in files}
+
+            # Filter metadata to only include files in this zip (using full_path)
+            # Output only filename, id, and title (not full_path)
+            metadata_for_zip = [
+                {"filename": m.filename, "id": m.id, "title": m.title}
+                for m in metadata_list
+                if m.full_path in files_in_zip
+            ]
+
+            if metadata_for_zip:
+                metadata_json = json.dumps(metadata_for_zip, indent=2)
+                zf.writestr(".onyx_metadata.json", metadata_json)
 
 
 def main() -> None:
@@ -301,17 +374,27 @@ def main() -> None:
         help="Maximum number of files per zip (creates incremental slices)",
     )
     parser.add_argument(
+        "--max-files",
+        type=int,
+        help="Maximum total number of files to export (for testing)",
+    )
+    parser.add_argument(
         "--split-by-source",
         action="store_true",
         help="Create separate zip files for each source",
     )
     args = parser.parse_args()
 
+    # Check for Onyx format from environment variable
+    onyx_format = os.environ.get(ONYX_FORMAT_ENV_VAR, "").lower() in ("1", "true", "yes")
+
     config = ExportConfig(
         sources=args.sources,
         create_zip=args.create_zip,
         max_files_per_zip=args.max_files_per_zip,
+        max_files=args.max_files,
         split_by_source=args.split_by_source,
+        onyx_format=onyx_format,
     )
 
     print("=" * 50)
@@ -325,20 +408,25 @@ def main() -> None:
     print(f"Create zip: {config.create_zip}")
     if config.max_files_per_zip:
         print(f"Max files per zip: {config.max_files_per_zip}")
+    if config.max_files:
+        print(f"Max files: {config.max_files}")
     if config.split_by_source:
         print("Split by source: enabled")
+    if config.onyx_format:
+        print("Onyx format: enabled (title in .onyx_metadata.json)")
     print()
 
-    # Check if export directory already has content
-    if is_directory_non_empty(EXPORT_DATA_DIR):
-        print(f"Warning: {EXPORT_DATA_DIR}/ already contains files.")
+    # Check if export directory already exists
+    if directory_exists(EXPORT_DATA_DIR):
+        print(f"Warning: {EXPORT_DATA_DIR}/ already exists.", flush=True)
         if not confirm_yes_no("Wipe directory and proceed with export?", default=False):
             print("Export cancelled.")
             return
+        print()  # Blank line after confirmation
 
     # Export files
-    print("Exporting files...")
-    stats = export_files(config)
+    print("Exporting files...", flush=True)
+    stats, metadata_list = export_files(config)
 
     print()
     print("Export Statistics:")
@@ -358,11 +446,15 @@ def main() -> None:
     if config.create_zip:
         print()
         print("Creating zip archives...")
-        zip_files = create_zip_archives(config)
+        # Pass metadata list if in Onyx format
+        zip_metadata = metadata_list if config.onyx_format else None
+        zip_files = create_zip_archives(config, zip_metadata)
         print(f"Created {len(zip_files)} zip file(s):")
         for zf in zip_files:
             size_mb = os.path.getsize(zf) / (1024 * 1024)
             print(f"  - {zf} ({size_mb:.2f} MB)")
+        if config.onyx_format:
+            print("  (each zip includes .onyx_metadata.json)")
 
     print()
     print("Export complete.")

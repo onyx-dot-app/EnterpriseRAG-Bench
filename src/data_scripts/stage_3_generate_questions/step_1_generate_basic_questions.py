@@ -7,7 +7,7 @@ import random
 
 from src.llm import Message, get_llm
 from src.paths import QUESTIONS_PATH, SOURCES_DIR
-from src.prompts.basic_questions import BASIC_QUESTION_VALIDATION, BASIC_QUESTIONS_PROMPT
+from src.prompts.basic_questions import BASIC_QUERY_VALIDATION, BASIC_QUERIES_PROMPT
 from src.utils import (
     count_json_files,
     DocumentFieldError,
@@ -54,7 +54,7 @@ def generate_question(
         return (False, str(e), None, None, None)
 
     # Build the prompt
-    prompt = BASIC_QUESTIONS_PROMPT.format(
+    prompt = BASIC_QUERIES_PROMPT.format(
         document_title=title,
         document_contents=content,
     )
@@ -106,10 +106,10 @@ def validate_question(
         (valid, expected_answer_explanation) tuple.
         On failure, expected_answer_explanation is None.
     """
-    prompt = BASIC_QUESTION_VALIDATION.format(
+    prompt = BASIC_QUERY_VALIDATION.format(
         document_title=title,
         document_contents=content,
-        question=question,
+        query=question,
     )
 
     llm = get_llm(tools=None, quiet=quiet)
