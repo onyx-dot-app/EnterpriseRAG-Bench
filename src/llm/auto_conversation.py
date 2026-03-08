@@ -6,6 +6,7 @@ from typing import Any, Generator
 
 from src.llm.factory import get_llm
 from src.llm.interface import LLMInterface, Message, ToolCall
+from src.tools.exceptions import ToolTerminationSignal
 from src.tools.runner import ToolRunner
 
 
@@ -120,13 +121,25 @@ def run_auto_conversation(
                         Message(role="tool_call", content="", tool_call=tool_call)
                     )
 
-                    with _braintrust_span(tool_call.name, span_type="tool") as tool_span:
-                        result = tool_runner.run(tool_call.name, **tool_call.args)
-                        _log_to_span(
-                            tool_span,
-                            input=tool_call.args,
-                            output=result,
+                    try:
+                        with _braintrust_span(tool_call.name, span_type="tool") as tool_span:
+                            result = tool_runner.run(tool_call.name, **tool_call.args)
+                            _log_to_span(
+                                tool_span,
+                                input=tool_call.args,
+                                output=result,
+                            )
+                    except ToolTerminationSignal as sig:
+                        # Tool signaled successful completion — append result and return
+                        messages.append(
+                            Message(role="tool_result", content=sig.result, call_id=tool_call.call_id)
                         )
+                        _log_to_span(
+                            conversation_span,
+                            output=sig.result,
+                            metadata={"total_steps": step, "tool_cycles": tool_cycles, "terminated_by_tool": True},
+                        )
+                        return sig.result
 
                     messages.append(
                         Message(role="tool_result", content=result, call_id=tool_call.call_id)

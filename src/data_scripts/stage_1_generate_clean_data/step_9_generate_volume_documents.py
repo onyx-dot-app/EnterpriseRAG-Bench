@@ -3,7 +3,6 @@
 import argparse
 import json
 import os
-import random
 import re
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
@@ -38,7 +37,6 @@ from src.utils import (
     get_directory_tree,
     load_file,
     process_written_document,
-    sources_resolver,
 )
 from src.utils.file_io import load_json_file, write_json_file
 from src.utils.statistics import update_statistics
@@ -1007,6 +1005,8 @@ def generate_single_document(
             allow_create_dirs=False,
             is_document_json=True,
             expected_source_type=source_type,
+            conflict_message=CONFLICT_PROMPT,
+            terminate_on_success=True,
         )
 
         # Initialize cheap LLM with only the write tool

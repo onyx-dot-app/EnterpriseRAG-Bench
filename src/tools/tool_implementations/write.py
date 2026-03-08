@@ -6,6 +6,7 @@ from collections.abc import Callable
 from src.llm import Message, get_llm
 from src.prompts.path_recovery import PATH_RECOVERY_PROMPT
 from src.tools import WRITE_TOOL
+from src.tools.exceptions import ToolTerminationSignal
 from src.tools.interface import ToolInterface
 from src.utils.directory_tree import get_directory_tree
 from src.utils.document_processing import process_written_document
@@ -107,6 +108,8 @@ class WriteTool(ToolInterface):
         auto_process: bool = False,
         quiet: bool = True,
         llm_path_recovery: bool = False,
+        conflict_message: str | None = None,
+        terminate_on_success: bool = False,
     ):
         """
         Initialize the WriteTool.
@@ -134,6 +137,10 @@ class WriteTool(ToolInterface):
                 Only used when is_document_json=True.
             llm_path_recovery: If True, use LLM to attempt to recover invalid paths
                 by finding the closest valid directory. Only used when is_document_json=True.
+            conflict_message: Custom message to return when a file already exists at the
+                target path. If None, a default error message is used.
+            terminate_on_success: If True, raise ToolTerminationSignal on successful write
+                to end the conversation loop immediately.
         """
         self._base_dir = base_dir
         self._file_path_override = file_path_override
@@ -148,6 +155,8 @@ class WriteTool(ToolInterface):
         self._auto_process = auto_process
         self._quiet = quiet
         self._llm_path_recovery = llm_path_recovery
+        self._conflict_message = conflict_message
+        self._terminate_on_success = terminate_on_success
         self._written_paths: list[str] = []
 
     @property
@@ -336,6 +345,10 @@ class WriteTool(ToolInterface):
             # Normalize path to be relative to SOURCES_DIR
             normalized_path = normalize_source_path(file_path, self._expected_source_type)
             abs_path = sources_resolver.to_absolute(normalized_path)
+
+            # Check if file already exists
+            if os.path.exists(abs_path):
+                return self._conflict_message or f"Error: File already exists at {file_path}. Please choose a different filename."
         else:
             # Basic validation without source type
             if not file_path.endswith(".json"):
@@ -371,7 +384,7 @@ class WriteTool(ToolInterface):
                         return f"Error: Parent directory does not exist: {parent_dir}. Please use an existing directory path."
 
                 if os.path.exists(abs_path):
-                    return f"Error: File already exists at {file_path}. Please choose a different filename."
+                    return self._conflict_message or f"Error: File already exists at {file_path}. Please choose a different filename."
             else:
                 abs_path = normalized_path
 
@@ -425,4 +438,7 @@ class WriteTool(ToolInterface):
             if not success:
                 return f"Error processing document: {error}"
 
-        return f"Successfully wrote to {normalized_path}"
+        result = f"Successfully wrote to {normalized_path}"
+        if self._terminate_on_success:
+            raise ToolTerminationSignal(result)
+        return result
