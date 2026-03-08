@@ -1,4 +1,4 @@
-PATH_RECOVERY_PROMPT = """
+PEOPLE_RECOVERY_PROMPT = """
 An LLM output the following project overview:
 ```
 {project_overview}

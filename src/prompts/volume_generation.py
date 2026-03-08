@@ -112,8 +112,10 @@ The estimation is off by {estimation_off_percentage}% which is too much. Please 
 # Topic and subtopics look like: "Topic description => subtopic description => subtopic description => ..."
 # Existing docs is a list of file paths/names of the existing documents for this topic.
 DOCUMENT_GENERATION_PROMPT = f"""
-You are an artificial dataset generation expert. You are provide a description of a hypothetical company, the source type of interest, and details about a topic of interest. \
-Your task is to generate a realistic document given all of the context. The directory structure is from a "tree" command of the file system which represents a realistic layout of the source type's documents. \
+You are an artificial dataset generation expert. You are provided a description of a hypothetical company, the source type of interest, and details about a topic of interest. \
+Your task is to generate a realistic document given all of the context that is as different to the other documents as possible. The more unique this document is likely to be, the better. \
+The directory structure is from a "tree" command of the file system which represents a realistic layout of the source type's documents. \
+Try to spread out the documents across the directory structure where it makes sense, try not to put all the documents in the same directory. \
 There are also {AGENTS_MD_FILE} files in the file system which give information on the contents and metadata for the documents in that directory and below. \
 User the {WRITE_TOOL} tool to write the document to the file system. The file must be valid JSON that matches the schema for the source type found in the {AGENTS_MD_FILE} file. \
 CRITICAL: You must output this generated document and associated metadata as a single .json. The JSON file must not have nested fields, all of the values must be strings or list of strings (no nested JSONs). \
@@ -125,6 +127,7 @@ The file written must exist in the existing directory structure (you cannot crea
 ```
 
 ## Source Directory Structure
+Try to find the most suitable location for the document, which typically should be in a leaf directory.
 ```md
 {{source_type}}
 ```
@@ -133,6 +136,7 @@ The file written must exist in the existing directory structure (you cannot crea
 {{agents_md_contents}}
 
 ## Existing docs for this topic
+Note, the new document should be as different to the existing documents as possible. The file name and the contents should be unique and loosely aligned with the topic.
 ```
 {{existing_docs}}
 ```
@@ -143,11 +147,12 @@ Topic (and subtopics): {{topic_and_subtopics}}
 
 
 DOCUMENT_GENERATION_USER_PROMPT = f"""
-Generate me a realistic document for the following topic.
+Generate me a realistic document for the following topic that is unique from the rest. Make sure the file name and contents conform to the {AGENTS_MD_FILE} file. \
+IMPORTANT: Use distinct wording and phrasing in the file name which does not mirror or closely echo the existing documents. The contents should also be different from what is likely to be found in the existing documents.
 
 Topic: {{topic_and_subtopics}}
 
-Remember that you must use the {WRITE_TOOL} tool to write the document to the file system. You can only write the file in the existing directory structure. \
+Remember that you must use the {WRITE_TOOL} tool to write the document to the file system. You can only write the file in the existing directory structure, preferably in a leaf directory. \
 The file must be valid JSON that matches the schema for the source type found in the {AGENTS_MD_FILE} file.
 """.strip()
 

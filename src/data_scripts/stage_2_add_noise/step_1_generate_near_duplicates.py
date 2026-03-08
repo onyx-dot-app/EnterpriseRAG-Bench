@@ -28,6 +28,7 @@ from src.utils import (
     load_file,
     process_written_document,
     select_random_file_hierarchical,
+    sources_resolver,
     try_recover_json,
     validate_no_nested_dicts,
     write_json_file,
@@ -77,7 +78,7 @@ def validate_file_path(file_path: str) -> bool:
     Returns:
         True if the parent directory exists, False otherwise.
     """
-    full_path = os.path.join(SOURCES_DIR, file_path)
+    full_path = sources_resolver.to_absolute(file_path)
     parent_dir = os.path.dirname(full_path)
     return os.path.exists(parent_dir) and os.path.isdir(parent_dir)
 
@@ -238,8 +239,7 @@ def _rename_file_for_source(
 
         # Validate the final path
         if final_path != file_path:
-            full_final_path = os.path.join(SOURCES_DIR, final_path)
-            if not os.path.exists(full_final_path):
+            if not sources_resolver.exists(final_path):
                 print(f"\nValid final path: {final_path}")
                 return final_path
             else:
@@ -371,7 +371,7 @@ def generate_near_duplicate(
         (success, message, old_file_path, new_file_path) tuple.
         On failure, old_file_path and new_file_path are None.
     """
-    full_path = os.path.join(SOURCES_DIR, file_path)
+    full_path = sources_resolver.to_absolute(file_path)
 
     # Load the original file
     try:
@@ -407,7 +407,7 @@ def generate_near_duplicate(
         return (False, "Failed to generate valid new file contents", None, None)
 
     # Write the new file with noise marker
-    full_new_path = os.path.join(SOURCES_DIR, new_file_path)
+    full_new_path = sources_resolver.to_absolute(new_file_path)
     try:
         # Add dataset_noise_document field before writing
         data = json.loads(new_contents)
@@ -530,8 +530,8 @@ def main() -> None:
             used_source_files.add(file_path)
 
             # Get UUIDs from both files
-            old_full_path = os.path.join(SOURCES_DIR, old_path)
-            new_full_path = os.path.join(SOURCES_DIR, new_path)
+            old_full_path = sources_resolver.to_absolute(old_path)
+            new_full_path = sources_resolver.to_absolute(new_path)
 
             old_uuid = get_dataset_doc_uuid(old_full_path)
             new_uuid = get_dataset_doc_uuid(new_full_path)

@@ -6,7 +6,7 @@ import os
 import random
 
 from src.llm import Message, get_llm
-from src.paths import QUESTIONS_PATH, SOURCES_DIR
+from src.paths import QUESTIONS_PATH
 from src.prompts.basic_questions import BASIC_QUERY_VALIDATION, BASIC_QUERIES_PROMPT
 from src.utils import (
     count_json_files,
@@ -15,6 +15,7 @@ from src.utils import (
     extract_json_from_response,
     load_json_file,
     select_random_file_hierarchical,
+    sources_resolver,
 )
 
 
@@ -34,7 +35,7 @@ def generate_question(
         On success, message_or_question is the generated question.
         On failure, dataset_doc_uuid, title, and content are None.
     """
-    full_path = os.path.join(SOURCES_DIR, doc_path)
+    full_path = sources_resolver.to_absolute(doc_path)
 
     # Load the document
     try:
@@ -292,7 +293,7 @@ def main() -> None:
         attempts = 0
         while attempts < 20:
             # Check if we already have a question for this document
-            full_path = os.path.join(SOURCES_DIR, doc_path)
+            full_path = sources_resolver.to_absolute(doc_path)
             try:
                 doc_data = load_json_file(full_path)
                 doc_uuid = doc_data.get("dataset_doc_uuid")

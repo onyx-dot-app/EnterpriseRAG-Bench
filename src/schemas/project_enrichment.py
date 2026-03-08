@@ -11,7 +11,7 @@ from src.llm import get_llm
 from src.llm.interface import Message
 from src.paths import EMPLOYEE_DIRECTORY_PATH
 from src.prompts.path_recovery import PATH_RECOVERY_PROMPT
-from src.prompts.people_recovery import PATH_RECOVERY_PROMPT as PEOPLE_RECOVERY_PROMPT
+from src.prompts.people_recovery import PEOPLE_RECOVERY_PROMPT
 
 
 class ProjectFile(BaseModel):

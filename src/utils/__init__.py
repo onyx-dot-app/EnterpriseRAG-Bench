@@ -20,6 +20,7 @@ from src.utils.file_selection import (
 )
 from src.utils.json_extraction import extract_json_from_response
 from src.utils.json_recovery import JsonRecoveryError, try_recover_json
+from src.utils.path_resolver import PathResolver, default_resolver, sources_resolver
 from src.utils.validation import validate_no_nested_dicts
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "confirm_regenerate",
     "confirm_yes_no",
     "count_json_files",
+    "default_resolver",
     "delete_file",
     "dir_has_json_files",
     "DocumentFieldError",
@@ -44,9 +46,11 @@ __all__ = [
     "load_file",
     "load_json_file",
     "needs_reordering",
+    "PathResolver",
     "process_written_document",
     "reorder_document_fields",
     "select_random_file_hierarchical",
+    "sources_resolver",
     "try_recover_json",
     "validate_no_nested_dicts",
     "write_json_file",

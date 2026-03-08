@@ -33,6 +33,7 @@ from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import WriteTool
 from src.utils import (
     confirm_yes_no,
+    default_resolver,
     extract_json_from_response,
     get_agents_md_for_source,
     JsonRecoveryError,
@@ -918,9 +919,10 @@ class JsonDocumentWriteTool(WriteTool):
 
         result = super().execute(final_content, file_path)
         if result.startswith("Successfully wrote to "):
-            # Extract the actual written path
+            # Extract the actual written path and convert to relative format
             actual_path = result.replace("Successfully wrote to ", "")
-            self._written_paths.append(actual_path)
+            rel_path = default_resolver.to_relative(actual_path)
+            self._written_paths.append(rel_path)
         return result
 
 
@@ -1125,24 +1127,26 @@ def generate_single_document(
 
             # Process the written document (add labels and UUID)
             # Note: JSON validation already happened at write time
-            file_path = write_tool.written_paths[0]
-            success, error = process_written_document(file_path)
+            rel_path = write_tool.written_paths[0]
+            abs_path = default_resolver.to_absolute(rel_path)
+            success, error = process_written_document(abs_path)
 
             if not success:
                 # Processing failed, delete file and retry
-                if os.path.exists(file_path):
-                    os.remove(file_path)
+                if os.path.exists(abs_path):
+                    os.remove(abs_path)
                 continue
 
-            # Success! Update the volume completed count and add file path
-            update_volume_completed(source_type, topic_path_parts, file_path, 1)
-            return (True, f"Created {file_path}")
+            # Success! Update the volume completed count and add file path (relative)
+            update_volume_completed(source_type, topic_path_parts, rel_path, 1)
+            return (True, f"Created {rel_path}")
 
         except Exception as e:
             # On exception, clean up any written files and retry
-            for path in write_tool.written_paths:
-                if os.path.exists(path):
-                    os.remove(path)
+            for rel_path in write_tool.written_paths:
+                abs_path = default_resolver.to_absolute(rel_path)
+                if os.path.exists(abs_path):
+                    os.remove(abs_path)
             if retry == max_retries - 1:
                 return (False, f"Error: {e}")
 

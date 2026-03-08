@@ -12,7 +12,6 @@ from src.llm import Message, get_llm, run_auto_conversation
 from src.paths import (
     AGENTS_MD_FILE,
     COMPANY_OVERVIEW_PATH,
-    GENERATED_DATA_DIR,
     DEBUG_DIR,
     PROJECTS_DIR,
     QUESTION_CACHE_DIR,
@@ -28,6 +27,7 @@ from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import ReadTool
 from src.utils import (
     add_dataset_doc_uuid,
+    default_resolver,
     extract_json_from_response,
     get_documents_without_labels,
     label_single_document,
@@ -127,12 +127,12 @@ def generate_single_file(
         (success, message) tuple.
     """
     # Check if file already exists
-    full_path = os.path.join(GENERATED_DATA_DIR, file_path)
+    full_path = default_resolver.to_absolute(file_path)
     if os.path.exists(full_path):
         return (True, "Skipped (exists)")
 
     # Get agents.md context along the path
-    agents_context = get_agents_md_along_path(file_path, GENERATED_DATA_DIR)
+    agents_context = get_agents_md_along_path(file_path, default_resolver.base_dir)
 
     # Build the system prompt
     system_prompt = DOCUMENT_GENERATION_SYSTEM_PROMPT.format(
@@ -227,8 +227,7 @@ def process_project_files(
     skipped = 0
     for file_entry in files:
         file_path = file_entry.get("path", "")
-        full_path = os.path.join(GENERATED_DATA_DIR, file_path)
-        if os.path.exists(full_path):
+        if default_resolver.exists(file_path):
             skipped += 1
         else:
             pending_files.append(file_entry)
@@ -325,7 +324,7 @@ def print_document_statistics() -> None:
     source_counts: Counter[str] = Counter()
     total_documents = 0
 
-    sources_dir = os.path.join(GENERATED_DATA_DIR, "sources")
+    sources_dir = default_resolver.to_absolute("sources")
     if not os.path.exists(sources_dir):
         return
 
@@ -391,8 +390,7 @@ def generate_documents(
             total_files += len(files)
             for file_entry in files:
                 file_path = file_entry.get("path", "")
-                full_path = os.path.join(GENERATED_DATA_DIR, file_path)
-                if os.path.exists(full_path):
+                if default_resolver.exists(file_path):
                     existing_files.append(file_path)
                 else:
                     pending_files += 1
@@ -490,7 +488,7 @@ def label_documents(max_parallelism: int = 5) -> None:
     print("Phase 2: Label Document Fields")
     print("=" * 40)
 
-    sources_dir = os.path.join(GENERATED_DATA_DIR, "sources")
+    sources_dir = default_resolver.to_absolute("sources")
 
     # Check which documents need labeling
     missing = get_documents_without_labels(sources_dir)
@@ -554,7 +552,7 @@ def add_dataset_uuids(max_parallelism: int = 20) -> None:
     print("Phase 3: Add Dataset Document UUIDs")
     print("=" * 40)
 
-    sources_dir = os.path.join(GENERATED_DATA_DIR, "sources")
+    sources_dir = default_resolver.to_absolute("sources")
 
     # Find all JSON files without dataset_doc_uuid
     files_to_process: list[str] = []
@@ -594,7 +592,7 @@ def add_dataset_uuids(max_parallelism: int = 20) -> None:
                     future.result()
                     added += 1
                 except Exception as e:
-                    rel_path = os.path.relpath(filepath, GENERATED_DATA_DIR)
+                    rel_path = default_resolver.to_relative(filepath)
                     failed.append((rel_path, str(e)))
                     tqdm.write(f"[FAIL] {rel_path}: {e}")
                 pbar.update(1)
@@ -656,9 +654,9 @@ def write_question_cache() -> None:
             document_uuids: list[str] = []
             for file_entry in files:
                 file_path = file_entry.get("path", "")
-                full_path = os.path.join(GENERATED_DATA_DIR, file_path)
+                full_path = default_resolver.to_absolute(file_path)
 
-                if os.path.exists(full_path):
+                if default_resolver.exists(file_path):
                     try:
                         doc_data = load_json_file(full_path)
                         uuid = doc_data.get("dataset_doc_uuid", "")
@@ -741,7 +739,7 @@ def main() -> None:
     write_question_cache()
 
     # Update aggregate statistics
-    sources_dir = os.path.join(GENERATED_DATA_DIR, "sources")
+    sources_dir = default_resolver.to_absolute("sources")
     source_counts: Counter[str] = Counter()
     total_docs = 0
     for root, _dirs, files in os.walk(sources_dir):

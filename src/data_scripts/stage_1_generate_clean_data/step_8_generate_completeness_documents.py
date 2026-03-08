@@ -9,7 +9,6 @@ from src.llm import get_llm
 from src.llm.conversation import Conversation
 from src.paths import (
     COMPANY_OVERVIEW_PATH,
-    GENERATED_DATA_DIR,
     QUESTION_CACHE_DIR,
     SOURCE_TREE_PATH,
     SOURCES_DIR,
@@ -26,6 +25,7 @@ from src.tools.tool_implementations import FinishTool, GlobTool, ReadTool, RmToo
 from src.utils.dataset_id import add_dataset_doc_uuid
 from src.utils.field_labeling import label_single_document
 from src.utils.file_io import delete_file, load_file, load_json_file, write_json_file
+from src.utils.path_resolver import default_resolver
 from src.utils.validation import validate_no_nested_dicts
 
 
@@ -42,10 +42,9 @@ def validate_written_files(file_paths: list[str]) -> tuple[bool, list[str]]:
     errors = []
 
     for rel_path in file_paths:
-        # Convert sources/... to generated_data/sources/...
-        full_path = os.path.join(GENERATED_DATA_DIR, rel_path)
+        full_path = default_resolver.to_absolute(rel_path)
 
-        if not os.path.exists(full_path):
+        if not default_resolver.exists(rel_path):
             errors.append(f"File not found: {rel_path}")
             continue
 
@@ -67,10 +66,10 @@ def delete_written_files(file_paths: list[str]) -> None:
     Delete all files that were written during this step.
 
     Args:
-        file_paths: List of paths relative to sources (e.g., "sources/confluence/doc.json")
+        file_paths: List of paths relative to GENERATED_DATA_DIR (e.g., "sources/confluence/doc.json")
     """
     for rel_path in file_paths:
-        full_path = os.path.join(GENERATED_DATA_DIR, rel_path)
+        full_path = default_resolver.to_absolute(rel_path)
         if delete_file(full_path):
             print(f"  Deleted: {rel_path}")
 
@@ -136,14 +135,10 @@ class JsonDocumentWriteTool(WriteTool):
 
         result = super().execute(content, file_path)
         if result.startswith("Successfully wrote to "):
-            # Extract the actual written path from the result
+            # Extract the actual written path and convert to relative format
             actual_path = result.replace("Successfully wrote to ", "")
-            # Convert to relative path from sources/
-            if self._base_dir and actual_path.startswith(self._base_dir):
-                rel_path = actual_path[len(self._base_dir):].lstrip("/")
-                self._written_paths.append(f"sources/{rel_path}")
-            else:
-                self._written_paths.append(actual_path)
+            rel_path = default_resolver.to_relative(actual_path)
+            self._written_paths.append(rel_path)
         return result
 
 
@@ -179,14 +174,14 @@ def add_uuids_to_files(file_paths: list[str]) -> list[str]:
     Add dataset_doc_uuid to each file and return the list of UUIDs.
 
     Args:
-        file_paths: List of paths relative to sources (e.g., "sources/confluence/doc.json")
+        file_paths: List of paths relative to GENERATED_DATA_DIR (e.g., "sources/confluence/doc.json")
 
     Returns:
         List of dataset_doc_uuids in the same order as file_paths.
     """
     uuids = []
     for rel_path in file_paths:
-        full_path = os.path.join(GENERATED_DATA_DIR, rel_path)
+        full_path = default_resolver.to_absolute(rel_path)
         doc_uuid = add_dataset_doc_uuid(full_path)
         uuids.append(doc_uuid)
     return uuids
@@ -197,10 +192,10 @@ def label_files(file_paths: list[str]) -> None:
     Add field labels (title_field_name, content_field_names) to each file.
 
     Args:
-        file_paths: List of paths relative to sources (e.g., "sources/confluence/doc.json")
+        file_paths: List of paths relative to GENERATED_DATA_DIR (e.g., "sources/confluence/doc.json")
     """
     for rel_path in file_paths:
-        full_path = os.path.join(GENERATED_DATA_DIR, rel_path)
+        full_path = default_resolver.to_absolute(rel_path)
         success, message = label_single_document(full_path, quiet=True)
         if not success:
             print(f"  Warning: Failed to label {rel_path}: {message}")
