@@ -2,7 +2,6 @@
 
 import json
 import os
-import subprocess
 
 import yaml
 from pydantic import BaseModel, field_validator
@@ -12,6 +11,7 @@ from src.llm.interface import Message
 from src.paths import EMPLOYEE_DIRECTORY_PATH
 from src.prompts.path_recovery import PATH_RECOVERY_PROMPT
 from src.prompts.people_recovery import PEOPLE_RECOVERY_PROMPT
+from src.utils.directory_tree import get_directory_tree
 
 
 class ProjectFile(BaseModel):
@@ -222,37 +222,7 @@ def normalize_path(path: str) -> str:
 def get_sources_tree(base_dir: str, max_depth: int = 4) -> str:
     """Get a tree representation of the sources directory, rooted at 'sources/'."""
     sources_dir = os.path.join(base_dir, "sources")
-    try:
-        result = subprocess.run(
-            ["tree", "-L", str(max_depth), "--noreport", sources_dir],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        output = result.stdout
-        # Replace the full path with just "sources" so LLM sees correct paths
-        # e.g., "generated_data/sources" -> "sources"
-        output = output.replace(sources_dir, "sources", 1)
-        return output
-    except Exception:
-        # Fallback: simple directory listing
-        lines = ["sources/"]
-        for root, dirs, files in os.walk(sources_dir):
-            # Get path relative to sources_dir
-            rel_path = os.path.relpath(root, sources_dir)
-            if rel_path == ".":
-                level = 0
-            else:
-                level = rel_path.count(os.sep) + 1
-            if level >= max_depth:
-                continue
-            if rel_path != ".":
-                indent = "  " * level
-                lines.append(f"{indent}{os.path.basename(root)}/")
-            for file in files:
-                indent = "  " * (level + 1)
-                lines.append(f"{indent}{file}")
-        return "\n".join(lines)
+    return get_directory_tree(sources_dir)
 
 
 def recover_path(incorrect_path: str, base_dir: str) -> str | None:

@@ -5,7 +5,6 @@ import json
 import os
 import random
 import re
-import subprocess
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 
@@ -36,6 +35,7 @@ from src.utils import (
     default_resolver,
     extract_json_from_response,
     get_agents_md_for_source,
+    get_directory_tree,
     load_file,
     process_written_document,
     sources_resolver,
@@ -196,17 +196,7 @@ def get_source_tree(source_type: str) -> str:
     if not os.path.exists(source_path):
         return f"(Source directory not found: {source_type})"
 
-    result = subprocess.run(
-        ["tree", "-d", source_type],
-        cwd=SOURCES_DIR,
-        capture_output=True,
-        text=True,
-    )
-
-    if result.returncode != 0:
-        return f"(Error running tree: {result.stderr})"
-
-    return result.stdout
+    return get_directory_tree(source_path)
 
 
 def validate_volume_json(json_str: str) -> str | None:

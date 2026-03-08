@@ -5,6 +5,7 @@ from src.utils.cli import confirm_regenerate, confirm_yes_no
 from src.utils.dataset_id import add_dataset_doc_uuid, generate_dataset_doc_uuid, get_dataset_doc_uuid
 from src.utils.document_content import DocumentFieldError, extract_document_content
 from src.utils.dates import get_current_date_formatted
+from src.utils.directory_tree import get_directory_tree
 from src.utils.document_processing import process_written_document
 from src.utils.field_labeling import (
     get_documents_without_labels,
@@ -45,6 +46,7 @@ __all__ = [
     "get_agents_md_for_source",
     "get_current_date_formatted",
     "get_dataset_doc_uuid",
+    "get_directory_tree",
     "get_documents_without_labels",
     "JsonRecoveryError",
     "label_document_fields",

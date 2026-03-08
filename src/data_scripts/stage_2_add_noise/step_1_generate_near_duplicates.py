@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import random
-import subprocess
 
 from src.llm import Message, get_llm
 from src.paths import (
@@ -25,6 +24,7 @@ from src.utils import (
     extract_json_from_response,
     get_agents_md_for_path,
     get_dataset_doc_uuid,
+    get_directory_tree,
     JsonRecoveryError,
     load_file,
     select_random_file_hierarchical,
@@ -47,20 +47,11 @@ def get_source_tree() -> str:
     Returns:
         Tree output string for the sources directory.
     """
+    # Use cached tree if available
     if os.path.exists(SOURCE_TREE_PATH):
         return load_file(SOURCE_TREE_PATH)
 
-    result = subprocess.run(
-        ["tree", "-d"],
-        cwd=SOURCES_DIR,
-        capture_output=True,
-        text=True,
-    )
-
-    if result.returncode != 0:
-        return f"(Error running tree: {result.stderr})"
-
-    return result.stdout
+    return get_directory_tree(SOURCES_DIR)
 
 
 # =============================================================================

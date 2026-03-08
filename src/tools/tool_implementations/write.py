@@ -3,8 +3,11 @@ import os
 import re
 from collections.abc import Callable
 
+from src.llm import Message, get_llm
+from src.prompts.path_recovery import PATH_RECOVERY_PROMPT
 from src.tools import WRITE_TOOL
 from src.tools.interface import ToolInterface
+from src.utils.directory_tree import get_directory_tree
 from src.utils.document_processing import process_written_document
 from src.utils.json_recovery import JsonRecoveryError, try_recover_json
 from src.utils.path_resolver import (
@@ -26,6 +29,66 @@ def _strip_control_chars(content: str) -> str:
     return _CONTROL_CHAR_PATTERN.sub("", content)
 
 
+def _recover_path_with_llm(
+    incorrect_path: str,
+    base_dir: str,
+    quiet: bool = True,
+) -> str | None:
+    """
+    Use LLM to recover a correct path from an incorrect one.
+
+    Args:
+        incorrect_path: The path that failed validation.
+        base_dir: Base directory for the tree (what LLM sees).
+        quiet: If True, suppress LLM output.
+
+    Returns:
+        Recovered path if successful, None otherwise.
+    """
+    valid_paths_tree = get_directory_tree(base_dir)
+
+    prompt = PATH_RECOVERY_PROMPT.format(
+        incorrect_path=incorrect_path,
+        valid_paths_tree=valid_paths_tree,
+    )
+
+    llm = get_llm(quiet=quiet)
+    messages = [Message(role="user", content=prompt)]
+
+    response = ""
+    for chunk in llm.generate(messages):
+        if isinstance(chunk, str):
+            if not quiet:
+                print(chunk, end="", flush=True)
+            response += chunk
+
+    if not quiet:
+        print()
+
+    response = response.strip()
+
+    # Extract the path from the response
+    # Look for patterns that look like file paths
+    base_name = os.path.basename(base_dir.rstrip("/"))
+
+    for line in response.split("\n"):
+        line = line.strip().strip("`").strip()
+        # Check if line contains a path starting with the base directory name
+        if f"{base_name}/" in line:
+            idx = line.find(f"{base_name}/")
+            candidate = line[idx:].split()[0].strip("\"'`,.")
+            # Remove the base_name prefix since we want path relative to base_dir
+            if candidate.startswith(f"{base_name}/"):
+                return candidate[len(base_name) + 1:]
+        # Also check for paths that might already be relative
+        if "/" in line and line.endswith(".json"):
+            candidate = line.split()[0].strip("\"'`,.")
+            if not candidate.startswith("/"):
+                return candidate
+
+    return None
+
+
 class WriteTool(ToolInterface):
     """Tool for writing content to files."""
 
@@ -43,6 +106,7 @@ class WriteTool(ToolInterface):
         mark_as_noise: bool = False,
         auto_process: bool = False,
         quiet: bool = True,
+        llm_path_recovery: bool = False,
     ):
         """
         Initialize the WriteTool.
@@ -68,6 +132,8 @@ class WriteTool(ToolInterface):
                 Only used when is_document_json=True.
             quiet: Suppress LLM output during processing (for JSON recovery and labeling).
                 Only used when is_document_json=True.
+            llm_path_recovery: If True, use LLM to attempt to recover invalid paths
+                by finding the closest valid directory. Only used when is_document_json=True.
         """
         self._base_dir = base_dir
         self._file_path_override = file_path_override
@@ -81,6 +147,7 @@ class WriteTool(ToolInterface):
         self._mark_as_noise = mark_as_noise
         self._auto_process = auto_process
         self._quiet = quiet
+        self._llm_path_recovery = llm_path_recovery
         self._written_paths: list[str] = []
 
     @property
@@ -239,11 +306,32 @@ class WriteTool(ToolInterface):
         if not file_path:
             return "Error: No file path provided. Please specify a valid .json file path."
 
+        # Track original path for error messages
+        original_path = file_path
+
         # Validate path format using existing utilities
         if self._expected_source_type:
             path_error = validate_source_path(file_path, self._expected_source_type)
             if path_error:
-                return f"Error: {path_error}"
+                # Attempt LLM path recovery if enabled
+                if self._llm_path_recovery and self._base_dir:
+                    if not self._quiet:
+                        print(f"\nPath validation failed: {path_error}")
+                        print("Attempting LLM path recovery...")
+                    recovered = _recover_path_with_llm(
+                        file_path, self._base_dir, quiet=self._quiet
+                    )
+                    if recovered:
+                        if not self._quiet:
+                            print(f"Recovered path: {recovered}")
+                        file_path = recovered
+                        # Re-validate the recovered path
+                        path_error = validate_source_path(
+                            file_path, self._expected_source_type
+                        )
+
+                if path_error:
+                    return f"Error: {path_error}"
 
             # Normalize path to be relative to SOURCES_DIR
             normalized_path = normalize_source_path(file_path, self._expected_source_type)
@@ -264,7 +352,24 @@ class WriteTool(ToolInterface):
                 abs_path = os.path.join(self._base_dir, normalized_path)
                 parent_dir = os.path.dirname(abs_path)
                 if not os.path.isdir(parent_dir):
-                    return f"Error: Parent directory does not exist: {parent_dir}. Please use an existing directory path."
+                    # Attempt LLM path recovery if enabled
+                    if self._llm_path_recovery:
+                        if not self._quiet:
+                            print(f"\nParent directory does not exist: {parent_dir}")
+                            print("Attempting LLM path recovery...")
+                        recovered = _recover_path_with_llm(
+                            file_path, self._base_dir, quiet=self._quiet
+                        )
+                        if recovered:
+                            if not self._quiet:
+                                print(f"Recovered path: {recovered}")
+                            normalized_path = recovered
+                            abs_path = os.path.join(self._base_dir, normalized_path)
+                            parent_dir = os.path.dirname(abs_path)
+
+                    if not os.path.isdir(parent_dir):
+                        return f"Error: Parent directory does not exist: {parent_dir}. Please use an existing directory path."
+
                 if os.path.exists(abs_path):
                     return f"Error: File already exists at {file_path}. Please choose a different filename."
             else:

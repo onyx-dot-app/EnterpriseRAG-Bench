@@ -1,7 +1,6 @@
 """Interactive script for generating source directory structure."""
 
 import os
-import subprocess
 
 from src.llm import get_llm
 from src.llm.conversation import Conversation
@@ -13,7 +12,6 @@ from src.paths import (
     SOURCES_DIR,
 )
 from src.prompts.source_structure import SOURCE_STRUCTURE_SYSTEM_PROMPT
-from src.utils.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import (
     FinishTool,
@@ -23,7 +21,8 @@ from src.tools.tool_implementations import (
     RmdirTool,
     TreeTool,
 )
-from src.utils import confirm_regenerate, get_current_date_formatted, load_file
+from src.utils import confirm_regenerate, get_current_date_formatted, get_directory_tree, load_file
+from src.utils.statistics import update_statistics
 
 
 def count_directories(base_dir: str) -> tuple[int, int]:
@@ -48,20 +47,7 @@ def write_source_tree() -> None:
     print("Writing Source Directory Tree")
     print("=" * 40)
 
-    # Run tree command from generated_data dir with just "sources" as argument
-    # This outputs "sources" as the root instead of "generated_data/sources"
-    result = subprocess.run(
-        ["tree", "-d", "sources"],
-        cwd=GENERATED_DATA_DIR,
-        capture_output=True,
-        text=True,
-    )
-
-    if result.returncode != 0:
-        print(f"Error running tree command: {result.stderr}")
-        return
-
-    tree_output = result.stdout
+    tree_output = get_directory_tree(SOURCES_DIR)
 
     # Write to file
     with open(SOURCE_TREE_PATH, "w") as f:
