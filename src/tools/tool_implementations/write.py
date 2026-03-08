@@ -1,9 +1,18 @@
+import json
 import os
 import re
 from collections.abc import Callable
 
 from src.tools import WRITE_TOOL
 from src.tools.interface import ToolInterface
+from src.utils.document_processing import process_written_document
+from src.utils.json_recovery import JsonRecoveryError, try_recover_json
+from src.utils.path_resolver import (
+    normalize_source_path,
+    sources_resolver,
+    validate_source_path,
+)
+from src.utils.validation import validate_no_nested_dicts
 
 # Validator function type: takes content string, returns error message or None
 ValidatorFunc = Callable[[str], str | None]
@@ -28,6 +37,12 @@ class WriteTool(ToolInterface):
         expected_format: str | None = None,
         display_name: str | None = None,
         allow_create_dirs: bool = True,
+        # Document JSON parameters:
+        is_document_json: bool = False,
+        expected_source_type: str | None = None,
+        mark_as_noise: bool = False,
+        auto_process: bool = False,
+        quiet: bool = True,
     ):
         """
         Initialize the WriteTool.
@@ -43,6 +58,16 @@ class WriteTool(ToolInterface):
             display_name: Name to show in schema description (defaults to basename of base_dir).
             allow_create_dirs: If False, will not create new directories. Instead,
                 files will be written to the nearest existing parent directory.
+            is_document_json: Enable document JSON validation pipeline (validates path,
+                JSON structure, and optionally runs post-processing).
+            expected_source_type: Source type for path validation (e.g., "confluence").
+                Only used when is_document_json=True.
+            mark_as_noise: Add dataset_noise_document: True to the document data.
+                Only used when is_document_json=True.
+            auto_process: Run field labels + UUID post-processing after successful write.
+                Only used when is_document_json=True.
+            quiet: Suppress LLM output during processing (for JSON recovery and labeling).
+                Only used when is_document_json=True.
         """
         self._base_dir = base_dir
         self._file_path_override = file_path_override
@@ -50,6 +75,13 @@ class WriteTool(ToolInterface):
         self._expected_format = expected_format
         self._display_name = display_name or (os.path.basename(base_dir) if base_dir else None)
         self._allow_create_dirs = allow_create_dirs
+        # Document JSON parameters
+        self._is_document_json = is_document_json
+        self._expected_source_type = expected_source_type
+        self._mark_as_noise = mark_as_noise
+        self._auto_process = auto_process
+        self._quiet = quiet
+        self._written_paths: list[str] = []
 
     @property
     def name(self) -> str:
@@ -66,6 +98,23 @@ class WriteTool(ToolInterface):
         elif path == base_name:
             path = ""
         return path
+
+    @property
+    def written_paths(self) -> list[str]:
+        """Return list of paths written since last reset (document JSON mode only)."""
+        return self._written_paths.copy()
+
+    def reset_tracking(self) -> None:
+        """Clear the list of written paths."""
+        self._written_paths = []
+
+    def remove_path(self, path: str) -> None:
+        """Remove a path from tracking (called when file is deleted)."""
+        # Try to remove with various formats
+        for p in [path, f"sources/{path}"]:
+            if p in self._written_paths:
+                self._written_paths.remove(p)
+                return
 
     @property
     def schema(self) -> dict:
@@ -104,6 +153,10 @@ class WriteTool(ToolInterface):
         Returns:
             Success or error message.
         """
+        # Document JSON mode: special validation pipeline
+        if self._is_document_json:
+            return self._execute_document_json(content, file_path)
+
         target = self._file_path_override or file_path
         if not target:
             return "Error: No file path provided"
@@ -166,3 +219,105 @@ class WriteTool(ToolInterface):
             return f"Successfully wrote to {response_path}"
         except Exception as e:
             return f"Error writing to {response_path}: {e}"
+
+    def _execute_document_json(self, content: str, file_path: str) -> str:
+        """
+        Execute document JSON write with validation pipeline.
+
+        Validates:
+        - File path ends with .json
+        - Path is under expected source type (if configured)
+        - Parent directory exists
+        - File doesn't already exist
+        - Content is valid JSON (with LLM recovery fallback)
+        - JSON has flat structure (no nested dicts)
+
+        After successful write:
+        - Tracks written path
+        - Optionally runs field labels + UUID post-processing
+        """
+        if not file_path:
+            return "Error: No file path provided. Please specify a valid .json file path."
+
+        # Validate path format using existing utilities
+        if self._expected_source_type:
+            path_error = validate_source_path(file_path, self._expected_source_type)
+            if path_error:
+                return f"Error: {path_error}"
+
+            # Normalize path to be relative to SOURCES_DIR
+            normalized_path = normalize_source_path(file_path, self._expected_source_type)
+            abs_path = sources_resolver.to_absolute(normalized_path)
+        else:
+            # Basic validation without source type
+            if not file_path.endswith(".json"):
+                return f"Error: File path must end with .json, got: {file_path}. Please use a .json extension."
+
+            # Check proper directory structure
+            normalized_path = self._normalize_path(file_path) if self._base_dir else file_path
+            path_parts = normalized_path.replace("\\", "/").split("/")
+            if len(path_parts) < 2:
+                return f"Error: File must be in a subdirectory, not directly in sources root. Got: {file_path}"
+
+            # Validate parent directory exists and file doesn't already exist
+            if self._base_dir:
+                abs_path = os.path.join(self._base_dir, normalized_path)
+                parent_dir = os.path.dirname(abs_path)
+                if not os.path.isdir(parent_dir):
+                    return f"Error: Parent directory does not exist: {parent_dir}. Please use an existing directory path."
+                if os.path.exists(abs_path):
+                    return f"Error: File already exists at {file_path}. Please choose a different filename."
+            else:
+                abs_path = normalized_path
+
+        # Strip control characters
+        content = _strip_control_chars(content)
+
+        # Parse and validate JSON
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            # Attempt JSON recovery using LLM
+            try:
+                content = try_recover_json(content, quiet=self._quiet)
+                data = json.loads(content)
+            except JsonRecoveryError as e:
+                return f"Error: Invalid JSON and recovery failed: {e}"
+
+        # Validate flat structure (no nested dicts)
+        validation_error = validate_no_nested_dicts(data)
+        if validation_error:
+            return f"Error: {validation_error}. All values must be strings, primitives, or lists of strings/primitives. Please fix and try again."
+
+        # Add noise marker if configured
+        if self._mark_as_noise:
+            data["dataset_noise_document"] = True
+
+        # Re-serialize JSON
+        final_content = json.dumps(data, indent=2)
+
+        # Write the file
+        try:
+            parent_dir = os.path.dirname(abs_path)
+            if parent_dir and not os.path.exists(parent_dir):
+                os.makedirs(parent_dir, exist_ok=True)
+
+            with open(abs_path, "w") as f:
+                f.write(final_content)
+        except Exception as e:
+            return f"Error writing to {normalized_path}: {e}"
+
+        # Track the written path (relative to GENERATED_DATA_DIR)
+        if self._expected_source_type:
+            rel_path = f"sources/{normalized_path}"
+        else:
+            rel_path = normalized_path
+        self._written_paths.append(rel_path)
+
+        # Run post-processing if configured
+        if self._auto_process:
+            success, error = process_written_document(abs_path, quiet=self._quiet)
+            if not success:
+                return f"Error processing document: {error}"
+
+        return f"Successfully wrote to {normalized_path}"

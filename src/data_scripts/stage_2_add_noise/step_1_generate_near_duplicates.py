@@ -19,6 +19,7 @@ from src.prompts.new_duplicate_file import (
     NEW_DUPLICATE_FILE_PROMPT,
     NEW_DUPLICATE_FILE_USER_PROMPT,
 )
+from src.tools.tool_implementations import WriteTool
 from src.utils import (
     count_json_files,
     extract_json_from_response,
@@ -26,7 +27,6 @@ from src.utils import (
     get_dataset_doc_uuid,
     JsonRecoveryError,
     load_file,
-    process_written_document,
     select_random_file_hierarchical,
     sources_resolver,
     try_recover_json,
@@ -406,25 +406,21 @@ def generate_near_duplicate(
     if not new_contents:
         return (False, "Failed to generate valid new file contents", None, None)
 
-    # Write the new file with noise marker
-    full_new_path = sources_resolver.to_absolute(new_file_path)
-    try:
-        # Add dataset_noise_document field before writing
-        data = json.loads(new_contents)
-        data["dataset_noise_document"] = True
-        with open(full_new_path, "w") as f:
-            json.dump(data, f, indent=2)
-        print(f"\nWrote file: {new_file_path}")
-    except Exception as e:
-        return (False, f"Error writing file: {e}", None, None)
+    # Write the new file with noise marker using WriteTool
+    # This handles: adding noise marker, writing file, labels + UUID
+    write_tool = WriteTool(
+        base_dir=SOURCES_DIR,
+        is_document_json=True,
+        mark_as_noise=True,
+        auto_process=True,
+        quiet=False,
+    )
+    result = write_tool.execute(content=new_contents, file_path=new_file_path)
 
-    # Add field labels and UUID
-    print("\nProcessing document (labels + UUID)...")
-    success, error = process_written_document(full_new_path, quiet=False)
-    if not success:
-        return (False, f"Error processing document: {error}", None, None)
-    print("Document processed")
+    if result.startswith("Error"):
+        return (False, result, None, None)
 
+    print(f"\n{result}")
     return (True, f"Created {new_file_path}", file_path, new_file_path)
 
 

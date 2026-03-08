@@ -74,75 +74,6 @@ def delete_written_files(file_paths: list[str]) -> None:
             print(f"  Deleted: {rel_path}")
 
 
-class JsonDocumentWriteTool(WriteTool):
-    """
-    WriteTool for writing JSON documents to the sources directory.
-
-    Validates that:
-    - File path ends with .json
-    - File is in a subdirectory (not directly in sources root)
-    - Parent directory exists
-    - File doesn't already exist
-
-    Tracks all written file paths for later reference.
-    """
-
-    def __init__(self, base_dir: str | None = None, allow_create_dirs: bool = False) -> None:
-        super().__init__(base_dir=base_dir, allow_create_dirs=allow_create_dirs)
-        self._written_paths: list[str] = []
-
-    @property
-    def written_paths(self) -> list[str]:
-        """Return list of paths written since last reset."""
-        return self._written_paths.copy()
-
-    def reset_tracking(self) -> None:
-        """Clear the list of written paths."""
-        self._written_paths = []
-
-    def remove_path(self, path: str) -> None:
-        """Remove a path from tracking (called when file is deleted)."""
-        # Try to remove with various formats
-        for p in [path, f"sources/{path}"]:
-            if p in self._written_paths:
-                self._written_paths.remove(p)
-                return
-
-    def execute(self, content: str, file_path: str = "") -> str:
-        """Write JSON content after validating path. Returns error if path invalid or file exists."""
-        # Validate file path format
-        if not file_path:
-            return "Error: No file path provided. Please specify a valid .json file path."
-
-        if not file_path.endswith(".json"):
-            return f"Error: File path must end with .json, got: {file_path}. Please use a .json extension."
-
-        # Check path has proper directory structure (not directly in base dir)
-        normalized_path = self._normalize_path(file_path) if self._base_dir else file_path
-        path_parts = normalized_path.replace("\\", "/").split("/")
-        if len(path_parts) < 2:
-            return f"Error: File must be in a subdirectory, not directly in sources root. Got: {file_path}"
-
-        # Validate parent directory exists and file doesn't already exist
-        if self._base_dir:
-            target_path = os.path.join(self._base_dir, normalized_path)
-            parent_dir = os.path.dirname(target_path)
-            if not os.path.isdir(parent_dir):
-                return f"Error: Parent directory does not exist: {parent_dir}. Please use an existing directory path."
-
-            if os.path.exists(target_path):
-                return f"Error: File already exists at {file_path}. Try with a new file name or path."
-
-        result = super().execute(content, file_path)
-        if result.startswith("Successfully wrote to "):
-            # Extract the written path (relative to SOURCES_DIR) and convert to
-            # format relative to GENERATED_DATA_DIR (prepend "sources/")
-            sources_rel_path = result.replace("Successfully wrote to ", "")
-            rel_path = f"sources/{sources_rel_path}"
-            self._written_paths.append(rel_path)
-        return result
-
-
 def count_existing_traces() -> int:
     """Count existing completeness trace files in question_cache."""
     if not os.path.exists(QUESTION_CACHE_DIR):
@@ -284,7 +215,7 @@ def main() -> None:
         print()
 
         # Create tools
-        write_tool = JsonDocumentWriteTool(base_dir=SOURCES_DIR)
+        write_tool = WriteTool(base_dir=SOURCES_DIR, is_document_json=True)
         glob_tool = GlobTool(
             base_dir=SOURCES_DIR,
             required_pattern=r"agents",
