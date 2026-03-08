@@ -108,12 +108,15 @@ class WriteTool(ToolInterface):
         if not target:
             return "Error: No file path provided"
 
+        # Track relative path for response messages (what the LLM sees)
+        response_path = target
+
         # Handle base_dir if set
         if self._base_dir and not self._file_path_override:
             if ".." in target:
                 return "Error: Path cannot contain '..'"
-            target = self._normalize_path(target)
-            target = os.path.join(self._base_dir, target)
+            response_path = self._normalize_path(target)
+            target = os.path.join(self._base_dir, response_path)
 
         # Validate content if validator is configured
         if self._validator:
@@ -160,6 +163,6 @@ class WriteTool(ToolInterface):
 
             with open(target, "w") as f:
                 f.write(content)
-            return f"Successfully wrote to {target}"
+            return f"Successfully wrote to {response_path}"
         except Exception as e:
-            return f"Error writing to {target}: {e}"
+            return f"Error writing to {response_path}: {e}"

@@ -23,7 +23,7 @@
 ### File Operations
 - **`file_io.py`** - Core file I/O: `load_file()`, `load_json_file()`, `write_json_file()` (atomic writes), `delete_file()`
 - **`file_selection.py`** - Random file selection: `select_random_file_hierarchical()`, `count_json_files()`, `dir_has_json_files()`
-- **`path_resolver.py`** - Path conversion between relative/absolute formats. Provides `PathResolver` class with `to_absolute()`, `to_relative()`, `exists()`, `is_file()`, `is_dir()`. Includes `default_resolver` and `sources_resolver` instances.
+- **`path_resolver.py`** - Path conversion between relative/absolute formats. Provides `PathResolver` class with `to_absolute()`, `to_relative()`, `exists()`, `is_file()`, `is_dir()`. Includes `default_resolver` and `sources_resolver` instances. Also provides `validate_source_path(file_path, expected_source_type)` for validating paths against a specific source type directory, and `normalize_source_path(file_path, expected_source_type)` for normalizing paths relative to SOURCES_DIR.
 
 ### JSON Handling
 - **`json_extraction.py`** - `extract_json_from_response()` - Extracts JSON from LLM responses using multiple fallback strategies (braces matching, markdown blocks, regex)

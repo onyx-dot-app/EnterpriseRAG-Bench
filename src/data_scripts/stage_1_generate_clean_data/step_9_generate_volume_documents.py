@@ -38,9 +38,12 @@ from src.utils import (
     get_agents_md_for_source,
     JsonRecoveryError,
     load_file,
+    normalize_source_path,
     process_written_document,
+    sources_resolver,
     try_recover_json,
     validate_no_nested_dicts,
+    validate_source_path,
 )
 from src.utils.file_io import load_json_file, write_json_file
 from src.utils.statistics import update_statistics
@@ -853,6 +856,7 @@ class JsonDocumentWriteTool(WriteTool):
 
     Validates that:
     - File path ends with .json
+    - File path starts with the expected source type directory
     - File is in a subdirectory (not directly in sources root)
     - Parent directory exists
     - File doesn't already exist
@@ -862,9 +866,15 @@ class JsonDocumentWriteTool(WriteTool):
     Tracks all written file paths for later reference.
     """
 
-    def __init__(self, base_dir: str | None = None, allow_create_dirs: bool = False) -> None:
+    def __init__(
+        self,
+        base_dir: str | None = None,
+        allow_create_dirs: bool = False,
+        expected_source_type: str | None = None,
+    ) -> None:
         super().__init__(base_dir=base_dir, allow_create_dirs=allow_create_dirs)
         self._written_paths: list[str] = []
+        self._expected_source_type = expected_source_type
 
     @property
     def written_paths(self) -> list[str]:
@@ -881,25 +891,35 @@ class JsonDocumentWriteTool(WriteTool):
         if not file_path:
             return "Error: No file path provided. Please specify a valid .json file path."
 
-        if not file_path.endswith(".json"):
-            return f"Error: File path must end with .json, got: {file_path}. Please use a .json extension."
+        # Use source path validation if expected_source_type is set
+        if self._expected_source_type:
+            path_error = validate_source_path(file_path, self._expected_source_type)
+            if path_error:
+                return f"Error: {path_error}"
 
-        # Check path has proper directory structure (not directly in base dir)
-        normalized_path = self._normalize_path(file_path) if self._base_dir else file_path
-        path_parts = normalized_path.replace("\\", "/").split("/")
-        if len(path_parts) < 2:
-            return f"Error: File must be in a subdirectory, not directly in sources root. Got: {file_path}"
+            # Normalize the path to be relative to SOURCES_DIR
+            normalized_path = normalize_source_path(file_path, self._expected_source_type)
+        else:
+            # Fallback to basic validation
+            if not file_path.endswith(".json"):
+                return f"Error: File path must end with .json, got: {file_path}. Please use a .json extension."
 
-        # Validate parent directory exists
-        if self._base_dir:
-            target_path = os.path.join(self._base_dir, normalized_path)
-            parent_dir = os.path.dirname(target_path)
-            if not os.path.isdir(parent_dir):
-                return f"Error: Parent directory does not exist: {parent_dir}. Please use an existing directory path."
+            # Check path has proper directory structure (not directly in base dir)
+            normalized_path = self._normalize_path(file_path) if self._base_dir else file_path
+            path_parts = normalized_path.replace("\\", "/").split("/")
+            if len(path_parts) < 2:
+                return f"Error: File must be in a subdirectory, not directly in sources root. Got: {file_path}"
 
-            # Check if file already exists
-            if os.path.exists(target_path):
-                return f"Error: File already exists at {file_path}. {CONFLICT_PROMPT}"
+            # Validate parent directory exists
+            if self._base_dir:
+                target_path = os.path.join(self._base_dir, normalized_path)
+                parent_dir = os.path.dirname(target_path)
+                if not os.path.isdir(parent_dir):
+                    return f"Error: Parent directory does not exist: {parent_dir}. Please use an existing directory path."
+
+                # Check if file already exists
+                if os.path.exists(target_path):
+                    return f"Error: File already exists at {file_path}. {CONFLICT_PROMPT}"
 
         # Validate JSON before writing, with recovery attempts
         final_content = content
@@ -917,11 +937,13 @@ class JsonDocumentWriteTool(WriteTool):
         if validation_error:
             return f"Error: {validation_error}. All values must be strings, primitives, or lists of strings/primitives. Please fix and try again."
 
-        result = super().execute(final_content, file_path)
+        # Use the normalized path for writing
+        result = super().execute(final_content, normalized_path)
         if result.startswith("Successfully wrote to "):
-            # Extract the actual written path and convert to relative format
-            actual_path = result.replace("Successfully wrote to ", "")
-            rel_path = default_resolver.to_relative(actual_path)
+            # Extract the written path (relative to SOURCES_DIR) and convert to
+            # format relative to GENERATED_DATA_DIR (prepend "sources/")
+            sources_rel_path = result.replace("Successfully wrote to ", "")
+            rel_path = f"sources/{sources_rel_path}"
             self._written_paths.append(rel_path)
         return result
 
@@ -1079,6 +1101,7 @@ def generate_single_document(
     system_prompt = DOCUMENT_GENERATION_PROMPT.format(
         company_overview=company_overview,
         source_type=source_tree,
+        source_type_dir=source_type,
         agents_md_contents=agents_md_contents,
         existing_docs=existing_docs_str,
         topic_and_subtopics=topic_and_subtopics,
@@ -1087,11 +1110,16 @@ def generate_single_document(
     # Build the user prompt
     user_prompt = DOCUMENT_GENERATION_USER_PROMPT.format(
         topic_and_subtopics=topic_and_subtopics,
+        source_type_dir=source_type,
     )
 
     for retry in range(max_retries):
-        # Create fresh tools for each retry
-        write_tool = JsonDocumentWriteTool(base_dir=SOURCES_DIR, allow_create_dirs=False)
+        # Create fresh tools for each retry with source type validation
+        write_tool = JsonDocumentWriteTool(
+            base_dir=SOURCES_DIR,
+            allow_create_dirs=False,
+            expected_source_type=source_type,
+        )
 
         # Initialize cheap LLM with only the write tool
         llm = get_cheap_llm(

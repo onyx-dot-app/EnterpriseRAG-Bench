@@ -20,7 +20,13 @@ from src.utils.file_selection import (
 )
 from src.utils.json_extraction import extract_json_from_response
 from src.utils.json_recovery import JsonRecoveryError, try_recover_json
-from src.utils.path_resolver import PathResolver, default_resolver, sources_resolver
+from src.utils.path_resolver import (
+    PathResolver,
+    default_resolver,
+    normalize_source_path,
+    sources_resolver,
+    validate_source_path,
+)
 from src.utils.validation import validate_no_nested_dicts
 
 __all__ = [
@@ -46,6 +52,7 @@ __all__ = [
     "load_file",
     "load_json_file",
     "needs_reordering",
+    "normalize_source_path",
     "PathResolver",
     "process_written_document",
     "reorder_document_fields",
@@ -53,5 +60,6 @@ __all__ = [
     "sources_resolver",
     "try_recover_json",
     "validate_no_nested_dicts",
+    "validate_source_path",
     "write_json_file",
 ]

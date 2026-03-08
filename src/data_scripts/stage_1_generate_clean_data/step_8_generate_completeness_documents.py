@@ -135,9 +135,10 @@ class JsonDocumentWriteTool(WriteTool):
 
         result = super().execute(content, file_path)
         if result.startswith("Successfully wrote to "):
-            # Extract the actual written path and convert to relative format
-            actual_path = result.replace("Successfully wrote to ", "")
-            rel_path = default_resolver.to_relative(actual_path)
+            # Extract the written path (relative to SOURCES_DIR) and convert to
+            # format relative to GENERATED_DATA_DIR (prepend "sources/")
+            sources_rel_path = result.replace("Successfully wrote to ", "")
+            rel_path = f"sources/{sources_rel_path}"
             self._written_paths.append(rel_path)
         return result
 
