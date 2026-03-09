@@ -1,0 +1,46 @@
+{
+  "repo": "redwood",
+  "pr_number": "741002",
+  "title": "Adaptive Prefill Gap Skipper and Interstage Handshake Optimizer",
+  "author": "Sofia Patel",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-02-24",
+  "merged_at": "2026-02-24",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/prefill-gap-skipper-handshake",
+  "reviewers": [
+    "Daniel Kim",
+    "Marta Silva",
+    "Omar Haddad"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kv-cache",
+    "scheduler",
+    "bench"
+  ],
+  "linked_linear": [
+    "ENG-1743",
+    "ENG-1989"
+  ],
+  "linked_jira": [
+    "SUP-432"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "7",
+  "additions": "842",
+  "deletions": "194",
+  "breaking_change": "false",
+  "release_notes": "Introduce an adaptive prefill skipper that reduces needless short-window prefill work and a tightened interstage handshake that reduces backpressure between prefill and decode. Expected latency improvement for short queries: 8-15% p95; tail improvement under high-concurrency: ~20%.",
+  "description": "Motivation: Short interactive requests (few-keystroke completions) suffer from prefill-decode handoff overhead when the prefill window is small and decode is idle. The runtime spends GPU cycles priming KV cache and scheduling tiny kernel launches that often block decode progress and increase tail latency under load. This PR implements a runtime coordinator that adaptively 'skips' trivial prefill windows and tightens the interstage handshake to let decode proceed opportunistically when prefills would provide marginal benefit.\n\nWhat this PR does (single-line summary): Adds an adaptive Prefill Gap Skipper, a stage Coordinator for handshake reductions, scheduler hints for kernel selection, and a KV-warmup policy to avoid redundant priming on micro-prefills.\n\nKey components and files touched: src/serve/pipeline/handshake.rs - new StageCoordinator and handshake state machine; runtime/scheduler/prefill_gap_skipper.cpp - skipper logic and backoff estimator; runtime/kernel/kernel_hints.h - new hint flags used by kernel selector; runtime/kv/kv_warmup_policy.cc - conservative warmup sampler and TTL; tests/bench/prefill_handshake_bench.py - microbench harness with synthetic short/query traces; docs/optimizations/prefill-gap-skipper.md - design doc and tuning knobs.\n\nCommits (high level):\n- Add Prefill Gap Skipper and basic estimator (S. Patel)\n- Wire StageCoordinator into pipeline handshake and expose handshake_time budget (D. Kim)\n- Add kernel hints and scheduler integration (M. Silva)\n- KV warmup sampler and microbench harness (S. Patel)\n- Unit tests and perf baselines, bench fixes (O. Haddad)\n\nImplementation notes: The Prefill Gap Skipper observes the recent sequence-length histogram and the observed decode-ready latency; it computes an expected utility for a prefill window using a simple cost model: expected token savings vs prefill latency and kernel startup overhead. When expected utility < threshold the skipper defers prefill and increments a short-gap counter which is used by the StageCoordinator to relax handshake barriers for the next decode stage. The StageCoordinator reduces the handshake's strictness (allowing decode to pull KV entries directly or proceed with partial KV warming) when the pipeline is dominated by low-utility prefills.\n\nKV warmup policy: Instead of aggressive priming on every prefill, we now sample a subset of recent keys based on sequence overlap heuristics and maintain a lightweight TTL on cache entries to avoid repeated synchronous loads. This reduces device memory churn and copy overhead on prefill bursts. The policy is conservative by default with a config flag to be more aggressive for specialized workloads.\n\nScheduler and kernel hints: Prefill Gap Skipper emits a kernel_hint (SKIP_SMALL_PREFILL) when skipping. The scheduler respects this hint to avoid spinning up small decode-optimized kernels that would otherwise be chosen for tiny prefill windows. We also added a 'fast-path' microkernel for decode that can run with partial KV availability, enabling earlier token emission while background warmup continues.\n\nBenchmarks: Microbench harness was run on a 4xA100 cluster (simulated multi-tenant load). Representative results (median of 10 runs, synthetic short-query trace - mean tokens/request ~ 12):\n- Baseline (main): p50=18ms, p95=62ms, tail(99)=210ms\n- This PR: p50=16.5ms (-8%), p95=54ms (-13%), tail(99)=168ms (-20%)\nUnder high concurrency (500 concurrent streams) the number of small kernel launches reduced by ~42% and total GPU cycles used for prefill dropped ~28%.\n\nSafety and compatibility: All new features are gated behind runtime flags and config knobs: ENABLE_PREFILL_GAP_SKIPPER (default: true in this PR for validation), PREFILL_UTILITY_THRESHOLD (float), KV_WARMUP_SAMPLING_RATE. We made sure the default behavior preserves semantic correctness: decode correctness is unchanged \u2014 we only opportunistically delay prefill when utility is low and allow decode to proceed with partial KV in the microkernel path.\n\nTests: Added unit tests for handshake transitions and skipper estimator edge cases, and integration bench tests that assert no correctness regression on greedy/beam decoding. The bench harness includes regression detection (assert p95 does not increase >5% vs baseline) and was used locally; CI runs the integration bench in a small emulation mode.\n\nReview timeline and conversation summary:\n- Daniel Kim (reviewer): \"Nice design \u2014 can you clarify how the utility threshold is auto-tuned? Concern about oscillation when load varies rapidly.\"\n- Sofia (author): \"Threshold is currently static; added a note to follow-up to add an EWMA-based auto-tuner. For stability we clamp step changes; also StageCoordinator tracks short-gap counters to avoid flip-flopping.\"\n- Marta Silva: \"Kernel hinting looks good. Please make sure default kernel selection still wins for long-prefill workloads.\"\n- Sofia: \"Added unit test to ensure long prefills still pick the heavy prefill kernels; preserved existing kernel selector priority when hint absent.\"\n- Omar Haddad: \"KV warmup TTL tuning needs docs; observed a case where overly-aggressive TTL eviction increased loads.\"\n- Sofia: \"Added doc and conservative defaults; also included a flag to disable TTL for customers who want max cache retention.\"\n\nCI and rollout: CI passed all unit and integration checks; a single flaky bench run was observed in one job (bench run timeout) and was re-run successfully. Merge method: squash merge. Post-merge, we deployed the feature to canary fleet with a 10% traffic ramp and monitored latency, cache hit-rate, and kernel launch counts for 48h. Canary telemetry matched local benchmarks and showed stable behavior.\n\nFollow-ups (future work):\n- Add an EWMA auto-tuner for PREFILL_UTILITY_THRESHOLD (ENG-1989)\n- Evaluate adaptive sampling for KV warmup under multi-tenant variance\n- Surface a console metric for skipped-prefill-rate and handshake-relax events for easier observability\n\nRelated work: contrasts with staged-prefill approaches that aggressively overlap prefill+decode; instead this change focuses on avoiding low-utility prefill work and enabling decode progress when it's the better path. See design doc at docs/optimizations/prefill-gap-skipper.md and Linear ticket ENG-1743 for planning notes.\n\nMerge notes: Squashed commits. No database or public API changes. Feature is opt-in via flags and can be disabled remotely if any customer regression is observed.\n\nFiles changed (high level):\n- src/serve/pipeline/handshake.rs (+248 -34)\n- runtime/scheduler/prefill_gap_skipper.cpp (+312 -12)\n- runtime/kv/kv_warmup_policy.cc (+142 -26)\n- runtime/kernel/kernel_hints.h (+18 -0)\n- tests/bench/prefill_handshake_bench.py (+96 -0)\n- docs/optimizations/prefill-gap-skipper.md (+82 -0)\n- tests/unit/handshake_tests.rs (+44 -122)\n\nIf merged, deploy plan: graduate from canary (10% -> 40% -> 100%) over 6 hours per step with rollback on p95 regress >5% or cache hit-rate drop >7% for critical workloads.\n\nSigned-off-by: Sofia Patel\n",
+  "merge_method": "squash",
+  "notes": "Canary validated; metrics dashboards updated (prefill.skip_rate, stage.handshake_relax_count).",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_7a01c44214c846d2985cadbe93b92ee0"
+}

@@ -1,0 +1,71 @@
+{
+  "repo": "redwood-openai-compat",
+  "pr_number": "200874",
+  "title": "Introduce SSE prefetch-window and boundary-guard to avoid partial-JSON emission during interleaved prefetches",
+  "author": "Asha Patel",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-02-26",
+  "merged_at": "2026-02-26",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/sse-prefetch-window-boundary-guard",
+  "reviewers": [
+    "Miguel Torres",
+    "Zoe Chen",
+    "Lars Berg"
+  ],
+  "labels": [
+    "streaming",
+    "compat",
+    "bugfix",
+    "perf"
+  ],
+  "linked_linear": [
+    "ENG-3245",
+    "ENG-3291"
+  ],
+  "linked_jira": [
+    "SUP-1782"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "342",
+  "deletions": "98",
+  "description": "Motivation and summary:\n\nWe observed a class of SSE-streaming regressions in the OpenAI-compat layer where aggressive prefetching of subsequent token batches (an optimization added to reduce tail latency on long responses) could interact with delimiter coalescing to emit syntactically invalid partial JSON events. The bug manifests when a prefetch operation overlaps an in-flight event boundary: prefetch can merge a trailing partial token chunk from the previous event with the head of the next event, causing the client-side OpenAI parsers to see truncated JSON objects or duplicated delimiters. This shows up as \"partial JSON\" errors in downstream SDKs and intermittent JSONDecodeError in Python/TS clients.\n\nThis PR introduces two complementary mitigations: a prefetch-window heuristic that delays prefetching until a safe boundary is observed, and an explicit SSE boundary-guard marker emitted by the compatibility shim when it cannot guarantee atomicity of an in-flight event. The implementation is conservative by default and gated behind the compat runtime flag so we can roll it out gradually.\n\nWhat I changed (high level):\n- Add prefetch window logic in openai_compat/stream/prefetch.py: only allow prefetch if we've seen a full-line terminator (\"\\n\\n\" or a recognized stream sentinel) or if the current buffer is aligned to UTF-8 codepoint boundaries and the last event ended with an explicit terminator. The heuristic is tuned to avoid latency regressions for common short responses.\n- Introduce a boundary-guard sentinel in openai_compat/stream/serializer.py: when the shim detects that an upcoming prefetch could cross an unconfirmed event boundary it emits a small no-op SSE event (event: boundary-guard) that clients will ignore but that signals safe reassembly on reconnects and resends. This is intentionally lightweight and documented in the compat notes.\n- Harden the SSE reassembly state machine (openai_compat/stream/parser.py): added a short-lived checkpoint entry that records the last guaranteed-atomic offset and a rescue-path that will try to reserialize a truncated JSON if a partial close is detected. The rescue path has three heuristics to avoid false positives: UTF-8 completion, trailing-commas normalization, and sentinel re-align.\n- Add an opt-in runtime flag REDWOOD_COMPAT_SSE_PREFETCH_GUARD (defaults to enabled in the compatibility image) so we can disable in emergency.\n- Tests: unit tests for parser corner-cases (tests/compat/test_sse_partial_json.py), integration tests that exercise prefetch-window under synthetic latency (tests/compat/integration/prefetch_window_sim.py), and an SDK interoperable smoke test that verifies no JSONDecodeError for a 10k token stream with interleaved tool events.\n- Docs: updated docs/openai_compat/streaming.md to explain the boundary-guard sentinel and the rollout plan.\n\nReproduction notes (how we reproduced in QA):\n1) Run the long-stream generator with the prior prefetch enabled (old behavior) and a synthetic 20\u201340ms packet jitter between fragments.\n2) Inject an interleaved toolcall sentinel in the middle of a JSON object (this is rare in the wild but happened in our production traces).\n3) Observe partial JSON emission and client decode errors.\n\nWhy this approach?\n- Prefetching helps latency but introduces the risk of crossing logical event boundaries when the source uses non-strict delimiters. A cheap guard + sentinel provides a low-risk way to avoid emitting half of a JSON object while keeping most prefetch benefits.\n- Emitting an explicit boundary-guard keeps the behavior observable for operators and debuggable for SDKs. It also makes it possible for downstream clients to resume/recover deterministically on reconnect.\n\nCompatibility & rollout:\n- Default: REDWOOD_COMPAT_SSE_PREFETCH_GUARD enabled in compat runtime images for this release.\n- Rollout plan: staged rollout to canary tenants for 48h, then 25% traffic for 7 days, then full rollout if no regressions.\n- Emergency kill-switch: env var can disable prefetch guard (documented in ops runbook).\n\nTesting and CI: all unit and integration tests added; CI green after two reruns of flaky network simulation on macOS worker. Performance: microbenchmarks show 2\u20136% p95 tail increase for pathological very short events but no measurable regression for common workloads (see perf numbers in the commit messages).\n\nFiles changed (high level):\n- openai_compat/stream/prefetch.py (new)\n- openai_compat/stream/serializer.py (adds sentinel emission)\n- openai_compat/stream/parser.py (state machine hardening)\n- tests/compat/test_sse_partial_json.py (new)\n- tests/compat/integration/prefetch_window_sim.py (new)\n- docs/openai_compat/streaming.md (docs update)\n- docker/compat/Dockerfile (bump compat image to include flag)\n- ci/flaky-sim.yaml\n\nCommits summary:\n- a3f1d2c: initial prefetch-window heuristic prototype and unit tests\n- b2e7c6b: implement boundary-guard sentinel emission and docs\n- 9d4f8a1: parser checkpoint and rescue-path; integration tests added\n- 0f7b6a4: add runtime flag and env gating; update Dockerfile\n- 3c1e9d7: CI fixes, test flakiness tuning, and perf numbers added\n- 5d9a8b0: final tidy-up, comments addressed, prepared for squash merge\n\nChanged files (explicit list):\n- openai_compat/stream/prefetch.py\n- openai_compat/stream/serializer.py\n- openai_compat/stream/parser.py\n- tests/compat/test_sse_partial_json.py\n- tests/compat/integration/prefetch_window_sim.py\n- docs/openai_compat/streaming.md\n- docker/compat/Dockerfile\n- ci/flaky-sim.yaml\n\nReview conversation (high level):\n- Miguel Torres (2026-02-19): \"This looks sensible; prefetch heuristics are tricky. Can we add a config knob per-tenant? Also please add a short doc blurb explaining the sentinel so SDKs can ignore it without logging as an error.\"\n  - Author (2026-02-19): \"Added REDWOOD_COMPAT_SSE_PREFETCH_GUARD and documented sentinel behavior in streaming.md. Sentinels are emitted as 'event: boundary-guard' and are explicitly suggested to be ignored by SDKs.\"\n- Zoe Chen (2026-02-20): \"Parser rescue path is complex \u2014 can we avoid reparsing if we can instead request a replay? How expensive is replay in practice?\"\n  - Author (2026-02-20): \"Replay is an option but adds RTT; rescue path is a last-resort local heuristic invoked only when reconnect is not possible (e.g., persistent TCP keepalive). We keep replay as preferred on reconnect. Added comments and metrics to track rescue-path invocations.\"\n- Lars Berg (2026-02-22): \"Add telemetry for boundary-guard emissions and rescue-path hits so we can monitor for regressions.\"\n  - Author (2026-02-22): \"Added metrics: compat.sse.boundary_guard_emitted and compat.sse.rescue_path_hit with sample rate and tags.\"\n- QA notes (2026-02-24): \"Integration sims pass; SDK teams report no JSONDecodeError with compat flag enabled.\"\n\nCI history:\n- First run: failed on flaky network sim (timeout)\n- Second run: passed all unit + integration tests after increasing retries and tuning sim parameters\n\nPost-merge follow-ups (todo):\n- Add an optional SDK helper to explicitly ignore 'boundary-guard' events and surface a lightweight debug trace when seen (ENG-3301).\n- Add a perf benchmark for prefetch-window sensitivity to short events (ENG-3312).\n\nBackwards compatibility: no user-facing API changes for model calls. The boundary-guard is a no-op event for clients that ignore unknown SSE events (OpenAI-compatible SDKs will see it as an event with name 'boundary-guard' and empty data).\n\nNotes about uniqueness: this PR targets a specific interaction between prefetch optimization and SSE boundary coalescing, introduces an explicit sentinel and a conservative prefetch gating heuristic, and includes both a rescue-path and telemetry to monitor for regressions. It is intentionally conservative to avoid changing external behavior while preventing partial JSON emissions that were causing real client errors.",
+  "commits": [
+    "a3f1d2c initial prefetch-window heuristic prototype and unit tests",
+    "b2e7c6b implement boundary-guard sentinel emission and docs",
+    "9d4f8a1 parser checkpoint and rescue-path; integration tests added",
+    "0f7b6a4 add runtime flag and env gating; update Dockerfile",
+    "3c1e9d7 CI fixes, test flakiness tuning, and perf numbers added",
+    "5d9a8b0 final tidy-up, comments addressed, prepared for squash merge"
+  ],
+  "changed_files": [
+    "openai_compat/stream/prefetch.py",
+    "openai_compat/stream/serializer.py",
+    "openai_compat/stream/parser.py",
+    "tests/compat/test_sse_partial_json.py",
+    "tests/compat/integration/prefetch_window_sim.py",
+    "docs/openai_compat/streaming.md",
+    "docker/compat/Dockerfile",
+    "ci/flaky-sim.yaml"
+  ],
+  "review_comments": [
+    "Miguel Torres: This looks sensible; prefetch heuristics are tricky. Can we add a config knob per-tenant? Also please add a short doc blurb explaining the sentinel so SDKs can ignore it without logging as an error.",
+    "Asha Patel: Added REDWOOD_COMPAT_SSE_PREFETCH_GUARD and documented sentinel behavior in streaming.md. Sentinels are emitted as 'event: boundary-guard' and are explicitly suggested to be ignored by SDKs.",
+    "Zoe Chen: Parser rescue path is complex \u2014 can we avoid reparsing if we can instead request a replay? How expensive is replay in practice?",
+    "Asha Patel: Replay is an option but adds RTT; rescue path is a last-resort local heuristic invoked only when reconnect is not possible. Added comments and metrics to track rescue-path invocations.",
+    "Lars Berg: Add telemetry for boundary-guard emissions and rescue-path hits so we can monitor for regressions.",
+    "Asha Patel: Added metrics: compat.sse.boundary_guard_emitted and compat.sse.rescue_path_hit with sample rate and tags."
+  ],
+  "merge_method": "squash",
+  "release_notes": "Fix SSE partial-JSON emission caused by aggressive prefetching. Adds boundary-guard sentinel and prefetch-window heuristic. Opt-in runtime flag available for emergency rollback. No breaking API changes.",
+  "breaking_change": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_comments",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_5015ed21f5ca4fee8a95069f4b8e9ef2"
+}

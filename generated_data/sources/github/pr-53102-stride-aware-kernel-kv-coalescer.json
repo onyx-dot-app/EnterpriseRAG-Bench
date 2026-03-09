@@ -1,0 +1,44 @@
+{
+  "repo": "redwood",
+  "pr_number": "53102",
+  "title": "Stride-aware attention microkernel with KV coalescer and hybrid prefetch",
+  "author": "Marina Chen",
+  "created_at": "2026-02-14",
+  "updated_at": "2026-02-21",
+  "merged_at": "2026-02-21",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/stride-kv-coalescer",
+  "reviewers": [
+    "Igor Petrov",
+    "Sofia Ramos",
+    "Devon Blake"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kv-cache",
+    "batching"
+  ],
+  "linked_linear": [
+    "ENG-2190",
+    "ENG-2246"
+  ],
+  "linked_jira": [
+    "SUP-811"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "1258",
+  "deletions": "312",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "release_notes": "Introduce a stride-aware attention microkernel that coalesces KV cache writes and a hybrid prefetcher. Default gated behind runtime.stride_coalescer feature flag. Improves throughput for long-sequence, strided-token workloads and reduces tail latency in continuous-batching scenarios.",
+  "body": "Motivation: Large production workloads at several customers exhibit non-uniform token stride patterns (e.g. code completion with long tokens, multi-lingual tokenizers with frequent long subwords). Existing FlashAttention-style kernels assume contiguous per-sequence access patterns which causes inefficient memory transactions when KV cache updates are strided across streams. This PR introduces a stride-aware microkernel and a lightweight KV coalescer that batches and reorders KV cache writes to improve memory coalescing and reduce PCIe/DRAM stalls.\n\nSummary of changes: Implements a stride detection pass in the serving runtime to classify request patterns at enqueue time, attaches a per-batch stride descriptor to the batching record, routes requests with moderate-to-high stride variance to the new microkernel and coalescer, and integrates a hybrid prefetch path that issues small asynchronous prefetch windows for hot KV segments. Adds a runtime feature flag runtime.stride_coalescer (off by default for now) and a canary rollout plan.\n\nChecklist: [x] Design doc (docs/perf/stride_coalescer.md) [x] Unit tests for stride detector and coalescer [x] Microkernel implementation (CUDA, C++) [x] Scheduler hooks for continuous batching [x] Perf harness and regression tests [x] Backward-compatible fallback to existing kernel [x] Feature-flag gating and telemetry metrics added\n\nPerformance numbers (internal perf-canary runs, H100/A100 synthetic & mixed production traces):\n- Mixed production trace (seq len distribution median=512, p95=2048): throughput +1.18x on H100, token latency p99 reduced by 12% at 2048 synchronous tokens; continuous-batching tail (99.9th) reduced by ~20% under load.\n- Synthetic long sequence (single-tenant stress, seq=4096, model=redwood/llm-4b): throughput +1.25x on A100 80GB, GPU memory overhead <3% due to compact coalescer buffers.\n- Small-sequence workloads (<128 tokens) show neutral impact (+/-1%) since those prefer existing low-latency path.\n\nDesign notes: The stride detector examines the token offsets for each request in the batch (cheap per-record prepass) and computes a small summary (stride histogram + hot-segment hints). If variance exceeds a tunable threshold we mark the batch as \"strided\". The KV coalescer maintains per-GPU compact segments and accumulates writes into a coalescing ring; on flush it issues large contiguous writes to device-local memory. The hybrid prefetcher monitors repeated accesses to the same segment across batches and issues async prefetches of the coalesced region. The microkernel uses a per-warp gather+scatter friendly path with scatter-friendly loads when segments are known to be hot.\n\nCompatibility and safety: The default path is unchanged. The new path is enabled by feature flag only and has automatic fallbacks when an unsupported layout or hardware is detected (e.g., V100 with older drivers falls back to existing flash kernel). Telemetry added: runtime.kernel.path, runtime.coalescer.flush_count, runtime.prefetch.hits, runtime.stride_histogram (sampled), and a per-route regression gauge.\n\nFiles touched (high level): runtime/attn/stride_kernel.cu, runtime/attn/kernel_interface.h, runtime/scheduler/coalescer_scheduler.cpp, runtime/kv/kv_coalescer.h, runtime/kv/kv_coalescer.cpp, runtime/kv/cache_manager.cpp, runtime/featureflags/flags.h, docs/perf/stride_coalescer.md, tests/unit/test_stride_detector.cpp, tests/bench/stride_bench.py, perf-canary/configs/stride_canary.yaml, examples/quickstarts/stride_demo.ipynb.\n\nCommits (summary):\n- 7d1c3f2: initial stride detector and microkernel skeleton + tests\n- b3f8a9e: implement KV coalescer ring buffer and flush path; add flags + telemetry\n- 3a9e5b1: scheduler integration and batching routing; add hybrid prefetcher prototype\n- c5f2d20: perf improvements, reduce atomic contention on coalescer; add unit tests and bench harness\n- 9f1a4d6: address review comments, add additional guardrails and fallback code paths\n\nTesting: Unit tests added for detector/coalescer, integration test in perf-canary that runs a 1-hour mixed-sequence trace and validates throughput/latency against baseline. Bench harness included (tests/bench/stride_bench.py) that reproduces synthetic numbers using pinned allocator on H100. CI: all checks passed after a flaky test (tests/scheduler/test_continuous_batching) was re-run once.\n\nReview conversation (high-level):\n- Igor Petrov (review): \"This is a thoughtful approach; can you clarify memory ordering on the coalescer flush and how it interacts with K/V eviction? Also we should be careful about atomic hot-paths \u2014 I see some atomics in kv_coalescer.cpp.\"\n- Marina Chen (author): \"Answered: flush uses a lightweight epoch barrier per-GPU; added comments and a small fence operation to ensure DMA visibility. Reworked the hot-path to use per-thread segment accumulation and reduce atomics; see commit c5f2d20. Also added unit tests that assert visibility semantics under stress.\"\n- Sofia Ramos (review): \"Can we add a config knob to control the stride variance threshold per-deployment? Some customers in APAC saw more frequent large tokens.\"\n- Marina Chen: \"Added runtime.stride_coalescer.threshold and made it dynamically configurable via the console. Documented defaults in docs/perf/stride_coalescer.md.\"\n- Devon Blake (review): \"CI flake noted; otherwise LGTM. Please add a short note about fallback behavior in the release notes.\"\n- Marina Chen: \"Added release notes and explicit fallback tests; thanks.\"\n\nRisk and rollout plan: Start with a small internal canary (perf-canary/stride_canary.yaml) for 5% of requests on a dedicated pool for two days; monitor telemetry for regressions and enable gradual ramp to 25% then 100% if stable. Rollback via feature flag toggle. Known limitations: current prefetcher heuristics tuned for desktop/web workloads may be suboptimal for tokenized speech data; plan to add a learning-based thresholding in a follow-up PR.\n\nMerge outcome: Merged via squash on 2026-02-21 after final approvals (Igor Petrov, Sofia Ramos). CI green.\n\nFollow-ups (future work):\n- ENG-2246: evaluate adaptive learning-based stride threshold and incorporate into Optimize recommendations.\n- Add model-annotation hints so model adapters can declare expected stride patterns at model registration time to avoid detection overhead.\n\nIf you want to exercise the new path locally: see examples/quickstarts/stride_demo.ipynb and set REDWOOD_RUNTIME_FLAGS=runtime.stride_coalescer=1 to enable.\n\nNotes: This PR intentionally keeps the existing flash kernel intact and uses the new path only when it is expected to improve global memory coalescing. The perf delta for long, strided streams is significant; for short sequences the change is a no-op.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_d597d003e96942259c4ff17366f04ca9"
+}

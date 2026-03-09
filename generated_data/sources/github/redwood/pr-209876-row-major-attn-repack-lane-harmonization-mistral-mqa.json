@@ -1,0 +1,44 @@
+{
+  "repo": "redwood",
+  "pr_number": "209876",
+  "title": "row-major-attn-repack-and-lane-harmonization-for-mistral-mqa-llama",
+  "author": "Maya Chen",
+  "created_at": "2026-02-15",
+  "updated_at": "2026-02-20",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/attn-repack-lane-harmonize",
+  "reviewers": [
+    "Arjun Patel",
+    "Lena Novak",
+    "Diego Ruiz"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "mqa",
+    "gqa",
+    "kernel"
+  ],
+  "linked_linear": [
+    "ENG-4421",
+    "ENG-4450"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "7",
+  "additions": "512",
+  "deletions": "143",
+  "merge_method": "squash",
+  "merged_at": "2026-02-20",
+  "description": "Motivation: We observed tail latency and throughput regressions on mixed-head models (MQA/GQA hybrids) and select Mistral variants when the kernel selector encountered too many head-stride polymorphisms. The runtime was spending CPU cycles in kernel dispatch, plus the GPU kernels saw suboptimal memory coalescing for attention key/value matrices encoded in the default layout. This PR introduces two complementary runtime optimizations: (1) a row-major attention repack pass that transforms KV/attn buffers into a coalesced-friendly layout for affected models, and (2) a lane harmonization preprocessor that groups attention heads into small homogeneous lanes to reduce kernel polymorphism and enable larger fused kernels. Both are gated by model metadata and a runtime probe to avoid regressions on models that are already optimal.\n\nWhat I changed (high level):\n- Added a new model onboarding hook that computes a per-model \"repack map\" and head-lane plan based on config (max heads per lane, head strides, and quantization footprint). The map is stored in model metadata and used by the serving runtime at first request to trigger an in-place repack when beneficial.\n- Implemented a lightweight row-major repack routine in runtime/kernel/layout_repack.cc with careful pinned-memory staging to avoid extra GPU synchronizations. The routine supports both float32 and int8/quantized weight encodings and preserves KV cache compatibility by storing an indirection table in the model manifest.\n- Implemented lane harmonization in runtime/scheduler/lane_harmonizer.cc which groups heads by stride/width and emits a lane descriptor that the kernel router can match to fewer kernel variants. The harmonizer also exposes a conservative fallback that keeps original head groupings if repack cost exceeds a runtime ROI threshold.\n- Kernel selector updates in runtime/kernel/router.cc to prefer fused row-major kernels when a lane descriptor is present. I added a new kernel variant: fused_fwd_attn_rowmaj_{float32|int8} that assumes coalesced loads and uses a different shared-memory tiling strategy.\n- Added unit and integration tests for the repack pass (tests/runtime/test_repack.py) and a small GPU benchmark harness (bench/gpu/attn_repack_bench.cc) used in CI perf sampling.\n\nCommits (summary):\n- 1a2b3f4: initial lane harmonizer prototype and unit tests\n- 2b3c4d5: row-major repack implementation + pinned staging buffers\n- 3c4d5e6: kernel router matching and fused kernel hooks + small kernel implementation\n- 4d5e6f7: perf harness + docs + model metadata glue\n\nFiles touched (representative):\n- runtime/kernel/layout_repack.cc\n- runtime/scheduler/lane_harmonizer.cc\n- runtime/kernel/router.cc\n- kernel/kernels/fused_fwd_attn_rowmaj.cu\n- bench/gpu/attn_repack_bench.cc\n- tests/runtime/test_repack.py\n- models/manifests/mistral-variants/repack-metadata.json\n\nKey design notes and tradeoffs:\n- Repacking is done lazily on first warm request to avoid extra prep work for cold models. The repack operation uses pinned staging buffers and a short-lived CUDA stream to write the coalesced layout; we avoid a blocking synchronize by using an event that gates the first inference that relies on the new layout. This reduces cold-start penalty to ~18-30ms on Mistral-7B families (measured on p4d-like instances).\n- Lane harmonization reduces kernel selector branching at the cost of slight head-level padding. We tuned the max padding to 6-8% in the default plan to keep quality and per-token cost stable. Operators that rely on exact head indexing (rare) are supported via an indirection map so correctness is preserved.\n- The fused row-major kernel is intentionally conservative in register pressure and uses a smaller tile when int8 quantization is detected. We found a 12-22% throughput uplift for MQA workloads on Mistral-7B variants and a 7-11% improvement for Llama-13B when lane harmonization matched heads to 4-head lanes. P95 latency improved by ~8-14% on continuous-batching workloads in our internal bench harness.\n\nSafety and rollout plan:\n- Feature gated via model metadata flag \"enable_repack_lane_harmony\" and a runtime probe that checks expected ROI. Default for existing manifests is off; new model onboarding can opt-in after offline analysis.\n- Canary rollout: staged to 5% of traffic on dedicated clusters, with trace-level metrics for repack_time_ms, repack_roi_estimate, and lane_pad_pct. Added alerts if repack_time_ms > 3x estimate or if token-level token_cost increases > 5% post-repack.\n\nReview summary and conversation (high level):\n- Arjun: requested a clear fallback path for models with side-effecting layers that assume head ordering. I added an indirection table and tests exercising those cases.\n- Lena: asked for quantized path validation; I added an int8 kernel and bench numbers including int8 variations.\n- Diego: suggested avoiding repack at scale when GPU memory is highly utilized; I added a quick probe that checks free device memory and will delay repack under pressure.\n- Author replies addressed all comments; small follow-up commit reduced staging buffer size and added more asserts in the lane harmonizer unit tests.\n- Final status: reviewed and approved by reviewers above; perf engineering gave a thumbs-up after bench runs.\n\nCI and perf checks:\n- Linux unit tests: pass\n- GPU bench job: flaky on first run (OOM on a crowded runner), re-run passed with baseline/perf numbers attached in CI artifact (see bench-results/attn_repack/2026-02-18).\n- Lint and static analysis: pass\n- Integration tests (models): pass on mainline nightly harness with Mistral/Llama/Qwen smoke tests.\n\nMerge and follow-ups:\n- Merged via squash to main on 2026-02-20.\n- Follow-ups tracked in ENG-4450: add automatic model onboarding tool to produce repack metadata and a small telemetry job to surface models that would benefit most.\n\nRelease notes: \n- Added optional row-major attention repacking and lane harmonization to improve throughput on MQA/GQA and mixed-head Llama/Mistral models. Expected impact: 10-20% throughput improvement on targeted models and reduced P95 in continuous-batching scenarios. Opt-in by model manifest flag and staged rollout to prevent regressions.\n\nIf you want to run the perf harness locally: \n- See bench/gpu/attn_repack_bench.cc; example run: ./attn_repack_bench --model mistral-7b --batch 8 --seq 1024 --quant int8\n\nNotes for release engineering: This change touches kernel selector and low-level CUDA paths; coordinate with infra upgrades for new kernel artifacts and ensure canary traffic includes both hosted and dedicated clusters to validate memory-pressure heuristics.",
+  "release_notes": "Optional row-major attention repacking + lane harmonization for MQA/GQA and mixed-head models. 10-20% throughput uplift on targeted models; opt-in via model manifest flag; staged rollout and telemetry added.",
+  "linked_jira": [
+    "SUP-9087"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_a5ded6710496409f80b9bc41f5e10f14"
+}

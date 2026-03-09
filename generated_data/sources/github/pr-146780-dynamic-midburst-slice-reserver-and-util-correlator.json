@@ -1,0 +1,51 @@
+{
+  "repo": "redwood",
+  "pr_number": "146780",
+  "title": "dynamic-midburst-slice-reserver-and-util-correlator",
+  "author": "Aisha Malik",
+  "created_at": "2026-02-12",
+  "updated_at": "2026-02-18",
+  "merged_at": "2026-02-18",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/dynamic-midburst-slice-reserver",
+  "reviewers": [
+    "Jonas Becker",
+    "Priya Raman",
+    "Marcus Lee"
+  ],
+  "labels": [
+    "dedicated",
+    "autoscaling",
+    "perf",
+    "telemetry"
+  ],
+  "linked_linear": [
+    "ENG-4829",
+    "ENG-4991"
+  ],
+  "linked_jira": [
+    "SUP-1124"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "412",
+  "deletions": "96",
+  "breaking_change": "false",
+  "release_notes": "Introduce a midburst slicing/reserver controller to reduce cross-tenant tail latencies and stabilize utilization; new telemetry metrics and a rollout guarded by a runtime feature flag.",
+  "description": "Context and motivation: Dedicated fleets have long-tail latency issues when multiple mid-priority tenants simultaneously issue bursty workloads that are too small to trigger warm-pool expansions but large enough to cause transient contention. Existing burst banks and warm-pool heuristics focus on peak bursts or reserved commitments; they leave a gap for midburst activity (short-lived 5\u201360s spikes) that increases cold-slot churn and causes p95/p99 latency regressions for affected tenants. This PR implements a \"dynamic midburst slice reserver\" and an associated utilization correlator to close that gap with minimal cost increase.\n\nWhat this change does (single-string summary): Adds a controller that maintains soft \"midburst slices\" per-tenant that can be temporarily reserved for 30\u201390s using a decaying credit model; integrates the slice state with the fleet autoscaler so warm-pool prewarming is informed by midburst reservations; introduces a util_correlation metric to detect when midburst reservations are correlated across tenants (to avoid over-prewarming); exposes a runtime flag (feature.dynamic_midburst_reserver) and new telemetry for observability.\n\nDesign notes and algorithm summary: 1) Sliding-credit model: each tenant accrues midburst credits proportional to recent sustained throughput (30m window) and a short-term earn rate so healthy tenants can burst without immediate fleet changes. Credits decay with a half-life configurable per-pool (default 60s). 2) Soft slice reservation: when a request is assigned and the pool has transient headroom, the controller may attach a soft slice token to the tenant allowing immediate allocation of a warmlet for the duration of the slice. Slices are non-exclusive and have a configurable concurrency ceiling per-tenant to prevent monopolization. 3) Correlator: util_correlation is computed per-pool using a bounded-window cross-correlation of per-tenant instantaneous utilization to detect synchronized bursting; if correlation is high, the autoscaler biases toward warm-pool expansion instead of granting more soft slices. 4) Fallbacks: if pool-level capacity is insufficient, slices are demoted to pre-warming hints and requests fall back to the default admission path; no hard preemption of active requests is introduced.\n\nTelemetry and observability: adds metrics (midburst.slice_grants, midburst.slice_evictions, midburst.credit_balance, midburst.util_correlation, midburst.slice_duration_seconds) and dashboards. Included tagging on existing per-tenant dashboards and new alert suggestions: sustained slice_evictions > 5/min, util_correlation > 0.6 for 3m, p95 latency growth > 15% post-rollout.\n\nAPI / config surface: Dedicated pool config gains optional section \"midburst\": {enabled, max_slices_per_tenant, credit_half_life_seconds, correlate_threshold}. Default: disabled for legacy pools. The runtime flag allows safe canarying across 10% -> 50% -> 100% rollouts.\n\nImplementation summary (commits): - initial controller scaffolding and CRD-free integration points with pool manager - sliding-credit state machine and in-memory windowed counter - slice lifecycle (grant, extend, revoke) and concurrency limits - util_correlation module (streaming correlation sketch) - autoscaler hook and prewarm hint pipeline - metrics/telemetry and dashboard snapshots - unit + integration test harness and sim workload for validation\n\nFiles changed (high level): services/fleet/controller/midburst_reserver.go, services/fleet/controller/midburst_credit.go, services/fleet/controller/util_correlation.go, services/fleet/autoscaler/prewarm_hints.go, services/fleet/api/pool_config.go, internal/telemetry/metrics_registry.go, observability/dashboards/midburst-overview.jsonnet, tests/integration/midburst_sim_test.go, tests/unit/midburst_credit_test.go, docs/operations/midburst.md, pkg/runtime/flags.go\n\nSmall illustrative snippet (midburst_reserver.go grant path): \"if pool.HasTransientHeadroom() && tenant.CreditBalance >= sliceCost && tenant.ActiveSlices < cfg.MaxSlices { grantSlice(tenant, pool, cfg.DefaultSliceDuration) } else { recordPrewarmHint(tenant, pool) }\". The implementation has been deliberately kept lock-light and relies on the pool's slot-allocator to enforce safety.\n\nTesting and results: Using our sim harness (tests/integration/midburst_sim_test.go) we ran mixed-tenant workloads with injected synchronized midburst noise. Results on canary cluster: p95 latency for mid-priority tenants improved by 18% (baseline against current master) with a 3% increase in average warm-pool occupancy; cold-start rate for small bursts decreased 42%. The correlator prevented over-prewarming in a test where 30 tenants synchronized, reducing unwarranted node spin-ups by 28%.\n\nRollout plan and safety: Feature gated behind runtime flag and pool config; rollout sequence: developer canary (1 pool) -> 10% pools (gradual) -> 50% -> 100%; observability checklist: monitor midburst.slice_evictions, midburst.util_correlation, p95/p99 latency, warm-pool occupancy, provisioning events. In case of regressions, runtime flag off will immediately stop new grants and autoscaler reverts to baseline heuristics; a fast patch to revert prewarm hints path is included (hotfix branch ready).\n\nChecklist (completed): - [x] Design doc and simulation (linked Linear ENG-4829) - [x] Unit tests for credit model - [x] Integration sim tests - [x] Telemetry and dashboard snapshots - [x] Backwards-compatible config - [x] Runtime feature flag and rollout guide - [x] Performance benchmarks on canary cluster\n\nOpen items / follow-ups: - Tune max_slices_per_tenant defaults per workload class (ENG-4991) - Add a persistent-but-ephemeral slice DB for multi-controller HA in a later change - Explore ML-based correlator for more accurate cross-tenant spike detection\n\nReview conversation (abridged, single string): Jonas Becker: \"Can you add a safety threshold that prevents granting slices if pool-level p95 latency is already degraded?\" Author (Aisha): \"Added a p95 check and unit tests around it in the latest commit; if pool.p95 > cfg.P95DisableThreshold we stop granting new slices.\" Priya Raman: \"Preference is to keep the correlator cheap \u2014 let's ensure the sketch is bounded memory; also please add an integration assertion that correlation triggers autoscaler path.\" Author: \"correlator uses a fixed-size ring buffer and streaming covariance sketch; added integration assertion and an extra sim scenario where correlation flips strategy.\" Marcus Lee: \"CI flaked on one test initially, looks fixed after the flake guard.\" Reviewer approvals: Jonas Becker (approved), Priya Raman (approved), Marcus Lee (approved).\n\nCI and merge: First CI run failed (tests/integration/midburst_sim_test flake due to timing assumptions). Fixed by replacing a timing race with an event-driven wait and updated tests (commit adds sim harness helper WaitForStableWindow). Final CI run: all checks green (unit, integration, linters, go vet, e2e smoke). Merge method: squash and merge. Change was merged to main and released behind the runtime flag for gradual rollout.\n\nNotes on uniqueness and risk: This PR specifically targets the midburst size-class (5\u201360s), a gap not previously addressed by warm-pooling or burst banks. The correlator prevents system-wide prewarming when many tenants synchronize. No changes to billing or committed capacity semantics.\n\nContact: Aisha Malik (author) \u2014 linked Linear ENG-4829 for design, ENG-4991 for tuning; operations runbook added at docs/operations/midburst.md.",
+  "merge_method": "squash",
+  "merge_commit_message": "squash: dynamic midburst slice reserver + util correlator; add metrics, autoscaler hook, tests\n\nCloses ENG-4829\n",
+  "notes": [
+    "Canary metrics show p95 improvements with modest occupancy cost",
+    "Feature gated via runtime flag: feature.dynamic_midburst_reserver",
+    "Follow-up tasks tracked under ENG-4991"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_9176c95ed91945db99211f421abd7f5f"
+}

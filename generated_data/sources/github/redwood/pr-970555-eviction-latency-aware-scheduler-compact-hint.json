@@ -1,0 +1,87 @@
+{
+  "repo": "redwood",
+  "pr_number": "970555",
+  "title": "Eviction latency-aware scheduler with compact-hint bitset and async micro-compact",
+  "author": "Marisol Chen",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-02-25",
+  "merged_at": "2026-02-25",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/evict-latency-scheduler-compact-hint",
+  "reviewers": [
+    "Arjun Patel",
+    "Sofia Martinez",
+    "Leah Kim"
+  ],
+  "labels": [
+    "runtime",
+    "kv",
+    "perf",
+    "sre",
+    "backfill"
+  ],
+  "linked_linear": [
+    "ENG-1849",
+    "ENG-2202"
+  ],
+  "linked_jira": [
+    "SUP-7781"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "7",
+  "additions": "612",
+  "deletions": "148",
+  "breaking_change": "false",
+  "description": "Motivation: In high-throughput multi-tenant workloads we observed tail-latency regressions caused by eviction work items being scheduled without regard to request-criticality and small-fragmented allocations causing repeated spill/rehydration churn. This PR introduces a latency-aware eviction scheduler and a compact-hint bitset per shard to drive low-cost background micro-compactions. The goal is to reduce tail latency and spill I/O while keeping steady-state memory residency high.\\n\\nSummary of changes: 1) eviction/scheduler: add a two-queue eviction scheduler (latency-critical queue + background queue). Items touched by recent user-facing requests are scored with a higher \\\"latency priority\\\" factor so eviction work that could block an in-flight request is deferred or scheduled with a bounded preemption window. 2) compact-hint bitset: each KV shard maintains a compact-hint bitset (one bit per slot-range) toggled by allocation/fragmentation heuristics. Background micro-compact workers sample the bitset and perform cheap in-place coalescing where useful. 3) async micro-compaction: lightweight non-blocking compaction paths that operate on cold ranges and return a compacted index without pausing the hot path; compaction work interacts with the scheduler so heavy compaction is rate-limited during request spikes. 4) spill prioritizer: improve spill ordering by introducing a size-weighted stale-score that favors evicting large cold allocations first to reduce immediate spill-backpressure. 5) kernel/scheduler knobs: exposed runtime knobs to configure latency threshold, max background compaction bandwidth, and scheduler preemption window for canary tuning.\\n\\nFiles changed (high level): serving/kv/cache/evictor.rs - new scheduler and scoring heuristics; serving/kv/cache/compact_hint.rs - bitset and sampling; serving/kv/cache/async_compactor.rs - async compaction worker and protocols; serving/kv/cache/pager.go - spill prioritizer changes used by pager; bench/perf/kv_eviction_bench.py - synthetic bench harness for multi-tenant eviction latencies; docs/ops/kv-eviction.md - operational guidance and knobs; tests/kv/test_eviction_policy.py - unit+integration tests.\\n\\nDesign notes and rationale: - Latency-aware scheduling: Eviction previously used a single priority queue based mostly on LRU+age which caused eviction work to preempt CPU during tail request handling (e.g., refresh/rehydrate). We limit eviction interference by tracking a per-request touch bit and enforcing a short \\\"grace period\\\" where touched items are either pinned or moved to background queue. The scheduler also supports a bounded preemption window so urgent eviction tasks aren't starved but won't spike tail latency. - Compact-hint bitset: Full compaction passes were expensive and caused allocation stall. A lightweight bitset flags fragmented regions; background workers probe hotness metrics and only compact if expected free-coalesced bytes exceed a threshold. This reduces unnecessary work and targets compaction where fragmentation yields net benefit. - Async micro-compaction: Implemented using compare-and-swap friendly metadata updates to avoid global locks. The compaction produces a small rewrite plan applied atomically to index pointers; large moves offloaded to spill pipeline. - Spill prioritizer: Reorders candidate pages to prefer large, cold ranges (size-weighted stale score) which reduces number of downstream I/O operations and rehydrate churn for common request patterns.\\n\\nTesting and results: - Unit tests cover scoring edge cases, bitset toggling, and atomic commit of micro-compaction plans. - Integration tests in tests/kv/test_eviction_policy.py simulate tenant mix (hot/cold) and verify correctness under concurrent access. - Perf bench: bench/perf/kv_eviction_bench.py ran 30-minute experiments comparing main vs this branch under a 60:40 hot/cold tenant mix. Observed 95th-tail latency reduction of 18-28% across GPU-backed inference workloads and a 22% reduction in total spill bytes under sustained load. Memory residency improved slightly (~3%) due to smarter compaction targeting. Detailed numbers included in the PR comment thread.\\n\\nRollout plan and safety: - Feature guarded behind runtime flags (env + console toggle). - Canary rollout to 10% of serving clusters for 48h with increased observability (new metrics: eviction_queue_length, compact_hint_activity, spill_priority_histogram). - Automatic rollback if 95th-tail latency regresses >10% or spill bytes increase >15%.\\n\\nRelated: ENG-1849 (eviction scheduling), ENG-2202 (kv-compaction roadmap), SUP-7781 (customer incident triggered further prioritization).\\n\\nNotes for reviewers: focus review on atomic commit logic in async_compactor.rs and scheduler preemption semantics in evictor.rs. The pager.go changes adjust spill selection but preserve I/O batching behavior; reviewer input on heuristics is welcome.\\n\\nMerge: squash merge after approval and green CI.",
+  "commits": [
+    "init: add compact-hint bitset and sampling (evictor/compact_hint) - Marisol Chen",
+    "perf: implement latency-aware scheduler and scoring - Marisol Chen",
+    "feat: async micro-compactor and atomic commit path - Marisol Chen",
+    "infra: expose runtime knobs and docs - Marisol Chen",
+    "tests: add unit and integration tests; perf harness - Marisol Chen"
+  ],
+  "files_changed": [
+    "serving/kv/cache/evictor.rs",
+    "serving/kv/cache/compact_hint.rs",
+    "serving/kv/cache/async_compactor.rs",
+    "serving/kv/cache/pager.go",
+    "bench/perf/kv_eviction_bench.py",
+    "docs/ops/kv-eviction.md",
+    "tests/kv/test_eviction_policy.py"
+  ],
+  "diff_snippets": [
+    "--- a/serving/kv/cache/evictor.rs\n+++ b/serving/kv/cache/evictor.rs\n@@ -120,6 +120,22 @@ impl Evictor {\n     fn schedule(&self, candidate: EvictCandidate) {\n-        self.queue.push(candidate);\n+        // latency-aware placement: prefer background queue if touched recently\n+        if candidate.touched_within(self.config.latency_grace_ms) {\n+            self.background_queue.push(candidate);\n+        } else {\n+            self.latency_queue.push(candidate.with_score(self.score(&candidate)));\n+        }\n     }\n+\n+    fn score(&self, c: &EvictCandidate) -> f64 {\n+        // combine age, size and fragmentation penalty into a single priority\n+        (c.age_ms as f64 * self.config.age_weight) + (c.size_bytes as f64 * self.config.size_weight) + (c.fragmentation as f64 * self.config.frag_penalty)\n+    }"
+  ],
+  "review_comments": [
+    "Arjun Patel: Nice separation of queues. Two questions: 1) how do you prevent starvation of background compaction during steady low-latency traffic? 2) can compact-hint bitset grow under pathological churn?",
+    "Marisol Chen: Answered - background compaction uses a token-bucket replenished from idle CPU budget and preemption window ensures background tasks get time slices; bitset is fixed-width per shard and uses wrap-around counters to avoid unbounded growth.",
+    "Sofia Martinez: Please add stronger invariants/tests around atomic commit path (race where compaction plan partially applied).",
+    "Marisol Chen: Added additional unit tests and an integration test that flips concurrency schedules to exercise commit races.",
+    "Leah Kim: CI flake on lint in pager.go, please run gofmt."
+  ],
+  "approvals": [
+    "Arjun Patel: approved",
+    "Sofia Martinez: approved after tests",
+    "Leah Kim: approved"
+  ],
+  "ci_checks": [
+    "Build: pass",
+    "Unit tests: pass",
+    "Integration tests: pass",
+    "Lint: pass",
+    "Perf bench: completed (see artifacts)"
+  ],
+  "merge": "squash merge by Marisol Chen on 2026-02-25 (squash and merge).",
+  "release_notes": "Introduces latency-aware eviction scheduling, compact-hint bitset for targeted background compaction, async micro-compaction, and improved spill prioritization. Feature disabled by default; runtime flags available to enable and tune. Recommended canary before wide rollout.",
+  "backout_plan": "Disable runtime flag to revert scheduler/compaction paths; fall back to single-queue evictor, immediate rollback script in ops playbook. Ops runbook updated in docs/ops/kv-eviction.md.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "diff_snippets",
+    "review_comments",
+    "release_notes",
+    "backout_plan"
+  ],
+  "dataset_doc_uuid": "dsid_215b9ebd41a14c7a830a69258c9305e8"
+}

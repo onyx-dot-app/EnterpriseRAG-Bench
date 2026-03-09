@@ -1,0 +1,72 @@
+{
+  "repo": "redwood",
+  "pr_number": "153220",
+  "title": "kv: burstless spill scheduler and soft-commit protector",
+  "author": "Asha Nair",
+  "created_at": "2025-02-11",
+  "updated_at": "2025-02-19",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/kv/burstless-spill-scheduler-soft-commit-protector",
+  "reviewers": [
+    "Miguel Ortiz",
+    "Priya Shah",
+    "Jonah Reed"
+  ],
+  "labels": [
+    "runtime",
+    "kv",
+    "perf",
+    "sre"
+  ],
+  "linked_linear": [
+    "ENG-4981",
+    "ENG-4999"
+  ],
+  "linked_jira": [
+    "SUP-7821"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "9",
+  "additions": "842",
+  "deletions": "278",
+  "release_notes": "Introduces a tenant-aware spill scheduler that smooths eviction-induced I/O and a soft-commit protection mechanism to reduce cache churn during hot batching windows. Opt-in via runtime knob: kv.spill.burstless=true. Backwards compatible; safe rollout with canary by tenant.",
+  "breaking_change": "false",
+  "description": "Motivation: Under bursty load patterns (short hot tails from continuous batching + KV pressure) we observed large, sudden spill waves that caused latency spikes and cascading eviction churn across tenants. This PR implements a two-part mitigation: (1) a burstless spill scheduler that spreads spill work across a configurable window and applies tenant-aware pacing, and (2) a soft-commit protector which temporarily raises residency protection for pages that are part of in-flight batch kernels to avoid immediate re-eviction.\n\nDesign summary: The scheduler replaces the previous immediate spill trigger path with a reservoir-based token allocator. When pressure crosses the spill threshold, a per-node spill reservoir is populated proportional to pressure and redistributed to tenant buckets using their prioritization score (tenant SLA + recent throughput). Each tenant consumes tokens to perform spill operations; once tokens are exhausted further spill work is deferred into the next window. The scheduler supports two time scales: smoothing window (default 250ms) for latency-sensitive workloads, and background refill window (default 2s) for throughput catch-up.\n\nSoft-commit protector: To reduce churn when continuous batching pipelines are flushing KV pages back to storage, we introduce a soft-commit state for pages touched by a batch. Pages in this state get a short-lived residency boost (configurable, default 500ms) and are gated from immediate eviction unless global memory danger is critical. The protector integrates with the continuous-batcher hook so that pages participating in a kernel or pinned by a streaming response are less likely to be reclaimed mid-flight.\n\nKernel and scheduling interactions: We added hint metadata to the KV allocator so the serving runtime can mark slots as batching-hot. The kernel scheduler checks these hints before preempting a GPU-bound batch to avoid introducing page faults during attention computation. This required a small knob in the kernel invocation path to consult the KV hint map (lightweight C++ API).\n\nTelemetry and observability: New metrics: kv.spill.window_tokens_total, kv.spill.tokens_used_by_tenant{tenant}, kv.soft_commit.active, kv.soft_commit.eviction_blocked, kv.spill.deferred_ops. We added tracing spans around spill windows for correlating with request latency. Dashboards updated in observability-pack to show spill smoothing behavior and tenant pacing.\n\nConfiguration knobs: kv.spill.burstless (bool), kv.spill.smoothing_ms (int), kv.spill.refill_ms (int), kv.spill.tenant_share_strategy (enum: proportional|fair|sla_weighted), kv.soft_commit.duration_ms (int), kv.soft_commit.force_evict_threshold_pct (int). Defaults chosen to be conservative: smoothing_ms=250, refill_ms=2000, duration_ms=500, force_evict_threshold_pct=95.\n\nBenchmarks: We ran mixed workload experiments on a 4x A100 dedicated cluster with representative continuous-batching trace and adversarial single-tenant fill. Key comparisons versus main branch: \n- 95th pct latency (inference tail) reduced from 182ms to 135ms under bursty injection (-26%).\n- KV-induced stall events (page-fault stalls) reduced by 68% during hot tail windows.\n- Background spill throughput decreased by ~12% in the short term (tradeoff for latency smoothing), but overall bytes spilled over 60s matched baseline due to refill windows.\n\nTesting: Unit tests added for reservoir token accounting, tenant share strategy, and soft-commit state transitions. Integration test harness extended to simulate continuous batching with page affinity; deterministic scheduler tests added (non-flaky via mocked time). Load tests executed in benchmark-lab repo with the included scenarios.\n\nRollout plan: Feature is behind runtime flag (kv.spill.burstless). Default off for now; will be enabled for 10% of tenants via canary on the dedicated pool, monitor kv.soft_commit.eviction_blocked and inference tail. If stable after 72h, increase to 50% then flip default.\n\nChecklist:\n- [x] Design doc updated and reviewed (ENG-4981)\n- [x] Unit & integration tests\n- [x] Benchmarks in benchmark-lab\n- [x] Observability dashboards + tracing\n- [x] Backwards compatible config defaults\n- [x] Canary rollout plan\n\nCommits summary: Implement reservoir allocator (kv/spill/reservoir.{h,cc}), tenant pacing policy, soft-commit state machine (kv/soft_commit.{h,cc}), kernel hint plumbing (runtime/kernel_hint.h), metrics and traces, unit/integration tests, docs and dashboard JSON.\n\nChanged files (high-level):\n- kv/spill/reservoir.cc\n- kv/spill/reservoir.h\n- kv/pacing/tenant_shares.cc\n- kv/soft_commit.cc\n- runtime/kernel_hint.h\n- runtime/kv_integration_tests.cc\n- observability/dashboards/kv_spill_smoothing.json\n- benchmark-lab/scenarios/continuous_batch_spill.yml\n- docs/kv_spilliness.md\n\nReview thread (high level):\n- Miguel Ortiz: \"Nice approach. Concern: how do we avoid starving low-priority tenants when a tenant has sustained high pressure?\"\n- Asha Nair (author): \"We cap per-tenant consumption and use proportional refill; added a hard min share to tenant_shares and tests to prevent starvation. See tenant_shares.cc lines 120-150.\"\n- Priya Shah: \"What about worst-case when memory pressure hits >95%? Do we bypass the smoothing?\"\n- Asha Nair: \"Yes, config force_evict_threshold_pct defaults to 95; above that we switch to emergency mode where we bypass soft-commit protector and allow immediate evictions, and we emit kv.spill.emergency_count metric.\"\n- Jonah Reed: \"CI flaked on the deterministic scheduler test once; looks like clock mocking race.\"\n- Asha Nair: \"Fixed with stronger barrier in scheduler test and added a retry guard. Re-run CI.\"\n- Miguel Ortiz: \"Approved after test fixes and docs updates.\"\n\nCI history: First run - unit failure (deterministic scheduler test) and lint warning. Fixes pushed (two commits). Second run - flaky integration test in perf harness (timeout); increased test timeout and optimized setup. Final run - all checks passed (unit/integration/lint/bench).\n\nMerge: Squash merged by Asha Nair on 2025-02-19 (merge commit: 3f7b9a2). Merge note: Enable behind kv.spill.burstless; observability deck updated; benchmark manifests added to benchmark-lab.\n\nNotes/Follow-ups:\n- Follow-up ticket ENG-5060 to evaluate adaptive window sizing based on observed spike frequency.\n- Consider integrating with autoscaler heuristics to preemptively increase memory reservations for tenants that consistently hit refill windows.\n\nThis PR is intentionally conservative: it prioritizes inference tail stability over immediate reduction in bytes spilled. It provides knobs for operators to tune the smoothing/refill tradeoffs and keeps a clear escape hatch for emergency evictions.",
+  "commits": [
+    "implement reservoir allocator and tenant pacing (res: 7bda3f4)",
+    "soft-commit state machine and kernel hints (res: 9cf114a)",
+    "tests and metrics (res: 2d8b1f0)",
+    "docs and dashboards (res: af0e7b1)"
+  ],
+  "changed_files": [
+    "kv/spill/reservoir.cc",
+    "kv/spill/reservoir.h",
+    "kv/pacing/tenant_shares.cc",
+    "kv/soft_commit.cc",
+    "runtime/kernel_hint.h",
+    "runtime/kv_integration_tests.cc",
+    "observability/dashboards/kv_spill_smoothing.json",
+    "benchmark-lab/scenarios/continuous_batch_spill.yml",
+    "docs/kv_spilliness.md"
+  ],
+  "review_thread": [
+    "Miguel Ortiz: 'Nice approach. Concern: how do we avoid starving low-priority tenants when a tenant has sustained high pressure?'",
+    "Asha Nair: 'We cap per-tenant consumption and use proportional refill; added a hard min share to tenant_shares and tests to prevent starvation.'",
+    "Priya Shah: 'What about worst-case when memory pressure hits >95%? Do we bypass the smoothing?'",
+    "Asha Nair: 'Yes, config force_evict_threshold_pct defaults to 95; above that we switch to emergency mode where we bypass soft-commit protector and allow immediate evictions, and we emit kv.spill.emergency_count metric.'",
+    "Jonah Reed: 'CI flaked on the deterministic scheduler test once; looks like clock mocking race.'",
+    "Asha Nair: 'Fixed with stronger barrier in scheduler test and added a retry guard. Re-run CI.'",
+    "Miguel Ortiz: 'Approved after test fixes and docs updates.'"
+  ],
+  "merge_method": "squash",
+  "merged_at": "2025-02-19",
+  "merge_commit": "3f7b9a2",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes",
+    "review_thread"
+  ],
+  "dataset_doc_uuid": "dsid_960daeb885444641a870fb34688d3d5c"
+}

@@ -1,0 +1,80 @@
+{
+  "repo": "redwood",
+  "pr_number": "821999",
+  "title": "Reduce KV fragmentation entropy and smooth spillback with adaptive hysteresis",
+  "author": "Asha Menon",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-02-18",
+  "merged_at": "2026-02-18",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/kv-frag-entropy-hysteresis-spillback-controller",
+  "reviewers": [
+    "Diego Ramos",
+    "Lena Choi",
+    "Ravi Patel"
+  ],
+  "labels": [
+    "runtime",
+    "kv-cache",
+    "perf",
+    "sre"
+  ],
+  "linked_linear": [
+    "ENG-3487",
+    "ENG-3490"
+  ],
+  "linked_jira": [
+    "SUP-9192"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "7",
+  "additions": "312",
+  "deletions": "98",
+  "breaking_change": "false",
+  "release_notes": "Introduces adaptive fragmentation hysteresis and a spillback rate controller for KV cache to reduce memory waste and stabilize spill-to-disk behavior under bursty workloads.",
+  "description": "Context: production clusters have seen recurring 'micro-fragmentation storms' in the KV cache when mixed tenant traffic causes frequent tiny allocations and deallocations. These storms increase residency overhead and trigger reactive spillback that oscillates between aggressive eagerly spilling to disk and then rapid reclamation, causing CPU and IO churn.\nMotivation: reduce fragmentation entropy (small, high-variance free segments) and prevent oscillatory spillback that spikes downstream storage IO. This PR introduces two complementary mechanisms: 1) fragmentation entropy reducer: a lightweight background compaction heuristic that detects high-fragmentation lanes and preferentially coalesces small adjacent free slots into larger slabs without full stop-the-world compaction; it uses a per-segment entropy score and bounded worker budget so tail latency isn't impacted. 2) spillback rate controller: a PID-inspired controller that smooths the rate of forced spill writes by applying hysteresis and momentum to the eviction pressure signal; when memory pressure decreases it delays reducing spill rate to avoid immediate re-absorption that causes oscillation.\nThe description below outlines design, implementation notes, tests, and rollout plan.\nDesign:\n- Entropy scoring: per-region metric computed from a rolling sample of allocation sizes and fragmentation gaps. Score maps to a compaction priority; low CPU budget regions skip compaction.\n- Bounded coalescer: coalescer workers run opportunistically during normal scheduling ticks; each worker has a byte-budget and operation-budget to ensure we never spend more than X% of a scheduling quantum.\n- Hysteresis in spillback: controller keeps a short-term and medium-term moving average of free-resident ratio and only reduces spill rate when both averages indicate sustained relief. Spikes will now exponentially back off rather than immediately cut the spill throttle.\n- Safety fallback: when IO queue depth exceeds a high watermark or latency SLOs for downstream storage are violated, the controller escalates to an emergency slow-spill mode (lower throughput, prioritize larger objects).\nImplementation notes:\n- New files: kv/frag_entropy.{h,cc} implements scoring and the coalescer; scheduler/evict_controller.{h,cc} implements the spillback controller and exposes tunables via runtime flags and the console.\n- Metrics: kv.frag_entropy_score, kv.coalesce_ops, controller.spill_rate, controller.spill_mode, controller.medium_ma, controller.short_ma.\n- Config defaults: coalescer budget 1% cpu quantum, worker count 2 per node, entropy threshold tuned by opt-in experiments.\n- Backwards compatibility: controllers are disabled by default in private installs; enabling requires a flag.\nTesting:\n- Unit tests for entropy scoring and coalescer invariants.\n- Stress tests: recreated fragmentation storms with mixed small/large allocations; measured 18-27% reduction in resident overhead and 35% reduction in IO spikes across our perf lab on p40-equivalent nodes.\n- End-to-end: Canary run on staging with traffic replay for 48h; CPU and IO tail improved with no regression in 99ms tail latency of inference.\nRollout: feature-flag gated in main; rollout plan is canary -> gradual ramp over 4 days -> monitor controller.spill_mode and kv.frag_entropy_score to detect regressions.\nChecklist:\n- [x] Design doc reviewed by runtime team (ENG-3487)\n- [x] Unit + integration tests\n- [x] Benchmarks in benchmark-lab with mixed-tenancy workload\n- [x] Docs update for runtime flags (small section in observability-pack)\n- [x] Console hooks for controller metrics and simple toggle\nCompatibility notes: The change touches the eviction path and introduces metrics that downstream alerting rules may want adjusted. No public API changes. Related: builds on prior KV compaction efforts but emphasizes low-overhead, non-blocking coalescing to reduce fragmentation entropy rather than full compaction. See ENG-3490 for early experiments.",
+  "commits": [
+    "a3f2e9f - kv: add frag_entropy scorer and coalescer (initial impl)",
+    "b4d1c11 - scheduler: introduce spillback controller skeleton and config",
+    "c9d7e22 - kv: wire coalescer into allocator loop; add metrics",
+    "d2a4f31 - tests: add unit tests for entropy scoring; add stress harness",
+    "e7b0a5c - docs: runtime flags and console metrics section"
+  ],
+  "files_changed": [
+    "kv/frag_entropy.cc",
+    "kv/frag_entropy.h",
+    "scheduler/evict_controller.cc",
+    "scheduler/evict_controller.h",
+    "tests/kv/frag_entropy_test.cc",
+    "perf/bench/frag_storm.yaml",
+    "docs/runtime_flags.md"
+  ],
+  "diff_snippets": [
+    "--- a/kv/allocator.cc\n+++ b/kv/allocator.cc\n@@ -412,6 +412,12 @@ void Allocator::tick() {\n-  // existing eviction logic\n+  // run lightweight coalescer opportunistically\n+  if (frag_entropy_score(region) > FLAGS_coalesce_threshold) {\n+    coalescer_.try_coalesce(region, FLAGS_coalesce_byte_budget);\n+  }\n+  // existing eviction logic\n",
+    "--- a/scheduler/evict_controller.h\n+++ b/scheduler/evict_controller.h\n@@ -10,6 +10,16 @@ class EvictController {\n+  // public API used by allocator to query current allowed spill rate (bytes/s)\n+  uint64_t allowed_spill_rate() const;\n+  enum Mode { NORMAL, SLOW_SPILL, EMERGENCY };\n+  Mode current_mode() const;\n+  // tuning knobs exposed as flags\n };\n"
+  ],
+  "review_comments": [
+    "Diego Ramos (2026-02-11): Nice approach. Two things: 1) Are the coalescer budgets enforced per-CPU or per-node? We need to ensure multi-socket math is correct. 2) Put a short blurb in docs about the default-off flag for private installs.",
+    "Asha Menon (2026-02-12): Reply: budgets are per-node; updated comments and added a unit test for multi-socket accounting. Docs blurb added in docs/runtime_flags.md.",
+    "Lena Choi (2026-02-14): Request changes: add an integration test that asserts no regression in 99% latency under heavy small-allocation workloads. Also please add a Prometheus label for tenant_id on kv.coalesce_ops.",
+    "Asha Menon (2026-02-15): Reply: added integration test and tag on metric. Fixed and pushed."
+  ],
+  "ci_logs": [
+    "Build: success (linux-x86) - 14m",
+    "Unit tests: success - kv frag tests passed",
+    "Integration tests: success - perf harness ran 2/2 scenarios",
+    "Lint: pass",
+    "E2E canary job: pass (staging)"
+  ],
+  "merge_outcome": "merged via squash",
+  "post_merge_notes": "Monitoring: added a temporary alert that fires if controller.spill_rate increases by >3x in 10m during initial rollout. Ops will run a 72h watch on kv.frag_entropy_score and controller.medium_ma. If regressions are observed, revert flagging path will be used.",
+  "changelog_entry": "runtime: non-blocking KV fragmentation coalescer + spillback rate controller (opt-in via runtime flags). Improves memory residency and stabilizes spill IO under bursty workloads.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_comments",
+    "post_merge_notes"
+  ],
+  "dataset_doc_uuid": "dsid_e24797d18cd84102ab56864953b2f6d6"
+}

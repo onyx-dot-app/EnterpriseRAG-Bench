@@ -1,0 +1,77 @@
+{
+  "repo": "redwood",
+  "pr_number": "65789",
+  "title": "staged shadow-buffer sparse allreduce and peer-aware launch throttling",
+  "author": "Aisha Patel",
+  "created_at": "2026-02-14",
+  "updated_at": "2026-03-04",
+  "merged_at": "2026-03-04",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/tp/shadowbuf-sparse-launch-throttle",
+  "reviewers": [
+    "Marcus Lee",
+    "Sofia Gonzalez",
+    "Olaf Berg"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "tp",
+    "nccl",
+    "kv-cache"
+  ],
+  "linked_linear": [
+    "ENG-1923",
+    "ENG-1978"
+  ],
+  "linked_jira": [
+    "SUP-8801"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "18",
+  "additions": "1245",
+  "deletions": "312",
+  "breaking_change": "false",
+  "description": "Context: Tensor-parallel workloads were experiencing periodic stalls when many concurrent in-flight microbatches attempted KV-cache merges at the same time. Motivation: Reduce communication tail-latency and improve overlap without changing model sharding. This PR introduces a two-part runtime optimization: (1) a staged 'shadow buffer' merge path that aggregates sparse KV merge deltas on-device and issues a single sparse-aware AllReduce, and (2) a peer-aware launch throttler that paces kernel/collective launches based on per-peer inflight credits and soft RTT estimates. Design: The shadow buffer acts as a small, per-GPU accumulator for kv-merge writebacks. When a microbatch finishes, the runtime appends a compact delta (indices + compressed values) into the shadow buffer. Periodically (configurable window), the kernel coalescer packs deltas and issues a sparse allreduce (custom op) that only transfers touched keys. The peer-aware throttler prevents an explosion of concurrent collectives by tracking recent completion latencies per peer (exponentially weighted) and computing a safe concurrency budget per GPU. The throttler operates at the scheduling layer so it also delays non-critical kernels (post-kv cleanup work) instead of blocking forward/backward compute. Compatibility: default behavior preserves existing dense fallback (unchanged merge path) when sparse mode is disabled or when sparsity falls below thresholds. The feature is gated behind two runtime knobs: TP_SHADOWBUF_ENABLE (default=true) and TP_SPARSE_ALLREDUCE_THRESHOLD (default=0.12). Benchmarks: On a 16xA100 TP run with realistic chat workloads, end-to-end latency p50 improved by 8% and p99 by 17% for long-context traffic; token throughput improved 6% while inter-GPU bandwidth usage dropped ~22% during peaks. On small sequences the overhead was neutral to slightly positive due to the throttler avoiding collectives bursts. Rollout: feature is enabled by default on dedicated clusters after a one-week canary. There are telemetry metrics added for shadowbuf_fill_rate, sparse_merge_ratio, peer_inflight_budget and throttled_kernel_count to detect regressions. Operator notes: migrations are non-breaking; however operators should validate that the sparse-allreduce builds for their NCCL/Collective stack. We added a diagnostic toggle to force dense fallback for debugging.",
+  "commits_summary": "6 commits: 1) runtime: add shadow buffer structures and buffer pool; 2) tp: implement sparse-delta serialization and packing; 3) collectives: sparse_allreduce op with optional compression; 4) scheduler: peer-aware launch throttler and inflight budget tracking; 5) telemetry: metrics and tracing for throttler + shadowbuf; 6) tests: microbench harness and CI gating for sparse op. Each commit is focused and accompanied by unit tests or microbench harnesses where applicable.",
+  "changed_files": [
+    "runtime/tp/shadow_buffer.h",
+    "runtime/tp/shadow_buffer.cc",
+    "runtime/tp/kv_merge_serializer.cc",
+    "runtime/collectives/sparse_allreduce.cu",
+    "runtime/scheduler/launch_throttler.cc",
+    "runtime/scheduler/launch_throttler.h",
+    "runtime/scheduler/scheduler_test.cc",
+    "infra/config/runtime_flags.yaml",
+    "telemetry/metrics_registry.yaml",
+    "docs/ops/runbook-shadowbuf.md",
+    "tests/microbench/tp_sparse_merge_bench.cc",
+    "build/CMakeLists.txt",
+    "examples/tp/benchmark_shadowbuf.yaml",
+    "scripts/ci/collectives_smoke.sh",
+    "python/redwood/runtime/flags.py",
+    "python/redwood/cli/debug_tools.py",
+    "third_party/collectives/README.md",
+    "bench/perf_reports/2026-02-shadowbuf.json"
+  ],
+  "review_conversation": "Marcus: Overall looks promising, but need clarity on memory safety for the shadow buffer when device OOM occurs. Aisha: added defensive checks and an eviction path that spills oldest deltas to host; updated docs. Sofia: can we quantify overhead of serialization? Aisha: added microbench that shows serialization adds ~120us per batch but is amortized by reduced network transfer. Olaf: edge case where a peer goes down mid-window \u2014 what happens to the inflight budget accounting? Aisha: throttler detects peer disconnects and instantly reclaims credits, also falls back to single-phase dense merge if peer set changes during packing; added unit test. Marcus: please add an opt-out env var for canaries. Aisha: done (TP_SHADOWBUF_ENABLE=false). Reviewers approved after two rounds; CI rerun after fixed race in packing code succeeded.",
+  "ci_summary": "CI pipeline: build (pass), unit-tests (pass), tp-microbench (pass, flaky on first run rerun), integration-collectives (pass), lint (pass). One flaky test 'tp_scheduler_test.TimerRace' initially failed; fix applied and rerun passed. GPU smoke on internal canary ran against a 4-node A100 farm with approved results attached.",
+  "merge_outcome": "Merged via squash-merge. Commit message: 'tp: staged shadow buffer + sparse allreduce + peer-aware throttler \u2014 reduce TP comm tail latency and KBW peaks (ENG-1923)'. Merged by Sofia Gonzalez after approvals and green CI. No manual conflicts during merge.",
+  "release_notes": [
+    "Performance: Introduces staged shadow-buffer sparse allreduce \u2014 reduces inter-GPU bandwidth for sparse KV merges and improves p99 latency on TP workloads.",
+    "Runtime: Peer-aware launch throttler paces kernel and collective launches to avoid comm storms; can be tuned via runtime flags.",
+    "Ops: New telemetry (shadowbuf_fill_rate, sparse_merge_ratio, peer_inflight_budget) and a canary opt-out flag TP_SHADOWBUF_ENABLE."
+  ],
+  "files_patch_snippet": "--- a/runtime/scheduler/launch_throttler.cc\n+++ b/runtime/scheduler/launch_throttler.cc\n@@ -12,6 +12,34 @@\n+// simple EWMA per-peer latency estimator used to compute safe concurrency\n+double PeerEstimator::update(int peer_id, double last_latency_ms) {\n+  auto &s = peers_[peer_id];\n+  s.ewma = s.ewma == 0 ? last_latency_ms : s.alpha * last_latency_ms + (1 - s.alpha) * s.ewma;\n+  // budget inversely proportional to observed latency, clamped [1, max_budget]\n+  return std::max(1, (int)std::min((double)max_budget_, std::round(max_budget_ * (baseline_ms_ / (s.ewma + 1e-6)))));\n+}\n+\n+void LaunchThrottler::maybe_schedule(Function&& f) {\n+  int budget = peer_estimator_.budget_for(peer_id_);\n+  if (inflight_for_peer_[peer_id_] >= budget) {\n+    // requeue non-critical tasks to batch later\n+    pending_queue_.push_back(std::move(f));\n+    metrics_.inc(\"throttled_kernel_count\");\n+    return;\n+  }\n+  inflight_for_peer_[peer_id_]++;\n+  executor_.post([this, f = std::move(f), peer = peer_id_](){ f(); inflight_complete(peer); });\n+}\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "commits_summary",
+    "review_conversation",
+    "ci_summary",
+    "merge_outcome",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_409df3e920ea4d8397e0c86e8ace7aa3"
+}

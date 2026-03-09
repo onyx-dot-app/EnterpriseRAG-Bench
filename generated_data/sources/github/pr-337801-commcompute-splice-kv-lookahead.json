@@ -1,0 +1,72 @@
+{
+  "repo": "redwood",
+  "pr_number": "337801",
+  "title": "commcompute splice scheduler + KV lookahead prefetch to reduce TP comm stalls",
+  "author": "Maya Chen",
+  "created_at": "2026-01-29",
+  "updated_at": "2026-02-03",
+  "merged_at": "2026-02-03",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/commcompute-splice-kv-lookahead",
+  "reviewers": [
+    "Arjun Patel",
+    "Sofia Martinez",
+    "Daniel O'Neill"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "tp-runtime",
+    "nccl",
+    "kv-cache"
+  ],
+  "linked_linear": [
+    "ENG-4821",
+    "ENG-4920"
+  ],
+  "linked_jira": [
+    "SUP-1143"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "16",
+  "additions": "1242",
+  "deletions": "312",
+  "release_notes": "Improves multi-GPU tensor-parallel throughput and tail latency by overlapping communication and compute more aggressively. Adds a new CommCompute Splice Scheduler and a KV lookahead prefetch window configurable per-model/workload. No user-facing API changes; runtime flags available for tuning.",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "body": "Problem: for certain tensor-parallel workloads we observed repeated NCCL stalls caused by misaligned collective boundaries and kernel granularity, especially when sequence length and microbatch size vary across traffic patterns. Existing heuristics waited for full collective readiness before issuing kernels which increased tail latency and reduced steady-state throughput under mixed batch conditions. Motivation: overlap comm and compute at finer grain with deterministic safety (no correctness regressions) and proactively warm KV cache entries so later steps reuse host/GPU-resident KV without blocking. Summary of changes: 1) Introduce a new CommCompute Splice Scheduler that slices layer-level comm/compute windows into lightweight 'splice' segments. The scheduler computes split points at runtime using recorded token/service time statistics and issues NCCL collectives on a lower-priority stream while launching dependent compute kernels on high-priority streams as soon as safe. 2) Add KV lookahead prefetch (kv_lookahead) configurable per-model. The runtime tracks upcoming attention key ranges and issues prefetch for those KV slabs into a pinned double-buffered slab pool to hide device-host latency. 3) Implement an interleaved host-pinned double-buffer pipeline (hostbuf_a/hostbuf_b) for cross-node reduce/gather to reduce hostcopy stalls; introduces a small host-side rendezvous for eager release. 4) Kernel chaining improvements: add a small chaining trampoline in the CUDA dispatcher so dependent microkernels can be queued without extra host roundtrips; this reduces launch overhead for tiny kernels used in sliced attention. 5) Continuous batching adjustments: the batching controller now aligns batch boundaries to KV lookahead windows and splice boundaries to maximize reuse and minimize cross-splice synchronization. 6) Safety and fallbacks: when NCCL reports unexpected errors or when dynamic profiling is insufficient, scheduler falls back to original full-collective behavior to preserve correctness. Commits (high level): - b3f1a2d: initial splice scheduler core loop and scheduler interface - 7a9c0de: kv_lookahead tracking, slab allocator and double-buffer hostbufs - 2c4d9ef: cuda dispatcher trampoline and kernel-chain tests - e8f7a1b: batching-controller alignment integration and metrics - 9d2b7f3: unit tests, integration test harness updates and perf benchmarks - 44a1e6c: docs and runtime flags + CLI examples Files changed (high level): - runtime/tp/scheduler/splice_scheduler.cc/.h: core scheduler and heuristics - runtime/tp/kv/kv_lookahead.*: lookahead tracker and prefetch logic - runtime/io/hostbuf_doublebuffer.*: host double-buffer pipeline and rendezvous - runtime/cuda/dispatcher_trampoline.*: small trampoline for kernel chains - runtime/batching/continuous_batcher.*: alignment logic and metrics hooks - tests/integration/tp_splice_perf_test.py: microbench harness and CI perf check - docs/ops/tuning_kv_lookahead.md: operator-facing tuning guide Small illustrative snippet (from splice_scheduler.cc): \"// compute splice points based on per-layer stats\nint splice = std::max(1, layer_tokens / config.splice_granularity);\n// issue collective on low-prio stream while launching compute on high-prio stream\nncclLaunchCollective(low_prio_stream, ...);\nlaunchCompute(high_prio_stream, ...);\" Benchmarks: - Cluster: 8xA100-80GB NVLink, CUDA 14, NCCL 2.18 - Workloads: mix of chat (context 8k), long-form generation (context 32k), and reranking microbatch tests - Results: 12% median throughput uplift on mixed-chat workloads; 18% uplift on long-form generation microbenchmarks with sequence reuse; 20\u201345% reduction in 99th percentile token latency for heterogeneous microbatch flows. Tests & CI: - Unit tests added for scheduler heuristics and kv_lookahead eviction logic - Integration perf job added (tp_splice_perf_test.py) that runs in the perf lab; CI runs full unit suite and a short perf smoke. - Initial CI run showed intermittent NCCL flaky in perf harness; added retry + tightened hostbuf ordering; final CI: all checks passed. Rollout and flags: - Default behavior: off for hosted runtime; enabled by default in Dedicated/private runtime with performance profile \"splice-optimized\". - Runtime flags: --tp-splice-enabled, --kv-lookahead=<tokens>, --splice-granularity=<int> - Observability: new metrics exported: tp_splice/slices_launched, tp_splice/overlap_ratio, kv_lookahead/prefetch_hits, kv_lookahead/prefetch_misses Review notes and conversation (summary): - Arjun: \"Nice end-to-end. Concern about memory headroom for kv_lookahead on smaller instances \u2014 can we limit by slab budget per-device?\" \u2014 Author: \"Added slab_budget_per_device flag and dynamic throttling; documented tradeoffs in tuning guide.\" - Sofia: \"Please provide a safe default that doesn't change hosted tenant behavior.\" \u2014 Author: \"Kept default disabled on hosted; Dedicated images ship with the optimized profile. Added integration test to assert defaults.\" - Daniel: \"Kernel trampoline looks good but please add a stress test to ensure no IPC handles are leaked across retries.\" \u2014 Author: \"Added leak-detection stress test and added an RAII guard in dispatcher_trampoline.\" - CI: initially failed perf smoke due to race in hostbuf ordering; fixed by introducing explicit hostbuf sequence numbers and barrier in rendezvous. Merging: approved by Arjun and Sofia after fixes; merged by squash on 2026-02-03. Operational follow-up: - Added a perf dashboard (internal) tracking tp_splice metrics + kv prefetch hit ratios - Suggested rollout plan: enable on Dedicated clusters for 2 weeks, monitor metrics, then enable on selected Private customer clusters. Known limitations and future work: - Current splice granularity is layer-token based; future work: adaptive splice sizing per-layer with ML-informed predictors. - Better integration with model quantization paths to reduce kernel overhead for small slices. - Further NCCL-level tuning (priority throttles per-lane) is left for a follow-up PR. Links: PERF-DASHBOARD-TP-SPLICE internal, ENG-4821, SUP-1143.",
+  "review_comments": [
+    "Arjun Patel: Needs slab_budget_per_device and dynamic throttling for small instances",
+    "Maya Chen: Added slab_budget_per_device flag + throttling in commit 7a9c0de",
+    "Sofia Martinez: Ensure defaults don't change hosted behavior",
+    "Maya Chen: Kept defaults off for hosted; Dedicated images ship with profile\n",
+    "Daniel O'Neill: Add stress test for kernel trampoline leaks",
+    "Maya Chen: Added leak-detection stress test and RAII guard in dispatcher_trampoline"
+  ],
+  "changed_files": [
+    "runtime/tp/scheduler/splice_scheduler.cc",
+    "runtime/tp/scheduler/splice_scheduler.h",
+    "runtime/tp/kv/kv_lookahead.cc",
+    "runtime/tp/kv/kv_lookahead.h",
+    "runtime/io/hostbuf_doublebuffer.cc",
+    "runtime/io/hostbuf_doublebuffer.h",
+    "runtime/cuda/dispatcher_trampoline.cu",
+    "runtime/cuda/dispatcher_trampoline.h",
+    "runtime/batching/continuous_batcher.cc",
+    "runtime/batching/continuous_batcher.h",
+    "tests/integration/tp_splice_perf_test.py",
+    "tests/unit/test_splice_scheduler.py",
+    "docs/ops/tuning_kv_lookahead.md",
+    "tools/perf/dashboard_tp_splice.json",
+    "ci/perf-smoke.yml",
+    "benchmarks/8xA100/tp_splice_longform.json"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "review_comments",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_29b35b71af904936945b8a76b6a4631f"
+}

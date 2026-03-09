@@ -1,0 +1,51 @@
+{
+  "repo": "redwood",
+  "pr_number": "907654",
+  "title": "introduce-kv-thermostat-evictor-with-granular-tenant-quotas",
+  "author": "Asha Mehta",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-02-18",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/kv-thermostat-evictor",
+  "reviewers": [
+    "Diego Ramos",
+    "Lina Chen",
+    "Omar Haddad"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kv",
+    "sre",
+    "release-notes"
+  ],
+  "linked_linear": [
+    "ENG-5123",
+    "ENG-5180"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "1200",
+  "deletions": "410",
+  "description": "Motivation: high fragmentation and tenant-level contention in the KV cache continues to cause uneven memory utilization and spill storms during mixed workloads. This PR introduces a thermostat-based eviction strategy that adapts eviction 'temperature' per-tenant, a lightweight micro-tiering layout to reduce fragmentation, and a page-morpher that enables safe, concurrent page resizing to consolidate free space without global pauses. Goals: (1) smoother global memory usage across tenants, (2) predictable spill prioritization aligned with tenant SLAs, (3) reduce tail latency caused by background compaction and large spill batches. This description is intentionally a single continuous string and includes checklist, design notes, and rollout plan. Checklist: - [x] Design doc (ENG-5123) linked and reviewed - [x] Unit + integration tests - [x] Canary plan + feature flag - [x] Perf benchmarks (micro + system) - [x] Operational runbook and dashboard widgets Changes in this PR: - Implemented kv::evictor::ThermostatEvictor with per-tenant temperature curves derived from occupancy, fragmentation_score, and recent spill_rate. The thermostat exposes dynamic target_residency which the scheduler uses to shape eviction batches. - Added kv::layout::MicroTier to categorize pages into hot / soft-warm / cold bands and prefer in-place reuse within bands to avoid fragmentation churn. - Introduced page_morpher module that performs safe concurrent split/merge on page frames to coalesce small free fragments into larger contiguous pages (only on backgrounds threads; no mainline blocking). - Spill prioritizer: ties spill candidates to tenant SLA and throttle score; low-priority spills may be delayed short windows to favor high-SLA tenants and avoid simultaneous heavy IO. - Scheduler integration: background compaction now respects node load and keeps compaction windows aligned with continuous batching to avoid affecting token path latency. - Kernel hinting: allocator exposes small annotations so runtime kernel selector can prefer sub-page-aligned kernels when micro-tiering signals high fragmentation. Why different from prior work: prior PRs focused on eviction rate shaping or slab compaction. This PR combines an adaptive control-loop (thermostat) with structural page morphing and tenant-aware spill policies to minimize reactive global compactions and to provide SLA-aware degradation. Performance summary (canary/dev perf): - Memory reclaimed during mixed gen/embedding workload: 18-24% reduction in active page count (depends on workload skew). - P95 latency on small-request path: improved by ~7% in mixed tenant scenarios due to reduced background compaction spikes. - Spill IO bandwidth smoothing: peak spike amplitude reduced by ~32% in lab runs. - Unit test coverage: +24 tests added covering concurrent morph operations and thermostat hysteresis. Rollout plan: feature gated behind kv.thermostat_evictor boolean; starts in canary for 2 weeks with tenant_profile=conservative, then wider rollout with telemetry thresholds. Ops: added metrics kv.thermostat.temperature, kv.eviction.batch_size, kv.page_morpher.compactions, and a dashboard widget. Backwards compatibility: all behaviour behind feature flag; page format unchanged on-disk so safe for rollback.",
+  "commits": "c1a9f3d: add ThermostatEvictor core loop and tests; 4f2b1c2: micro-tier layout and page tagging; a7d8e9b: implement page_morpher split/merge primitives; b2c3d4e: spill prioritizer and SLA mapping; d9f0ab1: scheduler integration and canary flags; e3f4a5b: docs and op runbook; f6a7b8c: perf harness and benchmarks",
+  "files_changed": "src/kv/evictor/thermostat.rs; src/kv/layout/micro_tier.rs; src/kv/page_morpher.rs; src/kv/evictor/mod.rs (wiring); src/scheduler/compaction_window.rs; tests/kv/evictor_integration_test.rs; tests/kv/page_morpher_concurrency_test.rs; perf/bench/kv_memory_scenarios.yaml; docs/operational/eviction.md; deploy/flags.yaml; examples/tuning/tenant_profiles.json; sdk/observability/metrics_defs.yaml",
+  "review_comments": "Diego: Great direction \u2014 please add more telemetry on per-tenant hysteresis so we can reason about oscillation. Also call out worst-case IO amplification in the doc. Lina: Concern about morpher safety under high concurrent loads; request that you add an assertion to ensure no double-free and an integration test with simulated preemption. Omar: Asked for a clearer canary rollback path in the runbook and suggested an additional feature flag to disable page morphing only. Author replies: added kv.thermostat.hysteresis_alpha metric and a test harness that fuzzes concurrent morph ops; made page_morpher opt-in via kv.page_morpher.enabled and added explicit rollback steps in docs. Diego: Verified added metrics and gave a small nit on naming. Lina: Approved after the extra test. Omar: Approved after runbook update.",
+  "merge_outcome": "merged via squash (merged_at: 2026-02-18; merge_commit: 8a7e6d5). Branch deleted after merge.",
+  "release_notes": "Introduces thermostat-based eviction for KV cache, micro-tier page layout to reduce fragmentation, and a concurrent page morpher to consolidate fragments. Exposed metrics and feature flags for controlled rollout. Expected memory and tail-latency improvements for mixed-tenant workloads.",
+  "breaking_change": "false",
+  "linked_jira": [
+    "SUP-9121"
+  ],
+  "additional_notes": "Observability: dashboards added under 'KV / Eviction' and alerts for kv.eviction.throttle_rate > 0.2 sustained for 5m. Recommended tuning: start with tenant_profile=conservative and increase thermostat aggressiveness in 5% steps while monitoring kv.thermostat.temperature distribution. Canary ran on region-us-east-2 with 20 tenants and mixed RPS profile. No data plane format changes.",
+  "patch_snippet": "--- a/src/kv/evictor/mod.rs\n+++ b/src/kv/evictor/mod.rs\n@@ -42,6 +42,18 @@\n pub fn on_memory_pressure(ctx: &EvictCtx) {\n-    // previous simple lru-based evictor\n+    // new thermostat-based eviction: compute target_residency per tenant\n+    for tenant in ctx.tenants.iter() {\n+        let temp = thermostat.compute_temperature(tenant.metrics());\n+        if temp > THRESHOLD {\n+            schedule_eviction(tenant.id(), thermostat.compute_batch_size(temp));\n+        }\n+    }\n }\n ",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_comments",
+    "release_notes",
+    "additional_notes"
+  ],
+  "dataset_doc_uuid": "dsid_b70b75611b65411191e241be1b9aac73"
+}

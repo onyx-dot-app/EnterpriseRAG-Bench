@@ -1,0 +1,44 @@
+{
+  "repo": "redwood",
+  "pr_number": "981555",
+  "title": "Ephemeral scale allocator + lane synchronizer for compact INT8 hotpath",
+  "author": "Maya Chen",
+  "created_at": "2026-01-18",
+  "updated_at": "2026-01-29",
+  "merged_at": "2026-01-29",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/ephemeral-scale-lane-sync",
+  "reviewers": [
+    "Liam O'Connor",
+    "Priya Desai",
+    "Diego Morales"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kv-cache",
+    "quant",
+    "bench"
+  ],
+  "linked_linear": [
+    "ENG-2042",
+    "ENG-2101"
+  ],
+  "linked_jira": [
+    "SUP-423"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "846",
+  "deletions": "312",
+  "breaking_change": "false",
+  "release_notes": "Introduces ephemeral scale allocator and lane synchronizer which reduce per-token allocation overhead on INT8 hotpaths; fuses dequant+transpose+requant microkernel; KV cache coalescer improves continuous-batching throughput. Measured p50 latency down 8-12% and throughput up ~18% on typical INT8 workloads. No user-facing API changes.",
+  "body": "Context and motivation:\\nWe identified two runtime inefficiencies on our INT8/FP8 serving paths that disproportionately affect short-lived hotpath allocations and continuous batching with KV cache traffic: 1) per-token temporary scale buffers are allocated/freed frequently across lanes, increasing allocator pressure and jitter; 2) KV cache prefetches and continuous batching introduce cross-lane contention during slot alignment which prevents optimal coalescing of microbatches.\\n\\nThis PR introduces two coordinated pieces: an ephemeral scale allocator and a lock-free lane synchronizer. The ephemeral allocator reuses small per-request scale buffers from a per-worker ring with epoch-based reclamation (no central locks). The lane synchronizer provides a light-weight rendezvous primitive that aligns KV-prefetch windows across active lanes so the continuous batcher can merge token batches with lower overhead. In addition, we add a compact fused microkernel (fused_deq_transpose_requant) for the common path INT8->FP16 compute->INT8/FP8 fallback to eliminate intermediate copies.\\n\\nWhat changed (single-string description with checklist):\\n- Implement ephemeral scale allocator with epoch reclamation and config flag: runtime.ephemeral_scale.enabled (default true)\\n- Add lane synchronizer primitive and integrate with continuous-batcher and kv-prefetch coordinator\\n- Implement fused_deq_transpose_requant microkernel (C++ + CUDA) with integer scaling LUT path for INT8\\n- Scheduler hints: allow scheduler to prefer \\\"lane_coalesced\\\" bundles when synchronizer is active\\n- Small API: expose internal metric keys: runtime.ephemeral_scale.reuse_rate, runtime.lane_sync.wait_ms, runtime.kv_coalesce.merge_ratio\\n- Unit tests for allocator and synchronizer, integration test for continuous-batcher correctness\\n- Bench harness updates and a perf job that collects p50/p95 latency and token throughput for INT8 workloads\\n\\nChecklist:\\n- [x] Design doc attached (link: https://linear.app/redwood/issue/ENG-2042/ephemeral-scale-allocator-design)\\n- [x] Unit + integration tests added\\n- [x] Perf benchmarks run in benchmark-lab (job id: bench/2026-01-25/ephemeral-scale)\\n- [x] Feature gated behind runtime.ephemeral_scale.enabled and can be disabled via env var\\n- [x] No public API breaking changes\\n\\nCommits (summary):\\n- 7c3a9d1 Implement ephemeral scale allocator with epoch reclamation and tests\\n- b1f7e44 Add lane synchronizer primitive and continuous-batcher integration\\n- d2e4f20 fused_deq_transpose_requant microkernel and CUDA launch wrapper\\n- a9f5b33 Scheduler hint plumbing + metrics export for reuse/merge ratios\\n- f0c8a66 Fix race in epoch reclamation under high concurrency (addressed review)\\n- e6b1f12 Bench harness: add INT8 hotpath scenario and perf report script\\n\\nFiles changed (high level):\\n- runtime/alloc/ephemeral_scale_allocator.{h,cpp}  (allocator core + tests)\\n- runtime/kv/lane_synchronizer.{h,cpp}  (rendezvous primitive)\\n- runtime/batching/continuous_batcher.cpp  (use lane synchronizer when enabled)\\n- runtime/kernels/fused_deq_transpose_requant.cu  (new microkernel)\\n- runtime/kernels/launcher.cpp  (kernel registration and fallback path)\\n- runtime/scheduler/scheduler_hints.cpp  (new enum and preference code)\\n- bench/benchmarks/int8_hotpath.yaml  (bench job definition)\\n- tests/integration/kv_coalesce_integration.test  (integration test)\\n- docs/ops/feature_flags.md  (document runtime.ephemeral_scale flag)\\n\\nSmall code excerpt (allocator usage in continuous_batcher, illustrative):\\n``\\n// reuse scale buffer from local ring; falls back to stack if disabled\\nauto* buf = allocator->acquire(scale_size);\\napply_scale_inplace(buf, tokens);\\nallocator->release(buf);\\n```\\n\\nBenchmarks (benchmark-lab; single-run median numbers):\\n- Workload: 2048-token long-chained chat, INT8 quantized model (gpt-like)\\n- Baseline (main, no allocator/sync): p50 = 42.1ms, tokens/sec = 23.4k, cost/token = 1.00x\\n- With changes: p50 = 37.6ms (-10.7%), tokens/sec = 27.6k (+17.9%), cost/token ~= 0.86x (-14%)\\n- p95 improved modestly (~6-8ms) due to reduced allocation jitter\\n\\nCorrectness and safety notes:\\n- Ephemeral allocator uses epoch-based reclamation to avoid ABA/free-after-free while remaining lock-free for the common path. Fallback path uses thread-local stack allocation for very small sizes (<64B) to avoid cross-lane contention in microbench workloads.\\n- The fused kernel contains a fallback path to the prior dequant->transpose->requant sequence when input shapes or alignment are not supported. A config flag runtime.kernels.fused_deq.enabled controls usage.\\n\\nReview thread (high-level):\\n- Liam O'Connor (reviewer) 2026-01-19: \\\"Nice microkernel. Concern: epoch reclamation loop may spin under heavy stall; prefer exponential backoff and metric for active stalls.\\\"\\n- Maya Chen (author) 2026-01-20: \\\"Added backoff and a metric runtime.ephemeral_scale.backoff_count. Also added tighter unit tests that simulate stalls.\\\"\\n- Priya Desai (reviewer) 2026-01-21: \\\"Please add a smoke test that runs fused kernel with FP8 fallback on CPU CI runner.\\\"\\n- Maya Chen 2026-01-22: \\\"Added CPU fallback smoke test and CI job entry. Also fixed a UB on misaligned 4-byte loads reported by sanitizer.\\\"\\n- Diego Morales (reviewer) 2026-01-24: \\\"Run results look good; request to add a scheduler opt-out when pod-level latency SLO is tight.\\\"\\n- Maya Chen 2026-01-24: \\\"Added scheduler opt-out config runtime.scheduler.allow_lane_coalesce (default true) and surfaced note in docs.\\\"\\n- CI history: initial push failed lint (clang-format) and a flaky test `kv_cache_eviction.test`; both addressed in follow-up commits and all checks passed on 2026-01-27.\\n\\nPerformance experiments and follow-ups:\\n- Bench run attached: bench/2026-01-25/ephemeral-scale/report.json (internal artifact). Summary above.\\n- Follow-up work: extend fused kernel to support per-head quantization scale LUT (ENG-2101) and evaluate FP8-only fastpath in a subsequent PR.\\n\\nMerge outcome:\\n- Approvals: Liam O'Connor, Priya Desai, Diego Morales\\n- Merge method: squash-and-merge on 2026-01-29 by Maya Chen\\n- Post-merge: Canary rollout to dedicated cluster pool with eps=0.1; monitored metric runtime.ephemeral_scale.reuse_rate and runtime.kv_coalesce.merge_ratio for one week; no regressions observed.\\n\\nNotes for operators:\\n- Default is safe-on: ephemeral allocator on, fused kernel enabled only for supported shapes. To disable: set RUNTIME_EPHEMERAL_SCALE=0 and RUNTIME_KERNELS_FUSED_DEQ=0 in the agent config.\\n\\nIf there are any questions about interaction with Dedicated autoscaling or Private installer, ping me (Maya) or ENG-2042 in Linear.\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "release_notes",
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_c7de14ff3edd4ef088baa5af102bab4f"
+}

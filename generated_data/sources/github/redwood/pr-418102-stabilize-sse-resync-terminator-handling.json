@@ -1,0 +1,81 @@
+{
+  "repo": "redwood",
+  "pr_number": "418102",
+  "title": "stabilize-sse-resync-terminator-handling-to-prevent-partial-json-splices",
+  "author": "Aisha Patel",
+  "created_at": "2026-02-11",
+  "updated_at": "2026-02-13",
+  "state": "merged",
+  "merged_at": "2026-02-13",
+  "merge_method": "squash",
+  "base_branch": "main",
+  "head_branch": "bugfix/sse-resync-terminator-handling",
+  "reviewers": [
+    "Liam O'Connor",
+    "Sofia Martinez",
+    "Ravi Kulkarni"
+  ],
+  "labels": [
+    "runtime",
+    "sse",
+    "compat",
+    "perf",
+    "tests"
+  ],
+  "linked_linear": [
+    "ENG-2042",
+    "ENG-2109"
+  ],
+  "linked_jira": [
+    "SUP-918"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "6",
+  "additions": "412",
+  "deletions": "128",
+  "description": "Context: customers exercising high-concurrency streaming (OpenAI compatibility layer + structured tool calls) observed malformed JSON when network-level chunk boundaries split object tokens and the SSE terminator sequence was ambiguous. This caused downstream parsers to reassemble a spliced JSON object (partial fields from two events) which in practice manifests as non-deterministic function-call payloads and occasional downstream errors. Motivation: we need a robust, backwards-compatible approach that (1) fixes partial-JSON splices resulting from mid-token chunking, (2) makes the stream terminator unambiguous across transports that may coalesce or split newlines, and (3) gives us good observability for resync events so we can diagnose regressions. Summary of the approach: introduce an explicit resync marker and a two-tier terminator semantics (soft delimiter + hard sentinel) while preserving existing public wire compatibility where possible. Implementation details: - Add a compact per-event trailing checksum (crc8, 1 byte encoded as hex) appended to the SSE 'data:' payload inside a new metadata envelope. The checksum is computed over the event payload bytes and makes splices detectable without changing application-level JSON content. - Introduce a soft delimiter (\\n\\n) to preserve human-readable SSE framing and a hard sentinel line starting with 'data: __RS__:' that signals a resync window boundary. Receivers that do not understand the sentinel ignore it (still valid SSE lines) while compat adapters explicitly watch for __RS__. - Modify the parser state machine to:   * buffer incomplete UTF-8 code points across chunks, preventing mid-codepoint split from producing invalid strings;   * validate trailing checksum on event completion and, on mismatch, trigger a deterministic resync path that discards the current buffer up to the last hard sentinel and emits a resync metric/event;   * treat the hard sentinel as an explicit flush point that prevents reassembly across its boundary. - Update OpenAI-compat adapter to wrap function-call payloads into the new envelope and to tolerate the sentinel when present. - Add unit/integration tests that simulate various chunking interleavings (split inside escape sequences, split inside numeric tokens, missing trailing checksum, sentinel inserted mid-stream). Backwards compatibility: - Receivers that ignore the checksum and sentinel still see the same SSE text events (we only add an extra 'data:' metadata line if the transport supports it), but benefit when upgraded. - To avoid inflating bandwidth for small events, checksum encoding uses compact hex and the sentinel is a short ASCII line. Rollout plan: feature-flag the sentinel/checksum on the server side for a staged canary rollout (10% -> 50% -> 100%) with metrics to monitor resync events and function-call mismatch rate. Checklist: - [x] Add checksum generator/validator in runtime streamer - [x] Extend parser state machine to preserve UTF-8 code points across chunks - [x] Implement hard sentinel emit path in OpenAI compat adapter - [x] Add replay/chaos tests for chunk-splitting scenarios - [x] Add integration test covering function-call boundary correctness - [x] Add console docs and observability counters - [x] Run canary and monitor resync metrics Behavior changes and rationale: this PR makes the streaming stack more defensive: instead of attempting best-effort coalescing across arbitrary boundaries, we prefer to detect and recover deterministically. That reduces silent corruption at the cost of explicit resync events (instrumented). Related work: supersedes earlier smaller fixes that addressed only delimiter ordering (see ENG-1880), differs from the ack-window approach by choosing a lightweight per-event checksum + sentinel to avoid coordination/ACK state complexity.",
+  "commits": [
+    "c1f5b3e: parser: add buf utf8 preservation and crc8 validation",
+    "d4a7e19: runtime: emit __RS__ sentinel on hard flush and append checksum metadata line",
+    "e9b2a01: openai-compat: wrap function call payloads in envelope and ignore legacy clients",
+    "f3c8b6d: tests: add chunking_fuzz, sentinel_resync, function_call_boundary tests",
+    "a45d7f2: docs: sse-framing.md describe sentinel/checksum and rollout plan",
+    "b13c9aa: bench: microbench for parse latency with/without checksum (opt-in)"
+  ],
+  "changed_files": [
+    "runtime/streaming/sse_parser.rs",
+    "runtime/streaming/streamer.cpp",
+    "adapters/openai/compat/adapter.go",
+    "tests/streaming/chunking_fuzz.py",
+    "docs/compat/sse-framing.md",
+    "bench/stream_frag_bench.rs"
+  ],
+  "diff_snippets": [
+    "--- a/runtime/streaming/sse_parser.rs\n+++ b/runtime/streaming/sse_parser.rs\n@@ -120,6 +120,22 @@ pub fn feed_chunk(...) {\n-    // previous logic attempted to coalesce naively\n+    // preserve partial UTF-8 codepoints across chunk boundaries\n+    self.partial_utf8.extend_from_slice(bytes);\n+    if let Some(codepoint) = try_extract_complete_codepoint(&mut self.partial_utf8) {\n+        // continue parsing safely\n+    }\n+    // validate crc8 on completed event; if mismatch, drop to resync\n+    if completed && !validate_crc8(payload_bytes, crc) {\n+        trace!(\"sse: crc mismatch -> resync\");\n+        self.resync_to_last_sentinel();\n+        return;\n    }",
+    "--- a/adapters/openai/compat/adapter.go\n+++ b/adapters/openai/compat/adapter.go\n@@ -45,6 +45,14 @@ func emitEvent(w io.Writer, ev Event) error {\n-    fmt.Fprintf(w, \"data: %s\\n\\n\", ev.Body)\n+    // emit checksum metadata followed by payload so old clients ignore extra metadata lines\n+    crc := crc8(ev.Body)\n+    fmt.Fprintf(w, \"data: __CRC__:%02x\\n\", crc)\n+    fmt.Fprintf(w, \"data: %s\\n\\n\", ev.Body)\n+    // hard sentinel when flush is requested\n+    if ev.HardFlush {\n+        fmt.Fprintf(w, \"data: __RS__:v1\\n\\n\")\n+    }\n }\")"
+  ],
+  "reviews": [
+    "Liam O'Connor (Reviewer): This is a solid approach to surface corruption deterministically. Two asks: 1) please add a small migration note for customers embedding low-level SSE consumers, 2) ensure checksum CPU cost is measured under high qps.",
+    "Aisha Patel (Author): Added bench and docs, simplified crc8 table lookup to a small inline for-loop to avoid cache pressure. Migration note added to docs/compat/sse-framing.md.",
+    "Sofia Martinez (Reviewer): Tests look comprehensive. Please add one case where the sentinel itself is split across TCP writes to ensure parser handles sentinel partial reads.",
+    "Aisha Patel (Author): Added fuzz test that fractures sentinel across multiple chunk boundaries; parser handles it by buffering until the sentinel line is complete.",
+    "Ravi Kulkarni (Approver): Verified end-to-end in canary, resync metric dropped malformed JSON rate to zero for the repro workload. Approving."
+  ],
+  "ci_details": [
+    "unit-tests: pass (run=45m)",
+    "integration-tests: pass (run=32m)",
+    "lint: pass",
+    "e2e-streaming: pass (canary verified)",
+    "bench-run: pass (baseline +1.7% parse overhead with checksum enabled)"
+  ],
+  "release_notes": "Fix SSE streaming partial-JSON splices by adding per-event checksum and an explicit resync sentinel; improves robustness of function-call and structured output streaming under aggressive chunking conditions. Opt-in via server-side feature flag; rollout will be gradual.",
+  "breaking_change": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "diff_snippets",
+    "reviews",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_f0f86c92e5254d158639443827b55b50"
+}

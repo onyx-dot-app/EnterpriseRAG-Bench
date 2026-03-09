@@ -1,0 +1,44 @@
+{
+  "repo": "redwood",
+  "pr_number": "75834",
+  "title": "transient-workspace-reclaimer-and-kv-hotness-tuner",
+  "author": "Priya Shah",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-02-24",
+  "merged_at": "2026-02-24",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/transient-workspace-reclaimer-kv-tuner",
+  "reviewers": [
+    "Ethan Kim",
+    "Lina Gomez",
+    "Omar El-Sayed"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kv-cache",
+    "scheduling"
+  ],
+  "linked_linear": [
+    "ENG-8921",
+    "ENG-9005"
+  ],
+  "linked_jira": [
+    "SUP-1182"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "11",
+  "additions": "642",
+  "deletions": "178",
+  "breaking_change": "false",
+  "release_notes": "Reduced peak GPU workspace by up to 28% for long-sequence workloads; added runtime knobs for transient workspace reclamation and KV hotness tuning.",
+  "description": "Summary:\\nThis PR introduces two coordinated subsystems in the serving runtime: a transient workspace reclaimer and a KV-cache hotness tuner. Together they reduce peak GPU working set and transient scratch usage for long sequence generation and bursty continuous-batching workloads. The focus is on reclaiming transient allocations earlier (without breaking correctness) and biasing KV cache residency toward recently used keys to avoid oversized backup snapshots.\\n\\nMotivation:\\n- Long-context, high-concurrency workloads were triggering large transient scratch allocations that inflated peak GPU memory by 15\u201335% in worst-case bundles.\\n- Previous arena/coalesce changes left behind short-lived fragments that could not be safely reclaimed until layer teardown, leading to repeated allocation churn.\\n- KV cache maintained a mostly-LRU policy but lacked a light-weight hotness forecast for continuous-batching scenarios; warm keys would be evicted unnecessarily during short bursts.\\n\\nDesign (high level):\\n1) Transient workspace reclaimer: a best-effort background pass that scans per-request transient slabs and reclaims segments that are no longer referenced by any active kernel but before full layer teardown. The reclaimer uses safe points (kernel boundary + KV commit points) and a small generation counter to avoid race conditions. It is conservative by default and controlled via runtime knobs: reclaimer.enabled, reclaimer.throttle_ms, reclaimer_aggressiveness (low/med/high).\\n\\n2) KV hotness tuner: lightweight on-device telemetry that tracks per-key access frequency over sliding windows and exposes a hotness score. The cache eviction policy is augmented to bias retention toward keys with short-term hotness above a tunable threshold. This reduces snapshot churn when the model experiences micro-bursts of repeated prefixes (e.g., multi-turn chat loops or repeated eval prompts).\\n\\nImplementation notes:\\n- Added a small state machine in runtime/alloc/ to attach a generation ID to transient slabs; reclaim logic runs in a non-blocking workqueue thread with preemption to keep tail latency stable.\\n- Introduced kv/hotness_tracker with a compact 8-bit counters per shard plus an exponential decay step to maintain short-term recency without large memory overhead. Counters are kept off the critical allocation path and updated in batch after kernel execution.\\n- Eviction policy changed from pure-LRU to hotness-biased LRU: eviction_score = lru_age / (1 + hotness_score). This keeps the scoring compute minimal.\\n- Exposed admin-level runtime flags + per-deployment defaults in config/runtime_defaults.yaml.\\n\\nCommits (high-level):\\n- c1a9f8a: introduce transient slab generation and reclaimer scaffolding\\n- 4f233b2: implement hotness tracker and decay kernel, wire into KV eviction path\\n- 7b5e3c0: add runtime knobs, tests, and telemetry counters; docs and config defaults\\n\\nFiles changed (high level snippets):\\n- runtime/alloc/transient_reclaimer.cc (new) \u2014 core reclaim loop and safe-point checks\\n- runtime/alloc/transient_reclaimer.h (new)\\n- runtime/alloc/arena_manager.cc \u2014 hook to publish slab generation metadata and reclaimed sizes\\n- runtime/kv/hotness_tracker.cc (new)\\n- runtime/kv/evict_policy.cc \u2014 integrate hotness score into eviction decision\\n- runtime/kv/evict_policy.h\\n- config/runtime_defaults.yaml \u2014 defaults for reclaimer and hotness tuner\\n- tests/alloc/reclaimer_test.cc \u2014 unit tests for safe-point semantics\\n- tests/kv/hotness_test.cc \u2014 synthetic access patterns and eviction behavior\\n- docs/runtime/reclaimer.md \u2014 operational notes and knobs\\n\\nTesting & CI:\\n- Unit tests added and extended for allocator safety (reclaimer_test) and KV behavior (hotness_test).\\n- Integration: local perf harness (bench-latency) run with continuous-batching simulation, 50k generated tokens per scenario.\\n- CI: linux-unit (passed), linux-integration (passed), python-sdk-tests (passed), perf-regression-check (passed with improved numbers).\\n- Canary: tested against a dedicated pool with 8x A100s using Canary profile 2026-02-20; results below.\\n\\nBenchmarks (canary):\\n- Baseline (main): peak GPU workspace 16.2 GB, 95p latency 310 ms\\n- With this PR: peak GPU workspace 11.7 GB (-27.7%), 95p latency 305 ms (-1.6%)\\n- KV snapshot churn: baseline 17 snapshots/s, PR 6 snapshots/s (-64%)\\n- Note: small throughput uplift for bursty workloads due to reduced OOM/backoff retries.\\n\\nBackwards compatibility & knobs:\\n- All new behavior is opt-in via runtime defaults; cluster admin can flip reclaimer.enabled: true to enable. Default for hosted testbeds is enabled at medium aggressiveness.\\n- Hotness tuner has tunable memory cap per shard to avoid unbounded metadata growth.\\n\\nReview conversation (highlights):\\n- Ethan Kim (review): \"Nice direction. Need strong proof we never reclaim a transient object still referenced by a lazy kernel. Add invariants + unit test for chained kernels where KV is touched post-reclaim.\"\\n  - Author reply: \"Added reclaimer.safe_point semantic and test for chained-kernel scenario in reclaimer_test.cc. The reclaimer checks a kernel boundary bit and will skip reclaim when in-flight references exist.\"\\n- Lina Gomez (review): \"Can we keep the hotness counters off critical path? Concern about update cost under heavy QPS.\"\\n  - Author reply: \"Counters are updated in batched post-kernel step; clarified code path and added microbench in tests showing <1% allocation overhead on synthetic 1k qps.\"\\n- Omar El-Sayed (approval): \"Verified canary numbers and unit tests. Approve.\"\\n\\nRisk and mitigations:\\n- Risk: aggressive reclaiming could cause use-after-free. Mitigation: conservative default, multiple unit tests, and a runtime flag to disable reclaimer per-pool. We also added an allocator-level debug mode that CTAs a stricter lint for reclaimed pointers.\\n- Risk: hotness bias could retain stale keys under pathological patterns. Mitigation: decay step and a cap on hotness contribution; operators can tune decay window.\\n\\nRollout plan:\\n1) Merge to main behind feature flag (this PR).\\n2) Enable on canary clusters for 48 hours. Monitor peak GPU committed memory, OOM rate, and KV snapshot churn metrics.\\n3) Gradual enable on dedicated pools with low-risk workloads, then default-on for hosted after 2 weeks of stability.\\n\\nMigration notes:\\n- No data migration required. Operators may want to adjust runtime_defaults.yaml to match their workload profile.\\n\\nMerge details:\\n- Method: squash and merge\\n- Post-merge: feature flag enabled in staging on 2026-02-24, canary runs completed with green metrics.\\n\\nIf you want a follow-up: I plan to add an optional GPU-side reclamation hook that can be triggered at kernel boundaries on supported CUDA versions to reduce CPU->GPU synchronization overhead.\\n\\nReferences:\\n- ENG-8921: transient-alloc-ooms investigation\\n- ENG-9005: kv-snapshot-churn investigation\\n- SUP-1182: customer incident report (chat bot memory spikes)\\n\\nSigned-off-by: Priya Shah <priya@redwood.ai>",
+  "notes": "",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_bd78f69542e648148054153a00f85b1e"
+}

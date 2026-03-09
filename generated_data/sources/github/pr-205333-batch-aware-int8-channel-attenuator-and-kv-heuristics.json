@@ -1,0 +1,47 @@
+{
+  "repo": "redwood",
+  "pr_number": "205333",
+  "title": "Fine-grained channel attenuator for INT8 kernel and stride-aware KV prefetch heuristics",
+  "author": "Arjun Mehta",
+  "created_at": "2025-11-02",
+  "updated_at": "2025-11-12",
+  "merged_at": "2025-11-13",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/perf/int8-channel-attenuator-prefetch",
+  "reviewers": [
+    "Lena Ortiz",
+    "Connor Blake",
+    "Priya Singh"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kv-cache",
+    "batching",
+    "hotfix-ready"
+  ],
+  "linked_linear": [
+    "ENG-4921",
+    "ENG-5010"
+  ],
+  "linked_jira": [
+    "SUP-887",
+    "INT-342"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "1568",
+  "deletions": "432",
+  "release_notes": "Improves INT8 runtime throughput and tail latency by introducing a per-channel attenuation factor that reduces dequant/requant overheads and a stride-aware KV prefetch heuristic to improve cache utilization. Backward compatible; behind feature flag.",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "description": "Context and motivation: We observed token-level CPU/GPU bottlenecks in mixed-precision INT8 paths for wide heads where uneven channel scales force frequent dequant/requant operations and excess kernel transitions. This PR introduces two cooperating changes: (1) an INT8 channel attenuator that applies a compact per-channel damping factor during attention projection to reduce dynamic range spikes and permit fewer dequant transitions; (2) a stride-aware KV prefetch heuristic that biases prefetch windows based on recent sequence stride patterns, improving KV cache hit probability for workloads with variable prompt/prefix reuse (chatbots and multi-turn assistants).\n\nSummary of changes: added a new kernel primitive int8_channel_attenuator (C++ CUDA + CPU fallbacks), extended kernel dispatch to fold attenuation as a fused op when the model is INT8/FP8-compatible, introduced prefetch/stride_merger logic in the KVCache coordinator, updated continuous batcher to expose a soft affinity score used by the prefetch heuristic, added unit and integration tests, and benchmark harness updates. The attenuation path is guarded behind runtime flag REDWOOD_INT8_ATTENUATOR and feature-flagged for Canary in Dedicated and Hosted.\n\nCommits (high level):\n- feat(kernel): implement int8_channel_attenuator and fused dequant-aware path\n- perf(kv): add stride_aware_prefetch_merger and exposure of batch affinity scores\n- refactor(batch): continuous-batcher: compute token stride histograms for affinity\n- test: add deterministic kernels unit tests + kv cache integration tests\n- bench: add microbench harness and perf scripts used for numbers in this PR\n\nFiles touched (high-level):\n- runtime/kernels/int8_channel_attenuator.cu\n- runtime/kernels/int8_channel_attenuator.cc\n- runtime/dispatch/kernel_fusion_registry.cc\n- runtime/kv/kv_cache_coordinator.cc\n- runtime/kv/prefetch/stride_merger.h\n- runtime/batcher/continuous_batcher.cc\n- tests/kernels/int8_attenuator_test.cc\n- bench/int8_prefetch_bench.py\n- docs/notes/perf-int8-attenuator.md\n\nBenchmarks and safety valve: microbench results (nvtx-marked, p50/p95 represent token-to-token generation latencies on an A100-40GB equivalent with sequence profile resembling multi-turn chat):\n- Baseline (before change): p50=11.9ms, p95=39.7ms, throughput=24.2k tokens/s, avg GPU memory used per worker=6.2GB\n- With attenuator + stride prefetch (canary): p50=8.6ms (-27.7%), p95=29.4ms (-25.9%), throughput=28.6k tokens/s (+18.2%), avg GPU memory per worker=6.08GB (-~120MB in some configs). KV cache hit rate improved from 62.4% to 66.0% on the chat-style workload measured.\n\nDesign notes: The channel attenuator computes a per-head, per-channel scalar based on a rolling quantile estimate of activation magnitude observed over the last N batches; this scalar is constrained to [0.75,1.0] by default (configurable). We empirically found that modest damping avoids introducing numerical bias in downstream logits while significantly reducing the frequency and cost of dequant conversions inside the attention kernel. The attenuation is applied as a fused multiply inside the INT8 attention projection, which enables the kernel to maintain contiguous memory access patterns and avoid an extra pass.\n\nKV prefetch heuristic: the stride merger tracks sequence-length deltas and assigns higher prefetch priority to KV windows with low stride variance (i.e., repeated prefixes) and to batches with affinity score > threshold. The heuristic integrates into existing prefetch queues and degrades gracefully when the KV cache is cold. The design avoids additional memory copies and keeps the prefetch budget throttled by an existing token-budget regulator.\n\nTesting and CI: All unit tests and integration tests pass in CI. We added deterministic kernel tests that validate numerical equivalence within tolerance to the non-attenuated INT8 path for representative prompts. Bench scripts are included under bench/ and are marked as optional CI steps. We ran a Dedicated Canary over a 24-hour window with A/B traffic split (10% canary) and observed no increase in error rates or hallucination signals in our prompt-sets; quality monitors reported metric deltas within acceptable bounds.\n\nReview conversation (abridged):\n- Lena Ortiz (reviewer): \"This looks promising. Can you clarify how the attenuation interacts with per-layer quant scales?\"\n  - Arjun: \"Attenuation multiplies the projection output post-quant-decode but pre-requant; the kernel computes a fused correction so the per-layer scale is read once and applied with attenuation to avoid extra rescale ops. Added comments and unit test to show equivalence.\"\n- Connor Blake: \"Concern about accuracy drift for low-temperature decoding.\"\n  - Arjun: \"We added a canary-level toggle and set default attenuation floor to 0.9 for low-temp workloads; also fallback: if rollback_quality_check fails on canary, we automatically disable the attenuator for that region. Added a logging hook to capture drift windows.\"\n- Priya Singh (approver): \"Bench numbers are solid; please add docs and a short migration note.\"\n  - Arjun: \"Docs added under docs/notes/ and migration note included in release notes.\"\n\nCompatibility and rollout: The change is backward compatible from the API/SDK surface. The flag REDWOOD_INT8_ATTENUATOR is false by default for main fleet. Canary rollout plan: enable in Hosted in us-west-2 for small footprint customers first, increase to 10% traffic after 6 hours of monitoring, then 50% after 24 hours if no regressions. Dedicated customers can opt-in via console toggle. Private installers receive the kernel as part of the next patch; admin must set feature flag to enable on-prem.\n\nRollback and mitigation: to rollback, disable REDWOOD_INT8_ATTENUATOR and the stride prefetch merger via runtime flags and restart worker hosts. We included a health-check that fails the canary rollout if p95 latency increases by >8% or if quality regression signal exceeds threshold configured in Optimize.\n\nRisks and mitigations: risk of subtle token-distribution shifts in edge cases; mitigation: conservative attenuation floor, automatic canary rollback, and an additional regression alert. Potential for scheduling hotspots due to prefetch aggressiveness; mitigation: we bound prefetch budget and use existing token regulator to prevent overload.\n\nRelated work and future: follows from earlier dequant/kvcache fusion efforts but focuses on runtime heuristics for uneven channel distributions and prefetching. Future work: extend attenuation learning to per-model calibration during onboarding and combine with quantization-aware fine tuning for lower attenuation floor.\n\nMerge: squashed and merged to main on 2025-11-13 after approvals from Priya and Connor and successful canary gate.\n\nNotes: This PR is intentionally conservative on numerical change and emphasizes operational controls. Please see docs/notes/perf-int8-attenuator.md for measurement scripts and the bench harness to reproduce numbers.",
+  "breaking_comment": null,
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_311d0352b3e84a08bc59646011437ac7"
+}

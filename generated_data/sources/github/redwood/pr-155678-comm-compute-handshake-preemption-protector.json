@@ -1,0 +1,59 @@
+{
+  "repo": "redwood",
+  "pr_number": "155678",
+  "title": "comm-compute-handshake-preemption-protector",
+  "author": "Sofia Alvarez",
+  "created_at": "2026-02-14",
+  "updated_at": "2026-02-20",
+  "merged_at": "2026-02-21",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/comm-handshake-protector",
+  "reviewers": [
+    "Marcus Chen",
+    "Ravi Kapoor",
+    "Elena Park"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "tp",
+    "nccl",
+    "kv_cache"
+  ],
+  "linked_linear": [
+    "ENG-8421",
+    "ENG-8487"
+  ],
+  "linked_jira": [
+    "SUP-312"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "1324",
+  "deletions": "412",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "release_notes": "Reduce TP tail latency under preemption by decoupling NCCL progress handshake from compute dispatch; improves small-microbatch tail by ~18-28% depending on topology. No API changes.",
+  "description": "Summary: This PR adds a small runtime subsystem \u2014 the 'progress guardian' \u2014 that separates the NCCL/collective handshake and progress responsibilities from the compute-launch path and makes collective submission preemption-aware. Motivation: we observed intermittent tail latency spikes under multi-tenant preemption and scheduler-induced GPU context switches. These spikes manifested as stalled collective handshakes that blocked downstream microbatch kernel launches and prevented effective KV cache reuse. Fix: (1) introduce a lightweight handshake token (progress token) that moves NCCL initial handshake and required progress work to a dedicated progress worker thread per device group, (2) make collective submission idempotent with a short-lived preemption token so the compute submitter can back out without leaving half-open NCCL state, (3) add a guarded fastpath for tiny microbatches that prefers host-vectorized allreduce with reduced synchronization when topology indicates low benefit from NCCL path, (4) add exponential backoff + watchdog for long-running collectives and graceful fallback to alternate ring-group when necessary. The description below is a single continuous string but contains the main sections implemented. Design notes: - Progress guardian: a small event-driven loop that runs progress and initial handshakes on a pinned CPU core, uses per-group completion queues. This prevents the compute hot path from blocking on kernel-level progress steps and reduces lock contention in the TP scheduler. - Preemption token: a monotonic submission token returned to compute callers; if the token is invalidated (preemption or context switch) the caller abandons the compute launch and lets the progress worker either retry or rollback the handshake cleanly. - Fastpath for tiny microbatches: when microbatch_size < config.runtime.tp.small_mb_threshold and all hosts are local, use the lightweight host-assisted reducer to reduce CUDA stream stalls. - Watchdog/backoff: if a collective handshake exceeds config.runtime.tp.collective_watchdog_ms, we try a conservative resubmit after a jittered backoff, or switch to a slower but safer ring-group via NCCL group semantics. What changed (high level): - runtime/tensor_parallel/progress_guardian.cpp: new event loop, handshake state machine, metrics hooks - runtime/tensor_parallel/progress_guardian.h: interfaces and token API - runtime/tensor_parallel/comm_scheduler.cpp: decouple handshake/submit, use token API, update retry semantics - runtime/cuda/async_launcher.cu: handle abandoned preemption token and avoid zombie kernels - runtime/cache/kv_cache_manager.cpp: updated eviction policy to account for preempted microbatch traces - tools/perf/tp_latency_bench.py: new microbench scenarios to reproduce preemption stalls - docs/ops/preemption-handshake.md: operational guidance and tuning knobs - ci/perf/checks.yaml: add a perf-regression job for TP handshake latency Tests & benchmarks: - unit: added tokens and handshake-state unit tests in runtime/tensor_parallel/tests - integration: added tp_preemption_stall_repro in testmatrix running on a 4xA100 simulated preemption scenario - perf: bench results attached in the PR show median tail improvement between 18-28% across representative models (gpt-2 small, gpt-j-6B) on 4x and 8x topologies. Commits (summary): - 1a2b3c4: initial progress_guardian skeleton and token API - 2b3c4d5: scheduler plumbing and token checks in compute submit path - 3c4d5e6: watchdog/backoff and alternate ring fallback - 4d5e6f7: small-microbatch host-reducer fastpath and perf tests - 5e6f7g8: docs, CI perf job and test fixes Changed files (high level list): - runtime/tensor_parallel/progress_guardian.cpp (.h) - runtime/tensor_parallel/comm_scheduler.cpp - runtime/tensor_parallel/tests/* - runtime/cuda/async_launcher.cu - runtime/cache/kv_cache_manager.cpp - docs/ops/preemption-handshake.md - tools/perf/tp_latency_bench.py - ci/perf/checks.yaml Minimal illustrative snippet (for reviewer context): \"// token check in compute submit\\nif (!submission_token.is_valid()) {\\n  // bail out fast; progress worker will clean up/ retry\\n  return SubmissionStatus::Preempted;\\n}\\n// otherwise proceed to queue compute kernel\\nqueue_kernel(...);\" Backwards compatibility: - No public API changes. All changes are internal runtime-only and surfaced knobs are opt-in (defaults unchanged). Why this approach: - Lock-free progress decoupling reduces contention and allows the compute path to proceed (or back out) predictably. - Preemption tokens provide a safe, auditable way to abandon partially-started collectives without risking NCCL deadlock. - Fastpath for tiny microbatches recovers a significant portion of small-batch throughput previously lost to synchronization overhead. Review conversation (high level): - Marcus Chen: \"Can the progress guardian saturate a single CPU core under heavy multi-tenant load?\" - Sofia (author): \"We pin the progress loop and keep its work bounded; heavy scenarios were tested and CPU usage stayed within a single core with <5% system overhead on our perf rigs. Added config.runtime.tp.progress_worker_cpu_limit for operators.\" - Ravi Kapoor: \"How do we guarantee we don't leave a dangling NCCL communicator when the token is invalidated?\" - Sofia: \"Communicator lifecycle is handled by the progress guardian; we added explicit rollback code paths that call ncclCommAbort() + a compact retry policy. See progress_guardian.cpp:rollback_path() for details.\" - Elena Park: \"Can we get a smoke test in CI that simulates preemption?\" - Sofia: \"Added tp_preemption_stall_repro to integration matrix; it runs under a lightweight container that simulates context switch via SIGSTOP/SIGCONT on GPU processes.\" CI / Checks: - build: passed - unit-tests: passed - integration-tests: passed (tp_preemption_stall_repro: pass) - perf-regression: pass (no regression) - lint: passed Risk & mitigation: - Risk: slightly increased CPU usage for progress workers under massive scale. Mitigation: configurable CPU cap, and guardian is disabled for dedicated pools by default in release rollouts. - Risk: complexity around rollback semantics. Mitigation: conservative default retry policy and aggressive telemetry to detect stuck handshakes (new metrics: tp.handshake.latency_ms, tp.handshake.failures). Rollout plan: - Canary on Dedicated 1 (low load) for 48 hours - Canary on a single-host TP cluster with simulated preemption - Ramp to default after 7 days if no regressions observed Documentation: docs/ops/preemption-handshake.md contains operator knobs and recommended tuning values. Related work / references: - Related ENG-8421 (TP backpressure work) - Prior PRs: small-microbatch fastpaths inspired by experimental host-reducer - Notes: This PR intentionally avoids changing kernel implementations besides async_launcher entry checks; focused on protocol & scheduler-level fixes.",
+  "review_comments": [
+    "Marcus Chen: Pin progress worker to a core by default; watch for sys-overhead on multi-tenant rigs.",
+    "Ravi Kapoor: Add explicit ncclCommAbort path and unit test to validate communicator cleanup.",
+    "Elena Park: Add an integration smoke that simulates preemption (SIGSTOP based).",
+    "Infra team (CI): Perf job added; please confirm perf thresholds in checks.yaml."
+  ],
+  "ci_checks": [
+    "build: passed",
+    "unit-tests: passed",
+    "integration-tests: passed",
+    "perf-regression: passed",
+    "lint: passed"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes",
+    "review_comments"
+  ],
+  "dataset_doc_uuid": "dsid_f63481987e5c4b2880bc1b39a98b4c8b"
+}

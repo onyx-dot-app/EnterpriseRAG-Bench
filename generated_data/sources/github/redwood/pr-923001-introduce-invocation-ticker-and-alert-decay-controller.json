@@ -1,0 +1,66 @@
+{
+  "repo": "redwood",
+  "pr_number": "923001",
+  "title": "Introduce invocation ticker and alert decay controller",
+  "author": "Maya Patel",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-02-25",
+  "merged_at": "2026-02-25",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/telemetry/invocation-ticker-alert-decay",
+  "reviewers": [
+    "Aisha Khan",
+    "Jonas Richter",
+    "Liam O'Connor"
+  ],
+  "labels": [
+    "observability",
+    "telemetry",
+    "alerting",
+    "sre"
+  ],
+  "linked_linear": [
+    "ENG-3492",
+    "ENG-3510"
+  ],
+  "linked_jira": [
+    "SUP-4412"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "420",
+  "deletions": "78",
+  "breaking_change": "false",
+  "release_notes": "Added invocation-ticker metrics, an alert decay controller to reduce alert noise for rapidly recurring invocation fingerprints, and a new dashboard panel for live ticker streams. No user-facing API changes.",
+  "description": "Motivation: We currently see alert churn for bursty invocation patterns where many similar invocations repeatedly trigger the same SLO alerts within a short window. Root cause analysis shows many such alerts are transient and dominated by the same invocation fingerprints (hot prompts). This PR implements two complementary pieces: 1) a lightweight per-invocation ticker that emits stage-aligned heartbeat metrics so we can understand phase durations without full trace hydration, and 2) an alert decay controller that dampens alert signal for repeated fingerprints over a configurable decay window.\n\nWhat this PR does (high level):\n- Introduces a new metric set: redwood.invocation.ticker.duration_ms (histogram), redwood.invocation.ticker.stage (gauge labels: start/kernels/kv/cache/emit), redwood.invocation.ticker.status (counter: started/completed/failed).\n- Adds redwood.alert.decay_score (gauge) and redwood.alert.decay_events_total which power the decay controller logic.\n- Implements a pluggable AlertDecayController that subscribes to fingerprint counts from the agg layer and applies a decay multiplier to alert weights exposed to the alerting pipeline. The controller runs per-tenant and honors TTL and minimum floor thresholds.\n- Adds a lightweight in-process ticker generator in the serving runtime. The generator emits minimal payloads (stage, elapsed_ms, invocation_fingerprint) to the metrics relay; it is turned off by default and can be enabled per-tenant via runtime config.\n- Adds an observability dashboard (Invocation Ticker Stream & Alert Decay) with a live stream panel, fingerprint heatmap, and decay effectiveness view.\n- Adds unit and integration tests for decay scoring and the ticker's stage transitions.\n\nWhy this approach:\n- Full trace enrichment is expensive; a ticker gives a low-cardinality, cheap signal aligned to stages (prefix warmup, kernel queue, generation, post-processing) that is actionable for SRE and product.\n- Decaying alert weight instead of hard-suppressing alerts preserves fidelity (we still record incidents) but lowers alert noise so oncall can focus on novel or persistent regressions.\n\nImplementation notes: (single continuous description) The AlertDecayController maintains an LRU-backed fingerprint ledger with time-decayed scores. When an alert candidate arrives it is annotated with a decay_multiplier in [0.1,1.0] based on recent fingerprint activity; the alert router multiplies signal weight by this multiplier and only escalates if weighted score passes thresholds. Decay parameters are configurable via the existing observability configstore and default to a 10-minute half-life with a minimum floor of 0.25. The ticker is implemented as a non-blocking ring buffer inside the request worker; emission is batched to the metrics relay via the telemetry client. To limit cardinality we only publish the 64-bit fingerprint hash (not raw prompt) and expose a tenant-level sample rate.\n\nChecklist:\n- [x] Metric names and docs added (telemetry/metrics.md)\n- [x] Runtime opt-in flag and tenant config\n- [x] Alert router integration and decay multiplier plumbing\n- [x] Dashboard JSON and runbook snippets\n- [x] Unit tests for decay math and ticker state machine\n- [x] Integration test that verifies reduced alert fires under simulated burst\n\nTesting performed:\n- Local unit tests: tick-state transitions and decay math (100% coverage for new modules)\n- Integration: stressbench harness that simulates 10k invocations/min with 30% fingerprint reuse; alert fires dropped by ~78% while detection latency for persisted regressions remained < 2% worse.\n- E2E in staging: enabled ticker for a single tenant for 48h; verified telemetry pipeline ingestion throughput increased by <2% and no regression in token-latency SLOs.\n\nOperational concerns & fallbacks:\n- The ticker is disabled by default in production; enablement is per-tenant. If telemetry relay backpressure occurs the emission is automatically sampled down and metric emissions are dropped with a counter.\n- The decay controller logs a provenance event for any alert it attenuates so runbooks can identify suppressed incidents.\n\nRollout plan:\n1) Merge and deploy server-side with ticker disabled. 2) Enable ticker+decay for internal QA tenants and run 48-hour validation (observability/qa). 3) Gradual ramp to high-traffic tenants with monitoring on redwood.alert.decay_effectiveness and redwood.alert.suppressed_total.\n\nDocs & runbook: Added runbook section that explains when to tune half-life and floor, and how to disable decay per-alert.",
+  "commits": "3 commits:\n- Add ticker proto and metrics client plumbing (m. telemetry/service/ticker.go, m. telemetry/proto/ticker.proto)\n- Implement AlertDecayController and router integration (m. observability/alert/decay_controller.go, m. observability/alert/router.go)\n- Dashboard + tests + docs (m. observability/dashboards/invocation_ticker.json, m. telemetry/tests/ticker_test.go)",
+  "changed_files": [
+    "services/serving/runtime/ticker.go",
+    "observability/alert/decay_controller.go",
+    "observability/alert/router.go",
+    "telemetry/client/relay.go",
+    "telemetry/proto/ticker.proto",
+    "observability/dashboards/invocation_ticker.json",
+    "docs/telemetry/metrics.md",
+    "configs/observability/defaults.yaml",
+    "telemetry/tests/ticker_test.go",
+    "observability/tests/decay_controller_integration_test.go",
+    "runbooks/alert_decay.runbook.md",
+    "scripts/staging/ticker-enable.sh"
+  ],
+  "diff_snippet": "--- a/observability/alert/router.go\n+++ b/observability/alert/router.go\n@@ -42,6 +42,14 @@ func RouteAlert(ctx context.Context, a Alert) error {\n-   weight := a.Severity\n+   // apply decay multiplier from controller\n+   multiplier := decayController.GetMultiplier(ctx, a.InvocationFingerprint)\n+   weight := float64(a.Severity) * multiplier\n+   // record provenance\n+   if multiplier < 1.0 {\n+       provenanceLogger.Info(ctx, \"alert attenuated\", \"fingerprint\", a.InvocationFingerprint, \"multiplier\", multiplier)\n+   }\n\n    if weight < alertingThreshold {\n        return nil\n    }",
+  "review_conversation": "Aisha: Could we make the decay controller realtime-configurable?\nMaya: Yes \u2014 wired into configstore, can toggle per-tenant.\nJonas: Concerned about cardinality; can we avoid shipping raw fingerprint?\nMaya: We only emit 64-bit hash; added sampling config to limit relay pressure.\nLiam: Add provenance event for attenuated alerts so PagerDuty playbooks can find suppressed incidents.\nMaya: Done \u2014 added provenanceLogger and runbook entry.\nAisha: CI flaky on linux/arm telemetry tests, reran and green now.",
+  "ci_summary": "All checks passed after one rerun.\n- unit (linux/go): pass\n- integration (staging harness): pass\n- lint: pass\n- dashboards/validate: pass\n- security-scan: pass\n\nOne transient failure on telemetry tests due to mock timing; fixed by adjusting test timeouts.",
+  "merge_method": "squash",
+  "notes_for_ops": "If enabling for a tenant, monitor redwood.alert.suppressed_total and redwood.alert.decay_effectiveness. If suppression is too aggressive, increase floor parameter or shorten half-life. Use scripts/staging/ticker-enable.sh to toggle.\nRunbook link: runbooks/alert_decay.runbook.md",
+  "observability_changes_summary": "New metrics: redwood.invocation.ticker.duration_ms (histogram), redwood.invocation.ticker.stage (gauge), redwood.invocation.ticker.status (counter), redwood.alert.decay_score (gauge), redwood.alert.decay_events_total (counter). Added dashboard invocation_ticker and a runbook for tuning.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes",
+    "diff_snippet",
+    "review_conversation"
+  ],
+  "dataset_doc_uuid": "dsid_249846d76a044fb991b8af9f6a6b7b59"
+}
