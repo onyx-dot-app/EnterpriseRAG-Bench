@@ -1,0 +1,86 @@
+{
+  "repo": "redwood",
+  "pr_number": "67291",
+  "title": "Improve streaming header propagation and scoped signature semantics for OpenAI-compat layer",
+  "author": "Amelia Chen",
+  "created_at": "2026-02-15",
+  "updated_at": "2026-03-02",
+  "merged_at": "2026-03-03",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/streaming-auth-headers-scope-compat",
+  "reviewers": [
+    "Diego Martinez",
+    "Priya Nair",
+    "Samir Patel"
+  ],
+  "labels": [
+    "api",
+    "openai-compat",
+    "security",
+    "streaming",
+    "perf"
+  ],
+  "linked_linear": [
+    "ENG-9481",
+    "ENG-9620"
+  ],
+  "linked_jira": [
+    "SUP-3112"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "412",
+  "deletions": "98",
+  "description": "Context: Streaming endpoints (SSE/WebSocket/progressive HTTP) need predictable auth semantics across preflight, initial handshake, and per-chunk delivery. Tool/function-calling and structured-output features rely on stable header propagation so downstream runtime routing and function authorization can reason about the request principal and scope. Previous inconsistencies caused 1) dropped project-scoped keys on CORS preflight + SSE upgrade, and 2) inability to validate per-chunk integrity for long-lived streams when using short-lived scoped tokens.\n\nThis PR unifies header handling across: the OpenAI-compat translation layer, streaming proxy, and the runtime auth middlewares. It introduces a backwards-compatible signed-chunk header and clarifies semantics for project/org-scoped tokens and nonce exchange.\n\nWhat this PR changes (high level):\n- Adds X-Redwood-Project and X-Redwood-Scope canonical propagation headers emitted by the compat layer when translating Authorization Bearer -> internal credential routing.\n- Implements X-Redwood-Session-Nonce exchange header for browser flows. The server returns a short-lived nonce on successful preflight/handshake so clients can sign subsequent chunk frames.\n- Adds chunk integrity header X-Redwood-Chunk-Sig (HMAC-SHA256 over chunk payload + sequence id) and validation in the streaming proxy. This supports long-lived SSE/WS streams without requiring reauth per message.\n- Extends CORS preflight handling to explicitly allow Signed-Session and Chunk-Sig headers and exposes the Session-Nonce on responses. Policy: Access-Control-Allow-Headers includes Signed-Session, X-Redwood-Chunk-Sig, X-Redwood-Session-Nonce; Access-Control-Expose-Headers exposes X-Redwood-Session-Nonce.\n- OpenAI-compat layer: when an Authorization: Bearer <token> is received, we attempt to resolve scope -> emit X-Redwood-Project & X-Redwood-Scope and a short-lived internal credential header (X-Redwood-Internal-Cred). Legacy clients without compatibility will continue to work (compat translations are opt-out via a header).\n- Adds integration tests for SSE and WebSocket handshake flows, plus unit tests for signature verification edge cases (replay, out-of-order seq ids).\n\nNotes on rollout and safety:\n- Backwards compatible by default: clients that don't send Signed-Session or Chunk-Sig continue to function; only streams opt into stricter chunk validation when the server issues a Session-Nonce.\n- Feature gate: compat_layer.header_translation can be toggled per-route (console + config flag) to assist staged migration and canary.\n- Canary plan: enable for 5% of streaming traffic in prod for 48 hours, monitor error_rate/latency and chunk_signature_failures metric.\n\nChecklist:\n- [x] Design doc reviewed by security and runtime teams\n- [x] Unit tests for signature verification and header translation\n- [x] Integration tests for SSE/WS preflight and handshake\n- [x] OpenAI-compat translation implemented and feature-gated\n- [x] SDK updates (JS + Python) with minimal client helpers (signChunk helper)\n- [x] Docs updated (auth headers and CORS notes)\n\nRisk: medium. Primary risk is accidental exposure of internal credential header; mitigated via strict translation rules, per-route feature gate, and scrub/strip logic at the public ingress layer.\n\nFollow-ups (future PRs):\n- Add support for asymmetric signing (Ed25519) for cross-service verification (ENG-9902).\n- Add server-side rotation hints for Session-Nonce lifetimes (ENG-10010).",
+  "commits": [
+    "a1b2c3d: implement session nonce exchange and chunk signature header handling",
+    "d4e5f6g: extend openai-compat header translation and emit X-Redwood-Project/X-Redwood-Scope",
+    "h7i8j9k: add streaming proxy validation and integration tests",
+    "l0m1n2o: update JS and Python SDK helpers + docs",
+    "p3q4r5s: fix lint and add canary feature flag wiring"
+  ],
+  "files_changed": [
+    "server/http/streaming_auth_middleware.go",
+    "server/auth/signature.go",
+    "server/compat/openai/translate_headers.go",
+    "server/proxy/streaming_proxy.go",
+    "sdk/js/src/streaming/signing.ts",
+    "sdk/python/redwood/stream_signer.py",
+    "docs/api/auth-headers.md",
+    "integration-tests/streaming_auth_test.go",
+    "config/feature_gates.yaml",
+    "console/routes/route_settings_controller.go",
+    "tests/fixtures/nonce_client_sim.sh",
+    "observability/metrics/definitions.yaml"
+  ],
+  "diff_snippets": [
+    "--- a/server/http/streaming_auth_middleware.go\n+++ b/server/http/streaming_auth_middleware.go\n@@ -42,6 +42,22 @@ func HandleUpgrade(w http.ResponseWriter, r *http.Request) {\n+// if we can resolve a scoped token, emit canonical headers for downstream\n+if scoped, ok := resolveScopedToken(r.Header.Get(\"Authorization\")); ok {\n+  r.Header.Set(\"X-Redwood-Project\", scoped.Project)\n+  r.Header.Set(\"X-Redwood-Scope\", scoped.Scope)\n+  r.Header.Set(\"X-Redwood-Internal-Cred\", scoped.InternalCred)\n+}\n     ",
+    "--- a/server/proxy/streaming_proxy.go\n+++ b/server/proxy/streaming_proxy.go\n@@ -210,6 +220,30 @@ func handleChunk(msg []byte) error {\n+// verify chunk signature when present\n+sig := src.Header.Get(\"X-Redwood-Chunk-Sig\")\n+if sig != \"\" {\n+  if err := verifyChunkSig(sig, seq, msg); err != nil {\n+    metrics.Inc(\"chunk_signature_failures\")\n+    return err\n+  }\n+}\n     ",
+    "--- a/server/compat/openai/translate_headers.go\n+++ b/server/compat/openai/translate_headers.go\n@@ -10,6 +10,18 @@ func TranslateHeaders(in http.Header, out http.Header) {\n+// allow opt-out if caller sets X-Redwood-Compat: none\n+if in.Get(\"X-Redwood-Compat\") == \"none\" {\n+  return\n+}\n+\n+if tok := in.Get(\"Authorization\"); strings.HasPrefix(tok, \"Bearer \") {\n+  scoped := resolveTokenToScope(strings.TrimPrefix(tok, \"Bearer \"))\n+  out.Set(\"X-Redwood-Project\", scoped.Project)\n+  out.Set(\"X-Redwood-Scope\", scoped.Scope)\n+}\n     "
+  ],
+  "review_comments": [
+    "Diego: Please add test for replayed seq ids \u2014 added integration test and assertion (addressed).",
+    "Priya: Ensure Access-Control-Expose-Headers includes the nonce so JS clients can read it \u2014 updated in middleware (addressed).",
+    "Samir: What's the perf impact on high-throughput streams? Recommend sampling verification to start. Author: we instrumented sampling and the metric shows <0.6% CPU at 50k rps in lab; sampling gating added to config (addressed).",
+    "Security (Sean): Confirmed translation rules do not leak internal creds to public clients; added e2e assertion that X-Redwood-Internal-Cred is stripped at public ingress (addressed).",
+    "Author (Amelia): responding to minor nits and pushed a small follow-up to reduce allocations in signing code."
+  ],
+  "merge_method": "squash",
+  "release_notes": [
+    "Auth: add canonical X-Redwood-Project and X-Redwood-Scope headers emitted by the OpenAI-compat layer when possible.",
+    "Security: support per-chunk HMAC signatures (X-Redwood-Chunk-Sig) and Session-Nonce exchange for long-lived streams.",
+    "CORS: explicit preflight allowlist for signed-session headers and expose Session-Nonce to browser clients.",
+    "Compatibility: opt-out header X-Redwood-Compat: none to disable automatic header translation."
+  ],
+  "breaking_change": "false",
+  "summary": "Add canonical project/scope headers, Session-Nonce exchange, and per-chunk signatures to make streaming stable and secure while keeping OpenAI-compat behavior configurable and back-compatible.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_comments",
+    "release_notes",
+    "summary"
+  ],
+  "dataset_doc_uuid": "dsid_928e99c29d934d0a91ca73c74bfb8096"
+}

@@ -1,0 +1,84 @@
+{
+  "repo": "redwood",
+  "pr_number": "34177",
+  "title": "sparse-scratch-suballocator-and-kv-windowed-evict-policy",
+  "author": "Aditi Rao",
+  "created_at": "2026-02-09",
+  "updated_at": "2026-02-18",
+  "merged_at": "2026-02-18",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/scratch-suballocator-kv-windowed-evict",
+  "reviewers": [
+    "Michael Chen",
+    "Elena Garc\u00eda",
+    "Jared Bloom"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "scheduling",
+    "kv-cache",
+    "gpu-memory"
+  ],
+  "linked_linear": [
+    "ENG-7842",
+    "ENG-7990"
+  ],
+  "linked_jira": [
+    "SUP-4121"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "1184",
+  "deletions": "409",
+  "description": "Motivation: Large transformer workloads show high transient GPU workspace peaks caused by conservative scratch allocations (per-kernel worst-case sizing) and suboptimal KV cache eviction in bursty chat workloads. This PR introduces two complementary runtime optimizations: 1) a sparse scratch suballocator that subdivides and reclaims contiguous scratch segments at kernel invocation granularity to reduce peak workspace and fragmentation; 2) a windowed, workload-aware KV eviction policy that uses short-term access windows and hinting from the scheduler to evict cold KV shards proactively instead of waiting for global pressure.\n\nSummary of changes (high-level):\n- Add runtime/scratch/suballocator.{cc,h}: a sparse suballocator that maintains a small set of coalescing free-ranges and supports efficient allocate/free for per-kernel scratch with O(log n) search. The allocator is optimized for many small transient allocations and supports optional per-stream arenas.\n- Modify runtime/kernel/launcher.cc to request suballocated scratch ranges instead of top-level arena slices for kernels marked as \"scratch-friendly\". A new kernel attribute (scratch_strategy) drives whether kernels get a contiguous slab or suballocated segments.\n- Add runtime/kv/evict_windowed.{cc,h}: a sliding-window tracker that collects KV access timestamps per-shard and produces eviction scores combining recency and frequency within the window. Exposes a soft_hint API so the scheduler can mark shards as \"prefetch\" or \"evict_candidate\".\n- Scheduler changes (runtime/scheduler/*.cc): integrate eviction hints with request routing so long-running chat sessions prefetch their own hot shard ranges, while background/ephemeral requests are tagged for aggressive evict. Also added a short-lived background defragmenter that coalesces adjacent free ranges in the suballocator.\n- Add tests: unit tests for suballocator edge cases, KV window heuristics, and an e2e throughput/latency regression harness for continuous batching to ensure no tail-latency regressions.\n- Benchmarks/telemetry changes: new smoke benchmark (benchmarks/peak-mem) and a Console metric emitted (redwood.metrics.runtime.scratch_peak_savings) to track impact over time.\n\nDesign notes and rationale:\n- Suballocator strategy: previous arena strategies reserved per-kernel worst-case scratch which over-provisioned by up to 3-4x on common prompt lengths. The sparse suballocator keeps small allocations on a single stream and attempts to reuse recently freed ranges for temporally-local kernels (common in auto-batching). To avoid pathological fragmentation we: (a) prefer power-of-two bucket allocations with a small tail allocator for odd sizes; (b) run a light-weight defragmenter off the critical path that merges adjacent free ranges when utilization falls below thresholds; (c) allow kernels to opt into contiguous-slab allocations when they require contiguous physical workspace (legacy kernels remain supported).\n- KV window eviction: LRU alone misses bursty access where items accessed frequently for a short time become cold but still pinned. The windowed policy computes an eviction_score = alpha * normalized_window_freq + beta * recency_penalty, tuned so ephemeral hotsets decay quickly. The scheduler emits hints derived from request attributes (session_id, priority) to bias eviction on background workloads and prefetch for active sessions. This tradeoff reduces peak memory by moving cold shards out before global pressure forces large-scale eviction.\n\nCommits summary:\n- a1f3c9b: initial sparse suballocator implementation + unit tests\n- b2d4e07: integrate suballocator into kernel launcher and mark common attention kernels as scratch-friendly\n- d4c8f21: KV windowed tracker + eviction scoring + unit tests\n- e7a9b3d: scheduler integration and hint paths; background defragmenter\n- f0b2c11: benchmarks, telemetry, and end-to-end regression tests\n- aa4d55e: bugfixes from reviewer feedback (race on free-list, tuning knobs)\n\nFiles changed (high-level list):\n- runtime/scratch/suballocator.cc\n- runtime/scratch/suballocator.h\n- runtime/kernel/launcher.cc (scratch allocation path)\n- runtime/kernel/kernel_attrs.h (scratch_strategy enum)\n- runtime/kv/evict_windowed.cc\n- runtime/kv/evict_windowed.h\n- runtime/scheduler/evict_integration.cc\n- runtime/scheduler/defrag_worker.cc\n- benchmarks/peak-mem/peak_mem_runner.py\n- tests/unit/test_suballocator.cpp\n- tests/unit/test_kv_windowed.cpp\n- docs/notes/scratch-suballocator.md\n\nBehavioral compatibility and safety:\n- Default behavior is backwards-compatible: suballocator is enabled per-cluster via a runtime flag (--enable-sparse-scratch=false). New scratch_strategy defaults to CONTIGUOUS to preserve existing behavior until rollout. KV windowing is guarded by --kv-evict-window-size and defaults to 30s window with conservative alpha/beta so it only kicks in under sustained pressure.\n- Race conditions: reviewers found a race when freeing ranges concurrently across streams; added a stream-aware lock-free free-list with epoch checks and falling back to a mutex path for pathological cases. We also added ASAN/TSAN runs to CI for the unit tests.\n\nPerformance results (benchmarks):\n- Internal conversational workload (75th percentile prompt length): peak GPU scratch reduced 28-37% on average across A100/RTX-class runs, end-to-end token throughput improved 6-10% under sustained batching due to lower eviction churn.\n- Tail latency (99th): unchanged within noise (+/- 3%), validated with 24h continuous batching harness.\n\nCI and rollout notes:\n- CI: all unit tests + regression harness passed in the merged run. One flaky e2e run failed due to infra GPU reclaim; rerun succeeded. CI checks: build (pass), unit-tests (pass), e2e-regressions (pass), lint (pass), safety-scan (pass).\n- Rollout plan: feature rolled out to canary clusters with --enable-sparse-scratch=true and --kv-evict-window-size=30s. Monitor redwood.metrics.runtime.scratch_peak_savings and kv.evictions.count. If we observe >5% increased tail-latency for priority sessions, revert the kv hinting path only (flagged).\n\nNotes for reviewers:\n- Pay attention to the allocator free-list correctness across streams and the defragmenter heuristics (defrag heuristics are in runtime/scheduler/defrag_worker.cc).\n- Kernel annotations: we added a small helper to mark kernels as scratch-friendly; review that the attention forward/backward patches use the helper correctly.\n\nChecklist:\n- [x] Unit tests added for allocator edge-cases\n- [x] KV window unit tests and basic integration tests\n- [x] Benchmarks and metrics emitted\n- [x] Documentation note in docs/notes",
+  "commits": [
+    "a1f3c9b initial sparse suballocator implementation + unit tests",
+    "b2d4e07 integrate suballocator into kernel launcher",
+    "d4c8f21 add kv windowed tracker and scoring",
+    "e7a9b3d scheduler integration + defragmenter",
+    "f0b2c11 benchmarks and telemetry",
+    "aa4d55e reviewer-driven bugfixes and tuning"
+  ],
+  "files_changed": [
+    "runtime/scratch/suballocator.cc",
+    "runtime/scratch/suballocator.h",
+    "runtime/kernel/launcher.cc",
+    "runtime/kernel/kernel_attrs.h",
+    "runtime/kv/evict_windowed.cc",
+    "runtime/kv/evict_windowed.h",
+    "runtime/scheduler/evict_integration.cc",
+    "runtime/scheduler/defrag_worker.cc",
+    "benchmarks/peak-mem/peak_mem_runner.py",
+    "tests/unit/test_suballocator.cpp",
+    "tests/unit/test_kv_windowed.cpp",
+    "docs/notes/scratch-suballocator.md"
+  ],
+  "review_comments": [
+    "Michael Chen: Left small comments on the free-list memory ordering; can we avoid the global mutex path when streams are disjoint?",
+    "Aditi Rao: Reply: added epoch checks to skip global mutex for common-case; global mutex remains as fallback for pathological race windows.",
+    "Elena Garc\u00eda: The eviction_score constants seem aggressive for long-running sessions \u2014 can we expose these as runtime flags?",
+    "Aditi Rao: Exposed alpha/beta/window-size as cluster flags; default conservatively tuned.",
+    "Jared Bloom: e2e harness shows one sporadic failure in prefetch path when session churn is high \u2014 added a sync point and backoff in scheduler hints."
+  ],
+  "ci_checks": [
+    "build: pass",
+    "unit-tests: pass",
+    "e2e-regression: pass (flaky run retried)",
+    "lint: pass",
+    "safety-scan: pass",
+    "asan/tsan: pass (unit tests)"
+  ],
+  "merge_method": "squash",
+  "merge_outcome": "merged into main after green CI and two approvals",
+  "release_notes": "Reduce transient GPU workspace and KV memory pressure by introducing a sparse scratch suballocator and a windowed, workload-aware KV eviction policy. Expected improvements: ~30% peak scratch reduction and 6-10% throughput gain under sustained batching for many transformer workloads. Flags available for controlled rollout: --enable-sparse-scratch, --kv-evict-window-size, --kv-evict-alpha, --kv-evict-beta.",
+  "breaking_change": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_comments",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_828d17475f2741d4a2dea1f443ea5451"
+}

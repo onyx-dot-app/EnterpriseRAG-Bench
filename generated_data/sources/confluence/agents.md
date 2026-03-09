@@ -8,6 +8,7 @@ File name format:
 File names should be short and descriptive with words connected with dashes (e.g. company-pto-policy-2025.json).
 
 Content rules:
+- All of the documents must be associated with a space (directory), they cannot be at the top level directly under confluence.
 - Confluence is Redwood Inference’s formal internal documentation system.
 - Documents should read like polished, broadly consumable references (not personal scratchpads). Write in complete sentences with clear structure.
 - Use standard Confluence-style organization: headings, short intro, bulleted lists, numbered procedures, tables for configs/requirements, and clearly labeled sections.

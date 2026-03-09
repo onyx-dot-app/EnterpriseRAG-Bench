@@ -1,0 +1,64 @@
+{
+  "repo": "redwood",
+  "pr_number": "41209",
+  "title": "compact-prefill-windowing-and-async-decode-handoff",
+  "author": "Asha Patel",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-02-26",
+  "merged_at": "2026-02-26",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/compact-prefill-async-handoff",
+  "reviewers": [
+    "Liam Chen",
+    "Sofia Martinez",
+    "Noah Green"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kv-cache",
+    "prefill"
+  ],
+  "linked_linear": [
+    "ENG-7421",
+    "ENG-7489"
+  ],
+  "linked_jira": [
+    "SUP-3382"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "1024",
+  "deletions": "321",
+  "breaking_change": "false",
+  "release_notes": "Reduced short-prompt end-to-end latency via compact prefill windowing and asynchronous decode handoff. No API changes.",
+  "commits": [
+    "a3b9f2c: introduce CompactPrefillWindow struct and windowing policy",
+    "b7d44e1: async decode handoff + ring buffer consumer/producer implementation",
+    "c8f0a12: scheduler heuristics to coalesce adjacent prefill requests",
+    "d4e6bb7: kernel pin caching and quick-path for repeated kernel selection",
+    "e12f993: unit + integration tests for handoff, benchmarks and perf harness tweaks"
+  ],
+  "changed_files": [
+    "runtime/prefill/compact_window.h",
+    "runtime/prefill/compact_window.cc",
+    "runtime/scheduler/async_handoff.cpp",
+    "runtime/scheduler/scheduler_policy.h",
+    "runtime/kernel/kernel_cache.mm",
+    "runtime/tests/prefill_handoff_test.cc",
+    "benchmarks/prefill_window_bench.py",
+    "docs/perf/prefill_handbook.md"
+  ],
+  "description": "Context and motivation: Customers and internal benchmarks showed that for short-to-medium prompts (<= 256 tokens) we spend disproportionate overhead in (1) repeated KV cache reads/evictions across adjacent prefill regions and (2) serial handoffs from prefill to decode stages that force full kernel rebinding. This PR introduces two complementary optimizations: (A) compact prefill windowing, which creates sliding/compact windows for prefill payloads to reduce KV cache churn and lower the number of kernel selection events, and (B) an asynchronous decode handoff (non-blocking ring buffer) so decode workers can start kernel-bound execution as soon as the minimal prefix is available while remaining prefill chunks stream in. The end goal is lower median latency and tighter p99 for typical production short-prompt workloads without changing user APIs.\n\nDesign summary: Compact prefill windowing groups logical prefill requests that are adjacent in sequence space into a single compact window. The window size is adaptive: we compute a lightweight cost heuristic using recent sequence-length distribution and KV cache hit rate. Small windows avoid prefetching too much history; larger windows amortize kernel bind costs. The heuristic is conservative by default and tunable via scheduler policy flags (prefill.window.min_tokens, prefill.window.max_tokens, prefill.window.ramp_factor).\n\nAsync decode handoff: We implement a lock-free ring buffer between prefill and decode stages along with a tiny handshake protocol. Prefill emits ready chunks (sequence index + KV delta + minimal token prefix) into the ring. Decode workers subscribe to the ring and begin execution as soon as they receive the minimal prefix and the first KV delta. Remaining KV deltas are streamed in and applied incrementally to the decode KV cache. Backpressure is applied by ring occupancy; the scheduler will fall back to the old synchronous handoff when occupancy crosses a safety threshold to avoid memory blowup.\n\nScheduler and kernel changes: To complement the handoff we add kernel pin caching (per-worker last-used kernel id -> quick path) which eliminates a bind syscall/lookup on repeated short-run decode tasks. The scheduler coalesces adjacent prefill windows from the same model shard into a single kernel-bound job when possible and favors GPU-local prefill placement to reduce cross-device transfers. We also adjusted continuous batching micro-batch target sizes for decode vs prefill to reduce latency variance: decode micro-batches are smaller and prefill micro-batches are slightly larger to amortize prefill kernel overhead.\n\nSafety and correctness: The ring buffer protocol includes sequence numbers, checksums, and an incremental-apply path to ensure KV cache consistency. Unit tests cover reordering, partial-apply, and simulated packet loss. We added a regression test that replays the real incident trace (SUP-3382) where earlier handoffs produced p99 spikes.\n\nBenchmarks & results: On the internal perf harness (open-source-like Llama-variant, batch=1 multimodel mix) we observed the following relative improvements vs main (before this PR): median E2E latency for 16-128 token prompts: -14% (median), p99: -22%. For throughput-heavy long sequences (> 1024 tokens) there's no regression in sustained tokens/sec. Observed KV cache read operations reduced by ~18% for the short-prompt mix. See benchmarks/prefill_window_bench.py for the harness and sample run outputs.\n\nCompatibility and toggles: All changes are behind runtime flags enabled by default for canary clusters. Configs: prefill.window.enabled, prefill.window.max_tokens, runtime.async_handoff.enabled, runtime.kernel_pin_cache.enabled. Default values are conservative; operator can disable if odd regressions appear.\n\nTesting and CI: Added unit tests (runtime/tests/prefill_handoff_test.cc), integration smoke in the canary harness, and perf benchmark artifacts. CI initially failed on a flaky scheduler test in the macOS runner; we added a deterministic scheduling seed and retriggered. Final CI status: pass (all checks green). Summary of CI checks: build (pass), unit-tests (pass), integration-canary (pass after rerun), lint (pass), perf-smoke (pass).\n\nReview conversation (abridged):\n- Liam Chen (reviewer): \"Nice work; I like the conservative default heuristic. Two asks: add a small e2e test with the incident trace and ensure we document the safety threshold for fallback behavior.\"\n- Author (Asha Patel): \"Added replay test and documented the fallback threshold in docs/perf/prefill_handbook.md; updated PR description with numbers.\"\n- Sofia Martinez (reviewer): \"Consider making kernel_pin_cache optional per-device; we saw weird allocator interactions on a multi-GPU box.\"\n- Author: \"Made kernel_pin_cache per-worker and added a runtime knob to disable per-device pinning; added an allocator integration test.\"\n- Noah Green (approver): \"Benchmarks look solid; approved on behalf of runtime team.\"\n\nEdge cases and known limitations: For extremely bursty workloads that have high interleaving across different prompts, compact windows can underperform if the heuristic misestimates locality; in that case the fallback to smaller windows kicks in. The ring buffer increases memory pressure modestly under prefill-heavy bursts; our backpressure threshold is tuned conservatively but operators should monitor ring occupancy metrics (prefill.ring.occupancy, prefill.window.size).\n\nFiles changed (high-level snippets):\n- runtime/prefill/compact_window.h: added CompactPrefillWindow and AdaptiveWindowPolicy classes (api comments included).\n- runtime/scheduler/async_handoff.cpp: ring buffer producer/consumer and handshake state machine (lightweight, lock-free pattern). Example snippet: \"while (!ring.try_push(chunk)) { scheduler.yield(); if (ring.occupancy() > safety_thresh) fallback_sync_handoff(); }\"\n- runtime/kernel/kernel_cache.mm: added pin cache lookup fast-path: \"if (pin_cache.hits(model_id, kernel_sig)) goto fast_path;\"\n\nMerge strategy: Squash merge after approvals and final perf validation.\n\nFollow-ups: (1) Evaluate automatic tuning of window.ramp_factor based on live telemetry (ENG-7489). (2) Extend ring buffer to support multi-shard fan-out (planned but requires cross-device ordering guarantees).\n\nRelated: references to earlier work: ENG-5951 (speculative prefill prototype), pr-33689 and pr-39521 informed our handshake semantics but this PR focuses on compact windows and async handoff rather than speculative chunking.",
+  "notes": [
+    "Canary rollout scheduled: canary cluster IDs: canary-us-west-2-a, canary-eu-west-1-b",
+    "Operators: watch metrics prefills.window.average_size, prefills.ring.occupancy, kernel.pin_cache.hits"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "release_notes",
+    "description"
+  ],
+  "dataset_doc_uuid": "dsid_fc86e40a1d9644dab974c0a1b5912e40"
+}

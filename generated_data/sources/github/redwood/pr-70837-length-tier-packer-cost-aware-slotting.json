@@ -1,0 +1,74 @@
+{
+  "repo": "redwood",
+  "pr_number": "70837",
+  "title": "length-tier packing and cost-aware slotting to minimize padding and improve KV locality",
+  "author": "Maya Gupta",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-03-05",
+  "merged_at": "2026-03-05",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/length-tier-packer",
+  "reviewers": [
+    "Owen Park",
+    "Zara Li",
+    "Rajesh Kumar"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "batching",
+    "kv-cache",
+    "optimization"
+  ],
+  "linked_linear": [
+    "ENG-1985",
+    "ENG-2130"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "9",
+  "additions": "684",
+  "deletions": "211",
+  "release_notes": "Introduce length-tier packing with cost-aware slotting: reduces padding waste and improves KV cache hit stability. Opt-in via scheduler.packing.length_tiers and rollout metric gating.",
+  "breaking_change": "false",
+  "description": "Summary:\nThis PR introduces a length-tier packing algorithm plus a cost-aware slotting policy in the runtime scheduler to reduce padding overhead and improve KV-cache locality for mixed-length workloads. The change is opt-in (scheduler.packing.enabled=false by default) and designed for minimal risk: it does not modify model kernels or public API surface.\n\nMotivation:\nWe observed persistent padding waste in multi-tenant traffic with broad seq-length distributions. Padding causes extra token work, worsens latency tail, and reduces effective KV-cache reuse because coalesced slots mix requests from very different sequence prefixes. Existing bucketing heuristics were either too coarse or induced oscillation under bursty traffic. We need a packing scheme that: (1) minimizes per-batch padding cost, (2) preserves KV cache locality across similar prefixes, and (3) plays nicely with continuous batching and autoscaling.\n\nDesign overview:\n- Length tiers: incoming requests are quantized into a small set (configurable, default 6) of \"length tiers\" (very-short, short, mid, mid-long, long, very-long). Tiers are defined by percentile anchors computed from an EWMA sketch of recent seq-lengths.\n- Slotting (cost-aware): the scheduler maintains slots sized for a target output token budget. When forming a batch, requests are preferentially placed into slots with the closest upper-tier bound to avoid unnecessary padding. Each candidate slot has a dynamic cost estimate: padding_cost + kv_locality_penalty. The latter penalizes mixing requests whose prefix keys differ (hash distance heuristics) to preserve KV cache hit rates.\n- Backfill and spill policy: small/unfilled slots are allowed a short grace window (configurable ms) to accept compatible arrivals; after that they can be spilled into a fallback merge policy to avoid head-of-line blocking.\n- Integration with continuous batching: the packer attaches metadata (tier_id, slot_id) so runtime backends can prioritize KV-cache placement and kernel selection. No change to model weights or serialized model artifacts.\n\nImplementation details:\n- New scheduler module: src/runtime/scheduler/length_tier_packer.rs implements tier computation, slot descriptors, and placement heuristics.\n- Cache-aware fingerprinting: src/runtime/kv/cache_key_finder.rs adds an optional lightweight prefix fingerprint used to score kv_locality_penalty. The fingerprint uses the first N bytes of normalized prefix tokens to avoid heavy hashing.\n- Configuration: config/defaults.yaml adds scheduler.packing.length_tiers, scheduler.packing.grace_ms, scheduler.packing.max_slot_padding_ratio.\n- Metrics and traces: observability hooks added in src/observability/metrics.rs and tracing spans in the packer so we can track padding_saved, kv_locality_hit_ratio, slot_utilization. Dashboards updated in docs/observability/length-tier-dashboard.md.\n- Tests + benchmarks: added unit tests (tests/unit/test_length_tier_packer.rs), integration tests with continuous batching harness (tests/batching/length_tier_integration_test.py), and a microbenchmark simulation (benchmarks/length_tier_simulation.json).\n\nKey files changed (high-level):\n- src/runtime/scheduler/length_tier_packer.rs\n- src/runtime/kv/cache_key_finder.rs\n- src/observability/metrics.rs\n- config/defaults.yaml\n- tests/unit/test_length_tier_packer.rs\n- tests/batching/length_tier_integration_test.py\n- docs/observability/length-tier-dashboard.md\n- benchmarks/length_tier_simulation.json\n- pkg/python/redwood/adapter/packing_adapter.py\n\nBenchmarks (internal cluster, Ampere A100 equiv):\n- Workload: synthetic mix of very-short(30%), short(25%), mid(20%), long(25%) sequences; open-loop arrival at 1200 req/s, model = gpt-medium-6B.\n- Baseline: current percentile-bucket strategy. Packer enabled with 6 tiers and default costs.\n- Results (P50, P95 generation latency for 512 token windows, cost = compute tokens):\n  - Baseline P50: 34.2 ms, P95: 129.3 ms, compute tokens/sec cost baseline = 1.00\n  - This PR P50: 30.9 ms (9.6% improvement), P95: 115.1 ms (10.9% improvement), compute tokens/sec cost = 0.88 (12% token savings due to less padding)\n- KV-cache locality: measured as fraction of continuation requests hitting existing KV shards; improved from 0.62 -> 0.78 in simulation.\n\nRollout and gating:\n- Feature is opt-in. Default off for safety.\n- Canary plan: enable for 5% of traffic on dedicated pool with realtime metric gating on padding_saved and kv_locality_hit_ratio; automatic rollback if P95 regression > 5% or errors increase.\n\nTesting and QA:\n- Unit tests cover tier assignment and slot selection heuristics, fuzz tests for edge cases around boundary seq-lengths.\n- Integration test simulates continuous batching with varying arrival bursts and verifies no deadlocks and acceptable slot spill behaviour.\n- Bench harness run against staging with deterministic seed; results captured in benchmarks/length_tier_simulation.json.\n\nChecklist:\n- [x] Implementation of length tiers and slotting\n- [x] Lightweight KV prefix fingerprint and scoring hook\n- [x] Metrics + tracing for rollout observability\n- [x] Unit + integration tests\n- [x] Benchmarks showing latency/cost wins\n- [x] Opt-in config and canary gating plan documented\n\nRelated work:\n- This complements earlier bucketed-batching efforts but focuses on minimizing padding cost while preserving KV locality; see ENG-1321 for prior percentile bucketer.\n- Linear: ENG-1985 tracks production rollout and metric dashboards.\n\nNotes on risk and mitigation:\n- Risk: mis-tuned tier boundaries could increase fragmentation and reduce throughput. Mitigation: EWMA anchor updates are rate-limited and changes are exposed as metrics; rollout gating prevents noisy changes.\n- Risk: fingerprint collisions could misrepresent KV locality. Mitigation: fingerprint is intentionally small and used only for scoring, not for correctness of keying.\n\nMerge outcome:\n- Merged via squash on 2026-03-05 after approvals from Owen Park and Zara Li. CI green after a lint failure was fixed in a small follow-up commit.\n\nIf reviewers want: I can follow up with a short RFC doc describing the cost model mathematics used for slot scoring (padding_cost + alpha * locality_penalty) and provide a tuning guide for ops teams.\n",
+  "commits": [
+    "feat(scheduler): add length-tier packer with slot descriptors",
+    "perf(kv): add lightweight prefix fingerprint and scoring hook",
+    "test: add unit and integration tests for packer and backfill",
+    "docs: add observability dashboard and canary rollout plan",
+    "fix(lint): whitespace and clippy fixes after CI"
+  ],
+  "files_changed": [
+    "src/runtime/scheduler/length_tier_packer.rs",
+    "src/runtime/kv/cache_key_finder.rs",
+    "src/observability/metrics.rs",
+    "config/defaults.yaml",
+    "tests/unit/test_length_tier_packer.rs",
+    "tests/batching/length_tier_integration_test.py",
+    "docs/observability/length-tier-dashboard.md",
+    "benchmarks/length_tier_simulation.json",
+    "pkg/python/redwood/adapter/packing_adapter.py"
+  ],
+  "review_comments": [
+    "Owen Park: Nice work, Maya. Can you clarify how EWMA anchors are initialized after a cold restart? We should avoid a transient where almost everything maps to 'very-long'.",
+    "Maya Gupta: Good catch. Anchors are initialized from the last persisted snapshot (if present) and fall back to a short-default distribution (percentiles from historical traffic profile) to avoid the long transient. I added a comment and unit test to cover the cold start path.",
+    "Zara Li: The kv_locality_penalty seems sensitive to the fingerprint length. Have you tried 8 vs 16 bytes? What's the perf cost?",
+    "Maya Gupta: I ran a microbenchmark; 8 bytes gives nearly identical locality discrimination vs 16 for our corpora but is cheaper to compute/compare. Default set to 8; adjustable via config. Results added to benchmarks/length_tier_simulation.json.",
+    "Rajesh Kumar: CI failed on lint initially. After fix, everything passed locally. Approving once CI green.",
+    "Owen Park: Approving; pls ensure rollout gating is enabled in the default release manifest (off by default, but present)."
+  ],
+  "ci_checks": [
+    "build: pass",
+    "unit_tests: pass",
+    "integration_tests: pass",
+    "lint: initial fail -> pass (fixed in follow-up)",
+    "benchmarks: artifact produced",
+    "security_scan: pass"
+  ],
+  "merge": [
+    "merge_method: squash",
+    "merged_by: Owen Park",
+    "merge_commit: a3f4b2e"
+  ]
+}

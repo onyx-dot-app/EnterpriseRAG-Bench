@@ -8,6 +8,7 @@ File name format:
 The files should start with "pr-" (since they're all Pull Request) followed by a few digits and a short description of the PR (e.g. pr-18345-address-parallelism-bottleneck-in-gpu-inference.json).
 
 Content rules:
+- All of the PRs must be associated with one of the repos (directories). It cannot be at the top level directly under github.
 - This directory represents GitHub artifacts, modeled as pull requests (PRs).
 - Each document corresponds to exactly one pull request.
 - Repository distribution:

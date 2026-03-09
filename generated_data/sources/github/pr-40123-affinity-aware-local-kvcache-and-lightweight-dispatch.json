@@ -1,0 +1,74 @@
+{
+  "repo": "redwood",
+  "pr_number": "40123",
+  "title": "Affinity-aware request dispatch and per-core local KV cache",
+  "author": "Asha Patel",
+  "created_at": "2026-01-15",
+  "updated_at": "2026-02-03",
+  "merged_at": "2026-02-03",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/affinity-local-kvcache-dispatch",
+  "reviewers": [
+    "Liam O'Connor",
+    "Yuki Tanaka",
+    "Rosa Martinez"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kvcache",
+    "scheduling",
+    "infra"
+  ],
+  "linked_linear": [
+    "ENG-5921",
+    "ENG-6050"
+  ],
+  "linked_jira": [
+    "SUP-1082"
+  ],
+  "ci_status": "pass (initial flaky failure in scheduler tests, rerun passed)",
+  "files_changed_count": "8",
+  "additions": "471",
+  "deletions": "122",
+  "release_notes": "Introduce an affinity-aware dispatcher and a core-local KV cache layer to reduce CPU-side tail latency and remove costly thread-affinity syscalls. Improves 99th percentile request latency under high concurrency. No API changes for end users; rollout via Canary by default.",
+  "breaking_change": "false",
+  "commits": [
+    "core: add CoreLocalKVCache with lockless read path and compact shard indices",
+    "scheduler: add AffinityDispatcher and worker-group registration",
+    "runtime: replace direct pthread_setaffinity calls with cooperative CpuHint API",
+    "tests: add microbenchmarks for dispatch and kv cache hot path",
+    "fix: race on kv cache eviction during shutdown"
+  ],
+  "changed_files": [
+    "runtime/scheduler/affinity_dispatcher.cc",
+    "runtime/scheduler/affinity_dispatcher.h",
+    "runtime/kvcache/core_local_cache.h",
+    "runtime/kvcache/core_local_cache.cc",
+    "runtime/kvcache/README.md",
+    "runtime/workerpool/cpu_hint.h",
+    "runtime/benchmarks/dispatch_bench.cc",
+    "tests/integration/affinity_dispatch_integration_test.cc"
+  ],
+  "review_comments": [
+    "Liam O'Connor: Great direction \u2014 the per-core reader avoids the global lock that was killing tail latency. Two asks: (1) add a fallback path for oversized keys that don't fit local shard, (2) make the CpuHint API a no-op behind a runtime flag for experimental rollouts.",
+    "Author (Asha): Added oversized key fallback to global spill with bounded locking and introduced --enable-cpu-hint flag. See new tests and docs in runtime/kvcache/README.md.",
+    "Yuki Tanaka: The cooperative yield looks safer than repeated pthread_setaffinity calls. Can you add a comment about how this behaves under CFS and with cgroup cpu shares?",
+    "Author (Asha): Comment and reference to scheduler behavior added. Also added a small benchmark comparing setaffinity vs CpuHint on AWS c6i and an on-prem AMD box.",
+    "Rosa Martinez: CI showed transient failures in affinity_dispatch_integration_test on macOS runners; can we gate that test to linux-only?",
+    "Author (Asha): Gated the test to linux in the test harness; added a note in tests/README about platform-specific integration tests.",
+    "Liam O'Connor: Approved after the fixes \u2014 please squash and merge once CI is green."
+  ],
+  "description": "Context and motivation: We've observed recurring 99th percentile latency spikes under sustained multi-tenant load caused by CPU-side contention: global KV cache locks, excessive pthread_setaffinity calls from hot request handling paths, and work stealing that thrashes caches. This PR introduces two complementary approaches: (1) a CoreLocalKVCache that provides lockless fast-path reads and bounded global spill for writes/evictions; (2) an AffinityDispatcher that routes requests to worker groups with preferred CPU locality using a cooperative CpuHint API instead of forcing thread pinning.\n\nDesign summary: CoreLocalKVCache keeps a compact per-core shard index and a read-optimized ring backing. Reads consult the local shard first; misses fall back to a spill map protected by a thin mutex. Eviction is done by a background janitor per shard to avoid write-side stalls. The AffinityDispatcher maintains lightweight worker groups (N groups = sockets or vcpu groups) and assigns short-lived request tasks to a preferred group using per-worker run-queues and a cooperative CpuHint call that nudges the scheduler; we avoid repeated pthread_setaffinity to reduce syscall overhead and context churn.\n\nImplementation highlights: \n- runtime/kvcache/core_local_cache.h/.cc: new implementation with lockless read path and small fixed-size per-core rings; public API matches existing KVCache interface so callers are unaffected.\n- runtime/scheduler/affinity_dispatcher.*: new dispatcher with group registration and preferred-worker enqueue API.\n- runtime/workerpool/cpu_hint.h: small abstraction that emits scheduler-friendly hints; on Linux this uses sched_yield + SOFT affinity heuristics, on other OSes it's a no-op behind a flag.\n- tests/ and benchmarks/: microbenchmarks show improvements and integration tests validate fallbacks.\n\nBenchmarks (pprof-style microbench, Linux x86_64, c6i.4xlarge): \n- baseline main (before change): p50=6.2ms p95=18.4ms p99=38.7ms throughput=2200 QPS\n- this PR (canary): p50=5.9ms p95=12.1ms p99=21.3ms throughput=2300 QPS\nNotes: gains come primarily from removing global lock stalls on KV reads and cutting ~0.5ms median from scheduling syscalls at high QPS.\n\nCompatibility and rollout: API remains backward-compatible. Feature gated with --enable-cpu-hint and runtime config for enabling core-local cache. Default rollout plan: canary on 10% of requests for 24h, increase to 50% if no regressions, full rollout after 7 days.\n\nTesting and CI: Added unit tests for local shard read/write semantics and an integration test exercising dispatcher failover. CI initially failed on a flaky scheduler unit test (timing-sensitive), flakiness fixed by relaxing a timing assertion and adding a retry harness. Final CI run passed.\n\nDiff/changed areas (high-level): modified the scheduler and kvcache subsystems, added new tests and docs. Important new files: runtime/scheduler/affinity_dispatcher.cc, runtime/kvcache/core_local_cache.cc. Example hot-path snippet used in runtime: if (try_read_local(key, &val)) return val; // fast-path lockless read\n\nReview and discussion: Reviewers asked for oversized-key fallback and gated platform tests; both addressed. Concern about cgroup scheduling semantics was discussed and documented. We decided not to expose the worker-group configuration to customers yet; it's an internal tuning knob.\n\nMerge strategy and outcome: After addressing review comments and stabilizing tests, PR was squashed and merged into main on 2026-02-03 using squash merge. Release notes added.\n\nFollow-ups and TODOs:\n- ENG-6050: add telemetry to measure local-shard hit rates and record eviction pressure (linked linear).\n- Explore adding a NUMA-aware worker group assignment when running on bare-metal with multiple sockets.\n- Try a specialized lock-free hash for the spill map to reduce mutex contention under pathological workloads.\n\nReferences: linear/ENG-5921, internal benchmarking doc: /docs/perf/affinity-dispatcher-bench.md, test plan in tests/integ/affinity_plan.md\n\nChecklist:\n- [x] Unit tests for core behavior\n- [x] Integration tests for dispatch and spill fallback\n- [x] Benchmarks and numbers included\n- [x] Feature gated for Canary\n- [x] Docs updated (runtime/kvcache/README.md)\n\nIf there are concerns about platform differences or additional telemetry required before ramp, I can follow up with a small patch to add opt-in metrics to the dispatcher.",
+  "merge_method": "squash",
+  "notes": "Squashed all commits into a single commit on merge. Canary rollout started immediately after merge on a select fleet.",
+  "hotfix_needed": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_comments",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_63f3f972e2f540bd99357a7b52f6d138"
+}

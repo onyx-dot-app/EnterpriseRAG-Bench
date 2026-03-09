@@ -1,0 +1,57 @@
+{
+  "meeting_id": "ff-20250403-aurora-001",
+  "recorded_at": "2025-04-03T15:00:00Z",
+  "duration_minutes": "62",
+  "call_type": "technical_deep_dive",
+  "title": "KV cache hit-rate & batching/quantization deep dive - Aurora MedTech",
+  "redwood_owner": "Lauren Kim",
+  "redwood_attendees": [
+    "Lauren Kim (AE)",
+    "Diego Park (SE)"
+  ],
+  "customer_company": "Aurora MedTech",
+  "customer_attendees": [
+    "Priya Shah (ML Engineer)",
+    "Mark Hsu (Infra Lead)",
+    "Suhail Reddy (CTO)"
+  ],
+  "transcription_quality": "medium",
+  "summary": "Deep technical review of KV/prefix caching strategy for multimodal clinical assistant: discussed cache key construction (tenant vs global, prefix hashing, salts), hit-rate measurement methodologies, eviction policies, implications for batching and latency SLOs, and quantization tradeoffs. Agreed to run a 3-day production traffic replay to measure realistic hit rates and to test int8/PTQ inference with Redwood Dedicated in their VPC. Next steps: benchmark run, config proposal, security checklist for VPC/HSM integration.",
+  "topics": [
+    "KV cache key design (tenant-scoped vs global)",
+    "Prefix hashing and salt strategies",
+    "Hit-rate telemetry and target thresholds",
+    "Eviction policies and TTLs",
+    "Interaction with batching and latency SLOs",
+    "Quantization impact (INT8/PTQ vs QAT)",
+    "VPC/on-prem considerations and KMS/HSM"
+  ],
+  "transcript": "Meeting header:\nDate: 2025-04-03 15:00 UTC\nDuration: ~62 minutes\nAttendees: Lauren Kim (Redwood AE), Diego Park (Redwood SE), Priya Shah (Aurora ML), Mark Hsu (Infra), Suhail Reddy (CTO)\nShared artifacts: 1) Redis prefixing + hit-rate spreadsheet (Lauren to share) 2) Redwood dedicated config doc (console link) 3) sample replay script link\n\n[00:00] Lauren: Hey everyone, thanks for joining, um we'll kick off, Diego and I are from Redwood, quick intros?\n[00:12] Diego: hi all, SE focus on runtime/kv optimizations, i'll jump into perf stuff, excuse my cough.\n[00:17] Priya: thanks, priya here im the ml engineer owning the assistant prompts. We've been seeing some hit-rate churn and tail latency bumps.\n[00:27] Suhail: yeah we want to understand if caching will actually help at our 99th percentile, and how safe it is across tenants.\n[00:35] Lauren: perfect, goal today is to walk through key strategies for prefix/prompt caching, measurement, and what changes if you run on Dedicated in your VPC. We'll capture action items.\n\n[02:10] Diego: ok starting with the basics - our KV cache stores past key/value attention states for prefixes. Typical keys are a hash of the prompt prefix plus model id and maybe tenant id. A naive global key can leak cross-tenant reuse so we recommend tenant-scoped keys unless you explicitly want cross-tenant hits.\n[03:05] Priya: quick q \u2014 we have shared system prompts for certain workflow templates across clients, would scoping by tenant prevent beneficial share?\n[03:22] Diego: yes, it would. There's three options: tenant-only, namespace-share with explicit consent, or opt-in shared repository. Sharing increases hit-rate but you need tighter governance and dedupe logic.\n\n[05:00] Mark: what about prefix hashing collisions? do we ever get wrong match where prefix A maps to same hash as B?\n[05:12] Diego: collisions are possible with fixed-width hashes, so we append model checksum + prefix length + a salt to the key and do a lightweight verification on hit \u2014 checksum mismatch invalidates the hit. That increases key size but avoids silent cross-match.\n[06:30] Priya: by salt you mean static per-tenant salt or rotating? we worry about replay attacks.\n[06:41] Diego: per-tenant static salt is typical for deterministic behavior; for extra safety you can rotate salt monthly which will flush keys but reduce hit-rate during rotation. If you need cryptographic isolation we recommend HSM/KMS-backed secrets for salt retrieval in Private deployments.\n\n[12:30] Diego: about hit-rate measurement \u2014 lab numbers are optimistic. We asked teams to run traffic replay for 72 hours using production logs to get realistic metrics: prefix reuse distribution, percent of requests with exact prefix match, and effective token savings. Targets we often see: 20\u201335% exact-prefix hit rate for chat-heavy apps, 45\u201360% if you include prefix-substring matches with prefix-normalization.\n[13:20] Priya: our initial offline run showed 8% exact hits, 19% with fuzzy normalization \u2014 is that terrible?\n[13:35] Diego: not necessarily, depends on your cost/latency SLO. Even 8% exact hits can reduce token spend meaningfully if those prefixes are long. Also you can boost hit-rate via prompt engineering: canonicalize user prompts, strip timestamps, or use templated system messages.\n\n[18:00] Suhail: can caching change latency? we thought caching reduces work but adds a network lookup and verification step. what about 99th pct?\n[18:20] Diego: good callout \u2014 there is a tradeoff. On-path cache lookup is microsecond-scale if co-located (same host or local redis), but if you require cross-region or VPC-NAT, that adds tens to hundreds of ms. Redwood tends to co-locate the KV store with the runtime or use in-process prefix cache for hot keys. Eviction and cache misses should be fast and fallback to normal model step. For worst-case 99th, you need to ensure cache layer has the same SLOs or is bypassed for critical paths.\n[22:40] Mark: what's the recommended deployment for Aurora? we run Dedicated in our VPC and prefer not to expose internal redis over internet.\n[22:56] Lauren: for Private/Dedicated we support co-located KV (on the same node) or VPC-hosted redis behind security groups. For HSM or KMS integrations, we use customer-managed KMS via IAM roles and Redwood service account. We'll share the security checklist.\n\n[28:00] Diego: on batching interactions \u2014 larger batches increase GPU throughput but can reduce cache effectiveness because diverse prompts reduce prefix reuse within the batch. We recommend adaptive batching: group by model, route, and prefix fingerprint so batches contain similar prefix families. That preserves KV cache hits and gets throughput benefits.\n[30:10] Priya: is that grouping done at the proxy/router level? how hard is it to add fingerprinting?\n[30:25] Diego: it's lightweight \u2014 compute a 64-bit fingerprint of the normalized prefix. Router uses that to assign request to a batch lane; lanes flush based on either SSLO latency cap or size. This logic lives in the serving runtime and can be enabled per-route.\n\n[35:00] Diego: quantization note \u2014 int8/PTQ often reduces memory and increases throughput, but it can slightly change logits causing cache miss behavior if you compare KV signatures post-quantization. We do keying before quantization, but model's internal kv layout differs by kernel selection. So when you switch quantization profile you should invalidate the KV store or tag keys with quantization-profile id.\n[36:15] Priya: oh so we need to include quantization profile id in the cache key?\n[36:23] Diego: exactly \u2014 model-id + model-version + quant-profile + prefix-hash. That avoids stale/invalid cache hits. Also QAT (quantization-aware training) reduces mismatch but you still want profile tagging.\n\n[41:00] Mark: eviction policies \u2014 LRU vs TTL vs cost-based? we have large long-tail prompts, worried about cache thrashing.\n[41:10] Diego: common approach: hot key in-memory LRU with weighted cost eviction; preserve keys with high token-length savings using a token-saved score. Also use a two-tier cache: small in-process LRU for hottest keys and a larger redis-backed store for warm keys. TTLs for ephemeral session-only prefixes (like one-time auth prompts) are short, while shared templates get long TTLs.\n\n[45:30] Priya: multi-tenant safety \u2014 is there risk of person-specific data leak being cached and served to other tenants?\n[45:45] Diego: yes, that's the primary risk. Best practices: tenant-scoped keys by default, redaction of PII before caching, and audit logs on cache hits with request id & tenant id. For shared keys, add permission gates and a review process. We also recommend masking sensitive fields and not caching messages flagged by your PII detector.\n\n[49:00] Suhail: for compliance, can we integrate cache audit logs into our SIEM?\n[49:10] Lauren: yes, Redwood Console can stream logs to your SIEM via syslog/S3 push. Action: we'll list the log fields and retention options. If you run Private in your VPC, trails stay inside your account.\n\n[52:40] Diego: sample numbers from similar customers \u2014 when they enabled tenant-scoped prefix cache plus normalization, hit-rate moved from ~10% to ~28% over two weeks due to templating. Token-cost savings around 14% monthly. But results vary by chat temperature and prompt length.\n\n[55:00] Priya: ok what test should we run?\n[55:10] Diego: 1) run 72-hour replay under safe mode: generate fingerprints and simulate cache hits without writing to KV to measure theoretical hit-rate. 2) run a shadow write test (write-only) to measure write throughput. 3) A/B small percentage of live traffic with read-enabled cache to measure real savings and latency impact. We'll provide a replay script.\n\n[58:30] Lauren: recap and next steps \u2014 Diego will share the sample replay script and config templates; Lauren will share the benchmark spreadsheet and the security checklist for VPC/KMS; Priya and Mark will agree on a 72-hour window and supply logs; Suhail will review any compliance questions.\n[59:10] Suhail: quick \u2014 cost of Dedicated compared to hosted for this workload?\n[59:20] Lauren: we'll send an estimate; Dedicated gives you predictable throughput and isolation which helps with co-location of cache and lower tail latency.\n\n[61:00] Lauren: thanks everyone, we'll follow up with notes and schedule the kickoff for the replay run.\n[61:08] Priya: thanks all.\n\nTranscript notes: occasional mis-hearings (e.g., \"een-tee-eight\" for int8), speaker overlap around 30:25, and some acronyms transcribed slightly incorrectly (QAT/QAT vs QT).\n",
+  "next_steps": [
+    "Run 72-hour traffic replay (Aurora to provide logs) - target start 2025-04-07",
+    "Redwood to share replay script, benchmark spreadsheet, and Dedicated config by 2025-04-08",
+    "Security checklist/KMS integration doc to be shared by Redwood (Lauren) by 2025-04-08",
+    "Schedule 30-min follow-up to review replay results week of 2025-04-14"
+  ],
+  "action_items": [
+    "Diego Park: share sample replay script and router fingerprinting notes by 2025-04-08",
+    "Lauren Kim: send benchmark spreadsheet + security checklist (VPC/KMS) by 2025-04-08",
+    "Priya Shah: confirm log delivery and 72-hour window by 2025-04-06",
+    "Mark Hsu: validate VPC firewall rules for co-located redis and share details by 2025-04-09"
+  ],
+  "competitors_mentioned": [
+    "Anthropic",
+    "Vertex AI",
+    "in-house caching"
+  ],
+  "crm_deal_id": "CRM-AUR-2025-042",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "topics",
+    "transcript",
+    "next_steps",
+    "action_items"
+  ],
+  "dataset_doc_uuid": "dsid_5dc027d943b14cd8888ab1d84593cf59"
+}

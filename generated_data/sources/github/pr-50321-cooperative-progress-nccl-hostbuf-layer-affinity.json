@@ -1,0 +1,44 @@
+{
+  "repo": "redwood",
+  "pr_number": "50321",
+  "title": "cooperative-progress-nccl-host-buffering-with-layer-stream-affinity",
+  "author": "Maya Thompson",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-02-25",
+  "merged_at": "2026-02-25",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/tp-nccl-coop-hostbuf-layer-affinity",
+  "reviewers": [
+    "Carlos Rivera",
+    "Lena Patel",
+    "Arjun Mehta"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "tensor-parallel",
+    "nvcc",
+    "sre"
+  ],
+  "linked_linear": [
+    "ENG-6122",
+    "ENG-6201"
+  ],
+  "linked_jira": [
+    "SUP-1322"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "1213",
+  "deletions": "462",
+  "release_notes": "Introduces cooperative NCCL progress thread, host-buffered micro-reductions, and layer->stream affinity heuristics to improve comm/compute overlap for tensor-parallel workloads. Not a breaking change; gated behind runtime flags.",
+  "breaking_change": "false",
+  "body": "Summary: This PR introduces a cooperative progress mechanism for multi-GPU tensor-parallel serving that reduces comm/compute stalls by (1) a lightweight host-side progress thread that drives NCCL collectives when kernels are long-running, (2) an optional host-buffered micro-reduction path for small per-layer tensors to amortize latency and enable overlap, and (3) a layer->stream affinity mapper that pins specific model layers to preferred CUDA streams to reduce stream contention and kernel serialization.\n\nMotivation: In large TP deployments we observed periodic spikes in tail latency caused by collectives not making timely progress while a long-running compute kernel occupies the device. Existing fixes (more streams or larger micro-batches) either increase complexity or regress average latency. The cooperative progress approach keeps kernels unchanged while letting an opt-in host progress helper and a small host buffer path absorb small reductions and forward them asynchronously, improving both latency and throughput on typical NLP transformer inference workloads.\n\nWork items completed: - Implemented cooperative progress thread (runtime/comm/progress.cc/.h) with safe lifecycle handling and low-overhead wake/wait paths. - Added host-buffered micro-reduction path (runtime/comm/host_reduce.{cc,h}) for tensors under configurable size threshold; integrates with existing collective ABI. - Layer->stream affinity heuristic and config (runtime/scheduler/affinity.cc) that maps layers to either high-priority comm streams or compute streams based on historical op size distribution. - KV-cache prefetch scheduling tweaks to sequence prefetches earlier for TP shards when affinity indicates imminent use. - Exposed new runtime flags and per-deployment config: enable_coop_progress, host_reduce_threshold_bytes, affinity_mode (auto/pinned/none). - Observability: added metrics (comm_progress_latency_ns, host_reduce_bytes, affinity_evictions) and logs for debugging. - Unit + integration tests, and a perf canary harness run.\n\nCommits (high-level): - 9b341c1: initial coop progress skeleton and thread lifecycle - 1f7a2d4: host-buffered micro-reduce implementation + ABI hooks - 6c2b8f0: affinity heuristic + config plumbing - 4d9ae03: KV-cache prefetch order changes for TP - b7f4d21: tests, docs, and metrics - a2e8c11: perf tweaks and guard rails (thresholds, metrics)\n\nFiles changed (high-level): - runtime/comm/progress.{cc,h} \u2014 new: main cooperative progress helper with spin/wait loop and NCCL progress callbacks (safe while kernel is active). Snippet: \"if (cooperative_enabled) progress_thread_->notify();\" - runtime/comm/host_reduce.{cc,h} \u2014 new: host-buffered reduce path that aggregates small shard slices on host, issues a batched NCCL allreduce when buffer hits threshold. - runtime/scheduler/affinity.cc \u2014 new mapping using simple LRU + size histogram to assign streams per layer. - runtime/scheduler/affinity_config.proto \u2014 added fields for affinity_mode, stream_priorities. - runtime/kvcache/prefetch_scheduler.cc \u2014 change: prefetch ordering respects affinity hints. - runtime/metrics/comm_metrics.cc \u2014 added counters/gauges for new features. - tests/integration/tp_coop_progress_test.cc \u2014 new: simulates long kernel + frequent small collectives. - docs/runtime/coop_progress.md \u2014 user docs and recommended flags.\n\nReview notes (excerpted as continuous discussion): - Carlos Rivera: \"This reads well; two high-level asks: (1) please ensure the progress thread is disabled by default and cannot race with shutdown, (2) add a guard for devices where NCCL async progress is already enabled by the driver.\" \u2014 Maya: \"Both addressed: progress is opt-in via enable_coop_progress=false by default; added shutdown barrier and device capability check in progress.cc (see commit 9b341c1 + 1f7a2d4).\" - Lena Patel: \"Can we measure memory overhead of host buffering? On 8xA100 with large models we've got tight host memory budgets.\" \u2014 Maya: \"host buffers are configured per-worker and default to 8MB total; we added host_reduce_bytes metric and optional global cap. Added docs callout.\" - Arjun Mehta: \"Please add an integration test that runs a TP model with sequential kernels and asserts p50/p95 latency improvement > 0 to catch regressions.\" \u2014 Maya: \"Added tp_coop_progress_test.cc that runs in CI perf-canary; test is gated and uses synthetic model to reproduce compute-bound kernels.\" - Reviewer follow-up: \"Make sure affinity evictions are logged at debug level and provide a simple command to dump current affinity map.\" \u2014 Maya: \"Added /api/v1/runtime/affinity_dump endpoint and debug logs.\"\n\nCI summary: - Initial push: linux-build: pass, unit-tests: pass, integration (perf-canary): fail (flaky timing in tp_coop_progress_test on older driver image) - After addressing test timing and adding driver check: re-run CI: linux-build: pass, unit-tests: pass, integration (perf-canary): pass, e2e-smoke: pass.\n\nBenchmark results (internal perf canary, 8 GPU TP, seq_len=1024, batch_size=8): - baseline (main): P50 latency = 210ms, throughput = 120 reqs/s - this PR: P50 latency = 181ms (-14%), throughput = 131 reqs/s (+9%), p95 improved by ~10% - micro-reduction path helped 80% of small-layer collectives, host_reduce_bytes metric typical value ~4.6MB during steady-state.\n\nRollout and flags: - Feature is behind enable_coop_progress (default false). - We added runtime guards to disable host_reduce if hbm/host memory pressure is reported. - affinity_mode defaults to auto; operators can set pinned per-model.\n\nObservability and ops guidance: - Metrics committed; dashboards in redwood/observability-pack recommended. - If you see increased host memory, lower host_reduce_threshold_bytes or disable host buffering.\n\nBackwards compatibility and risk: - No protocol-breaking changes to network or persistence. - Small risk: on very old drivers NCCL might not support the progress hooks; we detect and fallback to existing behavior.\n\nTests: - Unit tests for progress lifecycle and host buffer aggregation. - Integration perf-canary test ensures improvement and guards against regressions.\n\nDocs: - docs/runtime/coop_progress.md explains flags, safety, and troubleshooting.\n\nMerge outcome: - Approved by reviewers (Carlos Rivera, Lena Patel); auto-merge used squash strategy. - Deploy: staged rollout to dedicated clusters started 2026-02-26; monitoring dashboards show expected improvement.\n\nAdditional context: Linked Linear ENG-6122 tracked the TP perf initiative; ENG-6201 was the kvcache prefetch followup. SUP-1322 referenced a customer report that motivated the cooperative progress exploration.\n\nNotes for follow-ups: - Investigate tighter integration with driver-level async progress when available to reduce host thread overhead. - Explore adaptive host buffer sizing based on real-time host memory pressure. - Consider exposing per-model affinity overrides in the console. ",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_aa1137f242a545f7a280aaf94759174a"
+}

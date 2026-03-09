@@ -1,0 +1,49 @@
+{
+  "meeting_id": "ff-20250422-6b3a",
+  "recorded_at": "2025-04-22T15:00:00Z",
+  "duration_minutes": "58",
+  "call_type": "technical_deep_dive",
+  "title": "Warmstart sequencing & tokenflow optimization sync",
+  "redwood_owner": "Alex Kim",
+  "redwood_attendees": [
+    "Alex Kim (AE)",
+    "Priya Nair (SE)"
+  ],
+  "customer_company": "NebulaMaps",
+  "customer_attendees": [
+    "Jordan Li (Platform Eng)",
+    "Maya Singh (CTO)",
+    "Diego Ramos (SRE)"
+  ],
+  "transcription_quality": "medium",
+  "competitors_mentioned": [
+    "NVIDIA Triton",
+    "AWS Bedrock",
+    "internal on-prem runtime"
+  ],
+  "crm_deal_id": "DEAL-83921",
+  "summary": "Deep dive on warm-starting sequences, token caps to mitigate tail latency, scheduler knobs for continuous batching, and practical quantization tradeoffs for NebulaMaps private deployment in their VPC.",
+  "topics": "warmstart seq packing, max_num_seqs, token_limit strategies, KV cache warm-hitrate, continuous batching windowing, quantization vs accuracy, VPC networking implications",
+  "action_items": [
+    "Alex: share recommended scheduler config (max_num_seqs, batch_window_ms, token_soft_cap) - due 2025-04-25",
+    "Jordan: run synthetic traffic mix (70% short, 30% long) against current staging and send logs - due 2025-04-29",
+    "Priya: produce a short KV cache warmup script and k-v hitrate test harness - due 2025-04-24"
+  ],
+  "next_steps": [
+    "Redwood to send tuned scheduler example and a 1-page runbook",
+    "Customer to schedule 2-hour pilot benchmark with Redwood SEs next week",
+    "Exchange access to staging telemetry (prometheus + p99 traces)"
+  ],
+  "transcript": "Meeting header:\nDate: 2025-04-22\nStart: 15:00 UTC\nDuration: 58 minutes\nAttendees: Alex Kim (Redwood AE), Priya Nair (Redwood SE), Jordan Li (NebulaMaps Platform), Maya Singh (CTO), Diego Ramos (SRE)\n\n--- Summary (auto) ---\nShort: focused on reducing tail latency from long-token requests by combining token caps with sequence warmstarts and scheduler tweaks. Some noisy ASR artifacts, some acronyms mangled (k v cache -> k v cache).\n\n[00:00] Alex: hey everyone, thanks for carving out the time, we'll jump right in. quick round, Alex from Redwood, Priya my SE, Jordan, Maya, Diego with NebulaMaps?\n[00:08] Jordan: yep that's us, thanks. we're mainly worried about p95/p99 latency spikes when clients send long multi-paragraph prompts.\n[00:15] Priya: right, and you mentioned on the form you're on a private VPC deployment with reserved GPUs and an on-premish network path?\n[00:22] Maya: correct. it's hosted in our VPC with private nodes, the network is fine but we see these long-tail token storms during peak ingest.\n[00:30] Diego: and it's worse when the KV cache is cold, we get p99s up to 3.8s even though median is 120ms.\n\n[00:45] Alex: okay, so agenda: 1) warmstart sequencing and seq-packing tradeoffs, 2) scheduler knobs like max_num_seqs and batch_window_ms, 3) token caps and graceful truncation, 4) KV cache warmup patterns, 5) quantization impact on throughput/latency.\n\n[01:05] Priya: start with a quick mental model: continuous batching tries to form batches without blocking short requests, so we set a small window (e.g., 10-30ms) then fallback to immediate execution when window expires. if a long request holds the KV cache cold it can dominate.\n[01:22] Jordan: can you clarify how max_num_seqs interacts with long sequences? we currently set it to 8 per GPU session.\n[01:30] Priya: good question. max_num_seqs limits concurrent active sequences on the model instance. if you have one long 2k-token seq it can monopolize KV cache and eviction pressure; lowering max_num_seqs reduces concurrency and can improve tail but lowers throughput.\n[01:44] Maya: so what knobs do you recommend to avoid the long tail without slashing throughput?\n\n[01:50] Priya: a couple patterns we've seen: 1) soft token caps \u2014 e.g., token_soft_cap=1024 which triggers heuristic streaming and early KV persist but doesn't hard drop; 2) preemptible long-request lane \u2014 detect requests > X tokens and route to a separate pool with higher max_num_seqs but lower priority; 3) sequence warmstart \u2014 replay last K tokens into KV to speed cold-cache long continuations.\n\n[02:12] Diego: sequence warmstart \u2014 can you expand? sounds like pre-populating the KV cache?\n[02:16] Priya: exactly. if you can send a lightweight 'warm' request that primes the KV with prefixes common to your workload, latency drops for the first real heavy request. warmstart is most effective when your prompt shapes are repeatable across sessions (e.g., system + user template).\n\n[02:30] Jordan: do we need to store raw prompts in Redwood or can this be client-side? we care about PII.\n\n[02:35] Alex: can be client-side or hashed prefixes. we support hashed prefix warmups so no raw content stored server-side \u2014 but you need consistent deterministic prefixing so caches hit. security wise, that's compatible with your VPC/on-prem constraint.\n\n[02:48] Maya: what's the expected improvement numbers?\n\n[02:51] Priya: depending on pattern, warmstart + token_soft_cap reduced p99 by 30-60% in our internal tests on similar models; throughput per GPU stayed within 80-95% of baseline because we avoid long tail retries. Important: measure p50/p95/p99 pre and post.\n\n[03:08] Diego: about max_num_seqs \u2014 we tried to raise it to 16 to increase throughput but saw more spikes. is that because of cache thrash?\n\n[03:15] Priya: yes, higher concurrency increases KV cache churn. With small sequence sizes, higher max_num_seqs helps. With a mix including long sequences, you hit more eviction and memory pressure. One approach: adaptive governor that reduces max_num_seqs when recent average seq length exceeds threshold.\n\n[03:30] Jordan: that sounds complex to maintain. do you have an out-of-the-box adaptive profile?\n\n[03:34] Alex: we have a 'mixed-workload' preset that uses heuristics: batch_window_ms 20, max_num_seqs 8, token_soft_cap 1024, separate long-request pool with max_num_seqs 4 and lower weight. We can share the YAML.\n\n[03:49] Maya: we need exact sample config, please.\n\n[03:52] Alex: yes will send.\n\n[04:00] Priya: another critical point is token limits and graceful truncation \u2014 if a request arrives with 6k tokens, you either 1) stream partial and continue, 2) reject with guidance, or 3) route to an off-peak pool. We advise token_soft_cap + client-side streaming to avoid single canonical long request taking a full slot.\n\n[04:22] Diego: how does continuous batching interact with function calling or streaming? our app uses function-like structured outputs.\n\n[04:27] Priya: streaming complicates batching because you can't finalize the response until streaming completes; we implement early partial flushing \u2014 partial tokens are emitted while the remaining output is processed in a background smaller-batch path. There's a latency cost but it keeps throughput stable.\n\n[04:45] Jordan: KPI question: how to tune to hit p95 < 500ms while keeping cost target?\n\n[04:50] Priya: you need to define request mix. Example profile: 60% sub-128 tokens, 30% 128-512, 10% >512. For that mix, recommended: batch_window_ms 12-20, max_num_seqs 10, token_soft_cap 768, kv_cache_prefetch true. That usually gives p95 ~350-600ms depending on model/quantization. If >30% long requests, consider separate pool for longs.",
+  "transcript_continued": "[05:10] Maya: quantization \u2014 we were considering int8 to save cost. what's the impact on token latency?\n[05:15] Priya: int8 can reduce memory and increase throughput but often increases token compute latency slightly or introduces accuracy drift. For many production workloads, q4_0 or q4_f16 mixed configs give a better tradeoff. If latency is the dominant SLO, int8 can help by allowing higher batch sizes without memory thrash.\n[05:34] Diego: anything special for VPC/on-prem networking? we use eBPF-based routing and have occasional pod eviction windows.\n[05:40] Alex: for VPC, keep an eye on connect churn and how long the TLS handshake takes for short requests \u2014 reuse connections and socket pooling helps. Also, when autoscaling nodes in private deployments, warmstart the KV caches on new nodes with a background prefetch to avoid p99 spikes during scale-up.\n[05:58] Jordan: are there metrics we should expose to measure effectiveness?\n[06:02] Priya: instrument p50/p95/p99 tokens-per-second, avg seq length, kv_cache_hitrate, batch_fill_rate, batch_window_ms distribution, queue_time_ms. We'll provide a Grafana dashboard sample.\n[06:15] Diego: any gotchas \u2014 e.g., scheduler kernel selection or CUDA settings?\n[06:19] Priya: ensure your driver stack is modern and kernel params allow hugepages; but the big knob is the runtime 'batch_scheduler' version: v2 (continuous batching) vs v1 (micro-batch gated). v2 is better for mixed loads but needs tuned 'idle_wait' to avoid harming short tail.\n[06:36] Alex: quick demo idea: we can run two short benchmarks, baseline and tuned. Priya will join your staging and run the tuned config while you produce the synthetic mix.\n[06:45] Maya: schedule it next week please.\n[06:48] Diego: small note: ASR sometimes shows k v as 'kay vee' or 'k v' spelled oddly. ignore that in logs.\n[06:55] Priya: lol noted.\n\n--- Closing recap ---\nAlex: we'll send the scheduler YAML and 1-pager by Friday; Priya will provide the small warmup script; Jordan/Diego run the synthetic workload, we'll reconvene after the pilot.\n\n--- End of transcript ---\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "topics",
+    "action_items",
+    "next_steps",
+    "transcript",
+    "transcript_continued"
+  ],
+  "dataset_doc_uuid": "dsid_426b1a5a641c4c38b7e869db22eeb5c9"
+}

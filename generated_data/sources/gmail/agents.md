@@ -8,6 +8,7 @@ File name format:
 File names should include the date in a concatenated style followed by a description of the topic of the thread (e.g. 20250625-marketing-kpi-review.json).
 
 Content rules:
+- All of the emails must be in an inbox, the files cannot be directly at the top level under gmail.
 - This directory contains Gmail exports for a restricted set of Redwood Inference employees:
   - managers
   - sales roles

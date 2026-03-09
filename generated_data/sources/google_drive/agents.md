@@ -29,6 +29,7 @@ Content rules:
   - Which team or function created it (eng subteam, product area, CS, finance/legal, people ops, GTM)
   - Links/references to Confluence pages, Jira/Linear tickets, GitHub PRs, Slack threads, and external docs
 - It’s acceptable for Drive docs to overlap in content with Confluence, but Drive tends to show earlier drafts and more iterative collaboration.
+- It is very very rare for there to be files under the "users" directory, it is almost always in a shared drive.
 
 Metadata rules:
 - Every document must include:

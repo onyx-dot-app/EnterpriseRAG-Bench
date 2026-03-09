@@ -8,6 +8,7 @@ File name format:
 The documents must include the date and meeting title in the format of 2025-01-28-meeting-title.json (e.g. 2024-09-18-redwood-discovery-with-nvidia.json).
 
 Content rules:
+- All of the documents must be associated with one of the workspaces (directories), they cannot be at the top level directly under fireflies.
 - Documents in this directory are Fireflies.ai meeting artifacts, specifically call transcripts.
 - The vast majority of calls are sales-related and fall into these common categories:
   - discovery
