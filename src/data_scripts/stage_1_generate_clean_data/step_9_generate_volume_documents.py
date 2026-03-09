@@ -182,19 +182,25 @@ def get_total_docs_for_source(source_type: str, quiet: bool = False) -> int:
 
 def get_source_tree(source_type: str) -> str:
     """
-    Get the directory tree for a specific source type.
+    Get the directory tree for a specific source type, rooted at sources/.
 
     Args:
         source_type: Name of the source type (e.g., "confluence").
 
     Returns:
-        Tree output string for just that source directory.
+        Tree output string showing sources/<source_type>/... structure.
     """
     source_path = os.path.join(SOURCES_DIR, source_type)
     if not os.path.exists(source_path):
         return f"(Source directory not found: {source_type})"
 
-    return get_directory_tree(source_path)
+    tree = get_directory_tree(source_path)
+    # Prefix with sources/ root so the LLM sees the full path from sources/
+    lines = tree.split("\n")
+    indented_lines = ["sources/", f"└── {lines[0]}"]
+    for line in lines[1:]:
+        indented_lines.append(f"    {line}")
+    return "\n".join(indented_lines)
 
 
 def validate_volume_json(json_str: str) -> str | None:
@@ -986,7 +992,6 @@ def generate_single_document(
     system_prompt = DOCUMENT_GENERATION_PROMPT.format(
         company_overview=company_overview,
         source_type=source_tree,
-        source_type_dir=source_type,
         agents_md_contents=agents_md_contents,
         existing_docs=existing_docs_str,
         topic_and_subtopics=topic_and_subtopics,
@@ -995,7 +1000,6 @@ def generate_single_document(
     # Build the user prompt
     user_prompt = DOCUMENT_GENERATION_USER_PROMPT.format(
         topic_and_subtopics=topic_and_subtopics,
-        source_type_dir=source_type,
     )
 
     for retry in range(max_retries):

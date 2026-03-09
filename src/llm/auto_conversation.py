@@ -121,29 +121,32 @@ def run_auto_conversation(
                         Message(role="tool_call", content="", tool_call=tool_call)
                     )
 
-                    try:
-                        with _braintrust_span(tool_call.name, span_type="tool") as tool_span:
+                    termination_signal: ToolTerminationSignal | None = None
+
+                    with _braintrust_span(tool_call.name, span_type="tool") as tool_span:
+                        try:
                             result = tool_runner.run(tool_call.name, **tool_call.args)
-                            _log_to_span(
-                                tool_span,
-                                input=tool_call.args,
-                                output=result,
-                            )
-                    except ToolTerminationSignal as sig:
-                        # Tool signaled successful completion — append result and return
-                        messages.append(
-                            Message(role="tool_result", content=sig.result, call_id=tool_call.call_id)
-                        )
+                        except ToolTerminationSignal as sig:
+                            # Capture signal but don't propagate through context manager
+                            result = sig.result
+                            termination_signal = sig
                         _log_to_span(
-                            conversation_span,
-                            output=sig.result,
-                            metadata={"total_steps": step, "tool_cycles": tool_cycles, "terminated_by_tool": True},
+                            tool_span,
+                            input=tool_call.args,
+                            output=result,
                         )
-                        return sig.result
 
                     messages.append(
                         Message(role="tool_result", content=result, call_id=tool_call.call_id)
                     )
+
+                    if termination_signal is not None:
+                        _log_to_span(
+                            conversation_span,
+                            output=result,
+                            metadata={"total_steps": step, "tool_cycles": tool_cycles, "terminated_by_tool": True},
+                        )
+                        return result
                 continue
 
             # No tool calls = final response

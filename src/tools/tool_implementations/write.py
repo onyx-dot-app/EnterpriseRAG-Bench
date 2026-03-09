@@ -315,9 +315,6 @@ class WriteTool(ToolInterface):
         if not file_path:
             return "Error: No file path provided. Please specify a valid .json file path."
 
-        # Track original path for error messages
-        original_path = file_path
-
         # Validate path format using existing utilities
         if self._expected_source_type:
             path_error = validate_source_path(file_path, self._expected_source_type)
