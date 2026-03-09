@@ -1112,7 +1112,7 @@ def get_pending_work_items(
     return work
 
 
-def generate_documents(company_overview: str, parallelism: int = 10) -> None:
+def generate_documents(company_overview: str, parallelism: int = 10, doc_limit: int | None = None) -> None:
     """
     Phase 3: Generate documents for all sources based on volume files.
 
@@ -1122,6 +1122,7 @@ def generate_documents(company_overview: str, parallelism: int = 10) -> None:
     Args:
         company_overview: Company overview content.
         parallelism: Maximum number of documents to generate in parallel.
+        doc_limit: Maximum total documents to generate (None for no limit).
     """
     print()
     print("=" * 40)
@@ -1133,6 +1134,8 @@ def generate_documents(company_overview: str, parallelism: int = 10) -> None:
     print("      the total number of documents to generate.")
     print()
     print(f"Parallelism: {parallelism} (max 1 per leaf topic at a time)")
+    if doc_limit is not None:
+        print(f"Document limit: {doc_limit}")
     print()
 
     if not os.path.exists(VOLUME_DIR):
@@ -1169,9 +1172,12 @@ def generate_documents(company_overview: str, parallelism: int = 10) -> None:
         print("No sources have pending documents to generate.")
         return
 
+    effective_total = total_pending if doc_limit is None else min(total_pending, doc_limit)
     print(f"Found {len(source_contexts)} source(s) with {total_pending} pending document(s):")
     for source_type, ctx in source_contexts.items():
         print(f"  - {source_type}: {ctx['pending']} documents")
+    if doc_limit is not None and doc_limit < total_pending:
+        print(f"\nDocument limit: will generate at most {doc_limit} of {total_pending} pending documents.")
     print()
 
     # Track active topics and results
@@ -1183,14 +1189,25 @@ def generate_documents(company_overview: str, parallelism: int = 10) -> None:
 
     with ThreadPoolExecutor(max_workers=parallelism) as executor:
         futures: dict = {}
-        pbar = tqdm(total=total_pending, desc="Generating documents")
+        pbar = tqdm(total=effective_total, desc="Generating documents")
 
         while True:
             # Get pending work items (sorted by source for same-source priority)
             pending_work = get_pending_work_items(source_contexts, active_topics, active_lock)
 
+            # Check if we've hit the document limit
+            if doc_limit is not None and (total_success + total_fail) >= doc_limit:
+                # Cancel remaining futures and break
+                for f in futures:
+                    f.cancel()
+                break
+
             # Submit new work up to available slots
             available_slots = parallelism - len(futures)
+            if doc_limit is not None:
+                # Don't submit more than remaining limit
+                remaining_limit = doc_limit - (total_success + total_fail + len(futures))
+                available_slots = min(available_slots, remaining_limit)
             submitted = 0
 
             for source_type, topic_path, topic_parts in pending_work:
@@ -1286,6 +1303,12 @@ def main() -> None:
         type=int,
         default=10,
         help="Number of documents to generate in parallel in Phase 3 (default: 10)",
+    )
+    parser.add_argument(
+        "--doc-limit",
+        type=int,
+        default=None,
+        help="Maximum total number of documents to generate in Phase 3 (default: no limit)",
     )
     args = parser.parse_args()
 
@@ -1418,6 +1441,7 @@ def main() -> None:
     generate_documents(
         company_overview=company_overview,
         parallelism=args.doc_parallelism,
+        doc_limit=args.doc_limit,
     )
 
     # Final warnings
