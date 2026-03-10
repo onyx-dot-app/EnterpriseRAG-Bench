@@ -2,11 +2,14 @@
 
 Unlike step 1 (pure random), this uses an LLM to pick a plausible but
 non-ideal directory for each selected document within the same source type.
+Files are processed in parallel across all source types.
 """
 
 import argparse
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 
 from src.llm import Message, get_llm
 from src.paths import SOURCES_DIR, SOURCE_TREE_PATH
@@ -32,9 +35,7 @@ def get_source_tree() -> str:
 
 
 def get_source_type_tree(source_type: str) -> str:
-    """Extract the directory tree for a single source type from the full tree.
-
-    Falls back to generating it directly if the cached tree isn't available.
+    """Get the directory tree for a single source type.
 
     Args:
         source_type: Name of the source type (e.g. "confluence").
@@ -76,6 +77,10 @@ def collect_json_files(source_type_dir: str) -> list[str]:
 def validate_proposed_dir(proposed_dir: str, source_type: str) -> str | None:
     """Validate that a proposed directory exists under the source type.
 
+    Checks the path as-is first (expecting source_type/... format), then
+    falls back to prepending the source type directory in case the LLM
+    omitted it.
+
     Args:
         proposed_dir: The LLM's proposed directory path.
         source_type: Name of the source type.
@@ -83,33 +88,27 @@ def validate_proposed_dir(proposed_dir: str, source_type: str) -> str | None:
     Returns:
         Absolute path to the directory if valid, None otherwise.
     """
-    cleaned = proposed_dir.strip("`\"' \n")
+    cleaned = proposed_dir.strip("`\"' \n/")
 
-    # Strip leading sources/ or source_type/ prefixes the LLM might include
-    prefixes = [
-        f"sources/{source_type}/",
-        f"sources/{source_type}",
-        f"{source_type}/",
-        f"{source_type}",
-    ]
-    for prefix in prefixes:
-        if cleaned.startswith(prefix):
-            cleaned = cleaned[len(prefix):]
-            break
-
-    # Remove leading/trailing slashes
-    cleaned = cleaned.strip("/")
+    # Strip leading "sources/" if present (we only store under SOURCES_DIR)
+    if cleaned.startswith("sources/"):
+        cleaned = cleaned[len("sources/"):]
 
     source_type_dir = os.path.join(SOURCES_DIR, source_type)
 
-    if cleaned:
-        abs_dir = os.path.join(source_type_dir, cleaned)
-    else:
-        # LLM returned just the source type root
-        abs_dir = source_type_dir
+    # First: check if path already includes the source type prefix
+    # (e.g. "confluence/eng-infra/some-topic")
+    abs_with_sources = os.path.join(SOURCES_DIR, cleaned)
+    if cleaned.startswith(f"{source_type}/") or cleaned == source_type:
+        if os.path.isdir(abs_with_sources):
+            return abs_with_sources
 
-    if os.path.isdir(abs_dir):
-        return abs_dir
+    # Fallback: treat as relative to the source type directory
+    # (e.g. "eng-infra/some-topic" -> SOURCES_DIR/confluence/eng-infra/some-topic)
+    abs_with_prefix = os.path.join(source_type_dir, cleaned)
+    if os.path.isdir(abs_with_prefix):
+        return abs_with_prefix
+
     return None
 
 
@@ -132,25 +131,23 @@ def pick_directory_with_llm(
     Returns:
         Absolute path to the chosen directory, or None on failure.
     """
+    # Include source type in the path shown to the LLM
+    file_path_with_source = f"{source_type}/{file_path}"
+
     prompt = SHUFFLE_PROMPT.format(
-        file_path=file_path,
+        file_path=file_path_with_source,
         file_contents=file_contents,
         source_directory_structure=source_tree,
     )
 
-    llm = get_llm(tools=None, quiet=False)
+    llm = get_llm(tools=None, quiet=True)
     messages: list[Message] = [Message(role="user", content=prompt)]
 
     for attempt in range(max_attempts):
-        if attempt > 0:
-            print(f"    Attempt {attempt + 1}/{max_attempts}...")
-
         response = ""
         for chunk in llm.generate(messages):
             if isinstance(chunk, str):
-                print(chunk, end="", flush=True)
                 response += chunk
-        print()
 
         abs_dir = validate_proposed_dir(response.strip(), source_type)
         if abs_dir is not None:
@@ -160,7 +157,6 @@ def pick_directory_with_llm(
             )
             if abs_dir != current_dir:
                 return abs_dir
-            print("    LLM chose the same directory as the original, retrying...")
 
         if attempt < max_attempts - 1:
             messages.append(Message(role="assistant", content=response.strip()))
@@ -232,84 +228,85 @@ def move_and_tag_file(
 
 
 # =============================================================================
-# Per-Source Shuffle
+# Single File Processing (unit of parallel work)
 # =============================================================================
 
 
-def shuffle_source_type(
-    source_type: str,
-    percentage: float,
-) -> tuple[int, int]:
-    """Shuffle a percentage of documents within a source type using the LLM.
+@dataclass
+class ShuffleTask:
+    """A single file to be shuffled."""
+
+    file_path_abs: str
+    source_type: str
+    source_tree: str
+
+
+@dataclass
+class ShuffleResult:
+    """Result of processing a single shuffle task."""
+
+    source_type: str
+    rel_original: str
+    rel_new: str | None
+    error: str | None
+
+
+def process_single_file(task: ShuffleTask) -> ShuffleResult:
+    """Process a single file: ask LLM for destination, then move it.
 
     Args:
-        source_type: Name of the source type directory.
-        percentage: Percentage of files to shuffle (0-100).
+        task: The shuffle task describing the file to process.
 
     Returns:
-        (moved_count, total_count) tuple.
+        A ShuffleResult with the outcome.
     """
-    source_type_dir = os.path.join(SOURCES_DIR, source_type)
-    json_files = collect_json_files(source_type_dir)
+    source_type_dir = os.path.join(SOURCES_DIR, task.source_type)
+    rel_path = os.path.relpath(task.file_path_abs, source_type_dir)
 
-    total = len(json_files)
-    if total == 0:
-        print(f"  No JSON files found in {source_type}")
-        return 0, 0
-
-    num_to_move = max(1, round(total * percentage / 100))
-    selected = random.sample(json_files, min(num_to_move, total))
-
-    print(f"  {total} documents, shuffling {len(selected)} ({percentage}%)")
-
-    source_tree = get_source_type_tree(source_type)
-
-    moved = 0
-    errors: list[str] = []
-
-    for i, file_path_abs in enumerate(selected, 1):
-        rel_path = os.path.relpath(file_path_abs, source_type_dir)
-        print(f"\n  [{i}/{len(selected)}] {rel_path}")
-
-        # Load file contents for the LLM prompt
-        try:
-            file_contents = load_file(file_path_abs)
-        except Exception as e:
-            print(f"    Error reading file: {e}")
-            errors.append(f"{rel_path}: {e}")
-            continue
-
-        dest_dir = pick_directory_with_llm(
-            file_path=rel_path,
-            file_contents=file_contents,
-            source_type=source_type,
-            source_tree=source_tree,
+    # Load file contents for the LLM prompt
+    try:
+        file_contents = load_file(task.file_path_abs)
+    except Exception as e:
+        return ShuffleResult(
+            source_type=task.source_type,
+            rel_original=rel_path,
+            rel_new=None,
+            error=f"{rel_path}: {e}",
         )
 
-        if dest_dir is None:
-            msg = f"{rel_path}: LLM failed to pick a valid directory after 5 attempts"
-            print(f"    ERROR: {msg}")
-            errors.append(msg)
-            continue
+    dest_dir = pick_directory_with_llm(
+        file_path=rel_path,
+        file_contents=file_contents,
+        source_type=task.source_type,
+        source_tree=task.source_tree,
+    )
 
-        new_path = move_and_tag_file(file_path_abs, dest_dir, source_type)
+    if dest_dir is None:
+        return ShuffleResult(
+            source_type=task.source_type,
+            rel_original=rel_path,
+            rel_new=None,
+            error=f"{rel_path}: LLM failed to pick a valid directory after 5 attempts",
+        )
 
-        if new_path:
-            rel_new = os.path.relpath(new_path, SOURCES_DIR)
-            rel_original = os.path.relpath(file_path_abs, SOURCES_DIR)
-            print(f"    Moved: {rel_original} -> {rel_new}")
-            moved += 1
-        else:
-            errors.append(f"{rel_path}: failed to move file")
+    new_path = move_and_tag_file(task.file_path_abs, dest_dir, task.source_type)
 
-    if errors:
-        print(f"\n  Errors ({len(errors)}):")
-        for err in errors[:10]:
-            print(f"    - {err}")
-        if len(errors) > 10:
-            print(f"    ... and {len(errors) - 10} more")
+    if new_path:
+        rel_new = os.path.relpath(new_path, SOURCES_DIR)
+        rel_original = os.path.relpath(task.file_path_abs, SOURCES_DIR)
+        return ShuffleResult(
+            source_type=task.source_type,
+            rel_original=rel_original,
+            rel_new=rel_new,
+            error=None,
+        )
 
-    return moved, total
+    return ShuffleResult(
+        source_type=task.source_type,
+        rel_original=rel_path,
+        rel_new=None,
+        error=f"{rel_path}: failed to move file",
+    )
 
 
 # =============================================================================
@@ -328,6 +325,12 @@ def main() -> None:
         help="Percentage of documents to shuffle within each source type (default: 5)",
     )
     parser.add_argument(
+        "--parallelism",
+        type=int,
+        default=50,
+        help="Number of files to process in parallel (default: 50)",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -338,6 +341,7 @@ def main() -> None:
     print("Step 2: LLM-Based Shuffle")
     print("=" * 40)
     print(f"Shuffling {args.percentage}% of documents per source type using LLM.")
+    print(f"Parallelism: {args.parallelism}")
     print()
 
     if args.seed is not None:
@@ -352,17 +356,79 @@ def main() -> None:
         if os.path.isdir(os.path.join(SOURCES_DIR, entry))
     )
 
-    total_moved = 0
+    # Build all tasks across all source types
+    tasks: list[ShuffleTask] = []
     total_docs = 0
 
     for source_type in source_types:
-        print(f"\n[{source_type}]")
-        moved, count = shuffle_source_type(source_type, args.percentage)
-        total_moved += moved
-        total_docs += count
+        source_type_dir = os.path.join(SOURCES_DIR, source_type)
+        json_files = collect_json_files(source_type_dir)
 
+        total = len(json_files)
+        total_docs += total
+
+        if total == 0:
+            print(f"[{source_type}] No JSON files found, skipping")
+            continue
+
+        # Check for nested directories
+        has_subdirs = any(
+            os.path.isdir(os.path.join(source_type_dir, entry))
+            for entry in os.listdir(source_type_dir)
+        )
+        if not has_subdirs:
+            print(f"[{source_type}] No nested directories, skipping")
+            continue
+
+        num_to_move = max(1, round(total * args.percentage / 100))
+        selected = random.sample(json_files, min(num_to_move, total))
+        source_tree = get_source_type_tree(source_type)
+
+        print(f"[{source_type}] {total} documents, selected {len(selected)} ({args.percentage}%)")
+
+        for file_path_abs in selected:
+            tasks.append(ShuffleTask(
+                file_path_abs=file_path_abs,
+                source_type=source_type,
+                source_tree=source_tree,
+            ))
+
+    if not tasks:
+        print("\nNo files to shuffle.")
+        return
+
+    print(f"\nProcessing {len(tasks)} files with parallelism={args.parallelism}...")
+    print()
+
+    # Process all tasks in parallel
+    moved = 0
+    errors: list[str] = []
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=args.parallelism) as executor:
+        futures = {executor.submit(process_single_file, task): task for task in tasks}
+
+        for future in as_completed(futures):
+            completed += 1
+            result = future.result()
+
+            if result.error:
+                errors.append(f"[{result.source_type}] {result.error}")
+                print(f"  [{completed}/{len(tasks)}] FAILED: [{result.source_type}] {result.rel_original}")
+            else:
+                moved += 1
+                print(f"  [{completed}/{len(tasks)}] Moved: {result.rel_original} -> {result.rel_new}")
+
+    # Summary
     print("\n" + "=" * 40)
-    print(f"Done. Moved {total_moved} of {total_docs} total documents.")
+    print(f"Done. Moved {moved} of {len(tasks)} selected ({total_docs} total documents).")
+
+    if errors:
+        print(f"\nErrors ({len(errors)}):")
+        for err in errors[:20]:
+            print(f"  - {err}")
+        if len(errors) > 20:
+            print(f"  ... and {len(errors) - 20} more")
 
 
 if __name__ == "__main__":
