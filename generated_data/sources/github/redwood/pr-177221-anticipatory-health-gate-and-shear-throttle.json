@@ -1,0 +1,44 @@
+{
+  "repo": "redwood",
+  "pr_number": "177221",
+  "title": "Introduce anticipatory health gate and shear-throttle for regional ingress stability",
+  "author": "Maya Patel",
+  "created_at": "2026-02-15",
+  "updated_at": "2026-02-20",
+  "merged_at": "2026-02-20",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/anticipatory-health-gate",
+  "reviewers": [
+    "Luca Romano",
+    "Priya Desai",
+    "Ethan Green"
+  ],
+  "labels": [
+    "runtime",
+    "sre",
+    "perf",
+    "hotfix",
+    "stability"
+  ],
+  "linked_linear": [
+    "ENG-1889",
+    "ENG-1896"
+  ],
+  "linked_jira": [
+    "SUP-412"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "416",
+  "deletions": "128",
+  "breaking_change": "false",
+  "release_notes": "Adds an anticipatory health gating layer and a graduated shear-throttle to smooth regional surges and reduce circuit flip frequency; exposes new metrics and rollout knobs.",
+  "description": "Context and motivation: We've observed recurrent rapid circuit flips and cross-region failovers during short inbound spikes that saturate KV pressure and trigger aggressive load-shedding. These events temporarily violate SLOs even when overall capacity would have handled most traffic if the load had been smoothed. This PR introduces two coordinated pieces: (1) an anticipatory health gate that evaluates short-term KV and queue pressure signals and holds admission for a short, configurable holdoff window; (2) a 'shear-throttle' \u2014 a graduated probabilistic rejecter that slices burst traffic by percentiles rather than binary circuit trips. Together these reduce oscillation, prevent cascading regional failovers, and keep the system in a stable degraded state while autoscaling and recovery occur.\n\nWhat changed (summary):\n- New admission controller module: agent/health_gate.{cpp,py} implementing a sliding-window forecast of KV pressure and request queuing; exposes decision diagnostics via /debug/health-gate.\n- Shear-throttle implementation in serving/runtime/throttle.{rs,go}: supports tiered probability curves keyed by tenant priority and route.\n- Telemetry: added metrics (health_gate_hold_time_seconds, shear_throttle_rejection_ratio, shear_throttle_decision_histogram) and tracing annotations when a request is held or probabilistically rejected.\n- Config: config/operations/antici_health_gate.yaml with default thresholds and canary rollout flags.\n- Tests: unit tests for decision logic and an integration test that replays a synthetic spike trace to assert fewer circuit state transitions.\n\nCommits (high level):\n- feat(health-gate): initial anticipatory gate and metric hooks (Maya P.)\n- feat(throttle): shear-throttle probabilistic backoff and tenant weighting (Maya P.)\n- test: deterministic spike replay integration and new CI job (Luca R.)\n- perf: lightweight sampling hook to avoid hot-path allocations (Ethan G.)\n- fix: adjust default thresholds after internal canary (Maya P.)\n\nFiles changed (high level):\n- serving/runtime/throttle.rs (new), serving/runtime/throttle.go (adapter), agent/health_gate.cpp, agent/health_gate.py, config/operations/antici_health_gate.yaml, infra/ci/spike-replay-test.yaml, telemetry/metrics_registry.yaml, tests/integration/spike_replay_test.py, docs/ops/health-gate.md, CHANGELOG.md, pkg/telemetry/exporter.go\n\nDesign notes and rationale:\n- Anticipatory gating uses a short-time autoregressive estimate of KV pressure and in-flight queue growth to predict when accepting a request would likely push a node over its soft pressure threshold within the next 200-800ms. Instead of immediate shedding, we gate for a small holdoff (configurable, default 250ms) and signal upstream clients with Retry-After and structured annotations so SDKs can apply jittered retries or fall back to a lower-cost model variant.\n- Shear-throttle reduces binary failure semantics. For each admission decision we compute a rejection probability that grows smoothly with the short-term forecasted pressure and tenant weight. High-priority tenants receive a lower slope; low-priority tenants see a steeper curve. This preserves fairness and reduces total rejected requests compared to abrupt circuit trips.\n- We intentionally keep the hot-path decision cheap: a small number of integer ops, a ring buffer read, and one exponent lookup for the sigmoid curve when enabled. There is an opt-out config for legacy critical paths.\n\nTesting and CI:\n- Unit tests cover gate decision boundaries and throttle curve shapes.\n- Integration spike_replay_test replays a recorded 30s burst (from last incident) and asserts: (a) 50% reduction in circuit flip count, (b) <5% additional tail latency regression on non-sheared requests, (c) correct telemetry tags set.\n- CI initially failed due to a flaky time-based test (infra/ci/spike-replay-test.yaml); flake fixed by switching to deterministic clock in tests and bumping the replay tolerance. Final CI: all checks passed (unit, lint, integration, perf-smoke).\n\nReview conversation (high level):\n- Luca Romano: \"Can we surface an opt-in canary per region and a fast kill switch? Also please add a per-tenant override for emergency customers.\"\n  - Maya: \"Added config flags and a kill-switch endpoint (POST /ops/health-gate/kill). Documented in docs/ops/health-gate.md. Per-tenant override implemented via tenant policy -> health_gate.enabled: false.\"\n- Priya Desai: \"Need clear SLO telemetry that ties rejections to tenant impact for billing/alerts.\"\n  - Maya: \"Added shear_throttle_rejection_ratio with tenant label and a dashboard link. Also added a Linear ticket to instrument alert thresholds.\"\n- Ethan Green: \"Concerned about allocations on hot path.\"\n  - Maya/Ethan: \"Added sampling hook and micro-optimizations in perf commit; measured 0.4% p50 CPU increase under synthetic load.\"\n- Final: approvals from Luca, Priya; Ethan approved after perf numbers.\n\nRollout plan:\n- Canary: enable in region us-west-2 with canary flags for 72h (config/operations/antici_health_gate.yaml has canary=true for that region). Monitor two dashboards (health-gate and shear-throttle).\n- Gradual ramp: 10% -> 30% -> 100% over 7 days if no regressions. If rejection_ratio for high-priority tenants exceeds 0.5% or circuit flip rate increases, rollback immediately.\n\nMonitoring and alerts added:\n- health_gate_hold_time_seconds P95 alert (>500ms sustained)\n- shear_throttle_rejection_ratio alert per-tenant (>2% sustained for 5m)\n- circuit_flip_rate decrease expected; if flip rate increases by >20% alert SRE-runbook.\n\nRollback plan: kill-switch endpoint and config revert via infra/ci/rollout-revert job. Additionally a feature-flag gate per region to disable without full deploy.\n\nBackward compatibility and migration:\n- Default off for private deployments (config flag) to avoid unexpected behavior on older runtimes. Hosted default is ON with conservative thresholds after successful internal canary.\n\nSecurity/Audit:\n- Kill-switch endpoint requires ops role and is audited. Added audit log entries for per-tenant overrides.\n\nWhy this is different from previous approaches:\n- Prior changes relied on reactive circuit breakers with hard thresholds. The anticipatory approach smooths transient spikes and prefers probabilistic degradation which empirically reduces SLO violations during recovery windows.\n\nFollow-ups (post-merge):\n- ENG-1896: tune curve parameters per-tenant cohort and instrument cost-savings per tenant.\n- ENG-1902: SDK guidance for Retry-After handling and lower-cost fallback templates.\n\nMerge notes: Squash-merged after approvals and CI green. Change was rolled out via canary to us-west-2 on 2026-02-18; full rollout completed 2026-02-20.\n\nReferences: Linear ENG-1889, ENG-1896; SUP-412 incident replay. Docs: docs/ops/health-gate.md.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_6c111c5b9e1649c38af01e7c4afa851b"
+}
