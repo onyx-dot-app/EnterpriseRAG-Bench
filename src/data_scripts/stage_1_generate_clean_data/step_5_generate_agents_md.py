@@ -52,7 +52,7 @@ def main() -> None:
             # Just update statistics and exit
             print("Updating statistics only...")
             agents_paths = find_agents_md_files(SOURCES_DIR)
-            update_statistics("Step 5: Agents MD", {
+            update_statistics("Stage 1: Generate Clean Data", "Step 5: Agents MD", {
                 "total_agents_md_files": len(agents_paths),
                 "paths": agents_paths,
             })
@@ -113,7 +113,7 @@ def main() -> None:
         """Handle finish signal."""
         # Update aggregate statistics
         agents_paths = find_agents_md_files(SOURCES_DIR)
-        update_statistics("Step 5: Agents MD", {
+        update_statistics("Stage 1: Generate Clean Data", "Step 5: Agents MD", {
             "total_agents_md_files": len(agents_paths),
             "paths": agents_paths,
         })

@@ -1543,7 +1543,7 @@ def _update_statistics() -> None:
         except Exception:
             pass
 
-    update_statistics("Step 9: Volume Tasks", {
+    update_statistics("Stage 1: Generate Clean Data", "Step 9: Volume Tasks", {
         "total_source_types": len(source_summaries),
         "total_topics": total_topics,
         "total_target_documents": total_target_docs,

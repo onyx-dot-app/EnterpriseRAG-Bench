@@ -528,7 +528,7 @@ def _update_statistics(cache: dict) -> None:
         source_type = d.split("/")[0] if "/" in d else "unknown"
         per_source[source_type] = per_source.get(source_type, 0) + 1
 
-    update_statistics("Step 3: Miscellaneous Files (Noise)", {
+    update_statistics("Stage 2: Add Noise", "Step 3: Miscellaneous Files", {
         "total_directories": len(directories),
         "total_files": len(files),
         "directories": directories,

@@ -226,7 +226,7 @@ def main() -> None:
     print("=" * 40)
     print(f"Done. Moved {total_moved} of {total_docs} total documents.")
 
-    update_statistics("Step 1: Random Shuffle (Noise)", {
+    update_statistics("Stage 2: Add Noise", "Step 1: Random Shuffle", {
         "total_documents": total_docs,
         "documents_moved": total_moved,
         "shuffle_percentage": args.percentage,

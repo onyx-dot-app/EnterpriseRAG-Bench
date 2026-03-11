@@ -1187,7 +1187,7 @@ def main() -> None:
 
     # Update aggregate statistics
     project_count = len([f for f in os.listdir(PROJECTS_DIR) if f.endswith(".json")])
-    update_statistics("Step 6: Projects", {
+    update_statistics("Stage 1: Generate Clean Data", "Step 6: Projects", {
         "total_projects": project_count,
     })
 

@@ -431,7 +431,7 @@ def main() -> None:
         if len(errors) > 20:
             print(f"  ... and {len(errors) - 20} more")
 
-    update_statistics("Step 2: LLM-Based Shuffle (Noise)", {
+    update_statistics("Stage 2: Add Noise", "Step 2: LLM-Based Shuffle", {
         "total_documents": total_docs,
         "documents_selected": len(tasks),
         "documents_moved": moved,

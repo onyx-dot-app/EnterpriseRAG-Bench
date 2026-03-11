@@ -17,7 +17,7 @@ def main() -> None:
     if os.path.exists(INITIATIVES_PATH):
         if not confirm_regenerate("Initiatives"):
             print("Updating statistics only...")
-            update_statistics("Step 2: Initiatives", {
+            update_statistics("Stage 1: Generate Clean Data", "Step 2: Initiatives", {
                 "status": f"Completed - see file at {INITIATIVES_PATH}",
             })
             print("Statistics updated.")
@@ -63,7 +63,7 @@ def main() -> None:
 
     # Update statistics if file was created
     if os.path.exists(INITIATIVES_PATH):
-        update_statistics("Step 2: Initiatives", {
+        update_statistics("Stage 1: Generate Clean Data", "Step 2: Initiatives", {
             "status": f"Completed - see file at {INITIATIVES_PATH}",
         })
 

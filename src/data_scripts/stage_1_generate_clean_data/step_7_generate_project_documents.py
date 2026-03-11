@@ -749,7 +749,7 @@ def main() -> None:
                 top_level = rel_path.split(os.sep)[0]
                 source_counts[top_level] += 1
                 total_docs += 1
-    update_statistics("Step 7: Documents", {
+    update_statistics("Stage 1: Generate Clean Data", "Step 7: Documents", {
         "total_documents": total_docs,
         "documents_per_source": dict(source_counts),
     })

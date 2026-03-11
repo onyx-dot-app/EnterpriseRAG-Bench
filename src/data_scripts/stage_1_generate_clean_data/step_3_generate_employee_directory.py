@@ -257,7 +257,7 @@ def main() -> None:
             print("Updating statistics only...")
             directory = load_employee_directory()
             total_employees = sum(len(emps) for emps in directory.departments.values())
-            update_statistics("Step 3: Employee Directory", {
+            update_statistics("Stage 1: Generate Clean Data", "Step 3: Employee Directory", {
                 "total_employees": total_employees,
                 "departments": len(directory.departments),
             })
@@ -318,7 +318,7 @@ def main() -> None:
             # Update aggregate statistics
             directory = load_employee_directory()
             total_employees = sum(len(emps) for emps in directory.departments.values())
-            update_statistics("Step 3: Employee Directory", {
+            update_statistics("Stage 1: Generate Clean Data", "Step 3: Employee Directory", {
                 "total_employees": total_employees,
                 "departments": len(directory.departments),
             })

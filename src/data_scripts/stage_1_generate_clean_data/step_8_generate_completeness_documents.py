@@ -327,7 +327,7 @@ def main() -> None:
 
     # Update statistics
     total_traces = count_existing_traces()
-    update_statistics("Step 8: Completeness Traces", {
+    update_statistics("Stage 1: Generate Clean Data", "Step 8: Completeness Traces", {
         "total_traces": total_traces,
         "traces_generated_this_run": traces_generated,
     })

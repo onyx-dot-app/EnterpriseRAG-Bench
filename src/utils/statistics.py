@@ -1,5 +1,6 @@
-"""Utility for tracking aggregate statistics across steps."""
+"""Utility for tracking aggregate statistics across pipeline stages and steps."""
 
+import json
 import os
 import re
 from datetime import datetime
@@ -8,97 +9,59 @@ from typing import Any
 from src.paths import AGGREGATE_STATISTICS_PATH
 
 
-def _format_value(key: str, value: Any) -> str:
-    """Format a single key-value pair for display."""
-    # Convert snake_case to Title Case
-    display_key = key.replace("_", " ").title()
-
-    if isinstance(value, list):
-        # Format list as indented items
-        lines = [f"{display_key}:"]
-        for item in value:
-            lines.append(f"  - {item}")
-        return "\n".join(lines)
-    elif isinstance(value, dict):
-        # Format dict as indented key-value pairs
-        lines = [f"{display_key}:"]
-        for k, v in sorted(value.items(), key=lambda x: -x[1] if isinstance(x[1], (int, float)) else 0):
-            lines.append(f"  - {k}: {v}")
-        return "\n".join(lines)
-    else:
-        return f"{display_key}: {value}"
+def _load_stats() -> dict[str, Any]:
+    """Load existing statistics JSON, or return empty structure."""
+    if os.path.exists(AGGREGATE_STATISTICS_PATH):
+        try:
+            with open(AGGREGATE_STATISTICS_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"last_updated": None}
 
 
-def _format_step_section(step_name: str, stats: dict[str, Any]) -> str:
-    """Format a step's statistics as a text section."""
-    lines = [f"## {step_name}"]
-    for key, value in stats.items():
-        lines.append(_format_value(key, value))
-    return "\n".join(lines)
+def _save_stats(data: dict[str, Any]) -> None:
+    """Save statistics JSON atomically."""
+    data["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    parent = os.path.dirname(AGGREGATE_STATISTICS_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp_path = AGGREGATE_STATISTICS_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, AGGREGATE_STATISTICS_PATH)
 
 
-def _parse_existing_stats(content: str) -> dict[str, str]:
+def _step_sort_key(step_name: str) -> int:
+    """Extract step number for sorting."""
+    match = re.search(r"Step (\d+)", step_name)
+    return int(match.group(1)) if match else 999
+
+
+def update_statistics(stage_name: str, step_name: str, stats: dict[str, Any]) -> None:
     """
-    Parse existing statistics file into sections by step name.
-
-    Returns dict mapping step names to their full section content.
-    """
-    sections: dict[str, str] = {}
-
-    # Split by step headers (## Step X: ...)
-    pattern = r"(## Step \d+: [^\n]+)"
-    parts = re.split(pattern, content)
-
-    # parts will be: [header_content, step1_name, step1_content, step2_name, step2_content, ...]
-    i = 1
-    while i < len(parts) - 1:
-        step_name = parts[i].replace("## ", "").strip()
-        step_content = parts[i + 1].strip()
-        sections[step_name] = f"## {step_name}\n{step_content}"
-        i += 2
-
-    return sections
-
-
-def update_statistics(step_name: str, stats: dict[str, Any]) -> None:
-    """
-    Update the aggregate statistics file with new stats from a step.
-
-    Reads existing file, updates/replaces the section for this step,
-    and writes back. Preserves other step sections.
+    Update the aggregate statistics file with new stats for a stage/step.
 
     Args:
-        step_name: Name of the step (e.g., "Step 3: Employee Directory")
-        stats: Dictionary of statistics to record
+        stage_name: Name of the stage (e.g., "Stage 1: Generate Clean Data").
+        step_name: Name of the step (e.g., "Step 3: Employee Directory").
+        stats: Dictionary of statistics to record.
     """
-    # Read existing content if file exists
-    existing_sections: dict[str, str] = {}
-    if os.path.exists(AGGREGATE_STATISTICS_PATH):
-        with open(AGGREGATE_STATISTICS_PATH) as f:
-            content = f.read()
-        existing_sections = _parse_existing_stats(content)
+    data = _load_stats()
 
-    # Update/add this step's section
-    existing_sections[step_name] = _format_step_section(step_name, stats)
+    if stage_name not in data:
+        data[stage_name] = {}
 
-    # Build output with header
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    header = f"""================================================================================
-AGGREGATE STATISTICS
-Last updated: {timestamp}
-================================================================================
-"""
+    data[stage_name][step_name] = stats
 
-    # Sort sections by step number
-    def step_sort_key(name: str) -> int:
-        match = re.search(r"Step (\d+)", name)
-        return int(match.group(1)) if match else 999
+    # Sort steps within each stage by step number
+    for stage_key in list(data.keys()):
+        if stage_key == "last_updated":
+            continue
+        stage_data = data[stage_key]
+        if isinstance(stage_data, dict):
+            data[stage_key] = dict(
+                sorted(stage_data.items(), key=lambda x: _step_sort_key(x[0]))
+            )
 
-    sorted_sections = sorted(existing_sections.items(), key=lambda x: step_sort_key(x[0]))
-
-    # Combine all sections
-    output = header + "\n" + "\n\n".join(section for _, section in sorted_sections) + "\n"
-
-    # Write output
-    with open(AGGREGATE_STATISTICS_PATH, "w") as f:
-        f.write(output)
+    _save_stats(data)

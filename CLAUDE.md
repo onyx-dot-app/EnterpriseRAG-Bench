@@ -40,7 +40,7 @@
 ### Other Utilities
 - **`cli.py`** - `confirm_yes_no()`, `confirm_regenerate()` - Interactive CLI prompts for user confirmation
 - **`dates.py`** - `get_current_date_formatted()` - Returns current date as "Month DD, YYYY"
-- **`statistics.py`** - `update_statistics()` - Tracks aggregate statistics across pipeline steps
+- **`statistics.py`** - `update_statistics(stage_name, step_name, stats)` - Tracks aggregate statistics across pipeline stages/steps (JSON format)
 - **`agents_md.py`** - `get_agents_md_for_source()`, `get_agents_md_for_path()` - Retrieves agents.md content for source types
 
 ## LLM Layer (`src/llm/`)

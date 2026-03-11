@@ -73,7 +73,7 @@ def main() -> None:
             # Regenerate source_tree.txt and update statistics
             write_source_tree()
             top_level, total = count_directories(SOURCES_DIR)
-            update_statistics("Step 4: Source Structure", {
+            update_statistics("Stage 1: Generate Clean Data", "Step 4: Source Structure", {
                 "top_level_directories": top_level,
                 "total_directories": total,
             })
@@ -146,7 +146,7 @@ def main() -> None:
         write_source_tree()
         # Update aggregate statistics
         top_level, total = count_directories(SOURCES_DIR)
-        update_statistics("Step 4: Source Structure", {
+        update_statistics("Stage 1: Generate Clean Data", "Step 4: Source Structure", {
             "top_level_directories": top_level,
             "total_directories": total,
         })
