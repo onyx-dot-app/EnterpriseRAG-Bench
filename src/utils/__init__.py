@@ -21,6 +21,16 @@ from src.utils.file_selection import (
 )
 from src.utils.json_extraction import extract_json_from_response
 from src.utils.json_recovery import JsonRecoveryError, try_recover_json
+from src.utils.questions import (
+    append_to_jsonl,
+    count_existing_questions,
+    extract_answer_facts,
+    generate_question,
+    get_existing_doc_uuids,
+    get_next_question_id,
+    load_document,
+    validate_question,
+)
 from src.utils.path_resolver import (
     PathResolver,
     default_resolver,
@@ -32,6 +42,8 @@ from src.utils.validation import validate_no_nested_dicts
 
 __all__ = [
     "add_dataset_doc_uuid",
+    "append_to_jsonl",
+    "count_existing_questions",
     "confirm_regenerate",
     "confirm_yes_no",
     "count_json_files",
@@ -40,17 +52,22 @@ __all__ = [
     "dir_has_json_files",
     "DocumentFieldError",
     "extract_document_content",
+    "extract_answer_facts",
     "extract_json_from_response",
     "generate_dataset_doc_uuid",
+    "generate_question",
+    "get_existing_doc_uuids",
     "get_agents_md_for_path",
     "get_agents_md_for_source",
     "get_current_date_formatted",
     "get_dataset_doc_uuid",
     "get_directory_tree",
+    "get_next_question_id",
     "get_documents_without_labels",
     "JsonRecoveryError",
     "label_document_fields",
     "label_single_document",
+    "load_document",
     "load_file",
     "load_json_file",
     "needs_reordering",
@@ -62,6 +79,7 @@ __all__ = [
     "sources_resolver",
     "try_recover_json",
     "validate_no_nested_dicts",
+    "validate_question",
     "validate_source_path",
     "write_json_file",
 ]

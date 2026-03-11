@@ -1,0 +1,255 @@
+"""Shared utilities for question generation scripts."""
+
+import json
+import os
+
+from src.llm import Message, get_llm
+from src.paths import QUESTIONS_PATH
+from src.prompts.answer_generation import SINGLE_DOCUMENT_ANSWER_GENERATION
+from src.prompts.question_fact_extraction import FACT_EXTRACTION_PROMPT
+from src.utils.document_content import DocumentFieldError, extract_document_content
+from src.utils.file_io import load_json_file
+from src.utils.json_extraction import extract_json_from_response
+from src.utils.path_resolver import sources_resolver
+
+
+def load_document(
+    doc_path: str,
+) -> tuple[bool, str, str | None, str | None, str | None]:
+    """
+    Load a document and extract its UUID, title, and content.
+
+    Args:
+        doc_path: Path to the document relative to SOURCES_DIR.
+
+    Returns:
+        (success, message, dataset_doc_uuid, title, content) tuple.
+        On failure, dataset_doc_uuid, title, and content are None.
+    """
+    full_path = sources_resolver.to_absolute(doc_path)
+
+    try:
+        doc_data = load_json_file(full_path)
+    except Exception as e:
+        return (False, f"Error loading document: {e}", None, None, None)
+
+    dataset_doc_uuid = doc_data.get("dataset_doc_uuid")
+    if not dataset_doc_uuid:
+        return (False, "Document missing 'dataset_doc_uuid'", None, None, None)
+
+    try:
+        title, content = extract_document_content(doc_data)
+    except DocumentFieldError as e:
+        return (False, str(e), None, None, None)
+
+    return (True, "OK", dataset_doc_uuid, title, content)
+
+
+def generate_question(
+    title: str,
+    content: str,
+    prompt_template: str,
+    quiet: bool = False,
+) -> str | None:
+    """
+    Generate a question for a document using the given prompt template.
+
+    Args:
+        title: Document title.
+        content: Document content.
+        prompt_template: Prompt template with {document_title} and {document_contents}.
+        quiet: If True, suppress LLM output.
+
+    Returns:
+        Generated question string, or None on failure.
+    """
+    prompt = prompt_template.format(
+        document_title=title,
+        document_contents=content,
+    )
+
+    llm = get_llm(tools=None, quiet=quiet)
+    messages: list[Message] = [Message(role="user", content=prompt)]
+
+    response = ""
+    for chunk in llm.generate(messages):
+        if isinstance(chunk, str):
+            if not quiet:
+                print(chunk, end="", flush=True)
+            response += chunk
+
+    if not quiet:
+        print()
+
+    question = response.strip()
+    return question if question else None
+
+
+def validate_question(
+    title: str,
+    content: str,
+    question: str,
+    quiet: bool = False,
+) -> tuple[bool, str | None]:
+    """
+    Validate a question against its source document and generate a gold answer.
+
+    Args:
+        title: Document title.
+        content: Document content.
+        question: Generated question to validate.
+        quiet: If True, suppress LLM output.
+
+    Returns:
+        (valid, gold_answer) tuple.
+        On failure, gold_answer is None.
+    """
+    prompt = SINGLE_DOCUMENT_ANSWER_GENERATION.format(
+        document_title=title,
+        document_contents=content,
+        query=question,
+    )
+
+    llm = get_llm(tools=None, quiet=quiet)
+    messages: list[Message] = [Message(role="user", content=prompt)]
+
+    response = ""
+    for chunk in llm.generate(messages):
+        if isinstance(chunk, str):
+            if not quiet:
+                print(chunk, end="", flush=True)
+            response += chunk
+
+    if not quiet:
+        print()
+
+    response = response.strip()
+
+    try:
+        data = json.loads(response)
+    except json.JSONDecodeError:
+        try:
+            response = extract_json_from_response(response)
+            data = json.loads(response)
+        except Exception:
+            return (False, None)
+
+    is_valid = data.get("valid", False)
+    if not is_valid:
+        return (False, None)
+
+    gold_answer = data.get("gold_answer")
+    if not gold_answer or gold_answer == "N/A":
+        return (False, None)
+
+    return (True, gold_answer)
+
+
+def extract_answer_facts(
+    question: str,
+    gold_answer: str,
+    quiet: bool = False,
+) -> list[str] | None:
+    """
+    Extract atomic facts from a gold answer.
+
+    Args:
+        question: The question that the gold answer answers.
+        gold_answer: The gold answer to extract facts from.
+        quiet: If True, suppress LLM output.
+
+    Returns:
+        List of fact strings, or None on failure.
+    """
+    prompt = FACT_EXTRACTION_PROMPT.format(question=question, gold_answer=gold_answer)
+
+    llm = get_llm(tools=None, quiet=quiet)
+    messages: list[Message] = [Message(role="user", content=prompt)]
+
+    response = ""
+    for chunk in llm.generate(messages):
+        if isinstance(chunk, str):
+            if not quiet:
+                print(chunk, end="", flush=True)
+            response += chunk
+
+    if not quiet:
+        print()
+
+    response = response.strip()
+
+    try:
+        facts = json.loads(response)
+    except json.JSONDecodeError:
+        try:
+            response = extract_json_from_response(response)
+            facts = json.loads(response)
+        except Exception:
+            return None
+
+    if not isinstance(facts, list):
+        return None
+
+    return facts
+
+
+def append_to_jsonl(path: str, data: dict) -> None:
+    """Append a JSON object to a JSONL file."""
+    with open(path, "a") as f:
+        f.write(json.dumps(data) + "\n")
+
+
+def count_existing_questions() -> int:
+    """Count existing questions in the questions.jsonl file."""
+    if not os.path.exists(QUESTIONS_PATH):
+        return 0
+
+    count = 0
+    with open(QUESTIONS_PATH) as f:
+        for line in f:
+            if line.strip():
+                count += 1
+    return count
+
+
+def get_next_question_id() -> int:
+    """Get the next question ID number based on existing questions."""
+    if not os.path.exists(QUESTIONS_PATH):
+        return 1
+
+    max_id = 0
+    with open(QUESTIONS_PATH) as f:
+        for line in f:
+            if line.strip():
+                try:
+                    data = json.loads(line)
+                    question_id = data.get("question_id", "")
+                    if question_id.startswith("qst_"):
+                        num = int(question_id.replace("qst_", ""))
+                        max_id = max(max_id, num)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+    return max_id + 1
+
+
+def get_existing_doc_uuids() -> set[str]:
+    """Get set of document UUIDs already used in questions (from expected_doc_ids)."""
+    uuids: set[str] = set()
+    if not os.path.exists(QUESTIONS_PATH):
+        return uuids
+
+    with open(QUESTIONS_PATH) as f:
+        for line in f:
+            if line.strip():
+                try:
+                    data = json.loads(line)
+                    if "expected_doc_ids" in data:
+                        for doc_id in data["expected_doc_ids"]:
+                            uuids.add(doc_id)
+                    elif "dataset_doc_uuid" in data:
+                        uuids.add(data["dataset_doc_uuid"])
+                except json.JSONDecodeError:
+                    pass
+
+    return uuids
