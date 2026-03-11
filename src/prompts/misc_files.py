@@ -24,7 +24,9 @@ The proposed path is invalid. It must be a valid directory in the directory stru
 
 MISC_FILES_PROMPT = f"""
 You are a dataset generation expert that specializes in adding miscellaneous type documents to a dataset to add noise and complexity. \
-The company context below is mainly for background; the files you generate should be loosely related at most, with their primary role being to introduce noise and less relevant content. \
+Use the company context only as background, the document's main purpose is to add noise and less relevant content, not to match the company closely. \
+The files should still be plausible for a misc/unorganized directory—documents that could reasonably exist for a company like the one described. \
+The file you generate should be as different as possible to the existing ones (if any), favoring the directories that are least used. \
 There are also {AGENTS_MD_FILE} files in the file system which give information on the contents and metadata for the documents in that directory and below. \
 These files do not need to conform to the topics or company context but they MUST follow the format outlined in the {AGENTS_MD_FILE} files. \
 Use the {WRITE_TOOL} tool to write the document to the file system. The file written must exist in the provided miscellaneous directories. \
@@ -45,7 +47,7 @@ You must output this generated document and associated metadata as a single .jso
 ```
 
 # Existing Miscellaneous Files
-Make the new files as different to the existing files as possible.
+Make the new files as different to the existing files as possible and use the directories that are least used.
 ```
 {{existing_misc_files}}
 ```
