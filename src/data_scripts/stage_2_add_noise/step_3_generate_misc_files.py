@@ -11,6 +11,7 @@ from src.llm import Message, get_cheap_llm, get_llm
 from src.llm.auto_conversation import run_auto_conversation
 from src.llm.conversation import Conversation
 from src.paths import (
+    AGENTS_MD_FILE,
     COMPANY_OVERVIEW_PATH,
     GENERATED_DATA_DIR,
     SOURCES_DIR,
@@ -26,10 +27,11 @@ from src.tools.interface import ToolInterface
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import FinishTool, WriteTool
 from src.utils import (
-    get_agents_md_for_source,
+    get_dataset_doc_uuid,
     get_directory_tree,
     load_file,
     load_json_file,
+    sources_resolver,
     write_json_file,
 )
 from src.utils.statistics import update_statistics
@@ -251,23 +253,54 @@ def get_existing_misc_files(misc_directories: list[str]) -> list[str]:
 
 def get_agents_md_for_misc_dirs(misc_directories: list[str]) -> str:
     """
-    Get agents.md content for all source types that have misc directories.
+    Get agents.md files that exist on the ancestor paths of the misc directories.
+
+    For each misc directory, walks up from that directory to the SOURCES_DIR root,
+    collecting any agents.md files found along the way.
 
     Args:
         misc_directories: List of misc directory paths relative to SOURCES_DIR.
 
     Returns:
-        Formatted string with agents.md content for relevant source types.
+        Formatted string with agents.md content for relevant paths.
     """
-    source_types = set()
+    # Collect unique agents.md paths (keyed by rel_path to deduplicate)
+    agents_files: dict[str, str] = {}
+
     for dir_path in misc_directories:
-        source_type = dir_path.split("/")[0]
-        source_types.add(source_type)
+        abs_dir = os.path.join(SOURCES_DIR, dir_path)
+        current = abs_dir
+
+        # Walk up from the misc directory to SOURCES_DIR
+        while True:
+            agents_path = os.path.join(current, AGENTS_MD_FILE)
+            if os.path.isfile(agents_path):
+                rel_path = os.path.relpath(agents_path, SOURCES_DIR)
+                if rel_path not in agents_files:
+                    try:
+                        with open(agents_path) as f:
+                            content = f.read().strip()
+                        if content:
+                            agents_files[rel_path] = content
+                    except Exception:
+                        pass
+
+            # Stop once we've checked SOURCES_DIR itself
+            if os.path.normpath(current) == os.path.normpath(SOURCES_DIR):
+                break
+            current = os.path.dirname(current)
+
+    if not agents_files:
+        return "(No agents.md files found)"
 
     sections = []
-    for source_type in sorted(source_types):
-        agents_md = get_agents_md_for_source(source_type)
-        sections.append(agents_md)
+    for rel_path in sorted(agents_files):
+        formatted = f"""agents.md file path: {rel_path}
+agents.md file contents:
+```
+{agents_files[rel_path]}
+```"""
+        sections.append(formatted)
 
     return "\n\n".join(sections)
 
@@ -292,23 +325,16 @@ def generate_single_misc_file(
         max_retries: Maximum retries for file generation.
 
     Returns:
-        (success, message) tuple where message is the relative file path on success.
+        (success, message) tuple where message is the dataset_doc_uuid on success.
     """
     misc_dirs_str = "\n".join(misc_directories)
     existing_str = "\n".join(existing_files) if existing_files else "(none)"
 
-    system_prompt = MISC_FILES_PROMPT.format(
+    prompt = MISC_FILES_PROMPT.format(
         company_overview=company_overview,
+        agents_md_contents=agents_md_contents,
         misc_directories=misc_dirs_str,
         existing_misc_files=existing_str,
-    )
-
-    # Append agents.md content so the LLM knows the document format
-    system_prompt += f"\n\n# agents.md File Contents\n{agents_md_contents}"
-
-    user_prompt = (
-        "Generate a single miscellaneous file and write it to one of the "
-        "miscellaneous directories using the write tool."
     )
 
     for retry in range(max_retries):
@@ -330,8 +356,7 @@ def generate_single_misc_file(
         tool_runner.register(write_tool)
 
         messages: list[Message] = [
-            Message(role="system", content=system_prompt),
-            Message(role="user", content=user_prompt),
+            Message(role="user", content=prompt),
         ]
 
         try:
@@ -348,7 +373,11 @@ def generate_single_misc_file(
                 continue
 
             rel_path = write_tool.written_paths[0]
-            return (True, rel_path)
+            abs_path = sources_resolver.to_absolute(rel_path)
+            doc_uuid = get_dataset_doc_uuid(abs_path)
+            if not doc_uuid:
+                return (False, f"File written but no UUID found: {rel_path}")
+            return (True, doc_uuid)
 
         except Exception as e:
             # Clean up any written files on error
@@ -493,17 +522,17 @@ def _update_statistics(cache: dict) -> None:
     directories = cache.get("directories", [])
     files = cache.get("files", [])
 
-    # Count files per source type
+    # Count directories per source type
     per_source: dict[str, int] = {}
-    for f in files:
-        source_type = f.split("/")[0] if "/" in f else "unknown"
+    for d in directories:
+        source_type = d.split("/")[0] if "/" in d else "unknown"
         per_source[source_type] = per_source.get(source_type, 0) + 1
 
     update_statistics("Step 3: Miscellaneous Files (Noise)", {
         "total_directories": len(directories),
         "total_files": len(files),
         "directories": directories,
-        "files_per_source": per_source,
+        "directories_per_source": per_source,
     })
 
 

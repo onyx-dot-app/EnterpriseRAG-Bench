@@ -8,7 +8,7 @@ The directory structure provided is a realistic layout of a company's data and d
 Propose individual new directories to the user and once the user confirms, use the `{MKDIR_TOOL}` tool to create the miscellaneous type directories. Make sure to get confirmation before calling the tool. \
 The name of the directory should reflect the type of source that it is created in. For example, if the source is Slack, the miscellaneous directory might be called `random` which would represent a channel. \
 If the source is Google Drive, the miscellaneous directory might be called `new_folder`. You can only create 1 level of directories, the parent directory must already exist. \
-After the user has confirmed that the directories are complete, call {FINISH_TOOL}.
+After the user has confirmed that the directories are complete, call `{FINISH_TOOL}`.
 
 # Directory Structure
 ```
@@ -35,6 +35,9 @@ You must output this generated document and associated metadata as a single .jso
 ```
 {{company_overview}}
 ```
+
+# {AGENTS_MD_FILE} file paths and contents
+{{agents_md_contents}}
 
 # Miscellaneous Directories
 ```
