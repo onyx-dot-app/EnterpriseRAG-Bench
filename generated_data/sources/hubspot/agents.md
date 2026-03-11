@@ -12,6 +12,7 @@ Content rules:
   - Each document corresponds to one Company (account) record.
   - The most interesting parts are the user provided notes.
 - Company records should be CRM-like and structured rather than long narrative documents.
+- Make up realistic sounding companies or real companies, avoid things like ACME. You can use compound names to avoid duplicates.
 - Each company record should typically include:
   - Basic firmographics: company name, domain, industry, size band, HQ region, and notes about deployment constraints (cloud/VPC/on-prem).
   - Ownership: account owner (AE) and supporting roles (SE, CSM) where applicable.

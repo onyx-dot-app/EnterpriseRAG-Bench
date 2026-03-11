@@ -8,6 +8,7 @@ import random
 from src.llm import Message, get_llm
 from src.paths import QUESTIONS_PATH
 from src.prompts.basic_questions import BASIC_QUERY_VALIDATION, BASIC_QUERIES_PROMPT
+from src.prompts.question_fact_extraction import FACT_EXTRACTION_PROMPT
 from src.utils import (
     count_json_files,
     DocumentFieldError,
@@ -104,8 +105,8 @@ def validate_question(
         quiet: If True, suppress LLM output.
 
     Returns:
-        (valid, expected_answer_explanation) tuple.
-        On failure, expected_answer_explanation is None.
+        (valid, gold_answer) tuple.
+        On failure, gold_answer is None.
     """
     prompt = BASIC_QUERY_VALIDATION.format(
         document_title=title,
@@ -144,11 +145,60 @@ def validate_question(
     if not is_valid:
         return (False, None)
 
-    explanation = data.get("expected_answer_explanation")
-    if not explanation or explanation == "N/A":
+    gold_answer = data.get("gold_answer")
+    if not gold_answer or gold_answer == "N/A":
         return (False, None)
 
-    return (True, explanation)
+    return (True, gold_answer)
+
+
+def extract_answer_facts(
+    question: str,
+    gold_answer: str,
+    quiet: bool = False,
+) -> list[str] | None:
+    """
+    Extract atomic facts from a gold answer.
+
+    Args:
+        question: The question that the gold answer answers.
+        gold_answer: The gold answer to extract facts from.
+        quiet: If True, suppress LLM output.
+
+    Returns:
+        List of fact strings, or None on failure.
+    """
+    prompt = FACT_EXTRACTION_PROMPT.format(question=question, gold_answer=gold_answer)
+
+    llm = get_llm(tools=None, quiet=quiet)
+    messages: list[Message] = [Message(role="user", content=prompt)]
+
+    response = ""
+    for chunk in llm.generate(messages):
+        if isinstance(chunk, str):
+            if not quiet:
+                print(chunk, end="", flush=True)
+            response += chunk
+
+    if not quiet:
+        print()
+
+    response = response.strip()
+
+    # Try to parse as JSON list
+    try:
+        facts = json.loads(response)
+    except json.JSONDecodeError:
+        try:
+            response = extract_json_from_response(response)
+            facts = json.loads(response)
+        except Exception:
+            return None
+
+    if not isinstance(facts, list):
+        return None
+
+    return facts
 
 
 def count_existing_questions() -> int:
@@ -272,7 +322,6 @@ def main() -> None:
 
     success_count = 0
     fail_count = 0
-    skip_count = 0
     errors: list[str] = []
 
     for i in range(args.count):
@@ -329,7 +378,7 @@ def main() -> None:
 
         # Validate the question
         print("\n--- Validating Question ---")
-        valid, explanation = validate_question(
+        valid, gold_answer = validate_question(
             title, content, result, quiet=args.quiet
         )
 
@@ -337,6 +386,16 @@ def main() -> None:
             fail_count += 1
             errors.append(f"{doc_path}: Question validation failed")
             print("\nFailed: Question validation failed")
+            continue
+
+        # Extract answer facts
+        print("\n--- Extracting Answer Facts ---")
+        answer_facts = extract_answer_facts(result, gold_answer, quiet=args.quiet)
+
+        if not answer_facts:
+            fail_count += 1
+            errors.append(f"{doc_path}: Answer fact extraction failed")
+            print("\nFailed: Answer fact extraction failed")
             continue
 
         # Generate question ID
@@ -347,7 +406,8 @@ def main() -> None:
             "question_id": question_id,
             "question": result,
             "expected_doc_ids": [doc_uuid],
-            "expected_answer_explanation": explanation,
+            "gold_answer": gold_answer,
+            "answer_facts": answer_facts,
             "question_type": "basic",
         }
         append_to_jsonl(QUESTIONS_PATH, question_data)
