@@ -1,44 +1,10 @@
 """Automatic conversation utilities for running LLM conversations without user input."""
 
-import os
-from contextlib import contextmanager
-from typing import Any, Generator
-
 from src.llm.factory import get_llm
 from src.llm.interface import LLMInterface, Message, ToolCall
+from src.llm.tracing import log_to_span, traced_span
 from src.tools.exceptions import ToolTerminationSignal
 from src.tools.runner import ToolRunner
-
-
-BRAINTRUST_API_KEY = os.environ.get("BRAINTRUST_API_KEY")
-BRAINTRUST_PROJECT = os.environ.get("BRAINTRUST_PROJECT")
-
-
-@contextmanager
-def _braintrust_span(name: str, span_type: str | None = None) -> Generator[Any, None, None]:
-    """Context manager for Braintrust span, no-op if not configured."""
-    if BRAINTRUST_API_KEY and BRAINTRUST_PROJECT:
-        try:
-            from braintrust import start_span
-
-            kwargs: dict[str, Any] = {"name": name}
-            if span_type:
-                kwargs["type"] = span_type
-            with start_span(**kwargs) as span:
-                yield span
-        except Exception:
-            yield None
-    else:
-        yield None
-
-
-def _log_to_span(span: Any, **kwargs: Any) -> None:
-    """Log data to a Braintrust span if available."""
-    if span is not None:
-        try:
-            span.log(**kwargs)
-        except Exception:
-            pass
 
 
 def run_auto_conversation(
@@ -66,7 +32,7 @@ def run_auto_conversation(
     Raises:
         RuntimeError: If max iterations exceeded without getting a response.
     """
-    with _braintrust_span("auto_conversation", span_type="task") as conversation_span:
+    with traced_span("auto_conversation", span_type="task") as conversation_span:
         tool_cycles = 0
         current_llm = llm
         step = 0
@@ -76,7 +42,7 @@ def run_auto_conversation(
             full_response = ""
             tool_calls: list[ToolCall] = []
 
-            with _braintrust_span(f"llm_step_{step}", span_type="llm") as step_span:
+            with traced_span(f"llm_step_{step}", span_type="llm") as step_span:
                 for chunk in current_llm.generate(messages):
                     if isinstance(chunk, str):
                         full_response += chunk
@@ -84,7 +50,7 @@ def run_auto_conversation(
                         tool_calls.append(chunk)
 
                 # Log LLM output to span
-                _log_to_span(
+                log_to_span(
                     step_span,
                     input=[{"role": m.role, "content": m.content[:500]} for m in messages[-3:]],
                     output=full_response if full_response else None,
@@ -123,14 +89,14 @@ def run_auto_conversation(
 
                     termination_signal: ToolTerminationSignal | None = None
 
-                    with _braintrust_span(tool_call.name, span_type="tool") as tool_span:
+                    with traced_span(tool_call.name, span_type="tool") as tool_span:
                         try:
                             result = tool_runner.run(tool_call.name, **tool_call.args)
                         except ToolTerminationSignal as sig:
                             # Capture signal but don't propagate through context manager
                             result = sig.result
                             termination_signal = sig
-                        _log_to_span(
+                        log_to_span(
                             tool_span,
                             input=tool_call.args,
                             output=result,
@@ -141,7 +107,7 @@ def run_auto_conversation(
                     )
 
                     if termination_signal is not None:
-                        _log_to_span(
+                        log_to_span(
                             conversation_span,
                             output=result,
                             metadata={"total_steps": step, "tool_cycles": tool_cycles, "terminated_by_tool": True},
@@ -152,7 +118,7 @@ def run_auto_conversation(
             # No tool calls = final response
             if full_response:
                 messages.append(Message(role="assistant", content=full_response))
-                _log_to_span(
+                log_to_span(
                     conversation_span,
                     output=full_response,
                     metadata={"total_steps": step, "tool_cycles": tool_cycles},

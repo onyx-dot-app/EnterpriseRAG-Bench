@@ -24,7 +24,7 @@ from src.prompts.misc_files import (
 from src.tools import MKDIR_TOOL
 from src.tools.interface import ToolInterface
 from src.tools.runner import ToolRunner
-from src.tools.tool_implementations import WriteTool
+from src.tools.tool_implementations import FinishTool, WriteTool
 from src.utils import (
     get_agents_md_for_source,
     get_directory_tree,
@@ -194,11 +194,13 @@ def create_misc_directories() -> list[str]:
 
     # Set up tools
     mkdir_tool = SingleLevelMkdirTool(base_dir=SOURCES_DIR)
+    finish_tool = FinishTool()
 
     tool_runner = ToolRunner()
     tool_runner.register(mkdir_tool)
+    tool_runner.register(finish_tool)
 
-    llm = get_llm(tools=[mkdir_tool.schema], quiet=False)
+    llm = get_llm(tools=[mkdir_tool.schema, finish_tool.schema], quiet=False)
 
     conv = Conversation(llm=llm, tool_runner=tool_runner)
     conv.add_system_message(system_prompt)
@@ -208,8 +210,8 @@ def create_misc_directories() -> list[str]:
     conv.generate_response()
     print()
 
-    # Interactive loop - user confirms/denies each directory
-    conv.run_interactive_loop()
+    # Interactive loop - exits when finish tool is called or user quits
+    conv.run_interactive_loop(finish_tool=finish_tool)
 
     created_dirs = mkdir_tool.created_dirs
 

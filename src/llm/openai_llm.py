@@ -6,21 +6,12 @@ from typing import Any
 from openai import OpenAI
 
 from src.llm.interface import LLMInterface, Message, ReasoningLevel, ToolCall
+from src.llm.tracing import get_current_span, init_tracing, is_tracing_enabled
 
 
 LLM_API_KEY = os.environ.get("LLM_API_KEY")
 LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "gpt-5.2")
 CHEAP_LLM_MODEL_NAME = os.environ.get("CHEAP_LLM_MODEL_NAME", "gpt-5-mini")
-BRAINTRUST_API_KEY = os.environ.get("BRAINTRUST_API_KEY")
-BRAINTRUST_PROJECT = os.environ.get("BRAINTRUST_PROJECT")
-
-
-def _init_braintrust_client(api_key: str) -> OpenAI:
-    """Initialize OpenAI client with Braintrust tracing."""
-    from braintrust import init_logger, wrap_openai
-
-    init_logger(project=BRAINTRUST_PROJECT)
-    return wrap_openai(OpenAI(api_key=api_key))
 
 
 class OpenAILLM(LLMInterface):
@@ -55,8 +46,11 @@ class OpenAILLM(LLMInterface):
         self.reasoning_level = reasoning_level
 
         # Use Braintrust tracing if configured
-        if BRAINTRUST_API_KEY and BRAINTRUST_PROJECT:
-            self.client = _init_braintrust_client(self.api_key)
+        if is_tracing_enabled():
+            init_tracing()
+            from braintrust import wrap_openai
+
+            self.client = wrap_openai(OpenAI(api_key=self.api_key))
         else:
             self.client = OpenAI(api_key=self.api_key)
 
@@ -168,15 +162,10 @@ class OpenAILLM(LLMInterface):
                     current_tool_call = None
 
         # Log reasoning to Braintrust trace if available
-        if reasoning_content and BRAINTRUST_API_KEY and BRAINTRUST_PROJECT:
-            try:
-                from braintrust import current_span
-
-                span = current_span()
-                if span:
-                    span.log(metadata={"reasoning": "".join(reasoning_content)})
-            except Exception:
-                pass  # Braintrust span not available
+        if reasoning_content:
+            span = get_current_span()
+            if span:
+                span.log(metadata={"reasoning": "".join(reasoning_content)})
 
         for tc in tool_calls:
             yield ToolCall(

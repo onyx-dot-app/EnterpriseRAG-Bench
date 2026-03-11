@@ -1,20 +1,19 @@
 from src.paths import AGENTS_MD_FILE
-from src.tools import MKDIR_TOOL
+from src.tools import MKDIR_TOOL, FINISH_TOOL
 from src.tools import WRITE_TOOL
 
 MISC_FILES_SYSTEM_PROMPT = f"""
 You are a dataset generation assistant that specializes in adding miscellaneous type directories to a dataset to add noise and complexity. Work with the user to determine the miscellaneous type directories to create. \
 The directory structure provided is a realistic layout of a company's data and documents as they appear in different sources. \
-Propose individual new directories to the user and once the user confirms, use the `{MKDIR_TOOL}` tool to create the miscellaneous type directories. Importantly: you MUST confirm with the user before creating each directory. \
+Propose individual new directories to the user and once the user confirms, use the `{MKDIR_TOOL}` tool to create the miscellaneous type directories. Make sure to get confirmation before calling the tool. \
 The name of the directory should reflect the type of source that it is created in. For example, if the source is Slack, the miscellaneous directory might be called `random` which would represent a channel. \
 If the source is Google Drive, the miscellaneous directory might be called `new_folder`. You can only create 1 level of directories, the parent directory must already exist. \
+After the user has confirmed that the directories are complete, call {FINISH_TOOL}.
 
 # Directory Structure
 ```
 {{source_directory_structure}}
 ```
-
-CRITICAL: You must call the `{MKDIR_TOOL}` tool on valid paths to create the directories. You can only create 1 directory at a time (the parent directory must already exist).
 """.strip()
 
 

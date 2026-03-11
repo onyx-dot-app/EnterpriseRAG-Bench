@@ -6,21 +6,12 @@ from typing import Any
 import anthropic
 
 from src.llm.interface import LLMInterface, Message, ReasoningLevel, ToolCall
+from src.llm.tracing import get_current_span, init_tracing, is_tracing_enabled
 
 
 LLM_API_KEY = os.environ.get("LLM_API_KEY")
 LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "claude-sonnet-4-6")
 CHEAP_LLM_MODEL_NAME = os.environ.get("CHEAP_LLM_MODEL_NAME", "claude-haiku-4-5")
-BRAINTRUST_API_KEY = os.environ.get("BRAINTRUST_API_KEY")
-BRAINTRUST_PROJECT = os.environ.get("BRAINTRUST_PROJECT")
-
-
-def _init_braintrust_client(api_key: str) -> anthropic.Anthropic:
-    """Initialize Anthropic client with Braintrust tracing."""
-    from braintrust import init_logger, wrap_anthropic
-
-    init_logger(project=BRAINTRUST_PROJECT)
-    return wrap_anthropic(anthropic.Anthropic(api_key=api_key))
 
 
 class AnthropicLLM(LLMInterface):
@@ -55,8 +46,11 @@ class AnthropicLLM(LLMInterface):
         self.reasoning_level = reasoning_level
 
         # Use Braintrust tracing if configured
-        if BRAINTRUST_API_KEY and BRAINTRUST_PROJECT:
-            self.client = _init_braintrust_client(self.api_key)
+        if is_tracing_enabled():
+            init_tracing()
+            from braintrust import wrap_anthropic
+
+            self.client = wrap_anthropic(anthropic.Anthropic(api_key=self.api_key))
         else:
             self.client = anthropic.Anthropic(api_key=self.api_key)
 
@@ -197,15 +191,10 @@ class AnthropicLLM(LLMInterface):
                         current_tool = None
 
         # Log thinking to Braintrust trace if available
-        if thinking_content and BRAINTRUST_API_KEY and BRAINTRUST_PROJECT:
-            try:
-                from braintrust import current_span
-
-                span = current_span()
-                if span:
-                    span.log(metadata={"thinking": "".join(thinking_content)})
-            except Exception:
-                pass  # Braintrust span not available
+        if thinking_content:
+            span = get_current_span()
+            if span:
+                span.log(metadata={"thinking": "".join(thinking_content)})
 
         for tc in tool_calls:
             yield tc
