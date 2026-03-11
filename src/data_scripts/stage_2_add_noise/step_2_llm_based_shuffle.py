@@ -16,6 +16,7 @@ from src.paths import SOURCES_DIR, SOURCE_TREE_PATH
 from src.prompts.neighboring_shuffle import PATH_ERROR_RESPONSE, SHUFFLE_PROMPT
 from src.utils.directory_tree import get_directory_tree
 from src.utils.file_io import load_file, load_json_file, write_json_file
+from src.utils.statistics import update_statistics
 
 
 # =============================================================================
@@ -429,6 +430,14 @@ def main() -> None:
             print(f"  - {err}")
         if len(errors) > 20:
             print(f"  ... and {len(errors) - 20} more")
+
+    update_statistics("Step 2: LLM-Based Shuffle (Noise)", {
+        "total_documents": total_docs,
+        "documents_selected": len(tasks),
+        "documents_moved": moved,
+        "errors": len(errors),
+        "shuffle_percentage": args.percentage,
+    })
 
 
 if __name__ == "__main__":

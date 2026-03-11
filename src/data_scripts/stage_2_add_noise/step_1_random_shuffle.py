@@ -10,6 +10,7 @@ import random
 
 from src.paths import SOURCES_DIR
 from src.utils.file_io import load_json_file, write_json_file
+from src.utils.statistics import update_statistics
 
 
 def collect_json_files(source_type_dir: str) -> list[str]:
@@ -224,6 +225,12 @@ def main() -> None:
 
     print("=" * 40)
     print(f"Done. Moved {total_moved} of {total_docs} total documents.")
+
+    update_statistics("Step 1: Random Shuffle (Noise)", {
+        "total_documents": total_docs,
+        "documents_moved": total_moved,
+        "shuffle_percentage": args.percentage,
+    })
 
 
 if __name__ == "__main__":

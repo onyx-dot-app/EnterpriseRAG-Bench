@@ -33,6 +33,7 @@ from src.utils import (
     validate_no_nested_dicts,
     write_json_file,
 )
+from src.utils.statistics import update_statistics
 
 
 # =============================================================================
@@ -553,6 +554,12 @@ def main() -> None:
             print(f"  - {error}")
         if len(errors) > 20:
             print(f"  ... and {len(errors) - 20} more")
+
+    update_statistics("Step 4: Near-Duplicate Files (Noise)", {
+        "target_count": args.count,
+        "successfully_created": success_count,
+        "failed": fail_count,
+    })
 
 
 if __name__ == "__main__":
