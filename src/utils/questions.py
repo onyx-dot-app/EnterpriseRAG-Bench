@@ -196,6 +196,14 @@ def extract_answer_facts(
     return facts
 
 
+def extract_source_type(doc_path: str) -> str:
+    """Extract the source type (top-level directory) from a path relative to SOURCES_DIR.
+
+    Example: "gmail/user/doc.json" -> "gmail"
+    """
+    return doc_path.split(os.sep)[0]
+
+
 def append_to_jsonl(path: str, data: dict) -> None:
     """Append a JSON object to a JSONL file."""
     with open(path, "a") as f:

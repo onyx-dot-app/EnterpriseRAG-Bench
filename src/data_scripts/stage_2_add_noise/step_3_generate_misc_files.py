@@ -13,7 +13,6 @@ from src.llm.conversation import Conversation
 from src.paths import (
     AGENTS_MD_FILE,
     COMPANY_OVERVIEW_PATH,
-    GENERATED_DATA_DIR,
     SOURCES_DIR,
     SOURCE_TREE_PATH,
 )
@@ -36,7 +35,7 @@ from src.utils import (
 )
 from src.utils.statistics import update_statistics
 
-CACHE_DIR = os.path.join(GENERATED_DATA_DIR, "generation_cache")
+CACHE_DIR = "generation_cache"
 CACHE_PATH = os.path.join(CACHE_DIR, "misc_files.json")
 
 
