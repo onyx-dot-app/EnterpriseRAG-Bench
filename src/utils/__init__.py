@@ -15,6 +15,7 @@ from src.utils.field_labeling import (
 from src.utils.field_ordering import needs_reordering, reorder_document_fields
 from src.utils.file_io import delete_file, load_file, load_json_file, write_json_file
 from src.utils.file_selection import (
+    collect_json_files_by_size,
     count_json_files,
     dir_has_json_files,
     select_random_file_hierarchical,
@@ -42,6 +43,7 @@ from src.utils.validation import validate_no_nested_dicts
 
 __all__ = [
     "add_dataset_doc_uuid",
+    "collect_json_files_by_size",
     "append_to_jsonl",
     "count_existing_questions",
     "confirm_regenerate",

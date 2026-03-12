@@ -90,6 +90,7 @@ def validate_question(
     content: str,
     question: str,
     quiet: bool = False,
+    answer_prompt_template: str = SINGLE_DOCUMENT_ANSWER_GENERATION,
 ) -> tuple[bool, str | None]:
     """
     Validate a question against its source document and generate a gold answer.
@@ -99,12 +100,14 @@ def validate_question(
         content: Document content.
         question: Generated question to validate.
         quiet: If True, suppress LLM output.
+        answer_prompt_template: Prompt template with {document_title},
+            {document_contents}, and {query} placeholders.
 
     Returns:
         (valid, gold_answer) tuple.
         On failure, gold_answer is None.
     """
-    prompt = SINGLE_DOCUMENT_ANSWER_GENERATION.format(
+    prompt = answer_prompt_template.format(
         document_title=title,
         document_contents=content,
         query=question,

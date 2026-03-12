@@ -78,6 +78,39 @@ def select_random_file_hierarchical(base_dir: str | None = None) -> str | None:
         return os.path.relpath(full_choice_path, SOURCES_DIR)
 
 
+def collect_json_files_by_size(
+    min_file_bytes: int,
+    base_dir: str | None = None,
+) -> list[str]:
+    """
+    Collect JSON file paths filtered by minimum file size.
+
+    Uses os.path.getsize (a stat call) to filter efficiently without
+    reading file contents.
+
+    Args:
+        min_file_bytes: Minimum file size in bytes.
+        base_dir: Directory to search. Defaults to SOURCES_DIR.
+
+    Returns:
+        List of file paths relative to SOURCES_DIR.
+    """
+    if base_dir is None:
+        base_dir = SOURCES_DIR
+
+    results: list[str] = []
+    for root, _dirs, files in os.walk(base_dir):
+        for filename in files:
+            if filename.endswith(".json"):
+                full_path = os.path.join(root, filename)
+                try:
+                    if os.path.getsize(full_path) >= min_file_bytes:
+                        results.append(os.path.relpath(full_path, SOURCES_DIR))
+                except OSError:
+                    continue
+    return results
+
+
 def count_json_files(base_dir: str | None = None) -> int:
     """
     Count total JSON files in a directory.
