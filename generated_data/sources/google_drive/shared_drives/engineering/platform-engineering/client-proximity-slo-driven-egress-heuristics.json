@@ -1,0 +1,36 @@
+{
+  "title": "Client-proximity SLO-driven egress heuristics",
+  "owner": "Asha Gupta",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/platform-engineering/client-proximity-slo-driven-egress-heuristics.json",
+  "doc_type": "doc",
+  "created_at": "2024-11-03",
+  "last_modified": "2025-01-15",
+  "collaborators": [
+    "Evelyn Park",
+    "Diego Morales",
+    "Priya Raman"
+  ],
+  "team": "eng-platform-engineering",
+  "status": "in_review",
+  "tags": [
+    "multi-region",
+    "egress",
+    "SLO",
+    "GeoDNS",
+    "Anycast",
+    "probing",
+    "backpressure"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE:PLAT-EGRESS-2024",
+    "JIRA:PLAT-4812",
+    "GITHUB:repo/egress-controller#234"
+  ],
+  "body": "Purpose\nThis note captures a candidate approach for steering outbound inference traffic to the closest healthy region while respecting per-customer latency SLOs, capacity constraints, and graceful degradation under cross-region failure scenarios. The focus is on combining active probing, short-term backpressure signals, and SLO-driven weighting to drive GeoDNS/Anycast decisions via the control plane.\n\nContext and goals\n- Problem: As traffic grows, naive geography-based routing (by country/region) causes hotspots when regional pools saturate. We need an automated mechanism to prefer proximity but fall back quickly and predictably without oscillation.\n- Goals:\n  1) Honor customer-configured p50/p95 latency SLOs where possible\n  2) Prefer region-proximal nodes for latency/cost reasons\n  3) Avoid cascading failovers when one region degrades\n  4) Provide explainability / observability for steering decisions\n  5) Work with both GeoDNS and Anycast fronting models\n\nHigh-level design\n1) SLO-aware scoring: each (client-subnet -> region) candidate is scored periodically using a composite metric: score = w_lat * normalized_latency + w_load * normalized_capacity + w_probe * probe_health + w_cost * cost_factor. We convert score to a weight in the control plane.\n\n2) Active probes and short-term smoothing:\n  - Every egress region exposes a lightweight probe endpoint for each service version (probe path returns version, qps, and a small checksum).\n  - Probe frequency: per-region per-pop once every 10s for hotspots, 60s otherwise.\n  - Smoothing: maintain an exponential moving average (EMA) on latency and error rate with alpha=0.25 to avoid reacting to single spikes.\n\n3) Backpressure propagation:\n  - Backend pools export a soft-capacity signal (available_tokens) computed from headroom (target_rps - current_rps) and queue length.\n  - When available_tokens < threshold, region enters backpressure mode and emits a \"soft-failsafe\" flag to the control plane via the egress controller API.\n  - The control plane converts backpressure into a weight penalty multiplier (e.g., x0.2) that reduces DNS weights / Anycast preference.\n\n4) GeoDNS vs Anycast differences:\n  - GeoDNS: control plane writes weighted DNS records with per-region weights (0-1000). TTL strategy: default 30s for high-change clients, 120s otherwise. On backpressure, we immediately reduce weight and lower TTL to 10s for affected prefixes to accelerate migration.\n  - Anycast: operate via BGP prepends + local preference adjustments where supported. The controller updates local-preference and, when immediate failover needed, uses withdraws for extreme situations. A/B testing of prepends must be conservative: only 1-2 AS prepends per change window to limit churn.\n\n5) Client-proximity SLO targeting:\n  - Each customer can set a latency SLO profile (e.g., p50 60ms, p95 250ms). The scoring function penalizes regions that cause higher tail latency for that customer\u2019s traffic (learned from recent requests). Customers without explicit SLOs use platform defaults.\n\n6) Oscillation controls and hysteresis:\n  - Minimum hold: once weight for a region changes by >30%, hold for 60s before further reductions (unless region offline).\n  - Recovery ramp: when a region recovers, weights ramp up in 3 steps (10%, 40%, 100%) every 30s to allow gradual reflow and prevent thrashing.\n  - Cooldown windows per client-subnet and per-region to avoid oscillation between two proximate regions.\n\nControl plane API (example interactions)\n- POST /egress/weights/update\n  payload: {\"client_prefix\":\"203.0.113.0/24\",\"region_weights\":[{\"region\":\"us-west1\",\"weight\":700},{\"region\":\"us-east1\",\"weight\":300}],\"reason\":\"p95>threshold || backpressure\"}\n- GET /egress/probe-status?region=us-west1 returns last_probe_ts, ema_latency_ms, error_rate, available_tokens\n\nMetrics to push to telemetry\n- per-client-prefix: selected_region, selection_reason (proximity/slo/failover), weight_vector\n- per-region: ema_latency_p50/p95, available_tokens, probe_ok_ratio, recent_weight_changes\n- global: reroute_rate (changes/sec), DNS_updates/sec, Anycast_prepends/sec\n\nFailure modes and mitigations\n- Probe flapping: require 2 consecutive failing probes before marking region degraded for routing (but allow single failing probe to influence weights slightly).\n- DNS propagation delay: mitigate with short TTLs in high-impact scenarios and explicit HTTP redirection post-DNS if needed for sticky clients.\n- BGP instability: Anycast path changes should be rate-limited and gated by canary ASNs to avoid global instability.\n\nTesting and rollout plan\n1) Lab: synthetic client-subnet simulation with controllable latency and queueing. Validate scoring and ramp behaviors.\n2) Canary: opt-in customer prefixes (<=1% global) get new steering. Monitor reroute_rate and tail latency impact for 48h.\n3) Gradual rollout: 5% -> 20% -> 50% -> 100% with rollback gates (reroute_rate spike, p95 regressions).\n\nOperational runbooks (short pointers)\n- If region shows sustained p95 degrade and available_tokens low: trigger emergency weight drain to 0 over 30s and lower DNS TTLs to 5s for affected prefixes.\n- If anycast withdraw loop observed: toggle to GeoDNS fallback for affected prefixes and open incident for BGP investigation.\n\nOpen questions / follow-ups\n- How to reconcile client source IP geolocation inaccuracies (mobile/proxy traffic)? Consider integrating edge geolocation + client-declared region header for verified enterprise customers.\n- Should we expose a per-customer knob for \"latency-first\" vs \"cost-first\" steering? (important for enterprise pricing tiers)\n- Explore ML-based weight prediction using recent probe + telemetry to preemptively reroute before SLA breaches.\n\nAction items\n- [Evelyn] prototype probe agent and API by sprint end (PLAT-4812)\n- [Diego] implement TTL/weight control endpoints in egress-controller (GH #234)\n- [Priya] draft dashboards showing per-prefix selection_reason and reroute_rate\n\nNotes on uniqueness\nThis approach emphasizes customer SLOs and soft backpressure signals rather than hard regional cutover rules. It blends short-term reactive signals (probes/backpressure) with SLO-aware preference to preserve latency and reduce costly overprovisioning.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_eb318da7cef343c9a51cf3b4ca6a1c4d"
+}

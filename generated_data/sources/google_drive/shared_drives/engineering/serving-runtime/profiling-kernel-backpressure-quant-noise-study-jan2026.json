@@ -1,0 +1,41 @@
+{
+  "title": "Profiling kernel backpressure and quantization noise in multi-tenant workloads",
+  "owner": "Ava Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/profiling-kernel-backpressure-quant-noise-study-jan2026.json",
+  "doc_type": "doc",
+  "created_at": "2026-01-12",
+  "last_modified": "2026-02-03",
+  "collaborators": [
+    "Diego Martinez",
+    "Priya Nair",
+    "Lena Kowalski",
+    "Marcus Li"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "quantization",
+    "int8",
+    "fp8",
+    "gptq",
+    "awq",
+    "profiling",
+    "latency",
+    "kernels",
+    "multi-tenant",
+    "backpressure"
+  ],
+  "linked_artifacts": [
+    "SERV-1248",
+    "github.com/redwood-inference/serving-runtime/pull/412",
+    "https://redwood.slack.com/archives/C02SERVPROF/p1670000000000",
+    "confluence.redwood/products/quant-noise-isolation"
+  ],
+  "body": "(continued)\n\nKey observations:\n1) Kernel backpressure correlates with quality regressions at the p99+ range. During bursts (Mix B) we see p99 latency increase by 3-6x for short requests when AWQ/int8 kernels are present. Those same p99 requests exhibit a median perplexity increase of 8-14% relative to fp32 baseline.\n\n2) Kernel-switch-rate spikes precede quality drop windows. We measured a kernel-switch-rate jump from ~2 switches/sec to ~18 switches/sec during burst windows on affected GPUs. Each switch correlates with a small KV-cache eviction event (miss spikes from 4% to 18%), suggesting KV cache thrash as a mediating factor.\n\n3) Per-kernel occupancy shows that low-precision kernels (int8-awq) have higher dispatch throughput but tighter occupancy margins. In mixed loads, they saturate compute lanes and force preemptive scheduling for dense-fp32 tasks, causing repeated short-lived kernel launches for the higher-precision codepath \u2014 amplifying context-switch overhead and increasing decode jitter.\n\n4) FP8 shows smaller quality regressions but worse tail latency under microburst compared to AWQ. GPTQ behaved more stably in long-form paths but exhibited idiosyncratic token-level spikes when the scheduler attempted to pack heterogeneous shapes.\n\n5) Noise amplification effect: isolated low-precision runs (single-tenant) show expected quality deltas (2-6% perplexity increase), but multi-tenant co-located runs amplify the apparent quality regression up to 3x. Hypothesis: interaction between kernel switches and KV cache thrash transiently changes token contexts (cache misses cause recompute or slower KV load), which interacts with low-precision rounding to increase token-by-token drift.\n\nRepresentative numbers (13B model):\n- Single-tenant AWQ: p95 latency 72ms, p99 180ms, perplexity +4.8% vs fp32.\n- Multi-tenant AWQ mixed: p95 latency 85ms, p99 640ms, perplexity +13.2% vs fp32.\n- Single-tenant GPTQ: p95 78ms, p99 210ms, perplexity +3.1%.\n- Multi-tenant GPTQ mixed: p95 82ms, p99 320ms, perplexity +6.8%.\n\nQualitative failure modes observed:\n- Short chat sequences where the second reply degrades (repeating tokens/ragged punctuation) after a high-concurrency spike. Manual diff shows slight token logits shift that compounds after ~8 tokens of generation.\n- Long-form generation that loses coherence after a sudden scheduler preemption \u2014 often when switching back to a fp32 kernel mid-trajectory.\n\nRoot-cause hypothesis (draft):\n- Primary driver is scheduler-induced microburst kernel mixing creating transient KV cache thrash and increasing context load time.\n- Low-precision implementations are more sensitive to these micro-perturbations because rounding/noise accumulates faster when KV loads or compute reorderings occur.\n- The combination (backpressure + low-precision kernel mixing) leads to amplified observed quality regressions independent of steady-state numeric fidelity.\n\nImmediate mitigations tested (summary):\n1) Kernel switchover cooldown: enforce 250ms cooldown between automatic kernel switches per-request. Result: kernel-switch-rate reduced by ~78% during bursts, p99 latency fell by ~45% in mixed runs, perplexity regressions dropped by ~6 percentage points.\n2) KV-cache reservation: temporarily increase per-tenant cache slice size during bursts (auto-scale up to +2x) reduced KV miss spikes by half; coupled with cooldown gives best combined effect.\n3) Preemptive traffic shaping: limit short-chat burst QPS via token-bucket at edge \u2014 reduces bursts but is user-visible.\n\nLonger-term recommendations:\n- Route-sensitive kernel allocation: prefer isolating low-precision inference to dedicated slices for high-churn tenants (profiling signal: switch-rate > 4/s). Implement scheduling hint to pin AWQ/GPTQ kernels to separate streams where capacity allows.\n- Kernel mixing telemetry: add a per-request trace flag that logs kernel flavor transitions into the trace payload (for offline correlation with quality regressions).\n- Context-consistent fallbacks: ensure when a kernel switchover happens mid-generation, the runtime either (a) completes the existing KV-context in the same kernel flavor or (b) performs a KV rewarm with fidelity-aware priority.\n- Quant-quality SLOs: add a quality-regression guardrail that temporarily forces fp32 (or higher-fidelity profile) when p99-quality delta exceeds threshold over a sliding window.\n\nAction items:\n- Diego: file SERV-1248 follow-up to implement kernel switchover cooldown in experimental branch (target: v0.69).\n- Priya: add kernel-transition traces and KV-cache event counters to the telemetry payload (task: TELE-886).\n- Lena: run extended multi-tenant runs with fp8-packed-kernel-alpha pinned to dedicated slices to validate isolation hypothesis (due: 2026-02-10).\n- Marcus: evaluate cost impact (tokens/$) for recommendations and produce a short runbook for Dedicated customers on isolation knobs (due: 2026-02-18).\n\nOpen questions / next experiments:\n- Is the amplification effect consistent across different GPUs (H100 vs A100) and with MIG enabled? Need a cross-arch sweep.\n- Does increasing kernel launch batching window (hold small requests for 10ms to batch) help or harm tail quality? Batching reduces switches but increases latency for short queries. Tradeoffs to quantify.\n- Is there a practical per-tenant heuristic that balances cost and quality without manual isolation? Explore machine-learned routing policy.\n\nNotes to reviewers:\n- This is an initial field study \u2013 numbers are noisy across runs. We believe the qualitative effect is strong and actionable (cooldown + cache reservation combination worked best).\n- Please point to any missing telemetry that would make causality stronger (I suspect we need per-kernel per-request KV-lookup timing).\n\nAppendix (short):\n- Repro commands: replay-harness --trace=prod-sample-202601 --mix=B --tenants=6 --kernels=[awq,gptq,fp32] --profile=serveflow-profiles/bench-v2\n- Raw artifacts stored: s3://redwood-test/quant-noise/2026-01-12-run-*/ (linked in SERV-1248)\n- Quick slack thread: https://redwood.slack.com/archives/C02SERVPROF/p1670000000000\n\nLast updated: 2026-02-03 by Ava Chen\n\n(End of notes)",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_03a7c6ecd4de490983c9e502908782fc"
+}

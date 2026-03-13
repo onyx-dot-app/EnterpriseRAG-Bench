@@ -1,0 +1,34 @@
+{
+  "title": "tide-surge benchmark scratch (carmen)",
+  "owner": "Carmen Liu",
+  "drive_area": "users",
+  "path": "users/tide-surge-benchmark-scratch-carmen",
+  "doc_type": "doc",
+  "created_at": "2026-02-15",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Ben Cho",
+    "Ivy Chen"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "throughput",
+    "kv-cache",
+    "burst",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "JIRA-1427",
+    "github.com/redwood-inference/benchmarks/pull/88",
+    "https://redwood.slack.com/archives/C02TEAMTHREAD/p1654321"
+  ],
+  "content": "Context:\n- Quick personal scratchpad for a new burst pattern I called 'tide-surge' \u2014 long low QPS baseline with periodic high-amplitude short surges (10s-30s). Trying to capture cold-prefix + KV cache reheating + transient queueing effects on our serving runtime.\n- Goal: find safe concurrency and queueing knobs that keep p95 < 250ms for 2k-token generation runs during 30s surges while minimizing wasted capacity.\n- Environment: A100-80GB nodes, model: llama2-13b-quant (q4_0), runtime build: experiment/2026-02-14-hotpath, kernel set: opt-v2.\n\nHarness/traffic shape:\n- Baseline QPS: 5 RPS\n- Surge shape: every 5 minutes, 20s triangular surge up to 200 RPS peak, then decay back to baseline over 10s (approx).\n- Payload: avg 120 input tokens, gen length target 2000 tokens (seq len ~2120).\n- Concurrency clients: locust-like driver with controlled arrival.\n\nConfig variants tested (labels used below):\nA) default-queue (default batch timeout 5ms, max-batch 64)\nB) long-batch (batch timeout 25ms, max-batch 128)\nC) strict-concurrency (per-worker concurrency cap 6, batch timeout 3ms)\nD) kv-aggressive (prefix cache TTL 10m, prefetch enabled)\nE) hybrid (strict-concurrency + kv-aggressive)\n\nKey metrics captured (sample):\n- p50, p95, p99 generator latency (ms) measured end-to-end from request to final token stream close\n- tokens/sec (aggregate emitted) during window\n- batch size distribution (mean, 90th pct)\n- queue length over time (samples/sec)\n\nRun notes (2026-03-08):\n- Warmup: 3 full cycles (15m) before taking measurements. Verified KV cache warmed on baseline but allowed to expire for controlled cold runs.\n\nRun summary (aggregated over the 20s surge window, numbers are median across 3 repeats):\n- default-queue:\n  p50: 180ms, p95: 430ms, p99: 980ms\n  tokens/s (agg): 42k\n  mean batch size: 22 (90th: 47)\n  observed tail events: several 1s+ stalls when max-batch hit and worker preemption occured\n\n- long-batch:\n  p50: 220ms, p95: 510ms, p99: 1.1s\n  tokens/s: 45k (slightly higher), mean batch size: 36 (90th: 84)\n  notes: throughput improved but tail got worse due to batching-induced serialization when long sequences saturated worker time-slices\n\n- strict-concurrency:\n  p50: 160ms, p95: 240ms, p99: 420ms\n  tokens/s: 31k (lower), mean batch size: 8 (90th: 16)\n  notes: much tighter tail, stable p95 under 250ms objective, but we lost throughput \u2014 cost per token up ~18%\n\n- kv-aggressive:\n  p50: 155ms, p95: 290ms, p99: 610ms\n  tokens/s: 44k, mean batch: 20 (90th: 44)\n  notes: prefix cache helped cut decode work per request; tail still vulnerable when ingress burst evicted workers due to memory pressure\n\n- hybrid:\n  p50: 150ms, p95: 225ms, p99: 380ms\n  tokens/s: 36k, mean batch: 12 (90th: 22)\n  notes: best balance for p95 objective with tolerable throughput loss (~14% vs long-batch).\n\nObservations / hypotheses:\n1) Queueing vs batching tradeoff: Larger batch windows increase throughput but amplify serialization tail for long-response workloads. For long generations, prefer smaller batch windows + concurrency caps.\n2) KV cache: aggressive caching + prefetch reduces per-request work but interacts poorly with memory pressure during surges (evictions cause microspikes). Need smarter eviction hysteresis.\n3) Worker preemption: when surge pushes max-batch and workers are busy decoding long sequences, new arrivals queue and then form very large batches causing stragglers.\n4) Hybrid (moderate concurrency cap + kv prefetch) appears to meet p95 < 250ms while keeping throughput within an acceptable band.\n\nQuick ascii timeline (one representative surge, numbers = queue length samples every 2s):\nBaseline: 0 0 1 0 0 1 0 0\nSurge ingress (peaks): 2 5 16 34 68 92 70 45 28 10 3 1\nPost-surge: 0 0 0 0\n\nInterpretation: big ramp followed by long tail of queued requests when default batching allowed large batch formation.\n\nOperational notes / potential mitigations:\n- Short-term: roll hybrid to small fleet (canary 5%) for a subset of endpoints that have long generation lengths. Monitor p95 and tokens/s.\n- Medium-term: implement per-model batch window tuning (auto-tune based on seq len distribution).\n- Longer-term: extend KV cache eviction policy with preferential retention for recently accessed prefixes during surge windows (sticky-cache concept).\n\nMeasurement gaps / TODOs:\n- Re-run runs with different hardware shapes (H100 vs A100) \u2014 current numbers only on A100.\n- Test with different model sizes (7b/70b) \u2014 particularly microburst interaction with huge kv state.\n- Export more detailed telemetry: per-batch worker-id, per-batch decode time distribution, memory high-water marks.\n- File a ticket to simulate multi-tenant noisy neighbor scenarios: JIRA-1459.\n\nImmediate experimental follow-ups (next 7 days):\n- 2026-03-11: run hybrid variant with forced cold-prefix to validate eviction impact (owner: Ben)\n- 2026-03-12: run strict-concurrency but ramp peak higher (300 RPS) to find breakpoints (owner: Carmen)\n- 2026-03-14: prototype sticky-cache eviction heuristic in experiment branch (owner: Ivy)\n\nFreeform notes to self:\n- When communicating to product: emphasize that p95 objective is achievable without re-architecting runtime, mostly config + modest cache policy changes.\n- Watch out for naive throughput charts \u2014 show tokens/sec and cost/token together when proposing config changes.\n- Slack thread for quick context: link above.\n\nRaw snippets (copy-paste-friendly):\n- perf driver: bench/tide-surge-driver:v1 --shape surge --peak 200 --period 300 --payload 120/2000\n- local compare: python scripts/aggregate_latency.py --input runs/2026-03-08/*.json --metrics p50,p95,p99,tokens/s\n\nEnd of scratchpad.\n",
+  "_filename": "tide-surge-benchmark-scratch-carmen.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_a8f0de5410854423816b1772237a4596"
+}

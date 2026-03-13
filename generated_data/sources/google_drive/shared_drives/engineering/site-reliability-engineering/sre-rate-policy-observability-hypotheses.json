@@ -1,0 +1,37 @@
+{
+  "title": "Rate policy observability & hypothesis notes",
+  "owner": "Asha Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/site-reliability-engineering",
+  "doc_type": "doc",
+  "created_at": "2025-06-12",
+  "last_modified": "2025-09-07",
+  "collaborators": [
+    "Daniel Kim",
+    "Lena Rossi",
+    "Marcus Li"
+  ],
+  "team": "eng-sre",
+  "status": "draft",
+  "tags": [
+    "rate-limiting",
+    "telemetry",
+    "waf",
+    "quota",
+    "mitigation",
+    "simulation"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-1234",
+    "JIRA-SRE-987",
+    "https://github.com/redwood/inference/pull/211"
+  ],
+  "summary": "Working notes on designing observability-backed rate limit policies, heuristics for detecting leaked keys, and a plan for synthetic attack simulations to validate WAF and quota rules.",
+  "body": "Context:\\nWe keep seeing short-lived spikes that look like synthetic traffic or automated scraping. Recent incidents had two patterns: (1) many requests at low token-per-request but high requests/sec from a small set of keys, and (2) churny requests that appear to be leaked keys being tested across regions. Current rate caps are blunt (global tokens/min + per-key qps) and do a decent job, but both false positives (blocking legitimate high-traffic customers) and false negatives (slow key-exhaustion) remain.\\n\\nGoal:\\n- Define observability signals that reliably separate legitimate bursts from abuse.\\n- Propose incremental policy changes to reduce blast radius and enable faster automated responses.\\n- Provide a concise on-call checklist for rapid triage and mitigation.\\n- Validate new rules with synthetic attack sims before rollout.\\n\\nAssumptions and constraints:\\n- Minimal customer impact is top priority: prefer granular throttles to global kills.\\n- We can deploy per-key, per-route, and per-region limits in the gateway within ~30m.\\n- Telemetry pipeline (Prometheus + ClickHouse) carries request metadata: key, route, region, client_ip, user_agent, token_count, model, latency_ms.\\n\\nKey hypothesis signals (prioritized):\\n1) Burst shape: rapid sustained qps for >3m from single key with token_count < 100 per request -> suspect automated polling.\\n2) Cross-region fanout: same key generating similar request patterns from >=3 regions within 10m -> likely leaked key reused.\\n3) Unusual user-agent entropy: UA strings with high frequency of unknown agents + identical body length distribution -> synthetic.\\n4) KV cache miss spikes + short sequence lengths -> repeat prefix generation (common in scraping).\\n5) Failed billing checks or new key with immediate high qps -> suspicious.\\n\\nDetection queries (examples):\\n- PromQL (approx):\\n  sum by(api_key) (rate(requests_total{route=\\\"/v1/generate\\\"}[5m])) > scalar(20) and\\n  avg by(api_key) (rate(tokens_total[5m]))/sum by(api_key) (rate(requests_total[5m])) < 200\\n- ClickHouse (approx):\\n  SELECT api_key, count() AS rps_5m, avg(token_count) AS avg_tokens\\n  FROM requests\\n  WHERE timestamp >= now() - INTERVAL 5 MINUTE\\n  GROUP BY api_key\\n  HAVING rps_5m > 100 AND avg_tokens < 50\\n- Elastic/Kusto for cross-region fanout:\\n  group by api_key, region, bin(10m) -> count; then detect api_key with counts in >=3 regions in same bin.\\n\\nMitigation ladder (prefer automated, reversible):\\n- Alert-only: Create PagerDuty alert (severity P2) when detection triggers for first time in 1h window.\\n- Soft throttle: Apply per-key QPS reduction (50% of current) and add short-term 10m token cap. Monitor for escalation.\\n- Granular block: If cross-region fanout + UA entropy persists for 15m, add per-key region blackhole (route-level) and rate-limit by client_ip patterns.\\n- Managed disable: If billing anomalies or confirmed leak, rotate key and issue customer notification.\\n- WAF rules: Add temporary rule for offending UA pattern or path signature, with auto-expire 24h.\\n\\nQuick on-call triage checklist (steps in order):\\n1) Open incident Slack channel #sre-abuse-quick. Post short summary: key, observed rps, tokens/request, regions.\\n2) Run detection queries above, attach top 5 IPs and UA samples.\\n3) Check billing and customer identity in billing system. If unknown/new, label as suspected-leak.\\n4) Apply soft throttle via gateway API (example):\\n   curl -X POST $GATEWAY/control/limits -H \\\"Authorization: Bearer $CTRL_TOKEN\\\" -d '{\"api_key\":\"KEY\", \"qps\": 10, \"duration_sec\": 600}'\\n5) Monitor 5m windows for reduction in token spend; if not reduced, escalate to granular block.\\n6) If customer impacted, coordinate with account team; do not rotate key until we can notify.\\n\\nRollback criteria for false positives:\\n- Traffic drop back to baseline (< 20% above 7-day rolling median) within 10m of throttle AND customer SLA owner confirms legitimate workload.\\n- If false positive, remove throttle and run postmortem to tune detection.\\n\\nSimulation / validation plan (pre-rollout for new heuristics):\\n- Build a synthetic traffic driver that can model: steady scrape (10 req/s, 30 tokens), bursty scrape (300 req/s for 2m), and cross-region fanout. Repo: github.com/redwood/sim/abuse-sim (PR exists).\\n- Run in staging for 48h with telemetry capturing same metrics pipeline. Verify detection rates and false positive rate below 5% on staging production-like workloads.\\n- Run WAF rule test harness: replay recorded attack signatures against staging gateway and ensure auto-expire works.\\n\\nOperational notes and useful links:\\n- Dashboard to monitor candidates: /dashboards/sre/abuse-candidates (Grafana).\\n- Slack channel for immediate ops: #sre-abuse-quick.\\n- PagerDuty escalation policy: SRE Abuse P2 -> oncall -> escalation lead.\\n- Related tickets: JIRA-SRE-987 (policy design), CONFLUENCE-1234 (policy rationale).\\n\\nOpen questions / follow-ups:\\n- Should we prefer per-route token budgets instead of per-request token averages? Tradeoffs: complexity vs precision.\\n- Can we incorporate model fingerprinting (model+prompt hash) to detect repeated hot prompts? Privacy implications need review.\\n- Instrumentation gap: client_ip/geo sometimes masked by proxies. We need to add X-Forwarded-For handling and trust network header rules.\\n\\nNext steps (owners):\\n- Daniel: build the ClickHouse detection query and ship to a non-alerting dashboard by 2025-09-12.\\n- Lena: assemble synthetic driver variants and add CI smoke tests by 2025-09-20.\\n- Marcus: prototype gateway soft-throttle API endpoint with auto-expire by 2025-09-18.\\n- Asha (owner): schedule dry-run in staging and runbook review session with product security on 2025-09-22.\\n\\nNotes to self (informal):\\n- Keep rules conservative at first; prefer noisy alerts to mass key revokes.\\n- Remember to include customer support templates for messaging if a key is rotated.\\n- Follow-up: consolidate UA entropy detection with the device-fingerprint table.\\n\\nEnd of notes.\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_8daa01cf76144822be752d790a3559a2"
+}

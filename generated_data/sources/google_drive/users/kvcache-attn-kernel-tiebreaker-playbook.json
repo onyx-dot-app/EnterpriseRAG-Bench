@@ -1,0 +1,34 @@
+{
+  "title": "KVCache attention kernel tiebreaker playbook",
+  "owner": "Arielle Chen",
+  "drive_area": "users",
+  "path": "users/kvcache-attn-kernel-tiebreaker-playbook.json",
+  "doc_type": "doc",
+  "created_at": "2025-01-29",
+  "last_modified": "2025-02-07",
+  "collaborators": [
+    "Mateo Rivera",
+    "Jun Park"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "kvcache",
+    "kernel-selection",
+    "seqlen-edgecase",
+    "investigation",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "GH:repo/serving-runtime/pull/472",
+    "JIRA:SRV-1286"
+  ],
+  "body": "Purpose: jot down an actionable debug/playbook for the case where attention kernel selection ties and leads to KV offset anomalies at long sequence lengths. Goal: reproduce reliably, collect traces, apply mitigation (soft/hard), and propose long-term fix.\n\nSymptoms observed:\n- Irregular KV cache wrap or stale KV reads when in-flight request sequence length > 8192 (observed around 9100\u201311k tokens).\n- High p50 latency spikes on a subset (~3%) of requests; those correlate with unexpected kernel path (fallback to slow generic kernel) followed by KV slot reuse.\n- Errors: occasional \"kv_index_out_of_range\" logged, and later \"kv-ttl-mismatch\" in metrics pipeline.\n\nHypotheses (ranked):\n1) Kernel selector uses rounded sequence length bucket; tie-breaker picks kernel A (fast) but its prefetch path assumes different KV layout (offset policy), causing misaligned writes when sequence crosses internal window boundary.\n2) Race between eviction worker and streaming prefetch: eviction frees slot while prefetch still writing, leading to transient stale sequence indices.\n3) Quantization-specific kernel variant has a different header stride, and when selected incorrectly (tiebreak), pointer arithmetic mismatch corrupts per-session KV offsets.\n\nRepro steps (commands + notes):\n- Quick repro curl to hosted test endpoint (local replay worker):\n  curl -sS -X POST http://localhost:8080/v1/generate -H 'Authorization: Bearer testkey' -d '{\"model\":\"redwood/long-analyst-v2\",\"input\":\"'$(python3 -c 'print(\"x \".join([\"word\"]*10000))')'\",\"max_new_tokens\":0,\"stream\":false}' | jq '.'\n  (vary input length 8k, 9k, 11k)\n\n- Start instrumented runtime with KVCACHE_DEBUG=1, KERNEL_SELECTOR_LOG=verbose, and EVICITON_DEBUG=1:\n  env KVCACHE_DEBUG=1 KERNEL_SELECTOR_LOG=verbose EVICITON_DEBUG=1 ./bin/serve --config conf/test-tie.json\n\n- Collect perf & heaps:\n  sudo perf record -F 99 -a -g -- ./bin/serve --config conf/test-tie.json\n  sudo perf script > perf-kernel-tiebreaker.stk\n\n- Attach to worker when reproducing and capture memory map:\n  pid=$(pgrep serve) && sudo gcore $pid && sudo cat /proc/$pid/maps > maps.$pid\n\nKey log excerpts (sanitized):\n[2025-01-30T14:12:03.223Z] selector.c:234 select_kernel: seqlen_bucket=8192 tie_candidates=[A_fast_q8, B_generic_f16] picked=A_fast_q8 reason=tiebreaker:latency_est\n[2025-01-30T14:12:03.224Z] kvcache.c:987 write_kv: session=ses_43ff offset=0x7fffd1234 wrote=8192\n[2025-01-30T14:12:03.225Z] eviction.c:114 try_evict: evicted_slot=ses_43ff offset=0x7fffd1234 freed=true\n[2025-01-30T14:12:03.226Z] kvcache.c:1001 write_kv: session=ses_43ff offset=0x00000012 wrote=24  <-- suspicious small offset after eviction\n[2025-01-30T14:12:03.227Z] trace: ERROR kv_index_out_of_range session=ses_43ff idx=9203 max_idx=8192\n\nExperiment matrix tried so far:\n- Force selector to prefer generic kernel: env SELECTOR_FORCE=generic -> no kv errors, but latency + cost increase.\n- Force fast q8 kernel: env SELECTOR_FORCE=fast_q8 -> reproducible errors at >9k tokens.\n- Toggle prefetch on/off: disabling prefetch reduces frequency but doesn\u2019t eliminate failures.\n- Increase eviction grace window from 2 to 16ms: failure rate drops ~70% in test bench.\n- Run with quantization disabled: no failures, suggests quant kernels implicated.\n\nImmediate mitigations (safe, short-term):\n- Add defensive check in kvcache write path: if idx >= active_max_idx -> retry with lock and re-evaluate kernel selection. (cheap guard, potential perf hit)\n- Bump default tie-breaker to prefer generic_f16 when seqlen > 8192 (config flag).\n- Increase eviction grace period on dedicated nodes handling long-context sessions.\n\nInvestigations to run (next):\n- Add structured trace around selector decision: capture candidate list, exact seqlen, hardware flags, and per-kernel header_stride. (PR: GH#repo/serving-runtime/issue/472)\n- Instrument atomicity around eviction + prefetch: use sequence numbers on slots to detect concurrent ops.\n- Reproduce with ASAN build of kernel variants to detect pointer arithmetic issues in quant kernel.\n\nTests to add/modify:\n- Replay harness: generate synthetic sessions that append tokens to same session to exercise wrap boundary exactly at 8192 and +1, +16, +128. Capture kv slot meta before/after.\n- Fuzz kernel selector: randomize tie-breaker policy across runs and check kvcache invariants via invariant checker (assert in debug builds).\n\nNotes to self:\n- Watch out for name collisions: \"eviction\" vs \"eviciton\" typos in logs (we have both in old branches).\n- Check storage layout docs for q8 kernels: header_stride vs generic documented in /docs/kernels/strides.md (might be outdated).\n- Ping Jun about index lifetime guarantees for streaming inference (possible API contract mismatch).\n\nOpen questions:\n- Is this only happening on GPU type A100x with driver X.Y, or seen on T4 too? (initial data shows A100x majority).\n- Could model sharding interact with kernel selection? (sessions cross-shard boundary -> slot remap?)\n\nNext actions (assigned):\n- Arielle: add lightweight guard in kvcache write and roll to staging; measure perf delta.\n- Mateo: compile ASAN quant kernel build and run targeted repro.\n- Jun: validate eviction scheduling codepath; add tracing for slot seq numbers.\n\nReferences & quick links:\n- GH PR: repo/serving-runtime/pull/472 (selector logs + guards)\n- JIRA SRV-1286 (kv wrap incidents Q1)\n- Internal notes: confluence/serving-runtime/kvcache-arch (see section on slot semantics)\n\nScratch TODOs (low friction):\n- Add unit test for tie-breaker stable ordering.\n- Add alert rule: if kv_index_out_of_range > 5/min then auto-toggle selector to generic for affected pool.",
+  "footer_notes": "File is a personal working scratchpad. Don\u2019t ship directly \u2014 convert to PR checklist + changelog entry before merging any guards into prod.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "footer_notes"
+  ],
+  "dataset_doc_uuid": "dsid_87d9af0bc26a46c8b92511f887388e5e"
+}

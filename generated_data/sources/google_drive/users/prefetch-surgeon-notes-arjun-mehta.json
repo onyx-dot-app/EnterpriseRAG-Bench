@@ -1,0 +1,36 @@
+{
+  "title": "Prefetch surgeon notes (midnight)",
+  "owner": "Arjun Mehta",
+  "drive_area": "users",
+  "path": "users/prefetch-surgeon-notes-arjun-mehta.json",
+  "doc_type": "doc",
+  "created_at": "2025-10-22",
+  "last_modified": "2025-10-23",
+  "collaborators": [
+    "Nilima Rao",
+    "Liam O'Connor"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "kv-cache",
+    "p99-spike",
+    "prefetch",
+    "numa",
+    "nvlink",
+    "oncall",
+    "todo"
+  ],
+  "linked_artifacts": [
+    "JIRA-INF-4829",
+    "PR#2782:https://github.com/redwood-inference/serving-runtime/pull/2782",
+    "confluence:KV-cache-prefetch-design",
+    "slack:#serving-runtime"
+  ],
+  "content": "Date: 2025-10-22\nShift: midnight (solo) \u2014 quick capture before handing off to Nilima in the morning\nContext: customer-prod observed intermittent p99 token latency spikes correlated with long prompt sequences. Root suspicion: prefetch/eviction interplay with small LRU slices on multi-GPU nodes (NVLink topology variance).\n\nObservations from the incident (logs at /var/log/serving/runtime/2025-10-22/spike-0821.log):\n- Spike windows: ~08:21, 09:04 UTC \u2014 spikes last ~15\u201330s, p99 jumps from 120ms -> 820ms for generation steps around token 5k\u20139k.\n- Worker-level metrics show KV cache hit-rate drops from 98% -> 42% in the same window.\n- Kernel traces: repeated evict->fetch patterns on the same attention layer (attn_kv_layer_10) across workers co-located on same NUMA domain.\n- dmesg shows occasional nvlink timeouts on GPU1 (stack trace t=09:03), but not persistent.\n\nQuick repro attempt (local):\n1) Use small reproducer model (gpt-small-ish) with scripted long-context generator: 12k tokens input + streaming generation to force deep KV occupancy.\n2) Run two workers pinned to same NUMA node, batch size=1, unbatched concurrency 8.\n3) Toggle prefetch policy: off / conservative / aggressive.\nOutcome: aggressive prefetch causes earlier cache pressure (expected), conservative results in more fetches but slightly lower instant eviction churn. Repro is noisy but directionally similar to prod.\n\nHypotheses (ranked):\nA) Eviction storms triggered by prefetch aggressive heuristics + small per-worker cache slices -> concurrent evict/fetch thrash -> temporary loss of locality -> p99 spikes.\nB) NVLink hiccups amplify latency when remote KV fetchs fall back to PCIe (timeout path) for a few seconds. dmesg evidence weak but present.\nC) Batch packing changes (recent scheduler tweak PR#2782) increased variance in typical seq-lengths per worker -> cache fragmentation across workers.\n\nImmediate mitigations to try (fast, revertable):\n- Toggle prefetch from \"aggressive\" -> \"balanced\" for the customer ring (canary) (low blast radius). (Owner: Arjun, quick command: POST /api/v1/configs/prefetch?policy=balanced --env=canary)\n- Enforce per-worker soft guarding: worker_cache_soft_limit = 0.82 * worker_cache_alloc to delay evictions (temp param).\n- Add a micro-rate limiter to prefetch tasks when pending_evictions > threshold to avoid bursty simultaneous fetches.\n\nCommands I ran / snippets (save for runbook):\n- tail -n 200 /var/log/serving/runtime/2025-10-22/spike-0821.log | grep -i evict\n- sudo perf record -a -g -o /tmp/perf.data -- sleep 30 (on canary node, 09:10)\n- python tools/repro_long_context.py --model gpt-small --seq 12000 --workers 2 --prefetch aggressive\n\nMetrics to capture (add to canary dashboard):\n- kv.cache.hit_rate per-worker (1s resolution)\n- kv.cache.eviction_rate per-worker\n- prefetch.pending_tasks\n- kernel.nvlink_errors (nvlink hardware counters)\n- scheduler.batch_length_variance\n- os.numa_remote_access_rate\n\nLonger-run experiments (need cycle / coordination):\n- Experiment E1: Increase per-worker cache slice by 25% and measure p99 across days (risk: higher memory footprint across nodes). (Coord: Infra/Platform)\n- Experiment E2: Introduce jitter in prefetch start times (stagger prefetch across workers floor(random(0,50ms))). This reduces synchronized eviction waves. (Low-risk; code change in prefetch scheduler)\n- Experiment E3: Fallback path hardening: when nvlink errors spike, prefer local-cache-prefetch-to-disk rather than remote fetch to avoid timeout penalty. (Requires infra/driver discussion)\n\nNotes to self / heuristics discovered tonight:\n- When two high-KV workers land on the same NUMA socket, eviction storms are far more likely. Pinning strategy might need 'anti-colocate-high-kv' heuristic.\n- The token-position where p99 climbs is often the point where attention layers' kv size crosses a 4MB boundary \u2014 looks like a threshold in our allocator behavior (investigate allocator cut-offs).\n- PR#2782 changed the \"pack-seq\" fast-path to be more permissive; need to double-check side-effect on per-worker effective cache slice size.\n\nHandoff checklist for Nilima (AM):\n- Summary: observed p99 spikes due to KV cache thrash; temporary mitigation: switch prefetch->balanced on canary, enable soft_limit param.\n- Morning tasks (priority):\n  1) Validate canary metrics after policy flip (dashboard: INF-kv-canary). Check p99 over 1h window vs prior 6h.\n  2) Pull perf.data from canary node and run Flamegraph (tools/fg.py /tmp/perf.data). Look for repeated 'evict_kv' frames.\n  3) Check node GPU1 nvlink logs (sudo dmesg | grep nvlink) for 10/22 08:15-09:15 UTC. Attach to Jira INF-4829.\n  4) If canary shows improvement, coordinate with Liam to roll to prod little-by-little (1% -> 5% -> 20%).\n\nUnresolved questions (write up before next week design doc):\n- Is allocator boundary around 4MB a software artifact (jemalloc/our allocator) or driver-side? (Action: grep allocator release notes / check jemalloc arenas config).\n- Do we have metrics for per-layer KV distribution (by byte-size) across workers? If not, add logging hook in runtime.\n- Would staggered prefetch create cold-miss cascades that amplify tail for very deep sequences? Need simulation.\n\nRandom quick TODOs (for personal memory):\n- File small perf flamegraph in INF-4829 and tag Liam + Nilima.\n- Add unit test for prefetch backpressure threshold (simulate N concurrent evict tasks -> expect tasks to queue).\n- Draft mini-runbook entry: \"If p99 spike with KV-hit drop, flip prefetch->balanced, set worker_cache_soft_limit, escalate if nvlink errors > 5/min\".\n\nClosing notes (notes-to-self style):\n- Keep change small tonight; prefer config flip over code change.\n- Capture as much ephemeral telemetry as possible before rolling anything back.\n- If we see NVLink errors persist, loop in HW infra and open support ticket with cloud provider (include dmesg).\n\nEnd of capture. Passing to Nilima for morning follow-up.\n\nSignature: Arjun (quick, messy \u2014 will tidy if we turn into a runbook)\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_e0110d6351bd4addbb8b9b729a475263"
+}

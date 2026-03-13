@@ -1,0 +1,33 @@
+{
+  "title": "Memory map dump & replay cheatsheet for GPU OOM triage",
+  "owner": "Elliot Chen",
+  "drive_area": "users",
+  "path": "users/elliot-chen/gpu-debug/",
+  "doc_type": "doc",
+  "created_at": "2026-02-11",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Maya Patel",
+    "Liam O'Connor"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "gpu-oom",
+    "cuda",
+    "ld_preload",
+    "repro",
+    "triage"
+  ],
+  "linked_artifacts": [
+    "GH-rc/serve#1427",
+    "JIRA-OPS-521",
+    "confluence://gpu-debugging-playbook"
+  ],
+  "content": "Goal: quick, repeatable checklist to capture process memory maps, GPU allocation state, and a minimal Python repro to replay/titrate VRAM usage. Use when model runs fail nondeterministically with CUDA OOM or when suspecting mixed driver/library ABI issues.\n\n1) Immediate captures (do first, do not restart container/process):\n- `ps aux | grep -E \\\"python|torchserve|uvicorn\\\"` -> note PID of failing process (PID).\n- `nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv` -> which PIDs are using VRAM.\n- `cat /proc/PID/maps > /tmp/PID-maps.txt` -> memory mappings snapshot.\n- `pmap -x PID > /tmp/PID-pmap.txt` (if pmap available).\n- `gdb --batch -p PID -ex \\\"thread apply all bt full\\\" &> /tmp/PID-gdb-backtrace.txt` (careful on prod; best on dev replica).\n- `gcore -o /tmp/core-PID PID` to get core dump (if permitted by security).\n- `nvidia-smi pmon -s u -c 1` to capture util/clock snapshot.\n- `dmesg --ctime | tail -n 200 > /tmp/dmesg-tail.txt` (look for oom-killer or GPU driver errors).\n\n2) Library/ABI probes (to catch mismatched libs):\n- `ldd /proc/PID/exe | grep -E \\\"libcuda|cudart|libnvidia\\\"` -> what libcuda is linked at runtime.\n- `readlink -f /usr/lib/x86_64-linux-gnu/libcuda.so*` and `ldconfig -p | grep libcuda` on host and container.\n- `cat /proc/PID/environ | tr '\\\\0' '\\\\n' | grep -E \\\"LD_LIBRARY_PATH|LD_PRELOAD|CUDA\\\"` -> env vars that change library resolution.\n- `ls -l /usr/local/cuda | sed -n '1,10p'` and check docker base image tag (`cat /etc/os-release; cat /usr/local/cuda/version.txt` inside container).\n- `strings /proc/PID/maps | grep -i cuda | sort -u` (fast grep for loaded paths).\n\nHypothesis checklist when OOM + driver noise:\n- Mixed libcuda versions: container has cudatoolkit 12.x but host driver is older/newer -> ABI mismatch symptoms (hangs, segfaults, strange cuCtx failures).\n- Multiple runtimes loaded: LD_PRELOAD or vendor shim pulled in an incompatible libnvidia-ml.\n- Memory fragmentation due to many large mmapped allocations (check /proc/PID/maps for huge anonymous mappings and fragmented allocations).\n- Unexpected persistent allocations from previous processes (persistence daemon, sidecars).\n\n3) Minimal repro recipe (use to titrate sequence length / batch size):\n- Save as repro.py and run inside same container:\n  from transformers import AutoModelForCausalLM, AutoTokenizer\n  import torch\n\n  model = AutoModelForCausalLM.from_pretrained('gpt-neo-125M').half().to('cuda')\n  tok = AutoTokenizer.from_pretrained('gpt-neo-125M')\n\n  def alloc(size_mb):\n      # allocate ephemeral tensors to stress VRAM\n      t = torch.zeros((size_mb*1024*1024//4,), dtype=torch.float32, device='cuda')\n      return t\n\n  print('baseline:', torch.cuda.memory_allocated())\n  toks = tok('hello', return_tensors='pt').to('cuda')\n  out = model.generate(**toks, max_new_tokens=512)\n  print('after gen:', torch.cuda.memory_allocated())\n  # increase batch/seq until OOM reproducible\n\n- Titrate: reduce max_new_tokens, reduce batch, call `torch.cuda.empty_cache()` between iterations to check fragmentation.\n\n4) Remediation experiments tried (notes):\n- `export LD_PRELOAD=` (unset to remove shim) \u2014 reduced crashes, but OOM remained for large seqs.\n- `TORCH_CUDA_ALLOC_CONF=max_split_size_mb:64` -> helped fragmentation on dev for small allocations.\n- Rebuilt container on `nvidia/cuda:12.1-runtime-ubuntu20.04` with matching host driver 535.x -> stabilized runs.\n- Forced `torch.compile(..., backend='eager')` to avoid kernel fusion that increased temporary memory in one experiment.\n\n5) Quick commands to run on repro when OOM occurs (to collect artifacts for ticket):\n- `python repro.py 2>&1 | tee /tmp/repro-output.txt`\n- Immediately after OOM: `python -c \\\"import torch; print(torch.cuda.memory_summary())\\\" &> /tmp/mem-summary.txt`\n- `nvidia-smi --query-gpu=index,memory.free,memory.used,utilization.gpu --format=csv -l 1 -f /tmp/gpu-sample.csv` (sample during repro).\n- `strace -f -e open,openat -p PID -o /tmp/strace-PID.txt` (watch for unexpected file opens of different libcuda paths).\n\n6) Evidence to attach to bug:\n- /tmp/PID-maps.txt, /tmp/PID-pmap.txt, /tmp/PID-gdb-backtrace.txt, /tmp/mem-summary.txt, /tmp/gpu-sample.csv, repro.py, container image tag, output of `ldconfig -p | grep libcuda` from inside container and host.\n\n7) Fast heuristics and final notes:\n- If OOM appears deterministic with a small sequence length, suspect allocation growth bug in model code (KV cache double allocation, repeated .cpu()/.cuda() without freeing).\n- If OOM coincides with driver errors in dmesg, prioritize ABI/library checks and matching container base to host driver.\n- For intermittent OOMs that clear after restart, look for persistent memory allocators (custom CUDA allocators, caching pools) or fragmentation; try `max_split_size_mb` or application-level batching.\n\nSaved timeline: 2026-02-11 initial repro on dev-gpu-04, 2026-02-12 tried LD_PRELOAD unset, 2026-02-14 rebuilt container matching 535.x driver -> stabilized.\n\nOpen TODOs:\n- Add small benchmarking harness to measure fragmentation over repeated short inferences (tracked in GH-rc/serve#1427).\n- Upload core/gdb traces to GH issue and link to JIRA-OPS-521.\n\nContact: ping @elliot in #infra-gpu for quick follow-up.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_8fc30c9a6d204b819370cf253f0afbe4"
+}

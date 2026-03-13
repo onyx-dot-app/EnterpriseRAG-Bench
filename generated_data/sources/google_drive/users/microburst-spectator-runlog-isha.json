@@ -1,0 +1,34 @@
+{
+  "title": "Microburst spectator runlog - notes and quick findings",
+  "owner": "Isha Patel",
+  "drive_area": "users",
+  "path": "users/microburst-spectator-runlog-isha.json",
+  "doc_type": "doc",
+  "created_at": "2025-09-17",
+  "last_modified": "2025-10-02",
+  "collaborators": [
+    "Liam Chen",
+    "Zara Kim"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "microburst",
+    "latency",
+    "noisy-neighbor",
+    "profiling",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "jira:INF-4823",
+    "confluence:perf-playbook",
+    "github:PR#2041",
+    "s3://perf-logs/microburst/2025-09-17/"
+  ],
+  "content": "Purpose:\nQuick exploratory run to reproduce intermittent p99 spikes when a small subset of tenants (\"spectators\") suddenly send short, high-rate requests (10\u201350ms payloads). Goal: capture time-aligned telemetry, kv-cache behavior, and scheduler/batcher response; produce actionable next steps.\n\nHypothesis:\n- Spikes are caused by thin, high-QPS bursts that escape batching windows and thrash the GPU hotpool and KV cache priming.\n- Spectator pattern (small % of clients hitting same shard) amplifies cold-path serialization and queue head-of-line blocking.\n\nTestbed (local-ish staging):\n- 6-node serving fleet, heterogeneous GPUs (2x A10, 4x T4 emulated), model: gpt-smallish-6B (int8), tokenizer: huggingface-encoder v1.2\n- Runtime: rwinference-v0.63 (local build), batching config: max_batch_tokens=4096, batch_timeout_ms=6, max_batch_size=64\n- KV cache: LRU per-instance, capacity 2M tokens, prefix caching enabled for warm requests\n- Load generator: custom locust script + spectator shim that pins 5% of virtual users to shard-2\n\nWorkload pattern used:\n- Background steady traffic: 120 rps total, 80% short (40\u201360 tokens), 20% long (200\u2013600 tokens)\n- Spectator injection: at t=60s, 5% of clients start 200 qps bursts lasting 6s each, repeated every 30s for 10 minutes\n\nCommands (how to reproduce quickly):\n- start load: ./scripts/run_spectator.sh --duration 600 --bg-rps 120 --spectator-qps 200 --burst-dur 6\n- collect traces: curl http://obs-agent/flush && aws s3 cp /tmp/microburst-20250917/ s3://perf-logs/microburst/2025-09-17/ --recursive\n\nRun timeline & notable telemetry (timestamps relative to run start):\n- 00:00\u201300:55: baseline stable, p50=18ms, p95=42ms, p99=78ms, overall qps ~120\n- 01:00: first spectator burst (6s): p50=22ms, p95=110ms, p99=420ms -> backend hotpath CPU queues increased, one instance reported 2x syscall wait\n- 01:36: second burst: p99 peaked at 390ms, but one T4 instance saw sustained CPU load and queue length climbed from 3->16 requests\n- 02:30\u201304:00: repeated bursts, observed gradual KV cache hit-rate drop on shard-2 from 87% -> 61% (prefill not keeping up)\n- 05:10: recovery period: batcher increased frequency of tiny batches (timeout firing) causing more small-device kernel launches, leading to GPU utilization jitter\n\nKey metrics (aggregated, sample window 01:00-05:00):\n- baseline p99 (no bursts): 78ms\n- during bursts p99 median: 385ms (stdev 45ms)\n- observed small-batch rate (batches < 4 requests): 8% -> 32% during burst windows\n- KV cache hit-rate (shard-2): 87% -> 61% during run\n- GPU kernel launch rate: +3.7x during bursts\n\nQuick ASCII timeline (p99 in ms by 30s buckets):\n[0 ]  50 |====\n[30]  60 |=====\n[60] 420 |==================== (burst start)\n[90] 380 |=================  (burst)\n[120]110 |======\n[150] 95 |====\n[180]350 |===============\n...\n\nObservations / raw notes:\n- Spectator bursts consistently localized to shard-2 (we pinned them). That instance showed cache churn and more frequent small batches.\n- Small batches correlate strongly with p99 spikes. Timeout=6ms might be too aggressive for mixed workloads with microbursts.\n- KV-prefill doesn't keep up when many new short contexts arrive; we see prefill QPS exceed prefill-handler capacity and requests fall back to cold path.\n- T4 nodes are more sensitive; A10s handle bursts better (lower p99 under same load). Could be kernel warmup/geometric throughput differences.\n- Some request traces show head-of-line blocking: long requests in the same batch delaying short ones for extra 10\u201360ms. Dynamic priority lanes might help.\n\nImmediate quick mitigations attempted (manual toggles during run):\n- raised batch_timeout_ms -> 10ms: reduced small-batch fraction from 32%->18% but increased p50 by ~6ms; p99 still improved (~250ms peak)\n- enabled aggressive KV-prefetching for known-short clients: cache hit-rate recovered to ~78% but CPU prefill QPS spiked (extra CPU cost)\n- isolated spectator clients onto separate serving pool: p99 for main pool returned to baseline but spectator pool saturated and showed worse p99 (tradeoff)\n\nOpen questions / follow-ups:\n- What is the optimal batch_timeout that balances p50 vs p99 for mixed short/long traffic under microburst patterns? Run a sweep: [2,4,6,8,12,20] ms with same burst profile.\n- Can we throttle prefill consumers or apply a token-bucket to prefill pipeline to avoid CPU overload?\n- Need to reproduce with homogenous A10 fleet to confirm device sensitivity.\n- Instrument kernel launch latency per-GPU to see if there is a critical threshold where launching dominates.\n- Consider implementing a short-request fastpath (preliminary design in INF-4823).\n\nNext steps (concrete):\n- (Today) schedule timeout sweep (2\u201320ms) across 3 repeated runs, capture full traces + batch composition. Owner: Isha\n- (This week) run homogenous A10 test and T4-only test, compare p50/p95/p99. Owner: Liam\n- (Next week) prototype short-request fastpath in a branch (PR link in linked_artifacts). Owner: Zara\n\nNotes-to-self:\n- Make sure to include per-batch contexts count in telemetry (not just token counts).\n- Add a small synthetic test that warms KV cache for spectator identities before injecting bursts (to separate cache priming vs batching effect).\n- Remind infra to keep staging GPU drivers consistent with prod (we saw a driver minor mismatch).\n\nAppendix (snippets):\n- locust snippet (spectator pin):\n    class SpectatorBehaviour(HttpUser):\n        def on_start(self):\n            if self.environment.runner.user_count * 0.05 < 1: return\n        @task\n        def short_req(self):\n            client.post('/v1/generate', json={ 'input': 'hi' })\n\n- quick grep to find small batches in traces: grep '\\\"batch_size\\\"' -n perf-traces | jq 'select(.batch_size < 4)' | wc -l\n\nEnd \u2014 raw scratch. Keep this around until sweep done.\n\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_4155ce1546e146e685da1271c3c7cf14"
+}

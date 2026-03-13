@@ -1,0 +1,35 @@
+{
+  "title": "Prompt-aware qcache and batching playbook",
+  "owner": "Asha Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/product/optimize/prompt-aware-qcache-and-batching-playbook.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-03",
+  "last_modified": "2026-02-10",
+  "collaborators": [
+    "Liam O'Connor",
+    "Marta Ruiz",
+    "Diego Alvarez"
+  ],
+  "team": "product-optimize",
+  "status": "draft",
+  "tags": [
+    "qcache",
+    "batching",
+    "quantization",
+    "cost-model",
+    "playbook",
+    "simulation"
+  ],
+  "linked_artifacts": [
+    "https://docs.google.com/spreadsheets/d/1GkCostSweep-v4",
+    "ENG-1422",
+    "confluence.redwood/optimize/qcache-playbook"
+  ],
+  "content": "Objective:\nProvide a concise, operational playbook that maps workload archetypes to recommended qcache keying, cache TTL/windowing, batching presets, and quantization profiles. This doc is intended to feed the cost-model spreadsheet (sheet id above) and a set of runnable canaries for Dedicated and Hosted routes.\n\nBackground and constraints:\n- We observe 3 dominant interaction patterns: short-interactive (median response tokens <=60, bursty), sessioned-assistant (multi-turn, long cumulative context, tail up to 4k tokens), and batch-embed/compute (parallel independent requests, often long inputs).\n- Goal: reduce token compute by 20\u201355% on typical workloads without increasing 95th latency beyond SLOs.\n- Tradeoffs: more aggressive cache TTLs and prefix-matching reduce cost but risk staleness for personalization; quantization gains vary by model architecture and sequence length.\n\nKey recommendations (by archetype):\n1) Short-interactive (chat widgets, autocompletes)\n   - Batch preset: dynamic micro-batch = target 8 concurrent inflight per GPU for p99 latency slack; min_batch_ms = 5ms; max_batch_tokens = 1536 (cap per GPU slot).\n   - qcache: prompt-aware prefix cache keyed on (route, prompt-template-id, normalized-user-intent-hash). Use short windowed TTL = 30s with immediate reuse for exact prefix hits.\n   - KV caching: keep KV caches warm for sessions with >2 turns; evict LRU for sessions idle >45s.\n   - Quantization: prefer q4f16-like profile for non-deterministic assistant responses; avoid aggressive 8-bit for model variants serving open-ended generation because of small but visible quality regressions.\n   - Estimated cost impact (sheet sim): -28% token compute, median latency +2\u20136ms.\n\n2) Sessioned-assistant (long context, background docs)\n   - Batch preset: larger continuous batching, target throughput mode with target 4 inflight per GPU and longer max_batch_ms = 25ms to achieve amortization across long-seq tokens.\n   - qcache: windowed prefix match with hierarchical keys: (route, customer-id, doc-namespace, prompt-template). Use progressive TTLs: short-turn TTL 60s, session-level TTL 20m for authenticated sessions where content is static.\n   - KV cache sizing: reserve memory pool per-customer when pinned model variant; soft cap with eviction hinting based on last-access timestamp and token-length heuristics.\n   - Quantization: use mixed q8_dynamic for encoder-heavy models; for decoder-only long-context serve q5b for verified workloads where eval pass shows <1% semantic deltas.\n   - Estimated cost impact: -35% compute on long-context paths, tail-latency neutral if batch windows respected.\n\n3) Batch-embed / compute (parallel, independent)\n   - Batch preset: aggressive batching, target 128\u2013256 sequences per batch at embedding-size alignment; max_batch_ms = 50ms and adaptive scaling by incoming queue depth.\n   - qcache: limited utility; cache fingerprint of input-shingles for identical repetition workloads. If >10% duplicate inputs, enable shard-level embedding cache with async rehydration.\n   - Quantization: safe to use lower-precision q8_0 or q4_0 for embedding-only models after offline cosine-recall validation.\n   - Estimated cost impact: -45% compute when duplicates present; -20% baseline from quantization.\n\nOperational heuristics and spreadsheet knobs to expose:\n- route_priority: controls route-level batching policy (latency_first | cost_first | balanced).\n- micro_batch_target: integer to tune on canary.\n- cache_key_fidelity: low|medium|high (affects key derivation: intent hash only vs intent+slot values).\n- ttl_profile: {fast, normal, session} mapped to seconds (30, 300, 1200). Represent these as columns in the cost-model sheet so simulations sweep over combinations.\n\nSimulation notes (how to reproduce numbers in the cost-model sheet):\n1) Use trace sample 'interactive-telemetry-2026-01' and split by route.\n2) For each route, run 3x sim passes: baseline (no qcache, qfp16), qcache only, qcache + quantization.\n3) Key spreadsheet columns: median_resp_tokens, p95_latency_ms, avg_batch_size, cache_hit_rate, qcpu_equiv_cost.\n4) Use formula: estimated_compute_cost = instance_token_cost * (1 - cache_hit_rate) * (quantization_multiplier) / batching_amortization_factor. Provide default multipliers in the sheet.\n\nCanary checklist for rollout (Hosted first):\n- Create a canary route with identical traffic slice (1\u20132% RA traffic).\n- Turn on qcache read-only for 24h with conservative TTLs. Measure p50/p95 tail.\n- Enable dynamic micro-batching and gradually increase micro_batch_target while tracking latency SLO.\n- If metrics stable, enable quantized variant behind traffic-split (10% -> 50% -> 100%).\n- Monitor quality via weighted-rouge/semantic-sim diff using eval prompts in sheet.\n\nOpen questions & risks:\n- Personalization: how do we ensure personalization tokens (user name, user-specific system prompts) don't cause over-caching? Proposal: add flag 'personalization_sensitive' on prompt-template metadata that forces higher key_fidelity and lower TTL.\n- Quantization regressions at tail cases: need dedicated eval set per customer for Private deployments.\n- Memory fragmentation when reserving per-customer KV pools. Ops to prototype shardable pools.\n\nNext steps:\n- Wire sheet columns to canary config generator (ENG-1422).\n- Run a 72h batch of sims sweeping TTLs {30s, 60s, 300s} and batch windows {5, 15, 50ms}. Put results in sheet above.\n- Schedule sync with Solutions Eng and SRE to validate per-customer pool limits (week of 2026-02-20).\n\nNotes to reviewers (quick):\n- Look for assumptions about duplicate request frequency and session lengths; those are the sensitive knobs in the cost-model.\n- If you have real production traces that contradict the 30s/60s defaults, add them to the sheet and rerun the sim.\n\nAppendix (spreadsheet formulas snippets):\n- batching_amortization_factor = 1 + (avg_batch_size - 1) * (1 - overhead_fraction)\n- quantization_multiplier = lookup(qprofile, {fp16:1.00, q4:0.55, q5:0.72, q8:0.85})\n- cache_hit_rate_est = unique_prefix_hits / total_requests (use sliding window 60s)\n\nEnd of playbook (working draft).",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_7b8827b35c3446ff9363017ef16ecfae"
+}

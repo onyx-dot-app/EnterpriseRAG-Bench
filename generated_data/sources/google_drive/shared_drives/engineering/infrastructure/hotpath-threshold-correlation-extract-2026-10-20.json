@@ -1,0 +1,90 @@
+{
+  "title": "Hotpath threshold correlation - data extract for queueing & throttles (2026-10-20)",
+  "owner": "Ava Martinez",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/infrastructure/hotpath-threshold-correlation-extract-2026-10-20.json",
+  "doc_type": "sheet",
+  "created_at": "2026-10-20",
+  "last_modified": "2026-10-21",
+  "collaborators": [
+    "Ravi Patel",
+    "Lin Chen",
+    "Diego Alvarez"
+  ],
+  "team": "engineering-infrastructure",
+  "status": "in_review",
+  "tags": [
+    "gpu",
+    "saturation",
+    "queueing",
+    "throttles",
+    "postmortem",
+    "hotpath",
+    "telemetry"
+  ],
+  "summary": "Data pull for correlating service-level hotpath threshold crossings with regional GPU saturation, queue depth, and automatic throttle events. Purpose: produce a compact dataset for the incident RCA and to feed the diagnostic notebook for model routing fallback evaluation.",
+  "purpose": "Produce joined timeseries and event slices that link: (1) low-latency hotpath SLO breaches, (2) per-GPU queue depth and busy_ratio, (3) autoscaling/throttle events and policy decisions, and (4) model variant fallbacks. Intended consumers: infra oncall, serving-runtime, SRE and product incident owners.",
+  "sampling_windows": [
+    "Primary slice: 2026-10-18T02:00:00Z -> 2026-10-19T06:00:00Z (12h before high-latency spike through 24h after)",
+    "Baseline slice: 2026-10-11T00:00:00Z -> 2026-10-11T12:00:00Z (same weekday baseline)",
+    "Burst windows: auto-detected contiguous intervals where hotpath_slo_violation_rate > 0.5% for >= 5m"
+  ],
+  "key_metrics_table": [
+    "metric | aggregation | resolution | notes",
+    "hotpath_slo_violation_rate | pct per minute | 1m | SLO = p95 latency > 120ms for hotpath route",
+    "gpu_util_busy_ratio | mean per GPU | 30s | from fleet telemetry (nvlink aggregated)",
+    "gpu_queue_depth | p50,p90,p99 across GPUs | 30s | kernel queue + runtime request queue",
+    "throttle_event_count | count per region | 1m | includes automatic and manual throttle actions",
+    "active_batch_size | mean tokens/batch | 30s | derived from serving runtime trace tags",
+    "model_fallback_count | count by variant | 1m | when primary model variant rejected due to capacity"
+  ],
+  "raw_queries": [
+    "-- join hotpath SLOs to GPU telemetry (bigquery)\nSELECT\n  TIMESTAMP_TRUNC(h.ts, MINUTE) AS ts_min,\n  h.region,\n  COUNTIF(h.p95_latency_ms > 120) / COUNT(*) AS hotpath_violation_rate,\n  AVG(g.busy_ratio) AS avg_gpu_busy,\n  APPROX_QUANTILES(g.queue_depth, 100)[OFFSET(90)] AS q90_queue_depth\nFROM\n  `prod.telemetry.hotpath_latency_v2` h\nLEFT JOIN\n  `prod.telemetry.gpu_fleet_metrics_v1` g\n  ON h.region = g.region AND TIMESTAMP_TRUNC(g.ts, MINUTE) = TIMESTAMP_TRUNC(h.ts, MINUTE)\nWHERE\n  h.ts BETWEEN TIMESTAMP('2026-10-18T02:00:00Z') AND TIMESTAMP('2026-10-19T06:00:00Z')\nGROUP BY ts_min, region\nORDER BY ts_min",
+    "-- extract throttle events and correlate to request overflow\nSELECT\n  TIMESTAMP_TRUNC(t.ts, MINUTE) AS ts_min,\n  t.region,\n  t.throttle_type,\n  COUNT(*) AS events,\n  SUM(t.requests_rejected) AS requests_rejected\nFROM\n  `prod.events.throttle_actions` t\nWHERE\n  t.ts BETWEEN TIMESTAMP('2026-10-18T02:00:00Z') AND TIMESTAMP('2026-10-19T06:00:00Z')\nGROUP BY ts_min, region, throttle_type\nORDER BY ts_min",
+    "-- get per-request traces for hotpath requests hitting fallback\nSELECT\n  r.request_id,\n  r.ts,\n  r.region,\n  r.latency_ms,\n  r.model_variant_requested,\n  r.model_variant_served,\n  r.serving_node_id,\n  r.queue_time_ms\nFROM\n  `prod.traces.request_level` r\nWHERE\n  r.is_hotpath = TRUE\n  AND r.ts BETWEEN TIMESTAMP('2026-10-18T02:00:00Z') AND TIMESTAMP('2026-10-19T06:00:00Z')\n  AND r.queue_time_ms > 10\nLIMIT 10000"
+  ],
+  "top_findings": [
+    "Temporal alignment: the first notable cluster of hotpath SLO breaches (2026-10-18T03:14Z -> 03:38Z) lines up with a sharp regional increase in avg_gpu_busy for us-west1 (+22pp) and a simultaneous rise in p99 queue_depth.",
+    "Autoscaler latency: scaling decisions for Dedicated pools in us-west1 showed a median decision latency of ~45s (beyond target 15s) during the spike, causing transient undersupply before extra nodes registered.",
+    "Batching behavior: mean active_batch_size increased by ~1.8x during the event for long-sequence workloads; higher batching reduced per-token cost but increased tail queueing on hotpath requests.",
+    "Throttle pattern: two automated throttle bursts (03:20Z and 03:31Z) were correlated with policy threshold crossings tied to per-pool queue_length > 500; the throttle implementation rejected entire request batches instead of shedding low-priority replicas first.",
+    "Model fallback: 13% of hotpath requests were routed to smaller quantized variants during the incident; these fallbacks had lower p95 latency but higher rejection rate for large prompt sizes, contributing to user-visible errors.",
+    "Regional imbalance: europe-west2 saw modest load increases but did not receive cross-region failover due to routing policy set to prefer region affinity for hotpath, limiting spillover headroom.",
+    "Telemetry gaps: there is a 5\u201312s jitter window between serving runtime queue_time metrics and fleet-level GPU busy_ratio, complicating precise causality attribution for sub-30s spikes."
+  ],
+  "recommended_actions": [
+    "Short term (1\u20137d): implement an emergency policy to prefer shedding non-hotpath workloads before throttling hotpath routes; change throttle implementation to operate at request-level granularity for affected pools.",
+    "Short term: add a fast-path autoscaler hook that forces a cold-started node to register as \"available\" for routing earlier (soft register) while full health checks finish, reducing decision latency impact.",
+    "Medium term (2\u20136w): introduce dynamic routing override that allows controlled cross-region spillover when regional headroom < 10% and latency SLOs for hotpath are degrading beyond threshold.",
+    "Medium term: align batch-size controller with hotpath prioritization so that active_batch_size heuristics consider request priority tags and avoid increasing batch size for hotpath-dominant slices.",
+    "Long term (quarter): instrument sub-minute synchronized telemetry (micro-buckets) between runtime and fleet to remove the 5\u201312s jitter window; evaluate event-driven streaming of queue-depth signals to autoscaler.",
+    "Monitoring: add a composite alert that fires when (hotpath_p95 > 120ms) AND (avg_gpu_busy > 75%) in a region for >=2m; route to infra-oncall plus serving-runtime oncall."
+  ],
+  "referenced_tickets": [
+    "INC-4921",
+    "RINF-2339",
+    "RTE-719 (autoscaler slow-register)",
+    "PR-1184 (throttle request-level change draft)",
+    "CONF-3312 (routing policy doc)"
+  ],
+  "linked_artifacts": [
+    "https://redwood.atlassian.net/browse/INC-4921",
+    "https://confluence.redwood.ai/display/INF/Hotpath+Routing+Policy+v2",
+    "git+https://github.com/redwood-inference/serving-runtime/pull/1184"
+  ],
+  "notes_to_self": "This sheet is a focused extract for the infra RCA. Next step: feed the three pulls (latency+telemetry join, throttle events, request traces) into the incident notebook and run change-point detection on queue_depth p99. Add filtered sample of request traces for top 3 customers impacted. Verify storage of intermediate joins under bq:prod_rca.hotpath_correlation_temp.",
+  "authoring_notes": "Keep this extract minimal \u2014 downstream analysis notebooks should perform enrichment. Timestamp alignments use minute-truncation to reduce noisy millisecond jitter; if we need sub-minute causality, re-run with 10s resolution and sample smaller time ranges.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "purpose",
+    "sampling_windows",
+    "key_metrics_table",
+    "raw_queries",
+    "top_findings",
+    "recommended_actions",
+    "notes_to_self",
+    "authoring_notes"
+  ],
+  "dataset_doc_uuid": "dsid_7c99de4538834db3afea53b5160c26ef"
+}

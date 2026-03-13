@@ -1,0 +1,59 @@
+{
+  "title": "CUDA/NCCL/Driver Rollback Scenarios and Validation Probes",
+  "owner": "Ethan Collins",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/private-deployments/cuda-nccl-driver-rollback-scenarios-and-probes.json",
+  "doc_type": "doc",
+  "created_at": "2026-03-12",
+  "last_modified": "2026-03-13",
+  "collaborators": [
+    "Priya Malhotra",
+    "Jasper Kim",
+    "Ana Rodriguez"
+  ],
+  "team": "eng-private-deployments",
+  "status": "draft",
+  "tags": [
+    "cuda",
+    "nccl",
+    "gpu",
+    "k8s",
+    "terraform",
+    "rollback",
+    "validation",
+    "probes"
+  ],
+  "linked_artifacts": [
+    "https://confluence.redwood.ai/pages/PD-1234",
+    "https://github.com/redwood-inference/terraform-modules/pull/89",
+    "JIRA:PD-4221"
+  ],
+  "summary": "Draft playbook for safe rollbacks and non-disruptive validation probes for Kubernetes clusters running Redwood private deployments with GPU workloads. Focuses on terraform gating, canary node rotation, and automated probe scripts to assert CUDA/NCCL/driver compatibility before and after changes.",
+  "body": "Context: We're seeing occasional regressions after driver/CUDA/NCCL upgrades on customer on-prem clusters. This doc captures a pragmatic rollback-first playbook plus lightweight validation probes engineers can run during upgrades or emergency rollbacks. Intended for SREs and field engineering doing Private deployments and for terraform module authors who need gating hooks.\n\nGoals:\n- Minimize customer impact during driver/CUDA/NCCL changes.\n- Provide automated probes that catch the common failure modes (kernels mismatch, NUMA affinity issues, NCCL OOMs).\n- Define terraform gating and module-level feature flags to allow staged upgrades and fast rollbacks.\n\nHigh-level strategy:\n1) Preflight: gather inventory, baseline metrics, and record current driver/kernel/CUDA/NCCL versions.\n2) Canary: stage upgrade on 1\u20132 non-critical GPU nodes, run synthetic LLM inference workloads and NCCL allreduce smoke tests.\n3) Validate: run probe suite (see Probe section) and ensure SLA metrics unchanged.\n4) Rollout: if canary passes, use staggered node rotation with terraform + k8s drain. If canary fails, trigger rollback TTP.\n\nTerraform module notes (practical guidance):\n- Decouple driver lifecycle from nodepool creation: expose a boolean var gpu_driver_manage = true/false. Set to false for clusters where admin manages drivers.\n- Add a module output driver_version and a data source that can be used to create a sentinel configmap: module.gpu.driver_version -> k8s configmap redwood/gpu-driver-sentinel. That sentinel is read by rollout scripts.\n- Provide a plan-only mode: terraform apply -target=module.gpu -lock=false + a smoke_run flag to avoid changing node images during plan runs.\n- Feature flag for staged_apply_window: list of CIDR or node labels that will be patched in each stage. Default [\"stage-1\",\"stage-2\",\"stage-3\"].\n- Implement a pre-hook provider that runs remote exec (SSH) to collect driver binaries checksums and write to S3/Minio for audit.\n\nRollback runbook (fast path):\n- Trigger: canary failed or metric regression detected post-rollout.\n- Immediate action: scale down workloads using label redwood.workload=best-effort to free GPUs.\n- Terraform fast rollback: set module.gpu.driver_force_version = \"<previous-driver>\" and terraform apply -target=module.gpu -auto-approve. If drivers are installed via daemonset, roll the daemonset image back with kubectl set image ds/gpu-drivers gpu-driver=<previous-image>.\n- Node rotation: cordon the affected node, drain (kubectl drain --ignore-daemonsets --delete-local-data --grace-period=120), taint the node with redwood/rollback=active, restart the driver install DaemonSet or run the pre-baked installer, and uncordon once probes pass.\n- Post-rollback validation: run the probe suite and ensure at least one representative inference request (use the per-customer test prompt) completes within baseline latency +/- 15% and with identical tokenization results (hash check).\n\nProbe suite (lightweight, non-disruptive):\n- probe-01: driver-verify.sh (checks nvidia-smi, driver blob signatures, modinfo nvidia, kernel version match). Exit codes: 0=ok, 1=warning, 2=failure.\n- probe-02: cuda-smoke.py (runs small matrix multiply kernel via CUDA runtime, verifies correct FP32 outputs).\n- probe-03: nccl-allreduce-smoke (launches 2-process allreduce on the same node across GPUs using NCCL tests compiled with the target CUDA version).\n- probe-04: kv-cache-load (starts a small LLM inference that uses KV cache to exercise memory allocation paths).\n- probe-05: cuda-mem-stress (allocates buffer up to 80% of GPU memory then frees; assert no OOMs in dmesg).\n- probe orchestration: a single script run-probes.sh executes probes sequentially, captures stdout/stderr, and uploads a JSON result to S3/Minio under path redwood/inventory/<cluster>/<timestamp>.json.\n\nGate conditions (pass to continue rollout):\n- All probes exit code 0 on canary nodes.\n- GPU error metrics (nvidia_dc_errors, GPU ECC) do not increase beyond 10% of baseline in the 10m window after upgrade.\n- NCCL errors per-node remain at zero for 5 consecutive runs of allreduce.\n- Inference success rate >= 99% for synthetic n=2000 requests with 95th latency < baseline+25th percentile.\n\nTelemetry and alerts to configure during upgrade windows:\n- Grafana dashboard panels to watch: driver_load_failures, GPU_memory_errors, TensorRT_load_time, inference_p95_tokens, kube_node_unschedulable_count.\n- Alert rules: high-severity if driver_install_failures > 1 on more than 2 nodes in 15m; medium if canary p95 latency > baseline * 1.25.\n\nNon-disruptive verification patterns (recommendations):\n- Use node labels to pick canaries: label nodes with redwood.stage=canary or redwood.stage=prod. Only upgrade canary labels first.\n- Prefer DaemonSet-based driver install with image tags that are immutable and include the driver version as tag. Avoid \"latest\".\n- When possible use in-place driver modules that support rolling updates rather than full node reprovision to reduce ticket churn.\n\nCommon failure modes and mitigations observed in field:\n- kernel module mismatch after kernel upgrade -> mitigation: ensure kernel-headers package version pinned and include a post-upgrade modprobe sequence.\n- NCCL hangs on certain interconnect firmware versions -> mitigation: run nccl-tests early, fall back to single-GPU mode and flag nodes for vendor firmware update.\n- CUDA runtime symbol mismatch -> mitigation: validate libcudart.so soname before applying.\n\nOperational checklist for an upgrade window (pre-checklist):\n- Snapshot current driver and cuda packages checksums.\n- Ensure backups for critical configmaps: kube-system/nvidia-device-plugin-config, redwood/gpu-driver-sentinel.\n- Notify customers and set maintenance-mode routes in the console if any critical customers on the cluster.\n- Reserve SRE on-call for rollback window (2 hours after rollout).\n\nPostmortem capture fields (template):\n- summary, timeline, canary results (pass/fail), metrics at time of failure, root cause hypothesis, corrective action, terraform change id, linked PRs, retrospective owner.\n\nQuick commands (examples):\n- Collect node driver info: for n in $(kubectl get nodes -l redwood.stage=canary -o name); do kubectl debug $n -it --image=ubuntu -- nvidia-smi; done\n- Run canary nccl: kubectl run nccl-smoke --image=redwood/nccl-smoketest:1.0 --restart=Never --labels app=nccl-smoke -- nproc-runner.sh\n- Force driver rollback via daemonset: kubectl set image ds/gpu-drivers gpu-driver=redwood/driver:525.85.12-rollback\n\nNotes on documentation and handoff:\n- Add the probe run logs to the cluster audit (s3 path above) and link the artifacts to the ticket.\n- For customers running air-gapped clusters, ensure probe binaries are bundled into the airgap bundle and checksums published.\n\nNext steps (action items):\n- (Ethan) Add run-probes.sh into terraform module pre-hook and provide toggle for dry-run.\n- (Priya) Create a lightweight Grafana dashboard template for canary windows.\n- (Jasper) Draft automation to parse probe JSON and fail terraform apply if any probe returns failure code 2.\n\nEnd of draft. Please add any missing failure modes you have seen in the field and test the probe suite on the 2024 and 2026 driver branches.",
+  "compatibility_matrix": [
+    "k8s 1.25 | NVIDIA driver 515.76 | CUDA 11.8 | NCCL 2.11 | Notes: stable for older Ampere clusters; test nv_peer_mem",
+    "k8s 1.26 | NVIDIA driver 520.61 | CUDA 12.0 | NCCL 2.14 | Notes: requires new nvidia-container-toolkit >= 1.9",
+    "k8s 1.27 | NVIDIA driver 525.85 | CUDA 12.1 | NCCL 2.15 | Notes: generally OK, watch for kernel-headers mismatch on ubuntu 22.04",
+    "k8s 1.28 | NVIDIA driver 535.x | CUDA 12.2 | NCCL 2.18 | Notes: early tests show improved allreduce perf; need firmware 5.2+",
+    "k8s 1.24 | NVIDIA driver 510.x | CUDA 11.6 | NCCL 2.10 | Notes: end-of-life for some distros, avoid for new clusters",
+    "k8s 1.27 | NVIDIA driver 470.x (legacy) | CUDA 11.4 | NCCL 2.8 | Notes: only for legacy Tesla V100 fleets; require kernel pinning",
+    "k8s 1.29 (experimental) | NVIDIA driver 540.x | CUDA 13.0 | NCCL 2.20 | Notes: target for future testing, enable in staging only"
+  ],
+  "validation_checks": [
+    "driver-verify.sh exit code should be 0 on all GPU nodes",
+    "cuda-smoke runtime FP32 checksum matches golden for small matrix multiply",
+    "nccl-allreduce-smoke achieves zero NCCL errors for 5 consecutive runs",
+    "no OOM or GPU-reset logged in dmesg within 10 minutes of probe",
+    "inference p95 on canary within baseline + 15%",
+    "terraform plan must include the driver_version sentinel change before apply",
+    "probe run artifacts uploaded to S3/Minio and linked to rollout ticket"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "body",
+    "compatibility_matrix",
+    "validation_checks"
+  ],
+  "dataset_doc_uuid": "dsid_523b276d1c584478b1a52a5cc52385c8"
+}

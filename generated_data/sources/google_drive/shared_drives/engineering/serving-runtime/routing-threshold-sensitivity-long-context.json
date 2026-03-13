@@ -1,0 +1,61 @@
+{
+  "title": "Routing threshold sensitivity and long-context performance matrix",
+  "owner": "Priya Shah",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime",
+  "doc_type": "doc",
+  "created_at": "2025-10-15",
+  "last_modified": "2026-02-11",
+  "collaborators": [
+    "Ethan Chen",
+    "Marco Rivera",
+    "Leah Morris"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "moe",
+    "routing",
+    "long-context",
+    "profiling",
+    "mistral",
+    "llama",
+    "qwen",
+    "perf"
+  ],
+  "linked_artifacts": [
+    "https://linear.app/RD-4123",
+    "https://github.com/redwood-inference/serving-runtime/pull/987"
+  ],
+  "summary": "Notes from exploratory profiling across Llama/Mistral/Qwen with MoE routing threshold sweeps on long-context workloads. Focus is on how small gating threshold changes amplify memory and latency variability and which mitigation knobs give the most predictable improvement.",
+  "key_findings": [
+    "Gating threshold (activation clamp / min-score) exhibits non-linear impact on p95/p99 latency for long contexts (>16k) across all three models; Qwen shows the steepest cliff behavior.",
+    "Lowering the gate threshold to accept more experts increases parallel fanout and memory working set (KV + activation), which can push certain kernel tilings into a much less efficient path on A100, causing step changes in latency.",
+    "Mistral\u2019s FFN I/O patterns make it susceptible to IO-bound stalls when expert fanout increases; the effect shows as throughput cliffs at specific sequence-length \u00d7 expert-fanout combinations.",
+    "Llama variants are more tolerant due to denser attention tiling; their token-forward latency increases more gradually as fanout changes.",
+    "Simple microbatching and smaller token fragments reduce p99 variance but at unit-cost regression; adaptive microbatching based on online fanout estimate recovers some efficiency.",
+    "A cheap mitigation is dynamic gating clamp (per-request threshold adjustment using recent expert hotness estimate) which avoids extreme fanout spikes for tail requests.",
+    "KV cache layout interacts with routing: heavy fanout increases simultaneous KV read bandwidth and causes L2/L3 thrashing on particular GPU architectures, exacerbating p99.",
+    "Prefetching the top-k expert KV rows for high-hotness prefixes reduces stall incidence by ~20% in our trials.",
+    "Quantization (4-bit) reduces memory pressure but sometimes changes kernel selection and can expose different latency cliffs \u2014 must be evaluated together with routing sweeps."
+  ],
+  "content": "Context:\nThis doc captures a focused, empirical sweep we ran to understand how routing 'threshold' or min-activation gating parameters affect runtime behavior when serving long-context requests against Llama/Mistral/Qwen model families configured as MoE variants. The objective: identify why small gating changes sometimes produce large p99 regressions and what operational mitigations buy us the best latency stability vs cost trade-off.\n\nExperimental setup (summary):\n- Hardware: mixed pool of A100-80GB and H100-80GB nodes; experiments reported are primarily on A100 (unless noted).\n- Models: Llama-2-13B-MoE (64 experts, topk=2), Mistral-7B-MoE-like (48 experts, topk=2), Qwen-7B-MoE-prototype (64 experts, topk=2).\n- Context lengths: 2k, 8k, 16k, 32k tokens.\n- Batch sizes: single-request profiles (B=1) with synthetic concurrency experiments (B=4 microbatches).\n- Routing knobs swept: gating_min_score {0.0, 0.01, 0.03, 0.07, 0.12}, gating_temperature {0.8, 1.0, 1.2}.\n- Metrics captured: p50/p95/p99 latency (ms), GPU kernel time (ms), KV cache read MB, peak GPU memory, throughput (tokens/sec), per-kernel selection map (scheduler logs).\n- Tools: our flame capture (flame-runner v2), nvprof-lite traces, kernel-selector logs, and a lightweight runtime hook to capture per-request fanout and expert hit-map.\n\nObservations (detailed):\n1) Non-linear latency cliffing (Qwen worst)\n   - For Qwen at 16k/32k, moving gating_min_score from 0.03 -> 0.01 increased p99 by 2.5\u20133x. The median barely moved.\n   - Root cause trace: increased simultaneous expert invocations pushed certain attention kernels from a prefetch-friendly tiling path into a fallback kernel with serialized inner loops on A100. Kernel-selector logs showed a jump from kernel-id K_42 -> K_77 at the same sequence length when fanout > ~48.\n\n2) Memory working set amplification\n   - More experts accepted => KV cache reads multiply (per-expert KV footprint). At long contexts this crosses the L2/L3 budget and triggers repeated DRAM fetches. Measured KV read MB/request went from ~340MB -> ~1.1GB for Qwen when gate lowered in our 32k runs.\n\n3) Mistral FFN IO sensitivity\n   - Mistral experiments show throughput cliffs correlated with FFN staging buffers when expert fanout causes more concurrent FFN calls. This looks like an IO-bound saturation where overlapping FFN launches exceed the kernel fusion planner's sweet spot.\n\n4) Llama resilience\n   - Llama-2 variants increased latency more gracefully. Although p99 increases still present, the underlying kernel selector remained on the same high-throughput kernel family until much larger fanout thresholds.\n\n5) Microbatching trade-offs\n   - Smaller microbatches reduce peak memory pressure and smooth p99, but they increase per-token compute overhead and reduce peak throughput. Adaptive microbatching (increase microbatch size when observed fanout low, reduce when high) improved p99 tail by ~18% vs static baseline.",
+  "next_steps": [
+    "Prototype dynamic gating clamp: implement a runtime hook that increases gating_min_score by +delta for requests whose recent hotness metric passes threshold.",
+    "Add a prefetch path for top-4 experts when long-context and predicted fanout > 32 and measure prefetching overhead vs stall reduction.",
+    "Rerun full routing sweep on H100 to see if kernel cliff points shift \u2014 capture kernel-selector version and compare.",
+    "Add combined quantization + routing sweep (4-bit, NF4-style) to see end-to-end memory/latency surface.",
+    "Create an A/B experiment in staging to validate dynamic-clamp on production-like traffic for a limited subset of customers (low-risk routes)."
+  ],
+  "notes": "Quick notes / heuristics observed while poking:\n- If you see p99 >> p95 and top-1 kernel time spike, check kernel-selector transitions first. That often explains step-change behavior.\n- Fanout hysteresis: small changes in threshold can flip many sequences from single expert -> multi expert, so the distribution is bimodal for tail latency.\n- KV layout matters: aligning expert KV rows to contiguous memory for hot experts reduces L2 thrash. We should evaluate re-layout in the data loader.\n- Avoid global lower gating_min_score as a default for long-context end-users; prefer per-route or per-request adaptive policies.\n\nExperiment log (short):\n- 2025-10-16: initial sweep on A100; saw first Qwen cliff at gating_min_score=0.01, 16k seq.\n- 2025-10-20: repeated with pinned kernel-selector; confirmed kernel-id jump correlates with fanout > 48.\n- 2025-11-05: added microbatching experiments; adaptive scheme reduces p99 at cost of 6% lower throughput.\n- 2025-11-18: prefetch prototype (top-2) reduced stalls but increased average memory by ~150MB; net p99 improvement ~12%.\n\nOpen questions / unknowns:\n- Why does kernel-selector choose the fallback kernel at a particular fanout boundary? Need to inspect the selector heuristics and cost model.\n- How does GPU PCIe topology and multi-GPU spans (model parallel shards) change the cliff points? Our single-GPU tests are indicative but not complete.\n- Could a smarter KV layout or compression reduce the effective L2 pressure enough to avoid kernel fallback?\n\nImmediate action items (owners):\n- Priya: spike on dynamic gating clamp prototype (WIP).\n- Ethan: dig into kernel-selector heuristics and add more verbose logging for the selection decision (RD-4123).\n- Marco: run a controlled H100 sweep and collect per-kernel runtime counts.\n- Leah: prototype expert-KV prefetch indices and measure memory overhead.\n\nAppendix (useful traces):\n- Example trace snippet (abridged):\n  request-id: r-20251016-zz12\n  model: qwen-7b-moe\n  seq: 32768\n  gating_min_score: 0.01\n  observed_fanout: 62\n  p99: 2312ms p50: 210ms\n  kernel-steps: [K_12(60ms), K_42(120ms), K_77(1890ms)]\n  kv_read_mb: 1120MB\n\n- Command used to collect: \n  ./runtime/bin/flame-runner --model qwen-7b-moe --seq 32768 --trace-kernel --gating_min 0.01 --out trace.json\n\n- Reference Linear tickets / PRs: RD-4123 (kernel-selector visibility), RD-4191 (dynamic-gating-clamp spike), PR #987 (prefetch prototype).",
+  "filename": "routing-threshold-sensitivity-long-context.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "key_findings",
+    "content",
+    "next_steps",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_85fc8054a0234e3b8bb4970dab1fc3ee"
+}

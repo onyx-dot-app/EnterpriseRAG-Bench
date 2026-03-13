@@ -1,0 +1,35 @@
+{
+  "title": "SSE output drain / limbo investigation notes",
+  "owner": "Aisha Patel",
+  "drive_area": "users",
+  "path": "users",
+  "doc_type": "doc",
+  "created_at": "2026-03-06",
+  "last_modified": "2026-03-12",
+  "collaborators": [
+    "Diego Morales",
+    "Elliot Chen"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "sse",
+    "chunking",
+    "backpressure",
+    "repro",
+    "kv-cache",
+    "curl",
+    "node"
+  ],
+  "linked_artifacts": [
+    "JIRA-INF-1897",
+    "https://github.com/redwood-inference/serving-runtime/pull/789",
+    "slack://channel/C12345/thread/T67890"
+  ],
+  "content": "Summary:\nIntermittent issue where an SSE/streaming response appears to 'stall' for clients (no new chunks for 5\u201330s) then either resumes or connection resets. Locally I can reproduce a deterministic variant when a small tail chunk is written and the upstream handler closes immediately after. Hypothesis: last-chunk flush/drain race between writev/epoll and the connection close path + interaction with prefix/KV cache eviction.\n\nSymptoms (observed):\n- Client: long pause ~5\u201330s with no bytes received; TCP connection often stays ESTABLISHED.\n- Sometimes connection resets (RST) shortly after stall.\n- When using curl -N we sometimes see final chunk never arrive; using tcpdump shows a tiny packet with 1\u20134 bytes sometimes lost or delayed.\n- Affects ~0.5\u20133% of streaming requests in staging; higher under backpressure/burst.\n\nApprox repro frequency: low in prod, high when we enable heavy KV cache churn or artificially slow disk/network on node serving the stream.\n\nEnvironment / build: \n- branch: sse-drain-experiments (wip)\n- last-repro-commit: a3f9c2b (serving-runtime)\n- runtime flags used locally: REDWOOD_STREAM_DEBUG=1, LOG_LEVEL=debug\n\nQuick reproduction (local):\n1) Start local runtime with small write-coalescing thresholds: \n   export REDWOOD_STREAM_FLUSH_INTERVAL_MS=1\n   export REDWOOD_STREAM_MAX_COALESCE_BYTES=64\n   ./bin/runtime --dev --listen 127.0.0.1:8400\n2) Run test server that writes an SSE stream: first writes a few normal events, then writes a 3-byte tail and immediately closes the writer.\n\nRepro command (curl):\n- curl -v -N \"http://127.0.0.1:8400/v1/stream?model=test\" > /dev/null\n  (observe on server logs: writer closed right after last write)\n\nNode client repro (fetch):\n- node repro/stream-repro.js (script attached in linked artifacts)\n- Use fetch with keepalive: const res = await fetch(url, { method: \"GET\" });\n  res.body.on('data', d => console.log('chunk', d.length));\n  res.body.on('end', () => console.log('ended'));\n\nCommands tried and results:\n- curl -v -N ... shows stall sometimes; server logs show write returned >0 and then close after.\n- tcpdump on loopback shows: final small TCP PUSH often delayed until RTO (sets of duplicate ACKs) or dropped.\n- strace on runtime: sometimes close(fd) happens immediately after writev() returns, but sendmmsg/send doesn't indicate internal flush.\n- Force adding fsync-equivalent (not practical) but adding an explicit tcp_nodelay toggle on socket reduces frequency.\n- Increasing coalesce timeout to 50ms eliminates repro locally (makes sense: coalesce gives time for kernel to flush).\n\nObserved server logs (snippets):\n- [DEBUG] sse: writev(3) -> 18 bytes\n- [DEBUG] sse: close stream handler (graceful)\n- [DEBUG] sse: connection still ESTABLISHED\n- ... client reports no further bytes for 12s \n- [WARN] conn: reset by peer (on some runs)\n\nHypotheses (ranked):\n1) Flush/drain race: user-space closes fd too quickly after writev; kernel socket buffer hasn't been pushed to NIC (or gets dropped during congestion) -> client sees missing tail. Coalescing settings change frequency.\n2) Interaction with Nagle vs TCP_NODELAY: small writes may be delayed and then lost when connection close triggers reset; toggling NODELAY changed repro frequency.\n3) Middlebox or load-balancer (NGINX / envoy) is intervening when it sees connection-close with tiny leftover bytes, rebuffering or dropping them. Observed higher in prod behind envoy.\n4) Our streaming framing: trailing whitespace/newline rules confuse some SSE parsers and client code sometimes waits for newline delim before parsing; but tcpdump shows bytes not received rather than parser waiting.\n5) Backpressure/backlog in our per-connection write queue: writes get enqueued then evicted by KV-cache eviction code which calls cancel path and closes fd prematurely.\n\nNotes on code paths to inspect:\n- serving-runtime/pkg/transport/sse_writer.go -> writeEvent() and closeStream()\n- platform socket wrapper: net/socket_wrapper.go -> setNoDelay, flushPath\n- connection lifecycle: conn_manager's close with immediate 'force' flag when handler returns error\n- kv cache eviction callback: may call request.Cancel() in some code paths (check commit a3f9c2b changes)\n\nAdditional repro variants tried: \n- Add a small sleep(10ms) between last write and close in handler -> no repro.\n- Write larger tail (>512 bytes) -> no repro.\n- Use TLS vs plain -> both reproduce, but frequency differs (TLS slightly higher).\n- Run behind envoy proxy locally with http2 upstream -> no repro (suggests path difference).\n\nQuick patches attempted (local):\n- Delay close by 20ms unconditionally (fixes but hacky).\n- Explicitly set TCP_NODELAY on connection earlier -> reduces frequency.\n- Switch write path to use sendfile-like coalescing (untested on linux in this env).\n- Add metric for \"small-last-write-and-close\" counter.\n\nLogs / telemetry to add (next):\n- Count where last_write_bytes < 32 and close_time - last_write_time < 2ms.\n- Emit stacktrace on such closes (sampling) to find caller path.\n- Trace if kv-cache eviction triggered request cancellation in the same tick.\n\nImmediate next steps (assigned):\n- Diego: add the telemetry counters & sampling logs (JIRA-INF-1897) by EOD Thu.\n- Elliot: add optional 5ms grace delay in close-path behind a feature flag and run canary.\n- Me (Aisha): replicate in staging behind envoy with increased logging and tcpdump (start Mon).\n\nNotes-to-self: \n- Avoid pushing a global unconditional sleep into close path in code review; prefer targeted detection of small-last-write scenario.\n- Check kernel version differences: older kernels had known transmit queue behaviours.\n- Remember to correlate client-side SDK versions; Node fetch implementations have varied stream semantics.\n\nUseful commands (bookmark):\n- tcpdump -i lo -w sse-dump.pcap port 8400\n- sudo ss -tin sport = :8400\n- strace -f -p <pid> -e trace=network\n\nSlack threads / context: #serving-runtime, thread T67890 (linked above).\n\nOpen questions: \n- Is this purely timing/flush or is there a higher-level race with request cancellation (kv cache)?\n- Why TLS shows higher freq? does encryption change packet sizing/MTU -> more likely to create small final record?\n\nEnd - rough notes, will refine after Diego's metrics & sampled logs.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_1e4766c7db534b7d9d48b2a2d966d51e"
+}

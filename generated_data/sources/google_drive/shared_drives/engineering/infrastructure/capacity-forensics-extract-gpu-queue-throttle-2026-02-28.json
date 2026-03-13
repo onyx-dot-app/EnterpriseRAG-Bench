@@ -1,0 +1,98 @@
+{
+  "title": "Capacity forensics: GPU queue + throttle extract (Feb 2026)",
+  "owner": "Marcus Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/infrastructure/capacity-forensics-extract-gpu-queue-throttle-2026-02-28",
+  "doc_type": "sheet",
+  "created_at": "2026-02-28",
+  "last_modified": "2026-03-10",
+  "team": "eng-infrastructure",
+  "status": "in_review",
+  "collaborators": [
+    "Leah Thompson",
+    "Priya Nair",
+    "Diego Rivera"
+  ],
+  "tags": [
+    "capacity",
+    "postmortem",
+    "gpu",
+    "saturation",
+    "throttling",
+    "queueing",
+    "data-extract"
+  ],
+  "linked_artifacts": [
+    "https://confluence.redwood.ai/display/INFRA/Capacity+Incident+2026-02",
+    "JIRA-INFRA-4123",
+    "https://github.com/redwood-inference/infra-monitoring/pull/278"
+  ],
+  "summary": "Working data-extract sheet for the Feb 2026 capacity incident. Purpose: produce CSVs and pivot-ready slices for postmortem dashboards (saturation ratios, queue depth, throttles by route/region, GPU memory pressure events). This is a working draft with query text, export columns, notes on sampling windows, and quick charts to produce from the outputs.",
+  "primary_questions": [
+    "Which regions and instance types hit persistent saturation (>85% compute or >90% memory) during the incident window?",
+    "How did request queue depth and wait-time percentiles evolve before/after the mitigation?",
+    "Which routes/models experienced the most throttle events and what were the throttle reasons (rate-limit vs capacity fallback)?",
+    "Was there a correlation between node-level memory pressure events and per-route throttles or 429 spikes?",
+    "Did autoscaler behavior (scale-ups/scale-downs) lag the demand spike and produce transient queueing?"
+  ],
+  "time_windows": [
+    "pre-incident: 2026-02-14T00:00:00Z to 2026-02-18T23:59:59Z (baseline week)",
+    "incident-peak: 2026-02-19T03:20:00Z to 2026-02-19T08:00:00Z",
+    "mitigation-phase: 2026-02-19T08:00:01Z to 2026-02-19T12:00:00Z",
+    "post-incident: 2026-02-20T00:00:00Z to 2026-02-21T23:59:59Z"
+  ],
+  "exports_expected": [
+    "gpu_node_metrics.csv (timestamp, node_id, region, instance_type, gpu_util_pct, gpu_mem_used_mb, gpu_mem_total_mb, cpu_util_pct, running_tasks_count)",
+    "queue_events.csv (timestamp, request_id, route, model, region, queue_depth_at_enqueue, enqueue_latency_ms, deque_latency_ms, outcome)",
+    "throttle_summary.csv (timestamp_bucket, route, region, model, throttle_reason, throttle_count, unique_clients)",
+    "autoscaler_actions.csv (timestamp, pool_id, action_type, delta_instances, target_capacity, observed_util_pct)",
+    "node_pressure_events.csv (timestamp, node_id, event_type:OOM|preempt|memory_pressure, details)",
+    "route_traffic.csv (timestamp_bucket, route, region, model, requests, tokens_out, avg_latency_ms, p50_latency_ms, p95_latency_ms)"
+  ],
+  "sql_queries": [
+    "-- GPU node utilization slice (1m)\nSELECT time_bucket('1 minute', ts) AS ts_min, node_id, region, instance_type, avg(gpu_util_pct) AS gpu_util_pct, avg(gpu_mem_used_mb) AS gpu_mem_used_mb, max(gpu_mem_total_mb) AS gpu_mem_total_mb, avg(cpu_util_pct) AS cpu_util_pct, max(running_tasks_count) AS running_tasks FROM infra.gpu_node_stats WHERE ts BETWEEN '{{start_ts}}' AND '{{end_ts}}' GROUP BY ts_min, node_id, region, instance_type ORDER BY ts_min;",
+    "-- Queue events: include both enqueue/dequeue latencies and queue depth at enqueue\nSELECT q.ts AS timestamp, q.request_id, r.route_name AS route, r.model_name AS model, q.region, q.queue_depth AS queue_depth_at_enqueue, q.enqueue_duration_ms, q.dequeue_duration_ms, q.outcome FROM infra.request_queue q JOIN infra.routes r ON q.route_id = r.id WHERE q.ts BETWEEN '{{start_ts}}' AND '{{end_ts}}' AND q.queue_depth > 0 ORDER BY q.ts;",
+    "-- Throttle counts by reason and route (1m buckets)\nSELECT time_bucket('1 minute', ts) AS ts_min, route, region, model, throttle_reason, count(*) AS throttle_count, count(DISTINCT client_id) AS unique_clients FROM infra.throttle_logs WHERE ts BETWEEN '{{start_ts}}' AND '{{end_ts}}' GROUP BY ts_min, route, region, model, throttle_reason ORDER BY ts_min DESC;",
+    "-- Join throttle spikes to node memory pressure (correlate by 5m window)\nSELECT t.ts_min AS throttle_min, t.route, t.region, t.model, t.throttle_count, n.node_id, n.event_type, n.event_ts FROM (SELECT time_bucket('5 minute', ts) AS ts_min, region, route, model, sum(1) AS throttle_count FROM infra.throttle_logs WHERE ts BETWEEN '{{start_ts}}' AND '{{end_ts}}' GROUP BY ts_min, region, route, model) t LEFT JOIN infra.node_pressure_events n ON n.region = t.region AND n.event_ts BETWEEN t.ts_min - INTERVAL '5 minutes' AND t.ts_min + INTERVAL '5 minutes' WHERE t.throttle_count > 10 ORDER BY t.ts_min;",
+    "-- Autoscaler lag analysis: compute time between rising util and scale event\nWITH util AS (SELECT time_bucket('1 minute', ts) AS ts_min, pool_id, avg(gpu_util_pct) AS util FROM infra.gpu_node_stats WHERE ts BETWEEN '{{start_ts}}' AND '{{end_ts}}' GROUP BY ts_min, pool_id), scale AS (SELECT time_bucket('1 minute', ts) AS ts_min, pool_id, action_type, delta_instances FROM infra.autoscaler_actions WHERE ts BETWEEN '{{start_ts}}' AND '{{end_ts}}') SELECT u.ts_min, u.pool_id, u.util, s.action_type, s.delta_instances, s.ts_min AS scale_ts FROM util u LEFT JOIN scale s ON u.pool_id = s.pool_id AND s.ts_min BETWEEN u.ts_min AND u.ts_min + INTERVAL '30 minutes' WHERE u.util > 70 ORDER BY u.ts_min;",
+    "-- Route-level latency vs queue depth correlation (p95)\nSELECT rq.route, time_bucket('5 minute', rq.ts) AS ts5, percentile_cont(0.95) WITHIN GROUP (ORDER BY rq.latency_ms) AS p95_latency_ms, avg(rq.queue_depth) AS avg_queue_depth FROM infra.request_latency rq WHERE rq.ts BETWEEN '{{start_ts}}' AND '{{end_ts}}' GROUP BY rq.route, ts5 ORDER BY ts5;"
+  ],
+  "notes_and_caveats": "- Use TAGGED metrics only: some old nodes report legacy metric names and should be excluded (tag 'legacy-metrics' = true).\n- For 'gpu_mem_total_mb' use max() per node per window; fractional GPUs exist on special instance types.\n- Queue depth counter is eventual-consistent: cross-check with request logs when values seem inconsistent.\n- Throttle reasons are free-text controlled by service code: normalize common buckets (rate_limit, capacity_fallback, model_unavailable) in downstream ETL.\n- Autoscaler action timestamps are recorded on the controller; pod start/ready times appear later \u2014 join to event_ready_ts if measuring user-visible capacity.\n- When exporting large windows (multi-day) use 15m buckets to keep CSV sizes manageable.",
+  "steps_to_generate_exports": [
+    "1) Set start_ts and end_ts per time_windows above and provision a 64GB result VM for CSV writes.",
+    "2) Run GPU node utilization query with 1m bucket for incident-peak and 5m for pre/post windows as necessary.",
+    "3) Export queue_events.csv as raw rows (limit columns) and a separate deduped file keyed by request_id to avoid double-counting retries.",
+    "4) Run throttle_summary query, then normalize throttle_reason with lookup table (scripts/throttle-normalize.py).",
+    "5) Produce pivot tables: (region x minute) heatmap of gpu_util_pct, (route x minute) throttle_count, (pool_id x minute) pending_queue_length.",
+    "6) Push CSVs to /tmp/capacity-forensics-exports/ and link into the postmortem Confluence page.",
+    "7) Attach screenshots of the pivot heatmaps and the top-10 offending nodes list to the postmortem.",
+    "8) Note any gaps (missing node IDs, legacy metrics) in the postmortem findings section."
+  ],
+  "recommended_charts": [
+    "Region-level stacked area: requests per minute by route (pre/incident/post) \u2014 show model mix.",
+    "Heatmap: GPU util_pct by region and 1m minute bucket (saturation hotspots).",
+    "Timeseries: queue depth p50/p95 and enqueue latency alongside autoscaler actions (annotate scale events).",
+    "Bar: throttle_count by route+reason (incident window) sorted descending.",
+    "Scatter: node gpu_mem_used_mb / gpu_mem_total_mb colored by event_type (pressure/oom)."
+  ],
+  "final_reminders": "This sheet is a working extract: keep copies of raw CSVs. Flag any anomalies to #infra-capacity and link the JIRA INFRA-4123 for followups. If you need a retained longer-term sample, ask SRE for a sampled export from the cold storage bucket (request via ticket).",
+  "quick_links": [
+    "Slack thread: #infra-capacity (search: '2026-02-19 capacity spike')",
+    "Confluence: https://confluence.redwood.ai/display/INFRA/Capacity+Incident+2026-02",
+    "Jira: INFRA-4123"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "primary_questions",
+    "time_windows",
+    "exports_expected",
+    "sql_queries",
+    "notes_and_caveats",
+    "steps_to_generate_exports",
+    "recommended_charts",
+    "final_reminders",
+    "quick_links"
+  ],
+  "dataset_doc_uuid": "dsid_abbc4446dc964dab8bfe95a23e38bb7d"
+}

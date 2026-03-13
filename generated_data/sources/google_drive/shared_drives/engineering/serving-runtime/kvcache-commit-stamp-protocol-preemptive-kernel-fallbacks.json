@@ -1,0 +1,116 @@
+{
+  "title": "KVCache commit-stamp protocol and preemptive kernel fallback spec",
+  "owner": "Rina Chatterjee",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime",
+  "doc_type": "doc",
+  "created_at": "2025-01-12",
+  "last_modified": "2025-03-02",
+  "collaborators": [
+    "Mateo Alvarez",
+    "Jordan Kim",
+    "Priya Srinivasan"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "quantization",
+    "kvcache",
+    "int8",
+    "fp8",
+    "gptq",
+    "awq",
+    "scheduler",
+    "preemption"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/runtime/pull/4123",
+    "JIRA:RT-987",
+    "confluence://quant-runtime/commit-stamp-protocol",
+    "slack://archives/C012AB34Q/messages/FF56XY"
+  ],
+  "summary": "Draft specification for a lightweight commit-stamp protocol for the KV cache that enables safe precision transitions, preemptive kernel handoff, and deterministic fallback behavior across INT8/FP8/GPTQ/AWQ execution paths.",
+  "background": "We have many competing quantization execution paths (int8 runtime kernels, fp8 kernels, GPTQ/AWQ variants). Runtime switching and in-flight KV cache access currently cause subtle correctness and latency issues: partial KV writes, stale key reads when a request is retried on a fallback kernel, and inconsistent cache state after preemption. Existing documents focus on kernel contracts and scheduling heuristics independently; this doc ties a small commit/visibility protocol to the KV cache and defines handshake-free preemptive fallback rules so rollouts and autoscaling can operate without heavyweight global locks or long GC pauses.",
+  "goals": [
+    "Provide a minimal, low-overhead commit protocol (commit-stamps) for KV cache updates so cache visibility across kernel variants is deterministic",
+    "Allow safe preemptive kernel handoff (e.g., int8 -> fp8 -> gptq) for latency-sensitive requests without global locks",
+    "Define kernel constraints for read/write semantics around commit-stamps and dequantized buffers",
+    "Specify rollout and testing vectors for staged deployment and observability metrics to detect regressions"
+  ],
+  "non_goals": [
+    "Full transactional KV semantics (no multi-key ACID guarantees)",
+    "Replacing existing persistence storage designs",
+    "Large refactors of kernel ABI; this should augment current kernel contracts with small additional invariants"
+  ],
+  "key_constraints": [
+    "Low added latency: commit-stamp checks must be O(1) and cache-local where possible",
+    "Backward compatibility: older kernels must continue to run but may operate in stricter fallback mode",
+    "Memory budget: deferred dequant buffers should use a bounded pool per worker",
+    "Deterministic failure paths: fallbacks must either complete or explicitly roll back partial state visibility"
+  ],
+  "spec_overview": "Each KV cache write is annotated with a monotonically-increasing commit-stamp (epoch.tseq). Stamps are local to a worker process but comparable across workers using a compact vector of (epoch, local-counter, capability-bit). A read may see either the last committed value (stamp <= read-stamp) or a tombstone indicating a concurrent write. Kernels declare their precision-compatibility sets and a visibility policy: conservative (only read committed stamps), opportunistic (may read tentative values with verification), or isolated (never read tentative). During a preemptive handoff, the scheduler will attempt a 'soft-handoff' where the outgoing kernel publishes pending commit-stamps to a local handshake buffer and the incoming kernel validates the stamps according to its visibility policy. If validation fails, a fast fallback path runs the request from the last safe checkpoint. The protocol avoids global coordination by relying on per-worker stamps and occasional cross-worker checkpoint messages for longer-lived KV entries.",
+  "primitives": [
+    "commit-stamp: string token 'EPOCH:COUNTER:FLAGS' attached to KV writes",
+    "read-stamp: local view marker used by a request to bound visibility",
+    "tentative-write: in-memory write not yet made visible; associated with a commit-stamp but flagged as tentative",
+    "publish-buffer: per-worker ring buffer where kernels append small commit-stamp summaries during handoff",
+    "dequant-pool: bounded pool of pre-allocated dequantized buffers recyclable across kernel variants"
+  ],
+  "state_machine": "States for a KV entry: EMPTY -> TENTATIVE(stamp X) -> COMMITTED(stamp X) -> RECLAIMED. Transitions: write creates TENTATIVE with a stamp; commit atomically flips tentative->committed and makes stamp visible to reads with stamp <= current-read-stamp. Reclaim may occur after safe-epoch expiry. If a kernel crash occurs while entries are tentative, an asynchronous cleanup scans publish-buffers to resolve or tombstone entries older than a configurable threshold.",
+  "scheduling_integration": "Scheduler exposes a 'preemptive-handoff' API: reserve_slots(request_id, target_kernel), publish_pending_stamps(request_id), await_validation(timeout_ms). Typical handoff flow: 1) scheduler signals outgoing kernel to publish pending stamps for request 2) outgoing kernel writes stamp summaries to publish-buffer and returns immediately 3) scheduler instantiates or routes to incoming kernel, which reads the summary and validates stamps against its policy 4) if validation succeeds within timeout, incoming kernel continues; else scheduler triggers fallback: either re-run on conservative kernel or restart from checkpoint. This API permits speculative preemption for high-priority requests with bounded rollback cost.",
+  "kv_consistency_model": "We define 'bounded-visibility' consistency: reads see committed values with commit-stamps <= read-stamp and may optionally read tentatives if the kernel's visibility policy and verification checks pass. Verification consists of checksum agreement and simple dependency checks (e.g., same layer KV references). Bounded visibility gives us practical safety for inference workloads while avoiding the latency of global commit barriers.",
+  "kernel_constraints": "Kernels must provide a small capability descriptor: supported-precisions (int8, fp8, gptq, awq), visibility_policy (conservative|opportunistic|isolated), deferred-dequant-support (yes|no), and max-tentative-duration-ms. Runtime enforces: - Opportunistic kernels must verify checksums of tentative buffers before consuming. - Kernels that do not support deferred dequant must trigger an automatic dequant and publish a committed stamp before handing off. - GPTQ/AWQ kernels generally operate in conservative mode by default due to reference-shape mutations; allow opt-in opportunistic mode behind feature flag. - Kernels must not reorder commit semantics across different KV keys in a way that would violate per-request causal ordering.",
+  "dequant_and_buffer_management": "Introduce a per-worker dequant-pool with N slots (configurable). When a kernel wants to handoff without committing, it can export pointers to dequant buffers into the publish-buffer with associated stamps. Incoming kernel may import buffers if it supports the layout; otherwise it must re-dequantize from the committed packed weights. A small verifiable header (layout-version, checksum) accompanies exported buffers to avoid silent corruption.",
+  "fallback_policies": "Three fallback tiers: 1) Soft-fallback: incoming kernel verifies stamps; if missing, it reads committed values and continues (may increase latency). 2) Conservative-retry: scheduler restarts request on a conservative kernel (e.g., fp8 -> int8 -> reference fp32) from last checkpoint. 3) Abort-and-retry-later: if resource constraints prevent safe handoff, respond with controlled error to upstream caller. Rollouts can flip which policy is default per-customer tier.",
+  "observability_and_metrics": "New metrics to emit: commit_stamp_rate, tentative_write_count, stalled_publish_buffers, handoff_success_rate, fallback_rate_by_kernel, dequant_pool_utilization, avg-handoff-latency. Traces should include request-level annotated stamps for post-mortem debugging. Add deterministic test-mode toggles that force opportunistic reads to verify verification logic.",
+  "test_vectors": [
+    "1) Single-request handoff: int8 kernel creates 3 tentative writes then commits; incoming fp8 validates and continues - expected: no fallback, committed values read",
+    "2) Cross-worker stale read: worker A commits stamp X, worker B with older epoch tries to read tentatives - expected: B sees committed value only",
+    "3) Crash during tentative writes: kernel crashes after writing tentatives but before commit - expected: cleanup job tombstones or completes commit within reclaim threshold",
+    "4) Dequant pool exhaustion: many concurrent handoffs exceed pool - expected: incoming kernel either re-dequant or trigger conservative-retry, metric emitted",
+    "5) GPTQ opportunistic mode: verify checksum mismatch causes fallback to conservative retry"
+  ],
+  "rollout_plan": "Canary rollout: - Phase 0: unit tests and deterministic sim on runtime branch (T+2 weeks) - Phase 1: internal engineers and nightly cluster (10% traffic, feature flag off by default) - Phase 2: selected customers on dedicated capacity with feature flag enabled and aggressive telemetry - Phase 3: global rollout with opt-out for legacy kernels. Each phase gated on handoff_success_rate >= 99.9% and fallback_rate <= 0.1% during business hours.",
+  "migration_and_compatibility": "Older kernels that lack publish-buffer write must be treated as isolated and scheduled conservatively. Introduce a compatibility window where scheduler marks workers as 'legacy' and avoids preemptive handoffs unless fallback policy allows. A migration tool will annotate kernel images with declared capability descriptors at deploy time.",
+  "open_questions": [
+    "How large should the publish-buffer be by default? (64-512 entries?)",
+    "Do we need cross-worker monotonic clock sync for strictly comparable stamps, or is epoch-separation enough?",
+    "Should opportunistic read verification include layer-level dependency checks or just checksum?",
+    "What throttling should apply to reclaim/cleanup scans to avoid CPU spikes?",
+    "How do we instrument customer-facing error codes to map to fallback tiers for SLO reporting?"
+  ],
+  "action_items": [
+    "Implement publish-buffer API in runtime shim (owner: Mateo, ETA: 2025-02-10)",
+    "Add dequant-pool allocator and eviction policy (owner: Jordan, ETA: 2025-02-24)",
+    "Create deterministic test harness for handoff scenarios (owner: Priya, ETA: 2025-02-17)",
+    "Prototype scheduler preemptive-handoff API and integrate with canary cluster (owner: Rina, ETA: 2025-03-01)",
+    "Design dashboard panels and alerts for new metrics (owner: Observability team, ETA: 2025-03-08)"
+  ],
+  "changelog": "2025-01-12: initial draft. 2025-02-05: added dequant pool and fallback tiers. 2025-03-02: clarified kernel capability descriptor and rollout plan.",
+  "references": "See runtime kernel ABI doc, KV cache overview, and rollout playbook. Related PR: github.com/redwood-inference/runtime#4123. Related JIRA: RT-987.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "background",
+    "goals",
+    "non_goals",
+    "key_constraints",
+    "spec_overview",
+    "primitives",
+    "state_machine",
+    "scheduling_integration",
+    "kv_consistency_model",
+    "kernel_constraints",
+    "dequant_and_buffer_management",
+    "fallback_policies",
+    "observability_and_metrics",
+    "test_vectors",
+    "rollout_plan",
+    "migration_and_compatibility",
+    "open_questions",
+    "action_items",
+    "changelog",
+    "references"
+  ],
+  "dataset_doc_uuid": "dsid_93f11fcd921d4a26ae80efda18d924d5"
+}

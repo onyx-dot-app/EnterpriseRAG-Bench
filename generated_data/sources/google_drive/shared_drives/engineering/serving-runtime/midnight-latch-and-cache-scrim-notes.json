@@ -1,0 +1,36 @@
+{
+  "title": "midnight-latch-and-cache-scrim-notes",
+  "owner": "Aisha Ramirez",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/midnight-latch-and-cache-scrim-notes.json",
+  "doc_type": "doc",
+  "created_at": "2027-03-25",
+  "last_modified": "2027-03-26",
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "collaborators": [
+    "Samir Chen",
+    "Jordan Lee",
+    "Maya Patel",
+    "Ethan Brooks"
+  ],
+  "tags": [
+    "kvcache",
+    "coalescer",
+    "latch",
+    "p99",
+    "latency",
+    "experiments"
+  ],
+  "linked_artifacts": [
+    "JIRA-INF-4821",
+    "https://github.com/redwood-inference/serving-runtime/pull/1914",
+    "confluence:serving-runtime/latch-coalesce-ideas"
+  ],
+  "content": "Context: quick overnight debug + spike to reproduce a regression in p99 tail when the coalescer and new latch code run together. We wanted a lightweight, run-in-prod-safe test so ops could roll it during low-traffic windows and we could capture traces and kernel metrics without heavy disruption.\n\nWhen: 2027-03-25 23:30\u201301:00 (late-night scrim)\nAttendees (ad-hoc): Aisha, Samir, Jordan, Maya, Ethan (on-call), + infra on standby (Kai)\nWhy this doc: scribbles + hypotheses + concrete action items for follow-up. Keep rough \u2014 this lives in Drive as the working log.\n\nObserved symptom summary:\n- After deploying latch-v2 (lock-free coalescer latch) alongside kv-cache-prefill change, p99 increased from ~150ms to ~320ms on small (<64 token) requests for the low-latency tier.\n- CPU profiles show short, frequent spin loops at kernel scheduling boundary with ~4\u20138us stalls per request; aggregated they push a few percent CPU upward but spike tail.\n- Traces show many requests hitting \"coalesce:attempt\" and then an extra codepath into latch-acquire where contention sometimes retries twice.\n- Effect seems correlated with high arrival jitter (burstiness) \u2014 synthetic arrival pattern reproduction increases tail.\n\nRepro steps we ran during scrim (keep for playbook):\n1) Use traffic-replay (local harness) with arrival pattern: baseline Poisson@rps=120 -> bursty Poisson with 200ms microburst windows.\n2) Deploy kernel branch with debug counters enabled (coalesce_attempts, latch_retries, backoff_ms).\n3) Run 10k small-req sessions; collect p50/p95/p99, core dump of counters, and perf stat samples.\n4) Collect traces via jaeger sampling rate 100% for this test window.\n\nQuick results (sanity numbers):\n- baseline (no latch-v2): p99=148ms, p95=86ms\n- latch-v2 + kv-prefill: p99=322ms, p95=110ms\n- latch-v2 + kv-prefill + microbatch-throttle patch (experiment A): p99=210ms, p95=95ms\n- latch-v2 + kv-prefill + spin-yield tweak (experiment B): p99=174ms, p95=88ms\nNotes: experiment B looks promising; experiment A reduces burst amplification but is heavier on throughput.\n\nHypotheses (ranked):\n- H1: latch-v2's backoff strategy is too aggressive under high microburst jitter and spins in user-space in a way that amplifies scheduling latency.\n- H2: kv-prefill introduces an extra scheduling hop that interacts with the coalescer's critical section, increasing cache-eviction pressure and causing more kernel context switching.\n- H3: the coalescer's timeout heuristics cause more short-lived queues to form under bursty arrivals; combined with latch retries this multiplies stalls.\n\nDiagnostics / observability items we added during scrim:\n- counters added: coalesce_window_size, latch_attempts, latch_retries, latch_backoff_ns, kv_prefill_evictions (temporary).\n- heatmap dashboard panel: arrival inter-arrival ms vs p99 contribution (new panel in console under \"scrim/latch-2027-03\").\n- low-overhead trace span added around latch-acquire/release (span: latch.acquire, latch.release) to see retry chains.\n\nShort-term mitigation (prod-safe):\n- Roll back latch-v2 only for low-latency tier while keeping other changes (canary plan drafted: morning rollback 03/26 06:00 UTC if no fix).\n- Enable experiment B (spin-yield tweak) behind feature flag and run 2-hour canary during low load.\n\nAction items (owners + ETA):\n- Aisha: open a small perf PR with measured microbench for spin-yield tweak and document expected trade-offs (ETA: 2027-03-26 EOD). Linked PR: github/1914 (work in progress).\n- Samir: add deterministic microburst runner to nightly bench suite and add assertion alert for p99 > 200ms on small requests (ETA: 2027-03-29).\n- Jordan: expand tracing for kv-prefill codepath to include eviction hints and collect stdout samples (ETA: 2027-03-27).\n- Maya: run longer 12-hour overnight canary with experiment B on a small fraction (5%) of low-latency traffic and collect metrics (ETA: start 2027-03-26 02:00 UTC).\n- Ethan: update Jira INF-4821 with concrete repro steps and attach perf logs from tonight (ETA: 2027-03-26 morning).\n\nOpen questions / notes to self:\n- Is latch backoff_ns tuned per-core or global? if global, it may interact badly with heterogeneous CPU boxes.\n- We should simulate heterogenous boxes in bench (NVIDIA vs AMD cloud flavors differ scheduling granularity).\n- Could kv-prefill be made opt-in per-model to reduce contention on hot shards? Quick thought: prefill only when seq_len>32 OR when warm-cache-hit-rate < 0.6. Need safety checks.\n\nIdeas for longer-term fixes (brainstorm):\n- Add cooperative yield points to latch acquire so long waits hand control early to scheduler instead of spinning.\n- Replace latch spin loop with an MCS-style queue-free algorithm if contention remains high. (longer refactor, higher risk)\n- Adaptive coalescer window: if per-shard arrival variance exceeds threshold, shrink coalesce window to reduce queue formation.\n- Move small-request fast-path to a completely lock-free per-core slot to avoid global coordination for tiny tokens.\n\nNotes about trade-offs from experiments:\n- Spin-yield tweak reduces tail with minimal throughput change. But it shows slightly higher p50 in microbench due to extra syscall yield overhead in some cases. Might be acceptable for low-latency tier.\n- Microbatch-throttle reduces burst amplification but sacrifices peak throughput; good as emergency throttling knob though.\n\nFollow-up meetings:\n- Quick sync with SRE + infra (Kai) at 2027-03-26 09:00 to plan canary and rollback windows.\n- Design review for latch refactor 2027-04-02 (30 min) \u2014 bring microbench data.\n\nRandom scratch / todo (personal):\n- paste kernel perf lines here for later: \"samples: 12001, cycles: 3.2e8, stalls: 4.6e6\" (grab from nightly).\n- remind Maya to annotate canary results with raw span traces (not just aggregated percentiles).\n\nClosing: tonight's scrim was useful \u2014 narrowed likely cause to latch backoff interaction with bursty arrivals. Experiment B (spin-yield) is low-risk and should be the next canary. Keep log here; will move a cleaned summary to Confluence after action items are complete.\n\n---\nDoc status: working notes (no public distribution). Put final write-up in confluence/serving-runtime when stable.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_7d82d7195c464f32b13025edcf1b12e1"
+}

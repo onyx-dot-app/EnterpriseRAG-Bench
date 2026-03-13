@@ -1,0 +1,33 @@
+{
+  "title": "Burst-decay probe scratchpad",
+  "owner": "Wren Patel",
+  "drive_area": "users",
+  "path": "users/burst-decay-probe-scratchpad-wren",
+  "doc_type": "doc",
+  "created_at": "2024-03-18",
+  "last_modified": "2024-04-02",
+  "collaborators": [
+    "Noemi Ruiz",
+    "Omar Singh"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "burst",
+    "warmup",
+    "latency",
+    "throughput",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/benchmarks/pull/142",
+    "JIRA-INF-823",
+    "slack:#serving-runtime @channel thread"
+  ],
+  "content": "Goal: quick iterative notes on behaviour when an ingress spike decays (burst->steady). I want to capture: (1) what latency modes appear during decay, (2) how KV cache and cold paths influence tail, (3) whether we can shape cheap infra knobs (min-instances, pre-warm) to reduce p99 without overspending.\n\nEnvironment:\n- model: opt-6.7b-quant8 (local quantized runner build)\n- runtime: serving-runtime v0.9.1-rc3 (kernel selection patch applied)\n- instance: g4dn.12xlarge-equivalent emulation (8xA100-local in lab)\n- concurrency per instance: 16 active requests\n- batcher: continuous-batcher with max-batch-ms=8, min-batch=1\n- KV cache: enabled with 5-minute prefix TTL\n- client: k6 script + custom ramp-down generator (see cmd below)\n\nTraffic pattern (scripted):\n- t0..10s: spike to 500 QPS (poisson-ish), mean payload ~150 tokens\n- t10..70s: exponential decay to 50 QPS, half-life ~15s (not linear)\n- t70..end: steady 50 QPS for 3 minutes\n- run length: 4 minutes, repeated 3x per config\n\nCommands (notes to self):\n- k6: k6 run --vus 500 --duration 4m burst-decay.js (but we use custom generator)\n- bench harness: ./bench/run_ramp --pattern burst-decay --seed 42 --out csv/runA.csv\n\nKey metrics to capture: p50, p90, p95, p99, success_rate, tokens/s, instances_active, batch_size_distribution, kvcache_hit_rate\n\nExperiment matrix (quick):\nA) warm-cache (primed with 200 warm requests) + min-instances=2\nB) cold-cache (no priming) + min-instances=2\nC) cold-cache + min-instances=0 (scale-from-0)\nD) warm-cache + min-instances=4 + batcher.max-batch-ms=2 (aggressive burst coalescing)\n\nResults (aggregated summary, single-run median of 3 repeats):\n- Run A (warm, min=2): achieved peak throughput 480 QPS, p50=34ms, p95=112ms, p99=280ms, success=99.98%, kvcache_hit_rate=0.87, mean_batch_size_peak=10\n- Run B (cold, min=2): peak throughput 460 QPS, p50=38ms, p95=190ms, p99=740ms (big spike at t0..8s), success=99.92%, kvcache_hit_rate=0.12 initially -> 0.78 after 30s, mean_batch_size_peak=9\n- Run C (cold, min=0): scaled up slower, effective throughput only 320 QPS during first 20s, p50=55ms, p95=420ms, p99=1400ms, instances ramped from 0->6 over 18s (observed cold spinup penalty)\n- Run D (warm, min=4, max-batch-ms=2): peak throughput 500 QPS, p50=28ms, p95=98ms, p99=210ms, success=99.99%, mean_batch_size_peak=12 (coalescing helped), slightly higher steady cost (2.1x tokens/sec cost vs A)\n\nObservations / notes:\n- Cold-cache penalty dominates early tail. Even with min-instances=2 the first 8-12s show p99 blowups (Run B). This is mostly KV cache miss + model kv initialization + kernel lazy compile GC spikes.\n- Scale-from-0 is unacceptable for bursty short-lived spikes; scale-from-0 leads to both lost throughput and extreme tail (Run C). If customer patterns include occasional sub-1min spikes we should recommend min-instances >0.\n- Aggressive coalescing (lower max-batch-ms) helped p95/p99 slightly while increasing mean batch size \u2014 seems counterintuitive but reduced per-token scheduling overhead on hot path. Need to validate more runs with varied sequence lengths.\n- Warm priming (200 requests) is cheap and reduces p99 by ~2.6x in this workload. Consider a small warm-prefill for new model versions and after long idle windows.\n- There are still stochastic p99 spikes around t~15-25s in some repeats \u2014 correlate with host-level CPU steal and kernel JIT events. Attach system-profiler next time.\n\nQuick diagnostic traces to collect next runs:\n- instance-level perf counters (cpu, ctx-switches, iowait) with 1s resolution\n- runtime traces: kvcache.Miss events, kernel-compile.start/finish, batch.dispatch timestamps\n- network egress/ingress to rule out proxy-level buffering (nginx/ envoy)\n\nImmediate actionables:\n- Add a \"burst-prefill\" flag in the autoscaler that executes N warm requests when min-instances > 0 and model version changes. (JIRA-INF-823)\n- Add a short-lived pre-warm hook to runtime to force-kick kernel compile for hot layers for the first epoch (script in linked PR).\n- Instrument batcher to log per-batch origin (burst vs steady) to understand coalescing behavior during decay.\n\nHypotheses to validate:\n1) The majority of p99 early in decay is KV miss + kernel compile; remove either and p99 collapses.\n2) Scaling latency (instance spinup) explains Run C loss more than cold-model cost \u2014 need better profiling of instance startup path.\n3) A tiny always-on pool (1-2 instances) + tiny prefill reduces p99 dramatically at modest cost.\n\nNext experiments (short list):\n- Repeat matrix with >=5 repeats and capture full traces (cpu/perf + runtime events).\n- Run same matrix but vary payload length (50, 150, 400 tokens) to check token-amortized warmup cost.\n- Test with different quant levels (int8 vs int4 fallback) to see compile variance.\n\nNotes to self (TODO):\n- Attach raw CSVs to PR and link to chart (done to repo but need to link here).\n- Add a small grafana dashboard snapshot for burst decay visualization.\n- Share findings in standup and propose \"burst-prefill\" RFC next week.\n\nRough sketch of CSV snippet (time, qps, p50_ms, p95_ms, p99_ms, instances, kvcache):\n2024-03-18T12:00:01Z,480,32,110,270,3,0.85\n2024-03-18T12:00:05Z,475,33,115,300,3,0.82\n2024-03-18T12:00:12Z,420,40,130,520,3,0.27\n2024-03-18T12:00:25Z,200,44,160,700,4,0.48\n\nIf I had to summarize in one line: for short decaying bursts, a small warm pool + a 200-request prefill is the highest ROI to reduce early tail without massively increasing steady cost.\n\nEnd of notes.\n\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_c269acb50b804aa68fc81f558ac7b585"
+}

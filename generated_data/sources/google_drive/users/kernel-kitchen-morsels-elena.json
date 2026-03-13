@@ -1,0 +1,34 @@
+{
+  "title": "Kernel kitchen: morning triage & perf morsels",
+  "owner": "Elena Park",
+  "drive_area": "users",
+  "path": "users/kernel-kitchen-morsels-elena.json",
+  "doc_type": "doc",
+  "created_at": "2026-03-12",
+  "last_modified": "2026-03-13",
+  "collaborators": [
+    "Marcus Chen",
+    "Priya Nair"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "triage",
+    "kernel",
+    "perf",
+    "kv-cache",
+    "investigation",
+    "to-do"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/2345",
+    "JIRA:SRT-412",
+    "confluence:serving-runtime-kv-cache"
+  ],
+  "content": "Quick morning dump \u2014 kernel + runtime scratchpad (short, messy). Goal: capture repros, hypotheses, and tiny todos I can finish between meetings. Not polished.\n\nTopline:\n- 95p latency regression noticed on canary after kernel bump (0.9.8 -> 0.9.9). Affected path: continuous-batching + kv-cache hot path.\n- Local microbench reproduces increased tail when batch size > 8 and seq_len ~ 512.\n- Suspect: eviction path touching mutexes and cache iterator invalidation (seen in thread sanitizer logs).\n\nQuick facts / numbers (A100, 32GB, p3-equivalent test harness):\n- baseline (0.9.8): 95p = ~42ms, mean = 28ms, p50 = 24ms\n- canary (0.9.9): 95p = ~67ms, mean = 36ms, p50 = 26ms\n- delta most visible when concurrency >= 32 and burstiness spikes\n\nHow I reproduced locally (commands):\n- start local harness: ./scripts/run_local_bench --model gpt-small --workers 8 --seq 512 --batch_dist bursty\n- client hammer: python tools/bench_client.py --qps 200 --dur 120 --batch-target 8 --seq 512\n- collect perf: perf record -F 99 -g -o perf.data -- ./serving_runtime --config conf.yaml\n- tsan: RUSTFLAGS=\"-Z sanitizer=thread\" cargo run --bin runtime --features build-tsan\n\nObserved artifacts:\n- tsan output: repeated data-race on kv_cache.rs: insert/remove with iterator usage (stack shows kv_cache::evict_one -> lru::pop_tail -> iterator.next)\n- perf flame: top stacks show mutex contended in kv_cache::shard_lock -> std::sync::Mutex::lock at high percent\n- heap profile: small uptick in transient allocations around shard rotation (still within expected)\n\nHypotheses (ranked):\n1) iterator invalidation regression: recent lru optimization changed iteration order and now holds a temporary reference while we try to remove another entry, causing extra locking and slowdowns under concurrent ops.\n2) mutex granularity: a hot lock got introduced around shard metadata during the change; increasing shard count or switching to sharded rwlock will help.\n3) scheduler interaction: a small scheduling jitter due to new spin-loop may amplify tail under bursty arrival. less likely.\n\nImmediate experiments to run (short):\n- [ ] Revert the small LRU iteration optimization in PR #2345 locally and rerun bench (should be ~10-20m). (priority: high)\n- [ ] Increase LRU shard count from 16 -> 64 in config to see if contention drops (quick config flip). (priority: med)\n- [ ] Add micro-timestamp logs around evict_one to measure time spent holding lock (low overhead trace). (priority: med)\n\nLonger follow-ups / patches:\n- [ ] Add iterator-safe remove API to LRU that avoids aliasing mutable/immutable refs (design note required) (owner: me, est 3 days)\n- [ ] Replace Mutex with parking_lot RwLock for per-shard metadata to reduce contention (owner: Marcus, est 2 days)\n- [ ] Add e2e perf regression test for bursty workloads in CI (owner: Priya, est 1 day)\n\nNotes from pair debugging with Marcus (yesterday):\n- He saw similar lock stacks when simulating 128 concurrent requests with small seq lengths \u2014 suggests it's about batches and concurrency more than seq_len itself.\n- We instrumented counts: evict_one called ~4x per request in pathological runs (should be <1). That explains micro work per request ballooning.\n\nTriage decisions for today:\n- Rollback on canary not yet (need more data). Automations will keep routing to fallback model variant when latency > threshold.\n- Notify release owner (Sophie) about potential rollback window this afternoon if experiments don't show improvement.\n\nMicro debugging snippets (copied from terminal):\n--- tsan excerpt ---\nWARNING: ThreadSanitizer: data race\nRead of size 8 at 0x7f... by thread T3\n  #0 kv_cache::get_or_insert ... kv_cache.rs:483\n  #1 runtime::worker_handle ... worker.rs:212\nPrevious write of size 8 at 0x7f... by thread T5\n  #0 kv_cache::evict_one ... kv_cache.rs:510\n--- end excerpt ---\n\nIdeas that were thrown around (brainstorm):\n- Opportunistic eviction: don't evict synchronously in hot path; queue eviction to background worker (could reduce tail but increases memory pressure).\n- Use per-request soft hints to skip eviction if client QPS low; aggressive eviction only when memory crosses watermark.\n- Change LRU to CLOCK algorithm that is cheaper to update under concurrency (bigger refactor).\n\nSmall TODOs I can pick up today (in order):\n- [ ] run revert-iteration branch locally and attach perf flame (30-60m)\n- [ ] flip shard_count config in bench harness and run 2x, capture numbers (30m)\n- [ ] add one log line + histogram for evict duration, land quick follow-up if helpful (45m)\n- [ ] open short RFC for iterator-safe remove API (outline + example) (1h)\n\nMeeting notes (stand-up 09:30):\n- brief announce: investigating kv-cache tail regression, baseline vs canary numbers shared, Marcus and Priya helping.\n- action: if revert fixes in <1h, rollback canary; else keep canary but throttle burst routes.\n\nAttachments / reference links (copy for context):\n- PR that introduced LRU iteration optimization: https://github.com/redwood-inference/serving-runtime/pull/2345\n- Related JIRA: SRT-412 (kv-cache contention / evict cost)\n- Confluence scratch: serving-runtime-kv-cache (notes + diagrams)\n\nBrain dump / random thoughts to revisit:\n- Could we shadow-produce eviction work to a dedicated eviction pool and measure benefit? risk: double memory transient but might be worth for tail stability.\n- Is there an observable correlation between GC/allocator stalls (jemalloc) and eviction spikes? add jemalloc stats to bench harness.\n- Add experimental feature-flag to throttle eviction under high concurrency.\n\nIf I get one uninterrupted hour: local revert test -> bench -> open PR with quick revert + perf results. If not, at least flip shard_count and land log histogram.\n\nEnd of dump.\n\n-- elena\n(note: keep this in users drive; will tidy into proper RFC if we decide on approach)",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_c94ec22ed8f445b5b0e9eaf2af777e7b"
+}

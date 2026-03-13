@@ -1,0 +1,37 @@
+{
+  "title": "trace pipeline breadcrumbs scratchpad",
+  "owner": "Aisha Patel",
+  "drive_area": "users",
+  "path": "users/",
+  "doc_type": "doc",
+  "created_at": "2025-02-18",
+  "last_modified": "2025-02-20",
+  "collaborators": [
+    "Marco Li",
+    "Jules Carter"
+  ],
+  "team": "eng-observability",
+  "status": "draft",
+  "tags": [
+    "tracing",
+    "logs",
+    "metrics",
+    "otel",
+    "fluent-bit",
+    "loki",
+    "prometheus",
+    "debug"
+  ],
+  "linked_artifacts": [
+    "RED-1123",
+    "https://github.com/redwood-inference/telemetry/pull/45",
+    "https://confluence.redwood/obs/trace-pipeline-runbook",
+    "slack://archives/C03OBSERV/1676720000.abcdef"
+  ],
+  "content": "Quick context:\n- Noticed intermittent TRACE volume drop for user-facing services (frontend->api proxy) around 2025-02-17 03:10-03:25 UTC.\n- Metrics (trace_rate_total) down ~70% for 15m window, Prometheus scrape still up for other exporters.\n- Logs show Otel-Collector restarting / export failures, Fluent Bit occasionally returning 401 from Loki.\n- Suspect: recent telemetry config change in PR#45 (sampler/attribute filter) or upstream network auth change.\n\nWhat I saw (timeline / breadcrumbs):\n- 03:09 UTC: SLO alert triggered (trace ingestion drop). Dashboards show span count drop for api-proxy service.\n- 03:11 UTC: First pager; I ssh'd into bastion and kubectl port-forwarded otel-collector to local 4317 to test connectivity.\n- 03:12 UTC: otel-collector logs: \"error exporting traces: rpc error: code = Unavailable desc = \\\"transport: authentication handshake failed\\\"\"\n- 03:14 UTC: Fluent Bit logs: \"[error] HTTP status=401 Unauthorized, url=https://loki.prod.internal/loki/api/v1/push\" (batch dropped)\n- 03:16 UTC: Restarted otel-collector (kubectl rollout restart deployment/otel-collector -n observability) \u2014 partial recovery, then drop again at 03:22.\n\nCommands I ran (copy/paste):\n$ kubectl get pods -n observability -o wide\nNAME                                 READY   STATUS    RESTARTS   AGE   IP\\notel-collector-78d9f7c4c-5xj2z      1/1     Running   12         7d    10.10.3.12\nfluent-bit-6k9fp                     1/1     Running   0          3d    10.10.3.45\n\n$ kubectl logs deployment/otel-collector -n observability --since=30m | grep -i error -A2 -B2\n2025-02-17T03:12:14Z    otelcol    exporting failed: rpc error: code = Unavailable desc = \\\"transport: authentication handshake failed: tls: certificate signed by unknown authority\\\"\n2025-02-17T03:12:14Z    otelcol    retrying in 3s\n\n$ curl -s -v --insecure https://loki.prod.internal/loki/api/v1/push -o /dev/null -w \"%{http_code}\\n\"\n401\n\n$ kubectl exec -n observability -it otel-collector-78d9f7c4c-5xj2z -- /bin/sh -c \"apk add --no-cache curl; curl -v telnet://upstream-telemetry:4317\"\n(used telnet to verify port reachable)\n\nWhat I tried (mitigations):\n- Restarted otel-collector and fluent-bit pods (kubectl rollout restart) \u2014 temporary partial recoveries.\n- Rolled back PR#45 in a canary namespace to compare behaviour (no immediate data drop there).\n- Increased otel-collector exporter TLS debug level and collected logs.\n- Captured tcpdump on otel-collector pod host to check TLS handshake (saw RSTs occasionally).\n- Temporarily set Fluent Bit output to buffer and file to avoid immediate drops for 20m window.\n\nHypotheses (ranked):\n1) TLS/certificate trust change on upstream telemetry lane (rotated certs or CA not trusted by new image). Error \"certificate signed by unknown authority\" matches.\n2) Auth token rotation for Loki (401) \u2014 maybe a secret expired or service account token not mounted/renewed.\n3) New attribute filter/sampling config in PR#45 inadvertently changed service.name or dropped key attribute used by routing, causing exporter to reject (policy mismatch).\n4) Network flakiness / NAT gateway hit connection limits causing half-open handshakes.\n\nEvidence supporting #1:\n- otel-collector explicit TLS error.\n- Upstream telemetry (receiver) team reported a cert rotation around 2025-02-17 02:50 UTC (check PR/ops note).\n- Canary namespace with older image/config did not show the drop.\n\nEvidence supporting #2:\n- Fluent Bit 401s correspond to timestamps of token rotation job executed 2025-02-17 02:45 UTC (see RED-1123 notes).\n- Some logs show \"unauthorized\" responses from Loki but not consistently, which suggests token caching/refresh delay.\n\nOpen checks to do (next):\n- Verify certs on upstream endpoint: openssl s_client -connect upstream-telemetry:4317 -showcerts (from within cluster).\n- Inspect secret mounts in otel-collector pod: kubectl describe pod -n observability otel-collector-78d9f7c4c-5xj2z (look for cert, caBundle, token).\n- Confirm whether the telemetry upstream rotated CA; drop-in call with infra/telemetry team (Marco).\n- Check Kubernetes events for secret update/recreate around 02:40-03:00 UTC.\n- Rotate to a trusted CA bundle in otel-collector as a quick test (apply configmap with caBundle).\n\nRepro steps (minimal):\n1) In cluster, run: kubectl run -n test-obs -it --rm debug --image=alpine -- sh\n2) apk add --no-cache openssl curl\n3) openssl s_client -connect upstream-telemetry:4317 -showcerts -verify 5\n4) curl -v --cacert /path/to/bundled-ca https://loki.prod.internal/loki/api/v1/push\n\nNotes to self / loose TODOs:\n- If cert rotation confirmed, coordinate a rolling restart of otel-collector with updated CA bundle; communicate to SRE and telemetry upstream.\n- Add alert for otel_exporter_tls_errors (simple counter) so next time we get more actionable page.\n- Revisit PR#45 sampler change; add integration test that runs a canary against upstream to ensure attributes used for routing remain intact.\n- Add a runbook snippet: \\\"If otel-collector: certificate signed by unknown authority -> check secret CA, check upstream CA rotation, check otel image trust store\\\".\n- Follow up: ask infra to confirm if NAT gateway logs show connection RST spikes around the window.\n\nLast raw snippets I saved (for debugging paste):\n- otel log sample:\n2025-02-17T03:12:14Z otelcol exporter.go:54: exporting failed: rpc error: code = Unavailable desc = \\\"transport: authentication handshake failed: tls: certificate signed by unknown authority\\\"\n\n- fluent-bit sample:\n[2025/02/17 03:12:35] [error] [http_client] server returned status=401\n\n- tcpdump snippet (base64 chunked captured): saved to /tmp/trace-dump-20250217.pcap (on bastion).\n\nSlack notes: pinged @Marco Li in #observability at 03:19 UTC, dropped a short summary and link to RED-1123 (see linked_artifacts).\n\nIf I lose context (notes for future me):\n- Start with exporter TLS error \u2014 most likely cause. Check certs, CA bundles, secret mounts. Then look at token rotation for Loki.\n- Record any change in ingestion rate vs span count correlation to confirm if only traces affected or metrics/logs as well.\n\nEnd of scratchpad. Will update after the call with infra and telemetry teams.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_1f6150a9c1df40f183f87fbaf70a9463"
+}

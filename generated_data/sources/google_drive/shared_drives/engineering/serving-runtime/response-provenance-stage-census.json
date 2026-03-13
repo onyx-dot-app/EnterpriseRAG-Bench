@@ -1,0 +1,33 @@
+{
+  "title": "Response provenance stage census",
+  "owner": "Maya Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime",
+  "doc_type": "doc",
+  "created_at": "2025-11-03",
+  "last_modified": "2026-02-28",
+  "collaborators": [
+    "Arjun Patel",
+    "Lina Gomez",
+    "Ethan Brooks"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "e2e-profiling",
+    "p50-p95-p99",
+    "kv-cache",
+    "batching"
+  ],
+  "linked_artifacts": [
+    "JIRA-INV-842",
+    "github.com/redwood-inference/trace-tools/pull/317"
+  ],
+  "content": "Summary: This note collects an end-to-end census of stage-level latency for recent production traffic (Nov 01\u2013Nov 07 2025 window), with special attention to cohort slices that explain p95/p99 inflation. Goal is to: (1) give a reproducible measurement recipe, (2) show per-stage p50/p95/p99 for key cohorts (seq len, kv cache, batch size, model variant), and (3) surface concrete mitigation experiments.\n\nContext and motivation: Over several weeks we saw p95 regressions for real-time chat routes. High-level dashboards showed model-forward time growth but root cause was unclear: higher sequence lengths in certain customers? KV cache thrashing? IO contention? This exercise uses trace-level decomposition to attribute tail latency to discrete stages.\n\nInstrumentation and definitions:\n- Traces collected via ingress->tokenize->model-compile->model-forward->kv-lookup->kv-write->decoding->postprocess->egress spans. Span names used in traces: ingress.span, tokenize.span, model.compile, model.forward, kv.hit, kv.miss, decode.span, postproc.span, egress.span.\n- p50/p95/p99 computed on end-to-end trace.duration in milliseconds and per-stage durations aggregated across the same trace set.\n- Cohorts: sequence length bins (<=64, 65-256, 257-1024), KV cache (hit vs miss), Batch size (1,4,8), Model variant (rmv1-small, rmv1-medium-8bit).\n- Sampling: deterministic reservoir of 250k traces from real traffic during window; weighted to preserve route distribution. Also a smaller replayed synthetic workload (10k traces) used to validate microbenchmarks.\n\nEnvironment: Hosted cluster pool-prod-3, A100s (v4), runtime v1.9.2, kernel-compiled with fused-attn-2.4.\n\nKey aggregated results (end-to-end)\n- All traces (n=250k): p50=78ms, p95=320ms, p99=840ms\n- Cohort: seq<=64 (n=142k): p50=54ms, p95=210ms, p99=420ms\n- Cohort: seq 65-256 (n=88k): p50=130ms, p95=460ms, p99=980ms\n- Cohort: seq 257-1024 (n=20k): p50=420ms, p95=920ms, p99=1800ms\n\nPer-stage breakdown (representative cohorts, median/p95 in ms):\n1) Seq<=64, batch=1, kv hit:\n   - tokenize: p50=2, p95=6\n   - model.compile: p50=6, p95=18\n   - model.forward: p50=30, p95=120\n   - decode: p50=10, p95=40\n   - postproc+egress: p50=6, p95=36\n   => total p95 ~220ms (matches)\n2) Seq 65-256, batch=1, kv miss:\n   - tokenize: p50=4, p95=10\n   - model.compile: p50=8, p95=30\n   - model.forward: p50=150, p95=520\n   - kv.miss (backend fetch + disk op): p50=45, p95=180\n   - decode: p50=20, p95=80\n   => total p95 ~820ms (high contributor: model.forward and kv miss)\n3) Seq 65-256, batch=4, kv hit:\n   - tokenize: p50=4, p95=12\n   - model.compile: p50=8, p95=28\n   - model.forward: p50=110, p95=440\n   - decode: p50=30, p95=130 (batch tail amplification)\n   => total p95 ~650ms\n\nObservations and hypotheses:\n- Model.forward dominates tails for mid-to-long sequences. p95 increases nonlinearly with seq length distribution (attention cost). The p99 is sensitive to rare long-seq bursts.\n- KV misses are a second major contributor: dead-letter fetches add 100\u2013200ms on p95 for affected traces. Miss rate correlates with customer routing changes.\n- Batching increases throughput but amplifies decode/postproc tail due to stragglers inside batch (one slow item holds entire batch).\n- model.compile stage shows occasional p95 outliers tied to JIT cache eviction on older nodes (seen in node-restart windows).\n\nActionable next steps (short term):\n- Immediate: Add a smart circuit-breaker for KV backends to cap per-request backend wait (JIRA-INV-842), and add a fallback cached-empty path to avoid synchronous disk fetch for 'best-effort' routes.\n- Medium: Enable seq-length-aware routing: route requests with seq>256 to dedicated large-seq pool (reserved instances) to contain attention costs.\n- Medium: Implement per-request batch timeouts to let slow items fall back to single-item processing after a 30ms block window.\n- Investigate: JIT cache pressure \u2014 add a probe to mark nodes with >40% compile cache churn and exclude them from low-latency serving.\n\nPlanned experiments to validate:\n- Replay synthetic bursts of long sequences (10k traces) against a canary pool with quantized kernels (pr-317) to measure model.forward improvement.\n- Toggle KV-LRU window from 60m->180m for a subset of customers to measure miss-rate delta and p95 impact.\n- Run per-batch tail injection fault tests to quantify how many requests create batch stragglers; measure decode variance.\n\nNotes and trace exemplars: captured trace ids (sampled): trace-20251104-1a2b3c, trace-20251105-7f9d2a, trace-20251106-0c4e8f. These show recurring pattern: heavy model.forward + intermittent kv.miss.\n\nSynthesis: The dominant levers to reduce p95/p99 are (1) isolating long-sequence traffic to specialized pools, (2) reducing synchronous KV miss latency with timeouts/fallbacks and warmer caches, and (3) mitigating batch stragglers via timeouts or partial-fallthrough. Quick wins (KV timeouts + per-batch soft-fallback) are expected to move overall p95 by ~20\u201330% in the November window.\n\nAppendix: reproducible recipe\n- Use trace-export v2 with sample seed = 42, period=7d, filters: route in (chat, completions), status!=error.\n- Run aggregation script: github.com/redwood-inference/trace-tools/blob/main/census/aggregate_stage_latencies.py with --cohorts seq_bins --kv-tag.\n- Deploy experiment branches: github.com/redwood-inference/runtime PR#317 (quant kernels) and PR#322 (per-batch timeout).",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_86ad0eccba1b46ffb624544258f65f86"
+}

@@ -1,0 +1,35 @@
+{
+  "title": "Latency stitch: morning triage + microtasks",
+  "owner": "Mateo Alvarez",
+  "drive_area": "users",
+  "path": "users/latency-stitch-scratch-mateo-alvarez.json",
+  "doc_type": "doc",
+  "created_at": "2024-11-08",
+  "last_modified": "2024-11-10",
+  "collaborators": [
+    "Rina Chowdhury",
+    "Hector Kim",
+    "Ivy Chen"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "triage",
+    "kv-cache",
+    "p99",
+    "nvlink",
+    "numa"
+  ],
+  "linked_artifacts": [
+    "JIRA:INF-3421",
+    "PR:https://github.com/redwood-inference/serving-runtime/pull/1186",
+    "Confluence:serving-runtime/kv-cache-warmup"
+  ],
+  "content": "Morning capture (quick log) - context:\\n- Noticed steady p99 uplift starting 2024-11-07 02:00 UTC after kernel refactor (PR 1186). Regression is small-ish in average latency (~5-8% overall) but p99 jumps from ~120ms -> 210ms on some instance classes (a100-80gb, mixed NUMA).\\n- Customer impact: a couple of production routes saw timeouts (10s) sparingly; CS pinged at 03:15 UTC. No full outage.\\n\\nObserved symptoms (quick bullets):\\n- p50 ~ unchanged; p95 +10-15%; p99 up to +80% on long-context requests (>1k tokens).\\n- Spike correlates with high-concurrency bursts and KV cache cold-start windows after node restarts.\\n- NVLink saturation metrics slightly higher on affected nodes during spikes (GPU -> GPU copy ops up ~30%).\\n- Per-request kernel stack samples show extra memcpy / staging path not present in baseline (pre-PR).\\n\\nImmediate hypotheses (ranked):\\n1) Kernel refactor introduced an extra mem staging step when KV cache miss falls back to model layers, causing serialized cross-GPU copies for long contexts. Explains NVLink bump and p99.\\n2) NUMA/cuda pinning subtlety: new code path changes thread-to-GPU dispatch ordering so some requests hit non-local memory more often.\\n3) Batching fallback logic: when sequence length > 1024, fallback to single-GPU slow path due to buffer sizing edge-case added in PR. Fewer tokens batched -> higher tail.\\n\\nQuick diagnostics to run (high priority):\\n- Reproduce in perf lab: replay production trace (trace id: prod-20241107-02) with PR branch and main. Compare per-op breakdown.\\n  Commands: \\n  - ./scripts/replay_trace.sh --trace prod-20241107-02 --branch pr-1186 --out /tmp/replay-pr1186.json\\n  - python tools/latency_breakdown.py /tmp/replay-pr1186.json --op-filter memcpy,cudaMemcpy --aggregate p50,p95,p99\\n- Capture nvlink counters during synthetic long-ctx burst:\\n  - nvidia-smi nvlink --query-gpu=tx_bytes,rx_bytes --loop-ms=500 > /tmp/nvlink-pr1186.log  (run baseline and pr branch)\\n- Check kernel logs for \\\"staging buffer\\\" or \\\"fallback single-gpu\\\" strings (we added logging in PR but might not be hit with current log level).\\n  - grep -n \\\"staging\\\" /var/log/redwood/runtime/*.log || true\\n\\nShort-term mitigations (if reproduces):\\n- Hotfix option A (low-risk): revert the single refactor commit that changed memcpy staging loop (git revert <sha>) and run canary for 2h.\\n- Hotfix option B (safer): force routing policy for long-context routes to a variant with old kernel (model-variant:v1.8-legacy) until full fix. Update routing TTL short.\\n- Traffic shaping: temporarily reduce concurrency cap for affected routes via gateway quotas (rate-limited for 15m windows) to lower NVLink pressure.\\n\\nExperiment matrix (what to test + metrics):\\n- Baseline (main): run 1000 replayed requests (1k-2k tokens) concurrent=40 -> record p50/p95/p99, nvlink tx/rx, memcpy op time.\\n- PR branch (pr-1186): same scenario.\\n- PR branch + cuda-pinning-fix: change THREAD->GPU mapping to previous mapping (env override: RW_THREAD_PIN=legacy) to test hypothesis 2.\\n- PR branch + batch-size-forcing: set MAX_BATCH_TOKENS=4096 to avoid fallback slow path; see impact on latency and throughput.\\n\\nNotes for triage meeting (10:30 AM):\\n- Bring perf graphs: p50/p95/p99 by route for last 24h, NVLink per-node heatmap, GC/CPU spikes.\\n- Side-by-side waterfall for 3 example requests (one good, two p99) showing op times (model forward, kv-lookup, memcpy).\\n- Short list of possible hotfixes and estimated RU (risk/urgency): revert commit (~30m deploy), route pin (~15m), traffic cap (~5m).\\n\\nActionable TODOs (me):\\n- [ ] Run replay + op breakdown for PR branch (ETA 11:00) \u2014 Mateo\\n- [ ] Collect nvlink logs on two affected nodes (n5, n7) during synthetic burst \u2014 Hector (pinged)\\n- [ ] Draft rollback PR if results show staging memcpy is culprit \u2014 Mateo\\n- [ ] Create canary rollout plan for revert (2 nodes -> 10% -> 100%) and doc in Confluence \u2014 Rina\\n- [ ] Post initial findings to #runtime-triage with clear next steps & assign owner for hotfix \u2014 Ivy (covering oncall)\\n\\nHelpful commands/snippets (pasteable):\\n- perf replay: ./scripts/replay_trace.sh --trace prod-20241107-02 --branch pr-1186 --concurrency 40 --samples 1000\\n- per-op drilldown: python tools/latency_breakdown.py /tmp/replay-pr1186.json --group-by op --percentiles 50,95,99 > /tmp/op-breakdown.txt\\n- nvlink capture: sudo watch -n 0.5 'nvidia-smi nvlink --query-gpu=tx_bytes,rx_bytes --format=csv'\\n\\nNotes to self (observations while poking):\\n- Saw a corner case where kv-cache warmup path allocates host staging buffer of size (seq_len * 4 * sizeof(float)) which is ~10% bigger than pre-refactor. That pushes memory alignment to a different PCIe page boundary -> extra copy path triggered. This could be the golden ticket.\\n- If true, a minimal fix is to preserve old allocation granularity (pad to 64KB chunks) or reuse slab allocator from earlier commit. Try quick prototype: change allocator chunk to 64k and rerun replay (low-risk local patch).\\n\\nMeeting follow-ups (post-triage):\\n- If hotfix applied, monitor p99 on canary and escalate automatic rollback if p99 > baseline + 20% for 15m.\\n- Add an eval to Optimize that runs synthetic long-ctx burst weekly against new kernel PRs to catch regressions earlier.\\n\\nRandom quick thoughts (brain dump):\\n- Add a small e2e test that intentionally hits the KV-cache miss path with long keys to validate no extra memcpy is introduced.\\n- Document memory alignment invariants in developer guide (kernel/alloc.md).\\n- Consider a lightweight sampling profiler to attach to live requests that hit >350ms to capture op-level stack w/o heavy overhead.\\n\\nEnd of morning log \u2014 will update as I run replays.\\n\\n---\\nChange log: 2024-11-08 created initial triage note.\\nChange log: 2024-11-10 added allocator hypothesis and commands run notes.\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_89534834354546d0832a5067dc8825eb"
+}

@@ -1,0 +1,101 @@
+{
+  "title": "ensemble-probing-and-rewind-strategy-for-spec-decode-draft",
+  "owner": "Aisha Kapoor",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/ensemble-probing-and-rewind-strategy-for-spec-decode-draft.json",
+  "doc_type": "doc",
+  "created_at": "2024-01-18",
+  "last_modified": "2024-02-28",
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "speculative-decoding",
+    "kv-cache",
+    "kernels",
+    "onboarding",
+    "rollback",
+    "metrics"
+  ],
+  "collaborators": [
+    "Ben Torres",
+    "Mikael Svensson",
+    "Priya Desai"
+  ],
+  "linked_artifacts": [
+    "https://confluence.redwood/inference/INF-2025",
+    "GH-PR: redwood/serving#6789",
+    "JIRA: RUN-4321"
+  ],
+  "summary": "Draft design for an ensemble probing approach to speculative decoding plus a rewind/rollback strategy to keep KV cache and kernel state consistent during speculative attempts. Focused on pragmatic onboarding criteria, measurable metrics, and a minimally invasive rollback plan suitable for Dedicated and Hosted environments.",
+  "body": "Background:\nSpeculative decoding is effective at reducing end-to-end generation latency by producing candidate token sequences with cheap fast-path kernels or lower-cost model variants and then validating/confirming with the primary kernel. In practice we see two classes of failure that require careful handling: 1) mismatches between speculative and primary outputs (acceptance failures), and 2) state divergence in KV cache / kernel-local state when speculative work mutates microstate in place.\n\nThis doc introduces (a) an ensemble probing strategy for improving acceptance rates while keeping costs bounded, and (b) a rewind/rollback contract that kernels and KV-cache layers must implement to make speculative work safe to abort. It is written for engineers who will implement runtime scheduling, kernel contracts, and model on-call / SRE teams who will onboard models into speculative paths.\n",
+  "ensemble_probing_overview": "We run short, cheap probes across multiple lightweight variants (e.g., 1) quantized 4-bit variant, 2) small projection-only student, 3) shallow-decoder trimmed model) in parallel for the next token(s) to estimate the distributional confidence. Each probe returns top-k candidates and a calibrated confidence score. The scheduler aggregates signals to decide: permit speculative decode (emit candidate and spec write to cache) OR fallback to primary kernel immediate execution. The goal is to raise the speculative acceptance rate without running the expensive primary kernel for every request.",
+  "probe_cost_model": "A capped probe budget per request (default 0.7ms-equivalent on a high throughput path). Probes are charged to a speculative-cost bucket and tracked separately in telemetry. Scheduler must respect per-tenant rate limits for speculative probes and should evict probes when burst capacity is exceeded.",
+  "kernel_contracts": "All candidate kernels that participate in speculative flow must implement a small set of APIs: 1) speculate_start(request_id, probe_id) - reserve per-request slot; 2) speculate_commit(request_id, probe_id) - atomically commit any transient state to the canonical KV/cache and mark token stream as accepted; 3) speculate_abort(request_id, probe_id) - revert transient changes (KV entries, buffer pointers) and release reservations. Implementations that cannot support atomic commit/abort must run speculative work in an isolated memory region (shadow KV) and provide a fast delta-merge API. Kernels must also provide deterministic tokenization mapping and stable random seeds for probes to keep acceptance heuristics reliable.",
+  "kv_cache_considerations": "Two modes for KV handling: shadow-mode and incremental-merge. Shadow-mode: speculative writes go to a per-request shadow KV; on commit we atomically merge deltas into main KV (cheap pointer swap or vector append). Abort simply drops shadow bucket. Incremental-merge: kernels write in-place but annotate writes with speculative-tx ids; abort rolls back writes using the tx log. Shadow-mode preferred for maximum safety; incremental-merge allowed for memory-constrained kernels provided rollback latency is bounded. Metadata to keep: speculative_tx_id, parent_sequence_id, probe_confidence, write_offsets.\nConsistency guarantees: after commit, main KV must be identical to a non-speculative primary execution that produced same final tokens. After abort, no speculative residue must be visible to subsequent requests.\n",
+  "scheduling_and_preemption": "Scheduler runs probes with soft priorities: user-facing low-latency requests get higher probe budgets; background or batch requests get lower budgets or none. Speculative decodes are scheduled on separate execution queues to limit interference with critical primary kernels. Preemption rules: if primary kernel capacity becomes scarce, running probes should be preempted in LIFO order. Preemption must trigger speculate_abort for preempted probes to avoid partial state leakage. For probes that have already produced emissions, scheduler must coordinate: if emissions are sent to the client (streaming) they must be labeled as provisional and a rollback header must be supported on final confirmation.\n",
+  "acceptance_criteria_for_model_onboarding": [
+    "spec_decode.acceptance_rate >= 0.94 over a 24h rolling window on representative traffic",
+    "net token waste (wasted speculative tokens) < 6% of tokens emitted during spec attempts",
+    "speculative rollback events per 100k requests < 10",
+    "no increased P999 latency for primary kernels attributable to speculative scheduling in a 7-day canary",
+    "end-to-end correctness regression (model-behavior) quantified by eval-suite: no more than 0.5% drop in critical prompt set accuracy"
+  ],
+  "metrics_and_alerts": [
+    "spec_decode.accept_rate - fraction of speculative emissions accepted by primary kernel",
+    "spec_decode.wasted_tokens_ratio - tokens emitted speculatively that were later rolled back / replaced",
+    "spec_decode.probe_cost_ms - median probe CPU/GPU time per request",
+    "kv.rollback_rate - number of speculative KV aborts per minute",
+    "kernel.fallback_latency_ms - latency impact when speculative path fails",
+    "spec_decode.stream_reverts - count of times a streamed provisional emission was revoked",
+    "resource.spec_probe_quota_exhausted - alert when tenant probe budget is saturated"
+  ],
+  "rollback_protocol": "High-level steps for a single request where speculative work took place: 1) On accept: primary kernel issues speculate_commit(request_id, probe_id) -> kernel merges shadow or marks tx committed -> scheduler marks emission final and emits commit event to client (if streaming). 2) On reject or abort: primary kernel issues speculate_abort(request_id, probe_id) -> kernel purges shadow KV or rolls back tx log -> scheduler rewinds token output stream: if client saw provisional tokens, send a 'speculative-revoked' patch followed by final tokens or a compacted delta; internal tracing must include preimage of revoked tokens for audit. 3) In case of partial commit failure (e.g., merge failed): enter emergency fallback: 3a) mark request as failed, purge both speculative and partial main state, record forensic logs, escalate to SRE via RUN-4321 automated incident page.\n",
+  "streaming_and_client_contracts": "Streaming clients must be informed of provisional emissions: include metadata in the stream envelope: {speculative: true, probe_id}. Clients that cannot handle revocations must opt out of speculative path at request time (API flag: speculative=false). For webhooks and long-lived connections, the SDK should provide a recombine utility to accept revocations and replay final tokens without breaking application-level semantics.",
+  "risk_analysis": [
+    "State divergence if kernels implement non-atomic merges or have side-effects beyond KV (e.g., external logging hooks).",
+    "Cost blowup if probes are miscalibrated or if workloads adversarially trigger high probe rates.",
+    "Client integration complexity caused by revoked streamed tokens leading to UX issues.",
+    "Rollback latency causing tail spikes if many spec-aborts occur simultaneously and force heavy KV rollbacks."
+  ],
+  "operational_runbook_snippets": "Canary plan: enable ensemble probes at 5% traffic for a small tenant cohort, monitor spec_decode.accept_rate and wasted_tokens_ratio, gradually ramp to 50% then 100% if metrics stable. Incident triage: if kv.rollback_rate spikes > 5x baseline, disable speculative queue globally and run diagnostic job to reconcile shadow-KVs with main-KV for active sessions. Postmortem checklist includes correlation of probes to kernel versions, memory pressure events, and tenant-level quotas.",
+  "onboarding_checklist": [
+    "Confirm kernel implements speculate_start/commit/abort or shadow-mode with merge API",
+    "Run offline eval harness comparing speculative vs primary outputs on curated prompt-set",
+    "Perform 24h lightweight canary with telemetry hooks enabled",
+    "Add dashboard charts described above and set alerts",
+    "Document client-level opt-out and SDK examples for handling revocations"
+  ],
+  "next_steps": [
+    "Prototype shadow-KV with pointer-swap merge in bench-rt kernel (owner: Ben) - target: 2 weeks",
+    "Add probe-budget enforcement to scheduler and a tenant-level quota UI (owner: Mikael) - target: 3 weeks",
+    "Create SDK streaming revocation helpers and example integration (owner: Priya) - target: 4 weeks",
+    "Run canary with two enterprise tenants and collect 7-day metrics (owner: Aisha) - target: post-prototype"
+  ],
+  "notes_to_self": "Keep conservative defaults for the first rollouts: low probe budget, opt-in per-tenant, non-destructive merge paths. Record forensic traces for every speculative attempt to make postmortems efficient. Consider integrating a small ML-based probe calibrator later that tunes probe budgets per-tenant based on observed acceptance patterns.",
+  "references": [
+    "Speculative decoding literature: 'Speculative Decoding for Large Language Models' (2023)",
+    "Internal: GH-PR redwood/serving#6789 - initial shadow-KV prototype",
+    "Confluence: INF-2025 - kernel commit/abort API proposal"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "body",
+    "ensemble_probing_overview",
+    "probe_cost_model",
+    "kernel_contracts",
+    "kv_cache_considerations",
+    "scheduling_and_preemption",
+    "acceptance_criteria_for_model_onboarding",
+    "metrics_and_alerts",
+    "rollback_protocol",
+    "streaming_and_client_contracts",
+    "risk_analysis",
+    "operational_runbook_snippets",
+    "onboarding_checklist",
+    "next_steps",
+    "notes_to_self",
+    "references"
+  ],
+  "dataset_doc_uuid": "dsid_0f1695dcad6345a8b145b893fb9a10a4"
+}

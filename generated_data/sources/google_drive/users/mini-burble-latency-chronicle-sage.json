@@ -1,0 +1,32 @@
+{
+  "title": "Mini-burble latency chronicle (scratchpad)",
+  "owner": "Sage Park",
+  "drive_area": "users",
+  "path": "users/mini-burble-latency-chronicle-sage.json",
+  "doc_type": "doc",
+  "created_at": "2026-02-20",
+  "last_modified": "2026-03-09",
+  "collaborators": [
+    "Ibrahim Noor",
+    "Mira Soto"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "warmup",
+    "throughput",
+    "scratchpad",
+    "tail-latency"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/runner/pull/812",
+    "JIRA-ENG-4312"
+  ],
+  "content": "Purpose:\nQuick personal log of a small, noisy latency experiment where the system shows recurring short (tens-to-hundreds of ms) bumps under low steady QPS when the model KV cache is only partially populated. Trying to capture traces, reproduce with deterministic probes, and note follow-ups.\n\nQuick summary:\n- Platform: Dedicated dev cluster (us-west-2-e, 4xA10G-like GPUs).\n- Model: opt-6.7b-quant-v2 (perf profile: ~15 tok/sec/GPU warm).\n- Hypothesis: intermittent cache churn when two concurrent requests collide during KV-priming + small background GC spikes on host.\n- Short takeaway: reproducible with small synthetic steady stream (qps=6) and variable prompt lengths; p99 moves from ~280ms -> ~720ms every ~40\u2013120s window.\n\nTest harness & env (notes to self):\n- Load generator: local harness (bench/mini-burble-run) \u2014 single-threaded harness that issues one RPC every 160ms to target host.\n- Invocation: bench/mini-burble-run --target https://dev-dedicated.redwood.internal/api/v1/generate \n  --concurrency 2 --qps 6 --seq-len-mean 120 --jitter 20 --duration 20m --content-file ./prompts/fastseed.txt\n- Server flags (dev): --kv-cache=on --kv-evict-threshold=0.75 --batch-window-ms=12 --quant-run=fast\n- Instrumentation enabled: token-timing headers, per-request trace-id, and flamegraph upload to /tmp/sg-traces.\n\nWorkload details:\n- Prompts: mix of (short 16\u201332 tokens) and (long 80\u2013160 tokens) to force partial KV reuse.\n- Observed effective RPS: 5.8\u20136.2 (some jitter).\n- Background: there is a periodic metrics upload (daemon) every 60s performing a small disk I/O op \u2014 reconfigure later to avoid noise.\n\nRaw runs (representative snippet):\n\nTime window (mm:ss) | qps | median(ms) | p95(ms) | p99(ms) | notes\n--------------------|-----|------------|---------|--------|------\n00:00\u201302:00         | 6.0 | 120        | 240     | 310    | initial ramp, cache warming\n02:10\u201302:50         | 6.0 | 135        | 290     | 730    | p99 spike cluster (4 spikes)\n05:00\u201306:30         | 6.0 | 128        | 260     | 315    | back to baseline\n07:20\u201308:10         | 6.0 | 140        | 320     | 680    | 2 large spikes aligned with /metrics flush\n12:00\u201313:00         | 6.0 | 130        | 270     | 720    | repeating pattern every ~5\u20138 min\n\nNotes about the spikes:\n- Duration: each p99 spike lasts ~900\u20131200ms for a few requests, then latency returns.\n- Trace inspection: (trace-id: 20260308-mini-1532) shows a ~600ms pause in 'kv-attach' stage on GPU worker, followed by a short 200ms host-level syscall blocking for /var/log/metrics.upl.\n- CPU: small ephemeral user CPU bump (0.5\u20131.2 cores) on the worker; GPU utilization steady.\n\nHypotheses (ranking):\n1) Metric/upload daemon I/O intermittently holds a shared resource (file descriptor/lock) used by the KV cache metadata writer -> causes brief stall in kv-attach.\n2) Kernel-level scheduling: background cron job causing cgroup CPU steal on that core.\n3) Race in KV cache eviction logic under the specific request pattern (mixed prompt lengths) that forces synchronous eviction.\n\nQuick experiments run today (what worked / didn't):\n- Disabled metrics uploader on a single node -> p99 spikes dropped in magnitude (max 340ms) but occasional small spikes remained. (good signal for hypothesis #1)\n- Increased batch-window-ms to 24 -> median increased slightly (+8\u201312ms) but spikes reduced amplitude (p99 ~420ms).\n- Forced single-threaded IO affinity (taskset) for metric uploader -> similar effect as disabling.\n- Reproduced the same pattern on a different dev cluster (us-east-1) but less frequent (every ~8\u201312min) -> noise likely tied to local node load.\n\nImmediate conclusions:\n- Metrics uploader is a plausible contributor; we should avoid synchronous file writes in the hot path.\n- Batch window is a knob: larger window smooths out rare stalls but increases median latency slightly. Could be a tradeoff for premium customers.\n\nNext steps / action items (short):\n- (S1) Add non-blocking async write path for metrics (PR draft: runner#812 linked above).\n- (S2) Add per-process open_fd / lock contention telemetry to host-agent and roll out to the dev fleet for one day. (JIRA-ENG-4312).\n- (S3) Add a dedicated low-noise test: isolated node with no uploader + synthetic steady qps for 2 hours. Capture full perf profiles.\n- (S4) Try a quick patch to evict asynchronously (convert eviction to background sweep) and evaluate p99 impact.\n\nNotes to self / miscellaneous:\n- If the eviction race is real, we should see p99 correlation with prompt-length mix \u2014 try a run with homogeneous prompt lengths (all short) and homogeneous long prompts and compare.\n- Consider adding a lightweight random jitter to the metrics uploader schedule to avoid alignment across agents.\n- Document the findings in Confluence after S1 & S2 are verified.\n\nCommands / snippets used:\n- run (local harness): \n  ./bench/mini-burble-run --target $TARGET --concurrency 2 --qps 6 --duration 20m --content-file ./prompts/fastseed.txt\n- collect traces:\n  ./tools/collect-trace --trace-id 20260308-mini-1532 --out /tmp/sg-traces/1532.json\n- quick p99 calc (one-liner): \n  jq -r '.latencies[]' /tmp/mini-run.json | awk '{a[i++]=$1} END{print a[int(i*0.99)]}'\n\nOpen questions:\n- Is there any shared lock between metric writer and kv-metadata writer? (ask infra)\n- Can we push metrics to an in-memory ring buffer and flush off the hot path?\n- Is the dev cluster configured with the same IO scheduler as staging/production? mismatch could mask problem in prod.\n\nScratchpad end \u2014 will iterate.\n\nSage\n2026-03-09\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_72c57b1bfd55419d9c1b5303a378fc97"
+}

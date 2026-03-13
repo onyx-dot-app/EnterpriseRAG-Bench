@@ -1,0 +1,33 @@
+{
+  "title": "Eviction policy and slow-drip traffic protocol (scratch)",
+  "owner": "Samira Khan",
+  "drive_area": "users",
+  "path": "shared_drives/company/misc/eviction-policy-and-slow-drip-protocol-ml",
+  "doc_type": "doc",
+  "created_at": "2025-11-02",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Devon Morales",
+    "Jin Park"
+  ],
+  "team": "eng-platform-engineering",
+  "status": "draft",
+  "tags": [
+    "release-safety",
+    "traffic-shaping",
+    "eviction",
+    "canary-ish",
+    "warmup"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-PR-8743",
+    "JIRA: INF-3342",
+    "https://github.com/redwood-inference/runtime/pull/2211"
+  ],
+  "content": "Purpose and quick context:\\n- Quick scratchpad for a tuned slow-drip deployment approach that emphasizes eviction safety, KV-cache warmup, and controlled backpressure for model variants that have memory/latency variance.\\n- This lives as my personal notes prior to formalizing into a playbook. Keep minimal steps that I can copy into runbooks.\\n\\nHigh-level goal:\\n- Release new model variant X.v2 with minimal customer impact and predictable transient cost by:\\n  1) routing tiny steady trickle of traffic (0.05% -> 1%) to warm KV and kernel caches,\\n  2) evict aggressive sessions early (short RC-window) to avoid long-tail memory retention,\\n  3) progressively expand cohort size while verifying latency P95/P99 and error ratio.\\n\\nWhy this is different from standard canary:\\n- Traditional canary assumes quick stable latency; for large context models we need cache warmup and need to observe memory footprint changes over hours. Slow-drip avoids spiky pressure on GPU memory and autoscale.\\n- Adds explicit eviction policy (time-based + size-based) to avoid node-level OOMs when variant mismatches occur.\\n\\nCore elements (quick checklist):\\n- Preflight:\\n  - Validate model artifact checksums and quantization profile (CLI: ./bin/check_model --id X.v2 --profile q4)\\n  - Confirm serving node image has testing hooks: /healthz/eviction and /metrics/kv_cache_hit\\n  - Deploy model to 2 isolated warm nodes (label: warm-witness) in eu-west1\\n  - Create temp rollout config in Console with initial traffic 0.05% and explicit max-concurrent-per-instance = 2\\n\\n- Observability baseline (run 24h against baseline):\\n  - Record baseline P50/P95/P99 for model X.v1, error rate, GPU mem usage, KV cache hit rate\\n  - PromQL snippets to use:\\n    - error_rate = sum(rate(http_requests_total{job=runtime,handler=gen,model=~\\\"X.*\\\",status!~\\\"2..\\\"}[5m])) / sum(rate(http_requests_total{job=runtime,handler=gen,model=~\\\"X.*\\\"}[5m]))\\n    - kv_hit = avg(rate(kv_cache_hits_total{model=\\\"X.v1\\\"}[5m])) / avg(rate(kv_cache_requests_total{model=\\\"X.v1\\\"}[5m]))\\n    - p95_lat = histogram_quantile(0.95, sum(rate(request_duration_seconds_bucket{model=~\\\"X.*\\\"}[5m])) by (le))\\n\\n- Launch plan (slow-drip phases):\\n  - Phase A: 0.05% steady traffic for 2 hours to warm caches (cohort type: synthetic / low-cost test keys)\\n  - Checkpoints after A: kv_hit > 25% OR no P99 spike > 2x baseline AND error_rate < 0.2%\\n  - Phase B: 0.5% for 6 hours (mix of synthetic + small real cohort, prefer org-internal users)\\n  - Phase C: 1% for 24 hours (wider cohort, monitor for memory pressure)\\n  - Phase D: ramp to 10% over 4h, then normal rollout cadence if stable\\n\\n- Eviction policy (implementation notes):\\n  - Eviction triggers (order of precedence):\\n    1. hard OOM detection on node -> immediate redirect all X.v2 traffic from node and mark unschedulable\\n    2. sustained GPU memory usage > 85% for 5m plus P99 latency increased > 1.6x -> start selective session eviction\\n    3. KV-cache growth > configured quota (example: 12Gi per-instance) -> evict least-recently-used session keys older than 30m\\n  - Eviction tactic: graceful session eviction where in-flight requests finish but new requests for evicted sessions are routed to fallback variant X.v1 for 10 minutes\\n  - Fallback window and re-admit policy: after 10 minutes, session re-admitted to X.v2 at reduced token budget (for safety)\\n\\n- Rollforward / rollback rules (automated + manual hooks):\\n  - Auto-rollback if:\\n    - P99 latency > 2x baseline for > 15m OR\\n    - error_rate increase > 1 percentage point for > 10m OR\\n    - GPU OOM observed on any warm node twice in 1h\\n  - Soft-fallback: route 90% of cohort to X.v1 but keep 10% to X.v2 for diagnostics instead of full rollback\\n  - Manual confirmation required for rollforward to >10% traffic (owner: Samira K or on-call eng-platform)\\n\\n- Activation controls in Console/API:\\n  - Named policy: slow-drip-eviction-safe-v1\\n  - Config knobs: initial_weight, step_duration, max_weight, per-instance-concurrency, eviction_policy_id\\n  - Quick commands (examples):\\n    - set rollout weight: curl -X POST https://console/api/rollouts/slow-drip-eviction-safe-v1 -d '{\"weight\":0.005}' --header 'Authorization: Bearer $TOKEN'\\n    - emergency drain node: curl -X POST https://sre/api/nodes/drain -d '{\"node\": \"node-45-eu\"}'\\n\\n- Post-activation checks (first 48h):\\n  - daily digest of: latency deltas, kv hit delta, token-cost per request, cost-per-1000 tokens for cohort\\n  - sanity check: no change in end-user error reports via Zendesk/Sentry driven alerts\\n  - schedule small retro after 72h with stakeholders: eng, product, infra, SRE\\n\\nOpen questions / TODOs (notes to self):\\n- Do we want to persist eviction decisions to a lightweight audit log? (helpful for postmortem, small perf hit)\\n- Can we add an adaptive heatmap to Console showing per-session cache warmness? (visual ops tool)\\n- Should we pin X.v2 to a dedicated tiny pool for first 24h to isolate memory variance? Tradeoff: cost bump vs safer eviction surface.\\n- Verify whether autoscaler will spin new nodes for warm-witness label \u2014 tie to INF-3342.\\n\\nQuick reminder for next time:\\n- Start warm-witness deployment at least 4h prior to Phase A for long-context models.\\n- Keep Slack channel #deploy-telemetry open and add short heartbeat messages every 30m during phases.\\n\\nScratch notes (commands, snippets):\\n- Promtail quick query: curl -G 'https://prometheus/api/v1/query' --data-urlencode 'query=histogram_quantile(0.95, sum(rate(request_duration_seconds_bucket{model=\\\"X.v2\\\"}[5m])) by (le))'\\n- Rapid rollback = set rollout weight 0 then squash warming cohorts.\\n\\nEnd of scratch.\\n\\n(If this becomes a formal doc: move to shared_drives/product/console-and-rollouts/ and split into playbook + admin-ops checklist.)",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_2f1d6a5f50b042748c25c8d7849aa876"
+}

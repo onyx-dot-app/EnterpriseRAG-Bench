@@ -1,0 +1,35 @@
+{
+  "title": "Kernel bug playbook / quick triage (scratchpad)",
+  "owner": "Priya Nair",
+  "drive_area": "users",
+  "path": "users/kernel-bug-playbook-priya.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-14",
+  "last_modified": "2025-02-17",
+  "collaborators": [
+    "Samira Lopez",
+    "Diego Alvarez"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "triage",
+    "kernel",
+    "kv-cache",
+    "latency",
+    "investigation",
+    "todo"
+  ],
+  "linked_artifacts": [
+    "JIRA-RT-4123",
+    "JIRA-RT-4189",
+    "https://github.com/redwood-inference/serving-runtime/pull/2157",
+    "slack:#serving-runtime thread: GpK9zQxW"
+  ],
+  "content": "Context:\\n- Purpose: quick personal playbook & running log for triaging kernel-level regressions I hit while on rotation. Use this as a scratchpad to capture commands, small experiments, and what to escalate. Not polished.\\n- Recent incident summary (2025-02-13 evening): KV cache invalidates intermittently under bursty short-seq workloads; 99p token latency spikes ~2\u20133x for affected requests. Suspect eviction path + small-rw lock contention.\\n\\nQuick triage checklist (one-page):\\n1) Reproduce locally with a small harness\\n   - start runtime with --kv-evict-debug and --trace-locks\\n   - replay recorded trace: tools/replay/short-seq-burst.json (recorded from prod cluster 02/13)\\n   - expected: steady 25ms p99; observed: spikes to 70\u2013120ms every ~300\u2013600 requests\\n2) Capture perf counters\\n   - commands:\\n     - perf record -g -p <pid> -o /tmp/perf.data\\n     - ./tools/kv-inspect --pid <pid> --hist > /tmp/kv-hist.log\\n3) Narrow to code paths\\n   - grep traces for \\\"evict\\\" and \\\"rw-lock\\\"\\n   - instrument around CandidateEvict::try_evict\\n4) Short-term mitigations\\n   - increase eviction batch size to reduce frequent wakes (config: kv.eviction.batch=64 -> 256)\\n   - enable conservative backoff for client library to smooth bursts\\n5) Escalate if reproducible across >1 host\\n   - open JIRA with reproduction steps, perf dump, and a minimal trace; tag eng-sre and platform-engineering\\n\\nNotes / hypotheses (ordered by confidence):\\n- H1 (high): Frequent synchronous evict cycles holding global lock due to small batch size + high churn from short sequences. Eviction path holds write lock to update free list -> block token-serving.\\n- H2 (medium): Memory allocator contention in hot patch path (tcmalloc arena thrash) when many short-lived KV entries created/dropped.\\n- H3 (low): Network reorder causing duplicate inserts and immediate evictions (unlikely but flagged by two traces with identical keys within 1ms).\\n\\nExperiments to try (chronological log):\\n- 2025-02-14 09:10 \u2014 baseline replay on my laptop (4-core): reproduced p99 spikes. Captured trace.\\n- 2025-02-14 10:05 \u2014 changed kv.eviction.batch=256 locally: p99 spikes reduced by ~40% but still present. Note: throughput stayed nominal.\\n- 2025-02-14 11:22 \u2014 instrumented CandidateEvict::try_evict: added timing metrics and lock-hold histograms. Observed lock hold tail at ~8\u201314ms during spike windows.\\n- 2025-02-15 15:30 \u2014 tried switching allocator to jemalloc on dev box: no meaningful improvement. Suggests not allocator-dominant.\\n- 2025-02-16 09:00 \u2014 deployed config change kv.eviction.batch=256 to canary (2 nodes). Canary saw 30% drop in spike freq; one node still had occasional spikes.\\n\\nImmediate TODOs (priority sorted):\\n- [ ] Add per-key churn metric to kv exporter (prometheus) \u2014 who: Priya \u2014 ETA 2025-02-18\\n- [x] Add lock-hold histogram metrics in CandidateEvict (done locally) \u2014 pushed PR https://github.com/redwood-inference/serving-runtime/pull/2157\\n- [ ] Run cluster-scale A/B with eviction.batch=512 vs 256 for two hours during low traffic window \u2014 coordinate with SRE (Diego) \u2014 target 2025-02-19 02:00 UTC\\n- [ ] If A/B still shows spikes, prototype async eviction worker decoupled from hot path \u2014 spike reduction target >= 50%\\n- [ ] Draft postmortem if can reproduce across >3 hosts \u2014 include mitigations and long-term plan\\n\\nHelpful commands / snippets:\\n- start debug runtime: ./bazel-bin/runtime/server --config dev.yaml --kv-evict-debug --log-level=debug\\n- replay harness: ./tools/replay --trace recordings/short-seq-burst-20250213.json --rate 2000\\n- export metrics for timeframe: curl -s http://localhost:9090/metrics | grep kv_evict_lock_hold_ms_bucket\\n- lightweight tracer: RUST_LOG=kv=trace ./bazel-bin/runtime/server ... > /tmp/trace.log 2>&1 &\\n\\nPointers to code & artifacts:\\n- CandidateEvict: serving-runtime/kv/evict.rs (look at try_evict and pop_free_list)\\n- allocator bits: third_party/tcmalloc/ (search arena_create)\\n- reproducer: recordings/short-seq-burst-20250213.json (archived in infra-volume)\\n- recent PR: https://github.com/redwood-inference/serving-runtime/pull/2157 (lock histogram + metrics)\\n\\nOpen questions / decisions to make:\\n- Q1: increase eviction.batch to 512 by default? Pros: fewer wake-ups + bigger amortization. Cons: potential longer pauses during large eviction. Need canary A/B.\\n- Q2: async eviction worker design trade-offs. Should worker perform bounded evictions per tick or drain fully? Lean towards bounded to avoid long pauses.\\n- Q3: telemetry: do we need per-tenant eviction metrics or per-key only? Per-tenant might help tie to customer impact.\\n\\nNotes-to-self for oncall handoff:\\n- If paged for high p99: first check canary flags (kv.eviction.batch) and the per-node lock-hold histogram metric. If lock-hold > 5ms at 95p, flip canary config to batch=512 for the affected node group and notify SRE.\\n- Avoid restarting runtime during traffic peak. Try config flip + slow rollout.\\n\\nRandom micro-ideas (brain dump):\\n- Use a two-tier free-list: small fast-path free-list for hot keys that never require full eviction, fallback to heavy evict for cold churn.\\n- Consider sharded eviction locks per-hash-segment (reduce contention) \u2014 surgical change but high payoff if correctness simple.\\n\\nReferences & links:\\n- Slack thread: https://redwood.slack.com/archives/G01234567/p1707889322001234\\n- JIRA: JIRA-RT-4123 (investigation), JIRA-RT-4189 (canary config run)\\n\\nLast short log (today, 2025-02-17):\\n- 08:30 \u2014 merged PR for lock histograms (PR 2157); started canary with batch=256 across 4 nodes. Metrics look marginally better.\\n- 09:45 \u2014 Diego ran perf capture on canary node, transferring /tmp/perf.data to s3://redwood-debug/perf-20250217-canary-1\\n- 11:00 \u2014 pairing with Samira to sketch async eviction prototype. Action: mock API for eviction worker and failure modes.\\n\\nIf I leave this doc and come back: next steps if morning: check canary p99, grep lock histograms, start A/B plan ticket, sync with SRE for scheduled A/B window.\\n\\n-- Priya\\n(quick scratchpad; prune and formalize into a postmortem or runbook later)",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_6ae30b6b1eca4ff2bded91f839f03284"
+}

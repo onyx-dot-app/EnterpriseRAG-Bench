@@ -1,0 +1,35 @@
+{
+  "title": "QPS scaling probe notebook (interactive)",
+  "owner": "Elliot Park",
+  "drive_area": "users",
+  "path": "users/qps-scaling-probe-notebook-elliot",
+  "doc_type": "doc",
+  "created_at": "2025-02-10",
+  "last_modified": "2025-03-01",
+  "collaborators": [
+    "Maya Patel",
+    "Otis Chen"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "qps",
+    "scaling",
+    "interactive",
+    "batching",
+    "latency",
+    "autoscale"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/842",
+    "LINEAR-2025-QPS-16",
+    "confluence://perf/qps-scaling-notes"
+  ],
+  "content": "Purpose:\nQuick interactive scratchpad to capture QPS scaling behavior on the current runtime build (post-quantize-optimizer merge). Focus: identify sustainable QPS for 8xA100 pool with default dynamic batching and autoscale=on, and surface non-linear latency inflection points. Notes are messy \u2014 for my own recollection.\n\nEnvironment:\n- Model: mosaicml/ggml-redwood-7b-v1 (fp16 / quantized 4bit fallback)\n- Hardware: in-house 8xA100 dedicated pool (nvlink off for these runs)\n- Runtime: serving-runtime@main (post PR 842 changes), kernel selector v2\n- Traffic generator: locust + small custom client for KV-cache warmup (see linked PR)\n- Config snapshot used: dynamic_batch_max_tokens=2048, batching_delay_ms=6, autoscale.min=2, autoscale.max=20, kv_cache_enabled=true\n\nKey variables I swept:\n- offered_qps: 50 -> 5000 (stepwise)\n- concurrency per worker: 1 -> 32\n- batch size target: auto (observe), and manual overrides at 8/16/32 seekers\n- request tokens: prompt length 64, response target 256 (avg 140 tokens actually)\n\nQuick procedure:\n1) Warmup: send 200 short requests (prompt 8 tokens) to populate tokenizer and initial kernels.\n2) KV warmup: run 20 requests that reuse prefix to warm KV cache (important for multi-turn).\n3) For each offered_qps level: spin locust for 3 minutes steady state, capture p50/p90/p95/p99, CPU/GPU util, batch sizes, and queued requests.\n4) Follow up 2-minute cooldown between levels to let autoscaler adjust.\n\nRaw observations (high level):\n- 50-200 qps: p50 60-80ms, p95 ~180-250ms, batching mostly 1-4 tokens (very small). Utilization low (GPU 12-28%).\n- 200-800 qps: p50 climbs to 90-140ms, p95 300-600ms. Batching increases (8-32 tokens per batch), GPU util 30-60%. Autoscaler increased replicas from 2->6 around 400 qps.\n- 800-1800 qps: p50 ~150-300ms, p95 ~700-1500ms. Observed microbursting in queue depth every ~45s correlated with background SRE jobs (suspect noisy neighbor). Batch sizes sometimes peek to 64 when request coalescing triggers; this reduces GPU efficiency (long tail). GPU util 65-85%.\n- 1800-2500 qps: latency inflection. p95 jumps non-linearly (1500ms -> 3s). GPU util saturates ~92-99%, sustained queuing. Autoscaler tries to add replicas but rollout latency ~30-45s causes transient spike windows.\n- >2500 qps: system becomes unstable; p99 > 8s, request timeouts observed at 10s, backpressure kicks in from client. Manual throttle required.\n\nDetailed notes / anomalies:\n- Warmup matters a lot: cold-start p95 at 400 qps was 2x higher if KV warmup skipped. Suggest adding quick KV warmup in client library.\n- Batching delay=6ms seems conservative; increasing to 12ms reduced p95 under medium load (400-800 qps) by ~18% due to larger, more efficient batches. But under very high qps this increased p50 slightly \u2014 tradeoff.\n- Autoscaler ramp latency is primary cause of spikes between 800-2000 qps. Scaling steps: add 2 replicas every 30s; our workload requires smaller steps but faster reaction (add 1 replica earlier).\n- I saw one steady pattern: every ~60s there is a 200-400ms p95 blip correlated with GC cycles in python-based preprocessor (worker logs show 80-120ms GC). Might rewrite critical path to avoid Python GC at high QPS.\n- Large batch peaks (64+) cause KV cache thrash when requests with different prefixes get grouped; the batching heuristic needs prefix-awareness to avoid mixing unrelated chats.\n\nRepresentative sample output (from locust run at 1200 qps):\n- Duration: 180s\n- Avg batch size: mean 22, median 20, 95th 48\n- p50: 190ms, p95: 920ms, p99: 1.8s\n- GPU util: 78%\n- Replica count: 8\n- Queued requests avg: 14\n\nHypotheses:\n- H1: Autoscaler step size + cooldown causes transient queueing; smaller/faster steps reduce p95 spikes.\n- H2: Batching heuristic that ignores prefix is harming tail latency during chatty workloads\u2014prefix-aware batching will lower p99.\n- H3: Python preprocessing GC causes periodic latency blips; move to a C extension or offloaded process to minimize pauses.\n\nQuick experiments to run next (TODOs):\n- [ ] Run identical sweep with batching_delay_ms=12 and 18; compare p50/p95/p99 curves.\n- [ ] Try prefix-aware batching flag on a dev branch (simple hash of conversation id) to see p99 impact.\n- [ ] Autoscale policy: change step=+1 replica and cooldown=15s; re-evaluate at 1000-2200 qps.\n- [ ] Reproduce microburst with cpu/mem profiling turned on for preprocessor to confirm GC involvement.\n- [ ] Long run (30m) at 1600 qps to see sustained behavior and NVLink offload effects.\n\nNotes to self:\n- Keep an eye on slow starts immediately after deploy; warmup scripts should be part of rollout.\n- Communicate to SRE about noisy neighbor jobs around 10:12-10:20 PDT; check cron jobs on infra.\n\nQuick conclusion (working):\n- For this model+pool, sustainable P95 target < 1s appears feasible up to ~1400 qps with tuning (batching delay bump, autoscale tuning, prefix batching). Beyond ~1800 qps, diminishing returns and queuing make latencies unpredictable unless we increase pool capacity or reduce per-request compute (smaller model / quantization).\n\nLinks/refs: see linked_artifacts for infra PR and tracker. Also saved raw CSVs under /tmp/elliot/qps-sweeps/ (copied to artifacts later).\n\nTimestamped log snippets:\n- 2025-02-11 09:42:00 \u2014 baseline run 400 qps, p95 480ms.\n- 2025-02-12 13:01:30 \u2014 warmup disabled by accident; p95 doubled at 600 qps. Re-ran.\n- 2025-02-25 16:05:10 \u2014 increased batching_delay to 12ms, p95 at 800 qps fell 20%.\n\nEnd of notebook \u2014 will tidy into a short memo if findings hold after next runs.\n\n",
+  "note_type": "performance-scratchpad",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_8ddf77e0f0d243eab8dde7cc01048000"
+}

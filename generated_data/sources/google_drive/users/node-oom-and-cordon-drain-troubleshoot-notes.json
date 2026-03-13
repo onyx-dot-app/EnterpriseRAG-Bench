@@ -1,0 +1,34 @@
+{
+  "title": "Node OOM & cordon/drain troubleshoot notes",
+  "owner": "Avery Morales",
+  "drive_area": "users",
+  "path": "google_drive/users/node-oom-and-cordon-drain-troubleshoot-notes.json",
+  "doc_type": "doc",
+  "created_at": "2024-11-14",
+  "last_modified": "2024-12-03",
+  "team": "eng-sre",
+  "status": "draft",
+  "tags": [
+    "k8s",
+    "kubelet",
+    "oom",
+    "node-provisioning",
+    "cordon-drain",
+    "debugging"
+  ],
+  "collaborators": [
+    "Samir Gupta",
+    "Elena Park"
+  ],
+  "linked_artifacts": [
+    "JIRA-RINF-1724",
+    "gh-repo:infra/cluster-bootstrap#456",
+    "confluence:node-provisioning-runbook-v2"
+  ],
+  "body": "Notes-to-self: incident trace for node(s) hitting OOM + failing to rejoin after drain.\n\nContext:\n- Cluster: dev-dedicated-3 (us-west2).\n- Provisioning flow: cloud-init -> kubeadm join -> helm post-install hooks.\n- Symptom timeline: node reported NotReady -> kubelet OOMKilled repeatedly -> automated cluster-autoscaler retried -> drain/cordon attempted by admin -> node stuck in Terminating pods during drain.\n\nCommands run (raw):\n- kubectl get nodes -o wide --show-labels\n  >> node-17   NotReady   <none>   192.168.34.17   <...>\n- ssh ubuntu@192.168.34.17 sudo journalctl -u kubelet -n 200 --no-pager\\  \n  >> Nov 14 11:07:03 node-17 systemd[1]: kubelet.service: Main process exited, code=killed, status=9/KILL\n  >> Nov 14 11:07:03 node-17 kernel: Out of memory: Kill process 2431 (kubelet) score 987 or sacrifice child\n- dmesg | grep -i oom\n  >> [234567.123456] Killed process 2431 (kubelet) total-vm:120000kB, anon-rss:98000kB, file-rss:2000kB\n- ps aux --sort=-rss | head -n 12\\  \n  >> (on subsequent boot) found containerd-shim processes from failed pods consuming 1.4GiB each (several legacy test pods)\n- df -h /var/lib/docker /var/lib/containerd /var/lib/kubelet\\  \n  >> /var/lib/kubelet  90G  88G  2G  98% <-- suspicious\n- ls -lah /var/lib/kubelet/pods | wc -l\\  \n  >> 1200 (tons of leftover pod dirs)\n\nQuick observations:\n- Root cause likely storage exhaustion (inode/disk) on /var/lib/kubelet leading to thrashing and oom. kubelet OOM shows it's killed directly, but multiple container shims persisted and consumed memory.\n- Post-install hooks created test workloads that weren't cleaned up (helm job with restartPolicy=Never left stateful remnants?).\n- systemd-oomd might be active and propagating kills; verify with systemctl status systemd-oomd.\n\nHypotheses:\n1) Disk pressure on /var/lib/kubelet caused eviction + kubelet memory leak while scanning millions of pod dirs -> OOM.\n2) A background job (helm postinstall tests) spawned many pods with high RSS; when they terminated, containerd left shims and processes in zombie-like state.\n3) cgroup driver mismatch (docker vs systemd) caused improper accounting and allowed processes to exceed expected memory budgets.\n\nCommands/troubleshooting performed and notes:\n- sudo du -sh /var/lib/kubelet/* | sort -h | tail -n 20\\  \n  >> saw dozens of heavy pod directories (~500MB each) from a failing batch job (helm release: smoke-test-2024-11).\n- sudo systemctl status containerd.service\\  \n  >> active, but many shim processes in D state.\n- sudo kill -9 <shim-pid> (iterative) -> freed some memory but not sustainable.\n- kubectl drain node-17 --ignore-daemonsets --delete-local-data --force --grace-period=30\\  \n  >> hung: several pods in Terminating with finalizers; kube-controller-manager couldn't evict because static pods and local storage.\n- kubectl get pods --all-namespaces -o wide --field-selector spec.nodeName=node-17\n  >> lots of test pods with owners belonging to helm release smoke-test-2024-11.\n\nTemporary mitigations applied:\n- cordon node-17 (kubectl cordon node-17) to stop new scheduling.\n- On-node cleanup script: stop kubelet, rotate logs, delete stale pod dirs (mv to /tmp/kubelet-orphans-$(date)), restart containerd, restart kubelet.\\  \n  >> Note: must be careful to avoid deleting live volumes for real stateful workloads. This was run on a dev node.\n- Removed helm release smoke-test-2024-11 from Tiller/helm (helm delete --purge) to prevent recreation.\n\nPermanent fixes to propose:\n- Add kubelet local disk pressure alert threshold (prometheus alert for NodeDiskRunningOut) and autoscaling policy to cordon/notify earlier.\n- Ensure helm post-install smoke tests run in dedicated ephemeral namespace with TTL controller (or kubernetes.io/ttl) so pods get cleaned when job finishes.\n- Add cron/cleanup job to GC orphaned pod directories older than X days on dev clusters (but not prod).\n- Verify cgroup driver consistency (kubelet config & containerd config) across images. If mismatch, migrate to systemd cgroup driver in containerd and kubelet config.\n\nOpen questions / TODOs:\n- Why did kubelet get OOM-killed instead of evicting aggressively? Check kubelet eviction thresholds and system oom_score_adj for kubelet process.\n- Are there known memory leaks in kubelet version v1.27.3? Check changelog and existing cluster bug reports.\n- Confirm if cloud-init hook for smoke tests has runaway loop on failure (retries every minute). If yes, change to exponential backoff.\n\nRepro steps (dev only):\n1) Provision small VM (2GB RAM, 30GB root).\n2) Run current bootstrap with smoke-test helm release (same chart)\n3) Monitor memory/disk with watch (free -m; df -h /var/lib/kubelet) and ps top.\n4) When threshold reached, try cordon/drain and observe behaviour of controller-manager and kubelet logs.\n\nSnippets to paste in tickets / Slack when escalating:\n- \"kubelet OOMKilled on node-17 (us-west2) at 2024-11-14 11:07 UTC. /var/lib/kubelet usage 98%, ~1200 pod dirs, containerd shim processes consuming >6GB total. Suspect helm smoke-test leaving heavy artifacts. JIRA: RINF-1724.\"\n\nUseful commands for next time (keepers):\n- journalctl -u kubelet -b --no-pager | sed -n '1,200p'\n- sudo du -sh /var/lib/kubelet/pods/* | sort -rh | head -n 20\n- ps auxf | grep containerd-shim | awk '{print $2, $4, $11}' | sort -k2 -nr | head -n 30\n- sudo find /var/lib/kubelet/pods -mtime +7 -type d -print | wc -l\n\nFinal notes: treat dev clusters as low-trust: run potentially-destructive GC only on dev. For dedicated/prod, instrument with safe TTLs and eviction policies and make smoke tests self-contained (PVCs in ephemeral class, TTL controller).\n\nLogged at: 2024-12-03 by Avery Morales\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_3cbc894fe4a146cdbfeb11b191b18089"
+}

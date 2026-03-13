@@ -1,0 +1,34 @@
+{
+  "title": "KV batching runbook & nightly hacklog \u2014 Dec 20 2028",
+  "owner": "Ava Martinez",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/kv-batching-runbook-nightly-hacklog-2028-12-20.json",
+  "doc_type": "doc",
+  "created_at": "2028-12-20",
+  "last_modified": "2028-12-21",
+  "collaborators": [
+    "Ravi Patel",
+    "Lena Cho",
+    "Marcus Green"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "kv-cache",
+    "batching",
+    "runbook",
+    "night-ops",
+    "kernel-tuning"
+  ],
+  "linked_artifacts": [
+    "JIRA-8876",
+    "GH-PR#3421",
+    "https://confluence.redwood/serve/kv-batching-guide"
+  ],
+  "content": "Purpose: capture the ad-hoc nightshift findings and assemble a short operational runbook for the KV-prefetch + batching path. This is intentionally informal \u2014 notes, quick experiments, and immediate action items for the next 48h deploy window.\n\nContext: recent customer incidents showed 99th percentile token latency spikes during peak mixing workloads. Hypothesis is two-fold: (1) KV cache eviction thrash when micro-batches compete for limited GPU DRAM, (2) kernel scheduling causes batch-starvation for short seq requests. We invited oncall and two kernel devs to do rapid experiments.\n\nSummary of tonight's experiments (12/20):\n- Experiment A: shorter coalescing window\n  - change: coalesce_window_ms from 8 -> 4 on one canary shard (canary-5)\n  - why: reduce per-request wait time for low-latency paths, trade smaller batches for fresher KV hits\n  - observation: p50 improved from 22ms -> 17ms for short-seq (<64) requests; p95 increased slightly from 102ms -> 118ms during the same interval\n  - hypothesis: reduced coalescing reduced batch efficiency; kernel kernel-launch overheads dominated for medium requests\n  - follow-up: try coalesce_window_ms=6 and enable adaptive-window flag (see action items)\n\n- Experiment B: soft-eviction threshold adjustment\n  - change: kv_cache_soft_limit +10% (evict less aggressively) on canary-2\n  - why: observed repeated refill across same prefix hashed buckets \u2014 cost of refill (GPU memcpy + decode warmup) > occasional evictions\n  - observation: cache hit-rate increased from 67% -> 78% overall for canary-2; memory pressure rose by ~1.8GB on average GPU resident set\n  - side effect: single long-seq (>1024) tail runs occasionally triggered spill-to-host; tracked in JIRA-8876\n  - follow-up: add per-model adjustable soft limit; do not increase global soft limit until we have per-model heuristics and spill monitoring alerts\n\n- Experiment C: queued-batch timeout introspection\n  - change: instrumented kernel scheduler to log queue-wait times with 1ms granularity for 3 hours\n  - why: mysterious 10\u201330ms gaps seen in traces before kernel start\n  - observation: two major causes: preemptive GPU context switch when a larger batch arrives, and lightweight kernel warmups being scheduled out by SLI collector thread\n  - follow-up: patch in GH-PR#3421 reduces warmup preemption by marking warmup kernel launches as persistent, not preemptible. Need perf regression test on thermal profile.\n\nOperational notes / heuristics to add to runbook:\n- When p95 token latency rises while throughput is steady, first check kv_cache eviction rate and per-GPU resident memory (nvidia-smi). If eviction spikes and refill rate correlates, suspect KV limit too low.\n- If increase in p50 but p95 stays flat, suspect coalescing window too long for bursty short-seq traffic \u2014 decrease coalesce_window_ms on a canary shard and monitor batch yield.\n- For mixed workloads, enable 'per-model kv profiles' (experimental flag) before bumping global soft limits.\n- Emergency rollback steps: set coalesce_window_ms to 10 (safe fallback), set kv_cache_soft_limit back to baseline, enable fallback-to-small-batch routing for tiered customers.\n\nLogs and quick trace excerpts (redacted session ids):\n- 2028-12-20T22:11:02Z canary-5: trace: queue_wait_ms=5, kernel_start_delay_ms=3, batch_size=7, seq_len_p50=32\n- 2028-12-20T23:04:11Z canary-2: trace: kv_evictions=213, kv_refills=207, refills_to_hits=0.96\n- 2028-12-21T00:42:53Z canary-3: trace: queue_wait_ms=28, preemption=true, preempt_by_batch_size=48\n\nAction items (owners, due):\n- AVA: write a short RFC for per-model soft limit profiles and post to eng RFCs by 2028-12-23. (linked: JIRA-8891)\n- RAVI: land perf test harness for persistent warmup kernels; coordinate with infra for a thermal run on dev-gpu-4. Target: 2028-12-27. (GH-PR#3421)\n- LENA: add eviction/refill alert to SRE dashboards (pager threshold: refill rate > 120/min and eviction/refill ratio > 1.0). Due 2028-12-22.\n- MARCUS: run a mixed-workload replay using last month's production traffic slice; collect p50/p95 and KV hit curves. Due 2028-12-24.\n\nOpen questions we still have:\n- Is the kernel scheduler preemption policy doing the right thing when warmup kernels are present? We saw preemptions leading to 20\u201340ms added queue wait. Does marking warmups as non-preemptible cause bad head-of-line blocking?\n- What is a safe per-model soft limit heuristic \u2014 fraction of model KV residency vs. average live sessions? Any known workloads that will break such heuristics?\n- Can we do early KV hinting at the routing layer (predictive prefetch on first N tokens) without inflating mem pressure?\n\nQuick troubleshooting checklist for night-ops engineer:\n1) Check SRE dashboard: KV refill rate, eviction rate, per-GPU mem, queue wait histogram.\n2) If refill_rate high and evictions high: roll kv_cache_soft_limit +5% on canary, and enable per-model debug logging.\n3) If queue_wait histogram shows a high bin around 20\u201340ms: throttle arrivals for large-batch clients (routing policy), and flip persistent-warmup flag on canary.\n4) If thermal alarms fire during persistent kernel tests: abort test and escalate to infra.\n\nNotes-to-self / stray ideas:\n- Consider a hybrid coalescer where we do a tiny immediate prober (1\u20132ms) that probes the KV quickly for short seqs and then waits the remaining window for batch coalescing only if probe shows low hit-rate. Might reduce p95 regresses while keeping p50 good.\n- Data point: NVLink utilization did not exceed 68% during these runs; suggests DRAM churn is local rather than cross-GPU transfers.\n\nReferences (tickets & PRs): JIRA-8876 (kv spill investigation), JIRA-8891 (per-model kv profile RFC draft), GH-PR#3421 (warmup persistence patch).\n\nRevision history:\n- 2028-12-20 (Ava) initial notes and experiment results\n- 2028-12-21 (Ava) added follow-ups, action owners, updated status to in_review\n\nEnd of doc.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_1bef9eb023cd4773b6e69af0dd2b5dd1"
+}

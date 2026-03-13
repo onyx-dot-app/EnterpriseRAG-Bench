@@ -1,0 +1,33 @@
+{
+  "title": "Stochastic batch tinker log - afternoon session",
+  "owner": "Mei Chen",
+  "drive_area": "users",
+  "path": "users/stochastic-batch-tinker-log-mei-chen",
+  "doc_type": "doc",
+  "created_at": "2024-10-03",
+  "last_modified": "2024-10-04",
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "kernel",
+    "batching",
+    "p99",
+    "kv-cache",
+    "investigation"
+  ],
+  "collaborators": [
+    "Rohan Mehta",
+    "Ivy Chen"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/runtime/pull/987",
+    "https://redwood.atlassian.net/browse/RW-2121",
+    "https://slack-redwood.slack.com/archives/C04KERNEL/p1696422000000"
+  ],
+  "content": "Context:\\nWorking on intermittent p99 spikes for generative workloads when we enable stochastic batching (variable batch sizes based on request arrival). Goal: capture quick experiments, hypotheses, repro steps, and immediate TODOs so I don't forget between switches.\\n\\nQuick summary of what I saw (afternoon run, local rig: 8xA100-80GB, runtime@b2f3c4d):\\n- Baseline (deterministic batch=8): throughput ~850 toks/s, p50 18ms, p95 60ms, p99 110ms.\\n- Stochastic batching (target mean=8, CV~0.45): throughput ~880 toks/s, p50 16ms, p95 75ms, p99 260-320ms (spiky).\\n- Spikes correlate with ~15% of requests that end up as singleton batches during brief bursts in arrival pattern.\\n\\nHypotheses (ranked):\\n1) KV-cache eviction/rehash path under variable batch sizes causes lock contention (shared structure guarded by single mutex). When many small batches happen, we do more frequent KV ops -> contention -> tail latency.\\n2) Kernel launch overhead: small batches cause many more kernel launches that hit a non-amortized scheduling path (especially for fused-attn kernels with small sequence lengths).\\n3) Batching scheduler thrashes between pack/unpack codepaths when batchsize oscillates, leaving CPU scheduling jitter that cascades to GPU queuing.\\n4) Metric/reporting artifact: our p99 calculation window is per-second, but the queueing jitter causes transient spikes that inflate p99 \u2014 still real user-visible, but maybe shorter-lived than it looks.\\n\\nQuick experiments run (commands + notes):\\n- Repro script: python -m rwserve.bench --model redwood-13b --arrival-pattern poisson --mean-rps 60 --target-bucket-mean 8 --stochastic --rng-seed 42\\n- Baseline run pinned to runtime@b2f3c4d: reproduced p99 ~115ms.\\n- Stochastic run with deterministic KV-fastpath disabled (env KV_FASTPATH=0): p99 fell to ~140ms (still higher than baseline but better than 260ms).\\n- Stochastic run with batch-capping (max_batch=16): p99 ~180ms.\\nNotes: KV_FASTPATH toggle reduced the worst tails; points to hotpath there.\\n\\nObservations from flamegraphs (CPU side, perf on on-host):\\n- Long pause in thread 'batching-0' where it holds kv_map mutex for ~12-20ms occasionally.\\n- 'rpc-handler' threads pile up behind that lock; GPU queue shows bursts of submissions.\\n- nvprof traces show many small kernel launches clustered instead of amortized big kernels.\\n\\nImmediate small fixes to try (short, can test today):\\n- [ ] Add per-worker KV maps (shard by worker id) to reduce global lock contention (fast to prototype).\\n- [ ] Implement heuristic: prefer grouping requests up to a min effective batch size (min_effective=4) before releasing to GPU (reduces singletons).\\n- [ ] Add jitter smoothing: if arrival rate oscillates, add small buffering window (20ms) before flush.\\n- [ ] Instrument counters: count singleton-batch fraction per-second and expose in /metrics.\\n\\nRepro steps for devs (minimal):\\n1) git checkout b2f3c4d && make bench-image\\n2) docker run -e KV_FASTPATH=1 -p 8080:8080 runtime-bench:local \\n3) python tools/load_gen.py --target http://localhost:8080/generate --pattern poisson --rps 60 --duration 120 --seed 42\\n4) collect metrics via prometheus endpoint /metrics and trace /tracing\\n\\nLonger-term thoughts (not for today):\\n- Rework KV map to be sharded with lock-free read paths (sounds like 2\u20133 wks of focused work + tests).\\n- Consider backpressure: if batch execution latency rises, throttle acceptance for small requests (dangerous for PLG UX).\\n- Model-aware batching: certain models with short seqs benefit from merging more aggressively; route those requests to a different pool with tuned batch strategy.\\n\\nLinked/informative threads:\\n- RW-2121 (eviction thundering) has related history; assign notes overlap.\\n- PR #987 adds basic singleton metrics; use it to capture fraction of singleton batches in the next run.\\n\\nNotes for pairing with Rohan tomorrow (agenda):\\n- Walk through the perf flamegraph and point to kv_map mutex hotspots.\\n- Test per-worker KV shard prototype (I will push a branch early AM).\\n- Decide on quick rollout: enable min_effective batch heuristic behind runtime flag and run A/B on canary pool.\\n\\nOpen questions / unknowns to answer in follow-up:\\n- Is the mutex actually in userland code or in a third-party library (tests above suggest ours, but need confirm).\\n- How does this behavior change under Dedicated (reserved capacity) vs hosted noisy neighbors? replicate on dedicated staging.\\n- Any downstream feature (console tracing hooks) that would make this easier for customer debugging?\\n\\nTodo (concrete):\\n- [ ] Push prototype: per-worker-kv branch (mei/protobuf-kv-shard) \u2014 target EOD tomorrow.\\n- [ ] Add singleton-batch exporter via PR #987 (wire to prometheus).\\n- [ ] Run stochastic workload with KV_FASTPATH=0 on dedicated-staging (request infra slot from SRE).\\n- [ ] Draft short blurb for triage channel: \"stochastic-batching p99 spikes: hypothesis kv contention\" with attachments (flamegraph, nvprof).\\n\\nRandom micro-notes/to-self:\\n- Check kernel build flags: compiled with -O2 but not LTO; might be able to squeeze launch overhead with link-time opts.\\n- Look at nvlink utilization during spikes \u2014 might reveal inter-GPU stalls.\\n- Remember to tag PRs with RW-2121.\\n\\nMeeting snippet (15:45 quick sync with Ivy):\\n- Ivy: \"If we shard KV by worker, we need to ensure cache warm-up per-shard isn't expensive.\"\\n- Me: \"Plan: lazy warm-up + shared prefetch during low-load periods.\"\\n- Action: Ivy will sketch warm-up heuristic by EOD.\\n\\nEnd note: keep the next run reproducible; save the load_gen seed and attach all logs. If this goes to canary, include singleton fraction histogram in the release notes so SRE can roll back quickly.\\n\\n-- Mei\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_918e030b48334f0ba9f07769e03bcce5"
+}

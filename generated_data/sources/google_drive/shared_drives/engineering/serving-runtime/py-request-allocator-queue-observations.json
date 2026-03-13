@@ -1,0 +1,36 @@
+{
+  "title": "Python request queue + allocator observations",
+  "owner": "Aisha Kumar",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/py-request-allocator-queue-observations.json",
+  "doc_type": "doc",
+  "created_at": "2024-08-16",
+  "last_modified": "2024-09-02",
+  "collaborators": [
+    "Marco Li",
+    "Priya Desai",
+    "Evan Park"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "profiling",
+    "jemalloc",
+    "GIL",
+    "tokenization",
+    "queueing",
+    "latency",
+    "benchmarks"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-1234",
+    "GH-PR-789",
+    "JIRA-SERV-56"
+  ],
+  "content": "Summary:\\n\\nQuick notes from spike investigating CPU-side tail and median latency for small requests (<=64 tokens). Primary focus on how Python allocation patterns (jemalloc), GC, request queue ordering, and threadpool coordination interact with tokenization and JSON parsing. We ran multiple microbenchmarks and end-to-end traces on staging clusters (c6g-like CPUs, 32 vCPU, 64GB RAM) with our vanilla Python worker and a Rust-based tokenizer for comparison.\\n\\nBackground / hypothesis:\\n- Symptoms: occasional 50\u2013300ms spikes on CPU-bound worker processes while median stays ~12\u201320ms for micro-requests. Spikes correlate with increased RSS and sys CPU (context switch bursts).\\n- Hypothesis A: allocator fragmentation / jemalloc background activity causing occasional stop-the-world-ish pauses when pages are purged or background threads run.\\n- Hypothesis B: Python GIL contention across threadpool workers doing JSON parse + tokenize + request routing; GC cycles amplify tail latency.\\n- Hypothesis C: LIFO vs FIFO queueing and head-of-line blocking when large requests cause worker saturation.\\n\\nEnvironment and measurement setup:\\n- Binary: staging-serving:2024-08-01\\n- Worker binary run options: PYTHONMALLOC=malloc, MALLOC_CONF=prof:false,lg_dirty_mult:2 (experiments toggled jemalloc options)\\n- Bench harness: 5000 requests/sec sustained for 60s, request mix: 70% small (prompt ~30\u201360 chars), 30% medium (200\u2013400 chars)\\n- Sampling: dtrace-like userland samplings, perf script stacks, Python sys.setprofile CPU sampling every 5ms, jemalloc mallctl / statsmalloc snapshots every 1s\\n- Tracing: opentelemetry spans, flamegraphs per process, and pmap + smaps sampling on pause events\\n\\nKey observations:\\n1) Jemalloc churn correlates with RSS bump and sys CPU spikes. When MALLOC_CONF left default, we observed periodic background purging spikes every ~8\u201312s. Setting lg_dirty_mult lower reduced spike magnitude but not frequency.\\n2) GC: Python GC collections (gen2) happen during high allocation windows and frequently coincide with increased wall time in C-extensions for JSON parsing. Turning off GC (for a subset of synthetic runs) moved CPU to native C work and reduced Python-level stop-the-world time, but overall system CPU rose and process RSS increased.\\n3) GIL contention: when many tokenization calls run in native C extension (releasing GIL) the contention reduced; pure-Python tokenization had severe contention and longer tails.\\n4) Queueing: FIFO worker queues allowed head-of-line large requests to block small requests behind them; switching to LIFO (or size-aware priority queue) reduced small-request tail latency at cost of larger requests experiencing extra delay.\\n5) Threadpool coordination: OS thread wakeups were a contributor \u2014 too many short-lived tasks caused frequent thread churn. Using a small pool of long-lived pinned worker threads with cooperative task batching reduced context switches by ~30% and improved median latency by ~15%.\\n\\nNumeric snapshots (representative):\\n- Baseline median small-request latency: 18ms, p95: 85ms, p99: 230ms\\n- After MALLOC_CONF tweak (lg_dirty_mult=1): median 16ms, p95 70ms, p99 180ms\\n- After moving tokenization to Rust extension (releases GIL): median 13ms, p95 48ms, p99 90ms\\n- After LIFO queue and pinned worker pool: median 11ms, p95 32ms, p99 75ms\\n\\nFlamegraph / profile notes:\\n- Flamegraphs show dominant stacks in parse_json -> PyUnicode_FromString -> PyObject_Malloc when using pure Python parser and default allocator.\\n- When using rapidjson (C++ lib) integrated via pybind11 and releasing GIL, stacks shift to native code and Python frames drop.\\n- jemalloc profiling shows high number of small allocations (<=128 bytes) per request; aggregating across workers this creates fragmentation under high RPS.\\n\\nMitigations evaluated and tradeoffs:\\n1) Allocator tunables: reduce background purging and tune dirty_mult / decay time. Tradeoff: memory use can increase slightly; reduces pause magnitude.\\n2) Move hot-path parsing/tokenization into native extensions that release the GIL (Rust/C++). Tradeoff: engineering cost, careful memory semantics required.\\n3) Use cooperative batching inside workers: gather N small requests, parse/tokenize together, amortize alloc overhead. Tradeoff: additional code complexity and potential latency penalty if batch waits too long; adaptive batching required.\\n4) Priority queue (size-aware) or LIFO for worker scheduling to protect small requests. Tradeoff: fairness and long-request starvation unless bounded.\\n5) GC tuning: disable or tune thresholds for GC in hot processes, but must monitor for memory leak/regression.\\n6) Pin worker threads and reuse OS threads for frequent short tasks; avoid frequent thread creation.\\n\\nRecommended next steps (action items):\\n- Short-term (1\u20132 sprints):\\n  * Flip tokenization/JSON parse in a canary worker to Rust extension that releases GIL, run A/B for p99 comparisons (owners: Marco + Aisha)\\n  * Apply MALLOC_CONF (lg_dirty_mult=1) in staging and monitor p99/alloc profile and resident memory (owner: SRE/infra)\\n  * Implement LIFO option behind a feature flag and run small-request focused benchmark (owner: Priya)\\n- Mid-term (3\u20136 sprints):\\n  * Implement adaptive batching layer in worker runtime with latency SLO guardrails (owner: eng-serving-runtime)\\n  * Add jemalloc per-thread arena metrics to our telemetry and instrument GC pause durations and GIL wait time counters (owner: observability)\\n- Long-term:\\n  * Consider moving to an allocator mode optimized for short-lived many small allocs (or memory pool) and upstreaming performance improvements to shared tokenizers.\\n\\nNotes / open questions:\\n- Are there other libraries doing better small-allocation behavior under similar workloads (compare tcmalloc/hoard)?\\n- How does behavior differ on AVX2/AVX512 and different page sizes (hugepages)? Need to replicate on dedicated GPU nodes which have different NUMA topology.\\n- Investigate whether using subinterpreters for isolated request handling (PEP 684 experimentation) helps avoid GIL bottlenecks without process overhead.\\n\\nAttachments and artifacts: perf flamegraphs, jemalloc snapshots, opentelemetry traces uploaded to GH-PR-789.\\n\\nThis doc is a working spike; please comment with any additional experiments to prioritize or if you want ownership on any action item.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_d0830443da1446229086de08b68c379e"
+}

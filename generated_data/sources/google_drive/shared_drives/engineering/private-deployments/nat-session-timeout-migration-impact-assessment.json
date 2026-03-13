@@ -1,0 +1,37 @@
+{
+  "title": "NAT session timeout migration impact assessment",
+  "owner": "Samir Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/private-deployments",
+  "doc_type": "doc",
+  "created_at": "2024-09-18",
+  "last_modified": "2024-11-02",
+  "collaborators": [
+    "Lena Cho",
+    "Diego Alvarez",
+    "Priya Nair"
+  ],
+  "team": "engineering-private-deployments",
+  "status": "draft",
+  "tags": [
+    "NAT",
+    "conntrack",
+    "egress",
+    "terraform",
+    "k8s",
+    "dns",
+    "runbook",
+    "migration"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/infra/pull/4122",
+    "JIRA-DEPLOY-987",
+    "confluence:PrivateDeploy-NAT-Notes"
+  ],
+  "content": "Purpose:\nThis note documents the planned migration of NAT session timeout defaults and related conntrack/egress controls across private (VPC + on-prem) deployments. It focuses on the networking impact surface (DNS transactions, long-lived websocket/streaming sessions, short-lived HTTP bursts), Terraform changes required, K8s network policy interactions, test plans, rollback criteria, and monitoring runbook entries.\n\nBackground / why this matters:\n- Symptoms observed: increased 502/504 spikes for streaming inference in certain customers after router upgrades; intermittent DNS failures during bursty startup phases; higher retransmit rates for TCP flows from model-serving pods.\n- Root cause hypothesis: default NAT gateway/device conntrack timeouts are too short relative to Redwood workloads (many short-lived ephemeral connections + occasional long-lived streaming). Upgrading NAT behavior without migrating timeouts leads to silent connection drops and TCP/TLS rehandshake costs.\n\nGoals:\n1) Reduce customer-facing egress failures by aligning conntrack/timeouts with workload patterns.\n2) Make Terraform changes minimally disruptive and reversible.\n3) Provide per-customer knobs for strict environments (compliance) vs. relaxed defaults for performance.\n\nMigration surface / scenarios considered:\n- Cloud VPC with managed NAT gateway (AWS/NAT GW or GCP Cloud NAT): limited tunability; prefer connection pooling at application/proxy layer.\n- Customer-managed NAT VM / HAProxy / on-prem firewall: can tune conntrack, TCP timeout, and UDP tracking.\n- Egress via egress-proxy sidecar (envoy) or node-level masquerade: config changes instead of infra changes.\n\nTerraform changes (proposal):\n- Module: private-deployments/egress/nat\n  - Add variable: nat_conntrack_timeouts = { tcp_established = \"12h\", tcp_close_wait = \"1m\", udp_idle = \"30s\" }\n  - Add variable: nat_conntrack_mode = \"managed|proxy|inherited\"\n  - Conditionals: if nat_conntrack_mode == \"proxy\" set up an autoscaling egress-proxy ASG + route table override; if \"managed\" apply cloud-nat config (where supported).\n- Outputs: reported_conntrack_settings, applied_mode, impacted_subnets\n- Rollback: terraform plan will mark changes to nat resources; update strategy uses canary_subnets tag to apply to one AZ first.\n\nKubernetes interactions and network policies:\n- K8s Services that open long-lived streams (inference streaming): annotate pods with \"egress.keep-alive: true\" so the node egress-proxy can pin flows and keep conntrack entries refreshed.\n- NetworkPolicy: no change expected, but explicitly allow healthcheck IPs for egress-proxy probes; add policy debug label to quickly route traffic through diagnostics pod.\n- CNI considerations: for Cilium we recommend enabling connection tracking helpers and setting net.netfilter.nf_conntrack_tcp_timeout_established appropriately on nodes via daemonset.\n\nFirewall / security controls impact:\n- Session timers affect stateful firewall rules. If we extend timeouts, audit policies should be updated to accept longer-lived conntrack entries.\n- For compliance-sensitive customers, expose a per-customer terraform toggle nat_conntrack_mode = \"inherited\" to keep vendor defaults. Document security review checklist.\n\nTest plan (pre-prod):\n1) Canary AZ: apply module to 1 AZ subnet with 5% traffic; monitor 72h.\n2) Traffic profile tests: short burst (1000 ephemeral connections/min for 5m), steady streaming (50 long-lived sockets for 6h), mixed startup churn (rolling deploy with cold caches).\n3) DNS testcases: repeated SRV/TXT lookups, 500 concurrent stub-resolutions with split-horizon enabled and verify ttl/negative caching behavior.\n4) Chaos tests: simulate NAT gateway failover, conntrack table exhaustion and ensure fallback to proxy route.\n\nMetrics to track (SLO/alert thresholds):\n- 5xx egress failure rate (per-customer) > baseline + 0.5% -> alert\n- TCP retransmit ratio on node egress > 2% sustained over 5m -> alert\n- Conntrack table utilization > 70% -> warn; > 90% -> page\n- DNS resolution latency (p95) increase > 150ms -> investigate\n\nGradual rollout strategy:\n- Phase 0: dry-run plan + manual review in infra-council\n- Phase 1: enable nat_conntrack_mode=proxy in non-prod and validate metrics\n- Phase 2: apply to canary subnets (1 AZ) for 72h\n- Phase 3: expand to 25% of customer base (by tag: early-access) for 7d\n- Phase 4: full rollout with automated checks and auto-rollback on alert triggers\n\nRollback and mitigation steps:\n- Immediate: revert terraform to previous nat_conntrack settings via plan/apply to canary\n- Fast mitigation: enable egress-proxy sidecar for impacted customer clusters and route egress through it\n- Longer-term: increase conntrack table size (sysctl) on node pool and enable per-namespace egress proxies for heavy-churn tenants\n\nOperational runbook snippets (for on-call):\n- Symptom: sudden spike in 502/504 for streaming endpoints\n  - Check conntrack table utilization on NAT/edge node (ssh/metrics), check last reloads\n  - Query route table: ensure egress routes point to expected NAT/proxy\n  - If conntrack exhaustion: temporarily increase net.netfilter.nf_conntrack_max on nodes and add iptables-save snapshot, then trigger controlled rollback\n- Symptom: DNS NXDOMAIN bursts during deploys\n  - Verify resolvers in /etc/resolv.conf and CoreDNS logs; check any split-horizon ACLs; flush DNS caches on egress proxy\n\nOpen questions / decisions needed:\n- Default conservative timeout values (proposal in variables above) \u2014 need sign-off from infra security\n- Whether to support per-customer conntrack profiles or only global defaults\n- Do we allow managed cloud NAT mode to be modified programmatically for all cloud providers or only AWS for initial launch\n\nAction items (owners):\n- Samir: prepare terraform PR with variable scaffolding and plan for canary AZ (due 2024-10-02)\n- Lena: design egress-proxy sidecar image and healthcheck hooks (due 2024-09-27)\n- Diego: add conntrack metrics dashboards and alert rules (due 2024-10-09)\n- Priya: write compliance notes for customers that require fixed short timeouts (due 2024-10-05)\n\nAppendix: quick sysctl knobs (for on-prem appliances)\n- net.netfilter.nf_conntrack_max = 524288\n- net.netfilter.nf_conntrack_tcp_timeout_established = 43200  # 12 hours\n- net.netfilter.nf_conntrack_udp_timeout = 30\n\nNotes: keep this doc as the canonical migration plan for NAT/conntrack tuning. Iterate after the canary and attach measurements to linked_artifacts.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_7c1cf0e35b294c3ea1b6981f3b78368a"
+}

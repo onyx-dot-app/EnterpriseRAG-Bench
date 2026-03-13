@@ -1,0 +1,37 @@
+{
+  "title": "Lateness Index & Adaptive Batcher \u2014 Field Notes",
+  "owner": "Marcus Lee",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/lateness-index-adaptive-batcher-field-notes.json",
+  "doc_type": "doc",
+  "created_at": "2024-08-12",
+  "last_modified": "2024-09-01",
+  "collaborators": [
+    "Aisha Kaur",
+    "Diego Rivera",
+    "Priya Nair"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "batching",
+    "scheduler",
+    "tail-latency",
+    "SLO",
+    "adaptive",
+    "profiling"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/redwood-runtime/pull/4123",
+    "ENG-7891",
+    "https://confluence.redwood.ai/display/ENG/Adaptive+Batcher+Playbook"
+  ],
+  "summary": "Notes from small-scale experiments that explore an operational metric we call 'lateness index' and its use to drive runtime batcher adaptivity. Practical checklist, run outputs, and hypotheses for follow-ups.",
+  "content": "Purpose:\n- Try a lighter-weight signal to drive batching decisions that correlates with tail latency without needing full quantile tracing everywhere.\n- Evaluate soft deadline vs hard timeout strategies when paired with lateness index-based demotion.\n- Understand fairness implications when aggressive coalescing is applied to mixed-priority traffic.\n\nQuick description of lateness index (LI):\n- LI = (observed_flush_delay_ms / configured_soft_deadline_ms).\n- intuition: when LI > 1, the request waited longer than its targeted deadline; we use per-slot LI estimates (EWMA).\n- we experimented with class-specific EWMA windows (10s, 30s) to avoid overreacting to brief spikes.\n\nExperiment matrix (grid):\n- target_batch_size: [8, 16, 32]\n- soft_deadline_ms: [12, 25, 50]\n- hard_timeout_ms: [200, 500] (used as safety flush)\n- fairness_weight: [0.1, 0.5, 1.0] (0.1 biases toward throughput, 1.0 strict fairness)\n- LI_trigger_threshold: [0.8, 1.0, 1.2] (when to open a demotion lane)\n\nWorkloads used:\n- steady-qps: 150 req/s, single-token median=6 tokens (small chat), tailiness low\n- burst-qps: periodic 2s bursts to 800 req/s for 200ms window (simulates user spikes)\n- mixed-priority: 70% low-prio (background), 30% high-prio (interactive) interleaved\n- synthetic latency-fat clients: long-sequence requests to stress KV-cache interaction\n\nInstrumentation & commands we ran (notes):\n- tracing: enabled lightweight tracer (sample 1%) for fine-grained estimation; used trace id mapping in run logs.\n- perf counters: linux perf top during heavy bursts to watch syscall backpressure.\n- GPU profiling: nvidia-smi dmon + nvprof for kernel timeline on a subset of runs (helpful to see kernel batching efficiency).\n- local flamegraphs: py-spy record --native -o flame.svg PID (for python host code); perf script -> FlameGraph for C++ runtime bits.\n- scheduler debug: --emit-slot-metrics and --slot-ewma for 30s window per class.\n\nKey observations (selected):\n1) LI correlates well with P95/P99 only when EWMA window aligned to burst duration.\n   - 10s EWMA captured brief spikes too noisily; 30s too sluggish for quick adaptation. 15s ended up being a good middle ground in follow-ups.\n2) Soft-deadline (25ms) + LI-based demotion reduced tail amplification vs hard-timeout-only.\n   - when LI>1.0, we opened a demotion lane that forced smaller batches for the affected priority class. This prevented long waits for other lanes.\n3) Aggressive target_batch_size=32 + fairness_weight=0.1 gave best throughput but P99 regressed under burst.\n4) Mixed-priority runs reveal starvation patterns: low fairness_weight causes high-prio to monopolize slot formation due to arrival clustering; fairness_weight>=0.5 mitigated but at throughput cost.\n5) KV-cache churn interacts badly with large-batch coalescing for long-sequence clients \u2014 cache miss storms add 5-10ms jitter which LI picks up quickly.\n\nRepresentative run excerpt (text log condensed):\n- run id: li-experiment-aug12-16:42\n- params: batch=16 soft_deadline=25 hard=500 fairness=0.5 LI_thresh=1.0 ewma=30s\n- metrics: avg_lat_ms=18 P95=32 P99=58 qps=140 gpu_util=78%\n- LI summary: classA_EWMA=0.62 classB_EWMA=1.12 -> demotion triggered for classB at 16:45:03\n- action: opened demotion lane (max_batch=8) for classB, immediate P99 drop from 98->60 over 8s\n- note: small transient throughput dip 3% during lane reconfiguration\n\nProfiling notes (what was surprising):\n- Kernel launch batching was efficient; major CPU time was in slot allocation and eviction bookkeeping when demotion lanes proliferated.\n- Perf shows 20% time spent in futex/syscall path under heavy bursts \u2014 suggests contention on slot mutexes.\n- When demotion lane count > 3, scheduling overhead rises nonlinearly. Keep demotion lanes limited; collapse demotion buckets by affinity rather than per-request.\n\nHypotheses and follow-ups:\n- Hypothesis A: A two-tier EWMA (fast 5s + slow 30s) will let us react to short spikes while preserving stability. Test matrix suggested.\n- Hypothesis B: Replace per-slot mutex with per-shard lock to reduce futex contention (microbenchmarking required).\n- Hypothesis C: Add KV-cache-miss-aware inflight counter to avoid treating cache-induced jitter as scheduling failure.\n\nShort checklist for next run (immediate actions):\n- Add `--ewma-fast=5s --ewma-slow=30s` flags and expose combined LI metric.\n- Implement demotion-lane cap (max 2) and affinity collapse heuristic.\n- Run microbenchmark for lock sharding with synthetic contention (script attached in linked PR).\n- Gather nvprof traces for runs where GPU_util < 60% despite high qps \u2014 looks like CPU-side stall.\n\nOpen questions / TODOs:\n- What is acceptable transient throughput loss when demoting? need product-level SLO guidance.\n- Should LI be exported to Console as an early warning? dashboard sketch in Confluence, needs PM feedback.\n- How to tune LI thresholds per-customer basis: safe defaults vs tuned profiles.\n\nNotes to self:\n- Logs vs traces: prefer traces for root-cause, logs for signal. Keep sampling light.\n- Save candidate runs with trace coverage greater than 10% for later analysis.\n- Add a small gamified chart to Console to show \"lateness pressure\" for debugging during incidents.\n\nAttachments / artifacts (local):\n- raw run CSVs: s3://redwood-run-bench/li-experiments/aug12-aug20/\n- flamegraphs: li-aug12-flame.svg, li-aug14-cpu-flame.svg\n- PR w/ scheduler flags: https://github.com/redwood-inference/redwood-runtime/pull/4123\n\nDecision: Continue with two-tier EWMA + demotion cap experiments. Prioritize lock-sharding microbenchmark next sprint.\n\nIf you take anything from this doc: start small (batch 16, soft 25ms, ewma fast=5 slow=30, demotion_cap=2) and iterate.\n\nEnd of notes.",
+  "format": "plain_text",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_f792e2a148d84e9cac998b2cb5d452f6"
+}

@@ -1,0 +1,39 @@
+{
+  "title": "Rollback triage cheatsheet - ad hoc notes",
+  "owner": "Asha Patel",
+  "drive_area": "users",
+  "path": "users/asha-patel/rollback-triage/rollback-triage-cheatsheet-notes.json",
+  "doc_type": "doc",
+  "created_at": "2025-01-18",
+  "last_modified": "2025-02-03",
+  "collaborators": [
+    "Marcus Chen",
+    "Lydia Ramos"
+  ],
+  "team": "release-engineering",
+  "status": "draft",
+  "tags": [
+    "rollback",
+    "canary",
+    "ci-cd",
+    "artifact-tagging",
+    "triage-cheat-sheet"
+  ],
+  "linked_artifacts": [
+    "JIRA: REL-1182",
+    "https://github.com/redwood-inference/infra/pull/987",
+    "https://slack.redwood.com/archives/CENG123/p1678923456000000"
+  ],
+  "content": "Quick brain dump while triaging the canary rollback yesterday. Intended as a step-by-step checklist + command bank I can copy-paste next time. Informal, lots of TODOs and half-finished thoughts.\n\nSymptoms observed:\n- Canary pods (svc: api-canary) started 502s and TCP resets at ~10:18 UTC. Error spikes from frontend alerts, p95 latency rocket.\n- Healthchecks failing after ~120s, readiness probe failing on /health with 503 body: \"migration pending\".\n- Canary config same as stable except IMAGE_TAG and a new env FLAG_ENABLE_NEW_ROUTING.\n\nInitial hypothesis (chronological):\n1) New artifact corrupted / missing files (packaging step failed) -> entrypoint errors, readiness fails.\n2) Config flag triggers a code path expecting new DB migration -> 503.\n3) CI race: image tag reused/reassigned (promote step published wrong sha).\n\nCommands I ran (save these for future):\n- Check rollout status and pod logs:\n  kubectl -n prod rollout status deploy/api-canary --timeout=3m\n  kubectl -n prod get pods -l app=api,canary=true -o wide\n  kubectl -n prod logs deploy/api-canary -c api --since=30m | tail -n 200\n\n- Inspect failing pod and exec (if Ready):\n  kubectl -n prod describe pod api-canary-abcde\n  kubectl -n prod exec -it api-canary-abcde -c api -- /bin/sh -c 'ls -la /app; cat /app/version.txt; echo $FLAG_ENABLE_NEW_ROUTING'\n\n- Verify image tag / digest on registry vs deployment:\n  kubectl -n prod get deploy api-canary -o jsonpath='{.spec.template.spec.containers[0].image}'\n  docker pull ghcr.io/redwood-inference/api:${IMAGE_TAG}\n  docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/redwood-inference/api:${IMAGE_TAG} || true\n  # compare digest with k8s imageID from describe pod\n\n- Check release pipeline logs around publish stage (CI):\n  # in CI web UI, search pipeline REL-1182 and check `tag-and-push` step logs.\n\nActual snippets I saw in logs:\n- app stderr:\n  2025-01-17T10:18:09Z ERROR startup: missing migration manifest /app/migrations/0003_add_routes.sql\n  2025-01-17T10:18:09Z FATAL exiting: required file not present\n\n- kubernetes events:\n  10:18:12 Normal Killing pod/api-canary-abcde Container failed liveness probe\n\nWhat this pointed to:\n- Missing migration file inside container -> packaging problem during build. But why only canary? Canary used freshly-built image (candidate tag) while stable uses semver-pinned image. So candidate likely packaged from wrong workspace (e.g., partial workspace in CI runner).\n\nTried quick mitigation:\n- Promoted previous stable image to canary (force-promote):\n  # quick patch to k8s deployment\n  kubectl -n prod set image deploy/api-canary api=ghcr.io/redwood-inference/api:2025.01.10-rc2\n  kubectl -n prod rollout status deploy/api-canary --timeout=2m\n  # monitoring: errors subsided within 2 minutes; p95 returned to baseline\n\nDeeper debugging steps I ran after mitigation:\n- Pulled failing candidate image locally and inspected contents:\n  docker pull ghcr.io/redwood-inference/api:candidate-2025-01-17-485\n  docker run --rm -it ghcr.io/redwood-inference/api:candidate-2025-01-17-485 /bin/sh -c 'ls -1 /app | sed -n \"1,200p\"'\n  # observed no migrations dir -> packaging bug confirmed\n\n- Cross-check with build artifacts from CI storage:\n  # artifact list in CI-run: artifact://ci/rel-1182/build/485/api.tar.gz\n  # downloaded and inspected sha256, metadata showed missing step `scripts/copy-migrations.sh` in artifact list\n\nHypothesis on root cause:\n- The `publish-image` job depends on earlier `package-artifact` job, but the runner used a cached workspace and an artifact copy step was skipped for this ephemeral runner due to a flaky artifact download. Effect: image built from incomplete workspace snapshot.\n- Alternatively, packaging script uses `rsync --delete` and a bad exclude pattern removed migrations when source tree had a trailing slash. Need to reproduce locally.\n\nRecovery notes for postmortem:\n- Temporary rollback to previous image prevented customer impact.\n- CI job should enforce an explicit `ls -la` and `sha256sum` of tarball during publish step (fail-safe).\n- Add an early CI assertion: verify presence of /app/migrations/*.sql before building container.\n\nImmediate follow-ups (for next 48h):\n- Re-run the packaging job locally with same CI runner image to reproduce. Steps:\n  1) checkout commit (git rev-parse HEAD) -> record commit sha and compare to CI logs\n  2) run `bazel build //services/api:package` or `make package` using exact runner image\n  3) inspect artifact tar and confirm migrations folder present\n\n- Add automation: in release pipeline `tag-and-push` step add a verification script:\n  ./ci/verify_artifact_contents.sh api candidate-485 \n  # script should exit non-zero if key files missing\n\nSnippets to copy into PR for hotfix in CI:\n- verify_artifact_contents.sh (concept):\n  #!/bin/sh\n  set -e\n  tmpdir=$(mktemp -d)\n  curl -fsS \"$CI_ARTIFACT_URL\" -o \"$tmpdir/art.tar.gz\"\n  tar -tzf \"$tmpdir/art.tar.gz\" | grep -q 'migrations/0003_add_routes.sql' || { echo 'missing migration' >&2; exit 2; }\n  echo 'artifact ok'\n\nOther observations / TODOs (brain dump):\n- Why did kubernetes not surfacing explicit file errors earlier? maybe entrypoint catches and prints generic 'startup failed' -> improve entrypoint logging to include file listing on startup error (dev parity).\n- Consider blocking canary promotion until smoke-test container-level assertions pass (smoke test runner that checks key files and a quick DB connectivity check).\n- Ticket: REL-1182 updated notes + label `postmortem-needed` if we find CI root cause reproducible.\n\nQuick pasteable timeline for report:\n- 10:12 UTC: canary promotion started by pipeline REL-1182 (candidate-485)\n- 10:17 UTC: first 502 alerts from frontend\n- 10:19 UTC: SRE paged, triage -> found missing migration inside image\n- 10:25 UTC: rolled back canary to image 2025.01.10-rc2 -> errors subsided by 10:28\n\nUseful artifacts (local copy paths / refs):\n- /home/asha/tmp/rel-1182-artifact-485/ -> downloaded tar and extracted list.txt\n- git rev: 9f8c3e2a (candidate tagging commit)\n\nNext actions assigned to: (informal)\n- Marcus: reproduce packaging failure on runner image and attach logs (48h)\n- Lydia: draft PR adding verify_artifact_contents.sh to CI and add pipeline assertion (24h)\n- Asha (me): update REL-1182 ticket with timeline and add rollback notes (now)\n\nNotes to self: keep this scrap doc short and move cleaned version to shared_drives/release-engineering/postmortems/REL-1182 when we have root cause.\n\nEnd of scratchpad.",
+  "actions": [
+    "Copy verification script into infra repo with CI step",
+    "Add smoke-tests gating canary promotion (file existence + simple endpoint test)",
+    "Schedule postmortem meeting with SRE and CI owners",
+    "Audit recent tag/publish jobs for similar failures in last 90 days"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_f22b20ed6cce4238a04d0a8951f8ed05"
+}

@@ -1,0 +1,65 @@
+{
+  "title": "KV cache resize & throttling regression - post-incident notes",
+  "owner": "Aisha Moreno",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/site-reliability-engineering",
+  "doc_type": "doc",
+  "created_at": "2025-11-05",
+  "last_modified": "2025-11-07",
+  "team": "eng-sre",
+  "status": "in_review",
+  "collaborators": [
+    "Nakul Rao",
+    "Priya Patel",
+    "Evan Chou",
+    "Samir Velasquez"
+  ],
+  "tags": [
+    "kv-cache",
+    "oom",
+    "batching",
+    "runbook",
+    "postmortem"
+  ],
+  "linked_artifacts": [
+    "JIRA-INC-3921",
+    "JIRA-ENG-1478",
+    "https://slack.redwood.ai/archives/C0123456/p1634123456789000",
+    "https://github.com/redwood-inference/serving-runtime/pull/2894"
+  ],
+  "summary": "On 2025-11-05 we saw a multi-hour degradation impacting serving pools running continuous batching for <model-redwood/ggml-v2>. Symptoms included repeated OOM kills, rising tail latency, and degraded throughput. The proximate trigger was a KV cache resize operation that coincided with a continuous-batching path regression; together these produced sustained memory growth and compaction work that pushed pods over node memory limits. This document captures timeline, mitigation steps, analysis, a draft runbook for similar events, and proposed action items.",
+  "timeline": "2025-11-05T02:47Z - Alert: node-memory-high (pools: batch-us-west-2-pool-7)\n2025-11-05T02:49Z - First pod OOM (serving-runtime:worker) and restart seen in cluster metrics\n2025-11-05T02:51Z - Latency SLO breaches spike for routes using model ggml-v2 (p95 from 120ms -> 520ms)\n2025-11-05T02:55Z - Pager dispatched to eng-sre oncall (Nakul)\n2025-11-05T03:03Z - Initial mitigation: reduced max_batch_size via runtime feature-flag on affected pool (rollout id ff-2025-11-05-1)\n2025-11-05T03:18Z - OOMs continue; memory growth not reversing. Observed frequent cache_resizer jobs starting and overlapping\n2025-11-05T03:35Z - Disabled background compaction for kv-cache (hotfix ff-2025-11-05-2) which immediately slowed memory growth\n2025-11-05T04:10Z - Autoscaler paused for the pool; traffic gradually shifted to fallback nodes and latency recovered to baseline by 04:40Z\n2025-11-05T05:40Z - Incident declared mitigated; follow-up investigation started\n",
+  "symptoms": "- Repeated worker OOM kills across 6 pods in the pool\n- Gradual but persistent RSS increase over 30-90 minutes prior to first OOM\n- Alerts: node-memory-high, pod-restarts-high, route-latency-slo-exceeded\n- Logs: frequent 'kv_cache:resize started' entries interleaved with 'compaction:begin' and then sharp memory jumps\n- Heap/profile snapshots show large live allocation in kv-index structures and compaction buffers\n",
+  "detection_and_alerting": "Current alerts fired correctly (node-memory-high, pod-restarts-high). Gaps: there is no alert specifically for 'concurrent-kv-resize-job-count' or for 'kv-cache-growth-rate' which would have captured the early slope. Also no alert for compaction-duration > threshold. Detection improvement candidates are listed in action items below.",
+  "initial_mitigation": "- Reduced max_batch_size for the affected pool via feature flag to prevent large per-request cache growth\n- Disabled kv-cache background compaction process (hotfix) to stop work that amplified RSS spikes\n- Paused autoscaler to avoid creating new pods that would immediately get OOMed\n- Routed a percentage of traffic to an older model variant (ggml-v2-slim) to reduce cache pressure\nNotes: the compaction disable was a high-confidence, targeted change. It had the expected effect of flattening memory growth within ~10 minutes and stopped new OOMs.",
+  "root_cause": "Primary: Race between KV cache resize and background compaction combined with a continuous-batching regression that increased effective per-request key volume. Resize path was implemented to be optimistic and could spawn overlapping resize jobs without global coordination. Compaction assumed a stable index shape; overlapping resize+compaction could allocate transient buffers proportional to index deltas, producing memory amplification. Secondary: continuous-batching change increased average prefix lengths (more cached keys per request), which pushed indices into resize paths more frequently. Tertiary: alerts/telemetry lacked signals for resize concurrency and compaction latencies.",
+  "postmortem_analysis": "- Heap diffs: dominant growth in kv_index::buckets and compaction temp buffers.\n- Recreated locally by running high-concurrency continuous-batching harness with synthetic workload; reproduced when resize >= 2 concurrent jobs allowed.\n- Memory profile shows transient allocations up to 1.8x steady-state during compaction+resize overlap.\n- Code review: resize uses an atomic 'in_progress' bit per-shard but doesn't back off if another job is already allocating; multiple shards can be resized concurrently leading to peak transient usage.\n- CI/bench gap: no test covered long-running compaction under high-concurrency continuous-batch workloads; this workload shape wasn't in perf benchmarks.",
+  "runbook_draft": "(Quick triage)\n1) Alert fires: check pods in pool (kubectl get pods -n serving -l pool=<pool>). If >2 pods OOMing in 10m, proceed.\n2) Identify recent feature flags: check flag rollout for 'batching' and 'kv-cache' ops (ff dashboard).\n3) Mitigate: first reduce max_batch_size via ff to 50% of current value across pool.\n4) If OOMs continue: disable kv-cache compaction via runtime flag and set 'kv.compaction.enabled=false' for the pool.\n5) Pause autoscaler for pool: runtime-admin pause-autoscaler <pool>.\n6) Route 15-30% of traffic to fallback model variant (configured in routing policies) to relieve cache pressure.\n7) If memory growth persists, evacuate node by cordoning and draining (kubectl drain --ignore-daemonsets).\n8) Collect artifacts before restart: pmap, /proc/<pid>/smaps, runtime heap profile dump command (runtime-admin heap-dump <pid>), and core if available. Upload to incident folder.\n(Recovery verification)\n- Monitor heap slope for 20m. If flattening and SLOs returning, keep compaction disabled and schedule controlled re-enable after a fix.\n(Post-incident)\n- Add 'kv-cache-resize-concurrency' and 'compaction-duration' alerts.\n- Create playback to test re-enable path in staging with synthetic load.\n",
+  "action_items": [
+    "ENG-SRV-221: Add telemetry for 'kv-resize-concurrent-jobs' and a rolling gauge metric (owner: Priya, due: 2025-12-01)",
+    "ENG-SRV-222: Implement backoff/serialize behavior in resize path so multiple resize triggers do not run simultaneously (owner: Evan, due: 2025-12-15)",
+    "ENG-SRV-223: Add compaction-duration alert (owner: Nakul, due: 2025-11-21)",
+    "ENG-SRV-224: Introduce staging perf test that simulates continuous-batching workload with long tails; include compaction/resize stress (owner: Samir, due: 2025-12-05)",
+    "ENG-SRV-225: Create a safer default: compaction should start only when node available memory > X% and resize should abort if compaction is running (owner: Evan, due: 2025-12-22)",
+    "ENG-SRV-226: Update runbooks and oncall playbook to include explicit steps for disabling compaction and toggling routing (owner: Aisha, due: 2025-11-14)",
+    "ENG-SRV-227: Post-incident knowledge share + blameless retro scheduled (owner: Priya, meeting: 2025-11-12 16:00 PST)",
+    "ENG-SRV-228: Backfill CI coverage for compaction+resize concurrency; add regression tests (owner: Evan, due: 2026-01-10)",
+    "ENG-SRV-229: Consider circuit-breaker that prevents expanding kv-index when estimated transient allocation > node_free_mem_threshold (owner: Eng-Arch, due: 2026-02-01)",
+    "ENG-SRV-230: Update docs for model owners describing how continuous-batching and cache indexing interact (owner: Product-Docs, due: 2025-12-08)"
+  ],
+  "notes_to_self": "- Why did the resize jobs not log an error when they overlapped? Add better logging around 'resize reason' and concurrent job id.\n- Investigate whether certain model prompt shapes are disproportionately causing index growth; ask solutions-eng to share customer workloads that were active during the incident.\n- Evaluate if a memory cap for compaction temp buffers is possible.\n- Follow up: confirm whether the autoscaler created new pods that inherited flags incorrectly (ff scoping) - seen previously in ENG-SRV-134.\n- Slack thread: https://slack.redwood.ai/archives/C0123456/p1634123456789000 has raw oncall messages and command outputs.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "timeline",
+    "symptoms",
+    "detection_and_alerting",
+    "initial_mitigation",
+    "root_cause",
+    "postmortem_analysis",
+    "runbook_draft",
+    "action_items",
+    "notes_to_self"
+  ],
+  "dataset_doc_uuid": "dsid_31239c1a727f456abcece9ad4ee64c1b"
+}

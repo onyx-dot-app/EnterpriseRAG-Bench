@@ -1,0 +1,34 @@
+{
+  "title": "Regional autoscaler headroom playbook - Jun 2026",
+  "owner": "Priya Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/infrastructure",
+  "doc_type": "sheet",
+  "created_at": "2026-06-12",
+  "last_modified": "2026-06-15",
+  "collaborators": [
+    "Luca Romero",
+    "Maya Chen",
+    "Jordan Blake"
+  ],
+  "team": "eng-infrastructure",
+  "status": "draft",
+  "tags": [
+    "gpu-fleet",
+    "autoscaling",
+    "capacity-planning",
+    "regional-headroom",
+    "experiments"
+  ],
+  "linked_artifacts": [
+    "https://linear.app/REDWOOD/issue/INF-842-regional-headroom",
+    "https://confluence.redwood.ai/display/INF/Autoscaler+Notes"
+  ],
+  "content": "Purpose: quick, actionable sheet for regional GPU headroom tuning experiments. Goal is to pick stable min/max and trigger windows per region to meet 99th percentile tail latency SLO (<= 250ms for small text gen, <= 600ms for long chat) while minimizing reserved capacity and burst cost.\n\nSummary of experiments run (Jun 01 - Jun 10, 2026):\n- 6 regions: us-west-2, us-east-1, eu-west-1, ap-southeast-1, ca-central-1, eu-central-1 (control).\n- Hardware mix: A100-80GB (primary), A10G (burst pool), T4 (embeddings/low-priority).\n- Workloads: chat-short (median 20 tokens), chat-long (median 240 tokens), embeddings-batch (batch size 32), rerank (p95 small).\n\nExperiment matrix (high level):\n1) Min replicas = {0, 2, 4} per region (0 implies cold start allowed + warm pool strategy).\n2) Max replicas = {20, 40, 80} scaled by region capacity.\n3) Scale trigger metric: gpu_util (sustained over window), queue_length (requests/sec waiting for GPU), and token_throughput (tokens/sec).\n4) Thresholds tested: util: 55/65/75%, queue: 2/5/10 pending requests, throughput: 5000/10000 tokens/sec.\n5) Cooldown window: 30s/90s/300s.\n6) Step size: scale by 1/3/50% of current pool.\n\nRepresentative sheet excerpt (columns): region | min | max | trigger | threshold | cooldown | step | observed_p95_lat_ms | cost_delta_vs_base\n- us-west-2 | 2 | 40 | gpu_util | 65% | 90s | +33% | 210ms | +5%\n- us-east-1 | 0 | 80 | queue_len | 5 | 30s | +50% | 245ms | +12%\n- eu-west-1 | 4 | 40 | token_throughput | 10k | 90s | +33% | 195ms | +4%\n- ap-southeast-1 | 2 | 40 | gpu_util | 75% | 300s | +1 node | 280ms | +30% (spot pre-emption hit)\n\nKey findings (short):\n- Min=0 + aggressive pre-warm heuristics saves ~18% steady-state cost in low-traffic regions (ca-central-1, ap-southeast-1) with small latency regressions during sudden ramp (p95 +40-60ms). Cold-start penalty is dominated by model load (~6-10s) when model not in cache \u2014 so pre-warm should be used for premium customers only.\n- Queue-based triggers reduce tail latency faster than util-only in bursty traffic (sudden spikes), but cause more oscillation if cooldown <60s. Queue triggers with cooldown 90s were most stable.\n- Token-throughput as a trigger worked well for chat-long profiles where GPU utilization lags request arrival. Tuning threshold per model size is required.\n- Step-scaling by percentage (33%) gave smoother ramp than fixed node increment for regions with heterogenous GPU sizes.\n\nActionable recommendations (current runbook):\n- Default region policy: min=2, max=40, trigger=combined (queue_len > 3 OR gpu_util > 65% sustained 60s), cooldown=90s, step=+33% of current pool.\n- Low-traffic regions: min=0, burst-policy=prewarm-on-threshold (lookback 60s), max=20; separate pool for embeddings on T4s.\n- High-latency-sensitive customers: dedicated pools with min>=4 and no cold start. Offer as Dedicated add-on.\n- Spot pools: use longer cooldown (300s) and conservative max to reduce pre-emption oscillation.\n\nExperiment notes / raw observations:\n- Jun 03: us-east-1 saw repeated oscillation when cooldown=30s and queue trigger=2. Reproduced by feeding a synthetic sawtooth traffic (10m ramp every 2h). Fix: increase cooldown to 90s + add hysteresis (require sustained threshold for 30s).\n- Jun 05: ap-southeast-1 experiment with spot-heavy pool caused 18% higher tail latency due to staggered pre-empts. Logged incident to INF-889.\n- Jun 07: token_throughput trigger undercounted for multi-tenant model instances; moving to per-tenant smoothing (EWMA 30s) corrected false positives.\n\nMini runbook: how to reproduce a test run locally\n1) Create synthetic trace from recent 7-day percentile traces (script: infra/tools/synth_load.py --region us-west-2 --pattern sawtooth).\n2) Deploy autoscaler snapshot (tag: autoscaler/exp-2026-06-07) to test fleet (namespace: infra-test-usw2).\n3) Start metrics capture (prometheus job: autoscaler-experiments) and recording rule for p95 latency.\n4) Run load for 4 hours, collect scale events and instance lifecycle logs.\n\nMetrics we recorded for each run (columns, kept in the sheet): run_id, region, policy_tag, min, max, trigger_type, threshold, cooldown_s, step_percent, scale_events, avg_cold_start_s, p50_lat_ms, p95_lat_ms, cost_estimated_usd_hr, notes.\n\nOpen questions / follow-ups:\n- Should we expose combined triggers in the API (OR vs AND) or keep single metric triggers? Ops prefers OR for safety; infra wants to avoid unintended upscales. Suggested: default OR, allow per-customer override.\n- How to quantify and bill for pre-warm reserved nodes used only during spikes? Need pricing conversation with GTM (pricing@redwood.ai).\n- Can we improve model startup time via shared mmap image or kernel-level preload? Research task: INF-RD-022.\n\nAppendix A \u2014 quick cost model (toy):\n- Baseline (min=2 across 6 regions, no burst): 2 * 6 * A100_hr_cost = 12 * 4.2 = $50.4/hr (numbers illustrative).\n- With recommended defaults and burst: average nodes = 28 => ~28 * 4.2 = $117.6/hr.\n- Savings: turning min to 0 in two low-usage regions saved ~ $9/hr observed in experiment window.\n\nAppendix B \u2014 change log:\n- 2026-06-12 created initial matrix and test plan (Priya).\n- 2026-06-13 ran control experiments and logged anomalies (Luca).\n- 2026-06-15 consolidated results and wrote recommendations (Priya + Maya).\n\nNotes to self: drop a short summary in #infra-autoscaler and link this sheet; add a stripped-down version for product (one-pager).\n\nReferences:\n- tickets: INF-842, INF-889, INF-RD-022 (see linked artifacts).\n- slack threads: #infra-scaling (thread ts:1623456789), #product-hosted-api (for customer SLAs).\n\n(End of sheet)",
+  "references": null,
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_f1a1608c0ee74da8af1787ef344e2c3e"
+}

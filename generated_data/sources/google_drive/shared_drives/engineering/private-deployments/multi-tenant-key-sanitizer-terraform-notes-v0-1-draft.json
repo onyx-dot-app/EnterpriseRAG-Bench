@@ -1,0 +1,38 @@
+{
+  "title": "Multi-tenant Key Sanitizer Terraform notes v0.1 (draft)",
+  "owner": "Laura Kim",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/private-deployments/multi-tenant-key-sanitizer-terraform-notes-v0-1-draft.json",
+  "doc_type": "doc",
+  "created_at": "2024-11-05",
+  "last_modified": "2025-02-12",
+  "collaborators": [
+    "Ravi Patel",
+    "Elena Soto",
+    "Marcus Li"
+  ],
+  "team": "engineering-private-deployments",
+  "status": "draft",
+  "tags": [
+    "terraform",
+    "kms",
+    "hsm",
+    "multitenancy",
+    "migration",
+    "audit",
+    "playbook"
+  ],
+  "linked_artifacts": [
+    "https://confluence.redwood.ai/display/SEC/PD-Encryption-Patterns",
+    "JIRA-1234",
+    "github.com/redwood-inference/terraform-modules/pull/421"
+  ],
+  "content": "Purpose:\\nThis working note sketches a compact strategy and the Terraform module changes required to introduce a 'key-sanitizer' service for multi-tenant private deployments. The sanitizer provides envelope-key normalization, optional DEK rewrapping, and audit-enriched events when migrating customer data between KEK policies (e.g., HSM-backed KEK -> cloud-KMS KEK, or splitting KEK material across two HSMs).\\n\\nScope and constraints:\\n- Applies only to on-prem / VPC private deployments managed by our private control plane.\\n- Goal: zero-RPO and minimal-RTO rewraps where possible; fallbacks when HSM unavailable.\\n- Must preserve existing audit trail semantics and emit additional audit events for rewrap operations.\\n- Should not assume homogeneous HSM vendors (support for PKCS#11 + vendor SDKs).\\n\\nHigh level design:\\n1) Key Sanitizer service (lightweight binary run as k8s job or sidecar)\\n   - Responsibilities:\\n     - Read metadata for blobs from object store (path + key-id + tenant-id + wrapping-version).\\n     - Fetch DEK from sealed store (encrypted-by-KEK).\\n     - If policy triggers rewrap, request KEK unwrap from source KMS/HSM and rewrap under target KEK.\\n     - Write new sealed DEK back and append audit event to audit sink.\\n   - Safety features:\\n     - Checkpointing iterator so job can resume mid-run.\\n     - Rate limiter and token-bucket per-tenant to avoid noisy neighbour changes.\\n     - Dry-run mode that emits audit events but does not write objects.\\n\\n2) Terraform module surface (notes / variables to add)\\n   - New module: private/key-sanitizer\\n     - variables:\\n       - tenants (list of tenant ids or selector)\\n       - sanitizer_image (string)\\n",
+  "note_continued": "     - concurrency_limit (number, default 16)\\n     - audit_sink_pubsub_topic / s3_prefix\\n     - kms_providers: map -> { name, endpoint, auth_method, hsm_driver, hsm_slot }\\n     - keystore_selector: label selector for vaults/secretstores per tenant\\n     - migration_plan_ref (string) - pointer to migration manifest in git\\n   - outputs:\\n     - sanitizer_job_template_id\\n     - sanitizer_service_account\\n\\n3) Migration manifest format (simple YAML)\\n   - fields: tenant_id, object_prefix, source_kek_id, target_kek_id, drift_tolerance_seconds, batch_size, dry_run\\n\\nUpgrade plan (Terraform-first, non-disruptive):\\nPhase A - Prep (can be done with running system)\\n  - Add the module with dry_run=true for a single low-risk tenant.\\n  - Deploy sanitizer SA with least-privilege (only unwrap/wrap calls, read/write to object store path).\\n  - Smoke test: run single-blob rewrap, validate audit event, compare decrypted checksums.\\n\\nPhase B - Canary batch\\n  - Use migration manifest with 1000 objects, batch_size=50, concurrency_limit=4.\\n  - Monitor: token-level latency on serving path, error rates, audit sink throughput.\\n  - Acceptance: 0 silent failures, audit event for every object processed, verified checksum match (automated).\\n\\nPhase C - Tiered rollout\\n  - Rollout by tenant tier: dev->staging->prod. Increase batch_size and concurrency gradually.\\n  - If HSMs are in use and have limited unwrap QPS, coordinate with ops to throttle.\\n\\nPhase D - Cleanup\\n  - Once all objects are rewrapped and validated, flip metadata version flag to new wrapping-version and deprecate sanitizer dry-run artifacts.\\n\\nTerraform upgrade notes (what to change in modules):\\n- secretstores module: add attribute 'wrap_version' on each secret record for migration compatibility checks.\\n- kms_connector module: surface 'capabilities' (unwrap/rewrap/attest) with explicit booleans to allow runtime negotiation.\\n- observability module: add audit sink (structured JSON lines) and exporter configuration; include field for sanitizer_job_id.\\n\\nOperational runbook (short):\\n- Preparing job: terraform apply -var-file=secrets.tfvars \\n  - review SA permissions: iam:Decrypt/Wrap and storage:Get/Put for target prefixes.\\n- Launching: kubectl apply -f generated/job-template.yaml\\n- Monitoring: watch logs (stern), tail audit-sink, run checksum validator job (provided).\\n- Recovering failures: pause migration manifest, fix underlying reason (e.g., missing KEK access), restart job at last checkpoint.\\n\\nAudit and telemetry additions:\\n- Emit events with fields: timestamp, tenant_id, object_path, source_kek_id, target_kek_id, rewrap_result (success|fail|skip), sanitizer_version, executor_id.\\n- Send high-volume events to a dedicated audit partition and sample metadata events to analytics store for aggregate metrics.\\n- Add guardrail to avoid emitting plaintext keys in logs.\\n\\nTesting matrix (required tests before broad rollout):\\n- Unit tests: simulator for HSM unwrap failures, transient network, incorrect DEK length.\\n- Integration: end-to-end on staging with HSM emulator + object storage.\\n- Chaos test: kill sanitizer mid-batch to validate checkpoint/resume.\\n- Performance: ensure sanitizer does not increase 99th percentile tail of online inference (observe per-tenant quotas).\\n\\nOpen questions and TODOs:\\n- How to coordinate key rotation semantics when customers have their own KMS? (guest-managed KEKs) TODO: propose API contract for tenant-provided KEKs.\\n- Whether to use attestation evidence from HSM for every unwrap; this adds latency. Trade-off doc required.\\n- Migration manifest canonical storage: git vs central DB? Suggest git for auditability but DB for runtime updates.\\n\\nRollback and safety\\n- The sanitizer must support an atomic marker update per-object: new_sealed_blob and then metadata flip. If flip fails, we retry without deleting old sealed blob.\\n- Keep a 30-day retention for previous sealed blobs to allow emergency backout.\\n\\nAppendix: example terraform variable snippet\\nvariable \"kms_providers\" {\\n  type = list(object({\\n    name = string\\n    type = string # \\\"hsm\\\" | \\\"cloud-kms\\\"\\n    endpoint = optional(string)\\n    slot = optional(number)\\n    auth = optional(string)\\n  }))\\n}\\n\\nExample migration manifest (YAML)\\n- tenant_id: tenant-42\\n  object_prefix: s3://redwood-private/tenant-42/secrets/\\n  source_kek_id: kek-prod-us-east-1-v1\\n  target_kek_id: kek-hsm-alt-v2\\n  batch_size: 100\\n  dry_run: true\\n\\nContacts and ownership:\\n- Owner: Laura Kim (eng-private-deployments)\\n- Primary oncall during rollout: Marcus Li\\n- Observability / Audit: Elena Soto\\n\\nQuick notes for reviewers:\\n- This is intentionally concise\u2014feel free to expand the manifest fields (throttles, retry_policy, checksum_algorithm).\\n- We need a follow-up PR to add attestation policy toggles and a tenant opt-out signal for dev/test tenants.\\n\\nEnd of draft.\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content",
+    "note_continued"
+  ],
+  "dataset_doc_uuid": "dsid_9db7243c7436462d9f5e5d47e4f714df"
+}

@@ -1,0 +1,34 @@
+{
+  "title": "Scheduling fairness pulse notes (scratchpad)",
+  "owner": "Anya Patel",
+  "drive_area": "users",
+  "path": "users/scheduling-fairness-pulse-notes-anya.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-08",
+  "last_modified": "2025-11-14",
+  "collaborators": [
+    "Luca Marin",
+    "Sanjeev Rao"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "scheduling",
+    "fairness",
+    "burst",
+    "coalescing",
+    "kv-cache"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/678",
+    "INF-482",
+    "confluence:serving/fair-scheduling-proto"
+  ],
+  "content": "Goal: quick scratchpad for experiments exploring request scheduling fairness under bursty coalescence and how it interacts with KV-cache warmup. Not a final writeup \u2014 brain dump + raw numbers + next steps.\n\nBackground/context\n- Motivation: observed mid-latency tail increases when a high-priority stream coexists with many small low-priority requests during coalescing windows. Suspect unfair queueing + cache thrashing.\n- Hypothesis: naive coalescing (time-window based) tends to favor whatever arrival batch hits the window boundary and can starve other lanes for a short period. If KV-cache gets primed by the favored lane, subsequent requests gain advantage.\n\nExperiment setup (lightweight)\n- Single GPU local dev cluster (4x A100 sim), runtime: dev-build 2025-11-01, coalescer modes: time-window (TW), request-count (RC), adaptive (AD).\n- Workload: two logical lanes: HP (high-priority, qps=50, payload ~ 32 tokens), LP (low-priority, qps=300, payload 8 tokens). Zipf alpha=1.2 for LP to simulate skew.\n- Measure: p50/p95/p99 latency, qps delivered per lane, KV-cache hit rate, GPU utilization, observed batching distribution (batch sizes over time).\n- Short runs: 10 minutes steady + three 2-minute microbursts (LP qps -> 1200) at T=3,6,9 minutes.\n\nBaseline: TW window=10ms, max-batch=64\n- HP p50: 18ms, p95: 46ms, p99: 110ms\n- LP p50: 28ms, p95: 210ms, p99: 650ms (spikes during microbursts)\n- KV-cache hit rate overall: 72% (HP: 88%, LP: 68%)\n- Observations: during LP microbursts, TW coalescer creates very large batches dominated by LP; HP requests that arrive slightly after boundary get queued to next window and see high tail.\n\nRC mode: request-count threshold=32, max-wait=5ms\n- HP p50: 19ms, p95: 38ms, p99: 82ms\n- LP p50: 32ms, p95: 120ms, p99: 420ms\n- KV-cache overall: 69% (HP: 85%, LP: 66%)\n- Observations: RC keeps batch sizes more stable, reduces extremely large batches. HP tail improves vs TW but LP still suffers during large bursts because RC saturates and creates backlog.\n\nAD mode (adaptive: target latency 40ms, window adjusted 2-20ms)\n- HP p50: 17ms, p95: 34ms, p99: 72ms\n- LP p50: 30ms, p95: 95ms, p99: 290ms\n- KV-cache overall: 74% (HP: 90%, LP: 71%)\n- Observations: AD seems best tradeoff. It shortens windows when latency climbs, preventing one lane from monopolizing coalescing slots. LP tails still elevated but less extreme.\n\nFairness probe (priority inversion scenarios)\n- Inject periodic HP burst (200 qps for 15s) overlapping LP sustained high qps. Run AD + per-lane max-in-flight knobs (HP cap = 40 in-flight).\n- With no per-lane cap: HP bursts lead to LP starvation for 8-12s, p99(LP) > 1.2s.\n- With HP cap = 40: LP p99 reduces to ~320ms, HP p99 increases modestly (from 72ms to 120ms).\n- Note: cap works as crude fairness knob but causes HP partial slowdown; still acceptable for user-facing fairness policy.\n\nKV-cache interaction notes\n- When HP warms a small set of KV keys aggressively, HP enjoys persistent low latency. LP keys have lower reuse -> cache churn.\n- Idea: add lane-aware KV retention hint (on-cache-insert tag with TTL bias by lane) -> make coalescing fairness translate into cache fairness. Small quick test: mark LP inserts with TTL*1.5 -> LP cache hit rose +4\u20136% and LP tail dropped ~10\u201315% in p95. Side effects: increased memory usage, needs guardrails.\n\nMicro-observations / fragments\n- Large batches dominated by tiny-token LP requests increase amortized kernel overhead but hurt HP 1-2x for p99.\n- Adaptive window with per-lane slotting (reserve N slots per window for HP) looked promising in simulation: reduces HP misses while keeping LP throughput within 85% of baseline.\n- Strange artifact: when switching modes during run, GPU utilization dips for ~300ms then recovers \u2014 look into worker warm-up on coalescer config reload (possible lock contention).\n\nNext quick experiments (priority list)\n1) Run AD + lane-aware KV TTL at scale (30m run) and collect memory pressure stats.\n2) Try hybrid coalescer: time-window + reserved slots per lane (configurable). Short A/B against AD.\n3) Per-lane max-in-flight + backpressure shaping (soft vs hard cap) \u2014 measure percent degraded HP requests.\n4) Instrument per-batch composition telemetry (histogram of lane mix) and feed to optimizer to auto-adjust window/slots.\n\nRun commands (dev notes)\n- workload runner: ./tools/sim-load --config experiments/sched-fair/ad-config.yaml --out /tmp/run1\n- collect: ./tools/collect-telemetry /tmp/run1 --ids batch,kv,hostmetrics --out /tmp/tele1.json\n- quick plot: python tools/plot_latency.py /tmp/tele1.json --lanes HP,LP --percentiles 50,95,99\n\nOpen questions / risks\n- TTL bias may cause cache amplification for rare keys; need guardrail to avoid OOM in dedicated pools.\n- How to expose fairness knobs in API/console without overwhelming customers? Provide presets: conservative, balanced, aggressive-cost.\n- Interplay with preemption: if we preempt long LP batches to favor HP, we risk wasted compute (partial batch work). Need graceful partial batching semantics.\n\nQuick conclusions (working)\n- Adaptive coalescing + modest per-lane caps gives best practical fairness vs raw TW/RC.\n- KV-cache lane hints materially help tails for disadvantaged lanes but require memory safety checks.\n- UI/automation: we should expose a \"fairness profile\" and collect telemetry to recommend presets.\n\nNotes-to-self / TODOs\n- Expand runs to include heterogeneous token lengths (random 8-256) next week.\n- File GH PR with AD implementation notes and toggles (see linked PR).\n- Add a quick sampling hook to trace batch composition in production canary.\n\nReferences / links\n- Quick sim config: experiments/sched-fair/ad-config.yaml (repo: serving-runtime)\n- Candidate Confluence spec: confluence:serving/fair-scheduling-proto\n\nEnd of scratchpad. Keep this as working doc; will formalize if results hold after longer runs.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_f48a0acef5484457acd8f73cd575c360"
+}

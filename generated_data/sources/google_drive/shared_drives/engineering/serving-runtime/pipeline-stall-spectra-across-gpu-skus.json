@@ -1,0 +1,39 @@
+{
+  "title": "Pipeline stall spectra across GPU SKUs",
+  "owner": "Ava Ramirez",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/",
+  "doc_type": "doc",
+  "created_at": "2024-11-05",
+  "last_modified": "2024-11-12",
+  "collaborators": [
+    "Samir Patel",
+    "Lina Zhou",
+    "Marco Ortega"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "benchmarks",
+    "latency",
+    "throughput",
+    "A100",
+    "H100",
+    "L40S",
+    "driver",
+    "cuda",
+    "nvlink",
+    "profiling"
+  ],
+  "linked_artifacts": [
+    "https://confluence.redwood.ai/display/INF/decoding-bench-runbook",
+    "GH#repo/infra/PR-4823",
+    "JIRA-INF-1297"
+  ],
+  "content": "Summary:\nWe ran a focused set of experiments to map \"stall spectra\" \u2014 the distribution of microstall causes during autoregressive decoding \u2014 across representative cloud SKUs for A100, H100 and L40S variants. The goal was to identify reproducible cross-sku differences in the dominant stall modes (kernel launch wait, PCIe/NVLink transfer, CUDA memcopy syncs, kernel tailing due to occupancy, and CPU-side scheduling jitter) that correlate with observed p50/p99 decoding latency deltas.\n\nMotivation and context:\n- Several production customer endpoints showed intermittent p99 spikes on what should be a stable model/profile. Quick triage suggested differences by region/sku even with identical model container and batch packing heuristics.\n- Prior benchmarks covered aggregate p50/p90 across SKUs; we needed a breakdown of micro-causes to guide runtime mitigations (prefetching, reorder windows, kernel batching, fallback variants).\n\nHypotheses tested:\n1) NVLink-enabled SKUs reduce memcopy stalls for long-prefix requests but expose kernel tailing under mixed sequence-length workloads.\n2) Certain CUDA/driver combos amplify small-batch kernel launch overheads on H100 SKUs at high concurrency.\n3) L40S SKUs show lower absolute power but higher variance due to clock gating transitions under bursty traffic.\n\nExperiment matrix (short):\n- Models: small-medium transformer (7B public), large-like decoder-only (13B-ish toy config) to mimic KV pressure\n- Sequence lengths: prefill 1024 + decode 512, and a long-prep 4096 + decode 768 workload\n- Batches: batch=1, batch=4 warm, batch=8 peak packing\n- Concurrency: 8, 32, 80 in-flight requests\n- SKUs: cloud-A A100-40GB (NVLink off region), cloud-B H100-80GB (NVLink on), cloud-C L40S-48GB (burst power governor)\n- Driver/CUDA combos: CUDA 12.1 + driver 535.xx, CUDA 12.2 + driver 550.xx, CUDA 11.8 + driver 525.xx (selected to mimic common infra sets)\n- Measurements: per-token breakdown (ms) of kernel-launch, kernel-exec median/tail, DMA memcpy host->device, device->host, NVLink peer copies (where visible), CPU-side scheduling wait, GPU SM utilization, kernel occupancy samples, and eBPF-based PCIe/NVLink queue lengths.\n\nMethodology notes and tooling:\n- Use lightweight tracer patched into our runtime to emit per-request micro-timings and kernel categories. For kernel attribution we used cupti where available plus event-group counters sampled at 1s to attribute SM stalls vs issue rate drops.\n- To surface PCIe and NVLink queuing we captured perf counters on host (IB verbs not used) and corroborated with eBPF sketches of dma syscall timing.\n- Repeated each config 10x across two days to reduce diurnal cloud variability.\n\nKey findings (high level):\n- Kernel-launch overheads dominated small-batch batch=1 p50 on H100 under CUDA 12.2/driver 550, contributing ~0.9ms per token on average vs ~0.4ms on A100 with same container. This mapped to increased cpu-side serialization of kernel enqueue in our runtime under a specific CUDA launch path.\n- For long-prefill workloads (4096 prefix), NVLink-equipped H100 reduced host->device memcpy windows but produced a longer tail due to multi-kernel mutual blocking when concurrent long contexts interleaved. Observed as a bimodal kernel exec time distribution.\n- L40S showed higher variance in p99 at moderate concurrency (32) driven by GPU frequency throttling events: SM utilization drops accompanied by power governor jumps. These were transient and correlated with background host power/thermal signals.\n- Cross-driver variance: CUDA 11.8/driver 525 surprisingly had more frequent small memcpy stalls on A100 SKUs in cloud-A region; tracking showed a driver-level nvhost scheduling behavior change introduced in 525-series.\n\nRepresentative anecdote (useful for triage):\n- On cloud-B H100 with CUDA12.2: a 32-concurrency run where 3 long-context requests aligned produced chain-blocking: kernel A held a critical KV buffer, kernel B launched and waited on a memcopy that queued on NVLink, kernel C timed out waiting on a lock in our runtime leading to CPU-side retries. The observed p99 ballooned to 5x baseline. Postmortem showed a queuing hotspot in the NVLink path combined with our current lock granularity.\n\nActionable recommendations (short):\n- Short term: add per-request jitter in kernel enqueue (micro-random delay) for long-context workloads to reduce tail interlock probability on NVLink SKUs. Also enable a guardrail to reduce concurrency for long-prefill requests when NVLink queuing metrics are high.\n- Mid term: refactor KV buffer handoff to use lock-free handover for the hot path; evaluate kernel fusion opportunities to reduce enqueue counts on H100.\n- Driver policy: test rolling to CUDA 12.1/driver 535 on a small subset of nodes in cloud-B to validate whether the 12.2 path is amplifying launch serialization.\n- Capacity planning: for latency-sensitive single-token batch=1 workloads prefer A100 SKUs in the region unless NVLink benefits for long-context outweigh the kernel-launch tail; document this trade-off in the SKU selection playbook.\n\nOpen questions & follow-ups:\n- Are similar NVLink queuing patterns visible with multi-instance GPU setups (MIG-like) when we pin multiple workers per GPU? Need a small follow-up matrix.\n- Can we get vendor counters that expose NVLink queue depth directly (ask vendor eng partner)?\n- Re-run with synthetic microbench kernels to isolate whether kernel composition (many small kernels vs few large kernels) is the main amplifier.\n\nNotes to self / TODOs:\n- Samir to prototype lock-free KV handoff by 2024-11-20 and run against cloud-B smoke tests.\n- Lina to scope a CUDA-driver sweep automation for infra team (ticket created GH#repo/infra/PR-4823).\n- Marco to collect host-level thermal/power logs from failing L40S runs and put them in shared artifact bucket.\n\nAppendix (short):\n- Raw traces and aggregated flame graphs uploaded to the experiment bucket (linked above).\n- Small script used to synthesize aligned long-context arrival patterns: scripts/bench/aligner.sh in infra repo.\n\nConclusion:\nThe dominant p99 amplification mechanisms differ materially by SKU and driver: H100+NVLink shows inter-kernel blocking under long-context concurrency; A100 shows more driver-sensitive memcpy stalls depending on driver version; L40S has power/thermal-induced variance at moderate concurrency. Mitigations span quick runtime heuristics (jitter, concurrency gating) and deeper runtime/driver coordination (fewer kernel enqueues, lock-free handoffs).\n\nIf this looks reasonable I will convert the core findings into a short playbook entry for the SRE oncall runbook and schedule a vendor sync to discuss NVLink queue visibility.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_07efb1719f254e5da9c63042a8c3224f"
+}

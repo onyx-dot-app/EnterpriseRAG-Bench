@@ -1,0 +1,37 @@
+{
+  "title": "Perf thermostat scrub: small-seq p95 spike investigation",
+  "owner": "Ava Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime",
+  "doc_type": "doc",
+  "created_at": "2026-04-21",
+  "last_modified": "2026-04-23",
+  "collaborators": [
+    "Marco Ruiz",
+    "Priya Nair",
+    "Ethan Park",
+    "Lina Gomez"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "performance",
+    "regression",
+    "kv-cache",
+    "cuda",
+    "small-sequence",
+    "benchmarks"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/4123",
+    "JIRA-ENG-7891",
+    "confluence:perf-thermostat-diary",
+    "slack:https://slack.redwood.com/archives/C12345/p1650123456789"
+  ],
+  "content": "Meeting: Weekly perf thermostat scrub (21 Apr 2026)\nOwner: Ava Chen (notes)\nGoal: Triage unexpected p95 spikes for small-sequence online traffic after kernel selection refactor. Capture reproducible runs, narrow hypothesis, assign owners and next steps.\n\nAttendees:\n- Ava Chen (notes)\n- Marco Ruiz\n- Priya Nair\n- Ethan Park\n- Lina Gomez (observability)\n\nTL;DR:\n- Observed p95 jump from ~48ms -> ~120ms for sequences <= 32 tokens on variety-a model after kernel selector v2 rolled on 2026-04-18. Bulk throughput largely unchanged. Regression appears load-shape dependent and correlated with frequent KV cache flushes.\n- Repro steps and a minimal local harness were created (run id: thermostat-0421-r1). Repro is noisy but shows median p95 ~115ms across 10 repeats.\n- Short-term mitigation: fallback to kernel-selector v1 for affected pods in the canary pool; rollout paused.\n\nObserved signals and quick metrics:\n- Canary cluster (region us-west-2) traffic window: 2026-04-18 03:00 - 06:00 UTC\n- Small-seq qps: 220 -> 210 (no big drop)\n- p50: 18ms -> 22ms\n- p95: 48ms -> 118ms\n- CPU on host: +5% (normal). GPU util: same. Cuda context switching counters: up by ~2.3x for affected processes (observability metric cuda.ctx_switches).\n- KV cache churn metric (kv.cache.evictions/sec) spiked during the window (~3.8x baseline).\n\nReproduction summary (local harness):\n- Command: ./bench/harness --model variety-a --seq 16 --batch-dist poisson --qps 200 --kv-cache-on --kernel-selector v2 --seed 20260421\n- Harness run id: thermostat-0421-r1 (artifacts uploaded to s3://perf-playback/thermostat/thermostat-0421-r1.tar.gz)\n- Results (10 runs): p95s = [112, 118, 121, 110, 116, 117, 125, 109, 114, 119] ms -> median 116ms.\n- Same command with kernel-selector v1: median p95 50ms.\n\nInitial hypotheses (ranked):\n1) Kernel-selector v2 picks a kernel path that triggers extra stream synchronizations for short sequences (scheduling overhead dominates).\n2) KV cache flush path interacts with micro-batching heuristic, causing frequent offload/restore operations (I/O + cuda memcopies) on samples with low token count.\n3) New heuristic changed padding/packing behaviour for small batches, increasing hook calls into memory manager.\n\nQuick checks performed during meeting:\n- Re-ran harness with kv-cache disabled: p95 dropped to ~56ms (supports hypothesis #2).\n- Added extra logging around stream launch in the runtime: observed 1.7x more host->device memcopy calls per request on v2 path.\n- Single-request profiling with NVTX shows extra cudaStreamSynchronize in the hot path right after kv cache restore.\n\nLogs (abridged):\n- runtime:kernel_selector: INFO selected path=v2.kv-restore-sync\n- runtime:kv: DEBUG restore_shard id=0 size=2.3MB time=2.1ms\n- runtime:cuda: DEBUG memcpy_htod start t=2300.23 end t=2303.35 (3.12ms)\n- runtime:cuda: DEBUG stream_sync after_restore t=2303.36 (synchronous)\n\nImmediate actions (owner + ETA):\n- [Ava] Pause v2 on canary pool (done during meeting).\n- [Marco] Open PR to add async restore variant guarded by feature flag + perf test (PR drafted: linked). ETA: 2026-04-24.\n- [Priya] Wire up micro-benchmark that isolates kv-restore path with and without async flag, run on perf lab GPUs. ETA: 2026-04-23 (in progress).\n- [Ethan] Add NVTX-marked flamegraphs and upload to perf artifacts for the 10-run corpus. ETA: 2026-04-22 (done).\n- [Lina] Add alert that p95 for small-seq traffic > 80ms for 5m should auto-fail kernel-selector rollout. ETA: 2026-04-25.\n\nLonger-term investigations:\n- Verify whether packer/padder changes in model compilation are contributing; schedule a pairing session with compilation team (owner: Marco, target: week of 2026-04-27).\n- Evaluate a lightweight async restore path vs batched restores and measure additional memory pressure.\n- Add a continuous small-seq shadow-run job in perf CI that runs nightly on representative models and flags >20% p95 regressions.\n\nOpen questions / unknowns:\n- Why does kv.cache.evictions spike in these windows for small-seq traffic? (traffic shape? memory fragmentation?)\n- Is there any cross-talk from other processes on the same GPU (multiplexed tenancy) that increases stream syncs?\n- Could scheduler decision be influenced by recent heuristics that consider transient seq-length distributions?\n\nNotes to self / shorthand observations:\n- reproduce locally but prefer perf lab GPU vs dev laptop (latency numbers differ small-seq).\n- harness should pin --quantize-mode=fp16 to match canary.\n- verify driver/kernel versions are identical between canary and perf-lab.\n\nMeeting artifacts and quick refs:\n- reproducer run: s3://perf-playback/thermostat/thermostat-0421-r1.tar.gz\n- PR (draft): https://github.com/redwood-inference/serving-runtime/pull/4123\n- JIRA: JIRA-ENG-7891\n\nNext check-in: short sync Tue 2026-04-23 16:00 UTC to confirm micro-bench numbers and decide on v2 rollback duration.\n\nAction log (summary):\n- rollback v2 to canary: done (Ava)\n- micro-bench harness uploaded: in progress (Priya)\n- PR to add async restore flag: drafted (Marco)\n- NVTX artifacts: uploaded (Ethan)\n- rollout guard alert: todo (Lina)\n\nEnd notes: kept the doc intentionally terse \u2014 this is a noisy, reproducing regression. If you pick this back up, start with the harness id thermostat-0421-r1 and the async restore flag branch in the draft PR.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_a29f5b3d027c4ebfac27e3bea1d5c0a5"
+}

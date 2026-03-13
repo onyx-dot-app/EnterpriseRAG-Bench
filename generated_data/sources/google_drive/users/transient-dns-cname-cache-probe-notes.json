@@ -1,0 +1,33 @@
+{
+  "title": "transient-dns-cname-cache-probe-notes",
+  "owner": "Maya Singh",
+  "drive_area": "users",
+  "path": "users/transient-dns-cname-cache-probe-notes.json",
+  "doc_type": "doc",
+  "created_at": "2025-01-12",
+  "last_modified": "2025-02-03",
+  "collaborators": [
+    "Ethan Park",
+    "Rosa Alvarez"
+  ],
+  "team": "eng-private-deploy",
+  "status": "draft",
+  "tags": [
+    "private-deploy",
+    "egress",
+    "dns",
+    "cname",
+    "debug"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-PII-585",
+    "JIRA-INFRA-3214",
+    "github.com/redwood-inference/private-egress-playbook/pull/14"
+  ],
+  "content": "Summary:\n- Intermittent failures on private deployment when resolving customer-hosted model endpoints (tls: certificate name mismatch, sometimes connects fine). Suspect stale CNAME resolution cached on peered VPC NAT/forwarder path.\n\nWhat I observed (high level):\n- App in customer VPC A -> peered to Redwood VPC B via VPC peering (transit via vendor virtual appliance).\n- Requests to api.customer-models.example.com occasionally resolve to old-cname.edge-old.example.net instead of edge-new.example.net. Old CNAME maps to decommissioned egress IP ranges (NAT gateway removed last month).\n- Result: TCP established but TLS SNI mismatches against ip-based cert (RST later), or TLS handshake fails with \"certificate common name xyz does not match\".\n- Failures are bursty and correlate with short traffic spikes and NAT failover events.\n\nTimeline + quick notes:\n- 2025-01-10 09:18: spike of 5xxes from customer, repeated curl failures shown below.\n- 2025-01-10 09:20: ran dns probe from pod (see commands).\n- 2025-01-10 09:34: vendor appliance logs show cached answer for cname for ~8m after their internal glue update.\n\nCommands I ran (raw-ish):\n- from failing pod (busybox):\n  # busybox nslookup api.customer-models.example.com 8.8.8.8\n  Server: 8.8.8.8\n  Address: 8.8.8.8:53\n\n  Name: api.customer-models.example.com\n  Address 1: 10.11.12.13 (internal LB - expected)\n\n- using dig + trace + tcpdump on node:\n  $ dig +trace api.customer-models.example.com @10.0.0.2 +noall +answer\n  api.customer-models.example.com. 300 IN CNAME edge-old.example.net.\n  edge-old.example.net. 300 IN A 192.0.2.34\n\n  (later after flushing cache on appliance)\n  api.customer-models.example.com. 300 IN CNAME edge-new.example.net.\n  edge-new.example.net. 60 IN A 198.51.100.45\n\n- curl verbose (when failing):\n  $ curl -v --resolve api.customer-models.example.com:443:192.0.2.34 https://api.customer-models.example.com/health\n  * Connected to 192.0.2.34 (192.0.2.34) port 443 (#0)\n  * ALPN, offering h2\n  * TLSv1.3 (INTERNAL), Cipher ...\n  * Server certificate:\n    subject: CN=edge-new.example.net\n    start date: Jan 1 00:00:00 2025 GMT\n  * TLS alert, server closed connection\n  curl: (56) Received reset or unexpected EOF\n\n- tcpdump during failure window (node):\n  09:19:11.123 IP pod-xxx.12345 > 192.0.2.34.443: Flags [S], seq 12345\n  09:19:11.456 IP 192.0.2.34.443 > pod-xxx.12345: Flags [S.], seq 54321, ack 12346\n  09:19:11.789 IP 192.0.2.34.443 > pod-xxx.12345: Flags [RST]\n\nHypotheses (ranked):\n1) Vendor peering appliance has an aggressive internal DNS cache for CNAME chains and did not pick up the customer's glue change quickly -> some nodes resolve old edge-old IPs. (most likely)\n2) Intermediate NAT / egress device reused an old connection tracking entry mapping to the removed NAT IP -> packets routed to wrong host and TLS fails.\n3) Split-horizon DNS: internal resolver returns edge-old for certain subnets due to ACLs; occasional routing path uses that subnet.\n4) Client-side pod caching or node nscd misconfigured (less likely since dig +trace on node showed CNAME).\n\nExperiments run and outcomes:\n- Flushed vendor appliance DNS cache (vendor support): failure rate dropped to near zero for ~12m, then a few residual failures.\n- Added an explicit iptables rule to drop traffic to 192.0.2.0/24 on the node and watched failover -> requests retried and started resolving to edge-new (evidence that route + cached DNS both matter).\n- Tested TTL override by changing stub resolver to prefer shorter TTLs (not doable in prod).\n- Instrumented pod to log resolved IP + stacktrace on handshake failure (added quick env var DEBUG_DNS_RESOLVE=1).\n\nShort playbook (quick steps to triage next time):\n1) from failing pod: curl -v --resolve HOST:443:RESOLVED_IP to reproduce and capture cert subject.\n2) on node: dig +trace HOST @node-resolver ; tcpdump -w /tmp/host-traffic.pcap port 443 and capture 30s around event.\n3) query vendor appliance cache API (/cache/lookup?name=) if available and record timestamps.\n4) if appliance shows stale entry, escalate to vendor with cache key + TTL + sample pcap + dig output.\n5) temporary mitigations: add iptables drop for decommissioned IP range or route blackhole, or change egress mapping to use different NAT pool.\n\nOpen questions / TODOs:\n- Can we add an automated health check that resolves host -> verify cert CN matches expected and failover to alternative path? (Rosa to prototype)\n- Should we require vendors to implement DNS cache invalidation webhook for config updates? (raise in infra vendor review)\n- Check if Kubernetes node-local resolver (systemd-resolved / nscd) is contributing to sticky answers; test with node-level cache flush script.\n\nNotes to self / bits: \n- Pay attention to CNAME chains longer than 1, those are where appliance caches tend to be sticky.\n- Collect resolver logs from both sides of peering when next incident occurs.\n\nUseful commands snippet to keep handy:\n- dig +trace api.customer-models.example.com @10.0.0.2 +noall +answer\n- curl -v --resolve api.customer-models.example.com:443:<ip> https://api.customer-models.example.com/health\n- sudo tcpdump -i any host <ip> and port 443 -w /tmp/trace.pcap\n- ssh to vendor appliance -> show dns cache api (if they expose it)\n\nAttachments to create: pcap samples, vendor cache dump, dig traces.\n\nLast quick checklist before handing to support: dns trace, pcap, sample curl output, timeline, node id, pod id, affected customer endpoints.\n\nEnd of scratchpad.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_38723e92cd6e49d3907d24efe5ddc068"
+}

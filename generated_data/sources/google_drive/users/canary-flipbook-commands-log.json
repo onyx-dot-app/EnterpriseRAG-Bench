@@ -1,0 +1,90 @@
+{
+  "title": "Canary flipbook \u2014 commands & breadcrumbs",
+  "owner": "Avery Martinez",
+  "drive_area": "users",
+  "path": "users/avery-martinez/cicd/canary-flipbook",
+  "doc_type": "doc",
+  "created_at": "2025-11-02",
+  "last_modified": "2026-03-09",
+  "collaborators": [
+    "Jordan Lee",
+    "Priya Nambiar"
+  ],
+  "team": "eng-release-engineering",
+  "status": "draft",
+  "tags": [
+    "canary",
+    "artifact-version",
+    "ci",
+    "staging",
+    "debug",
+    "kv-cache"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/platform/pull/4921",
+    "JIRA-ENG-7833",
+    "confluence://canary-runbook-2026",
+    "commit:ab12c3d4f8f9e6b2a1c7e9d4ae3b6c1234567890"
+  ],
+  "summary": "Personal scratchpad capturing the commands I ran while debugging a canary flip that caused a fraction of requests in staging to timeout / hit a 502 cascade. Mostly artifact-version and routing suspicion \u2014 suspect mismatch between image tag and accompanying model prewarm metadata (kv cache warm keys).",
+  "timeline": [
+    "2025-11-02 09:13 - Started canary rollout: platform-service v1.12.0-canary -> 10% of staging traffic",
+    "2025-11-02 09:27 - Observed spike in 502s on route /v1/generate, ~3% of requests. Latency P95 jumped 2x for those pods.",
+    "2025-11-02 09:35 - Triggered quick rollback to v1.11.9 on canary pool (manual ejection) \u2014 errors reduced but tracebacks persisted for some requests.",
+    "2025-11-02 10:02 - Recreated pod locally with same image digest and ran smoke tests, reproduced timeouts intermittently.",
+    "2025-11-02 11:10 - Dug into deployment artifacts: discovered model-prewarm metadata file missing in the image at /opt/prewarm/kv_meta.json for canary image tag",
+    "2025-11-02 11:45 - Created this flipbook to record commands, outputs, and hypotheses for follow-up and handoff."
+  ],
+  "commands_tried": [
+    "kubectl -n staging get pods -l app=platform-service -o wide",
+    "kubectl -n staging logs deploy/platform-service-canary --since=10m | grep -i 'ERROR\\|WARN' -n",
+    "gcloud container images describe gcr.io/redwood/platform-service:v1.12.0-canary --format='get(digest)'",
+    "docker run --rm -it gcr.io/redwood/platform-service@sha256:ab12c3d4f8f9e6b2a1c7e9d4ae3b6c1234567890 /bin/bash -c 'ls -la /opt/prewarm && cat /opt/prewarm/kv_meta.json'",
+    "git rev-parse --short HEAD",
+    "git show --name-only ab12c3d4f8f9e6b2a1c7e9d4ae3b6c1234567890",
+    "curl -s -X POST https://staging.api.redwood.internal/v1/generate -H 'Authorization: Bearer $TOKEN' -d '{\"prompt\":\"hello\"}' -o /tmp/res.json -w '%{http_code}\\n'",
+    "kubectl exec -it <pod> -n staging -- bash -c 'strace -f -p 1 -s 200 -o /tmp/strace.log & sleep 5; killall -SIGINT strace; cat /tmp/strace.log | head -n 200'",
+    "kubectl exec -it <pod> -n staging -- bash -c 'python3 tools/list_kv_cache_keys.py --db /opt/kv/cache.db | wc -l'",
+    "gcloud builds describe 20251102-rolling-canary --format='yaml'"
+  ],
+  "error_snippets": [
+    "[2025-11-02T09:24:33Z] ERROR request handler: upstream returned 502 (connection reset) trace_id=abc123 pod=platform-service-canary-7f6b9",
+    "2025-11-02T09:24:33.142Z platform-service main: TimeoutError: KVCache fetch timed out after 1200ms -- key=prewarm:model-v2:slot-23",
+    "Traceback (most recent call last):\\n  File \\\"/opt/service/server.py\\\", line 412, in handle_request\\n    response = model.generate(req)\\n  File \\\"/opt/service/runner.py\\\", line 788, in generate\\n    kv = kv_store.get_batch(keys)\\n  File \\\"/opt/service/kv.py\\\", line 59, in get_batch\\n    raise TimeoutError('KV RPC timed out')",
+    "HTTP/1.1 502 Bad Gateway\\ncontent-type: application/json\\n{\"error\":\"upstream error: kv-service unavailable\"}"
+  ],
+  "hypotheses": [
+    "Artifact build accidentally omitted prewarm metadata file (kv_meta.json) for canary tag -> code path expects metadata to decide which prewarm keys to request; absence leads to empty key list and a fallback that floods KV with malformed keys (timeouts).",
+    "Image digest mismatch: rollout used tag v1.12.0-canary but deployment controller resolved to a different digest with old prewarm schema -> incompat between runtime and metadata.",
+    "KV service experienced a transient region-level degradation at 09:24 which coincided with canary ramp; amplifying due to new code path increased fanout.",
+    "Autoscaler created pods with insufficient ephemeral disk (ephemeral storage pressure) causing KV cache file descriptors to fail intermittently.",
+    "Sidecar proxy (envoy) config for canary pool had a stale route pointing to old kv cluster endpoint due to missing rollout of configmap during canary."
+  ],
+  "immediate_actions": [
+    "Manual ejection of canary pool (scale down canary replicas to 0) \u2014 done 09:35, temporary mitigation.",
+    "Patch CI pipeline to assert presence of /opt/prewarm/kv_meta.json inside built image before pushing to registry (add 'docker run cat /opt/prewarm/kv_meta.json' step).",
+    "Add an integration test that bootstraps a container and runs tools/list_kv_cache_keys.py against a mocked KV to ensure code path handles missing metadata gracefully.",
+    "Open a hotfix PR to re-add metadata to v1.12.0-canary build if confirmed missing: branch hotfix/prewarm-meta.",
+    "Add temporary rate limit on prewarm requests from new runtime path to prevent KV fanout spike during future canary ramps.",
+    "Schedule postmortem with infra + kv-service owners: include metrics (number of prewarm keys requested, kv latency distribution) for 09:00-10:00 window."
+  ],
+  "notes_to_self": "Steps for handoff: 1) capture exact image digest used by the canary pods and upload to Jira ticket; 2) attach the docker run output (ls -la /opt/prewarm) to PR; 3) if reproducing locally, run with --env KV_SERVICE=staging-mock to avoid hitting real kv; 4) follow up with Priya on envoy config rollout timing; 5) avoid rolling canary beyond 10% until prewarm validation is in place. Also, mention the possibility of adding a 'metadata presence' gating check in the release controller (server-side).",
+  "next_steps": [
+    "Confirm whether CI image build step changed between v1.11.9 -> v1.12.0-canary (look at Dockerfile diff in PR #4921)",
+    "If metadata missing, push hotfix image with same tag but corrected digest and coordinate controlled canary re-run with observability flags enabled (profiling + kv request logs).",
+    "Draft short Slack blurb for #eng-release: summary + mitigation + ETA for re-roll",
+    "Add test in staging that does a canary smoke: 50 small requests across multiple pods and assert no 5xxs for 2 minutes before allowing >10% traffic."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "timeline",
+    "commands_tried",
+    "error_snippets",
+    "hypotheses",
+    "immediate_actions",
+    "notes_to_self",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_713d91bcdadd444cab67d39fa7d29adf"
+}

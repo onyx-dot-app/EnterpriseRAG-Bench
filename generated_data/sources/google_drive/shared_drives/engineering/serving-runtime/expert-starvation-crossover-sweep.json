@@ -1,0 +1,53 @@
+{
+  "title": "Expert starvation and crossover sweep: Llama/Mistral/Qwen long-context notes",
+  "owner": "Maya Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/expert-starvation-crossover-sweep.json",
+  "doc_type": "doc",
+  "created_at": "2024-10-18",
+  "last_modified": "2024-11-05",
+  "collaborators": [
+    "Arjun Patel",
+    "Lina Rodriguez",
+    "Hector Morales"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "moe",
+    "long-context",
+    "latency",
+    "llama",
+    "mistral",
+    "qwen",
+    "profiling",
+    "kv-cache"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/benchmarks/pull/87",
+    "JIRA-RT-1245",
+    "confluence://serving-runtime/moe-troubleshooting"
+  ],
+  "summary": "Notes from a focused sweep investigating expert starvation and cross-model handoff effects on p95/p99 latency for long-context workloads across Llama, Mistral and Qwen families. Experiments probe whether starvation is scheduling-related (serialization/handshake), KV staleness, or PCIe/DMA backpressure during prefetch and handoff.",
+  "environment": "Testbed: 2x H100-80GB (NVLink), 1x A100-80GB (PCIe) for cross-arch experiments. Driver: NVIDIA 535.x, CUDA 12.2, nsight-systems v2024.3. Serving runtime: commit 9b3aefc (routing + prefetch refactor), build tag: v0.12.4-experiments. Models: llama-2-13b (fp16), mistral-instruct-7b (fp16), qwen-14b (int8-quant-sim). Long context token lengths: 2k, 8k, 32k. MoE config used: 64 experts, top-2 gating, expert capacity factor tuned to 1.0/1.5 in different runs.",
+  "experiments": "Run list (synthetic workload + real prompts):\n1) Synthetic uniform token stream with repeated prefix to exercise cache reuse. Command: ./scripts/run_sweep.sh --model llama-2-13b --tokens 8192 --tps 8 --concurrency 4 --trace nvts\n2) Cross-arch handoff: route 40% qwen -> mistral by policy to force redispatch and KV transfer. Command: ./tools/route_stresser.py --from qwen-14b --to mistral-7b --ratio 0.4 --duration 1800\n3) Expert starvation probe: same input across MoE models with varying expert capacity (0.75,1.0,1.5) and top-k gating. Use microbench: ./bench/moe_starve.py --experts 64 --topk 2 --warmup 200 --measure p95,p99\n4) DMA pressure capture: run nsys profile during a cross-host eviction event: nsys profile --output cross_handoff --trace=openacc,cuda,osrt ./bin/serve_e2e --workload cross_handoff.json\nNotes: each run repeated 5 times, restart runtime between capacity changes to avoid kernel selection carryover.",
+  "observations": "High level:\n- p50 stable across models; p95/p99 spikes correlate with redispatch events when routing crosses model families (qwen <-> mistral).\n- When expert capacity factor = 0.75 we saw clear tail amplification: p99 increased by 2.2x vs capacity 1.5 for same throughput.\n- NVLink host (H100 pair) reduced p95 of cross-model handoffs by ~30% compared to PCIe-only path (A100). However, p99 still present due to scheduling stalls in expert handshake.\n- KV cache hit-rate drop from ~72% to ~51% during handoff bursts; each cache miss incurred average extra 8-14ms for remote KV prefetch/dma.\n- NSYS traces show frequent short (~20-80us) gaps where GPU kernel queues empty while CPU-side routing logic waits on gated aggregation locks. These gaps produce serialization cascades under high concurrency.\n- BPFtrace on host shows repeated wakeups (~1.8k/sec) by routing worker threads coinciding with p99 events; CPU sched latency peaked at 6-12ms in worst runs.\nNumeric examples (representative):\nrun: llama-13b tokens=8192, concurrency=4 -> p50 32ms, p95 78ms, p99 210ms\nrun: qwen->mistral handoff (NVLink) -> p50 40ms, p95 95ms, p99 260ms\nrun: qwen->mistral handoff (PCIe) -> p50 46ms, p95 135ms, p99 410ms\nObservation: gap between p95 and p99 often corresponds to a handful of requests that hit both cache miss + gating-serialization simultaneously.",
+  "root_causes_and_hypotheses": "1) Handshake serialization: gating aggregation (top-2 selection + capacity accounting) currently uses a single per-batch lock; when many sessions target overlapping experts this becomes a bottleneck and yields CPU-thread wakeup spikes. Hypothesis supported by BPFtrace wakeup correlation and nsight 'idle gaps'.\n2) KV staleness amplification: during cross-model handoffs, the target model expects different tokenization/prefixing alignment, causing more cache misses and larger delta in prefetched KV sizes -> more PCIe/DMA traffic which amplifies stalls on PCIe hosts.\n3) PCIe DMA queuing: A100(PCIe) shows DMA queue saturation when several large KV prefetches coincide; NVLink reduces host-to-host transfer overhead but cannot fix master-thread serialization.\n4) Scheduling affinity: worker threads handling gating and serialization are running on non-isolated cores in our test VMs; scheduler preemption worsens tail.\nEvidence: nsight timeline + perf show CPU syscall and lock contention during p99 windows; nvlink runs reduce DMA time but not lock time.",
+  "mitigation_attempts": "Tried quick patches (all in runtime branch 'moe-fast-fix'):\n- Replaced per-batch lock with sharded locks (16 shards) for gating aggregation: reduced p99 by ~18% in small runs but not elimination.\n- Added eager KV prefetch hints for cross-model handoff policy: improved cache hit by ~10%, p95 down 12% but p99 unchanged.\n- Increased expert capacity factor to 1.5: reduced tail but increased average GPU memory by ~6GB.\n- Offloaded gating aggregation to a dedicated pinned CPU thread set (isolcpus) which reduced scheduler latency spikes; p99 improved ~25% in NVLink runs but only 12% on PCIe runs.\n- Disabled cross-model routing policy in a control run: tails disappeared but throughput dropped ~7% (expected).",
+  "recommended_next_steps": "Short term (next week):\n- Roll gated sharded-locks + dedicated pinned worker thread prototype to canary pool for more realistic traffic.\n- Instrument gating to capture per-expert queue lengths and per-request wait-time: add lightweight telemetry (histograms) to routing pipeline.\n- Add eviction-aware KV prefetch scheduler that sequences large prefetches to avoid DMA queue storms on PCIe hosts.\nMedium term (2-6 weeks):\n- Rework gating aggregation algorithm to be lock-free (per-thread append + reduce) or use RCU-like pattern. Prototype on small scale.\n- Explore hybrid handoff: copy minimal token metadata in routing vector to allow quick speculative KV rehydrate instead of full prefetch.\n- Add host-level QoS: pin routing worker threads to cores and reserve CPU bandwidth for routing under high load.\nOpen questions:\n- Can we adjust model tokenization alignment heuristics to improve KV reuse across model families?\n- Cost tradeoffs for persistent larger KV allocation vs. dynamic prefetch complexity.",
+  "raw_traces": "(snippets)\n[nsys cross_handoff timeline] time=00:01:12.234 kernel: cudaLaunchKernel void* 0x7f... duration=1.2ms queueIdle=23ms\n[trace] host: routing_worker[13] lock_wait=8.9ms expert_id=42 batch_id=1873\n[bpftrace] /usr/bin/serve_e2e:syscall:epoll_wait :  + 3.4ms -> wakeup routing_worker (tid 4211)\n[serve log] request=abcd-1873 action=redispatch from=qwen-14b to=mistral-7b kv_fetch=miss prefetch_ms=12 dma_wait=9.1ms\n[perf] cpu-cycles stalled==20% during p99 window; top lock: gating::Agg::append\n(see attached full traces in linked_artifacts GitHub PR)",
+  "notes_to_self": "- Re-run PCIe saturation test with reduced concurrency but heavier token lengths (32k) to isolate DMA vs. lock effects.\n- Talk to infra about reserving a dedicated NVLink host for MoE stress tests (ticket filed JIRA-OPS-332).\n- If lock-free reduce works, measure memory overhead for per-thread buffers.\n- Share summary in Monday eng sync (slide 2: before/after p99 graphs).\n- Remember to include model vocab/tokenization mismatch notes when discussing KV reuse with model-onboarding team.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "environment",
+    "experiments",
+    "observations",
+    "root_causes_and_hypotheses",
+    "mitigation_attempts",
+    "recommended_next_steps",
+    "raw_traces",
+    "notes_to_self"
+  ],
+  "dataset_doc_uuid": "dsid_ff387adbb6774140a0c128dec46ae5af"
+}

@@ -1,0 +1,82 @@
+{
+  "title": "eBPF light-sampler: CI profiling playbook and trace collector notes",
+  "owner": "David Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/ebpf-light-sampler-ci-playbook.json",
+  "doc_type": "doc",
+  "created_at": "2024-02-12",
+  "last_modified": "2024-03-05",
+  "collaborators": [
+    "Marta Rivera",
+    "Kenji Sato",
+    "Priya Nair"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "profiling",
+    "ebpf",
+    "ci",
+    "flamegraph",
+    "trace",
+    "gpu",
+    "batching",
+    "observability"
+  ],
+  "linked_artifacts": [
+    "GH:https://github.com/redwood-inference/runtime/commit/abc123ef",
+    "JIRA:RT-4213",
+    "Confluence:/pages/serving-runtime/profiling-ebpf-playbook"
+  ],
+  "summary": "Working notes for a lightweight eBPF-based sampler + CI workflow that produces actionable flamegraphs and span-level histograms for the serving runtime. Goal: reproducible, low-overhead traces that run in CI (and optionally on staging) to catch regressions in token latency, KV cache misses, and hot-kernel paths.",
+  "objectives": "1) Add a small-footprint trace collector (eBPF/bpftrace + userspace aggregator) that can run inside CI containers. 2) Make flamegraph + hotmap artifacts automatically produced and uploaded on perf failures. 3) Capture both CPU and GPU hotspots (where feasible) and correlate to request routing and batching. 4) Provide a runbook for triage.",
+  "design_overview": "We use a sampling profiler implemented with eBPF uprobes and perf events to periodically capture stack traces from the serving-runtime process and its worker threads. A small userspace aggregator (go/c) collects samples, symbolicates them using build-id maps and the deployed binary, and writes folded stacks for flamegraph.pl. For CI, we synthesize realistic traffic via the perf-job harness (curl-style replay) and run the sampler for short windows (30-90s) to reduce noise and cost. Optional GPU hotspots are captured by invoking CUPTI or nvidia-smi-based sampling on the dedicated GPU test runner and merged into reports as separate flamegraphs.",
+  "ci_workflow_steps": [
+    "1) Start dedicated CI runner with pinned CPU isolation (cset) and a GPU node if testing GPU paths.",
+    "2) Deploy a test build of the serving runtime with debug symbols stripped into a side artifacts bucket for symbolication.",
+    "3) Launch the traffic generator that replays a short real-prompt workload (use small batch sizes to exercise queueing).",
+    "4) Start eBPF sampler for 45 seconds with event frequency tuned to keep overhead <3%.",
+    "5) Aggregate samples into folded stacks, run flamegraph.pl to produce SVG/HTML, compute p99/p50 histograms for token latency.",
+    "6) If latency/regression thresholds are exceeded, attach artifacts to the CI run and open RT/GH issues automatically with links.",
+    "7) Clean up kernel probes and any temporary files; optionally store aggregated metrics (hot functions, time spent) to Influx/Prometheus for trend analysis."
+  ],
+  "commands_and_snippets": [
+    "# example: start bpftrace ephemeral sampler (attach to binary path)\nsudo bpftrace -e 'uprobe:/opt/runtime/bin/redwood:handle_request { @[ustack] = count(); } interval:s:1 { exit(); }' -o /tmp/samples.bt",
+    "# userspace aggregator (fold stacks)\nsudo ./sample-collector --pid 12345 --duration 45 --sample-interval 10ms --output /tmp/folded.txt",
+    "# generate flamegraph (requires FlameGraph scripts in PATH)\ncat /tmp/folded.txt | flamegraph.pl > /tmp/flame.svg",
+    "# perf variant for kernel traces (to capture syscall/KVM wait hotspots)\nsudo perf record -F 250 -a -g -- sleep 45; sudo perf script | stackcollapse-perf.pl > /tmp/folded-perf.txt",
+    "# GPU sampling hint (run on GPU test node)\n# snapshot wrapped via nvidia-smi sampling: nvidia-smi dmon -s u -d 1 -o DT > /tmp/gpu-dmon.log",
+    "# quick symbolication tip: ensure BUILD_IDs from /usr/lib/debug and binary are uploaded to CI artifacts bucket before symbolication step."
+  ],
+  "flamegraph_generation": "We prefer producing two artifacts per run: (A) user-space CPU flamegraph (SVG + folded.txt) capturing stacks inside runtime and libraries (libtorch/tvm/custom kernels), (B) kernel+syscalls flamegraph for blocked/wait states. Naming convention: flame-<commit>-<runner>-<metric>-<timestamp>.svg. Store folded stacks for diffing; use flamegraph-diff to compare across commits. For CI, keep SVG + folded.txt zipped and upload to the job artifacts URL for easy inspection.",
+  "gpu_profiling_notes": "GPU profiling in CI is heavier and usually gated. For short runs we collect coarse metrics: GPU utilization, PCIe stalls, and NVML power/temperature logs. For deeper hotspots, schedule a nightly GPU job that runs CUPTI-based sampling or Nsight CLI on a pinned test image. When merging GPU and CPU artifacts, map per-request timestamps to GPU submission timestamps. If CUPTI sampling is not feasible in CI (restricted env), fall back to instrumenting the runtime to log kernel submission durations and queue times (lightweight tracing points).",
+  "thresholds_and_alerting": [
+    "- p95 token latency increase > 10% compared to baseline -> fail CI",
+    "- new top-3 functions accounting for >20% of CPU time not seen previously -> warn and attach flamegraph",
+    "- any syscall blocking spike (e.g., futex wait) correlating to increased tail latency -> mark for investigation",
+    "- GPU kernel queueing > 50ms for >1% of requests in CI GPU run -> gated failure (requires owner approval)"
+  ],
+  "runbook_quick_checks": [
+    "If CI indicates regression: 1) Download folded stacks and flame SVGs from artifacts. 2) Run flamegraph-diff against baseline commit. 3) Check whether newly hot functions are in runtime or third-party libs (libtorch/tvm). 4) If kernel hotspots: run perf record on a reproducer with full symbols. 5) If GPU queueing suspected: correlate host-side submission timestamps with nvml logs and check batch sizes. 6) Capture a full-profile (60-90s) with higher sampling frequency on an isolated runner for confirmation.",
+    "Sanity checks: ensure build-id mapping is present; check that eBPF probes were removed after run (bpftool prog list); verify no kernel oops in dmesg; check container cgroup for CPU throttling."
+  ],
+  "troubleshooting_examples": "Example: CI run shows 18% p95 increase. Flamegraph highlights 'serialize_request' taking more CPU and a new 'jit_compile' function. Investigation steps: 1) Confirm commit diff for JIT changes. 2) Reproduce locally with same binary and run sampler for 90s. 3) If JIT is root cause, attempt to force JIT-disabled build and re-run CI to confirm. 4) If not, capture kernel perf to see if thread wakes/futex waits are dominant. Attach logs GH-issue with flamegraph and folded stacks.",
+  "open_questions": "- How tightly do we want CI to fail on GPU-based regressions vs warn (cost/availability tradeoff)?\n- Should we standardize on bpftrace for CI vs a small compiled eBPF agent for lower noise?\n- Is symbolication via build-id artifacts reliable across our cross-compiled toolchain?",
+  "notes": "This doc is intentionally pragmatic: focus on short-duration samples, reproducible traffic, and automating artifact upload. Long-lived continuous profilers (prod agents) still have value for trend detection; this playbook complements them by creating lightweight gated checks inside PR pipelines and nightly regression sweeps. Next steps: prototype a minimal Go agent that emits folded stacks directly to stdout and a GitHub Action wrapper that runs the full flow and posts links to PRs.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "objectives",
+    "design_overview",
+    "ci_workflow_steps",
+    "commands_and_snippets",
+    "flamegraph_generation",
+    "gpu_profiling_notes",
+    "thresholds_and_alerting",
+    "runbook_quick_checks",
+    "troubleshooting_examples",
+    "open_questions",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_b2d5f104c0e64b2f9a6e41d21e0a5bf9"
+}

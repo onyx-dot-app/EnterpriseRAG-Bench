@@ -1,0 +1,33 @@
+{
+  "title": "asymmetric-throttle-pingburst-diary-jayden",
+  "owner": "Jayden Patel",
+  "drive_area": "users",
+  "path": "users/asymmetric-throttle-pingburst-diary-jayden",
+  "doc_type": "doc",
+  "created_at": "2025-04-18",
+  "last_modified": "2025-04-22",
+  "collaborators": [
+    "Riley Chen",
+    "Marta Alvarez"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "burst",
+    "kv-cache",
+    "p99",
+    "microburst"
+  ],
+  "linked_artifacts": [
+    "JIRA: INF-1123",
+    "GH: redwood/runtime#768",
+    "notion:perf-playbooks/asymmetric-throttle"
+  ],
+  "content": "Purpose:\\nQuick scratchpad for the asymmetric throttle / pingburst experiment series. Trying to capture the run plan, raw observations, and next actions while it\u2019s still fresh. This is a messy lab note; expect TODOs and shorthand.\\n\\nSummary (one-liner):\\nWe observed a persistent p99 spike when alternating high-frequency microbursts with long idle gaps under an asymmetric throttle policy. Warm-cache helps p50/p95 but p99 remains elevated due to preemption + cold-KV-cache refill.\\n\\nHypothesis: \\n- Asymmetric throttle (aggressive preempt on low-priority lane during idle) evicts useful KV cache periodically, causing long tail on first tokens of bursty requests.\\n- Preempt + kernel warmup (cuda kernels) creates compound cold penalties for microbursts.\\n\\nEnvironment / setup:\\n- Model: llama-variant-13b-fp16 (quantized to 4-bit in some runs)\\n- Runtime: redwood-runtime v0.19.2 (local dev cluster)\\n- HW: 1x A100-40GB, driver 535.86, CUDA 12.1\\n- Serving config:  max_concurrency=16; per-request priority lanes: high/low; asymmetric throttle: low-lane preempt_threshold=60s, eviction-policy=aggressive\\n- Batching: continuous batching enabled; batch_timeout_ms=10 or 30 (varied)\\n- KV cache: per-model local cache (capacity ~ 6GB), eviction LRU-like but with lane-weight adjustments\\n- Arrival pattern: custom pingburst generator (python) \u2014 pattern = [idle 45s, 6 bursts of 50 req/s for 3s each, 10s gap between each microburst]. Payloads small (avg 30 tokens). Duration 20 minutes per run.\\n\\nMetrics collected:\\n- latencies: p50/p90/p95/p99, tail-heap (99.9)\\n- throughput: tokens/s and req/s\\n- kv_cache: hit-rate (prefix / token-level), eviction count per minute\\n- system: GPU util, memcpy stalls, kernel launch time distribution\\n\\nRepresentative run (warm cache vs cold after long idle):\\nCSV snippet (run A = aggressive eviction, run B = conservative eviction):\\n\\nrun,phase,p50_ms,p95_ms,p99_ms,kv_hit,reqs\\nA,burst-1,32,78,420,0.63,290\\nA,burst-2,30,81,450,0.59,300\\nA,burst-3,28,74,510,0.52,305\\nB,burst-1,34,76,120,0.88,295\\nB,burst-2,33,79,130,0.85,298\\nB,burst-3,31,75,125,0.86,302\\n\\nNotes on the numbers:\\n- Run A shows p99s in 400\u2013500ms range during later bursts; kv_hit steadily drops across bursts (evictions happening between bursts).\\n- Run B with conservative eviction keeps kv_hit ~85% and p99 ~120\u2013130ms stable.\\n\\nTrace observations (stack sampling & kernel logs):\\n- High p99 traces show: stalled on KV fetch (host->device memcpy) + a few kernel cold-launch events immediately after preemption.\\n- Many p99 traces include a ~200ms host-side wait (scheduling + stall) before GPU work starts.\\n\\nQuick ASCII chart (p99 over time, simplified):\\nTime -> |---burst1---|---burst2---|---burst3---|\\nRunA p99 -> 420ms -> 450ms -> 510ms\\nRunB p99 -> 120ms -> 130ms -> 125ms\\n\\nQualitative observations: \\n- Warm-cache effect: first burst after long idle is always worse. If gaps <15s p99 stabilizes. The current aggressive preempt threshold (60s) means useful entries get evicted during the long idle windows.\\n- Batching/timeout: increasing batch_timeout_ms to 30ms reduced p50 slightly but had no impact on p99 spikes triggered by cache misses.\\n- Quantized vs fp16: 4-bit runs show similar relative patterns; absolute p99 slightly lower (fewer GPU ops) but still dominated by host->device and scheduling penalty.\\n- Preemption behavior: we\u2019re seeing lane-switching cost that is not purely GPU compute \u2014 kernel context setup + KV rehydration cost is dominant.\\n\\nOpen questions / TODOs:\\n- Is eviction aggressive because of absolute memory cap or because lane-weighted eviction favors short-lived low-lane entries? Check eviction logs + make an instrumentation flag to tag entries by lane and age.\\n- Replay with pinned memory for KV buffers to measure host->device memcpy delta.\\n- Run with no preemption (disable lane preempt) as a control to isolate preempt vs eviction.\\n- Measure cold kernel launch cost in isolation (microbenchmark launching same kernels repeatedly).\\n- Try a tiny on-disk vs in-GPU cache to see if miss penalty changes ordering.\\n\\nQuick next-run plan (priority order):\\n1) Instrument eviction logs to include lane tag + sequence id (GH PR quick change). (2d)\\n2) Control run: disable preemption for low lane, run same pingburst pattern (1d)\\n3) Pinned-mem experiment: allocate KV buffers pinned and repeat (1d)\\n4) Kernel microbenchmark for launch cost (0.5d)\\n\\nPotential mitigation ideas (sketch):\\n- Short-term: raise preempt_threshold to 120s for low-priority lane if expected idle windows >30s, or switch to time-windowed eviction that preserves hot prefixes for x minutes after last access.\\n- Mid-term: *lazy rehydrate* \u2014 keep lightweight pointer info on host, only copy full KV pages on demand with async prefetch triggered at ~50ms into burst.\\n- Long-term: policy aware eviction that weights prefix reuse probability (derived from telemetry).\\n\\nRandom notes to self: \\n- saw occasional OOM during a pinned-mem run last week \u2014 double-check accounting (might be double counted across worker threads).\\n- talk to SRE about kernel-launch queue depth logs (marta?).\\n\\nConclusions (draft):\\nAggressive eviction + preemption under long idle windows explains the high p99 tails for microbursts. Simple policy tweaks (less aggressive eviction or longer preempt threshold) produce big wins; however, the root cause also includes host->device copy + kernel cold penalties that need targeted microbenchmarks to fully quantify.\\n\\nLinks / refs:\\n- GH PR: redwood/runtime#768 (eviction change branch)\\n- JIRA: INF-1123 (asymmetric-throttle investigation)\\n- Run artifacts: gs://perf-logs/asym-throttle/2025-04-18/*\\n\\nEnd of scratchpad.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_5a7989d628e7437b93277243139b4a92"
+}

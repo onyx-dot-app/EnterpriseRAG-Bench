@@ -1,0 +1,35 @@
+{
+  "title": "ProbeFlow troubleshooting transcript",
+  "owner": "Maya Chen",
+  "drive_area": "users",
+  "path": "users/probeflow-troubleshooting-transcript.json",
+  "doc_type": "doc",
+  "created_at": "2026-02-20",
+  "last_modified": "2026-03-12",
+  "collaborators": [
+    "Liam O'Rourke",
+    "Sofia Patel"
+  ],
+  "team": "eng-routing",
+  "status": "draft",
+  "tags": [
+    "probeflow",
+    "routing",
+    "failover",
+    "debug",
+    "regional-failover",
+    "egress",
+    "playback"
+  ],
+  "linked_artifacts": [
+    "JIRA: ROUTE-8421",
+    "GitHub PR: https://github.com/redwood-inference/routing/pull/1283",
+    "Slack: https://redwood.slack.com/archives/C03ROUTING/p1672531234000"
+  ],
+  "content": "Quick scratchpad from local repro + playback for the 2026-02-18 regional failover event affecting eu-west-1->eu-north-1 steering. This is messy; steps, commands and raw snippets kept for traceability.\n\nContext and visible symptom\n- Around 2026-02-18T21:34:XXZ we saw a surge of 502s for a subset of requests pinned to model x-heavy-2 on eu-west-1.\n- Smart router started ejecting backends for the shard, but some requests were routed to an isolated region (eu-north-1) where the model variant was not compatible (quantized mismatch), causing RPC failures that cascaded into short-lived 503s.\n- Incident linked to ROUTE-8421 (spike + partial capacity drain).\n\nWhat I tried locally (commands and rationale)\n1) Quick indicator queries against debug endpoints to see routing decision path\n- curl -s 'https://staging.api.redwood.internal/route-debug?req_id=20260218-abc123' -H 'Authorization: Bearer REDACT'\n- Expected: JSON with selected route vector and fallback metadata. Observed: route_vector shows region_priority [eu-west-1, eu-north-1], fallback_policy: prefer_compatible=false, elected_eject_reason: 'latency_spike'.\n\n2) Pull router logs for request id and surrounding timeframe\n- kubectl logs -n routing router-ccf8 -c router --tail 500 | grep '2026-02-18T21:34' -A6 -B4 | sed -n '1,200p'\n- Snippet observed: \n  2026-02-18T21:34:12.112Z INFO router decision req=20260218-abc123 route=eu-west-1 pool=primary eject=latency_spike\n  2026-02-18T21:34:12.118Z WARN router fallback req=20260218-abc123 fallback_target=eu-north-1 mismatch=quantization_profile\n  2026-02-18T21:34:12.121Z ERROR rpc dial req=20260218-abc123 target=eu-north-1 err='incompatible-kernel: q4_0 not supported by runtime'\n\n3) Validate model variant compatibility matrix used by smart router\n- git clone .../routing-config && grep -n 'x-heavy-2' -R config/variants\n- local table shows x-heavy-2@eu-north-1 -> q4_0, but runtime profile for eu-north-1 pool shows compiled_kernels: [q8_0, q5_0] (mismatch).\n\n4) Repro via replay tool (probeflow-playback) to confirm sequence of decisions\n- probeflow-playback --input replay/2026-02-18/events.ndjson --start '2026-02-18T21:33:50Z' --end '2026-02-18T21:35:00Z' --router-config staging\n- Observed: deterministic path where router attempts primary, then fallback to eu-north-1, immediately hits incompatible kernel, drops to overall error. Playback shows missing compatibility gating in fallback code path.\n\nRaw error snippets captured\n- rpc error: incompatible-kernel: q4_0 not supported by runtime\n- fallback decision: prefer_compatible flag not checked for route override\n- kernel-negotiation: negotiated_profile=null, requested=q4_0\n\nHypotheses (ranked)\n1) Fallback policy code path bypasses the compatibility check for performance reasons when eject reason is latency_spike. Repro confirmed in playback logs where prefer_compatible is unset.\n2) Model variant metadata propagation delay: catalog update for eu-north-1 missing compiled_kernels field at time of event, causing router to assume compatibility.\n3) Batching/caching heuristic interacting: prefix caching returned a key that selected quantized variant not present on fallback region. Less likely but traces include a cache-hit header at time of fallback.\n\nImmediate mitigations tested\n- Hotfix branch: enforce prefer_compatible=true when fallback occurs due to eject=latency_spike. Deployed to staging, re-ran playback, replay no longer selected incompatible region.\n- Temporary routing rule: pin x-heavy-2 to eu-west-1 for 10 minutes while rollout verification runs. Verified in console that traffic stayed in region.\n\nEvidence for/against hypotheses\n- For hypothesis 1: Playback shows code path where prefer_compatible flag is only evaluated during normal route selection, not in eject-driven fallback. Code snippet line numbers in PR referenced in linked_artifacts.\n- For hypothesis 2: Catalog audit shows a single missing compiled_kernels key for eu-north-1 between 21:10 and 21:36 UTC due to a flaky config push by infra. That window overlaps incident. This supports metadata delay theory.\n\nNext actions (short and concrete)\n- Short term: backfill compiled_kernels for eu-north-1 from artifact store and push emergency config. Add a validation check at apply-time to fail if compiled_kernels missing. Owner: Liam. ETA: 2 hours.\n- Medium term: modify fallback code to explicitly require compatibility on any fallback that was triggered by eject reasons relating to model capability (latency_spike, overload). Owner: Maya. ETA: next dev cycle.\n- Postmortem: assign, include sequence diagrams from probeflow-playback, timeline, and impact numbers. Owner: SRE lead. ETA: before weekly ops review.\n\nNotes on observability improvements\n- Add a routed_decision.trace field that records the exact compatibility check outcome (pass/fail) and the catalog rev used.\n- Emit metric fallback_incompatible_count by model variant and by eject_reason.\n\nPlaybook snippets to include in postmortem\n- How to quickly pin model variants to region via console: steps 1..4 (copy from ops-runbook).\n- Rollback checklist for config push: verify compiled_kernels across regions, run simple compatibility probe across pools, then unpause routing.\n\nTL;DR\n- Root cause likely twofold: temporary catalog metadata omission + code-path that allowed fallback without compatibility gating. Repro done with probeflow-playback. Immediate mitigations validated in staging.\n\nAppendix: useful commands used during triage\n- curl route debug as above\n- kubectl logs -n routing router-ccf8 -c router --since=30m | grep 'req=20260218-abc123' -n\n- jq usage to inspect replay event: cat events.ndjson | jq 'select(.req_id==\"20260218-abc123\")'\n- probeflow-playback command line captured earlier\n\nOpen questions I still have\n- Was there a concurrent config rollout to eu-north-1 at 21:10 that we can correlate to infra deploy logs? (I saw a failed apply in infra-audit but need confirmation)\n- Why did the cache return a quantized key \u2014 where is prefix -> variant mapping getting populated?\n\nWill update this doc with links to playbook and postmortem once those are created.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_aef5990e3764474781c670052806057d"
+}

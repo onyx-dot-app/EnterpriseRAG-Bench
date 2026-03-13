@@ -1,0 +1,35 @@
+{
+  "title": "Signal Runner: field notes for alert triage and cohort comparisons",
+  "owner": "Priya Khandelwal",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/signal-runner-field-notes.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-14",
+  "last_modified": "2025-03-01",
+  "collaborators": [
+    "Marco Alvarez",
+    "Elena Park",
+    "Samir Gupta"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "triage",
+    "dashboards",
+    "canary-comparison",
+    "kv-cache",
+    "observability",
+    "playbook"
+  ],
+  "linked_artifacts": [
+    "JIRA: SERV-4821",
+    "Slack: #runtime-observability (thread: feb-13/regression)",
+    "github.com/redwood-inference/serve/PR#1284"
+  ],
+  "content": "Purpose:\nQuick-running notes from the nightly/early-morning runs where I exercise the new alert signals and compare two live cohorts (control vs. new-routing). This is a scratchpad used during triage runs and will evolve into formal playbook steps once we stabilize the checklist.\n\nHigh-level hypothesis pattern I use when an alert spikes: \n1) Is this signal global or route-scoped? (check per-route panels first)\n2) Did shape change (p50/p95/p99) or only the tail/variance?\n3) Are token-paths/kv-cache hits correlated?\n4) Are worker-level resource counters (GPU utilization, RT mem) changing?\n5) Did routing/compile kernels change in last deploy window?\n\nQuick dashboard checklist (order matters):\n- Route overview: requests/sec, error-rate, p50/p95/p99 latency (last 1h vs. baseline 24h)\n- Token accounting: tokens-per-request distribution, per-route token cost breakdown\n- KV cache: hit-rate by model+route, eviction rate, cache occupancy by shard\n- Batching: average batch size, queue-time, throttle events\n- Resource telemetry: GPU util, CPU steal, IO wait, swap usage (if any)\n- Canary cohorts: cohort A (control) vs cohort B (new-routing) side-by-side percentiles and sample traces\n\nUseful PromQL snippets I run (copy-paste friendly):\n- p95 latency per route: histogram_quantile(0.95, sum(rate(request_duration_seconds_bucket{route=~\"$route\"}[5m])) by (le))\n- kv cache hit rate: sum(rate(kv_cache_hits_total{model=~\"$model\"}[5m])) / sum(rate(kv_cache_requests_total{model=~\"$model\"}[5m]))\n- batch queue time: avg_over_time(batch_queue_time_seconds{pool=\"$pool\"}[5m])\n\nTrace sampling approach:\n- Increase sampling on impacted route (trace-sampler override) for 30 minutes.\n- Pull 20 longest tail traces and 10 median traces from each cohort.\n- Use trace playback tool to replay top-3 tail traces in local microbench with controlled token-length to reproduce.\n\nReproduction recipe I use locally (microbench):\n- Recreate request headers + sequence length distribution using anonymized sample payloads.\n- Run 100 synthetic calls to replicate observed batch and queue patterns.\n- Toggle KV cache on/off to see delta in worker-side duration.\n- If kernel-compile path suspected, pin model variant to previous image and compare.\n\nCommon root causes discovered in prior runs (notes):\n- Regression A: small change in kernel scheduling bumped evicted KV entries causing extra forward passes \u2014 manifested as p99 spikes only on long token requests. (See SERV-3710)\n- Regression B: routing policy introduced cross-region fanout for a small fraction of requests, increasing median queue-time and visible in per-worker queue-size heatmaps.\n- Regression C: autoscaler cooldown misconfiguration led to transient underprovisioning during traffic bursts \u2014 visible as step-changes in queue-time with no increase in request rate.\n\nDecision matrix for quick mitigation:\n- If delta is >40% p95 and cohort B worse: rollback routing change or divert traffic back to control (fast rollback).\n- If tail-only and related to long sequences: enable prefix-caching override and increase KV cache retention for affected model shard.\n- If resources saturated across both cohorts: scale up pool, enable emergency-burst-capacity, and file infra incident.\n\nSample session from 2025-02-28 (actual triage timeline):\n- 02:10: Alert fired: p99 latency for route \"/chat/stream\" +420ms (baseline: 900ms -> 1320ms).\n- 02:12: Dashboard inspection: cohort B p50 ~ same, p95 +10%, p99 +46%. KV hit-rate for cohort B dropped from 88% -> 62% in last 20m.\n- 02:20: Increased trace sampling + collected 25 traces. Playback reproduced 30\u201340ms extra per-token in forward path on cohort B.\n- 02:35: Hypothesis: k-v cache churn due to newly-deployed eviction policy (PR #1284).\n- 02:47: Mitigation: temporarily revert eviction setting via config flag; monitor.\n- 03:05: p99 for cohort B back to baseline within 8 minutes. Follow-up: schedule deeper profiling with memory alloc traces.\n\nNotes about canary comparisons that reduce noisy signals:\n- Use fixed-window percentiles (rolling 5m vs rolling 1h) to avoid alarm fatigue from transient spikes.\n- Normalize by tokens-per-request when comparing cohorts to make sure longer prompts don't bias p95.\n- Always compare the same model-version image; if we want to evaluate a new image, pin other variables (traffic mix, sequence length).\n\nOpen questions / To-dos (short):\n- Automate cohort-normalized dashboards that show per-token percentiles (Samir owns) \u2014 ticket SERV-4890.\n- Add a lightweight A/B diff panel that highlights delta-only signals (percent change + confidence) \u2014 proposal needed.\n- Investigate correlation between background GC pauses and tail latency on worker type g4dn-like machines.\n\nAction items from this file: \n- [ ] Add a canned query for \"kv-cache eviction churn\" to the triage dashboard. (Owner: Marco)\n- [ ] Create a small runbook for trace-playback reproduction to be shared with on-call (Owner: Priya).\n- [ ] Post-run retrospective in #runtime-observability with summary and link to PR/rollback notes.\n\nMeta: format & intended audience\n- This is intentionally informal and acting as a daily lab notebook. Intended audience: SREs, serving eng, and applied ML folks who jump into night triage. When stable, we will condense into a proper runbook in Confluence and attach example queries and playback scripts.\n\nRaw scratch snippets (logs / commands I used):\n- curl -H 'X-Cohort: B' https://api.redwood.dev/chat/stream -d @sample-long.json --output /tmp/trace.raw\n- python tools/playback.py --trace /tmp/trace.raw --iterations 10 --pin-model rwd-v1-7b\n- psql perf_db -c \"select time_bucket('1m', ts) as t, percentile_cont(0.95) within group (lat) as p95 from requests where route='/chat/stream' and cohort='B' and ts > now() - interval '1 hour' group by t order by t desc limit 60;\"\n\nIf you use anything in here during an incident, please add a short note at the bottom with timestamp and outcome so we can iterate on the checklist.\n\n-- Priya K.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_0aea8e412e984badb5f232a823678293"
+}

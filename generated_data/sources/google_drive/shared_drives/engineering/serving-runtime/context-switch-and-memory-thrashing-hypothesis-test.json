@@ -1,0 +1,34 @@
+{
+  "title": "context-switch-and-memory-thrashing-hypothesis-test",
+  "owner": "Maya Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/context-switch-and-memory-thrashing-hypothesis-test.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-11",
+  "last_modified": "2025-02-18",
+  "collaborators": [
+    "Rafael Gomez",
+    "Priya Kapoor",
+    "Linus Park"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "latency",
+    "kernel",
+    "nvlink",
+    "driver",
+    "investigation"
+  ],
+  "linked_artifacts": [
+    "JIRA-RT-842",
+    "github.com/redwood-inference/serving-runtime/pull/337",
+    "confluence.redwood/internal/rt-kv-thrashing"
+  ],
+  "body": "Summary:\nThis doc captures an exploratory investigation into an intermittent tail-latency pathology we observed for long-context decode workloads. Hypothesis: elevated host context-switch rate + uncontrolled memory working sets (page migration + DMA churn for KV spill) combine to create periodic memory-thrashing that amplifies kernel launch latencies and causes p95/p99 spikes on some cloud SKUs (notably L40S variants).\n\nWhy this matters:\n- Customers using long-context streaming (16k-64k prefix) see occasional 2-4x p99 increase even when p50 is stable.\n- Unclear root-cause across SKUs and driver versions; need reproducible experiments and mitigations (thread pinning, cgroups, prefetching, spill backpressure).\n\nObserved behaviour (short notes):\n- Problem appears more common on L40S and older A100 SKUs when CUDA driver is 11.8 or early 12.x builds. H100/A100 newer drivers less frequent but not immune.\n- Spikes correlate with: host CPU context-switch rate (voluntary+involuntary), kernel scheduler migrations, and elevated DMA activity on PCIe lanes.\n- eBPF traces show series of small syscalls from worker threads around the time of spike (flushes, mmap/fadvise on spill files).\n\nExperimental setup (replicable):\n- Model: trimmed-124M synthetic decoder with long-kv (configured to emulate 32k context).\n- Serving runtime: local dev build from branch perf/kv-thrash (PR 337).\n- Cloud SKUs tested: GCP L40S (a2-like), AWS p4d (v1), Azure ND96asr_v4 (proxy A100); mix of 1x and 2x GPU nodes.\n- Drivers/CUDA: 11.8, 12.1, 12.2rc; NVIDIA driver versions 525.xx, 535.xx (where available).\n- OS: Ubuntu 22.04; kernel 5.15 and 6.2 variants where noted.\n- Tools: perf (cycles, cs), bcc/eBPF trace, nvml metrics, nsys snapshots, pidstat/psrecord for thread-level CPU, iostat for NVMe throughput.\n\nKey commands used:\n- perf stat -e context-switches,cs,cycles -p <pid> -- sleep 60\n- sudo /usr/local/bin/trace_kv_spill.sh (attaches eBPF to fs events)\n- nsys profile --output=nsys-spike.nsys --trace=cuda,osrt --duration=30s -p <pid>\n\nRepresentative results (summary):\n- L40S, CUDA 11.8, driver 525: p50 18ms, p95 42ms, p99 186ms (spike windows ~3\u20136s every ~70\u2013120s)\n- p4d (A100), CUDA 12.1, driver 535: p50 16ms, p95 35ms, p99 78ms (rare small spikes, correlated with host IO bursts)\n- ND96 (A100), CUDA 12.2rc: p50 15ms, p95 34ms, p99 92ms (some p99 events tied to page-fault storms)\n\nDeeper signals:\n- perf reports show context-switches increase by 3\u20136x in spike windows; involuntary switches up by 2\u20134x.\n- nsys shows increased kernel launch latency average for the small CUDA kernels involved in decode loop (register spilling and memcpy peaks).\n- NVML/PCIe counters: increased PCI util/req during spikes; on L40S we saw elevated PCIe-retry counters on some hosts.\n- eBPF trace: frequent small file I/O operations (fsync/fdatasync) from spill manager thread just before spike start. Suggests spill flush + metadata ops trigger page migration path on host.\n\nHypothesis (detailed):\n1) Runtime triggers small, frequent spill file writes (kv spill) when memory pressure high during long contexts.\n2) Spill manager does synchronous fs metadata ops (fadvise, fsync) that cause kernel threads to wake and do work => high voluntary syscalls.\n3) Combined with host background IO (snapshotting, antivirus, cloud agent), scheduler churn increases context-switches and migrations into dirty page reclaim paths.\n4) DMA engines and PCIe transaction bursts interfere with small kernel-launch latency by delaying interrupt handling and MMIO for GPU launches.\n5) Result: a short window (seconds) of amplified per-kernel latency and queueing => p99 spikes.\n\nQuick checks we ran to validate parts of the hypothesis:\n- Disabled spill fsync (make it async) -> spike frequency reduced by ~60% on L40S.\n- Pinning spill manager thread to dedicated CPU and setting SCHED_FIFO at low priority reduced involuntary switches; p99 improved ~30% in noisy hosts.\n- cgroups blkio limits throttled NVMe write bursts; spikes less frequent but throughput lower.\n\nActionable mitigations (short-term):\n- Make spill writes coalesced and asynchronous by default in runtime (PR 337 contains a WIP patch).\n- Recommend thread pinning and SCHED_BATCH/SCHED_FIFO for spill/IO threads in long-context serving mode.\n- Add optional backpressure on spill when host PCIe/utilization passes threshold (via nvml).\n\nLonger-term work (tracking):\n- Run controlled factorial experiment across: (SKU: L40S, A100, H100) x (CUDA: 11.8,12.1,12.2) x (kernel: 5.15,6.2) to quantify interactions. (See JIRA-RT-842).\n- Add finer telemetry around fs IO latencies, context-switch counts and DMA outstanding counters into the console dashboard for Dedicated customers.\n- Investigate kernel patch/config interactions that reduce PCIe retry storms on L40S hosts (collab with infra).\n\nNotes / next steps:\n- Rafael to land async-spill draft and smoke test across p4d and L40S (ETA 2025-02-20).\n- Priya to reproduce on H100 nodes and run nvlink-specific traces (ETA 2025-02-22).\n- Maya to set up factorial job matrix and collect structured traces for offline analysis (ETA 2025-03-01).\n\nAppendix: quick checklist for reproducer run\n1) checkout perf/kv-thrash branch, build with -O2, debug symbols.\n2) Launch single model worker, warm KV cache with 16k tokens, then inject continuous decode requests (1 req/s, 512 gen) for 15m.\n3) Collect perf, nsys, nvml logs, and iostat every 2s.\n4) If spike seen, run eBPF fs-trace to capture syscall pattern, then collect /proc/interrupts and dmesg.\n\nUnresolved questions:\n- Why are some L40S hosts more sensitive than others (same image/driver)? Suspect BIOS/PCIe hw config and cloud host firmware differences. Need infra colab.\n- Are there kernel-level scheduler knobs we can tune safely for Dedicated customers?\n\nIf you have additional ideas or can run the reproducer on any SKU we haven't covered, add notes here and tag JIRA-RT-842.\n\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_d298ae8d6b2b461cbe5bc280683525e2"
+}

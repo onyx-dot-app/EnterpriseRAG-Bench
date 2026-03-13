@@ -1,0 +1,35 @@
+{
+  "title": "Fleet headroom cliff extract \u2014 saturation & spillover diagnostics",
+  "owner": "Riley Thompson",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/infrastructure",
+  "doc_type": "sheet",
+  "created_at": "2026-11-04",
+  "last_modified": "2026-11-06",
+  "collaborators": [
+    "Aisha Patel",
+    "Daniel Kim",
+    "Marta Ruiz"
+  ],
+  "team": "eng-infrastructure",
+  "status": "in_review",
+  "tags": [
+    "gpu",
+    "capacity",
+    "saturation",
+    "queueing",
+    "throttle",
+    "postmortem"
+  ],
+  "linked_artifacts": [
+    "JIRA-OPS-1214",
+    "confluence://infra/incident-2026-11-headroom-cliff",
+    "https://github.com/redwood-inference/serving-runtime/pull/987"
+  ],
+  "content": "Purpose:\nThis sheet collects the raw telemetry and slices needed to diagnose the Nov 3\u20134 'headroom cliff' event: a rapid loss of region headroom that produced cascading queueing, cross-region spillover, and elevated throttle rates for hosted customers. Goal is to produce reproducible aggregates for the postmortem and support actionable mitigations (autoscale tuning, routing changes, emergency capacity playbook).\n\nSummary of incident (producer timeline):\n- Window: 2026-11-03 22:10 UTC \u2192 2026-11-04 03:05 UTC \n- Trigger: unexpected sustained bursts from a set of high-seq-length customer workloads + a small region-level preemption wave that reduced available GPU slots by ~18% at 22:18 UTC.\n- Observed effects: p50/p95 latency drift, queue depth growth on N. Virginia (us-east-1), burst spillover to europe-west-1 routes, and throttle counts increased on hosted tier for models with long context.\n\nPrimary hypotheses to test with data pull:\n1) Preemption-induced headroom loss amplified batching pressure (increased per-GPU queue depth and batch latency).\n2) Workload-sequencing: sudden high-seq requests produced KV cache churn, which increased per-token compute and reduced sustained throughput.\n3) Smart routing fallback logic sent traffic to secondary regions before headroom stabilized, causing cold-start-like latency spikes and additional queue pressure.\n\nRequired telemetry slices (export each as CSV with consistent timestamp granularity, 1s and 1m aggregates):\n- per-timestamp, region, rack, host: gpu_util_pct, allocated_gpus, free_gpu_slots, preempt_count, last_maintenance_flag\n- request-level traces (sampled 0.1%): request_id, timestamp, region_inbound, model_id, seq_len, kv_cache_hit, tokens_produced, token_latency_ms, error_code, route_via_region\n- queue telemetry: region, queue_name, queue_depth, oldest_age_ms, inflight_batches, batch_size_mean, batch_latency_ms\n- throttle records: tenant_id_hash, timestamp, throttle_reason, throttle_action, throttle_count_window_1m\n- routing decisions: request_id, decision_path, fallback_reason, routing_policy_version\n\nSuggested SQL / query snippets (run against telemetry warehouse):\n--- per-host headroom probe ---\nSELECT\n  date_trunc('minute', ts) AS minute,\n  region,\n  host_id,\n  avg(gpu_util_pct) AS gpu_util_p50,\n  max(queue_depth) AS max_queue_depth,\n  sum(preempt_count) AS preempt_sum,\n  max(allocated_gpus) - sum(free_gpu_slots) AS consumed_slots\nFROM infra_gpu_telemetry\nWHERE ts BETWEEN '2026-11-03T21:30:00Z' AND '2026-11-04T04:30:00Z'\nGROUP BY 1,2,3\nORDER BY minute, region;\n--- KV cache churn correlation ---\nSELECT\n  date_trunc('minute', r.ts) AS minute,\n  r.region,\n  avg(r.seq_len) AS seq_len_avg,\n  avg(r.kv_cache_hit::int) AS kv_hit_rate,\n  avg(h.gpu_util_pct) AS gpu_util_avg\nFROM requests_sampled r\nJOIN infra_gpu_telemetry h ON date_trunc('minute', r.ts)=date_trunc('minute', h.ts) AND r.region=h.region\nWHERE r.ts BETWEEN '2026-11-03T22:00:00Z' AND '2026-11-04T02:30:00Z'\nGROUP BY 1,2\nORDER BY minute;\n--- routing spillover trace ---\nSELECT\n  date_trunc('minute', ts) AS minute,\n  decision_path,\n  count(*) AS routed_count\nFROM routing_decisions\nWHERE ts BETWEEN '2026-11-03T22:10:00Z' AND '2026-11-04T03:30:00Z'\nAND fallback_reason IS NOT NULL\nGROUP BY 1,2\nORDER BY minute DESC;\n\nSampling guidance and export size estimates:\n- 1s-granularity per-host telemetry for full region (~200 hosts) for 6 hours ~ 4.3M rows CSV (~600MB). Use 1m aggregates for dashboarding to reduce volume.\n- Request-level sampling 0.1% should yield ~120k rows for the window (typical). Increase to 1% if correlation noise is too high.\n\nImmediate diagnostic charts to produce (attach PNGs):\n- Region headroom timeseries: allocated_gpus vs free_slots vs preempt_sum (1m)\n- Queue depth heatmap by region \u00d7 minute\n- KV cache hit rate vs avg seq_len \u00d7 minute overlayed with gpu_util\n- Throttle rate per tenant cohort (hosted vs dedicated)\n- Routing fallback rate and target region inflow\n\nPreliminary observations from quick samples (Riley 2026-11-04 10:30 UTC):\n- Preemptions concentrated on a small set of hosts in us-east-1 between 22:16\u201322:21 UTC (confirmed by preempt_count spikes).\n- Several long-sequence customers spiked at 22:12\u201322:25 UTC; sampled requests showed kv_cache_hit dropped from 0.86 \u2192 0.44 for those models during the spike window.\n- Routing policy v2.3.1 sent ~27% of overflow to europe-west-1 within the first 5 minutes; those requests saw p95 token latency increase by 2.1x relative to baseline.\n\nActionable next steps (owners):\n- infra/sre (Daniel Kim): produce full per-host 1m aggregates and chart headroom overlay (due 2026-11-06).\n- serving-runtime (Marta Ruiz): review preemption patterns and whether preemption throttles were aggressive; propose temporary backoff config (due 2026-11-07).\n- product/console (Aisha Patel): evaluate routing policy rollback impact and simulate alternate fallback thresholds (due 2026-11-08).\n\nData export checklist for postmortem:\n- [ ] attach CSVs: per-host-1m.csv, request-sample-0_1pct.csv, queue-timeseries-1m.csv, throttle-logs.csv, routing-decisions.csv\n- [ ] include sampling parameters and query text in postmortem appendix\n- [ ] annotate key timestamps in charts and mark confirmed preemption spikes\n\nNotes and open questions:\n- Need to confirm whether cloud provider maintenance jobs coincided with preemptions; request cloud-provider maintenance logs for 2026-11-03 21:45\u201322:30 UTC.\n- Should we enable short-term region-level admission control to prevent aggressive spillover? Simulation required before production change.\n\nRaw query history and saved views:\n- Saved view: infra.headroom_minute_2026_11_03\n- Saved view: analytics.routing_fallback_spill_202611\n\nRevision history:\n- 2026-11-04: initial draft and quick-sample observations (Riley)\n- 2026-11-05: added SQL snippets and export guidance (Daniel)\n- 2026-11-06: formalized owners and action items; switched status -> in_review (Marta)\n\nEnd of sheet.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_c22683abf96b4e4cbe4652e837202746"
+}

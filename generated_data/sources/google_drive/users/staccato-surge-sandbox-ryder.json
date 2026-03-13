@@ -1,0 +1,34 @@
+{
+  "title": "Staccato surge sandbox \u2014 microburst soak notes",
+  "owner": "Ryder Chen",
+  "drive_area": "users",
+  "path": "users/staccato-surge-sandbox-ryder.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-20",
+  "last_modified": "2025-03-02",
+  "collaborators": [
+    "Imani Park",
+    "Noor Patel"
+  ],
+  "team": "performance-eng",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "microburst",
+    "kv-cache",
+    "batching",
+    "soak-test",
+    "staccato"
+  ],
+  "linked_artifacts": [
+    "JIRA-PERF-842",
+    "https://github.com/redwood-inference/serving-runtime/pull/456",
+    "confluence:perf/staccato-surge-brief"
+  ],
+  "content": "Objective:\nRun a set of microburst / staccato arrival patterns against a small dedicated cluster to see: 1) how often cold-KV-cache penalties show up in p99, 2) whether transient batching improves or worsens p95 under tiny bursts, and 3) how admission and queueing behave when burst spacing is sub-second. Quick note: 'staccato' = very short bursts separated by variable quiet windows (mimics interactive assistant spikes).\n\nTestbed summary:\n- Cluster: 3 x A10G-equivalent nodes, each with 40GB GPU RAM, 8 vCPU worker agents\n- Serving binary: runtime v2.7.1 (local build with microbatching toggle)\n- Model: open-llama-13b-8bit (quantized FP16->int8-like path for throughput)\n- KV cache: server-side 64k-entry LRU, per-tenant namespace, hit probe instrumentation enabled\n- Traffic generator: custom Python harness (staccato-driver) that can emit Poisson+burst mixing and exact microbursts; uses persistent connections and client-side warmup to avoid TLS noise\n- Measurement: internal tracing (trace_id), token-level timing, CPU/GPU utilization, queue-length histograms, batch size distributions, and tail latencies (p50/p95/p99) measured at gateway and node.\n\nScenarios executed (short):\n1) Baseline steady qps 40 RPS (single-token prompt), 10m soak.\n2) Staccato-1: 1s bursts of 200 RPS every 10s (duty 10%), keep for 15m.\n3) Staccato-2: sub-second microbursts: 200 RPS for 300ms every 6s.\n4) Staccato-3: randomized spacing (exp(mean=6s)) with microbursts of 150-350 RPS.\n5) Cold-cache restart: same as Staccato-2 but restart servers once during run to force cold KV cache + JIT paths.\n\nKey knobs toggled between runs:\n- microbatching: on/off\n- priority lanes: soft-priority vs single-lane\n- prefill aggregation window: 0ms, 10ms, 25ms\n\nRepresentative results (extracted aggregated summaries):\n- Baseline (steady 40 RPS): p50=12ms, p95=38ms, p99=84ms, avg batch size=1.9, kv_hit=87%\n\n- Staccato-1 (1s bursts / 10s): p50=15ms, p95=72ms, p99=320ms, avg batch size=3.4, kv_hit=82%\n  Observations: p99 dominated by a small set of cold-JIT and cache-miss traces during burst ramp-up. Gateway shows queue spikes up to 60 concurrent requests at burst peaks.\n\n- Staccato-2 (300ms bursts / 6s): p50=18ms, p95=140ms, p99=520ms, avg batch size=4.1 (but high variance), kv_hit=74%\n  Observations: sub-second bursts cause batching to grow erratically \u2014 batches accumulate quickly, then drain; some requests experience extra queuing while waiting to fill a batch. Microbatching improved throughput but shifted some percentiles worse.\n\n- Staccato-2 with prefill 10ms: p50=16ms, p95=95ms, p99=260ms, avg batch size=3.1, kv_hit=76%\n  Observations: small prefill window reduced worst tails and kept batch sizes modest. 10ms hit seemed a good sweet spot for this model/hardware combo.\n\n- Cold-cache restart run: sharp p99 spikes > 1.2s tied to first burst after restart, KV cache miss ratio jumped to 98% for first 90s, then decayed to baseline.\n\nResource/Counters (notes):\n- GPU util: peaks 78-92% during bursts, but frequent oscillation (sawtooth) in Staccato-2.\n- CPU utilization for inference workers spiked due to microbatch assembly and copy routines during microbursts.\n- Memory (host): no OOM but increased GC pressure in runtime when many tiny batches queued.\n\nTrace examples (anecdotal):\n- trace_id=tr-20250221-0043: request waited 28ms in queue (prefill window=0) then batch size=7, execution=43ms, end-to-end 93ms.\n- trace_id=tr-20250221-0043b: warm cache variant same burst: wait 8ms, batch=2, exec=16ms, end-to-end 30ms.\n\nQuick conclusions:\n- Microbursts sub-second are the worst offender for p99; batching that triggers too aggressively can make p95/p99 worse despite improving throughput.\n- Small prefill windows (5\u201315ms) reduce tail risk for these patterns by limiting over-aggregation.\n- KV cache warmup matters \u2014 if an application cannot tolerate the first-burst penalty, we need proactive priming or a warm shadow workload.\n- Priority lanes (soft-priority) help for keeping interactive p50 low but can increase overall jitter in tail latencies unless combined with prefill caps.\n\nNext experiments (TODOs):\n- Run same scenarios with runtime v2.8 candidate that has new batching scheduler (ticket JIRA-PERF-898).\n- Try adaptive prefill: start with 5ms and bump to 25ms if queue length > X (prototype in staccato-driver).\n- Add client-side jitter to burst spacing to see impact of synchronization across tenants.\n- Measure request-level cost delta (tokens * worker-ms) to quantify unit economics tradeoffs for microbatching vs prefill.\n\nOpen questions / loose thoughts:\n- Is there a good heuristic to bound max batch size during microbursts without harming throughput? (cap + per-request timeout?)\n- Could we pre-warm KV cache with light priming traffic timed shortly before expected bursts (prediction-driven)? Feels application-specific but could be offered as a managed feature.\n- Explore a hybrid lane: low-latency lane with strict batch cap + background aggregated lane for best-effort throughput.\n\nPractical notes for replication:\n- staccato-driver flags used: --burst-size 200 --burst-width 0.3 --period 6 --warmup 60s --connections 400\n- runtime flags: --microbatching={on,off} --prefill-window-ms={0,10,25} --priority-lanes={soft,single}\n- artifacts: saved traces under /tmp/staccato/2025-02-21/, raw telemetry dumps uploaded to S3 (s3://redwood-perf/staccato-2025-02-21/).\n\nAppendix: minimal ASCII summary table (p99 focused)\n\nScenario        | p50   | p95  | p99  | avg batch | kv_hit\n-------------------------------------------------------\nBaseline        | 12ms  | 38ms | 84ms | 1.9       | 87%\nStaccato-1      | 15ms  | 72ms | 320ms| 3.4       | 82%\nStaccato-2      | 18ms  |140ms | 520ms| 4.1       | 74%\nStaccato-2+10ms | 16ms  |95ms  | 260ms| 3.1       | 76%\nCold-restart    | 22ms  |180ms | 1.2s | 3.5       | 12% (initial)\n\nEnd notes: keep this file as a running lab notebook. If anyone wants raw traces or wants me to reproduce a specific run, ping me (ryder.chen@redwood.ai) or open JIRA-PERF-842.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_579ddcc3e28442e1aa120bd6a669edbb"
+}

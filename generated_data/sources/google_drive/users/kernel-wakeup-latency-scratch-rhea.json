@@ -1,0 +1,34 @@
+{
+  "title": "Kernel wakeup latency scratchpad",
+  "owner": "Rhea Patel",
+  "drive_area": "users",
+  "path": "users/kernel-wakeup-latency-scratch-rhea.json",
+  "doc_type": "doc",
+  "created_at": "2025-10-02",
+  "last_modified": "2026-02-28",
+  "collaborators": [
+    "Arjun Mehta",
+    "Lena Cho"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "kernel",
+    "wakeup",
+    "epoll",
+    "io_uring",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/4123",
+    "JIRA: INF-1934",
+    "confluence:Wakeup-Behavior-Notes-2025"
+  ],
+  "body": "Notes to self: kernel wakeup costs and effect on p99 at low qps\n\nContext\n- Problem: observed sporadic p99 spikes (~3-4x baseline) on small requests (<=128 tokens) when QPS is low-to-moderate (5-50r/s) and concurrency is 1-4 per container. Suspect: kernel wakeup latency and event loop wakeups on hotpath.\n- Goal: measure contribution of user/kernel transition (wakeup) to end-to-end token latency and test mitigations (io_uring, epoll busy-wait, thread-pin, timer granularity).\n\nQuick summary of experiments (dates recorded inline):\n1) baseline (epoll + polite sleep) \u2014 2025-10-05\n   - harness: local-single-core container (c6g.large-like), 1 worker thread pinned to core 2, event loop using epoll_wait with 10ms timeout fallback.\n   - load: 20r/s steady, payload: 40 tokens, mean server-side processing 6ms (mock).\n   - observed: p50=21ms, p95=47ms, p99=120ms (spikes every ~30s)\n   - notes: spikes correlate with periodic 10s GC-like workload in other thread \u2014 suggests cross-core wakeup penalty.\n\n2) epoll busy-poll (SO_BUSY_POLL) enabled \u2014 2025-10-12\n   - kernel param set: net.core.busy_poll=50 (ops), socket busy poll on accept fds for 50us\n   - observed: p50=19ms, p95=32ms, p99=60ms \u2014 big improvement on spikes but CPU up ~4%\n   - tradeoff: higher CPU, less wakeup penalty. Good for dedicated pools.\n\n3) switched to io_uring (liburing v2.5) \u2014 2025-11-03\n   - event loop rewired to submit/read with io_uring (sqe: readv/accept) + fixed-size SQ polling (ring->sq->poll) without timeouts.\n   - observed: p50=18ms, p95=28ms, p99=42ms. CPU similar to epoll busy-poll but smoother tail.\n   - artifact: a few OOMs if queue depth too low; need tuning for high concurrent accepts.\n\n4) thread pinning + cgroup cpuset isolation \u2014 2025-12-08\n   - pinned IO thread and worker thread adjacent cores (core 2 and 3), isolated background threads to cores 6-7.\n   - observed: p50=17ms, p95=25ms, p99=40ms. Spikes reduced frequency.\n\n5) timer granularity / kernel tick tweaks (tickless) \u2014 2026-01-19\n   - tested CONFIG_NO_HZ and sched_wakeup_granularity_ns adjustments (lowered from 5000000 -> 500000 ns on test vm).\n   - observed: minor gains; p99 improved by ~5-8% only. Hard to change in managed k8s clusters.\n\nMicrobench notes (how I measured)\n- harness script (local): ./scripts/wakeup_probe.sh \u2014 spawns N client threads, requests with fixed payload, records RTT on client and server processing time on server.\n- server logs include monotonic timestamps (CLOCK_MONOTONIC_RAW) at: accept, read-complete, queue-dequeue, request-start, request-end. Subtract queue-dequeue->request-start to isolate wakeup cost + scheduling jitter.\n- ran perf (kernel) sampling on hot threads: perf record -e sched:sched_wakeup -g -p $PID -o perf.data\n- also used 'ftrace' trace-points for sched_wakeup and sched_waking interactions; cheap but verbose.\n\nRepresentative raw numbers (one run, 20r/s, 1 worker):\n- avg scheduling latency (queue-dequeue -> request-start): 0.85ms\n- 75th: 1.2ms\n- 95th: 3.6ms\n- 99th: 19.8ms (rare outliers correlated with cross-core migrations)\n\nASCII timeline (single spike)\n[0ms] accept->enqueue -> (0.8ms) dequeue -> worker woke -> (0.004ms) start processing -> ...\nthen a spike trace:\n[0ms] accept->enqueue -> (0.8ms) worker sleep -> sched_wakeup -> (15ms) worker scheduled on different core -> start processing\n\nHypothesis and root causes (working):\n- cross-core wakeup penalty when target thread is parked deep-sleeping -> kernel must send IPI, scheduler picks core -> migration cost.\n- epoll_wait with long timeout causes threads to park; wakeup pays full penalty.\n- busy-poll reduces park frequency at cost of CPU.\n- io_uring can use polling and submission queue polling to eliminate kernel userspace roundtrips for IO completions (reduces latency).\n\nMitigations tried and notes:\n- SO_BUSY_POLL: works well for ephemeral low-latency workloads, but requires kernel support and increases CPU. Good candidate for Dedicated.\n- io_uring: best tail behavior in my tests; need to ensure kernel >=5.11 and liburing stable. Also careful with CQE overflow and fixed buffers.\n- thread pinning + cpuset: cheap wins, reduces cross-core migrations. Must ensure orchestration (kube) won't reschedule pods across nodes unexpectedly.\n- busy-loop hybrid: spin for 100us then park \u2014 good compromise when expecting bursts but saves CPU relative to full busy-poll. Implemented as spin-yield loop in user-space.\n\nOpen questions / next runs\n- test spin-then-park heuristic vs SO_BUSY_POLL on a fleet-like noise background (50% background CPU noise).\n- measure impact on aggregated cost: e.g., 5% CPU -> X% cost increase vs tail reduction savings at customer-level SLOs. Need to simulate token mix and per-token cost model.\n- confirm io_uring behaviour under heavy accept churn (benchmark 200 connections/s).\n- can we upstream a small runtime flag (busy_poll:off|spin:100us|io_uring) for customers to toggle per-deployment? Add to rollout config.\n\nQuick deployment notes\n- busy_poll requires CAP_NET_ADMIN to change socket options on some platforms; need user-space fallback.\n- io_uring requires recent kernel in Private deployments \u2014 note to solutions-engineering for installer checklist.\n\nTODOs\n- [ ] Run 3-day soak w/ io_uring on a dedicated pool and collect p99 cost tradeoffs (owner: Arjun)\n- [ ] Add telemetry metric: wakeup_latency_ms histogram and correlate with cgroup cpuset shifts (owner: me)\n- [ ] Draft short RFC for \"wake-optimized runtime mode\" and include knobs/expected CPU delta and gating for Dedicated only (owner: Rhea)\n\nRandom notes / snack ideas\n- maybe adaptively toggle busy-poll on traffic patterns: enable busy-poll for first 30s after pod spin-up then revert.\n- rough rule-of-thumb: if avg inter-arrival < 2ms then keep spin; otherwise park. Need to simulate.\n\nEnd of scratchpad.\n\n-- rhea",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_28a7f113031d4e669135524124e42e9e"
+}

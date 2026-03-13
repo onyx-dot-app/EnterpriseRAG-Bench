@@ -1,0 +1,35 @@
+{
+  "title": "Helios private deploy - KV cache & tail-latency scratch notes",
+  "owner": "Maya Patel",
+  "drive_area": "users",
+  "path": "users/helios-privdeploy-kvcache-incident-notes.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-12",
+  "last_modified": "2025-02-13",
+  "collaborators": [
+    "Ravi Singh",
+    "Evelyn Park",
+    "Jon Alvarez"
+  ],
+  "team": "eng-private-deployments",
+  "status": "draft",
+  "tags": [
+    "incident",
+    "kvcache",
+    "latency",
+    "private-deploy",
+    "investigation"
+  ],
+  "linked_artifacts": [
+    "JIRA: RED-4821",
+    "Confluence: /display/PRIV/Helios+Incidents",
+    "Slack: #privdeploys (thread ts: 1707744000.000200)"
+  ],
+  "content": "Summary:\nHelios (on-prem/private) reported repeated 5\u201310s tail latency spikes for text-generation routes 2025-02-11 22:00\u201302:00 UTC. Symptoms include transient 502/503s, large variance in per-token latency, and several worker restarts. This doc is my scratchpad: commands tried, raw error snippets, timeline, hypotheses, and draft comms to customer/infra teams.\n\nQuick hypothesis (working):\n- Recent model rollout (v2.3.1 -> v2.4.0) changed KV cache key shape and increased cache miss ratio, causing bigger KV re-materialization and slower token generation.\n- That extra memory pressure caused GPU memory to fragment and sometimes trigger fallback or longer GC operations in our runtime, producing very high tail latencies and occasional request failures.\n- Secondary: node-level I/O/blocking (NVMe contention) amplified during pruning/flush.\n\nCommands & observations (raw) \u2014 run interactively:\n- kubectl -n redwood logs pod/helios-runtime-0 -c runtime --since=2h | grep \"kvcache\"\n  -> \"kvcache: hit_rate=0.12 miss_rate=0.88 entries=3421\" (22:14:03 UTC)\n- /opt/redwood/bin/inferctl status --endpoint=helios:8080\n  -> active-model: v2.4.0; kvcache-size: 64MB; batchers: 6/6; queue-depth spikes 200->1200\n- nvidia-smi -q -d MEMORY\n  -> processes: runtime PID 4132 gpu-memory 14348MiB, occasionally briefly 16000MiB then OOM log\n- journalctl -u redwood-runtime | tail -n 200\n  -> repeated: \"runtime: cuda allocation failed: out of memory\" followed by \"runtime: falling back to CPU path\"\n- dmesg | grep -i oom\n  -> no kernel OOM killer entries; but many \"nv_mem_agent: reclaim requested\" lines\n- redis-cli -h 10.2.5.8 INFO | grep -E \"keyspace_hits|keyspace_misses\"\n  -> hits: 4.5M, misses: 9.1M  (miss ratio ~0.67 during window)\n\nError snippets captured:\n- \"2025-02-12T22:11:14Z ERROR runtime - cuda: out of memory while allocating 512MB (requested by kvcache rehydrate)\"\n- \"rpc: unexpected EOF while reading response body\"\n- \"http: 502 upstream read timeout\" (loadbalancer logs)\n- \"kvcache: prune loop took 2.4s (threshold 0.1s)\"\n\nTimeline (local times UTC):\n- 2025-02-11 21:50: deployment of model v2.4.0 completed (Helios release pipeline)\n- 2025-02-11 22:00: first customer alert: spike in 95th/99th latency (observed by Helios SRE)\n- 2025-02-11 22:03: internal alert -> on-call paged (Ravi)\n- 2025-02-11 22:10: started collecting runtime logs, nvml and redis metrics\n- 2025-02-11 22:20: noticed kvcache miss spikes and several GPU allocation failures\n- 2025-02-11 22:35: scaled runtime replicas +2 as short mitigation (reduced error volume, latency still high)\n- 2025-02-11 23:15: rollback candidate prepared (v2.3.1) but held for analysis\n- 2025-02-12 00:05: started targeted pprof on runtime to inspect heap growth during long tail requests\n\nActions so far (by time):\n- Collected pprof heap + goroutine dumps from pid 4132 (saved in /tmp/helios-dumps/)\n- Increased kvcache memory quota from 64MB -> 128MB as experiment (observed lower miss ratio but temporary improvement)\n- Forced a rolling restart of one node that had repeated allocation failures (node-3); after bounce, error volume dropped ~30% for 20m\n- Reproduced locally with smaller model + synthetic load; observed similar kvcache thrash when key prefix changed\n\nOpen questions / next investigative steps:\n- Did v2.4.0 change tokenization or cache key construction? Need diff of model-serving config (ask model-onboarding).\n- Is NVMe or PCIe transient causing allocations to block? Check slow I/O traces and iostat during spike windows.\n- Could memory fragmentation in our allocator (cuda malloc patterns) cause repeated slow allocations? Try upgrading cuda-allocator layer in a canary.\n- How bad is cross-pod KV cache churning? Are we invalidating prefixes aggressively?\n\nMitigations to propose:\n- Short-term: pin Helios to v2.3.1 until a fix; increase kvcache quota and gentle autoscale to absorb burst.\n- Medium-term: add better cache key compatibility layer + migration shim that warms keys on rollout.\n- Long-term: introduce allocation guardrails and pre-reserve KV rehydrate buffers to avoid on-request cuda allocations.\n\nDraft message to Helios SRE (internal copy):\nSubject: Helios private deployment - tail latency spikes (investigating)\nHi Casey,\nWe\u2019re actively investigating the latency spikes you observed 02/11\u201312. Initial evidence points to increased KV cache miss rates after the recent model rollout (v2.4.0) combined with transient GPU allocation failures in our runtime. We\u2019ve taken short-term mitigations (increase kvcache, scaled up runtime replicas) which reduced error volume.\nRequest: can you hold traffic on canary cluster (if you have one) and avoid rolling further model updates until we validate a fix? Also please share any host-level NVMe/iostat logs for 22:00\u201323:30 UTC so we can rule out storage I/O as a contributor.\nI\u2019ll follow up with a summary once we have the root cause.\nThanks,\nMaya (Redwood)\n\nNotes to self / small TODOs:\n- Ask model team for commit diff and tokenizer diff (Ravi assigned)\n- Attach pprof+heap dumps to RED-4821 and link in Confluence\n- Run a controlled canary: instrument runtime to pre-allocate kvcache buffers before first token generation\n- Check PCIe errors: lspci -vvv and dmesg on node-3\n\nNon-customer comms (Slack draft to #privdeploys):\nHeads up: Helios saw tail latency spikes after v2.4.0 rollout; kvcache miss rate up, some CUDA OOMs. Rolling restart + kvcache increase helped; full rollback is on table if we can\u2019t stabilize. Pinged model onboarding for key shape diff.\n\nRandom notes (extra logs/snips):\n- runtime debug: \"rehydrate_time p50=12ms p95=1.2s p99=4.9s\"\n- LB trace id: lb_hel_20250211_2212: 502 -> upstream read timeout after 6.0s\n- local reproduction script: tests/loadgen/helios_kv_keyshape_test.py (branch: kv-keyshape-debug)\n\nEnd of scratchpad. Will convert to a cleaner timeline and customer-facing postmortem if root cause confirmed.\n",
+  "summary": "Scratchpad for Helios private-deploy incident: kvcache thrash after model rollout causing GPU allocation failures and tail latency spikes. Contains commands tried, errors, timeline, hypotheses, draft comms.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_8cf27950ff3446c6ba7ebafcc2135b01"
+}

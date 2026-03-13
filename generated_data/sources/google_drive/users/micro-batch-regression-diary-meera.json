@@ -1,0 +1,34 @@
+{
+  "title": "Micro-batch regression diary \u2014 Meera",
+  "owner": "Meera Shah",
+  "drive_area": "users",
+  "path": "users/meera-shah/micro-batch-regression-diary-meera",
+  "doc_type": "doc",
+  "created_at": "2025-11-02",
+  "last_modified": "2026-02-10",
+  "collaborators": [
+    "Arjun Patel",
+    "Elena Kors"
+  ],
+  "team": "eng-applied-ml",
+  "status": "draft",
+  "tags": [
+    "regression",
+    "micro-batch",
+    "kv-cache",
+    "heuristic-evals",
+    "investigation"
+  ],
+  "linked_artifacts": [
+    "https://redwood.atlassian.net/browse/INF-2345",
+    "https://github.com/redwood-inference/serving-runtime/pull/789",
+    "confluence:ModelOnboarding/quantization-notes"
+  ],
+  "content": "Purpose / quick summary:\\n- Running small-batch (micro-batch size 2\u20138) workloads found subtle output regressions after recent KV-cache change (PR #789). This doc is my scratch diary: examples, ad-hoc rubric, quick repro steps, and next experiments.\\n\\nHigh-level hypothesis (current):\\n- Change in cache-key normalization / eviction interacts poorly with short-session prompts that reuse prefixes across requests. Result: repeated tokens or off-by-one context leading to hallucinated entity expansions in ~1.6% of samples for the new runtime build.\\n\\nWhen I hit this:\\n- First noticed during canary of dedicated pool yesterday: customer smoke tests for a chat app showed odd duplicate entity fragments (\"United Statess\").\\n- Repro'd on staging with the v2 runtime image. Reverted PR locally and regression disappears.\\n\\nAd-hoc rubric I used (0\u20133; 0 = fail, 3 = clean):\\n- Factuality: 3 if grounded, 2 if minor hallucination, 1 if wrong entities, 0 if fabricates major facts.\\n- Token continuity: 3 if no repeated/broken tokens, 2 if occasional repetition, 1 frequent garbling, 0 severe duplication.\\n- Latency impact: 3 if within SLO, 2 mild spike, 1 noticeable, 0 unacceptable.\\n- Determinism: 3 if outputs stable across 3 runs, 2 minor variance, 1 big variance, 0 non-deterministic.\\n- Overall (aggregate): average of above.\\n\\nQuick scored examples (micro-batch size = 4, seed fixed where possible):\\n1) prompt: \\\"Summarize: CEO of Acme Corp announced expansion into Germany in 2024.\\\"\\n- baseline v1 runtime: \\\"Acme's CEO announced expansion into Germany in 2024.\\\" (Factuality 3, Token continuity 3, Determinism 3) \\n- v2 runtime (regression): \\\"Acme's CEO announced expansion into Germ\\\"\\\"any in 2024.\\\" -> duplicated quote char and \\\"Germ\\\" split across tokens. (Factuality 2, Token continuity 1, Determinism 1)\\n- notes: looks like tokenization boundary shifted when KV cache hit used prefix length 37->36 bytes.\\n\\n2) prompt: short-chat turn reuse where prefix = previous system message (common customer pattern)\\n- baseline: normal answer\\n- v2: partial repetition of previous assistant phrase appended mid-sentence. (Overall score 1.5)\\n\\n3) edge case: numeric normalization prompt (dates and currency)\\n- v2 sometimes outputs doubled currency symbol: \\\"$ $300\\\" in 7/200 samples. (Token continuity 1)\\n\\nWhat I captured in scratch runs:\\n- Regression rate roughly 1.2\u20131.8% across 5k recent production-like micro-batched requests (sampled). Regression concentrated in short prompts where cached prefix length > 24 tokens and next token probability mass concentrated on punctuation.\\n- Larger batch sizes (>=16) reduce incidence to ~0.4% \u2014 suggests batching alignment changes something about how cache offsets are applied.\\n\\nQuick repro steps (local):\\n1) checkout branch with PR #789 merged\\n2) build runtime image: make image-local TAG=pr789\\n3) start local serving with small-batch config: BATCH_SIZE=4, MAX_LATENCY_MS=1200\\n4) run repro script: tools/microbatch_repro.sh --seed 42 --prefix-reuse true --n 5000\\n5) collect samples and run ad-hoc validator: scripts/check_token_continuity.py\\n\\nValidator heuristics (what I used):\\n- look for repeated characters / tokens adjacent to whitespace\\n- detect split-word mid-subtoken boundary (heuristic: punctuation token followed by lower-case starting token without intervening space in reconstructed text)\\n- simple factuality fuzz: look up named entities (orgs, locations) via our lightweight entity map and flag unknown expansions\\n\\nImmediate mitigations tried (and results):\\n- force disable KV-cache: regression goes away but CPU/tokens cost up ~9% (not acceptable long-term).\\n- change micro-batch alignment to always pad to fixed multiple of 8 tokens before estimating cache offset: reduces regression by ~60% in staging.\\n- fallback policy: if cache-hit confidence < 0.9, re-run without cache for that request (expensive).\\n\\nOpen questions / unknowns:\\n- Is this a tokenizer boundary bug or a race in KV eviction ordering?\\n- Why larger batch sizes reduce incidence? Hypothesis: different kernel path triggers a different offset rounding behavior. Need logs from kernel selection layer.\\n- Are there sequences of tokens (rare punctuation combos) that amplify this? I have a candidate list in 'samples/edge-phrases.txt' locally.\\n\\nShort experiments to run next (priority order):\\n- E1 (high): Add deterministic unit test that simulates prefix re-use and asserts exact reconstructed string across 10 seeds. If fails, test will surface whether difference is deterministic or stochastic.\\n- E2 (high): Run the staging micro-batch sweep with telemetry on cache-offset math (emit prefix_length, cache_offset, kernel_choice). Correlate with errors.\\n- E3 (med): Try alternative rounding strategy for offset computation (floor vs round) in a canary build.\\n- E4 (low): Apply lightweight post-tokenizer glue step that merges split tokens heuristically for a temporary hotfix (risky).\\n\\nCustomer impact note:\\n- Affected customers are those with many short chat turns and prefix reuse (chat apps, assistants). The incidence is low but visible during demos; would harm trust. Need a hotfix schedule for Dedicated pools + patch notes for Hosted.\\n\\nNotes-to-self / follow-ups:\\n- Sync with Arjun (infra) about kernel telemetry (he said he'd add a tracepoint by EOD).\\n- Ping Elena to run a quick evaluation against the eval-suite so we have objective numbers for the customer-facing report.\\n- Write a short internal incident note once we have final root cause (INF-2345).\\n\\nSnippets of raw failing outputs (sanitized):\\n- \\\"United Statess of America\\\" -> \\\"United Statess of America\\\" (dup on s)\\n- \\\"price is $300\\\" -> \\\"$ $300\\\"\\n- \\\"moving to Germany\\\" -> \\\"Germ\\\"\\\"any\\n\\nQuick TODO (today):\\n- add failing test (E1) \u2014 Meera (in progress)\\n- request kernel_choice logs \u2014 Arjun (waiting)",
+  "_id": "doc_users_meera_microbatch_001",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_690b0e2af6634d63b68c46850d8a9b5a"
+}

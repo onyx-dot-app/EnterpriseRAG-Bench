@@ -1,0 +1,33 @@
+{
+  "title": "Runway scratchpad \u2014 kernel & perf quick log",
+  "owner": "Sawyer Kim",
+  "drive_area": "users",
+  "path": "users/runway-scratchpad-sawyer.json",
+  "doc_type": "doc",
+  "created_at": "2026-03-12",
+  "last_modified": "2026-03-13",
+  "collaborators": [
+    "Ling Zhao",
+    "Evan Holtz"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "kv-cache",
+    "p99",
+    "eviction",
+    "triage",
+    "scratch"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/2789",
+    "https://linear.app/redwood/issue/INF-552-kv-eviction",
+    "https://redwood.slack.com/archives/C01XYZ9AB/p1712345678000"
+  ],
+  "content": "3/13 quick runway log (late-night triage)\\n\\nContext / summary:\\n- Noticed intermittent p99 token-latency spikes on gpu-pool-3 during the 22:00-01:00 UTC window. Spikes coincide with a small subset of long-sequence requests (seq_len > 2048) and concurrent small-chat traffic.\\n- Spikes look like: short window of 800-1200ms p99 for token-step after ~120 tokens, baseline ~120-160ms. Not an OOM. Kernel logs show repeated KV cache miss churn + small memcpy bursts.\\n- Hypothesis: aggressive eviction path thrashes the KV cache when we switch back-and-forth between long-seq model variants and short-chat variants in the same process. Prefetch not keeping up, and memcpy on CPU pinned thread causing brief stalls.\\n\\nImmediate repro steps (manual):\\n1) Use local perf harness with model variant v2-3b-qat (matches prod). Payload: interleave 1x seq=2500 request every ~45s with 6x seq=64 burst. Repeat for 30 minutes.\\n2) Instrument with debug build (LOG_KV=TRACE) to see eviction decisions and cache size toggles.\\n3) Run with KERNEL_PREEMPT=0 and then KERNEL_PREEMPT=1 to see if preemption reduces memcpy stall impact.\\n\\nQuick observations from small test run (3/12 23:45):\\n- When long-seq hits, we call kv->shrink(path) which sets max_cache_entries down to ~30% for that model instance. Immediately following small-chat burst, we see repeated refills leading to 3x memcpy spikes in 200-400ms range.\\n- CPU thread pinned to core 7 shows syscall latency bumps (sched_yield spikes) correlated with memcpy.\\n- nvlink and GPU timelines look clean; no GPU-side stall. Points to host-side memory movement or page faults.\\n\\nImmediate mitigations to try (fast):\\n- Canary config: change eviction threshold from 0.6 -> 0.45 for long-seq models only (so we avoid oscillating threshold swings).\\n- Add 100ms debounce before resizing cache after a long-seq completes. Simple guard in runtime: if time_since_last_rescale < 100ms, skip.\\n- Force KV cache allocation on hot path (pre-reserve) to avoid repeated small mmaps that may be causing page faults.\\n\\nLonger-term experiments:\\n- Implement 'soft-resize' where we mark pages as logically evicted but keep mapping alive for a grace period; physically free only if pressure persists for X seconds.\\n- Trace-based sampling: add a lightweight online estimator that tracks sequence length distribution per route and precomputes a per-route cache target (instead of per-request resize).\\n- Evaluate adding a tiny background thread that does async memcpy / prefetch to warm KV pages when switching context. Risk: extra CPU cycles.\\n\\nCommands / snippets I ran:\\n- Repro harness: ./tools/run_harness --model v2-3b-qat --pattern interleave --long 2500 --short 64 --long-interval 45s --duration 30m\\n- Debug logs: kubectl -n inference logs -f pod/serving-runtime-gpupool-3 --container runtime | grep KV_EVICT -A3 -B1\\n- Perf: sudo perf record -F 99 -g -- sleep 60; sudo perf report --stdio | head -n 60\\n\\nMetrics to capture for next run (add to dashboards):\\n- host.memcpy.ms p50/p95/p99 (per-node)\\n- kv.cache.refill.rate and kv.cache.evict.rate (per-process)\\n- sequence_len.percentiles per-route (5/50/95/99)\\n- thread.syscall.latency p99 for pinned worker threads\\n\\nOpen questions / notes to check:\\n- Are we accidentally using hugepages for some KV allocations in that pool? (check /proc/meminfo and runtime logs). Hugepage faults would explain the page-scan pauses.\\n- Is there any recent kernel update on the nodes in gpu-pool-3? I noticed kube-image: base-ubuntu-22.04-2026-03-01 vs others on 2026-02-12. Maybe different glibc/mmap behavior.\\n- Could a background GC (python sidecar) be kneecapping host memory briefly? Check sidecar OOM/GC logs.\\n\\nQuick TODOs (priority):\\n- [ ] Run repro harness with LOG_KV=TRACE + perf + set KERNEL_PREEMPT=1 (today)\\n- [ ] Push canary config change (eviction threshold + 100ms debounce) to staging (Evan)\\n- [ ] Add dashboard panels for host.memcpy.ms and kv.cache.refill.rate (Ling)\\n- [ ] Check node kernel/glibc versions for gpu-pool-3 vs gpu-pool-1 (me)\\n- [ ] Find any recent PRs that touched mmap/alloc path: scan PRs from last 2 weeks (link PRs here)\\n\\nNotes for the canary PR (draft comments):\\n- Keep change minimal: config knobs + runtime guard (no new threads).\\n- Add verbose metric emit for 'rescale_skipped_by_debounce' to know how often it would have resized.\\n- Add unit tests for debounce logic and boundary conditions (0ms, 100ms, 500ms).\\n\\nPotential rollback plan:\\n- If canary increases p50 or increases memory pressure, revert knob and keep metric data for analysis.\\n- If canary reduces p99 but increases mean CPU by >5%, throttle debounce to 50ms.\\n\\nReferences / links to check later:\\n- GH PR to scan: https://github.com/redwood-inference/serving-runtime/pull/2789 (alloc changes)\\n- Linear: INF-552 kv eviction oscillation (assignee: Ling)\\n- Slack thread: #runtime-kernel -- message ts 1712345678\\n\\nRandom notes (ad-hoc):\\n- Idea: use per-socket memory pools to avoid cross-socket memcpy. Might buy a factor of 2. Need NUMA team input.\\n- Could try running the runtime process with MADV_WILLNEED for new mappings to avoid page faults; test on staging.\\n\\nEnd-of-night snapshot:\\n- Major hypothesis: host-side allocation/churn + eviction debounce oscillation causing short memcpy stalls => p99 token latency increases.\\n- Next steps: reproducible harness + minimal canary. Keep this doc as the working log for the next 48h.\\n\\n-- Sawyer\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_f3132b959a794b16ace390c9ced610a8"
+}

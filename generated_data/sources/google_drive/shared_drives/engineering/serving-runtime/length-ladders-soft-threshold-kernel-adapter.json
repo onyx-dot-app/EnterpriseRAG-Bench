@@ -1,0 +1,40 @@
+{
+  "title": "Length ladders and soft-threshold kernel adapter",
+  "owner": "Maya Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/length-ladders-soft-threshold-kernel-adapter.json",
+  "doc_type": "doc",
+  "created_at": "2024-09-12",
+  "last_modified": "2025-02-06",
+  "collaborators": [
+    "Diego Alvarez",
+    "Priya Raman",
+    "Samir Patel"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "batching",
+    "kv-cache",
+    "kernels",
+    "latency",
+    "length-buckets",
+    "experiment"
+  ],
+  "linked_artifacts": [
+    "https://redwood.atlassian.net/browse/INF-4321",
+    "https://github.com/redwood-inference/runtime/pull/2183",
+    "https://confluence.redwood.ai/display/ENG/Length+Ladders+Design+Notes"
+  ],
+  "body": "Summary\\n\\nThis note introduces the 'length ladder' admission and kernel-adapter concept: a lightweight, runtime-friendly bucketing scheme for dynamic sequence lengths combined with a soft-threshold policy that lets the serving runtime pick slightly larger or smaller kernels based on latency budget, occupancy, and cache state. The goal is to reduce padding waste while keeping tail latency predictable and to make kernel selection more stable (fewer jittery kernel swaps).\\n\\nMotivation / problem statement\\n- Current packing strategies either over-pad aggressively or create many small unique shapes that cause kernel proliferation and cold-kernel penalties.\\n- KV cache pressure grows when many slightly different lengths allocate separate caches; eviction behavior becomes noisy.\\n- We need a policy that: (1) groups lengths intentionally, (2) bounds how often we probe new kernels, (3) aligns kernel variants with ladder buckets, and (4) interacts naturally with prefix/KV caching.\\n\\nDesign overview\\n1) Length ladders: pre-defined step sizes that grow roughly exponentially but tuned to empirical distributions. Example ladder: [1..8], (9..16], (17..32], (33..64], (65..128], (129..256]. Each incoming request maps to its ladder index L. The runtime maintains per-ladder queues and occupancy estimates.\\n\\n2) Soft-threshold admission: each ladder has a soft occupancy threshold t_soft and a hard latency budget delta. If queue occupancy for ladder L is low AND the latency budget permits, we allow a request near the top of ladder L to be served on ladder (L-1) kernel (i.e., downcast) to improve kernel utilization. Conversely, if occupancy is high or latency SLO tight, we upcast to (L+1) to avoid missing deadlines. This prevents oscillation with a hysteresis window.\\n\\n3) Kernel adapter: we bind a small set of kernel variants to each ladder (e.g., native-unquantized, quantized-fast, fused-attn). The adapter picks a kernel using a multi-factor score: kernel_score = w1*latency_est + w2*cost_est + w3*kv_hit_rate + w4*kernel_warmth. Kernel warmth is decayed exponentially and prevents flip-flopping.\\n\\n4) Micro-probing: when a new ladder/kernel combo is cold, the runtime issues a tiny micro-benchmark (a few synthetic short requests or a sampled real request) to estimate throughput and latency. Probes are rate-limited per ladder to avoid noise. Probe results update latency_est and kernel_warmth.\\n\\n5) KV cache alignment and length-decay TTL: KV entries are sharded by ladder so that long-sequence entries (heavy memory) do not evict small-sequence working sets. Additionally, KV entries get a length-decay TTL where entries created by longer sequences expire slightly faster in high-memory pressure cases since they tend to be less reusable for short requests.\\n\\nOperational knobs and defaults\\n- ladders: [8, 16, 32, 64, 128, 256] (configurable)\\n- t_soft: default 0.35 (fraction of batch capacity)\\n- latency_budget_per_request: configured per route (ms)\\n- kernel_probe_rate: 0.5 probes / min per ladder by default\\n- kv_length_decay_alpha: 0.8 (decay factor for longer sequences)\\n\\nPseudo-code (high level)\\nfunction handle_request(req):\\n  L = ladder_index(req.length)\\n  if should_downcast(req, L):\\n    chosen_kernel = select_kernel(L-1)\\n  elif should_upcast(req, L):\\n    chosen_kernel = select_kernel(L+1)\\n  else:\\n    chosen_kernel = select_kernel(L)\\n  enqueue_to_batch(chosen_kernel, req)\\n\\nfunction should_downcast(req, L):\\n  return (req.length > ladder_top(L) * 0.85) and (occupancy(L-1) < t_soft*cap(L-1)) and (latency_budget_allows(req, L-1))\\n\\nNotes on KV interaction\\n- When we downcast a request, we prefer kernels whose KV consistency is compatible (i.e., prefix lengths align). If the downcast kernel would require incompatible KV layout, prefer not to downcast.\\n- KV sharding key: (model_version, ladder_index, prefix_hash mod N_shards). This keeps hot short-prefix traffic isolated.\\n\\nMetrics to capture for experiments\\n- per-ladder pad_waste_tokens / request\\n- ladder-to-ladder downcast/upcast counts and flip rate\\n- kernel_warmth per kernel variant\\n- KV hit rate by ladder and eviction rate under pressure\\n- tail latency (p50/p95/p99) per ladder and per route\\n\\nStaged rollout plan\\n- Canary: enable ladders + kernel adaptor on a single n1-high throughput pool for low-traffic routes (2 weeks). Measure pad savings and kernel swap rate.\\n- Experiment: A/B on 10% traffic against baseline packing for 4 weeks. Track p95 and token-cost per request.\\n- Ramp: expand ladders to more routes and add KV-length-decay once kernel probe behavior is stable.\\n\\nOpen questions / TODOs\\n- Ladder definition: should ladders be learned from traffic distribution automatically? (Pros: could adapt; Cons: churn causes instability)\\n- Fine-tuning weights (w1..w4) for kernel_score; need offline optimization harness + small RL loop?\\n- Interaction with multi-tenant Dedicated pools where fairness may conflict with ladder occupancy heuristics.\\n- Micro-probe safety: synthetic vs sampled real traffic \u2014 need to avoid leaking sensitive prompt data.\\n\\nReferences and links\\n- INF-4321: initial spike and microbench results (Jira)\\n- PR #2183: prototype kernel adapter implementation (runtime repo)\\n- Slack: #serving-runtime thread \"length-ladders-early-testing\" (see pinned messages)\\n\\nAppendix: quick sketch of ladder mapping heuristic\\n- For length L_req: find smallest ladder top T_i >= L_req. If L_req/T_i > 0.95 then mark as 'near-top' (eligible for downcast policy). If L_req/T_i < 0.5 mark as 'near-bottom' (eligible for upcast if occupancy warrants).\\n\\nChangelog\\n- 2024-09-12: initial draft (Maya)\\n- 2024-10-03: added micro-probing proposal (Diego)\\n- 2025-02-06: adjusted defaults after small-scale experiments (Priya)\\n\\nAction items\\n- Diego: finalize micro-probe harness and add privacy filter for sampled requests (INF-4390)\\n- Samir: implement simple kernel_warmth counter in runtime (PR stub created)\\n- Maya: run A/B test design and metric dashboards for canary\\n\\nNotes-to-self: keep this lightweight \u2014 the goal is an operationally simple adapter that buys 10-20% pad token savings for low risk to p99 latency.",
+  "changelog": [
+    "2024-09-12: initial draft (Maya)",
+    "2024-10-03: added micro-probing proposal (Diego)",
+    "2025-02-06: adjusted defaults after small-scale experiments (Priya)"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_3b1a73b6fc9e473ab011c417566236b2"
+}

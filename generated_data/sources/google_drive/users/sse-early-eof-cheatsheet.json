@@ -1,0 +1,35 @@
+{
+  "title": "sse-early-eof-cheatsheet",
+  "owner": "Priya Kothari",
+  "drive_area": "users",
+  "path": "users/priya-kothari/sse-early-eof-cheatsheet",
+  "doc_type": "doc",
+  "created_at": "2026-02-12",
+  "last_modified": "2026-02-18",
+  "collaborators": [
+    "Marco Liu",
+    "Ana Gomez"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "sse",
+    "early-eof",
+    "repro",
+    "nginx",
+    "node",
+    "http-chunking",
+    "backpressure"
+  ],
+  "linked_artifacts": [
+    "JIRA-2026-1429",
+    "https://github.com/redwood-inference/serving-runtime/pull/981",
+    "slack:#serving-runtime/thread-1678553342"
+  ],
+  "content": "Problem summary:\nObserved intermittent \"early EOF\"/connection closed events from clients consuming SSE/streaming responses when payloads cross ~64KB boundary. Client sees truncated JSON chunk or connection resets mid-frame. Repro intermittent but correlated with high concurrency and nginx reverse-proxy in front of runtime.\n\nWhy this doc: scratchpad to capture commands I ran, minimal reproducer, logs, and short hypotheses so we don't re-run the same experiments.\n\nEnvironment notes:\n- Runtime: serving-runtime v0.31.2 (local dev image)\n- Frontend proxy: nginx 1.22.1 (default proxy_pass config)\n- Client tests run from macOS + Linux CI runner\n- Observed with Node fetch clients and curl -N; Python requests (non-streaming) masks the issue.\n\nQuick repro (minimal):\n1) Start minimal SSE server (node) that emits a large JSON line > 70KB:\n\n# server.js\nconst http = require('http');\nhttp.createServer((req, res) => {\n  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });\n  const payload = { msg: 'x'.repeat(72000), t: Date.now() };\n  res.write(`data: ${JSON.stringify(payload)}\\n\\n`);\n  // keep connection open\n}).listen(8083);\n\n2) Start nginx proxy (simple config):\nproxy_pass http://127.0.0.1:8083;\nproxy_buffering on; # default\n\n3) Client: curl -N http://localhost:8080/stream\nExpected: a single event with full payload.\nObserved (intermittent): curl exits early or prints truncated JSON (cut in middle), or shows \"curl: (18) transfer closed with outstanding read data remaining\".\n\nCommands I used while diagnosing:\n- curl -v -N --http1.1 localhost:8080/stream  # force http1.1, get verbose socket close\n- socat - TCP4:localhost:8080,raw,echo=0  # watch raw bytes flow and closure\n- tcpdump -i lo0 -s 0 -w sse-earlyeof.pcap port 8080  # capture and inspect in Wireshark\n- ab -n 100 -c 20 -k http://localhost:8080/stream  # concurrency stress (keeps connections)\n\nWhat I saw in nginx logs:\n- upstream prematurely closed connection while reading response header from upstream\n- \"client prematurely closed connection\" entries match times of curl complaints\n\nHypotheses (ordered):\n1) nginx proxy_buffering default causes it to read chunks into buffer and on certain sizes flush/close upstream prematurely if upstream doesn't signal content-length (chunked transfer) and connection reuse triggers early close.\n2) TLS/ALPN or HTTP/2 framing mismatch between runtime and proxy when payload crosses internal buffer thresholds.\n3) Runtime's streaming implementation uses single write for large payload; node kernel TCP stack segments, and our keepalive/linger/socket timeout interactions at proxy cause RST when upstream socket returns EPIPE after proxy's assert.\n4) KV cache/continuous batching step introduces small delay causing proxy timeout threshold to trigger.\n\nExperiments and results (notes):\n- Turning off nginx proxy_buffering (proxy_buffering off) reduced frequency dramatically (from ~30% to <5% in quick stress runs). Suggests buffering behaviour related.\n- Forcing smaller writes from server (split payload into 4x ~18KB writes with 5ms setTimeout between writes) also reduced failures.\n- Enabling chunked transfer explicitly (res.setHeader('Transfer-Encoding','chunked')) didn't change much; nginx still logs upstream prematurely closed at times unless buffering is off.\n- Switching client to HTTP/2 (curl --http2) removed early EOF in my local tests (but prod uses http1.1 between nginx and upstream).\n\nMinimal Node client repro (to reproduce truncated parsing):\n// client.js\nconst fetch = require('node-fetch');\n(async () => {\n  const r = await fetch('http://localhost:8080/stream');\n  const reader = r.body.getReader();\n  let buf = '';\n  while (true) {\n    const { done, value } = await reader.read();\n    if (done) break;\n    buf += Buffer.from(value).toString('utf8');\n    // try parse when we see full event separator\n    if (buf.includes('\\n\\n')) {\n      const event = buf.split('\\n\\n')[0];\n      console.log('event chunk len', event.length);\n      // attempt JSON parse of data: line\n      const m = event.match(/^data: (.*)$/m);\n      if (m) {\n        try { JSON.parse(m[1]); console.log('parsed ok'); }\n        catch (e) { console.error('parse failed', e.message); }\n      }\n      buf = ''; // drop\n    }\n  }\n})();\n\nNotes from parse failures: when truncated, JSON.parse throws 'Unexpected end of JSON input' (consistent).\n\nImmediate mitigations suggested to prod: \n- Set proxy_buffering off for streaming endpoints in nginx config (quick and effective).\n- Add explicit small-chunk writes in runtime for large-first-token responses (eg split message into 16KB writes).\n- Add a runtime metric/export that counts \"single-write > 50KB\" responses to correlate to errors.\n\nNext experiments to run:\n- Reproduce with TLS between nginx->upstream to rule out ALPN/http1.1 interactions.\n- Try increasing proxy_read_timeout and proxy_send_timeout to see if timeouts are culprit.\n- Reproduce on dedicated environment with same nginx config as production (we use haproxy in some regions).\n\nNotes for follow-up ticket (JIRA-2026-1429):\n- Attach pcap if we can capture the RST/FIN pattern.\n- Attach nginx error.log snippets and upstream logs with timestamps.\n- Patch suggestion: in runtime, if response length > X, write as multi-chunk with small delays / or set TCP_CORK/CORK semantics where available.\n\nOpen questions:\n- Why does HTTP/2 client not hit the issue locally? Probably different framing/flow-control semantics. Needs more testing.\n- Does cloud LB (GCLB/ALB) vs nginx behave differently? We should test both.\n\nPersonal TODOs (quick):\n- [ ] Add a small regression test in e2e harness that runs curl -N via nginx and ensures response contains valid JSON for 100 concurrent clients.\n- [ ] Add instrumentation on runtime for write sizes and write counts per request.\n- [ ] Run the early-eof reproducer against staging with haproxy in front.\n\nIf anyone picks this up: start with proxy_buffering off + split writes in runtime and rerun ab -k. Results I saw were convincing enough to push a short-term nginx config change for streaming endpoints.\n\nEnd of notes.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_88d97210ba6a435089f3edada49d5202"
+}

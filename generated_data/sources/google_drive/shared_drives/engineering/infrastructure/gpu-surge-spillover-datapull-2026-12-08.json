@@ -1,0 +1,85 @@
+{
+  "title": "GPU surge spillover postmortem - datapull manifest",
+  "owner": "Elena Marquez",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/infrastructure",
+  "doc_type": "sheet",
+  "created_at": "2026-12-06",
+  "last_modified": "2026-12-08",
+  "collaborators": [
+    "Marcus Liu",
+    "Priya Desai",
+    "Olga Petrov"
+  ],
+  "team": "eng-infrastructure",
+  "status": "in_review",
+  "tags": [
+    "postmortem",
+    "datapull",
+    "gpu",
+    "regional-surge",
+    "autoscaler"
+  ],
+  "linked_artifacts": [
+    "JIRA-INC-3241",
+    "https://github.com/redwood-inference/infra/pull/892",
+    "confluence:capacity/postmortem/gpu-spillover-2026-12"
+  ],
+  "summary": "Data pull manifest and immediate analysis notes for the 2026-12-05 GPU surge + spillover event that caused elevated queue depths and cross-region throttle propagation. This sheet lists the raw tables/streams we pulled, the queries used, and initial anomalies to investigate for the postmortem writeup.",
+  "incident_window": "2026-12-05T02:10:00Z to 2026-12-05T05:40:00Z",
+  "objective": "Collect time-aligned telemetry from orchestration, serving runtime, and routing layers to determine root cause(s) of sudden capacity imbalance, why autoscaler did not replenish fast enough in eu-west1, and which throttle/routing policies propagated to other regions.",
+  "datasets_pulled": [
+    "gpu_util_timeseries: per-gpu 1s samples (util_pct, mem_used_mb, temp_c)",
+    "request_queue_depth: per-region/per-zone/per-backend 1s (queued_count, oldest_request_age_s)",
+    "throttle_events: policy_id, reason, target_backend, start_ts, end_ts, affected_tenants",
+    "autoscaler_actions: decision_ts, group_id, delta_replicas, reason, cooldown_until",
+    "model_variant_routing: request_id, chosen_variant, fallback_variant, latency_ms",
+    "kv_cache_hit_rate: model_shard, tenant_id, prefix_hit_rate, ttl_ms",
+    "batching_stats: batch_size_distribution, batch_wait_ms, batch_fill_pct",
+    "network_egress: cross-region egress bytes/s, NVLink/PCIe error counters"
+  ],
+  "queries_run": [
+    "peak_gpu_spike.sql -- align gpu_util_timeseries with requests to identify correlation windows",
+    "regional_queue_backfill.sql -- compute per-region queue depth and oldest_request_age 1m-averages",
+    "throttle_cascade_trace.sql -- join throttle_events to routing logs to find downstream propagation",
+    "autoscaler-timeline.sql -- reconstruct autoscaler decisions and cooldowns across the incident",
+    "fallback-frequency.sql -- count requests that hit fallback_variant grouped by tenant and minute",
+    "kvcache-eviction-spike.sql -- detect mass eviction events correlated with memory pressure"
+  ],
+  "sample_sql_snippets": "-- sample, run with exported dataset names\nSELECT ts, gpu_id, util_pct, mem_used_mb\nFROM gpu_util_timeseries\nWHERE ts >= '2026-12-05T02:00:00Z' AND ts <= '2026-12-05T06:00:00Z' AND region = 'eu-west1'\nORDER BY ts, gpu_id;\n\n-- queue join\nSELECT q.ts, q.region, q.queued_count, a.delta_replicas, t.policy_id\nFROM request_queue_depth q\nLEFT JOIN autoscaler_actions a ON floor(q.ts, '1m') = floor(a.decision_ts, '1m') AND q.group_id = a.group_id\nLEFT JOIN throttle_events t ON q.region = t.target_region AND q.ts BETWEEN t.start_ts AND t.end_ts\nORDER BY q.ts;",
+  "initial_findings": "1) eu-west1 GPU median utilization jumped from 42% to 96% within a 6-minute window; several hosts hit sustained 99% and memory pressure triggered eviction events. 2) Autoscaler had a staggered cooldown policy (aggressive_down = 180s, conservative_up = 300s) which blocked immediate upscales for the cpus/gpu-mixed groups serving lower-priority traffic. 3) Throttle policy BETA-THROTTLE-3 was incorrectly applied to two dedicated pools, causing cross-region fallback traffic to route to smaller CPU-backed variants in us-central, increasing their latency and then feeding back as elevated queue depth. 4) KV cache hit rate dropped ~18% at 02:18 which amplified per-request compute due to missed reuse. 5) NVLink error counters increased slightly but not enough alone to explain the drop \u2014 likely cofactor with memory eviction.",
+  "notes": "- Confirm if there was a scheduled maintenance window in eu-west1 prior to 02:00; maintenance history shows a rolling firmware update earlier that day but engineer notes say it finished by 00:45.\n- Check if model snapshot rollout 2026-12-03-v12 changed per-tenant footprint (new quantization profile?)\n- Cross-check tenant priority configuration for tenants that experienced >500ms p50 latency increase\n- Slack thread: #infra-incidents referenced (link in linked_artifacts)\n- Keep raw query outputs in /tmp/capacity-dumps/2026-12-05 for auditors",
+  "anomalies_to_verify": [
+    "unexpected autoscaler cooldown behavior for gpu-mixed groups",
+    "throttle policy application to dedicated pools",
+    "kv cache eviction spike coincident with mem pressure",
+    "batching delays increased for large models (batch_wait_ms distribution shift)",
+    "unbalanced allocation from placement-service (some racks drained while adjacent racks busier)"
+  ],
+  "action_items": [
+    "(P0) Temporarily reduce conservative_up for gpu-serving groups during surge windows until autoscaler tuning is deployed -- owner: Marcus Liu -- due 2026-12-10",
+    "(P1) Add early-warning alert: per-region median GPU util > 80% for 3m AND oldest_request_age > 1500ms -- owner: Priya Desai -- due 2026-12-14",
+    "(P1) Re-audit throttle policy mapping logic to ensure dedicated pools are excluded from beta throttle rules -- owner: Olga Petrov -- due 2026-12-11",
+    "(P2) Investigate KV cache eviction heuristics and consider raising cache TTL or shard sizing for high-throughput tenants -- owner: Elena Marquez -- due 2026-12-20",
+    "(P2) Run placement-service simulation with synthetic spike to validate rack-level balancing -- owner: eng-infrastructure team -- due 2027-01-05"
+  ],
+  "next_steps": "Complete full postmortem doc with timeline, root cause, and remediation after onboarding query outputs. Schedule 60-min incident review with SRE, Serving Runtime, and Autoscaler owners week of 2026-12-13.",
+  "retention_marker": "raw-pulls-retain-90d",
+  "notes_for_auditors": "All pulled datasets include request_id where available; PII scrubbed. Exported CSVs contain sampling hash for reproducibility. Contact owner for decryption keys if required.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "incident_window",
+    "objective",
+    "datasets_pulled",
+    "queries_run",
+    "sample_sql_snippets",
+    "initial_findings",
+    "anomalies_to_verify",
+    "notes",
+    "action_items",
+    "next_steps",
+    "notes_for_auditors"
+  ],
+  "dataset_doc_uuid": "dsid_54cc16204e6a4afcb09607f832be449f"
+}

@@ -1,0 +1,36 @@
+{
+  "title": "Attention kernel fallback + locality synthesis - arch jam notes",
+  "owner": "Priya Desai",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/attention-kernel-fallback-locality-synthesis-notes.json",
+  "doc_type": "doc",
+  "created_at": "2024-09-18",
+  "last_modified": "2024-09-20",
+  "collaborators": [
+    "Marcus Chen",
+    "Olivia Park",
+    "Diego Alvarez",
+    "Aisha Khan"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "attention",
+    "fallback",
+    "kv-cache",
+    "locality",
+    "performance",
+    "rfc"
+  ],
+  "linked_artifacts": [
+    "jira:SRV-3128",
+    "github:repo/attention-fallback-proto PR#214",
+    "confluence:LongContext-Perf-Playbook"
+  ],
+  "content": "Context:\nQuick sync after prototype runs for attention-kernel fallback + request-locality-aware slab placement. Aim: decide whether to fold the fallback logic into the runtime kernel selector or keep it as a routing layer policy. Also discuss KV reconciliation impacts when requests are migrated between slots for locality.\n\nAttendees:\n- Priya Desai (note taker, infra lead)\n- Marcus Chen (kernel team)\n- Olivia Park (serving runtime / telemetry)\n- Diego Alvarez (SRE)\n- Aisha Khan (applied-ml focusing on long-context models)\n\nGoals for session:\n- Surface perf numbers from microbench and end-to-end canary\n- Choose ownership boundary for fallback behavior (kernel vs routing)\n- Outline KV cache reconciliation contract for preempted sessions\n- Capture open questions and owners for follow-ups\n\nSummary of prototype runs (Marcus):\n- Microbench: fallback path (software attention) vs optimized kernel shows 1.8-2.6x higher CPU on fallback for short sequences (<=128) and 3-4x for long sequences (>=1024) on A100.\n- End-to-end (canary) with 200rps synthetic mixed traffic: 95th latency increased from 58ms to 140ms when fallback triggered for 12% of requests.\n- Important: fallback often correlates with unexpected input shapes (uneven tokenization) and occasional kernel OOMs at large batch sizes.\n\nLocality placement experiment (Olivia):\n- Simple allocator that tries to keep consecutive requests from same tenant in same slab reduced KV-sync events by ~34% in our sim.\n- Heatmap shows hot conversation sequences get colocated, but cold-starts still distributed.\n- Memory fragmentation increases slightly; need compaction triggers.\n\nDiscussion notes / tradeoffs:\n1) Ownership of fallback: kernel vs routing\n- Marcus: kernel-level fallback keeps decision close to runtime; simpler in terms of correctness (no routing-layer race), but kernel bloat risk and harder to test across hardware families.\n- Diego: routing layer fallback enables policy experimentation (SLO-based decisions) and easier metrics, but increases request hop surface and potential for KV cache loss during migration.\n- Decision: favor a hybrid approach. Implement a lightweight kernel-level safe-fallback (for immediate, deterministic fallbacks like unsupported op) and expose a routing-layer policy for higher-level SLO-driven fallbacks (e.g., prefer cheaper model variant under load).\n\n2) KV reconciliation contract for slot migration\n- Problem: when routing moves a conversation to a different slab/node for locality or load, the KV prefix (KV cache for that session) may be stale or incomplete. Naive full-copy causes latency spikes.\n- Proposed contract (Aisha + Olivia):\n  - Each KV block stamped with a monotonic sequence + last-updated TTL.\n  - Migration procedure: optimistic start on new slab using best-effort async fetch of missing KV pages; fallback to blocking copy only if missing pages requested synchronously.\n  - Expose metrics: kv-miss-on-migration, kv-blocking-copy-count.\n- Tradeoffs: async fetch keeps latency low but risks slight quality regressions for few tokens; blocking copy guarantees fidelity but increases tail latency.\n- Decision: adopt optimistic async-first with configurable blocking threshold per-tenant (default conservative for SLO-critical tenants).\n\n3) Locality-aware slab allocator heuristics\n- Heuristics considered:\n  - Sticky-by-tenant (coarse): keep same tenant sessions together. Pros: simple; cons: poor inter-tenant fairness.\n  - Sticky-by-conversation (fine): attempt to colocate sequential requests from same conversation id. Pros: best KV hit-rate; cons: higher fragmentation.\n  - Hybrid TTL-based stickiness: conversation sticky while active, then evict to general pool.\n- Decision: implement hybrid TTL stickiness (default 30s active window) with tenant-level caps to avoid noisy-tenant hogging.\n\n4) Telemetry & observability requirements (Olivia)\n- Must instrument: fallback-reason, fallback-origin (kernel|routing), kv-migration-latency, kv-async-miss-rate, slab-compaction-events, per-tenant fallback-rate.\n- Add lightweight tracing hook so persona (prod vs dev) can see per-request path.\n- Action: telemetry proto in github PR#214 to be expanded; Olivia to add sampling plan.\n\nOpen questions / Risks:\n- Kernel footprint growth and test matrix across device families (A100, H100, AMD). Marcus to draft risk matrix by 2024-09-25.\n- Edge case: concurrent migration + compaction may cause missing KV pages; need to ensure idempotent retries. Diego + Aisha to prototype safe ack on compaction.\n- Security: cross-tenant KV leakage risk if reuse not zeroed; platform-engineering to audit allocator free-paths. Assigned to Nils (cc: platform-engineering).\n\nAction items (owner / ETA):\n- Marcus: small RFC documenting hybrid fallback split (kernel safe-fallback API + routing policy hooks). ETA 2024-09-26.\n- Olivia: extend PR#214 with telemetry fields, sampling spec, and annotation examples. ETA 2024-09-22.\n- Diego + Aisha: prototype optimistic async KV fetch with blocking threshold and run synthetic canary. ETA 2024-10-03.\n- Priya: add confluence page LongContext-Perf-Playbook with runbook for fallback incidents. ETA 2024-09-24.\n- Platform-engineering (Nils): security audit of slab free-paths and zeroing strategy. ETA 2024-10-01.\n\nNotes-to-self / rough ideas (brainstorm fragments):\n- Could keep small sticky cache of last-N KV pages on routing layer to further reduce blocking copies (cheap to keep).\n- Consider per-tenant QoS token-bucket so heavy tenants can be throttled from triggering fallback storms.\n- Explore kernel-level guardrails that detect imminent OOM and fail fast to routing fallback to prevent partial kernel corruption.\n\nMeeting follow-up plan:\n- Short 30m follow-up next Tuesday to walk through Marcus RFC and Olivia telemetry PR. Schedule invite: 2024-09-24 10:00 PT.\n\nAppendix: quick perf table (from Marcus runs, trimmed)\n- Optimized kernel (A100): median 18ms (seq=256), p95 58ms\n- Software fallback (A100, same batch): median 42ms, p95 120-160ms depending on long tokens\n- Migration copy cost (blocking): +80-200ms depending on KV size\n\nEnd notes: keep design conservative for default tenants but unlock aggressive async behavior for trusted enterprise tenants via per-tenant config flags (matching Dedicated/Private needs). Priya to track adoption plan in product sync.\n\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_5edd6d85060643e4824d867f93f5bd66"
+}

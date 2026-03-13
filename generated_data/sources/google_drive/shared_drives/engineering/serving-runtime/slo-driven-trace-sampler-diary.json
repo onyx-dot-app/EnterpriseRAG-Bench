@@ -1,0 +1,38 @@
+{
+  "title": "SLO-driven trace sampler diary",
+  "owner": "Maya Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/slo-driven-trace-sampler-diary.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-18",
+  "last_modified": "2025-03-02",
+  "collaborators": [
+    "Arjun Patel",
+    "Sofia Martinez",
+    "Devin Park"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "p50",
+    "p95",
+    "p99",
+    "sampling",
+    "profiling",
+    "batching",
+    "kv-cache",
+    "coldstart",
+    "slo"
+  ],
+  "linked_artifacts": [
+    "JIRA-ENG-4123",
+    "github.com/redwood-inference/serving-runtime/pull/981",
+    "confluence/redwood/trace-sampling-ops"
+  ],
+  "content": "Purpose:\nThis is a working diary for running an SLO-aligned trace sampling experiment across production routes. Goal: capture representative p50/p95/p99 stage breakdowns without saturating storage or blowing through retention budgets. Use results to prioritize low-hanging scheduling and batching fixes for the 1-3s tail.\n\nBackground/context:\n- We have recurring customer reports of occasional 2\u20136s tail responses on hosted routes that normally sit at 200\u2013400ms p50.\n- Prior analyses (bench vs prod) show attention kernels and emit handoffs both contribute, but attribution varies by seq_len and cold/warm cache state.\n- Current full-trace capture is expensive; we need an SLO-driven sampler to increase signal at p95/p99 while keeping costs modest.\n\nSampling strategy (high level):\n- Tiered sampling windows keyed by route SLA and recent error/latency spikes.\n- Base sample rate: 0.1% across all traffic for long-term baselines.\n- Elevated windows: when route p95 > SLO*1.1 or error rate > 0.5%, increase to 2% for 10m.\n- Tail focus: run 100% capture for individual requests that exceed 1s (ad-hoc) but limit to N/day per route.\n- Sequence-aware boost: for seq_len >= 512 boost sampling by x10 to catch long-token behavior.\n- Coldstart tagging: mark traces where instance_uptime < 120s or kv-cache_miss_ratio > 0.6.\n\nImplementation notes and flags (teams):\n- sampler.v2.enabled = true (feature flag for progressive rollout)\n- sampler.v2.route-policy = slo-driven\n- trace.max_size_bytes = 1MB (hard cap)\n\nData schema captured per trace (minimum):\n- request_id, route, model_variant, seq_len, coldstart, kv_cache_hit, batch_size, queue_wait_ms, tokenize_ms, kv_lookup_ms, attention_ms, emit_ms, egress_ms, total_ms, timestamp\n- tags: snippet of prompt hash, customer_tier (free/paid/enterprise)\n\nQuick synthetic cohort table (sampled day 2025-02-25):\n(plain text CSV style)\ncohort,requests,sampled,p50_ms,p95_ms,p99_ms,median_batch,avg_kv_miss\nshort-<128,120k,120,210,480,820,1,0.05\nmid-128-512,21k,210,310,920,1400,2,0.12\nlong->=512,3k,90,610,1800,4200,3,0.48\ncoldstart-any,9k,180,420,1600,3600,1,0.62\n\nSelected observations (from diary runs):\n1) Short requests (p95 ~480ms): emit_ms ~200\u2013300ms contributes ~40\u201360% of tail. Emit stalls correlate with downstream egress retries to ISTIO (5xx) \u2014 need circuit-breaking telemetry join.\n2) Mid-length (p95 ~920ms): batch wait + attention kernel dominate. For p95 traces where batch_size=1, attention_ms is still high (gpu scheduling jitter).\n3) Long sequences (p95 1800ms, p99 4200ms): kv_lookup misses and cache-populated synchronous fetches cause amplification. When kv_cache_miss_ratio > 0.4, median kv_lookup_ms jumps from 12ms -> 320ms.\n4) Coldstart traces: when instance_uptime <120s, p99 often dominated by model load and cold kv miss cascade; observed spikes 2\u20136x baseline.\n\nPer-stage breakdown (example aggregate for long->=512 cohort p99):\n- ingress (TLS + routing): 35ms\n- tokenize: 48ms\n- queue_wait / batcher wait: 430ms\n- kv_lookup (sync): 780ms\n- attention compute: 1250ms\n- emit handoff & serialization: 420ms\n- egress + network: 150ms\n- total observed: ~3163ms (numbers from sample day)\n\nHypotheses and immediate experiments (ranked):\nA) kv-sync-to-async: converting the largest synchronous kv paths to optimistic async with best-effort fallback will reduce tail in long sequences. Experiment: enable optimistic async on a canary route (10% of long requests) and compare p95/p99 after 48h. Linked PR: github.com/redwood-inference/serving-runtime/pull/981\nB) batcher threshold tuning: lower max wait threshold for routes with high seq_len variance. Experiment: dynamic wait threshold based on recent seq_len distribution (start at 20ms -> reduce to 5ms for targeted route). Measure p95 change and throughput impact.\nC) emit backpressure instrumentation: add counters for emit->egress handoff retries and expose per-route alert. Short cohort shows large variance here. Quick fix: more aggressive egress connection pool sizing for high-SLA routes.\nD) coldstart mitigation: pre-warm pools for enterprise routes during business hours; introduce a tiny warm-up cache for KV keys seen in last 5m.\n\nOpen questions / unknowns:\n- Are attention kernel jitter issues correlated with multi-tenancy on node GPUs (noisy neighbors)? Need node-level GPU telemetry join.\n- How stable is kv cache miss behavior across regions? Current samples are NA-heavy.\n- Does our sampler bias toward problematic requests (bootstrap problem)? need to validate sampling representativeness for p50 baseline.\n\nAction items (next 2 weeks):\n- Arjun: wire optimistic-async KV path into canary and add metric kv.optimistic.enabled (JIRA-ENG-4123) \u2014 target: 2025-02-26\n- Sofia: run batcher threshold A/B and collect throughput vs p99 tradeoff for three routes \u2014 target: 2025-03-03\n- Devin: instrument emit->egress retry counters and dashboard for top 10 routes by tail impact \u2014 target: 2025-02-24\n- Maya (owner): collect regional sampled traces (EU + APAC) and validate cohort distributions; produce follow-up diary entry comparing region differences \u2014 target: 2025-03-02\n\nNotes to self (raw):\n- Watch for sampler amplification: high seq_len boost + tail-trigger 100% capture can generate many big traces; enforce daily cap per route and per-customer.\n- Consider offline replay harness to reconstruct stage timings when partial traces are captured (we have token timestamps in logs).\n- Keep an eye on retention cost: evaluate compression of stage times instead of full span payload for long traces.\n\nEnd of entry. ",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_71b61eea57f549299c79b6379758a921"
+}

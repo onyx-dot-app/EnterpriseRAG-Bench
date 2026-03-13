@@ -1,0 +1,42 @@
+{
+  "title": "Rare-path profiling notes: INT8 + AWQ kernel anomalies",
+  "owner": "Aisha Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/rare-path-profiling-int8-awq-mar2028.json",
+  "doc_type": "doc",
+  "created_at": "2028-03-15",
+  "last_modified": "2028-03-21",
+  "collaborators": [
+    "Marco Ruiz",
+    "Zhang Wei",
+    "Priya Menon"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "int8",
+    "awq",
+    "profiling",
+    "kernels",
+    "latency",
+    "rare-paths",
+    "regression"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/runtime/pull/4123",
+    "JIRA-ENG-9876",
+    "https://confluence.redwood.ai/display/SERV/rare-path-profiling"
+  ],
+  "content": "Context:\\nThis doc captures an exploratory runbook + notes from a small investigation into persistent latency tail spikes observed when serving a mix of long-prefix requests under INT8 quantized AWQ weights. The issue reproduces only on a small subset of traffic (rare invocation patterns) and intermittently on a small percentage of nodes.\\n\\nWhy this matters:\\n- Customer-facing p99 regression (spiky behavior) affects interactive agents (multi-turn chat with long context).\\n- Reproducible in-house with a crafted workload; root cause unclear (kernel selection vs. microkernel correctness vs. cache eviction).\\n- Need pragmatic mitigations while investigating long-term fixes (kernel routing, kernel rewrite, or quant profile changes).\\n\\nEnvironment & baseline:\\n- Model: open-gpt-13b-like (causal), AWQ per-layer quantization applied; baseline FP16 and GPTQ runs are normal.\\n- Runtime: runtime v2.14.1 branch with PROFILE=on; kernels: kernel-v3 (fast path) and kernel-compat-v1 (fallback slow path).\\n- Hardware: A100s (40GB) in Dedicated cluster; observed on both NVLink and non-NVLink hosts.",
+  "content_continued": "(note: file schema requires flat values; content continued here)\\n\\nSymptom summary (observed):\\n- Under synthetic workload (see workload command below) p50 ~35ms (unchanged) but p95/p99 sometimes spike to 220\u2013480ms.\\n- Spike only happens when:\\n  * request contains a long static prefix (>= 2048 tokens cached in KV) + small dynamic completion (<=32 tokens), AND\\n  * model config uses AWQ per-layer int8 with the new kernel-v3 enabled.\\n- Spike does not reproduce with: FP16, GPTQ, or if we force kernel selection to kernel-compat-v1 for all layers (odd).\\n- Spike rate ~0.4% of requests for this traffic pattern.\\n\\nHow we reproduced locally (commands):\\n- client harness: ./stress-client --model open-gpt-13b-awq-int8 --prefix-file long-prefix.txt --batchshape 1x1 --steps 50 --seed 42\\n- profiler run: RUNTIME_PROFILER=1 RUNTIME_KERNEL_LOG=1 ./runtime/bin/server --model-config path/to/config.json\\n- collection: nvprof (where available), runtime microprofiler output, kernel selection trace from /var/log/runtime/kernel-decisions.log\\n\\nMicroprofile findings (high level):\\n- Kernel selection trace shows an unexpected kernel switch mid-request: layers 1..18 use kernel-v3 fast codepath, then layers 19..21 temporarily select a different microkernel path that performs an expensive dequant+repack, then fast path again.\\n- The expensive microkernel correlates with increased memcpy activity (host<->device) and a synchronous blocking op on the main inference thread.\\n- Flamegraph (text summary): main thread blocked at kernel_dispatch -> env_call_copy_kv_prefetch -> sync_copy -> microkernel_dequant -> compute -> kernel_dispatch resume.\\n- GPU metrics during spike windows show high PCIe activity and reduced SM utilization vs normal runs (suggests data movement overhead).\\n\\nHypotheses (ranked):\\n1) Kernel misrouting due to batchshape + KV size heuristics: scheduler chooses a microkernel that expects a different quant packing (edge case in the AWQ per-layer meta tags).\\n2) Per-layer quant metadata corruption/edge-case: a small subset of layers marked as 8bit but actually packed with a differing blocksize, causing the runtime to choose a fallback that does a runtime conversion.\\n3) KV cache eviction pattern: large prefix causes on-demand KV page-in that triggers synchronous host->device copies if a threshold is crossed mid-request, invoking older kernel path.",
+  "content_more": "Quick checks we ran (and results):\\n- Forced kernel flag: --force-kernel=kernel-v3 => spikes disappear (but note: some rare correctness assertions fail in unit tests, we flagged this to model-onboarding).\\n- Force-compat-kernel=kernel-compat-v1 => p99 increases uniformly (expected), but the intermittent 400ms spikes go away. So compat kernel slower but stable.\\n- Requantizing the model with consistent blocksize across layers -> spike rate dropped to ~0.02% (suggests metadata mismatch is likely).\\n- Reproduced on a bare-metal devbox and on Dedicated; more common on hosts with slower PCIe gen (Gen3) but present on Gen4 too (less frequent).\\n\\nDetailed artifact snippets (search keys):\\n- kernel-decisions.log (grep: \\\"switch-to-microkernel\\\"), sample line: 2028-03-17T11:22:45Z node-07 layer=19 reason=blocksize-mismatch selected=kernel-micro-v1\\n- microprof CSV: main_thread_block_ms, 0.45, 0.5, 436, 2.1, ... (note the 436ms outlier)\\n\\nImmediate mitigations suggested (fast):\\n- Patch runtime to make kernel switching synchronous-safe: ensure that any microkernel path that does host<->device transfers does so asynchronously and off the main inference thread (PR #4123 touches this area).\\n- Conservative default: for AWQ-int8 models, enable a routing policy that prefers kernel-compat-v1 for long-prefix workloads until we fully validate blocksize metadata. Tradeoff: higher baseline latency vs fewer spikes.\\n- Add a lightweight runtime check at model load: verify per-layer packing/blocksize and fail fast or warn loudly to onboarding pipeline.\\n\\nPlanned deeper diagnostics (next week):\\n- Add more detailed per-layer telemetry (KV size at dispatch, chosen kernel, time spent copying). Target: get per-request timeline for 1k sampled invocations to analyze distribution.\\n- Instrument microkernel code to emit why-it-was-chosen reason string (blocksize mismatch, vector-lane issue, scalar fallback).\\n- Run massive sweep across hardware types (Gen3 vs Gen4) and compare spike frequencies.\\n\\nOpen questions / notes to self:\\n- Some nodes show the problem only for specific driver versions (470.xx vs 525.xx). Need to add driver version to kernel-decision logs.\\n- Is this related to AWQ's per-layer runtime quant params produced by the current quantizer (we recently changed default blocksize heuristic)?\\n- How often does the model validator (on onboarding) incorrectly accept inconsistent layer metadata? add a validator test.\\n\\nAction items (owners):\\n- Aisha: add driver-version and pci-gen to kernel-decisions.log (ETA: 2028-03-18).\\n- Marco: small PR to make host<->device copies off-thread (PR: runtime#4123; reviewer: Zhang).\\n- Zhang: run cross-hardware sweep and collect stats (ETA: 2028-03-23).\\n- Priya: follow up with quant team on blocksize heuristic change and re-run quantization for a failing model (ETA: 2028-03-22).\\n\\nAppendix: short reproducer notes\\n- long-prefix.txt is ~2300 tokens of mostly-repeated context; removing 500 tokens removes the spike in all runs.\\n- Key flags: --allow-dynamic-kernel-routing=false will force a single kernel family (useful for A/B).\\n- Sample perf number snapshot:\\n  * normal (FP16): p50=32ms p95=58ms p99=74ms\\n  * AWQ+kernel-v3 (no spike): p50=30ms p95=62ms p99=85ms\\n  * AWQ+kernel-v3 (with rare spike): p50=31ms p95=60ms p99=430ms (outliers)",
+  "final_note": "If we can reproduce consistently with a short reproducer, we can test a patch that disables mid-request kernel switching altogether for known long-prefix workloads. For now, prioritise telemetry + safe-guarding (validator + async-copy).\\n\\n-- Aisha (notes) 2028-03-21",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content",
+    "content_continued",
+    "content_more",
+    "final_note"
+  ],
+  "dataset_doc_uuid": "dsid_a7c760e2a43848eeac8eb5ab53107ffa"
+}

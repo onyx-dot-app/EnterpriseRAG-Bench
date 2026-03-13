@@ -1,0 +1,37 @@
+{
+  "title": "Kernel callsite lens instrumentation plan",
+  "owner": "Priya Nair",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/kernel-callsite-lens-instrumentation-plan.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-03",
+  "last_modified": "2025-11-10",
+  "collaborators": [
+    "Miguel Alvarez",
+    "Chen Wu",
+    "Riley O'Connor"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "profiling",
+    "attention",
+    "flashattention",
+    "paged-attention",
+    "fused-ops",
+    "instrumentation",
+    "latency"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/842",
+    "ENG-1284",
+    "CON-7621",
+    "slack:#serving-runtime:messageId:1723"
+  ],
+  "content": "Summary:\nThis is a working plan to add a \"callsite lens\" for attention kernels (FlashAttention, paged attention, fused ops). Goal: capture light-weight, per-call telemetry (arguments + decision signal) at kernel entry points so we can connect CPU-side routing/heuristics with observed GPU behavior and latency spikes. This doc is a pragmatic smoke/instrumentation plan: implementation notes, sampling commands, expected signals, quick analysis heuristics, and next actions.\n\nMotivation / problem statement:\n- We see intermittent tail-latency spikes in mixed workloads. Existing traces show kernel name + duration but lack context: seq_len distribution, kv-cache hit pattern, chosen kernel variant, batch packing details, prefetch outcome.\n- Without per-call metadata we can\u2019t confidently attribute a spike to: wrong kernel variant, bank conflicts, inefficient prefetch, or runtime scheduling.\n\nHigh-level approach:\n1) Add minimal per-call metadata emitted as structured NVTX ranges + compact JSON-encoded tag in an async logging buffer: {kernel_variant, seq_len, batch_size, kv_prefix_hit, fusedops_flags, prefetch_hint, input_dtype}.\n2) Sample 1% of requests in production and full traces for canary clusters.\n3) Correlate NVTX tags with CUPTI/Nsight timelines and GPU metrics (SM utilization, active warps, L2 throughput, stall reasons).\n4) Export small-period histograms (per-minute) of kernel variant frequencies by seq_len bucket to Console dashboards.\n\nInstrumentation details:\n- Callsites: attention entry in runtime where kernel variant chosen (flash, paged, fused-xxx). Instrument immediately after selection, before launch.\n- Format: base64'ed compact JSON payload (max 256 bytes) inside NVTX message string to avoid extra I/O. Example NVTX payload: \"v:flash_v2|s:128|b:4|k:pref|f:bf16|p:1\" (key shortcodes).\n- Sampling: environment variable RT_CALLSITE_LENS=enabled,sample_rate=0.01,path=nvtx\n- Fallback: when NVTX unavailable, write to circular in-process buffer and flush on qps spikes to blob storage.\n\nCommands / quick probes for local dev:\n- Run a mixed workload generator: python tools/mixgen.py --profile-distribution small:0.6,med:0.3,large:0.1 --openai-mode=chat\n- Launch with env: RT_CALLSITE_LENS=enabled,sample_rate=0.05 LOG_NVTX=1 CUPTI_CAPTURE=1 \n- Capture Nsight timeline: nsys profile -o tmp/trace --trace=cuda,osrt ./bin/inference_server --workload-file=workloads/mix.json\n- Extract NVTX messages: nsys export nvtx --input tmp/trace.qdrep --output tmp/nvtx.json\n\nSignals to look for (quick heuristics):\n- Variant flip at runtime: same seq_len bucket using different kernel variants correlating with 2x latency change -> investigate kernel selection thresholds.\n- Prefetch hint mismatch: p:0 but heavy L2 load + bank_conflict counter -> prefetch policy underestimating.\n- KV prefix hit toggles: k:miss -> memory movement patterns and page faults in paged attention.\n\nSample NVTX excerpt (synthetic):\n[time=12.034s] NVTX: v:flash_v2|s:256|b:1|k:pref|f:fp16|p:1 -> kernel_elapsed_ms=0.84,sm_util=78,stall_mem=12\n[time=12.035s] NVTX: v:paged_alpha|s:1024|b:2|k:miss|f:fp16|p:0 -> kernel_elapsed_ms=5.32,sm_util=62,stall_mem=58\nInterpretation: paged call had large stall_mem and much longer duration; tag shows missing prefix and prefetch disabled.\n\nMeasurement matrix (to run across canaries):\n- axes: model (llama-7b, mix-encoder), sequence length buckets (<=64, 65-256, 257-1024), batch sizes (1,2,4,8), dtype (fp16,bf16), kv-cache prefix percent (0,25,50,100), prefetch policy (on/off/heuristic).\n- metrics: p95/p99 tail latency per-token, kernel duration distributions, variant switch rate, L2 bandwidth, DRAM bandwidth, occupancy, TPU? (N/A).\n\nPrivacy / cost considerations:\n- NVTX payloads are sampled and contain no user text. Only numeric tags and short flags. Do not include any prompt tokens or user ids.\n- Sample rate default 1% in prod to limit overhead and tracing volume.\n\nQuick experiments we ran (notes):\n- Canary A (sample_rate=0.1) on 8xA100: observed paged->flash fallback when memory threshold reached; NVTX shows sudden increase of 'paged_alpha' selection with prefetch hint 0.\n- Canary B (mixed seq lens): flash_v2 performs well up to seq 512 for batch<=2. For batch 4 flash_v2 had higher register spills (from Nsight counters) and slower than paged variant.\n\nActionable hypotheses / next steps:\n- Add variant selection telemetry to Rollout UI so we can see time-series of variant fractions by seq_len bucket. (Follow-up: product ticket ENG-1298).\n- Modify prefetch heuristic to raise aggressiveness when L2 throughput < X and observed k:miss fraction > 10% in last minute. (Prototype: PR #842).\n- Run controlled microbench that toggles fused-ops on/off with identical kernels to measure warp divergence and bank conflicts.\n\nChecklist for landing basic change:\n- [ ] Add NVTX tagging at kernel selection sites (PR + unit tests).\n- [ ] Add circular buffer fallback and flush logic for non-NVTX platforms.\n- [ ] Dashboard: kernel variant ratios by seq_len.\n- [ ] Canary rollout (0.5% -> 2% -> 10%).\n- [ ] Postmortem template for any observed spike with callsite tags included.\n\nOwners:\n- Instrumentation implementation: Miguel Alvarez\n- Dashboarding and query ingestion: Chen Wu\n- Analysis + experiment design: Priya Nair, Riley O'Connor\n\nOpen questions / risks:\n- NVTX string size limits on some GPUs. Using compact shortcodes but need fallback to numeric IDs.\n- Overhead: coarse sampling shows ~0.3% CPU overhead at 1% sample rate; confirm on high-QPS service.\n- False positives from sampling: must ensure dashboards show sample-rate adjusted rates.\n\nIf you want to run a quick local smoke: ping Miguel for the dev branch and run the mixed workload above. Keep this doc as the temporary home for notes; will canonicalize to Confluence if plan stabilizes.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_0baca1ca42f0495a902aad8359c269e9"
+}

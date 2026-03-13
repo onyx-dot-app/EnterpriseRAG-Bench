@@ -1,0 +1,35 @@
+{
+  "title": "KV TTL rotation & seqlen boundary exploration",
+  "owner": "Aisha M. Patel",
+  "drive_area": "users",
+  "path": "users/kv-ttl-rotation-seqlen-exploration.json",
+  "doc_type": "doc",
+  "created_at": "2025-01-18",
+  "last_modified": "2025-02-02",
+  "collaborators": [
+    "Ravi Singh",
+    "Marisol Gomez",
+    "Evan Chen"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "kvcache",
+    "kv-ttl",
+    "attention-kernel",
+    "seqlen",
+    "debug",
+    "repro"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/runtime/pull/6789",
+    "RW-2713",
+    "slack://channel?team=T12345&id=thread5678"
+  ],
+  "content": "Personal scratchpad \u2014 KV TTL rotation + sequence-length edge tests\nOwner: Aisha M. Patel\nContext: trying to reproduce intermittent loss of context after ~8192-8220 tokens on rtx-gpu pool with kv_cache_v2 + flash_attn fallback. Similar to RW-2713 but different repro pattern (non-deterministic with batching).\n\nSummary of the problem:\n- Long-running chat sessions lose older tokens (responses start hallucinating as if prefix dropped).\n- Observed after a TTL-based eviction run and when client sequence length jumps across a boundary (e.g., 4096 -> 8193).\n- Suspect interplay between KV TTL rotation, per-shard kernel selection (flash_attn vs sparse_attn), and cache slot alignment when sequence lengths cross compile-time optim assumptions.\n\nRepro steps attempted (local):\n1) Start local inference with patched logger:\n   $ ./server/bin/inference_server --conf configs/local-rt.conf --log-level debug --kv-ttl-check 60\n2) Run synthetic client that appends tokens to push seqlen across thresholds:\n   $ python tests/synthetic_client.py --model rwlm-13b --batch 1 --tokens-per-step 300 --steps 30\n3) Watch metrics: /metrics (prom) and logs (stdout).\n\nCommands / small hacks tried:\n- Forcing kernel selection env var:\n   $ export RW_FORCE_KERNEL=flash_attn\n   $ ./server/bin/inference_server ...\n- Forcing cache variant:\n   $ export RW_KV_VARIANT=kv_cache_v1\n- Recompiled with boundary checks in kv_index_rotate() and added assert in kv.c:\n   if (new_index % cache_slots == 0) log_warn(...);\n- Added a one-off fix: zero-pad kv slot metadata during rotate to ensure alignment:\n   (quick patch) src/kv/rotate.c: memset(slot_meta+offset, 0, pad_bytes);\n\nObserved behaviors (snippets):\n- Kernel selection log around problematic window:\n  [2025-01-20T14:02:12.241Z] kernel_select: model=rwlm-13b seq=8188 prefer=flash_attn selected=flash_attn\n  [2025-01-20T14:02:12.313Z] kernel_select: model=rwlm-13b seq=8194 prefer=flash_attn selected=sparse_attn  <-- unexpected change\n\n- KV rotate trace (simplified):\n  rotate start idx=12288 epoch=5\n  rotate end idx=16384 epoch=6\n  kv_slot_align mismatch: expected_align=64 actual=56  <-- suspicious, alignment drift\n\n- Error/stack when behavior reproduced:\n  EPOCH=6: evicting slots 12288..16383\n  E[14:02:12.315] kv_get: invalid slot header (magic mismatch) at slot=13200\n  Traceback (most recent call last):\n    File \"server/worker.py\", line 421, in handle_request\n      out = runtime.generate(request)\n    File \"runtime/engine.py\", line 128, in generate\n      kv = self.kv_cache.get(prefix_id)\n  RuntimeError: KV header checksum failed (expected 0x5a3f, got 0x0000)\n\nHypotheses:\n- Hypothesis A: When sequence length crosses the JITed-kernel threshold, the runtime switches kernel mid-stream and kernel-specific KV layout expectations differ, leading to misinterpreting slots (header magic mismatch).\n- Hypothesis B: KV TTL rotation uses a chunk-aligned rotation size; under certain batch/sequence combos the padding is not applied, producing header truncation (observed align mismatch 64 vs 56).\n- Hypothesis C: Cache slot metadata written by background rotating thread races with inference threads reading slots when kernel choice changes buffer sizes (race exacerbated by continuous-batching).\n\nQuick experiments to validate hypotheses:\n- Force stable kernel across boundary (RW_FORCE_KERNEL=flash_attn) \u2014 reduces incidence drastically (went from ~1/50 to 0/200 runs). Supports Hyp A/C.\n- Increased kv-rotation mutex granularity (coarse lock) \u2014 reduced rate but increased latency. Suggests race in C.\n- Added zero-padding on rotation \u2014 reduced header checksum failures but not fully eliminated (likely partial overlap window).\n\nMicro-repro script (used locally):\n- tests/repro/kv-seqlen-edge.py (rough):\n  * warmup 20k tokens to populate cache\n  * concurrently spin 4 clients, drop one client into seq=8194 on step boundary\n  * sleep 0.01 between token sends to simulate real user pacing\n  * re-run with RW_FORCE_KERNEL env var toggles\n\nNext steps / TODOs:\n- Add kernel-compatibility metadata to KV slot header (version + kernel_mask) so mismatch is detectable and graceful fallback triggered.\n- Add per-slot write fences when rotation writes header (small perf hit but quick to test).\n- Create a targeted unit test that simulates mid-rotation read of header (C-level test harness).\n- Collect full core dumps / memory map when checksum mismatch occurs (need SRE help to attach gdb on node).\n- Share findings in RW-2713 and schedule 1-hr debug sesh with Ravi + Marisol.\n\nNotes / stray observations:\n- The mismatch often shows up when a client does an immediate big jump (e.g., imported conversation appended all at once). Sequential incremental appends less likely to trigger.\n- CPU affinity of rotation thread seems to drift to different socket under load; I saw more failures when rotation thread ran on socket 1 and inference on socket 0 (possible NUMA effect).\n\nRaw kernel selection debug log (context window compressed):\n  [14:02:11.987] batch=3 seq=4096 candidate_kernels=[flash_attn,sparse_attn] choose=flash_attn\n  [14:02:12.310] batch=3 seq=8194 candidate_kernels=[flash_attn,sparse_attn] choose=sparse_attn  # fallback path picked due to failed fast-path init\n\nAttached quick links: RW-2713 (jira), PR#6789 (runtime kv fixes), slack thread thread5678 (chat excerpts).\n\nIf I had to prioritize: 1) add write-fence+slot-version header (fast mitigation), 2) force stable kernel selection until header versioning is in place, 3) add unit test and SRE assisted core capture.\n\nEnd of scratchpad.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_57f2979dc1cf4480836782310fd6041d"
+}

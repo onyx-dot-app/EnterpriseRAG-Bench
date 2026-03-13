@@ -1,0 +1,37 @@
+{
+  "title": "Coldstart & warmup oddity sync - 2026-03-10",
+  "owner": "Morgan Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime",
+  "doc_type": "doc",
+  "created_at": "2026-03-10",
+  "last_modified": "2026-03-11",
+  "collaborators": [
+    "Ravi Kapoor",
+    "Sofia Martinez",
+    "Jonah Park",
+    "Elena Ruiz"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "benchmark",
+    "coldstart",
+    "warmup",
+    "latency",
+    "throughput",
+    "regression-hypothesis"
+  ],
+  "linked_artifacts": [
+    "JIRA: ENGINF-2437",
+    "JIRA: ENGINF-2499",
+    "GITHUB: https://github.com/redwood-inference/serving-runtime/pull/789",
+    "PLAYBACK: gs://redwood-bench/playbacks/2026-03-09/coldstart-mix-1"
+  ],
+  "content": "Summary:\\n\\nBrief sync capturing an unusual coldstart/warmup variance we observed on Dedicated pools starting 2026-03-08. Not a classical KV-cache regression (we verified cache hits), but p95/p99 jumps on long-context requests during the first ~90s after an instance is assigned. Repeatable on A100-40GB Dedicated nodes in eu-west1 and on a smaller A10G pool in us-central1.\\n\\nObserved behaviour (short):\\n- Baseline expectation: after instance assignment, warmup requests (single-token probes) should stabilise latency within ~10s.\\n- Observed: p50 stable; p95/p99 spikes intermittently for up to ~90s, correlated with sequences >2k tokens and with model checkpoint variants that use the quantized kernel path.\\n- Example numbers (redwood-model-x-7b-quant / batch=1):\\n  - Cold start first 30s window: p50=42ms, p95=410ms, p99=820ms\\n  - Steady-state window (>120s): p50=40ms, p95=85ms, p99=120ms\\n  - Reproduced on 7/10 runs per node type; not observed when quantized kernels disabled.\\n\\nHypotheses discussed:\\n1) Kernel JIT/first-use slow path: the quantized kernel path triggers a runtime codepath that compiles additional kernels on-demand for long sequence lengths, causing transient tail latency.\\n   - Evidence for: spikes strongly correlate with sequence-length > 1024 and first-appearance of that sequence length on a fresh instance.\\n   - Evidence against: compilation logs we sampled don't show large kernel compile durations (most < 50ms).\\n\\n2) Memory allocator fragmentation on first large KV allocations: when the KV cache grows to handle long contexts, allocator behavior causes occasional GPU-to-host synchronization points (blocking).\\n   - Evidence for: NVTX traces show intermittent syncs aligned with p99 events.\\n   - Evidence against: we see similar syncs on non-quantized runs but without latency spike magnitude.\\n\\n3) Mixed-precision fallback during warmup: quantized path triggers an FP16->INT8 boundary condition where fallback to a reference kernel occurs for some layer shapes until a small cache is populated.\\n   - Evidence for: spike disappears if we pre-load a short synthetic trace covering all layer shapes.\\n\\nReproduction steps (minimal):\\n1) Start a Dedicated instance (A100-40GB) using image: redwood-serving:2026-03-05-rc.\\n2) Model: redwood-x-7b-quant@v2026-03-01 (quantized kernel enabled).\\n3) Warmup script: send 1 probe every 500ms for 60s, then traffic pattern: 1 sustained client that issues 1 request per second of length 2k tokens for 120s.\\n4) Collect NVTX, runtime logs, and trace exports: export to gs://redwood-bench/playbacks/<run-id>.\\n\\nCommands (examples):\\n- launch test: ./scripts/dedicated-launch.sh --image redwood-serving:2026-03-05-rc --machine a100-40gb --model redwood-x-7b-quant --tag coldstart-test-0310\\n- run client: python tools/bench_client.py --target $ENDPOINT --seq-len 2048 --qps 1 --duration 180 --trace gs://redwood-bench/playbacks/coldstart-0310\\n\\nLogs & traces we captured:\\n- NVTX timeline (attached to playback): shows small synchronisation spikes at kernel boundary points.\\n- runtime.log: commit 4d2a9c3 (serving runtime), CUDA driver 525.85, cuDNN 9.4.\\n- kernel probe: quant-kernel v2.3.1 enabled.\\n\\nImmediate mitigations tried (results):\\n- Pre-warm synthetic run that touches all layer shapes for 20s before traffic: eliminates spikes in 9/10 runs. (Workaround)\\n- Force-disable quantized kernels via env REDWOOD_FORCE_FLOAT=true: no spikes but ~1.9x token cost increase; unacceptable for production.\\n- Increase background warmup probes frequency to 5hz for 30s: reduces spike probability but increases cost.\\n\\nAction items (owners):\\n- (Ravi) Add a deterministic layer-shape sweep synthetic warmup step to Dedicated onboarding and test harness (JIRA ENGINF-2499). Due 2026-03-17.\\n- (Sofia) Add extra logging for kernel first-use durations to runtime (small lightweight histogram metric) and feature-flag to eagerly JIT compile shapes we care about. PR draft: linked_artifacts above. Due 2026-03-14.\\n- (Jonah) Re-run A10G pool tests to check if behaviour scales to smaller GPUs and collect allocator traces. Due 2026-03-12.\\n- (Morgan) Prepare a short postmortem-style note for GTM about possible cost/latency tradeoffs if pre-warm is added to Dedicated onboarding. Due 2026-03-16.\\n\\nOpen questions for next sync:\\n- Is kernel compilation actually taking longer than our logs indicate due to hidden driver-level work? (action: runtime histogram + NVTX correlation)\\n- Can we implement a low-cost pre-warm policy that only spins up for model variants with quantized kernels?\\n- Should Dedicated SLAs call out a warmup window for the first 2 minutes after instance assignment (transparency to customers)?\\n\\nDecision notes:\\n- Do not roll back quantized kernel path (cost unacceptable). Focus on instrumentation + targeted pre-warm.\\n- Default Dedicated onboarding to include the deterministic shape-sweep warmup for now; expose as opt-out.\\n\\nMeeting attendees (quick): Morgan Chen (note), Ravi Kapoor, Sofia Martinez, Jonah Park, Elena Ruiz, Priya Nair (PM), Marco Silva (dedicated infra).\\n\\nNext sync: 2026-03-12 14:00 UTC - follow up on A10G runs, logging PR, and warmup onboarding plan.\\n\\nNotes-to-self / quick checklist:\\n- Upload NVTX gz to playback bucket and link in the JIRA.\\n- Add automated test to nightly bench-suite to run the shape-sweep on a cheap GPU instance (A10G) and fail if p99 > 3x baseline.\\n- Coordinate with infra to add a small quota burn allowance for warmup probes during instance assignment.\\n\\nUnresolved fragments (free-form):\\n- \\\"Weirdness around lock contention in allocator appears on host-side timings but not in driver metrics\\\" - need deeper SRE trace.\\n- \\\"Consider a hybrid approach: eager compile of 75th percentile shapes instead of all shapes\\\" - cheaper but needs shape-distribution analysis.\\n\\nEnd of notes.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_066dc60905654fc2994069d75595c16d"
+}

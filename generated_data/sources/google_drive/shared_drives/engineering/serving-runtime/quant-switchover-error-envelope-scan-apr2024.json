@@ -1,0 +1,39 @@
+{
+  "title": "Quant switchover error-envelope scan (APR 2024)",
+  "owner": "Aisha Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/quant-switchover-error-envelope-scan-apr2024.json",
+  "doc_type": "doc",
+  "created_at": "2024-04-12",
+  "last_modified": "2024-04-18",
+  "collaborators": [
+    "Ben Carter",
+    "Diego Morales",
+    "Mei Lin"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "quantization",
+    "int8",
+    "fp8",
+    "gptq",
+    "awq",
+    "kernels",
+    "latency",
+    "regret",
+    "switchover"
+  ],
+  "linked_artifacts": [
+    "JIRA-4812",
+    "PR#3984",
+    "confluence://quant-slos/overview",
+    "slack://C01A2B3C4/general-thread-quant-scan"
+  ],
+  "content": "Purpose and short story:\nThis is an exploratory sweep to identify practical switchover boundaries (the \"error envelope\") where we should route live requests from high-throughput low-precision kernels to higher-fidelity kernels or model variants. Goal: codify simple rules that recover most quality while preserving cost/latency wins from INT8/AWQ/FP8 runs.\n\nScope and motivations:\n- Not a full QA; focused on interactive generation workloads (1-2 turn chat, typical token lengths 32-256).\n- We want a tiny decision surface: when p95 latency is within SLO but expected quality regret (relative to FP16 baseline) exceeds threshold X, then switchover.\n- Compare quant methods: per-channel INT8 (symmetric), block-AWQ, GPTQ (per-layer quant), and FP8 (E4M3-like simulated).\n- Kernel variants: vectorized-matmul (low-latency), tiled-gemm (stable for AWQ), fallback-ref (baseline).\n\nExperimental setup:\n- Model: opensource LLM-13B-like checkpoint (decoder-only), trimmed to production-compatible tokenizer.\n- Host: single A100-80GB equivalent for kernel-local tests; separate small cluster for multi-kernel interference tests.\n- Client workload: 10k requests sampled from production prompt corpus (search snippets, support transcripts), request length distribution: p25=20, p50=48, p75=96, p90=180, p99=400 tokens.\n- Metrics collected per request: latency_ms (total), tokens_generated, model_variant, kernel, quant_method, BLEU-like similarity to FP16 baseline, perplexity_ratio, topk-agreement (k=5), cost_estimate_usd_per_1k_requests.\n- Quality regressions represented as \"regret\" = 1 - topk-agreement (FP16 top-1 baseline). We also compute LMDelta = (crossentropy_quant - crossentropy_fp16)/crossentropy_fp16.\n\nSweep design:\n- For each quant_method x kernel combination run batch of 10k requests single-threaded client to measure clean latencies and quality.\n- For each combination, sweep request concurrency from 1 -> 32 to see how switchover boundaries shift under queuing.\n- Produce a 2D surface: latency_ratio (quant/kernel) vs median_regret. We will mark iso-regret contours (0.5%, 1%, 2.5%, 5%).\n\nRepresentative results (summary):\n- INT8 (per-channel, symmetric) on vectorized-matmul: p50 latency = 18ms, p95 = 62ms, median_regret = 0.9% (but tail has rare spikes up to 8% for long prompts where activation clipping happened).\n- AWQ block-quant on tiled-gemm: p50 = 24ms, p95 = 70ms, median_regret = 1.8%, 95th-errile (95% quantile of regret) = 3.6%. More stable for long contexts.\n- GPTQ (per-layer) on fallback-ref kernel: p50 = 48ms, p95 = 120ms, median_regret = 0.4% (best quality but ~2x latency).\n- FP8 emulated on vectorized-matmul: p50 = 22ms, p95 = 68ms, median_regret = 0.6%, but shows increased variance under mixed-workload interference.\n\nKey observations:\n1) Error envelope is non-linear with latency. At low latencies (p95 < 70ms) median_regret moves quickly from ~0.5% to ~2.5% with small kernel/quant changes.\n2) Long-context prompts amplify INT8 instability: activation saturation/clipping causes outlier tokens with extremely high regret; this shows up as heavy right tail in regret distribution.\n3) AWQ shows better tail-behavior for long contexts but slightly worse median. GPTQ holds quality across lengths but costs ~2x-3x in latency and 1.8x cost.\n4) Under concurrency (>=8), vectorized kernels saturate and start showing queueing latency that shifts switchover boundary \u2014 i.e., you might prefer a slightly slower but more stable kernel under multi-tenant load.\n\nProposed switchover candidate rule sets (simple heuristics):\n- Static threshold rule A (latency-first): If p95_latency_estimate < 80ms AND expected_median_regret < 1% => use INT8 vectorized; else if median_regret in [1%, 3%] => AWQ tiled; else GPTQ fallback.\n- Tail-aware rule B (tail-first): If expected_95th_regret > 3% OR prompt_length_estimate > 256 => route to AWQ or GPTQ immediately.\n- Cost-sensitivity rule C: allow INT8 for <= 1k tokens/customer-month; otherwise prefer AWQ for balance. (placeholder for billing hooks)\n\nMicro-profiling notes (commands and traces):\n- Collected nvprof-like traces; kernel time breakdown shows matmul op time dominates as expected, but quant/dequant overheads are non-trivial when using per-token casting on vectorized path (adds ~2.5ms per 128 tokens).\n- KV cache touch patterns: INT8 reduced memory pressure but caused more frequent L2->L1 fetches on tiled kernels causing jitter.\n\nFailure / edge cases observed:\n- Activation clip mode: certain prompts with many rare tokens cause activation ranges to exceed calibration quantization ranges (seen in INT8 runs). Need better per-request fallback or range-adaptive quant clamps.\n- Off-by-one token divergence: small rounding differences cascade after ~80 tokens on some AWQ runs leading to different completions that increase measured regret (not necessarily a human-noticeable difference).\n\nActionable next steps (short list):\n1) Implement cheap switchover estimator in runtime: use a 1-5 token micro-eval on prefix to predict 95th-regret probability; cheap sampling approach. (Assigned: Ben)\n2) Add simple range-adaptive clamp mode for INT8 paths to reduce activation clip spikes; build guard that falls back to AWQ on detection. (Assigned: Diego)\n3) Run multi-tenant interference sweep with AWQ vectorized kernels in a 3-node cluster to measure stability at production load curves. (Assigned: Mei)\n4) Bake in policy A (latency-first) as a default in canary for 2 weeks, collect metrics, and measure customer-visible regressions with small eval-set. (Assigned: Aisha)\n\nOpen questions / discussion points:\n- How to set regret thresholds in a way that maps to human-perceived quality (not only topk agreement)? Need human eval subset or quality heuristics.\n- Pricing signals: can we expose dynamic-cost-awareness to customers (e.g., cheaply prefer INT8 but with an SLA for quality)?\n- Is it feasible to do fast on-request micro-evals without doubling median latency? Early testing suggests sub-5ms if we reuse warmed kernels.\n\nAppendix (quick tables):\n- Example single-run summary (vectorized INT8): p50=18ms, p95=62ms, median_regret=0.009, 95th_regret=0.08, cost_est=0.28$ per 1k\n- AWQ tiled example: p50=24ms, p95=70ms, median_regret=0.018, 95th_regret=0.036, cost_est=0.36$ per 1k\n- GPTQ fallback: p50=48ms, p95=120ms, median_regret=0.004, 95th_regret=0.009, cost_est=0.62$ per 1k\n\nNotes to reviewers:\n- This is exploratory; numbers depend heavily on model shape and tokenization. Please look at the linked PR with raw CSVs (PR#3984) for full distributions.\n- We should standardize a small eval set (50 prompts per workload type) to map regret->human delta.\n\nQuick todo: attach raw traces, lite script to reproduce sample workloads, and a short runbook for the canary policy.\n\n-- Aisha",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_15a9017342c342a9952cc2757850cf2c"
+}

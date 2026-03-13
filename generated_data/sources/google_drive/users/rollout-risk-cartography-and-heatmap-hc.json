@@ -1,0 +1,40 @@
+{
+  "title": "Rollout risk cartography and heatmap",
+  "owner": "Hannah Chen",
+  "drive_area": "users",
+  "path": "users/rollout-risk-cartography-and-heatmap-hc",
+  "doc_type": "doc",
+  "created_at": "2025-11-02",
+  "last_modified": "2025-11-09",
+  "collaborators": [
+    "Rafael Gomez",
+    "Priya Menon"
+  ],
+  "team": "eng-release",
+  "status": "draft",
+  "tags": [
+    "rollout",
+    "risk-mapping",
+    "canary",
+    "telemetry",
+    "model-pinning"
+  ],
+  "linked_artifacts": [
+    "https://redwood-confluence.internal/display/RELEASE/rollout-playbook",
+    "JIRA-1428",
+    "https://github.com/redwood-inference/runtime/pull/5172"
+  ],
+  "content": "Notes to self: mapping release risks to observable signals, mitigations, and cohort rules. Goal: make decisions deterministic during ramp and avoid fuzzy heuristics. \\n\\nContext:\\n- Target: staged rollout for hosted text-generation v2.3.0 engine changes (KV cache eviction tweak + kernel selector fallback). Small perf win but potential regressive behavior for long-context prompts.\\n- Launch window: 2025-11-12 to 2025-11-20 (quiet window nights PST).\\n- Strategy: 4-stage canary with anchored fallback model (v2.2-stable) and traffic steering by client affinity.\\n\\nAssumptions:\\n- Prefix KV cache improvements should reduce tail latency for medium tokens but may increase OOM risk for long sequences on shared instances.\\n- Most customer impact will be visible in 99th latency, OOM traces, and a subtle semantic drift for very long prompts (>2048 tokens).\\n\\nRisk cartography (quick):\\n- Risk: latent semantic regression for very long prompts\\n  - Signals: sudden spike in eval regression score on benchmark set; customer bug reports with >2048 tokens; increased semantic-similarity drop (>0.06 cosine on eval set).\\n  - Threshold: regression delta >= 0.05 on daily eval (rolling 6h) or >3 customer incidents in 12h\\n  - Immediate mitigation: route affected clients to fallback model; pause rollout and open high-pri incident; start targeted replay of failing inputs.\\n\\n- Risk: increased 5/10/25xx OOMs on long-context flows\\n  - Signals: instance OOM count, pod restarts labeled oom_kill, new gcore dumps, RL3 errors in SRE channel\\n  - Threshold: >2 OOMs per shard in 1h or >0.5% of requests hitting OOMs in any one region\\n  - Mitigation: reduce batch sizes for the variant pool; enable forced quantization fallback; divert traffic fraction to dedicated nodes with higher-memory SKUs.\\n\\n- Risk: 99p latency regressions (bad for real-time partners)\\n  - Signals: token-level latency 99th percentile increases >25% vs baseline; RU cost spike for affected routes\\n  - Threshold: sustained >25% increase for 30m on key customer routes OR >40% across global traffic for 15m\\n  - Mitigation: auto-fallback to v2.2-stable for high-latency cohorts; scale up burst capacity; temporarily disable batching optimization for small sequences.\\n\\nHeatmap (decision guidance):\\n- X axis = probability (low/medium/high), Y axis = impact (low/medium/high).\\n- High impact & high probability = immediate halt + full rollback\\n- High impact & medium probability = pause + targeted rollback for affected cohorts + canary expansion freeze\\n- Medium impact & high probability = throttled ramp + additional telemetry sampling\\n- Low impact & low probability = continue ramp, add extra monitoring and post-rollout eval.\\n\\nCohort selection heuristics (practical):\\n- Seed cohort 1 (0.1%): internal dev keys + canary orgs (hard-coded allowlist).\\n- Cohort 2 (1%): hashed client_id mod 1000 in [0..9] excluding enterprise contracts with SLA. Example pseudo-SQL: SELECT client_id WHERE abs(hash(client_id)) % 1000 < 10 AND contract_tier != 'enterprise'.\\n- Cohort 3 (5%): mod 100 in [0..4], prefer low-latency client regions (us-west/us-east).\\n- Cohort 4 (gradual): expand by doubling fraction every 4 hours if all green for last 60 min and no threshold hits.\\n\\nModel pinning notes (temp strategy):\\n- Do NOT change customer pinned model configs. For rollout, create a parallel routing rule: if route in canary cohort -> serve v2.3-canary else serve pinned version. This preserves customer expectations and avoids accidental version drift.\\n- KV cache considerations: cache keys include model version and compilation fingerprint; when switching cohorts ensure TTL for cache entries is short (5m) to avoid cross-contamination during first 2h.\\n\\nPreflight checklist (quick run):\\n- [ ] Smoke: end-to-end smoke on dev cluster with long-context (>4k tokens) synthetic prompts\\n- [ ] Regression eval: run eval set (n=12k long prompts) and compare similarity metrics; produce report\\n- [ ] SRE capacity check: confirm spare_shards >= 2 per region and burst capacity available\\n- [ ] Observability: dashboards for 50/90/99 latency, OOMs, error_code distribution, unit-cost per route all wired to alerting\\n- [ ] Canary keys: seed list verified + rollout gating policy created in Console with pinned fallback targets\\n- [ ] Client comms: scheduled note to top-10 customers and partner Slack channel\\n\\nRollback decision matrix (simplified):\\n- Immediate rollback if any of:\\n  - Regression delta >= 0.07 on semantic eval within 6h\\n  - OOMs > 3 per shard in 1h OR any widespread data loss/garbage-corruption alerts\\n  - Any persistent 99p latency >2x baseline for >30m on enterprise routes\\n- Soft pause + targeted mitigation if:\\n  - 99p latency 25-100% increase on non-enterprise routes OR increasing tail errors <0.5%\\n\\nTelemetry queries (bookmarks):\\n- Latency rollup per model: SELECT model_version, route, percentile(99, latency_ms) FROM token_logs WHERE timeframe = last_30m GROUP BY model_version, route\\n- OOMs: SELECT count(*) FROM instance_events WHERE event_type = 'oom_kill' AND timeframe = last_60m GROUP BY region, shard\\n- Semantic drift: run embedding similarity job: compare embeddings(old_model, new_model) -> aggregate mean cosine delta by prompt_bucket\\n\\nOperational runbook snippets (commands):\\n- Divert 10% of route foo to fallback: curl -X POST $CONSOLE/api/route-update -d '{\"route\":\"foo\",\"cohort_rule\":\"hash(client_id)%100<10\",\"target_model\":\"v2.2-stable\",\"fraction\":0.10}' \\n  (note: replace with Console UI flow in prod)\\n- Force immediate cache eviction on canary nodes: ssh to canary-hosts && sudo /opt/redwood/bin/evict-cache --age 300\\n\\nOpen questions / TODOs:\\n- How to validate semantic regression quickly at scale? Need lightweight online eval that samples production requests and computes similarity without leaking PII. Possible approach: hashed-sample + local embedding computation + differential stats.\\n- Do we want a temporary auto-abort rule when x% of routes hit user-facing error 5xx? Need product input.\\n- Confirm cost model: if fallback to dedicated nodes occurs, who owns incremental spend? Need finance sign-off for >$5k/day.\\n\\nNotes to self: keep rollout small, instrument the noisy signals first (OOM, 99p latency) and sanity-check semantic metrics asynchronously. Prefer freeze-and-probe over blind expansion.\\n\\nReference snippets and where to paste: put SQL bookmarks in Metrics > Saved Queries, copy curl templates to Console quick-commands.\\n\\nSigned-off-by: hannah. Quick follow-ups: Rafael will confirm Canary org list by 2025-11-05; Priya to run the eval job and post the diff by 2025-11-08.",
+  "action_items": [
+    "Rafael Gomez: finalize canary allowlist (due 2025-11-05)",
+    "Priya Menon: run long-context regression eval and upload report (due 2025-11-08)",
+    "Hannah Chen: create Console gating policy and attach fallback model (due 2025-11-10)",
+    "SRE: confirm burst capacity and spare_shards by 2025-11-09"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "content",
+    "action_items"
+  ],
+  "dataset_doc_uuid": "dsid_fc408d7233464a969b55358e4e09c3a3"
+}

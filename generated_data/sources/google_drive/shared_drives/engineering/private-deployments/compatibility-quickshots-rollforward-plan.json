@@ -1,0 +1,35 @@
+{
+  "title": "Compatibility quickshots: rollforward plan and experimental log",
+  "owner": "Priya Natarajan",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/private-deployments/compatibility-quickshots-rollforward-plan.json",
+  "doc_type": "doc",
+  "created_at": "2026-02-18",
+  "last_modified": "2026-03-05",
+  "collaborators": [
+    "Ethan Park",
+    "Miguel Alvarez",
+    "Hannah Li"
+  ],
+  "team": "eng-private-deployments",
+  "status": "draft",
+  "tags": [
+    "gpu-compat",
+    "k8s-upgrade",
+    "terraform-experiments",
+    "cuda",
+    "nccl",
+    "playbook"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/terraform-modules/pull/78",
+    "ENGINF-4219",
+    "CONFLUENCE:private-deployments/k8s-gpu-matrix"
+  ],
+  "body": "Purpose:\nQuick experimental log and rollforward playbook for validating K8s + NVIDIA stack upgrades in private (VPC/on-prem) clusters. This is intentionally lightweight \u2014 rapid iteration notes, short TF knobs we tried, and a minimal canary/rollback plan. Meant to sit alongside the formal upgrade playbook as \u2018fast feedback\u2019 artifacts.\n\nContext and goals:\n- We have multiple customers running Dedicated/private clusters with mixed GPU generations (V100, A100, A30).\n- Goal: identify low-risk upgrade path to kernel + driver + CUDA + NCCL that keeps inference runtime (token latency) within SLOs and avoids pod eviction/kernel panics.\n- Secondary: exercise Terraform module changes for node image and driver daemonset rollout.\n\nHigh-level approach (quickshots):\n1) Small isolated lab cluster (3 nodes, 1 GPU each) per GPU family.\n2) Run smoke inference workload (small LLM toy model + KV cache pressure) for 2 hours pre-upgrade to baseline.\n3) Apply single variable change: either kernel update, driver daemonset image, or CUDA container image.\n4) Monitor with perf counters + dmesg + kubelet logs for 30\u201390 minutes.\n5) Record pass/fail and rough root cause notes.\n\nQuick matrix snapshot (flattened text, last run 2026-03-04):\nGPU | OS kernel | nvidia-driver | CUDA runtime | NCCL | k8s | containerd | result | notes\nA100 | 5.15.0-58 | 525.85.12 | 12.1 | 2.14 | 1.27.3 | containerd 1.7 | PASS | small mem spike during pod startup, stable after warmup\nA100 | 6.1.0-12 | 530.30.02 | 12.2 | 2.16 | 1.27.3 | containerd 1.7 | FAIL | kernel oops on nvidia_uvm, trace to driver ABI mismatch; reproduction 2/3\nV100 | 5.15.0-58 | 470.161.03 | 11.4 | 2.10 | 1.26.3 | docker 20.10 | PASS | baseline perf within SLO\nA30  | 5.10.0-102 | 510.47.03 | 11.8 | 2.12 | 1.27.3 | containerd 1.6 | FLAKY | intermittent NVML timeouts under heavy batch\n\nObserved patterns and heuristics (fast notes):\n- Kernel upgrades to mainline 6.x can break older 52x/53x drivers; prefer driver >= 525 for 6.x kernels on A100s.\n- NCCL 2.16 showed improved cross-socket throughput but introduced hangs when combined with older drivers and cgroup v2 CPU throttling.\n- containerd 1.7 + cgroup v2 is the cleanest path for modern kernels; older docker runtime may mask cgroup regressions.\n- MIG-enabled A100 nodes need driver 470+? (depends on CUDA) \u2014 always validate MIG mode state in lab before rollout.\n\nTerraform/infra experiment notes (snippets kept as prose):\n- tf variable tried: enable_kernel_tune = true \u2014 toggles a small systemd unit to apply vm.max_map_count and swappiness. Worked harmlessly in lab.\n- node_image_map change: added \"ubuntu-22.04-kernel-6.1\" entry and new node-pool definition. During apply we saw instance replacement delays (cloud-init timeout) \u2014 increased cloud-init timeout to 25m.\n- driver_daemonset_image was changed from quay/redwood/nvidia-driver:525-ubi to quay/redwood/nvidia-driver:530-ubi in a single TF plan. Recommendation: split into two PRs: terraform change + separate canary rollout script.\n- sample terraform vars we tried (for record):\n  - gpu_node_pool_count = 3\n  - driver_daemonset_strategy = \"rollingUpdate\"\n  - driver_image_tag = \"525-ubi-fastprobe\"\n  - enable_node_label_mig = \"auto\"\n\nSanity checks and smoke tests (checklist for each quickshot):\n- [ ] nvidia-smi shows expected GPUs and MIG slices (if applicable)\n- [ ] kubelet does not log driver registration errors within 10m\n- [ ] small inference job (10 concurrent requests) completes with 95th latency below baseline + 30%\n- [ ] no dmesg OOPS or kernel panics seen in 30m window\n- [ ] NCCL tests (allreduce/single-GPU) pass at basic level\n\nRepro and debugging notes (concrete ties):\n- For A100 + kernel 6.1 failure: collected /var/log/kern.log + /var/log/syslog + driver pod logs. Repro steps: boot node with 6.1, install 530.30.02 driver via daemonset, start workload \u2014 first OOPS occurred at time ~ 00:14 with stack trace referencing nvidia_uvm. Suspect mismatch between driver kernel module and kernel ABI (module built against different kernel headers).\n- Immediate mitigation: pin kernel to 5.15 in terraform node_image_map for canary pools and escalate to kernel team if 6.1 required.\n\nCanary/rollforward plan (short):\n1) Create canary node pool (2 nodes) per GPU family using new node image + driver pod image but with driver_daemonset.strategy = OnDelete.\n2) Drain a single canary node, delete driver pods to trigger new image lifecycle, run smoke tests from CI (smoke-infra job).\n3) If smoke passes for 2h, increment canary pool by 1 and repeat.\n4) Full rollforward only after 3 consecutive successful canaries over 24h.\n5) Rollback: terraform to previous node_image_map + driver_image_tag, cordon/evict replacement nodes. Maintain old AMI snapshot for quick reprovision.\n\nOpen questions / action items:\n- Which customers require kernel 6.x features? (ACTION: solutions-eng to triage list)\n- Do we have an automated binary compatibility check between driver image and kernel headers during CI? (ACTION: build infra to mount headers and verify modinfo)\n- How does cgroup v2 throttling interact with NCCL \u2014 add a micro-benchmark that toggles cpu quota in lab.\n\nAppendix: quick failure Triage checklist (for on-call/private deploy ops)\n- Collect: dmesg, kubectl describe daemonset nvidia-driver, kubectl logs -n kube-system <driver-pod>, /var/log/cloud-init-output.log, nvidia-smi -q\n- Quick triage heuristics: if 'nvidia_uvm' oops -> likely kernel-driver module mismatch; if NVML timeouts -> possible driver handshake or firmware problem; if NCCL hang with high CPU steal -> check cgroups and IO saturation.\n\nNotes to self (loose):\n- Keep these quickshots near the TF branch until stabilization.\n- Convert successful quickshot matrix rows into definitive entries in the canonical compat matrix doc.\n- Add a small CI job that boots a vm with target kernel and runs kernel module build check against driver image (low effort, high payoff).\n\nEnd of quick log.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_968a87499d984170abcd5626995b6bd9"
+}

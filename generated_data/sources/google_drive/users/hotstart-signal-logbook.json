@@ -1,0 +1,36 @@
+{
+  "title": "Hotstart signal logbook: pool hysteresis & warmup breadcrumbs",
+  "owner": "Maya Singh",
+  "drive_area": "users",
+  "path": "users/hotstart-signal-logbook.json",
+  "doc_type": "doc",
+  "created_at": "2026-03-10",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Evan Park",
+    "Diego Ruiz",
+    "Asha Kapoor"
+  ],
+  "team": "eng-platform",
+  "status": "draft",
+  "tags": [
+    "autoscaler",
+    "warmup",
+    "gpu",
+    "incident",
+    "s3",
+    "driver",
+    "kv-cache"
+  ],
+  "linked_artifacts": [
+    "JIRA: INC-4452",
+    "PR: https://github.com/redwood-inference/infra/pull/388",
+    "Confluence: /display/INF/Pool+Warmup+Runbook"
+  ],
+  "content": "Summary:\nPersonal scratchpad capturing commands run, log snippets, quick hypotheses and next actions while investigating repeated capacity thrash and slow warm paths for a Dedicated GPU pool (on-call night). Preserve transient diagnostics from pager session and follow-ups to convert into a formal incident postmortem later.\n\nContext:\n- Pool: dp-dedicated-eu-west-2/gpu-pool-4 (H100 nodes, 8x GPU)\n- Symptom: rapid create-drain cycles of nodes (5-15m lifecycle), long warm tails (~3m) leading to request queueing and retries from controller\n- Alerts first fired: 2026-03-09 23:20 UTC; pager escalation 2026-03-10 00:04 UTC\n\nHigh-level observations:\n- Autoscaler scales up aggressively on queue spikes, but new nodes often enter NotReady or have driver/container crashloops during bootstrap.\n- Two failure modes: (1) node bootstrap fails (driver DS crashloop) due to package fetch errors; (2) node becomes Ready quickly but kv-cache priming is slow or OOMs so serving-runtime deems it not warm.\n- Feedback loop: slow warm -> higher latency -> autoscaler perceives shortage -> scale-up -> bootstrap failures or slow priming -> scale-down when nodes are NotReady.\n\nCommands & checks performed (chronological):\n- kubectl config use-context rwinf-prod-eu-west-2\n- kubectl get nodes -l pool=gpu-pool-4 -o wide 2026-03-10T00:22Z (6 nodes, 3 NotReady)\n- kubectl describe node ip-10-0-23-45 | egrep -i \"kernel|driver|taint|unsched\" -> nvidia-driver-installer crashloop (OOMKilled init)\n- kubectl logs ds/nvidia-driver-installer -n gpu-drivers --tail=200 -> downloader failed with 503 from packages-redwood.s3\n- curl -v https://packages-redwood.s3.eu-west-2.amazonaws.com/cuda-runner/2.1.0/sha256 -> intermittent 503 matches infra metrics\n- journalctl -u kubelet -n 200 on node ip-10-0-23-45 -> eviction of kv-cache-populator pods (OOMKilled)\n- kubectl logs deploy/kv-cache-populator -n serving-runtime --since=20m -> prefetch stalled: \"0/512 completed; latency 183s; missing shard 3\"\n- prometheus queries for container CPU and network egress to check warmup load patterns\n- nvidia-smi & dmesg -> GPUs present but device plugin errors and driver mismatch messages\n\nError snippets captured:\n- downloader.go: \"failed to fetch object: status 503\"\n- kubelet: \"Failed to setup device plugin: plugin API mismatch: server version 1.4, client 1.6\"\n- kv-cache-populator: \"panic: allocation failed: unable to reserve 48GB for shard loader\"\n- serving-runtime: \"model_load: shard 3 missing, falling back to remote fetch (cold)\"\n\nWorking hypotheses (ranked):\n1) Package distribution instability: S3 5xxs during bootstrap cause driver DS crashloops and node NotReady. Evidence: S3 503 spikes in timeframe + driver DS logs.\n2) Autoscaler hysteresis too tight for spiky traffic: cooldown < real warmup causing oscillation. Need warmup-aware windows.\n3) KV-cache/populator memory consumption sometimes exceeds available memory on new nodes resulting in OOM and prolonged priming.\n4) Device plugin / kubelet minor version skew leads to API registration failures and restarts.\n5) Large remote shard fetch patterns + limited egress bandwidth cause extended warm paths on initial load.\n\nQuick validations performed:\n- Grafana: confirmed elevated S3 503 errors between 2026-03-09 23:15 and 2026-03-10 00:40 UTC.\n- kubelet --version on failing nodes: 1.31.2 vs control-plane 1.31.3 -> minor skew.\n- Configmap diff: autoscaler stable-window was 30s for this pool.\n\nShort-term mitigations applied during incident:\n- Temporarily increased autoscaler stable-window from 30s to 180s for gpu-pool-4 to reduce churn (infra ops manual override).\n- Rolled driver DS back to v2.0.9 (known good) to avoid hitting the new package path during window.\n- Launched 2 pre-warm reserved nodes with nodeSelector preemptible=false to act as cache warmers for critical shards.\n\nWhat I tried that regressed or didn't help:\n- Turning off graceful drains caused more failed requests (reverted).\n- Increasing kubelet eviction thresholds in template helped future nodes but not already-failing ones.\n\nPost-mitigation snapshot (10-90m):\n- Oscillation frequency dropped; pool reached steady capacity in ~6-8m (improved from 10-20m).\n- 95p latency reduced ~30% but still above SLO; kv-cache completion still trailing on some nodes.\n\nRaw trace snippets saved:\n- [2026-03-10T00:17:18Z] ds/nvidia-driver-installer ip-10-0-23-45: failed to fetch: status 503\n- [2026-03-10T00:19:34Z] kubelet: device plugin registration failed: rpc error: code = Unknown desc = plugin API mismatch\n- [2026-03-10T00:20:04Z] kv-cache-populator: prefetch shard=3 status=fetching url=s3://models-prod/shard-3 seg=0 tries=3\n- [2026-03-10T00:22:12Z] autoscaler: scale_up pool=gpu-pool-4 delta=4 reason=\"pending-queue>threshold\"\n- [2026-03-10T00:25:07Z] autoscaler: scale_down pool=gpu-pool-4 delta=3 reason=\"node-not-ready:3\"\n\nImmediate follow-ups (owners):\n- Evan Park (infra): pin & mirror package distribution, add robust retry/backoff + multi-region mirrors for driver artifacts.\n- Diego Ruiz (serving-runtime): add readiness gating based on kv-cache-populator completion for critical model shards so nodes are not used until warm.\n- Asha Kapoor (autoscaler): introduce warmup grace period tied to cache-populator metrics, not just k8s Ready.\n- Hannah Lee (platform): evaluate product offering for reserved pre-warmed nodes and pricing trade-offs.\n- Maya Singh (infra): add CI gate to prevent device-plugin/control-plane API mismatch, reconcile manifests.\n\nShort checklist to close incident doc (me):\n- Upload full driver DS logs artifact to incident folder (saved /tmp/maya/h100-driver-20260310.tar.gz).\n- Create PR to add mirror + 5xx retry logic to driver-installer with circuit-breaker.\n- Run 24h canary with driver v2.0.9 and monitor S3 client errors & bootstrap success rate.\n- Draft design doc to gate node readiness on kv-cache-populator metrics.\n\nNotes-to-self:\n- Convert this scratchpad into timeline + graphs (CPU, network egress, s3 errors, scale events).\n- Remind PM to freeze driver image upgrades until mirrors + retry logic are in place.\n\nLinked artifacts (repeated for visibility):\n- INC-4452 (JIRA)\n- PR: https://github.com/redwood-inference/infra/pull/388\n- Confluence: /display/INF/Pool+Warmup+Runbook\n\nStatus: draft - will expand with prometheus panels and timeline plots for the incident postmortem.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_29e25f5c57dc44f6a91f298a7a4e4512"
+}

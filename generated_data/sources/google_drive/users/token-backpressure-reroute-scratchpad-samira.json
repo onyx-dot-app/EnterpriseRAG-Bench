@@ -1,0 +1,34 @@
+{
+  "title": "Token backpressure reroute scratchpad",
+  "owner": "Samira Khan",
+  "drive_area": "users",
+  "path": "users/token-backpressure-reroute-scratchpad-samira",
+  "doc_type": "doc",
+  "created_at": "2025-01-10",
+  "last_modified": "2025-02-03",
+  "collaborators": [
+    "Diego Ramos",
+    "Leah Park"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "throughput",
+    "backpressure",
+    "burst",
+    "kv-cache",
+    "reroute"
+  ],
+  "linked_artifacts": [
+    "https://jira.redwood.ai/browse/INF-1423",
+    "https://github.com/redwood-inference/serving-runtime/pull/867",
+    "https://confluence.redwood.ai/display/INF/Token+Backpressure+Playbook"
+  ],
+  "content": "Context / quick motivation:\nI keep seeing short-lived client bursts (30-90s) that spike token QPS 3\u20136x above baseline. When model nodes hit a token-level backpressure we currently: enqueue (longer latency), drop (error), or throttle upstream. Hypothesis: a targeted reroute to lower-cost / larger-buffer nodes when token-backpressure tripping could preserve p95/p99 SLOs while keeping overall cost reasonable. This scratchpad captures an exploratory bench run and notes for an experimental reroute policy.\n\nHigh-level goal:\n- Measure impact of an immediate reroute policy (on backpressure detection) vs. baseline queueing for bursts on p50/p95/p99 and overall token cost.\n- Verify that reroute doesn't cascade (i.e., cause downstream nodes to overload).\n\nTestbed / env:\n- Model: open-7B-quant (int8 pipeline) \u2014 representative medium-sized generator\n- Serving tier: hosted-sim (local cluster sim using same runtime)\n- Node types: primary-pool (A100-like, batch limit 128), buffer-pool (V100-like, larger input buffer, batch limit 512, slower per-token throughput)\n- KV cache: enabled, moderate hit-rate (simulated warmCache 60% for repeated prefixes)\n- Client generator: synthetic Poisson arrival with superimposed microbursts (see workload section)\n\nWorkload patterns:\n1) Baseline steady: 200 RPS sustained, mean tokens/request 40\n2) Microburst: 30s spike to 1200 RPS (6x), repeated every 10 minutes for 1 hour run\n3) Mixed priority: 80% regular, 20% high-priority requests that bypass queue when possible\n\nDetection heuristic for token-backpressure (prototype):\n- If node-level inflight tokens > token_capacity_threshold (configured per-model) for 3 consecutive 100ms ticks => mark as backpressured\n- Backpressure severity = (inflight_tokens / token_capacity) * tail_penalty_factor\n\nReroute policy (experiment A):\n- On detection, up to 30% of new arrivals in the next 2s are redirected to buffer-pool (probabilistic), leaving the remaining to queue as usual.\n- If buffer-pool latency (p95) exceeds 2x primary baseline, throttle reroute fraction down by 0.5x (adaptive fallback)\n\nBaseline run command snippets:\n- client generator: ./burst-client --pattern microburst --base-rps 200 --spike-rps 1200 --spike-duration 30 --interval 600 --mean-tokens 40 --concurrency 500\n- collect metrics: prom-scrape -> influx local, also capture per-request token count, queue-time, node-id, model-version\n\nExperiment run (A) command snippets:\n- edge proxy config: enable-backpressure-detector = true; reroute-fraction = 0.3; cooldown = 2s\n- same client as baseline; run for 3600s; capture node-level queue lengths and reroute decisions in debug log\n\nKey measurements (what I care about):\n- p50/p95/p99 request latency (end-to-end)\n- average tokens/sec per node (to see load transfer)\n- error rate (503 / client drops)\n- reroute-induced variance on buffer-pool latencies (did we push buffer-pool into backpressure?)\n\nRaw-ish results (hand-summarized from logs):\n- Baseline (no reroute), 1h run with bursts:\n  - p50: 42ms, p95: 620ms, p99: 2.3s, errors: 0.6% (mostly 503s during peak), avg tokens/sec primary nodes: 18.2k\n- Experiment A (probabilistic reroute 30%):\n  - p50: 45ms, p95: 290ms, p99: 1.1s, errors: 0.18%, avg tokens/sec primary nodes: 13.9k, buffer-pool: 5.1k\n- Buffer-pool p95 increased from 310ms (warm) to 580ms during sustained reroute episodes but adaptive fallback reduced reroute fraction after 3 cycles\n\nInterpretation / quick conclusions:\n- Reroute reduced system-wide p95 by roughly 50% and p99 by ~52% vs baseline in this synthetic burst pattern.\n- Error rate dropped ~3x, showing fewer hard drops when primary nodes hit backpressure.\n- Buffer-pool absorbed a meaningful fraction without immediate cascading failure; adaptive fallback prevented runaway overload.\n- Cost impact: buffer-pool tokens cost ~1.15x primary tokens per unit (lower throughput), so unit cost rose ~6\u20138% for the hour, but tail latency improvements are likely worth it for SLA-bound customers.\n\nObserved oddities / anomalies:\n- During the 3rd burst the reroute fraction oscillated fast causing ~5s windows where buffer-pool p95 spiked >1.1s \u2014 investigate detector hysteresis and feedback smoothing.\n- High-priority requests still experienced queueing on one test machine due to sticky routing; needs routing affinity fix.\n\nQuick to-dos / next experiments:\n- Run longer (4\u20136h) with variable burst sizes and spacings to test cascade risk over time.\n- Try deterministic reroute (first N requests after backpressure) vs probabilistic \u2014 might reduce oscillation.\n- Tweak detector to require both inflight_tokens and increasing enqueue rate (two-signal detection) to reduce false positives.\n- Cost analysis: run a per-hour cost model with real cloud pricing to quantify cost vs SLA benefit for a customer profile.\n- Instrument: add per-request reroute tag so we can aggregate user-visible latency for rerouted vs not.\n\nNotes-to-self:\n- Add metric: \"reroute_decay_time\" to logs for easier postmortem \u2014 current logs only show decisions, not decay sequence.\n- Check PR 867 (linked) for current proxy backpressure code; coordinate with Diego on smoothing window.\n\nOpen questions:\n- What does an acceptable cost uplift look like for the SLAs we want to claim? (Ping product)\n- Can we use predictive signals (rising queue slope) to preempt backpressure rather than react?\n\nRelevant traces / artifacts:\n- saved logs: s3://exp-logs/token-reroute/2025-01-10-runA.tar.gz (note: needs IAM grant)\n- per-request sample traces attached to INF-1423 (Jira)\n\nBottom line (current): reroute-on-backpressure is promising for short microburst patterns: clearly improves tail latencies and reduces hard drops at modest cost. Next step: broaden workload variety and harden detection hysteresis before any canary to production.\n\n-- Samira\n\n(rough, messy \u2014 intended as working scratchpad)",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_a770640c51f24c7fafbe6371d9f3aa3f"
+}

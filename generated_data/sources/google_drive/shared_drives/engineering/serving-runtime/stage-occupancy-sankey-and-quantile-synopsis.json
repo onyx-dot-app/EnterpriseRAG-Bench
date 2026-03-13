@@ -1,0 +1,43 @@
+{
+  "title": "Stage occupancy sankey and quantile synopsis (p50/p95/p99)",
+  "owner": "Aisha Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/stage-occupancy-sankey-and-quantile-synopsis.json",
+  "doc_type": "doc",
+  "created_at": "2026-01-20",
+  "last_modified": "2026-02-15",
+  "collaborators": [
+    "Marco Chen",
+    "Sofia Gomez",
+    "Ethan White",
+    "Lina Farouk"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "p99",
+    "sankey",
+    "occupancy",
+    "profiling",
+    "batching",
+    "kv-cache"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-RT/occupancy-sankey-visual",
+    "JIRA-RT-582",
+    "https://github.com/redwood-inference/traceplayground/pull/241"
+  ],
+  "body": "Purpose:\nThis note captures a compact, pragmatic view of end-to-end emission latency by combining stage occupancy metrics with quantile timing (p50/p95/p99). The goal is to expose where time is spent as load shifts so we can prioritize inexpensive mitigations (batching tweaks, cache pre-warm, serialization hotpath) versus heavier work (model kernel tuning, hardware mapping).\n\nDataset and method:\n- Sampled ~30k successful responses over a 6-hour evening window (US-East peak).\n- Traces were annotated with stage boundaries: ingest -> deserialize -> preprocess -> tokenize -> batching_wait -> model_forward -> kv_lookup -> postprocess -> serialize -> egress.\n- Occupancy measurement: wall-clock time each request spent in a given stage across its lifecycle (includes queue wait inside that stage).\n- Quantiles computed across same sample slice; stage times sum per trace approximately equals end-to-end duration (small variance due to concurrent bookkeeping).\n- Sankey visualization was generated from aggregated stage occupancy fractions for p50/p95/p99 cohorts to show shifting dominances.\n\nHigh-level numbers (end-to-end):\n- p50 overall: 82 ms\n- p95 overall: 210 ms\n- p99 overall: 420 ms\n\nRepresentative per-stage quantiles (ms) - median / p95 / p99 (stage order approximates critical path):\n- ingest: 4 / 9 / 14\n- deserialize: 3 / 7 / 12\n- preprocess: 9 / 18 / 30\n- tokenize: 2 / 6 / 10\n- batching_wait: 10 / 35 / 90\n- model_forward: 38 / 120 / 280\n- kv_lookup: 6 / 15 / 36\n- postprocess: 7 / 14 / 26\n- serialize: 2 / 4 / 7\n- egress: 1 / 2 / 4\n\nNotes on numbers and shape:\n- model_forward dominates p50-to-p99 growth in absolute terms but batching_wait is the most volatile contributor to p95 spikes: its p99 (90 ms) amplifies shorter sequences where model_forward is small.\n- kv_lookup p99 (36 ms) correlates tightly with traces where a cache miss triggers a slow fallback to remote datastore. Those traces also show increased deserialize and serialize time (payloads larger).\n- The sankey for p50 shows model_forward ~46% of occupancy, batching_wait ~12%, remaining stages split small. For p99 the sankey shifts: model_forward ~66%, batching_wait ~21%, kv/fallback ~8% combined.\n- We observed two dominant trace archetypes: (A) long model runs (larger sequences / sampling steps) where model_forward alone explains >75% of end-to-end; (B) short model runs with high wait or cache misses where batching_wait + kv_lookup together push p95/p99.\n\nRoot-cause signals and heuristics applied during triage:\n- Queue depth and batch formation: when QPS spikes by >2x the batching policy increases typical batching_wait by 2\u20134x due to conservative timeout; also exacerbated by skewed arrival patterns (bursty clients).\n- KV cache TTL and coldness: certain keys (customer-specific prompt templates) have TTLs misaligned with traffic, causing elevated miss rates on a small but high-impact cohort. Misses introduce 20\u201360ms variance depending on remote datastore latency.\n- Model stepping and kernel selection: p99 traces for model_forward often show degraded kernel selection metrics (fallback to slower matmul kernel under certain sequence length combos).\n- Serialization path: large payload branches (structured tool outputs) show extra deserialize/serialize time; these are responsible for ~3\u20138% of p99 tail in traces with >2KB payloads.\n\nActionable mitigations (cheap first):\n- Reduce batching timeout floor for routes with sub-100ms model_forward median and strong burstiness: test lowered floor from 8ms -> 4ms and monitor p95 change for short-seqlen cohort.\n- Add small in-memory LRU for templated prompt keys to reduce kv miss fraction (target top 2% of keys by frequency).\n- Introduce an early-exit path for tiny payloads to bypass full deserialize/serialize for known compact formats.\n- Warm model kernels for common seqlen buckets during autoscale events to avoid slow kernel fallback.\n\nLonger-term/engineering projects:\n- Adaptive batching policy: dynamic floor based on observed arrival entropy (burstiness metric) to minimize batching_wait tail without sacrificing throughput.\n- Route-aware caching: per-customer small LRU + async background refresh for recently evicted hot keys.\n- Kernel/compilation profiling harness: systematic offline runner to detect sequence-length -> kernel-degradation points and produce precompiled kernels.\n\nValidation windows and success criteria:\n- Short-term experiments (A/B) should run for at least 48h across two peak windows. Success criteria: p95 drop >= 15% for short-seqlen cohort and no >5% throughput regression.\n- KV LRU pilot: reduce observed cache-miss p99 contribution by 40% on targeted keys and total p99 by >=6 ms.\n\nOpen questions / unknowns to address in follow-ups:\n- Precise mapping between kernel fallback signals and per-trace metadata (we have a noisy signal from runtime logs; need stronger correlation keys).\n- Whether any multi-tenant interference on hardware is contributing to sporadic model_forward p99 spikes (requires dedicated capacity experiment).\n- Impact of client-side retry patterns that may artificially increase batching_wait under certain SLA configs.\n\nAppendix: quick trace archetype examples (anonymized):\n- Archetype A (long-run): end-to-end 760 ms (p99-like); stage breakdown: model_forward 520 ms, batching_wait 40 ms, kv_lookup 20 ms, others 180 ms. Notes: large seqlen, kernel fallback observed.\n- Archetype B (short-run, missy): end-to-end 380 ms; stage breakdown: model_forward 60 ms, batching_wait 120 ms, kv_lookup 36 ms, deserialize/serialize 30 ms, others 134 ms. Notes: cache miss + bursty arrival.\n\nConcluding summary:\nCombining occupancy fractions with quantile timing gives an interpretable view of how tail behavior emerges: for our workload, model compute is the largest single contributor to tails, but queue/batching dynamics and cache misses are multiplicative pain points for shorter requests. The recommended first experiments (batching floor adjustments + small-key LRU) are low-effort and target the most actionable tail drivers observed in the dataset.\n\nIf reviewers want the sankey visuals and per-trace CSVs, see linked artifacts and the PR for the viz generation.\n",
+  "next_steps": [
+    "Create A/B branch to test batching timeout floor change (8ms -> 4ms) for route: chat-small-seq",
+    "Prototype in-memory LRU for templated prompts and run pilot on 10% of traffic",
+    "Add stronger kernel fallback logging correlation IDs to runtime traces",
+    "Schedule dedicated-capacity 2-hour run to rule out hardware multi-tenant interference"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_012b32c8e0834749b9afe78f35b2883a"
+}

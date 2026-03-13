@@ -1,0 +1,34 @@
+{
+  "title": "KV-cache quant probe: emergent hunches and tiny-run log",
+  "owner": "Lucas Chen",
+  "drive_area": "users",
+  "path": "users/lucas-kv-quant-emergent-hunches.json",
+  "doc_type": "doc",
+  "created_at": "2026-03-18",
+  "last_modified": "2026-03-19",
+  "collaborators": [
+    "Maya Chen",
+    "Ida Patel",
+    "Omar Ruiz"
+  ],
+  "team": "eng-applied-ml",
+  "status": "draft",
+  "tags": [
+    "quantization",
+    "kv-cache",
+    "microbench",
+    "prompt-eval",
+    "low-precision"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/842",
+    "ENG-1289",
+    "https://confluence.redwood.ai/display/ENG/KV+cache+quant+notes"
+  ],
+  "content": "Quick context: informal run-log for smallscale probes into how KV-cache interacts with low-precision quantized weights. Goal is to capture weird regressions and hunches before I forget them. High-level question: do certain quant schemes (q4_0 vs q4_k) amplify cache-related token drift on long-context continuation tasks?\n\nTop-level notes / framing:\n- Hypothesis A: group-size and per-channel scaling differences change distributed rounding noise and that noise accumulates when KV cache is reused across many tokens (esp. autoregressive long tails).\n- Hypothesis B: cache warm-starts (prefilled KV from prefix) make quantized models more brittle to tiny input perturbations \u2014 could explain occasional hallucination spikes in production.\n- UX goal: find safe quant+cache combos with <1.5% drop in accuracy and <5% latency gain vs baseline FP16.\n\nExperiments run (mini-batch of quick probes):\n- Model: open-llama-13b-like (test harness uses our trimmed eval weights).\n- Workload: long-continuation stories (avg prefix 1k toks, continuation 2k toks), and dialogue multi-turn replay (10 turns).\n- Metrics captured: token-level logprob delta, top-1 next-token accuracy on held prompts, avg latency (ms/token), throughput (tokens/sec), memory (GPU alloc MB).\n\nRun summary table (quick):\n- RUN 2026-03-18-A | quant: FP16 baseline | kv_cache: ON | group: n/a | latency: 12.4 ms/tok | throughput: 810 tok/s | top1_acc: 0.00% delta (baseline) | notes: warm, stable\n- RUN 2026-03-18-B | quant: q4_0 | kv_cache: ON | group: 128 | latency: 9.8 ms/tok | throughput: 1000 tok/s | top1_acc: -1.1% | notes: small drift after ~900 tokens, sporadic token prob dips\n- RUN 2026-03-18-C | quant: q4_k (per-channel) | kv_cache: ON | group: 64 | latency: 10.2 ms/tok | throughput: 960 tok/s | top1_acc: -0.8% | notes: noticeably smoother continuation, fewer low-prob spikes\n- RUN 2026-03-18-D | quant: q8_0 | kv_cache: OFF | group: 256 | latency: 8.6 ms/tok | throughput: 1120 tok/s | top1_acc: -2.6% vs FP16 | notes: fast but quality hit large on specific suffix tokens\n- RUN 2026-03-18-E | quant: q4_k | kv_cache: ON | group: 128 | latency: 9.9 ms/tok | throughput: 995 tok/s | top1_acc: -0.6% | notes: repeat run with different seed; similar to C\n\nObservations (rough):\n- q4_k (per-channel scales) + kv_cache seems most robust in these tiny probes: smaller accuracy drop + stable token probs. q4_0 sometimes has larger tail spikes \u2014 maybe due to coarse per-tensor scale rounding interacting with cached KV values.\n- When kv_cache is OFF, quant artifacts are less correlated across tokens (makes sense) but overall runtime is also worse for production patterns (no cache means higher compute).\n- Group size tradeoffs: smaller groups (64) give slightly better quality at cost of some performance; for q4_k 64 vs 128 delta was ~0.2% accuracy but throughput drops ~5-7%. Might be a useful knob for latency-sensitive vs quality-sensitive routes.\n- Memory: q4_* reduces peak GPU mem and allows larger batch/longer context, but watch for alignment padding causing small perf cliffs.\n\nWeird anomalies / hunches to follow up:\n- Observed repeatable low-prob spikes around punctuation-heavy suffixes. Might correlate with KV-cache addressing patterns (attention indices landing on quantized values near rounding boundaries). Could try synthetic input that toggles punctuation and inspect attention score distributions.\n- Small seed shifts produce different early-drift behavior; maybe rounding error interacts with dropout/softmax numerical conditioning \u2014 run deterministic (no dropout) to sanity-check.\n- One run showed sudden logits collapse at ~1.7k tokens, then recovered \u2014 logging shows small negative infinity-like values in cached K embedding chunk. Suspect a bug in our KV serialization for quant bins \u2014 file an issue.\n\nImmediate TODOs (next 48h):\n- [ ] Re-run C with deterministic rng and exact same seed as A/B to compare cumulative KL per token. (Jira: ENG-1289)\n- [ ] Add attention-score histogram logging for suffix tokens and dump KV activations for a few tokens. (small binary extractor script)\n- [ ] Try per-row (per-channel) zero-clipping before quant for q4_0 to see if we can reduce spikes.\n- [ ] Add microbench route in dev cluster to test q4_k group64 at scale for 30 min to watch for rare drift events.\n- [ ] Draft short note for Solutions Eng: recommended safe profiles (q4_k group128 + kv-cache) with caveats.\n\nNotes for run reproducibility:\n- harness: /repos/serving-runtime/bench/mini_eval.py commit 34f7c1f\n- docker: redwood/serving-runner:staging-20260318\n- GPU: A100-sxm-80GB (dev slot)\n\nScratch ideas / longer-term experiments:\n- Quant-aware KV storage: store KV in slightly higher precision (e.g., int16-ish packing) while keeping weights q4 to reduce cumulative drift. Evaluate cost/latency tradeoff.\n- Cache-correction layer: small lightweight dequantizer network applied to cached KV blocks before reuse (learned tiny residual). Could be trained on continuation data to correct quant-induced bias. Risk: adds overhead, needs careful profiling.\n- Adaptive group-size at runtime: start small-group then relax to larger-groups once cache stabilized. Need stateful per-inference config.\n\nOpen questions / decision points:\n- For Dedicated customers with strict latency SLOs, is q4_k group128 + kv_cache acceptable as default? Need more long-run proof (1M tokens across 24h).\n- Do we add a \"quant-safe KV\" flag in the API to toggle hybrid storage? UX + billing implications.\n\nMisc quick logs / micro-notes:\n- Slack thread: #aml-quant (see thread ts:1623429182.000200)\n- PR hint: consider adding a small clamp in kv_serialize() to avoid sending NaN/Inf in rare paths.\n- Reminder: sync with Maya on 2026-03-20 for dataset of long-form prompts (she has curated 5k stories).\n\nEnd of scratch. Will polish into a short internal memo if any of the anomalies reproduce at scale. Keep this doc as canonical \"my quick jot\" for these probes.\n\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_3791288d54ab41f6b182a33235905d72"
+}

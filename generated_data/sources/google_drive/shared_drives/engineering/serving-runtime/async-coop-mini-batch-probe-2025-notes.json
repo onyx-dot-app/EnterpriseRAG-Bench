@@ -1,0 +1,35 @@
+{
+  "title": "Async cooperative mini-batcher: probe notes and hypotheses",
+  "owner": "Aisha Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/async-coop-mini-batch-probe-2025-notes.json",
+  "doc_type": "doc",
+  "created_at": "2025-01-12",
+  "last_modified": "2025-01-18",
+  "collaborators": [
+    "Ben Harper",
+    "Carmen Liu",
+    "Diego Morales"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "mini-batching",
+    "async",
+    "latency",
+    "python-overhead",
+    "tokenization",
+    "profiling"
+  ],
+  "linked_artifacts": [
+    "GH-hr/mini-batcher-PR-512",
+    "JIRA-SRV-1374",
+    "confluence://serving-runtime/mini-batch-design-v2"
+  ],
+  "content": "Purpose:\nQuick working notes from probes into a new async cooperative mini-batcher prototype (`mini-batcher`) that attempts to collect very small requests into micro-batches inside the Python process\n\nObservations so far (experiment logs):\n- Experiment harness: local dev machine (c6i-like CPU), 8 cores, python3.11, pypy not tested. Tokenizer is fastBPE (C extension) exposed via CFFI.\n- Baseline: single-request path median p95=8.3ms, p99=14.7ms under synthetic workload (r=200/s).\n- Mini-batcher enabled (cooperative async wait 200us window): p95=9.6ms (+15%), p99=22.1ms (+50%) \u2014 tail regressed.\n- CPU profiles (perf+flamegraphs) show increased time in:\n  - Python scheduler overhead (PyEval_EvalFrameEx / interpreter state switches)\n  - syscall wait loops inside event loop (short sleeps)\n  - tokenizer CFFI boundary calls appearing slightly more often per request due to speculative tokenization attempts\n\nWhat we measured (snippets):\n- microbench harness output (representative):\n  requests: 10k, concurrency: 4, batch-window: 200us\n  median latency: 6.1ms\n  p95 latency: 9.6ms\n  p99 latency: 22.1ms\n  CPU util: 62% (user), 6% (sys), small I/O waits\n\n- perf top / annotated stack (summary):\n  25% PyThreadState_Swap (context switching between green-threads)\n  18% PyEval_EvalFrameEx (bytecode evaluation during batching loop)\n  12% CFFI_call_fastbpe_tokenize (tokenization time)\n  8% epoll_wait and nanosleep (micro-sleep coordination)\n\nHypotheses (root causes):\n1) Cooperative polling window creates bursts of interpreter activity that serialize with tokenizer C calls, increasing contention on the Python thread and amplifying tail latency.\n2) Short sleeps (nanosleep/epoll timeouts) used to implement a batching window produce syscall jitter and scheduler wakeups; when combined with many worker coroutines it increases context-switch noise.\n3) Tokenizer CFFI re-entrancy: if tokenization holds a GIL-like lock or long C work, other coroutines are starved; our mini-batcher increases frequency of tokenization calls per unit time, worsening head-of-line blocking.\n4) Per-request micro-allocation churn in the batching path increases GC pressure and Sporadic GC pauses correlate with p99 spikes in some runs.\n\nQuick experiments to validate hypotheses (what we ran):\n- Disable micro-sleep (busy-wait spin for 50us) -> tail improved on local run but CPU doubled; suggests syscalls are a factor.\n- Move tokenization to a shared tokenization threadpool (offload via concurrent.futures.ThreadPoolExecutor) -> median unchanged, p99 reduced ~18% in one trial but introduced threadpool queue latencies at high load.\n- Increase batch-window to 500us -> p95 improves slightly but p99 sometimes spikes more due to larger grouping when a slow tokenization call stalls the group.\n- Run with tracemalloc and smaller heap to trigger more frequent GC; p99 correlates with GC collections in ~30% of bursts.\n\nOpen questions / unknowns:\n- Does the tokenizer C module release the GIL during heavy work? (need to inspect source or run Python-level GIL contention tools)\n- Are we seeing Python-level scheduling (PyThreadState) or OS-level preemption? perf and py-spy show both \u2014 need a combined timeline.\n- What is the sweet spot for window size vs CPU cost for production fleet? (need param sweep with realistic request distribution)\n\nSuggested next steps (concrete):\n1) Add a small trace timeline per request that includes: enqueue_ts, batch_start_ts, tokenizer_enter_ts, tokenizer_exit_ts, send_ts. This will let us attribute tail-causes to tokenizer vs scheduling. (owner: Ben)\n2) Run a kernel-timer+py-spy combined capture on a staging node under realistic QPS with 12 cores. Use perf record -g + py-spy to correlate C stacks and Python frames. (owner: Carmen)\n3) Instrument tokenizer C extension to assert whether it releases the GIL and emit micro-metrics (tokenize_ms per call) for 48h. (owner: Diego)\n4) Prototype a hybrid: small busy-spin for first 50us then fall back to epoll_wait; benchmark CPU vs tail tradeoffs. (owner: Aisha)\n5) Try a minimal Rust tokenizer shim that exposes an async-friendly interface (releases the GIL entirely) for a controlled A/B test. Note: this is heavier but will isolate the GIL hypothesis. (owner: roadmap)\n\nExperiment notes / commands used: (for reproducibility)\n- harness run: ./tools/mini-batch-harness --qps 200 --concurrency 4 --batch-window-us 200 --duration 300s --payload small\n- perf capture: sudo perf record -F 99 -p <pid> -g -- sleep 60; sudo perf script > perf.stacks\n- py-spy: sudo py-spy record -o profile.svg --pid <pid> --duration 60\n- tok profiler: export TOK_DEBUG=1; ./service --enable-tok-metrics\n\nLow-effort mitigations to try in prod (can be toggled):\n- Increase default batch-window slightly (e.g., 200 -> 350us) behind a flag for tiered customers. Trade: slightly higher median but fewer p99 spikes seen in early trials.\n- Route requests that are likely short (few tokens predicted) to a separate fast-path bypassing batching. Need heuristic: content-length, header hints.\n- Add GC tuning: increase object arena to reduce frequency of small GCs; run with PYTHONMALLOC=malloc or tuned GC thresholds for the process.\n\nNotes to self / rough TODO list:\n- Check GH-hr/mini-batcher-PR-512 for recent changes to sleep/backoff code (Ben).\n- Add flamegraph of combined C/Python frames to the Confluence page.\n- Schedule pairing session with tokenizer team to confirm GIL behavior.\n\nPreliminary conclusion (working):\nMini-batching at microsecond windows is promising for cost but sensitive to interpreter-level scheduling and C-extension behavior. The p99 regressions appear to be a mix of syscall wakeup jitter and tokenization-induced serialization. Resolving this will likely be: 1) ensure tokenization releases the GIL or run it on an independent worker, 2) replace short sleeps with hybrid spin/epoll logic, and 3) add tracing so we can attribute tail spikes to a single component rather than the black-box batching layer.\n\nSigned-off-by: Aisha (quick notes, not final doc)\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_0dde4c5e34bd4f069a6b920a2587aa07"
+}

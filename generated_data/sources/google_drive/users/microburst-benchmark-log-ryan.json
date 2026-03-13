@@ -1,0 +1,35 @@
+{
+  "title": "Microburst benchmark log \u2014 KV cache warmup & short bursts",
+  "owner": "Ryan Cho",
+  "drive_area": "users",
+  "path": "users/ryan-cho/performance/microburst-bench-2026",
+  "doc_type": "doc",
+  "created_at": "2025-11-03",
+  "last_modified": "2026-03-05",
+  "collaborators": [
+    "Aisha Patel",
+    "Evan Torres"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "microburst",
+    "kv-cache",
+    "warmup",
+    "p99",
+    "benchmarks",
+    "cpu-gpu"
+  ],
+  "linked_artifacts": [
+    "GH:github.com/redwood-inference/serving-runtime/pull/2142",
+    "JIRA:INF-7890",
+    "Confluence:PerfPlaybook#microbursts"
+  ],
+  "content": "Objective:\nRun focused microburst experiments to understand p95/p99 behavior when KV cache is cold vs warmed and when client-side batching is disabled. Looking specifically at 64-token responses and sub-second latency targets (aim: p95 < 200ms for 1-3 concurrent requests; p99 < 350ms ideally).\n\nContext / motivation:\n- Customers see sudden spikes (e.g., feature flagged rollouts, traffic spikes from a single user) and Redwood needs predictable tail latency even for short requests.\n- Previous throughput tests cover steady-state long streams; microbursts expose different code paths: new KV allocations, attention buffer init, GPU kernel overhead for short seqs.\n- Hypothesis: KV cache warmup and small batch sizes cause disproportionate p99 spikes due to per-request kernel launch overhead and runtime arbitration.\n\nExperimental setup (env):\n- Model: redwood-alpha-7b-v2 (FP16, fast-kernels profile)\n- Hardware: Dedicated dev node g4dn-like; 1x A100-40GB (dev pool), CUDA 12.1, cuBLAS-XT off, kernel tuning: default\n- Runtime: serve v3.6.1 (local dev cluster), batching disabled for these runs (continuous_batching=false), prefix/KV cache controlled by tests\n- Client: synthetic load generator (go-based) that can issue precise bursts and vary concurrency; client RTT ~ <1ms inside same AZ\n- Request: prompt template small: \"Summarize in one sentence: <input>\" -> target gen length 64 tokens average\n- Metrics captured: latency per request (ms), CPU/GPU util, kernel launch counts, KV cache hits, queue depth, and per-request trace id for correlation\n\nTest matrix: (each run = 15k requests over 10min with microburst injection every 10s)\n- A: Cold KV, no priming, concurrency 1 (single requester bursts of 3 concurrent requests), batching off\n- B: Warm KV (1000 prime requests), concurrency 1, batching off\n- C: Cold KV, concurrency 3 steady (3 parallel clients), batching off\n- D: Warm KV, concurrency 3 steady, batching off\n- E: Warm KV + client-side tiny batching (group 2) to check tradeoffs\n\nRaw summary results (aggregated):\n- A (cold, bursts 1-3 concurrent): p50=68ms, p95=212ms, p99=498ms, max=920ms\n- B (warmed): p50=62ms, p95=128ms, p99=214ms, max=310ms\n- C (cold, steady 3): p50=95ms, p95=300ms, p99=710ms, max=1250ms\n- D (warm, steady 3): p50=82ms, p95=170ms, p99=290ms, max=450ms\n- E (warm + client batch 2): p50=72ms, p95=140ms, p99=240ms, max=350ms\n\nObservations / quick interpretations:\n- Warm KV dramatically reduces tail (p99) by ~2x-3x across burst and steady scenarios. The biggest gains are for p99 and max (top 1% of requests) which suggests most overhead is cold allocation/initialization cost.\n- Cold microbursts (A/C) show p99 > 400ms which fails our 350ms soft target. Warmed scenarios B/D/E are within or near soft targets.\n- Steady concurrency of 3 increases median by ~20-35ms compared to single-concurrency warm runs. Some of that is GPU occupancy/context switching, not the KV cache.\n- Tiny client-side batching (E) didn't materially hurt median and reduced p99 slightly vs D. So in production some small request coalescing might be beneficial without hurting latency SLOs.\n\nCorrelated signals (from traces):\n- High-latency traces often show a spike in \"kv-init\" span (50-300ms) for cold runs. Following spans (kernel exec) remain similar across cold/warm.\n- Kernel launch count is higher per request in cold runs (additional short kernels to allocate attention buffers).\n- GPU utilization low (<20%) for 64-token runs; this implies kernel startup overhead dominates, not compute.\n\nRepresentative trace snippet (cold p99) - simplified timeline (ms):\n- 0   client send\n- 4   receive request on worker\n- 6   allocate KV buffers (+120ms)\n- 130 load model weights into cache (fast path)\n- 150 kernel launch (attn) -> 60ms\n- 220 assembly/serialize -> 40ms\n- 260 response sent\n\nSmall ascii table of p95/p99 (for quick paste):\nScenario, p95(ms), p99(ms)\nCold burst, 212, 498\nWarm burst, 128, 214\nCold steady-3, 300, 710\nWarm steady-3, 170, 290\nWarm + batch2, 140, 240\n\nImmediate conclusions:\n- KV cache warmup is the dominant knob for tail in microbursts. We should prioritize fast priming or cheap async priming strategy for cold clients.\n- Short-term mitigation: recommend client-side warmup (on onboarding volume), or server-side async priming for new model shards when traffic arrives from a customer.\n- Longer-term: reduce per-request kernel launch overhead path for short sequences (investigate fused kernels or persistent buffer pools).\n\nActionable next steps / TODOs:\n- [ ] Run same microburst tests on a 2x GPU node to see if multi-GPU scheduling changes behavior (assign to @Aisha)\n- [ ] Prototype async priming: when a new shard is created, enqueue a set of lightweight priming requests (10 x 16-token) to fill KV structures (assign to @Evan)\n- [ ] Measure memory allocator impact: try persistent KV slab allocator (patch branch: perf/kv-slab) and re-run cold tests (me, Ryan)\n- [ ] Add a microburst scenario job to CI that runs once per week against staging (low-cost smoke check)\n\nNotes to self / open questions:\n- What is the cost impact of always doing a small async prime (idle GPU ops)? Need cost estimate (GPU minutes per week) vs decreased p99 SLA penalties.\n- Is there a generic signal we can use to detect \"new shard\" vs \"already active\" to trigger priming automatically without owner intervention? Should tie to shard last-active timestamp.\n- Check interaction with quantized kernels (int8) \u2014 might have different init costs.\n\nAttachments / artifacts to produce next:\n- Lightweight svg chart: p95/p99 vs scenario (for slides)\n- Example traces (zip) for warm vs cold p99 to attach to RFC\n- Small script to reproduce locally (will push to GH linked PR above)\n\nExperiment notes (raw run IDs):\n- run-20260301-microburst-A (cold bursts) -> logs: /tmp/run-20260301-A.log\n- run-20260302-B-warm -> logs: /tmp/run-20260302-B.log\n- run-20260303-C-steady3 -> logs: /tmp/run-20260303-C.log\n\nIf I get time today: try warm priming with only KV allocations (avoid full forward pass) to see if we can reduce priming cost further.\n\nEnd of notes.\n\n---\nQuick search tags for future find: microburst, warmup, KV, priming, p99, short-requests, kernel-launch\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_ad6e28b7071149458a6c5af63d7b1063"
+}

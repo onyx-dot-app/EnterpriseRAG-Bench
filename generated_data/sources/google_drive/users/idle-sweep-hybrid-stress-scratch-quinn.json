@@ -1,0 +1,34 @@
+{
+  "title": "Idle-sweep hybrid stress test scratchpad",
+  "owner": "Quinn Alvarez",
+  "drive_area": "users",
+  "path": "users/idle-sweep-hybrid-stress-scratch-quinn",
+  "doc_type": "doc",
+  "created_at": "2025-11-08",
+  "last_modified": "2026-03-01",
+  "collaborators": [
+    "Maya Patel",
+    "Diego Ramos"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "p99",
+    "kv-cache",
+    "idle-sweep",
+    "stress-test",
+    "hybrid-load"
+  ],
+  "linked_artifacts": [
+    "JIRA: PERF-7423",
+    "GH: https://github.com/redwood-inference/serving-runtime/pull/8812",
+    "CONFLUENCE: PERF/idle-sweep-2025"
+  ],
+  "content": "Context:\nThis is a personal scratchpad for an experimental run exploring the interaction between the runtime's idle-kv-sweep mechanism and mixed-priority request patterns. The goal is to see whether a hybrid (adaptive + timed) sweep reduces memory pressure without aggravating tail latency during bursty high-priority traffic.\n\nMotivation / hypothesis:\n- Observed intermittent p99 spikes during sustained bursts (see PERF-7423). Hypothesis: aggressive idle-sweeps free memory/kv entries at the wrong time and cause increased cache misses for hot prefixes, amplifying tail latency for high-priority requests.\n- Alternative idea: run an adaptive-sweep that backs off when recent high-priority qps > threshold, and schedule a timed background sweep when system idle. Expectation: fewer p99 spikes, slightly higher average memory footprint.\n\nExperiment design (mini matrix):\n- Variables:\n  - sweep_mode: [timed, aggressive, adaptive-hybrid]\n  - sweep_interval_ms (timed): [5000, 15000]\n  - idle_threshold_tokens: [128, 512]\n  - high_prio_qps_cutoff: [20, 50] (for adaptive)\n  - concurrency: [32, 128]\n  - priority_mix: high:low = [10:90, 50:50]\n  - duration: 10m warmup + 30m steady-state run\n\nLoad generator (local test cluster):\n- go tool: loadgen-redwood (local script)\n- pattern: mixed poisson for high priority, periodic bursts for low priority to simulate background batch processing\n- command used for a single run: \n  ./loadgen-redwood --target https://local-rtf:8443/generate --qps-high 40 --qps-low 10 --concurrency 128 --duration 2400 --burst-size 200 --priority-routes high,low --payload-size 64\n\nInstrumentation captured:\n- per-route p50/p95/p99 latency (ms) sampled at 10s windows\n- meminfo (RSS + GPU mem) per node every 5s\n- kv-cache hit ratio (prefix hit, kv-lookup count)\n- sweep events log (timestamp, sweep_type, reclaimed_entries)\n- Node-level GC/paging events\n\nRepresentative run (adaptive-hybrid vs timed):\n- Config A (timed): sweep_mode=timed, sweep_interval_ms=5000, idle_threshold_tokens=128\n- Config B (adaptive-hybrid): sweep_mode=adaptive-hybrid, high_prio_qps_cutoff=20, idle_threshold_tokens=512\n\nSummary stats (steady-state window: minute 5-35)\n- Config A (timed):\n  - overall qps delivered: 11.8k\n  - p50 high: 18 ms\n  - p95 high: 64 ms\n  - p99 high: 310 ms (frequent ~300-400ms spikes coincident with sweep events)\n  - kv-cache hit: 78%\n  - average reclaimed entries per sweep: 12.6k\n  - memory RSS per node: 9.2 GB (avg)\n\n- Config B (adaptive-hybrid):\n  - overall qps delivered: 11.4k (slightly lower due to conservative backoff)\n  - p50 high: 21 ms\n  - p95 high: 58 ms\n  - p99 high: 180 ms (spikes reduced and less correlated with sweep logs)\n  - kv-cache hit: 85%\n  - average reclaimed entries per triggered sweep: 4.1k\n  - memory RSS per node: 10.6 GB (avg)\n\nObservations / raw notes:\n- In Config A, every timed sweep (5s) shows a burst of reclaimed entries; immediately afterwards p99 increases within the same 5-10s window. Heap/RSS dips were visible and concurrent kv-cache misses spike.\n- Adaptive-hybrid often defers sweep during a sustained high-priority burst. When it does sweep (e.g., after a lull), reclaimed entries are more targeted (older prefixes).\n- The larger idle_threshold_tokens (512) helped reduce reclaiming active short-lived prefixes.\n- There is a trade-off: adaptive-hybrid increases steady memory footprint by ~1.4 GB but reduces worst-case latency by ~130 ms in p99 for high-priority route.\n- Low-priority latencies increased slightly under adaptive-hybrid because deferrals mean larger eventual sweeps during low-activity windows. That's acceptable for our SLA.\n\nNotable event log excerpt (timestamps are local-test):\n- 2026-02-28T13:12:05Z SWEEP timed reclaimed=12560\n  - corresponding p99-high increased from 98 -> 345 ms over next 7s\n- 2026-02-28T13:12:32Z SWEEP adaptive-hybrid deferred (high_qps present)\n- 2026-02-28T13:18:10Z SWEEP adaptive-hybrid triggered reclaimed=4102 (older-prefixes)\n  - p99-high remained ~170 ms (no big spike)\n\nQuick diagnostic checks:\n- Repeat with higher idle_threshold_tokens=1024: fewer false-positives reclaiming but memory grows another ~600MB. p99 slightly better (~165 ms).\n- Try lowering sweep_interval_ms to 2s (timed): p99 spikes worse and many reclamation events, not recommended.\n- Confirmed same behavior across 3 different node images (cuda 12.3/12.4): pattern consistent.\n\nConclusions so far:\n- Timed aggressive sweeps are correlated with p99 bursts for high-priority requests; they cause cache churn.\n- Adaptive-hybrid approach reduces tail spikes at cost of higher steady memory usage \u2014 acceptable trade for SLOs targeting p99 under 200ms for premium routes.\n- Larger idle threshold is helpful to avoid evicting prefixes that are still warm.\n\nNext steps / TODOs:\n- Run longer 6 hour stability runs with adaptive-hybrid to observe drift and whether memory keeps growing unbounded.\n- Add a sampled prefix age histogram to better tune idle_threshold_tokens per prefix-length bucket.\n- Run with production-like multi-tenant noise on Dedicated cluster to validate that isolation factors don't change the tradeoff.\n- Open a small PR to add a runtime flag: --sweep-mode=adaptive-hybrid and expose two knobs (idle-threshold, high-priority-cutoff) to Console. Link: GH PR above.\n- Discuss SLA/ops tradeoffs with Solutions Eng (Diego) and CS (Maya) before changing defaults.\n\nNotes-to-self:\n- Keep the timed sweep code path as fallback (emergency reclaim) when system memory pressure > 85% (do not defer then).\n- Consider making the adaptive algorithm reactive to kv-cache hit-rate change instead of qps; might be less noisy.\n\nEnd of scratchpad.\n\nAttachments / experiment artifacts:\n- raw_proflogs/idle-sweep-2026-02-28.tgz (uploaded to perf-bucket)\n- flamegraphs and kv-hit-time-series CSVs (see linked artifacts)\n\nSigned-off-by: Quinn (quick notes, not an official runbook)\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_f8a8dd98bde14823ae79262e2dee8d76"
+}

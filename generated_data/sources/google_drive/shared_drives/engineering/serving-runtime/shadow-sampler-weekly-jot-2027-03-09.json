@@ -1,0 +1,34 @@
+{
+  "title": "Shadow sampler weekly jot - kernel microbatches & KV oddities",
+  "owner": "Aisha Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime",
+  "doc_type": "doc",
+  "created_at": "2027-03-09",
+  "last_modified": "2027-03-10",
+  "collaborators": [
+    "Diego Morales",
+    "Priya Singh",
+    "Liam O'Connor"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "shadow-sampler",
+    "kv-cache",
+    "microbatch",
+    "latency",
+    "oncall"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/runtime/pull/492",
+    "JIRA:RR-7351",
+    "confluence:SERVE-RUN-127"
+  ],
+  "content": "Weekly standup scratch / field notes (compact) - Shadow sampler focus\nDate: 2027-03-09\nAttendees: Aisha (owner), Diego, Priya, Liam, oncall: J. Rivera (rotation)\nGoal: Triage recent small-batch tail-latency spikes and an anomalous KV sampler drift seen Sat-Sun during low traffic.\n\nSummary (top-line)\n- We observed repeated 99.9th-percentile tail spikes (~220ms -> 840ms token) on p3-like nodes when microbatch sizes fell to 1-2 tokens. Spikes co-occur with Shadow Sampler toggle on the tile group.\n- KV sampler rate (the adaptive shadow-sampler that samples requests to populate the KV shadow cache) drifted from target 0.5% -> 7% over ~6 hours under low QPS, causing increased background load and occasional OOM evictions on the thin-state arena.\n- Kernel handshake logs show ~0.6% extra memcpy within the attention kernel for sampled requests (wasn't expected). Likely pathing into a fallback memcpy due to prefetched KV mismatch.\n\nWhat we looked at\n- Replayed 1 hour of production traces locally with sampler enabled (seeded traffic, low QPS). Reproduction: +++\n  * Repro scenario: start at QPS 3, drop to QPS 0.6 over 20 minutes, keep sampler target 0.5%. Sampler adaptive routine increased weight due to underflowing moving-average window.\n  * Result: sampler rate jumped and background prefill tasks queued. Prefill tasks hold the prefill lock which delays microbatch construction -> microbatch latency spikes.\n- Kernel-telemetry: compared kernel reports between sampled and non-sampled requests. Found a path where prefetched KV length mismatches (off-by-one for padding tokens) flip an optimized attention kernel to an unoptimized memcpy path. Patch idea below.\n- Memory profile: thin-state arena fragmentation increased 8% during the spike window. Evictions lifted cold-kv hit ratio from 92% -> 61% in the shadow-affected tiles.\n\nHypothesis / root cause (working)\n- Adaptive sampler's estimator uses a fixed-window decay (n=10) which is too noisy under low QPS; noise causes overcompensation and suddenly spikes sample rate. The spike bursts prefill work that competes with normal request KV lookups and forces kernel to take fallback memcpy path when prefill partiales overlap.\n\nImmediate mitigation applied (today)\n- Rolled back adaptive-weight-feedback to deterministic 0.5% for the midnight -> 8am zone (region us-west2). (PR: runtime/pull/492)\n- Oncall increased thin-state arena soft-limit by +15% for canary nodes to reduce eviction thrash while we investigate.\n- Added alert: RR-TAIL-SAMPLER-01 (pager) when sampler rate > 2% sustained for 15m on any tile-group.\n\nLonger-term action items (owners + ETA)\n- Aisha: implement exponential-decay estimator (alpha=0.2) for sampler to smooth under low QPS and drop fixed-window logic. Draft PR by 2027-03-16.\n- Diego: add prefill backpressure token to prefill-queue to prevent prefill tasks from starving microbatch assembly. Spike test and microbench by 2027-03-18.\n- Priya: add kernel-telemetry gating to log when fallback memcpy path is selected and capture KV-length/pad distribution (non-PII). Small runtime agent on canary fleet. 2027-03-14.\n- Liam: run stress suite across microbatch sizes [1,2,4,8,16] with sampler enabled; produce regression matrix and heatmap. 2027-03-20.\n- Oncall (J. Rivera): monitor new alert, run immediate rollbacks if sampler > 4% or thin-state evictions > 5/min.\n\nOpen questions / discussion notes\n- Should the sampler use a Bayesian estimator with prior from day-time traffic baseline? Priya suggested a lightweight prior to prevent full zero-history under night windows. TODO: decision by 2027-03-12 meeting.\n- Risk of disabling sampler: reduces shadow coverage for new prefix shapes (we might miss a regression). Mitigation: enable deterministic 0.1% golden-sample route for canaries only.\n- Are there other codepaths forcing memcpy? We saw one suspicious call in the reorderer when prefetched KV splice started mid-chunk; needs static analysis.\n\nQuick logs excerpt (for triage)\n- Mar 06 02:13:44 runtime-canary-7 kernel: attention-opt: fallback memcpy path taken for request id=ghr-21-001, kv_size=4096, pad_last_segment=true\n- Mar 06 02:13:44 runtime-canary-7 prefill: sampled_request queued prefill id=sp-00034, sampler_rate=0.052, backoff=none\n- Mar 06 02:14:12 runtime-canary-7 arena: eviction triggered slab=thin-state, freed=12KB, free_shards=3\n\nNotes-from-replay\n- Replayed trace id trace-prod-20270306-0220 on local cluster with sampler alpha=0.5-> reproduced 3/5 times. Adding a 50ms jitter to prefill start made the issue less repeatable (indicates race ordering).\n\nRisks and rollout plan for changes\n- Sampler estimator change: low risk, will be feature-flag behind cfg.sampler.alpha and deployed to canary tiles first. Metrics to watch: sampler_rate, prefill_queue_length, microbatch_tail_p99.\n- Prefill backpressure: moderate risk (can increase request latency if backoff too aggressive). Will introduce a token-per-second budget with adaptive refill; start conservative.\n\nQuick wins sprint allocation (2w)\n- Week 1: Aisha + Diego: estimator change + small canary rollout; Priya telemetry agent.\n- Week 2: Liam + SRE: large-scale heatmap runs, leak/eviction hardening, docs for ops-runbook on sampler toggles.\n\nAppendix: shorthand checklist (for oncall)\n- If tail_p99 > 500ms and sampler_rate > 2% -> flip sampler to deterministic 0.5% and notify eng-runtime channel.\n- If thin-state evictions > 5/min -> increase soft-limit and run slab-defrag job on canaries.\n- If fallback memcpy count > 100/hr -> disable sampler fleet-wide and trace kernel-call stack for pad mismatch.\n\nReferences and links\n- Repro trace: trace-prod-20270306-0220 (internal trace id)\n- PR for immediate rollback: https://github.com/redwood-inference/runtime/pull/492\n- Related JIRA: RR-7351 (sampler drift), RR-7399 (prefill queue backpressure)\n\nNext sync: Weekly triage Thu 2027-03-11 10:30 PST (sync slot)\n\n---\nNotes: this doc is intentionally terse (working notes). Will expand into a runbook once root cause confirmed.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_ff0b0f9fc7054b57a29c3603c60e96db"
+}

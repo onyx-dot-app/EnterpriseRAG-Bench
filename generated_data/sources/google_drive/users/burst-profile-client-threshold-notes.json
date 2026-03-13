@@ -1,0 +1,35 @@
+{
+  "title": "Burst profile: client threshold & retry hypotheses",
+  "owner": "Maya Chen",
+  "drive_area": "users",
+  "path": "users/burst-profile-client-threshold-notes.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-07",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Jamie Olson",
+    "Priya Narang"
+  ],
+  "team": "eng-sre",
+  "status": "draft",
+  "tags": [
+    "401",
+    "429",
+    "rate-limit",
+    "burst",
+    "backoff",
+    "retry-after",
+    "telemetry"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-ENG/ratelimit-burst-analysis",
+    "https://linear.app/RED/issue/RED-2038",
+    "https://github.com/redwood-inference/sdk/pull/412"
+  ],
+  "content": "Purpose:\\nQuick scratchpad to capture commands, observations and hypotheses for the recurring 429 spikes we're seeing from a small cohort of client keys (mostly mobile SDK users). Also documenting the intermittent 401s that tend to cluster with the 429 bursts. This is messy; keeping steps and failed attempts to avoid repeating work later.\\n\\nSummary of current hypothesis (short):\\n- Primary: clients do micro-bursts (50\u2013200 requests within seconds) that exceed soft concurrency thresholds; autoscaling + routing sometimes delays capacity causing 429s with Retry-After set, client treats that as fatal and spins up parallel reconnects -> thundering herd.\\n- Secondary: some clients rotate ephemeral keys too quickly (refresh TTL ~30s), resulting in transient 401s when in-flight requests hit old token. Token rotation + retry logic sometimes results in increased request rate during rotation window.\\n- Tertiary: small subset of SDK versions (v1.4.2, v1.4.3) have broken backoff (exponential capped too low) and ignore Retry-After header.\\n\\nLogs / sample snippets (sanitized):\\n- 2026-03-09T14:12:01Z client_id=cli_xxx token_fingerprint=fp_9a3a 200 tx=gen seq=241 latency=72ms\\n- 2026-03-09T14:12:03Z client_id=cli_xxx token_fingerprint=fp_9a3a 429 tx=gen code=rate_exceeded retry_after=6\\n- 2026-03-09T14:12:03Z client_id=cli_xxx sdk_ver=1.4.2 origin=ios burst_count=82\\n- 2026-03-09T14:12:04Z client_id=cli_xxx token_fingerprint=fp_2b1c 401 tx=gen reason=invalid_token (rotation)\\n- 2026-03-09T14:12:05Z client_id=cli_xxx tx=gen 429 tx=gen code=rate_exceeded retry_after=2\\n\\nCommands I ran (telemetry / repro):\\n- quick query for cohort:\\n  SELECT client_id, COUNT(*) as cnt, ANY_VALUE(sdk_ver) as ver, MIN(ts) as start_ts\\n  FROM api_requests\\n  WHERE ts >= '2026-03-09' AND response_code = 429\\n  GROUP BY client_id\\n  ORDER BY cnt DESC\\n  LIMIT 50;\\n- result: top client had 3.1k 429s over 2 hours; many had sdk_ver pinned to 1.4.2.\\n\\n- curl to repro (simulated small-window burst):\\n  for i in $(seq 1 80); do \\\n    curl -s -H \"Authorization: Bearer $TEST_KEY\" \\\n      -X POST \"https://api.redwood.ai/v1/responses\" \\\n      -d '{\"input\":\"hello\"}' &\\n  done; wait\\n  # watch for 429 and Retry-After headers\\n\\n- python quick repro (threaded):\\n  import requests, threading\\n  def post_once(k):\\n    r = requests.post('https://api.redwood.ai/v1/responses', headers={'Authorization': f'Bearer {KEY}'}, json={'input':'hi'})\\n    print(r.status_code, r.headers.get('Retry-After'))\\n  threads = [threading.Thread(target=post_once, args=(i,)) for i in range(120)]\\n  for t in threads: t.start()\\n  for t in threads: t.join()\\n\\nWhat I observed in repro:\\n- 80\u2013120 concurrent client threads -> ~30\u201340% 429s within first second; Retry-After values vary (2\u20138s).\\n- If client reissues requests immediately ignoring Retry-After, a second wave produces higher 429 rate.\\n- When simulating token rotation mid-burst (invalidate key + issue new), ~5\u20138% 401s observed where in-flight requests hit old token; that triggers client library to reauthenticate and often retry aggressively (no jitter).\\n\\nSDK & client behavior notes:\\n- SDK v1.4.2: backoff strategy = fixed 500ms -> 1s between retries, ignores Retry-After.\\n- SDK v1.4.4 (canary): exponential backoff implemented with jitter and honors Retry-After. Early rollouts show lower post-429 thrash.\\n- Some mobile clients implement synchronous token refresh: when refresh call is triggered, they block outgoing requests and then replay queued ones immediately, causing a localized burst when refresh finishes.\\n\\nAttempts at mitigation (what I tried):\\n- Config changes: temporarily increased soft-threshold on routing tier for the affected region -> reduced 429s but latency spikes because we hit warmup limit. Not ideal.\\n- Short-term client bulletin: sent targeted message to top 20 client_ids (via CS) recommending upgrade to SDK 1.4.4 and enable 'honor_retry_after' flag. Waiting on adoption numbers.\\n- Feature flag roll: deployed server-side header that suggests backoff (X-Redwood-Suggested-Backoff: 3) \u2014 client ignored it if SDK not updated.\\n- Telemetry patch: added more granular sampling (token_fingerprint, sdk_ver) to rate metrics for next 48h.\\n\\nOpen questions / next steps:\\n1) Can we gate token rotation TTL in SDKs to avoid <60s life? Which customers have TTL=30s? (Investigate auth service configs).\\n2) Do we have a way to programmatically push a forced backoff (longer Retry-After) to a specific client_id without raising global thresholds? Might use route-level throttles + message in response body for older clients.\\n3) Should we implement server-side token-accept grace window (accept token X sec after rotation) to avoid in-flight 401s? Risks: replay/impersonation surface. Need security review.\\n4) Instrumentation: add a check that correlates token_fingerprint transitions per client_id over 60s windows; emit an alert when >3 transitions/60s.\\n5) SDK team: prioritize release that honors Retry-After and adds jittered exponential backoff + max-retry cap + token-refresh queuing strategy.\\n\\nNotes to self / timeline:\\n- 2026-03-10: add token_fingerprint delta metric to pipeline (in progress).\\n- 2026-03-11: follow up with SDK eng on canary adoption numbers for 1.4.4.\\n- If immediate mitigation needed: route-level throttle for top offender client_ids -> return 429 with Retry-After 10s; but coordinate with CS.\\n\\nRandom ideas (untested):\\n- Server sends terminal 429 (X-Client-Soft-Block: true) to clients exceeding burst budget; client lib treats this as backlog-signal and backs off longer (requires SDK change).\\n- Provide an ephemeral token handshake extension: accept an \\\"in-flight\\\" token header mapping so rotation can be atomic from client pov. Heavy security review needed.\\n\\nItems to paste into ticket when I open one:\\n- SQL query results with top 50 client_ids + sdk_ver + 429 counts (attach sample CSV).\\n- Repro script used and a short recording of output showing Retry-After headers.\\n- Sample log snippets and timeline showing token fingerprint flip and subsequent 401s.\\n\\nIf you read this and have more ideas: ping me (Maya) or drop notes in the Linear issue RED-2038.\\n\\nEND OF SCRATCHPAD\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_c304414e784542039285b323062a1eb3"
+}

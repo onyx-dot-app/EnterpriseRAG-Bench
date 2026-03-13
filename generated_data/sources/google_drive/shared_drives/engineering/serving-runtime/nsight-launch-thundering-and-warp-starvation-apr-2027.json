@@ -1,0 +1,58 @@
+{
+  "title": "nsight-launch-thundering-and-warp-starvation-apr-2027",
+  "owner": "Aisha Kapoor",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/nsight-launch-thundering-and-warp-starvation-apr-2027.json",
+  "doc_type": "doc",
+  "created_at": "2027-04-05",
+  "last_modified": "2027-04-12",
+  "collaborators": [
+    "Miguel Santos",
+    "Dana Li",
+    "Omar Rahman"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "nsight",
+    "cuda",
+    "latency",
+    "launch",
+    "occupancy",
+    "a100",
+    "profiling"
+  ],
+  "linked_artifacts": [
+    "https://redwood.atlassian.net/browse/INF-4123",
+    "https://github.com/redwood-inference/serving-runtime/pull/981",
+    "confluence:serving-runtime/launch-thundering-notes-2027-04"
+  ],
+  "summary": "Investigation of high tail latency spikes correlated with bursts of micro-kernel launches (\"launch thundering\") on A100 nodes. Nsight Systems + CUPTI traces show frequent short-lived kernels that serialize on stream submission and cause warp starvation across SMs. This doc captures traces, measurements, hypotheses, and candidate mitigations.",
+  "observations": "1) Repro pattern: under steady QPS + bursty request arrival (microbatching disabled), 95th/99th token latency spikes by 2.2-3.5x for affected requests.\n2) Nsight run id: nsys-2027-04-02-run17. Trace window: 00:00:12.300 - 00:00:42.300. Workload: llama-like 8B, seq_len=1024, dynamic batching disabled.\n3) Kernel fingerprint: >40 distinct kernel launches per token step (names observed: compute_token_logits, gather_kv_update, kv_shard_copy, softmax_qk_small, position_bias_add). Majority are sub-200us launches; many <50us.\n4) Launch rate bursts: instantaneous kernel launch rate spiked to ~1200 launches/sec for 200-800ms windows during request bursts.\n5) CPU-side serialization: CUPTI and strace show libcublasLt/cuLaunchKernel calls grouped; driver spends time serializing stream submission due to global stream mutex and the CUDA runtime doing kernel enqueue bookkeeping.\n6) SM-level: per-kernel occupancy is low (~12-28%) because kernels are small (warps per block low, low register pressure comfortable but small grid sizes). However, aggregate SM utilization should be high \u2014 but we observe long idle gaps between kernels on many SMs.\n7) NVTX + Nsight timeline shows inter-kernel gaps of 150-600us \u2014 these are when SMs are idle while the host issues many small kernels to other streams; the scheduling and PCIe DMA/host bookkeeping cause jitter.\n8) When CUDA graphs replay is enabled, we see reduced serialization but graph instantiation overheads and replay fragmentation (due to variable batch sizes) make it brittle.\n9) Memory ops: async copies overlap sometimes, but DMA queues are overloaded during bursts which can increase kernel enqueue latency.",
+  "nsight_metrics": "- Average kernel duration: 28us (median 18us) for small compute kernels.\n- Kernel launch overhead (host-side between cuLaunchKernel and kernel start on device): median 9us, tail 120us.\n- SM active % (sampled): median 46% across trace window; 95th-window peaks 84% but with long intermittent drops to <10%.\n- L2 hit rate: steady ~72%; no obvious L2 flood during bursts.\n- Warp stall reason sampling: 45% due to 'no instruction' (idle), 25% due to memory, 18% due to synchronization.\n- PCIe utilization spikes align with launch bursts: PCIe TX bandwidth up by 15% during peaks.\n- Stream API contention: nsight CPU timelines show repeated contention on libcudart.so `cuStreamSynchronize` wrapper calls in our runtime wrapper library.\n",
+  "traces_and_examples": "Trace excerpt (nsys run17, wallclock times approximate):\n- 00:00:15.102 compute_token_logits kernel (33us) on stream 1\n- 00:00:15.156 kv_shard_copy async memcpy (12us) on stream 3\n- 00:00:15.179 gather_kv_update (21us) on stream 2\n- 00:00:15.225 [idle gap] 240us where no kernels run on SM 0/2/4 despite pending launches queued on host\n- 00:00:15.465 compute_token_logits (29us)\nNote: many kernels show host-side enqueue clustering: 8-12 launches all within 40us, then ~200us gap until kernels actually start.\nExample correlation: tail token latency for request R#3245 overlaps with a launch cluster at 00:00:15.15 and experiences an extra 320us latency added to token generation compared to baseline.",
+  "experiments": "1) Microbatching toggle: enabling 8x microbatch reduces kernel launch rate by 7x and 95th token latency drops ~40%. However, perceived latency for single-request path increases due to batching wait.\n2) CUDA graphs: building a per-model graph for sequence-prefix trajectories reduced host enqueue overhead by ~60% in stable-batch-size runs, but failed to cover variable prefix lengths and increased memory footprint. Graph replay had higher throughput but brittle to dynamic request mix.\n3) Stream partitioning: moved heavy async copies to a dedicated high-priority stream and compute work to a pool of pooled streams. Result: slight reduction in enqueue contention but still observed global runtime serialization points when creating new streams or tearing down streams.\n4) Persistent-kernel POC: implemented a persistent kernel worker (single long-running kernel that consumes work queues in device memory). This eliminated most enqueue overheads in the POC and cut tail latency spikes by ~65% for high burst loads. Tradeoffs: more complex code path, harder to support wide variety of kernel shapes and dynamic memory use.\n5) Launch coalescing: added a lightweight host-side coalescer that merges small ops scheduled within 40us into a single merged kernel (sum-of-ops fused). Reduced launch rate and tail, but requires kernel fusion/plumbing and increased binary complexity.",
+  "hypotheses": "- Primary cause: host-side enqueue/driver serialization + many short-lived kernels -> SM starvation between launches.\n- Secondary factors: dynamic batch arrival patterns create bursts that expose the host-to-device pipeline limits (PCIe + driver).\n- Low per-kernel occupancy exacerbates the effect because each kernel can't amortize enqueue overhead via longer device time.\n- CUDA graph helps when batch shapes are stable, but instability in real traffic limits effectiveness.\n- Persistent kernel pattern addresses the root cause by moving scheduling onto device; however it requires careful resource management (registers, shared memory) and safe preemption strategy.",
+  "mitigation_recommendations": "Short-term (weeks):\n- Enable lightweight microbatching for high-burst paths with configurable latency SLO opt-in (client-level flag).\n- Introduce a host-side launch coalescer for non-latency-critical small kernels (merge dispatch for small ops within a 50us window).\n- Avoid creating/destroying CUDA streams per request; use a pool of pre-created streams and prefer cudaStreamCreateWithPriority once at startup.\n- Profile and move non-critical async copies to a dedicated low-priority stream to reduce noise on default stream.\n\nMedium-term (quarter):\n- Implement and harden persistent-kernel workers for KV-cache merging and small token-level ops. Add a fallback path to regular kernels for edge cases.\n- Evaluate hybrid CUDA-graph + parameterized replay where we maintain multiple graphs for common prefix-length buckets to reduce fragmentation.\n- Add driver-side pacing: if launch cluster detected, delay lowest-priority launches by a small jitter to avoid thundering herd.\n\nLong-term (6-12 months):\n- Explore runtime-level batching/coalescing in the serving runtime: convert many tiny kernels into fewer larger kernels at compile-time via kernel fusion or generated kernels for common op sequences.\n- Work with NVIDIA field engineers to investigate driver-side adjustments for enqueue scalability (ticket opened: INF-4123).\n- Consider moving more scheduling logic to device via persistent kernels or a lightweight job-queue runtime running in a supervisor kernel.\n",
+  "risks_and_tradeoffs": "- Microbatching increases tail for single-req latency; needs client opt-in or adaptive switching.\n- Persistent kernels complicate debugging and reduce flexibility; must implement robust telemetry/fallback.\n- Kernel fusion increases maintenance burden, binary size, and codegen complexity across model variants.\n- CUDA graphs reduce flexibility; managing multiple graphs for different shapes increases memory overhead.\n",
+  "next_steps": "1) Ship short-term changes: stream pooling + coalescer prototype in canary cluster (owner: Miguel). Timeline: 2 weeks.\n2) Roll out microbatch flag gated by route-level config and experiment on a set of customer routes (owner: Dana). Timeline: 3 weeks.\n3) Start persistent-kernel POC to cover KV merge & softmax small ops, integrate profiling hooks (owner: Aisha). Timeline: 2 months.\n4) Continue driver ticket INF-4123 with NVIDIA; attach nsight captures and low-level CUPTI traces.\n5) Add a synthetic load generator that reproduces bursty arrival patterns to perf lab; run continuous regression.\n",
+  "notes_to_self": "- Attach raw nsys run17 trace and CUPTI CSV to Confluence page.\n- Re-run with CUDA 12.2 and change compile flags to increase block size for softmax kernels to test occupancy sensitivity.\n- Check if recent libcudart patch in 530 branch altered stream mutex behavior.\n- Remember to correlate host CPU scheduling (SCHED_OTHER vs SCHED_FIFO) during enqueue bursts.\n",
+  "appendix": "Raw sample counters:\n- nsys counter: host_enqueue_latency_p50=9us p95=118us p99=312us\n- kernel counts per token-step: 42 avg (microbatch off), 8 avg (microbatch 8x)\n- persistent-kernel POC: average extra device-memory for queue=~1.2MB, CPU overhead -4%\nLinks:\n- POC branch: https://github.com/redwood-inference/serving-runtime/tree/persistent-kernel-poc\n- Jira: INF-4123\n- Confluence notes: confluence:serving-runtime/launch-thundering-notes-2027-04",
+  "conclusion": "Launch thundering is a real, reproducible source of token-tail latency in our workload. Short-term mitigations (stream pooling, coalescing, opt-in microbatch) give meaningful reductions and are low risk. Medium-term work (persistent kernels and smarter graphing) addresses root causes but need engineering investment and careful rollout. Prioritize the short-term canary and the persistent-kernel POC in parallel.",
+  "file_version": "v1",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "observations",
+    "nsight_metrics",
+    "traces_and_examples",
+    "experiments",
+    "hypotheses",
+    "mitigation_recommendations",
+    "risks_and_tradeoffs",
+    "next_steps",
+    "conclusion",
+    "appendix"
+  ],
+  "dataset_doc_uuid": "dsid_15bce4d6cc0a4e259cc40cbcb3d463d5"
+}

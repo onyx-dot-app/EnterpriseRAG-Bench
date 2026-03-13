@@ -1,0 +1,71 @@
+{
+  "title": "late-afternoon-weight-stitching-race-debug-notes",
+  "owner": "Priya Shah",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/site-reliability-engineering/late-afternoon-weight-stitching-race-debug-notes.json",
+  "doc_type": "doc",
+  "created_at": "2024-11-06",
+  "last_modified": "2024-11-07",
+  "team": "eng-sre",
+  "status": "draft",
+  "collaborators": [
+    "Jordan Lee",
+    "Mateo Alvarez",
+    "Rina Patel",
+    "Ethan Brooks"
+  ],
+  "tags": [
+    "weight-stitching",
+    "rollout",
+    "race-condition",
+    "kv-cache",
+    "hotfix",
+    "latency-regression"
+  ],
+  "summary": "Canary rollout of a small async weight-apply hotfix triggered a race in the stitcher causing partial weight visibility and a scheduler stall on ~6% of hosts in us-west2. Resulted in p95/p99 latency spikes, sporadic decode errors, and elevated KV cache miss rates. Immediate rollback and targeted restarts mitigated impact. This doc collects on-call notes, timeline, hypothesis, commands used, and action items.",
+  "severity": "sev2",
+  "detection": "Alerting: model-decode-error-rate > 0.5% for 5m (alert M-DEC-ERR), p95 latency > 350ms on text-gen route (alert M-LAT-95), kv_cache_miss_rate spike > 3x baseline. First alert fired 2024-11-06 15:12 PST from production canary cluster metrics. Pager oncall (Jordan) acknowledged and started triage.",
+  "timeline": "2024-11-06 14:50 PST - Deploy window: staged rollout of runtime patch 'async-stitch-apply-v2' started to 10% canary pool.\n2024-11-06 15:10 PST - First p95 latency alert (M-LAT-95) from us-west2 canaries.\n2024-11-06 15:12 PST - Decode error alert (M-DEC-ERR) triggered. Oncall paged.\n2024-11-06 15:18 PST - Observed KV cache miss spike and increased stitch_apply_duration on canary hosts.\n2024-11-06 15:26 PST - Scoped to canary pool: 6/100 hosts reporting partial weight shard visible (layer N+1 missing params), decode token offsets shifted.\n2024-11-06 15:38 PST - Initial mitigation: paused rollout and set traffic routing to fallback variant (model-v1-compat) for affected routes.\n2024-11-06 15:50 PST - Performed controlled rollback of 'async-stitch-apply-v2' on canary hosts.\n2024-11-06 16:05 PST - Restarted stitcher process and greedy prefetch worker on 6 affected hosts.\n2024-11-06 16:18 PST - Metrics returning to baseline, alerts resolved by 16:30 PST.\n2024-11-07 09:00 PST - Post-incident debug session and deeper root cause analysis with Applied ML and Runtime teams.",
+  "symptoms": "p95/p99 latency increase, sporadic decode errors (token offset mismatches), KV cache miss rate spike, stitch_apply_duration stretched, stitch_partial_count non-zero. Symptoms limited to canary rollout cohort and reproduced in small internal repros.",
+  "hypothesis": "A race in the new async apply path allowed a weight shard manifest to be marked as \"applied\" before the full in-memory shard was copied/initialized, leading to partial parameter visibility during inference and a scheduler thread waiting for a resource resulting in a local stall. The patch removed a memory barrier and assumed ordering that was enforced previously by synchronous handoff. Prefetch and KV cache interactions amplified decode mismatches because parts of the KV cache were populated against mixed parameter versions.",
+  "investigation_notes": "- Grep of logs from affected hosts showed 'stitch_apply_complete' events followed by 'layer_lookup_miss' for the same layer within 10-50ms.\n- Heap/alloc traces showed deferred mmap completion on 4 hosts with high IO.\n- Reproduced locally by toggling fast-path async apply without the fence; deterministic in looped unit test on x86 with concurrent stitch/serve threads.\n- Applied ML confirmed small numerical differences in layer outputs when partial apply occurred; these caused tokenization aliasing in downstream decode heuristics.\n- No S3 corruption detected; manifests and checksums matched but ordering of apply steps was different between old and new code paths.\n- Observed that restart of stitcher cleared the partial state and allowed normal decode again.",
+  "commands_run": "# paused rollout:\nredwood rollout pause async-stitch-apply-v2 --cohort=canary\n# route traffic to fallback model:\nredwood route update --route text-gen --model model-v1-compat --priority temporary-fallback\n# rollback on affected hosts:\nfor host in $(cat affected_hosts.txt); do ssh $host 'systemctl stop stitcher && rm -f /var/lib/stitch/temp-* && systemctl start stitcher'; done\n# verify checksums:\nsha256sum /mnt/weights/* | sort > /tmp/checksums_pre && curl -sS https://weights.example.com/manifest | jq -r '.files[].sha256' > /tmp/checksums_manifest\n# quick health queries:\ncurl -sS \"http://canary-host:8080/health\" | jq .\n",
+  "mitigation_actions": "1) Pause rollout and freeze further canary promotions. 2) Re-route prod traffic away from affected canaries to stable variant. 3) Rollback async-stitch-apply-v2 on canary nodes. 4) Restart stitcher and prefetch workers on nodes with partial applies. 5) Run checksum+integrity verification on weight directories. 6) Increase canary observability (stitch_apply_duration, stitch_partial_count) and hold new rollout until gated tests added.",
+  "short_term_fix": "Revert async apply change (PR #4128) and deploy synchronous fallback. Add a temporary gating flag 'stitch_async_enabled=false' in rollout config. Throttle future rollouts to 2% with extended monitoring window (30m) and an automated rollback threshold on stitch_partial_count > 0.",
+  "long_term_actions": "- Introduce atomic manifest switch for weight bundles (apply-to-temp then atomically rename). - Add a memory barrier/fence and strict ordering in async apply path; convert the unit test to a stress test that runs for 30m in CI. - Implement per-host pre-apply verification: ensure all shards pass checksum and residency before marking applied. - Add deterministic e2e canary that runs a small decoding suite after weight apply. - Update rollout tool to support preflight 'stitch-sanity' checks and automatic hold if any host reports partial_apply>0.",
+  "monitoring_changes": "New metrics: stitch_apply_duration_ms, stitch_partial_count, stitch_apply_retries, stitch_apply_io_wait_ms. Alert rules: stitch_partial_count > 0 sustained 2m (P0), stitch_apply_duration > 2x baseline for 5m (P1). Add synthetic decode tests to canary cluster that assert tokenization parity across versions.",
+  "postmortem_links": [
+    "https://confluence.internal.redwood/model-rollouts/late-afternoon-weight-stitching-race-2024-11-06",
+    "https://github.com/redwood-inference/runtime/pull/4128"
+  ],
+  "linked_artifacts": [
+    "JIRA-ENG-1987",
+    "PR-4128",
+    "slack://channel:eng-runtime:thread:GHk3k2"
+  ],
+  "action_items": "AI-1: Priya - revert PR and coordinate canary rollback (done). AI-2: Mateo - implement atomic manifest rename and unit tests (JIRA-ENG-1990). AI-3: Jordan - add stitch_partial_count alert and runbook entry (JIRA-ENG-1991). AI-4: Rina - add canary synthetic decode suite and integrate into CI (JIRA-ENG-1992). AI-5: Ethan - schedule postmortem writeup and exec summary (JIRA-ENG-1993).",
+  "lessons_learned": "- Small ordering assumptions can be hidden by synchronous code; converting to async requires explicit ordering guarantees and pre-apply verification.\n- Canary rollouts are effective: issue was limited to canaries and detected by existing alerts.\n- Need stronger preflight checks for weight apply (checksums + residency + decode parity).\n- Observability gaps: stitch_partial_count and stitch_apply_duration should have existed earlier.\n- Rolling back quickly and routing traffic to compatible model variants reduced customer impact.",
+  "notes": "Keep this doc as the living record for follow-ups until postmortem is final. We should run the new stress test against the nightly build and tag any flakiness. Add a short training note for oncall about how to detect partial weight visibility: look for 'layer_lookup_miss' followed by 'stitch_apply_complete' in logs within 100ms.",
+  "related_incidents": [
+    "JIRA-INC-2023-weight-apply-flap",
+    "canary-tokenizer-config-drift-rollback-notes.json"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "detection",
+    "timeline",
+    "symptoms",
+    "hypothesis",
+    "investigation_notes",
+    "commands_run",
+    "mitigation_actions",
+    "short_term_fix",
+    "long_term_actions",
+    "monitoring_changes",
+    "action_items",
+    "lessons_learned",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_cb5e5db8b46e4242974b51deebcbbedf"
+}

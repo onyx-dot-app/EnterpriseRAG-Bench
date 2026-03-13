@@ -1,0 +1,33 @@
+{
+  "title": "Warmup eigenspectrum profiling - microburst attenuation probe (scratch)",
+  "owner": "Karthik Menon",
+  "drive_area": "users",
+  "path": "users/warmup-eigenspectrum-profiling-karthik.json",
+  "doc_type": "doc",
+  "created_at": "2024-02-18",
+  "last_modified": "2024-03-01",
+  "collaborators": [
+    "Riley Chen",
+    "Mira Alvarez"
+  ],
+  "team": "eng-applied-ml",
+  "status": "draft",
+  "tags": [
+    "warmup",
+    "eigenspectrum",
+    "latency",
+    "microburst",
+    "profiling"
+  ],
+  "linked_artifacts": [
+    "GH:repo/PR#884",
+    "JIRA:INF-2193",
+    "slack:#serving-runtime thread ts=1711234567"
+  ],
+  "content": "Context and quick motivation:\n- Trying to understand why short microbursts (<2s) after an idle period spike p99 despite overall warm-cache behavior being fine. Suspect that the distribution of early KV-cache activations + small kernel dispatch patterns cause transient tail events.\n- Idea: treat the activation vectors seen during warmup as a dynamic signal, compute an approximated eigenspectrum to quantify how \"concentrated\" the early-token activation subspace is vs steady-state. Hypothesis: sharper low-rank energy early leads to less efficient batching/kernels -> higher variance in per-token execution time.\n\nExperiment ID: WEP-2024-02-18-A\nRun owner: Karthik\nHardware: 1x A100-sxm4 (40GB) in single-tenant test node\nModel: rwi-7b-v2 (fp16 runtime path, qkv-cache enabled)\nServing runtime commit: git@github.com:redwood/serving-runtime@a7c9f2b\nWorkload harness: local loadgen (poisson arrival, adjustable burst factor)\nInput profile: 16\u201364 token prompt lengths, average request tokens = 28\nBatching config: max_batch = 16, dynamic_batch_timeout_ms = 8, prefill_cache = true\nKV-cache priming: enabled (cold to warm transition logged)\nTrace instrumentation: per-kernel timing + per-request enqueue/dequeue timestamps + activation snapshot dump for first 8 tokens (L2 downsampled)\n\nMethod:\n1) Play repeated microbursts: 5s idle -> 1s burst @ 120% of steady qps -> 10s ramp down, repeat 60 cycles.\n2) For each request in first 3 tokens after idle, capture activation snapshot (float32, downsampled to 512 dims) from layer 10.\n3) Compute SVD on minibatch of 128 snapshots every cycle; take top-10 singular values, normalize by sum -> call this \"warm-spectrum\".\n4) Correlate per-cycle warm-spectrum concentration (s1 / sum(s)) with p50/p95/p99 latencies for the same cycle.\n\nRaw observations (selected cycles):\n- cycle 4: s1_norm=0.43, p50=32ms, p95=86ms, p99=210ms\n- cycle 11: s1_norm=0.12, p50=28ms, p95=64ms, p99=92ms\n- cycle 19: s1_norm=0.51, p50=36ms, p95=120ms, p99=320ms (notable outlier)\n- cycle 27: s1_norm=0.09, p50=26ms, p95=58ms, p99=88ms\n- cycle 43: s1_norm=0.38, p50=30ms, p95=78ms, p99=190ms\n\nAggregated stats over 60 cycles (first-token requests only):\n- mean(s1_norm) = 0.29\n- stdev(s1_norm) = 0.14\n- Pearson r(s1_norm, p99) = 0.61\n- Pearson r(s1_norm, p95) = 0.48\n- Pearson r(s1_norm, p50) = 0.21\n\nInterpretation:\n- Moderate to strong correlation between concentration of early activations (higher s1_norm) and tail latency (p99). Intuition: when activations concentrate into a smaller subspace, kernel codepaths produce less uniform work distribution across threads/warps, causing some threads to take longer. Also observed increased small dispatches (more kernel launches of short duration) during those cycles.\n- Not every high s1_norm cycle produced high p99; correlated with small batch sizes (avg batch size <=3) during that cycle. So a two-factor effect: concentrated eigenspectrum + tiny batch sizes amplify tails.\n\nShort ascii histogram of s1_norm distribution (60 cycles):\n0.0-0.1: |||||| (6)\n0.1-0.2: |||||||||| (11)\n0.2-0.3: |||||||| (8)\n0.3-0.4: |||||| (6)\n0.4-0.5: |||| (4)\n0.5-0.6: | (1)\n\nMicro-trace example (cycle 19):\n- enqueue->dispatch skew: mean enqueue->launch = 3.7ms (vs baseline 1.1ms)\n- per-kernel run times: kernelA: 9.2ms (2x baseline), kernelB: 1.1ms, kernelC: 0.6ms\n- observed 12 kernel launches for 8 requests (vs 5 typical) -> overhead increases\n\nQuick root-cause hypothesis:\n1) Model warmup states with high low-rank energy cause attention/qkv matmuls to have short, cache-misaligned slices resulting in kernel fragmentation.\n2) When batch size is small, the relative cost of a fragmented kernel launch is large -> p99 increases.\n3) Prefill cache helps average case but doesn't remove the initial spectral concentration effect.\n\nMitigation experiments to run next (short list):\n- M1: Increase dynamic_batch_timeout_ms from 8 -> 20 to allow slightly larger batches during microbursts. Measure impact on p99 and on average latency.\n- M2: Force mini-batching grouping at pre-dispatch layer (aggregate up to 8 short requests arriving within 6ms) to reduce kernel launches.\n- M3: On-device micro-kernel fusion patch (experimental in branch: GH:repo/PR#892) to reduce fragmentation cost.\n- M4: Embedding a small random jitter to ingress arrival (\u00b13ms) to avoid pathological synchronized arrivals.\n\nQuick tradeoffs/concerns:\n- Increasing batch timeout reduces p99 but will add p50 cost for interactive workloads; need SLI tradeoff.\n- Kernel fusion patch shows promise in microbenchmarks but requires careful GPU occupancy testing for different sequence lengths.\n\nNotes to self / action items:\n- Run M1 + M4 in combination for 30-cycle run and record eigenspectrum again (target date: 2024-03-04).\n- Share this note with Riley and Mira and schedule 30-min sync to pick which mitigation to graduate to a canary.\n- Add lightweight per-cycle logging into canary harness: s1_norm, avg_batch_size, kernel_launch_count, p99 (first-token). Keep retention 14 days for analysis.\n- Follow up linking: add GH:repo/PR#892 benchmarking artifacts to the PR and reference JIRA INF-2193.\n\nRough TL;DR (for slack):\n- Found correlation between concentrated early activation eigenspectrum and p99 spikes during short microbursts. Amplified when batch sizes are tiny.\n- Short-term mitigations: slightly longer dynamic batching timeout + small ingress jitter. Medium-term: micro-kernel fusion.\n\nRaw experiment notes appended to s3 (internal): s3://redwood-test-logs/bench/wep/2024-02-18-A/ (snapshots + svd dumps + telemetry CSVs)\n\nEnd of scratchpad.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_1f3dc4f16b1f49f08d6108f408c7dceb"
+}

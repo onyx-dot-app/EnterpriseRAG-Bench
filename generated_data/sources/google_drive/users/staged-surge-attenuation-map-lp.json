@@ -1,0 +1,34 @@
+{
+  "title": "Staged Surge Attenuation Map \u2014 rollout sketch",
+  "owner": "Lena Park",
+  "drive_area": "users",
+  "path": "users/staged-surge-attenuation-map-lp.json",
+  "doc_type": "doc",
+  "created_at": "2024-09-15",
+  "last_modified": "2024-10-03",
+  "collaborators": [
+    "Marco Diaz",
+    "Aisha Khan"
+  ],
+  "team": "eng-sre",
+  "status": "draft",
+  "tags": [
+    "rollout",
+    "traffic-steering",
+    "attenuation",
+    "pinning",
+    "warmup"
+  ],
+  "linked_artifacts": [
+    "GHPR: https://github.com/redwood-inference/platform/pull/4982",
+    "JIRA: INF-1324",
+    "Confluence: https://confluence.internal.redwood/display/INF/Staged+Surge+Attenuation+Notes",
+    "Slack: #infra-rollouts thread 12-Oct-2024"
+  ],
+  "content": "Purpose:\\nThis is my personal sketch for a low-friction rollout pattern I want to try for the next model flip: staged surge attenuation. Aim is to reduce burst/backpressure risk during early ramp while still letting higher-tier clients exercise the new variant. Focused on safety signals, progressive traffic smoothing, and quick pinback lanes.\\n\\nScope:\\n- Applies to hosted API route /v1/generate (path-based rollouts).\\n- For model family: rwd-model-x (2.1 -> 2.2 experimental quantized).\\n- Traffic mix: 70% mid-tier web apps, 20% premium dedicated, 10% edge integrations.\\n- Primary risk: sudden tail-latency spikes and cache thrash during cold KV loads.\\n\\nHigh-level idea (one-liner):\\nStart with narrow, high-confidence cohorts + slow exponential ramp windows with attenuation layers that cut effective concurrency at each step. If any attenuation tier trips, reduce concurrency and route surviving traffic to fallback variant immediately.\\n\\nCohort definitions (unique naming so I don't confuse it with old docs):\\n- Anchor-1 (A1, 3% global) \u2014 internal QA + canary clients; lowest latency tolerance, highest observability.\\n- Anchor-2 (A2, 7% global) \u2014 low-risk long-running customers (warm client affinity).\\n- Ramp-1 (R1, 15%) \u2014 mid-tier gradual exposure, 2x request smoothing window.\\n- Surge Buffer (SB, dynamic up to 30%) \u2014 permissive bucket that can absorb traffic if upstream capacity is healthy; always behind attenuation checks.\\n\\nPlanned timeline (rough):\\n- T0 (preflight): run warmup scripts (see below), sanity evals, KV priming. 60\u201390m before any traffic.\\n- T1: route A1 (3%) for 30m. Monitor heavy.\\n- T2: open A2 (additional 7%) for 45m.\\n- T3: release R1 (additional 15%) with 15m smoothing windows, observe for 2h.\\n- T4: allow SB to scale up in 10% increments every 30m subject to green checks, until target 30% or until we hit global 55% new model footprint.\\n- T5: finalize to 100% (post-validation) or pinback/rollback.\\n\\nTraffic shaping rules (attenuation):\\n- Each cohort enforces a soft concurrency ceiling via gateway token bucket: default concurrency multiplier for new-model = 0.6 (i.e., reduces concurrent inflight requests).\\n- Smoothing windows: 15m rolling, with max step increase of +5% absolute per window for SB.\\n- If p95 latency vs baseline increases > 25% or error rate > 0.4% on any cohort for 2 consecutive windows -> cut SB by 50% and hold other ramps for 1 hour.\\n\\nPin strategy (version pinning and fast escape):\\n- Per-client pin threshold: if a client receives >500 requests/min to new model and observes consistent errors, auto-pin client to old model for 15m and escalate to oncall.\\n- Global quick pin: CLI command (internal): rwdctl route pin /v1/generate --model rwd-model-x:2.1 --reason \\\"pinback-attenuation\\\". This must be callable by SRE and Console fallback.\\n\\nWarmup & priming checklist (preflight):\\n- Run kv-prime job (k8s job): image=infra/warmers:latest args=(--route /v1/generate --model 2.2 --tokens 1200 --parallel 40) ~45m\\n- Smoke evals: run eval suite (small set of prompts to check hallucination deltas), require BLEU/embedding-dist within threshold.\\n- Run canary load generator: k6 script staging/warmup-k6.js ramp to 40rps for 20m.\\n- Ensure cache hit ratio > 65% on prefix cache after priming.\\n- Confirm GPU mem stable and no OOMs in last 2h on dedicated nodes.\\n\\nObservability & SLO checks (datadog/sentry hooks):\\n- Metrics to watch (per-cohort): p50/p95/p99 lat, errors (4xx/5xx), 429s, CPU/GPU util, model load times, queue length, kv-cache hit ratio, VCPU throttles.\\n- Alerts (auto):\\n  - p95 > baseline*1.25 for 2 windows -> page SRE\\n  - error rate > 0.4% (5m avg) -> page SRE + auto-attenuate SB\\n  - quality regression: eval-score drop > 2% -> create task in INF-1324 and halt further ramps\\n- Quick dashboards: create temporary dashboard tile for cohorts A1/A2/R1/SB with single pane view.\\n\\nRollback & escape hatches (fast):\\n- Fast pin: rwdctl route pin (above) \u2014 guarantees immediate routing to old model within 20s.\\n- Regional fallback: redirect region egress to warm fallback pool (policy id: fallback-warm-07).\\n- Circuit breaker: if overall 5xx spike > 0.75% in 1m, fully disable new-model and enable degrade mode (retries -> old model).\\n\\nPost-rollout checks (post T5):\\n- 24h evaluation window: compare p95, unit-cost/token, and quality evals vs baseline.\\n- Create postmortem template with traffic deltas, anomalies, time to pin.\\n- Decide whether to promote to Dedicated capacity profile or roll back quantization.\\n\\nOpen questions / TODOs (my brain dump):\\n- How aggressive should SB be for premium customers? Maybe expose an opt-in flag rather than automatic.\\n- Should we pre-warm KV per-client group instead of global? Tradeoff: more targeted but slower orchestration.\\n- Add a telemetry dimension for \\\"kv-warmth\\\" per client to better alert on cache thrash.\\n- Need a shell wrapper to run warmup + smoke + priming in one command (cc Marco).\\n\\nQuick runbook snippets (for oncall):\\n- Pin global: rwdctl route pin /v1/generate --model rwd-model-x:2.1 --reason \\\"pinback-<tag>\\\"\\n- Reduce SB by 50%: rwdctl route set-attenuation /v1/generate --cohort SB --factor 0.5\\n- Force warmup re-run: k8s job create --from cronjob/kv-prime --arg \"--force\"\\n\\nNotes-to-self: keep the first A1 window intentionally long (30m+) \u2014 we often see tail problems appear after multiple surface-level requests that cause other subsystems (cache eviction, kernel warmups) to misbehave. When in doubt, cut SB and buy time.\\n\\nRelated artifacts: see linked PR and JIRA. I'll sync with Marco for the warmup wrapper and ask Aisha to wire a temporary dashboard tile.\\n\\nEnd of sketch.\\n\\n-- Lena\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_44f39b18335f44a5a09217bf81646c79"
+}

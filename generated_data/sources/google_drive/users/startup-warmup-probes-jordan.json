@@ -1,0 +1,35 @@
+{
+  "title": "startup warmup probes - jordan",
+  "owner": "Jordan Patel",
+  "drive_area": "users",
+  "path": "users/startup-warmup-probes-jordan.json",
+  "doc_type": "doc",
+  "created_at": "2024-11-07",
+  "last_modified": "2025-01-15",
+  "collaborators": [
+    "Aisha Chen",
+    "Evan Kim"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "warmup",
+    "cold-start",
+    "cache-probing",
+    "kv-cache",
+    "batching",
+    "gpu-overhead",
+    "quantization"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/842",
+    "SERVE-2191",
+    "confluence:Warmup-Behavior-Notes-2024"
+  ],
+  "content": "Purpose\nThis is a personal scratchpad to capture small-scale experiments around cold-start / warmup behavior in the runtime. Goal: identify how many requests/tokens until steady-state throughput and where the dominant overheads are (tokenization, model init, kernel warmup, KV cache fill, first-attention pass). Not a polished doc \u2014 quick notes for follow-ups and for the SRE/Optimize teams.\n\nExperimental setup (quick)\n- Host: dedicated test cluster (single node) with 1x A100-40GB (driver: CUDA 11.8) and a small multi-tenant node with H100 for comparison.\n- Runtime build: main@2024-10-31 + warmup-fixes branch (local flags: --kv-cache-enabled --prefill-opt=on).\n- Models: small-medium Llama-like: redwood/llm-7b-fp16 (baseline), redwood/llm-7b-int8 (quantized probe).\n- Client: curl + small Python harness (requests with keepalive). Each trial is 30s of steady pinging after a cold start (node restart) or process restart.\n- Prometheus + nvtop + nsys traces for one hot run.\n\nMeasurements captured\n- t0: time to first byte (TTFB) for first request after process start (ms)\n- t_first_token: latency for the first generated token (ms)\n- tokens_per_sec (steady-state): measured from 10s-30s window\n- kernel-warmup: observed increased GPU SM utilization during first 2-4 requests\n- cpu-overhead: tokenization and request prep (ms) measured client-side\n\nRun summary (selected trials)\n1) Fresh process start (no prior requests), 1 request at a time, seq_len=64, batch=1\n- model: llm-7b-fp16 on A100\n- TTFB: 480 ms\n- first_token: 510 ms\n- steady tokens/sec: 150 tok/s\n- GPU util first 10s: 18% -> steady 42%\n- Notes: first request dominated by JIT/kernels + cuBLAS workspace alloc. nvprof shows kernel compilation-ish overhead (dynamic kernel selection + small workspace).\n\n2) Same as (1) but after one warm request (warm cache)\n- TTFB: 120 ms\n- first_token: 135 ms\n- steady tokens/sec: 160 tok/s (small improvement)\n- GPU util: 45% steady\n- Notes: major improvement in TTFB; suggests init/alloc cost amortized. Slight throughput bump too.\n\n3) Cold node restart (OS-level), same model\n- TTFB: 1.3s (first request)\n- first_token: 1.5s\n- steady tokens/sec: 140 tok/s\n- Observations: node-level restart incurs device reinitialization + driver context setup. Persistent processes avoid this.\n\n4) Quantized model (int8), cold process start\n- TTFB: 720 ms\n- first_token: 760 ms\n- steady tokens/sec: 210 tok/s\n- Notes: higher first request cost vs fp16 but much higher steady throughput. Quantization changed kernel paths and increased small-kernel initialization time.\n\n5) Small burst test (5 quick seq=128 requests, batch=1, 50ms inter-request)\n- First three requests: per-request latency ~600-800ms; after request 4 latency stabilizes ~380ms; tokens/sec observed jump after cache fills (prefill + kv cache)\n- Conclusion: KV cache warmup matters for repeated sequences with overlapping context.\n\nMicro-observations / hypothesis\n- Two distinct warmup costs: 1) process/node startup (allocs/drivers), 2) first few model inferences (kernel selection + cuBLAS workspace + small-tensor kernel launches).\n- Tokenization (CPU) adds ~15-25 ms per request in our harness for English text; not dominant for long sequences, but significant for short prompt + short generation cases.\n- Quantized kernels incur extra per-kernel setup cost but better steady-state throughput. This explains larger delta between first request and steady throughput for int8.\n- Keep-alive connections cut ~100-300ms off TTFB vs cold client TCP/TLS handshakes in our test infra.\n\nQuick list of commands used (for reproducibility)\n- start server: ./serve --model llm-7b-fp16 --listen :8080 --enable-kv-cache\n- client perf: python perf_probe.py --model llm-7b-fp16 --seq 64 --duration 30 --batch 1 --keepalive\n- simple curl check: curl -s -X POST http://127.0.0.1:8080/generate -d '{\"prompt\":\"hello world\",\"max_tokens\":64}' | jq '.latency'\n\nRepresentative ascii table (first-run vs warmed)\n- headers: scenario | TTFB(ms) | first_token(ms) | steady_tok_s\n- rows:\n  fresh-process | 480 | 510 | 150\n  warmed-process | 120 | 135 | 160\n  node-restart | 1300 | 1500 | 140\n  int8-fresh | 720 | 760 | 210\n\nOpen questions / next probes\n- Is kernel selection cacheable across model versions? Try minor weight bit flips or re-quantized variants to see if we pay warm kernel penalty again.\n- Measure impact of increasing batch size on warmup delta (1,2,4,8). Do bigger batches reduce per-token warm penalty?\n- Profile memory alloc patterns to confirm workspace allocations are the bulk of first-request delta. Could preallocate workspaces at process start to reduce TTFB.\n- Repeat on H100 multi-tenant node to see if driver/multi-process context sharing reduces node-restart penalty.\n\nAction items (quick)\n- [ ] Add an opt-in early workspace prealloc flag in serving runtime to evaluate savings (issue tracked: SERVE-2202).\n- [ ] Run batch-size sweep (1-8) with warm vs cold runs, log deltas (assign: Evan).\n- [ ] Measure tokenization-only overhead with local script (assign: Aisha).\n- [ ] Convert a short note into a Confluence page summarizing recommended mitigations for app teams (after we have batch sweep).\n\nNotes to self\n- This lives as a user scratchpad; move to shared doc if we want to present to runtime owners. Keep small numbers reproducible. Save raw traces under /tmp/warmup-traces-Jordan-2024-11 (done).\n\nBottom line (rough):\n- Cold process/node starts can add order-of-magnitude to first-request latency (hundreds ms to >1s).\n- After 2-3 requests steady-state behavior is reached for FP16; quantized paths warm slower but deliver higher throughput.\n- Simple mitigations to try: keepalive / persistent processes, preallocate workspaces, and small warmup probes at process start.\n\n-- Jordan",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_f31f836cca38401fbd85ec71ac6486a4"
+}

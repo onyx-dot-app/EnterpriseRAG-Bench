@@ -1,0 +1,33 @@
+{
+  "title": "KV prefetch rabbit hole \u2014 scratchpad",
+  "owner": "Mina Gupta",
+  "drive_area": "users",
+  "path": "users/kv-prefetch-rabbit-hole-mina.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-18",
+  "last_modified": "2025-02-19",
+  "collaborators": [
+    "Rajiv Menon",
+    "Evelyn Cho"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "kv-cache",
+    "prefetch",
+    "p99",
+    "investigation",
+    "micro-batching"
+  ],
+  "linked_artifacts": [
+    "INF-4823",
+    "https://github.com/redwood-inference/runtime/pull/187",
+    "confluence:kv-cache-prefetch-notes"
+  ],
+  "content": "Context:\\n- Spike to understand whether proactive KV prefetching (on request start) can reduce p99 on medium-length chat traces without blowing up GPU memory or throughput.\\n- Observed two customer clusters: short-turn chat (<=128 tokens) and long-turn assistant sessions (~2k tokens). Prefetch benefit likely only for the latter or for warmed-up sequences.\\n- Hypothesis: Prefetching the next N KV blocks when first request arrives reduces serialization stalls on the first few generation steps for continued sessions. Trade-offs: extra memory + bandwidth + potential wasted prefetch on single-turn requests.\\n\\nQuick notes from last run (2025-02-18, 02:15 UTC):\\n- Test harness: local-mini (4xA100-40G), runtime branch: prefetch/opt-187\\n- Workload: mixed-chat-1k.json (50% short, 30% medium, 20% long; 500 sessions)\\n- Config: prefetch_enabled=true, prefetch_blocks=3, prefetch_async=true\\n- Result summary: median latency unchanged; p95 improved ~6%; p99 improved ~11% for long sessions only; throughput drop ~2.3% under 1% tail-saturation.\\n- Memory: per-GPU extra ~370MB when prefetch_blocks=3 (KV stored in host pinned buffers), still within headroom.\\n- Unexpected: a small subset (~4%) of short sessions had increased latency due to host->device transfer contention during bursts.\\n\\nRepro steps (local):\\n1) checkout runtime branch: git fetch && git checkout prefetch/opt-187\\n2) start local harness: ./tools/run_local_harness --config tests/mixed-chat-1k.json --nodes 1\\n3) enable tracing for sample 003: export RL_TRACE=sample-003 && tail -f /tmp/runtime-trace.log\\n4) inspect nvtop and nvidia-smi during run; note host pinned mem rising.\\n\\nHypotheses / ideas to validate:\\n- H1: Async prefetch with a low-concurrency host DMA queue reduces the contention seen by short sessions (schedule at lower priority).\\n- H2: Prefetch heuristics should be based on session length estimate (from request metadata or early token pattern) instead of global flag.\\n- H3: For models with big KV stripe size (like >512 dim), prefetch_blocks=1 gives ~80% of p99 benefit with much less memory.\\n- H4: Use per-connection budget; if connection idle > X ms then cancel in-flight prefetch to reclaim memory.\\n\\nMini-experiments to run (priority):\\n- EXP-A: prefetch_blocks=1, async=true, host-queue-depth=2 (run same harness). Target: p99 improvement with <150MB memory.\\n- EXP-B: conditional prefetch only when session_metadata.estimated_length > 256 tokens. Evaluate false positives/negatives.\\n- EXP-C: throttle prefetch bandwidth to 50% during high short-session bursts (simulate spike). See if short-session penalty disappears.\\n- EXP-D: measure host->device PCIe stalls with perf counters when prefetch enabled (capture with nvprof / Nsight counters).\\n\\nOpen risks / questions:\\n- Q1: Does prefetch interact poorly with KV eviction? If prefetch pushes out hot entries for other sessions, we could create regressions. Need to capture eviction logs.\\n- Q2: For dedicated pools with smaller instance sizes, does extra host memory become a blocker for multi-tenant packing?\\n- Q3: Security: do we prefetch only same-tenant sequences? Yes, but verify there is no cross-tenant cache leakage path.\\n\\nQuick todo (rough timeline):\\n- [ ] Run EXP-A (low) \u2014 2025-02-19 (Mina)\\n- [ ] Add session-length heuristic toggle feature flag (runtime flag + simple estimator) \u2014 2025-02-20 (Rajiv)\\n- [ ] Add prefetch cancellation on idle (prototype) \u2014 2025-02-21 (Evelyn)\\n- [ ] Collect eviction traces + overlay with prefetch timeline (SRE assist) \u2014 2025-02-22\\n- [ ] Draft short doc for product tradeoffs (1-pager) \u2014 2025-02-24\\n\\nNotes to self (kernel-level observations):\\n- When prefetch async is true we see more host pinned buffers in 'smaps' (host pinned allocations remain longer). Might need LRU trimming.\\n- Kernel-level DMA thread spikes coincide with high arrival bursts; causes slight jitter in kernel scheduling. Consider lower-priority niceness for DMA thread.\\n- NUMA: pin host pinned buffers to the same NUMA node as GPU to reduce latency; current allocator is round-robin which likely adds 20\u201330us per fetch.\\n\\nCommands I used (copyable):\\n- ./tools/run_local_harness --config tests/mixed-chat-1k.json --nodes 1 --env PREFETCH_BLOCKS=3\\n- sudo perf record -a -g -- ./tools/run_local_harness --config tests/mixed-chat-1k.json\\n- python scripts/trace_overlay.py --traces /tmp/runtime-trace-* --out /tmp/overlay.html\\n\\nMetrics to capture next runs (automatic):\\n- p50/p95/p99 by session length bucket (<=128, 129\u2013512, >512)\\n- per-GPU host-pinned-memory over time\\n- number of cancelled prefetches\\n- eviction rate (entries/sec) + collateral misses\\n\\nShort brainstorm (future ideas):\\n- Aggressive micro-prefetch: instead of blocks, prefetch only first M-keywords likely to be needed (requires model token-coverage heuristics).\\n- Hybrid caching: maintain a small per-AI-tenant warm-KV of last-called keys for faster resume.\\n- Cost-aware router: route suspected long sessions to nodes with prefetch capacity enabled.\\n\\nScratch log (timestamps):\\n- 2025-02-18 01:58 \u2014 started local run, saw p99 drop on long sessions\\n- 2025-02-18 02:05 \u2014 spotted short-session regressions; started perf\\n- 2025-02-18 02:35 \u2014 Rajiv suggested session-length heuristic; penciled EXP-B\\n- 2025-02-18 03:10 \u2014 wrote initial PR and pushed small allocator tweak\\n\\nUnresolved TODOs (for next async pairing):\\n- decide default prefetch_blocks for hosted vs dedicated\\n- add telemetry labels so we can split prefetch traffic in datadog/dashboard\\n- checklist for rollout: canary in dedicated pool -> metrics gating -> staged enable in hosted\\n\\nIf I forget:\\n- Link to perf artifacts: /mnt/artifacts/prefetch/2025-02-18/*\\n- Slack thread: #runtime-kv (search \"prefetch\" last 48h)\\n\\nEnd of scratchpad.\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_3cb19291635e463d90d0e504afef2faa"
+}

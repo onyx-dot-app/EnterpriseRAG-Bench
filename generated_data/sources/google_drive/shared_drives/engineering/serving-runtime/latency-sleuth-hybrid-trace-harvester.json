@@ -1,0 +1,35 @@
+{
+  "title": "Latency Sleuth: Hybrid Trace Harvester",
+  "owner": "Maya Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/latency-sleuth-hybrid-trace-harvester.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-10",
+  "last_modified": "2025-03-01",
+  "collaborators": [
+    "Rafael Gomez",
+    "Priya Nair",
+    "Jonah Li"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "profiling",
+    "tracing",
+    "perf-ci",
+    "ebpf",
+    "flamegraph",
+    "ad-hoc"
+  ],
+  "linked_artifacts": [
+    "https://confluence.redwood.ai/display/SERV/trace-standards",
+    "GH-issue-3921",
+    "jira:SERV-718"
+  ],
+  "content": "Purpose and context:\\n\\nThis is an ad-hoc runbook + working notes for a hybrid trace collector we use when a production latency spike or tail-regression appears and the regular CI perf jobs don't surface an obvious hotspot. The goal is to capture correlated user-request traces, kernel-level samples, and lightweight eBPF events with a single coordinated invocation so we can stitch: wall-clock request flow, CPU stacks, syscalls, and scheduler delays.\\n\\nWhen to use:\\n- Intermittent 95/99p tail latency increases only reproducible on production traffic patterns or long-batched workloads.\\n- When deployment rollouts correlate with latency shape changes but microbenchmarks look fine.\\n- Before starting a disruptive rollback, capture full-context artifacts.\\n\\nHigh-level approach:\\n1) Light request-tagging at ingress (temporary header X-Latency-Sleuth: <run-id>) to correlate logs/traces and to filter sampling in downstream services.\\n2) Short-lived request-level sampling (1 in N) using router/ingress rate limiter hooks \u2014 keep sampling fraction low to reduce cost and noise.\\n3) On sampled requests, trigger a collector pod (or sidecar) that:\\n   a) launches perf (or async-profiler) for user-space stacks, configured for CPU and async-java if applicable;\\n   b) attaches a BPFTrace/eBPF probe for sched/sleep/syscall latencies and queue lengths;\\n   c) emits a compact pprof (cpu/alloc) and raw perf.data;\\n   d) records a small kernel trace (ftrace) for IO and context switches (capped to 10s).\\n4) Push artifacts to S3 with a consistent prefix: /perf-sleuth/<run-id>/<hostname>/<pid>/\\n\\nCollector orchestration (script sketch) - keep idempotent and limited to 15s capture window:\\n- env RUN_ID=$(uuidgen)\\n- curl -X POST http://router.local/sampling-hook -d \"run_id=$RUN_ID&headers=X-Latency-Sleuth\"\\n- spawn collector with: --duration=12 --perf-interval=1ms --ebpf-filter=\\\"comm == \\\\\\\"runtime\\\\\\\" || pid==${TARGET_PID}\\\"\\n\\nPerf and flamegraph notes:\\n- Use perf record -F 400 -p PID -g -- sleep 12 to capture callgraphs; prefer -F 400 on busy hosts and reduce to 100 on quiet ones.\\n- For Java/Managed runtimes prefer async-profiler (keeps wall-clock stacks and resolves JIT frames).\\n- Convert perf.data to folded stacks for flamegraph: perf script | ./stackcollapse-perf.pl > out.folded; then flamegraph.pl out.folded > flame.svg.\\n- Ensure kernel symbols available (debuginfo) or use addr2line for triage.\\n\\neBPF probes to collect (recommended small set):\\n- sched:sched_switch (capture latency between runnable -> running)\\n- tracepoint:syscalls:sys_enter_open and sys_exit_open (for suspicious FS waits)\\n- tcp:tcp_probe (if networking suspected) with caps on number of events (--max-events 10000)\\n- tracepoint:block:block_rq_issue and block_rq_complete (to see IO queues)\\n\\nBPFTrace example snippet (save as sleuth.bt) - keep it conservative:\\n- BEGIN { printf(\\\"SLEUTH %s start\\\\n\\\", ENV->RUN_ID); }\\n- tracepoint:sched:sched_switch /comm == \\\"runtime\\\"/ { @[comm] = count(); }\\n- tracepoint:block:block_rq_issue { @[disk] = hist(blk_rq_sectors); }\\n- END { print(@); }\\n\\nArtifact naming and metadata (important for triage):\\n- filename convention: <run-id>__<service>__<host>__<timestamp>__<type>.tar.gz\\n- include metadata.json inside tar with: run_id, sample_rate, trigger_headers, git_sha, kernel_version, container_runtime, cpu_freq_governor\\n\\nStorage and retention guidance:\\n- Keep raw perf/perf.data and eBPF event logs for 7 days by default, pprof + flamegraphs for 30 days.\\n- Upload compressed tar.gz to perf-sleuth bucket with lifecycle policy: raw->30d cold->90d delete unless ticket attached.\\n\\nCI integration and perf job recipe (for later automation):\\n- Make a perf-job template that can be invoked with: job_type=ad-hoc-sleuth, sample_fraction=0.01, duration=12s, probes=[sched,block].\\n- The job should produce: flame.svg, pprof.pb.gz, perf.data.gz, ebpf.log, metadata.json and a short summary note (top 5 hot symbols, top syscalls, top block devices).\\n\\nTriage checklist (quick runbook):\\n1) Confirm run_id and retrieve tar from bucket.\\n2) Look at metadata.json for sample_rate and target pid/service.\\n3) Open flame.svg and inspect wide, high stacks at top; note function names and inlining.\\n4) Correlate with logs: grep for X-Latency-Sleuth: <run-id> to find request IDs and timings.\\n5) Inspect eBPF summaries for syscalls and block latencies; look for 100us+ hist buckets.\\n6) If perf stacks are kernel-heavy, check for scheduling or IRQ storms (dmesg, iowait).\\n\\nCommon pitfalls and mitigations:\\n- Too high sampling rate: noisy artifacts and overhead. Start 0.1% and raise if signal weak.\\n- Large perf captures on multi-core machines can be huge. Use -F limit and narrow -p PID + --call-graph dwarf to reduce size.\\n- eBPF scripts with open histograms can blow memory \u2014 always specify aggregates limits and max-events.\\n- JIT symbol resolution fails: ensure java/native debug symbols or use async-profiler agent to resolve names at runtime.\\n\\nFollow-ups and improvements backlog:\\n- Add small agent that can atomically toggle perf collection on a pod given run_id via sidecar API (avoid SSH).\\n- Automate symbol upload so flamegraphs resolve in the web UI.\\n- Provide a lightweight web UI for browsing sleuth artifacts (search by run_id, tag by ticket).\\n\\nNotes and references:\\n- Async-profiler guide: https://github.com/jvm-profiling-tools/async-profiler\\n- Brendan Gregg flamegraphs: http://www.brendangregg.com/flamegraphs.html\\n- BPFTrace cookbook snippets (internal): confluence link above\\n\\nQuick command reference (copyable):\\n- perf capture: perf record -F 400 -p $PID -g -- sleep 12 && perf archive -o perf-$RUN_ID.tar.gz\\n- convert: perf script | ./stackcollapse-perf.pl > out.folded && ./flamegraph.pl out.folded > flame-$RUN_ID.svg\\n- bpftrace: sudo bpftrace sleuth.bt -c \"sleep 12\" > ebpf-$RUN_ID.log\\n\\nIf you run this and the artifact points to a kernel or scheduler issue, please ping eng-sre and attach the run_id + one-line summary in the ticket.\\n\\nAuthor: Maya Chen (serving-runtime perf lead)\\nRevision notes: initial draft; looking for teams to try on canary traffic next week.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_66a2e71b5ef6456bbf4f2c851890372b"
+}

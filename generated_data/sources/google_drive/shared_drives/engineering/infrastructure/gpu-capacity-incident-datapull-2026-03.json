@@ -1,0 +1,60 @@
+{
+  "title": "GPU capacity incident data pull & analysis sheet - March 2026",
+  "owner": "Maya Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/infrastructure/gpu-capacity-incident-datapull-2026-03.json",
+  "doc_type": "sheet",
+  "created_at": "2026-03-12",
+  "last_modified": "2026-03-15",
+  "collaborators": [
+    "Ravi Patel",
+    "Diego Alvarez",
+    "Aisha Nwosu"
+  ],
+  "team": "eng-infrastructure",
+  "status": "draft",
+  "tags": [
+    "capacity",
+    "postmortem",
+    "gpu",
+    "throttle",
+    "data-pull"
+  ],
+  "linked_artifacts": [
+    "https://redwood.atlassian.net/browse/INFRA-987",
+    "https://confluence.redwood.ai/display/INF/Mar+2026+capacity+postmortem+notes",
+    "slack:#infra-incidents:message-01ab23cde"
+  ],
+  "body": "Purpose:\nThis sheet is a lightweight data-pull spec + scratchpad to support the March 9-10 GPU capacity incident (incident INF-987). The goal: produce reproducible queries and a summary table for saturation, queueing, and throttle signals across regions and instance families so SRE/infra can finalize numbers for the postmortem.",
+  "body_2": "How to use:\n- Run the SQL snippets below in bigquery-project:redwood-telemetry.jobs (or adapt for internal Clickhouse)\n- Collect 1-hour rolling windows and 5m/1m granular samples as noted\n- Paste sample output rows into the \"SAMPLE_OUTPUT_CSV\" section and attach as CSV to the postmortem Confluence page.\n- Notes and quick findings go in the \"Summary notes\" section at the bottom.",
+  "query_snippets": [
+    "-- 1) node-level GPU utilization (5m avg) over window\nSELECT region, gpu_type, node_id, window_start, AVG(gpu_util_percent) as avg_gpu_util\nFROM `redwood-telemetry.cluster.node_gpu_metrics`\nWHERE window_start BETWEEN TIMESTAMP('2026-03-09T00:00:00Z') AND TIMESTAMP('2026-03-10T23:59:59Z')\nGROUP BY region, gpu_type, node_id, window_start\nORDER BY region, avg_gpu_util DESC\nLIMIT 1000;",
+    "-- 2) queue depth and avg wait time per model route (1m buckets)\nSELECT route, region, bucket_start, SUM(queue_depth) as queued, AVG(wait_ms) as avg_wait_ms\nFROM `redwood-telemetry.request.queue_stats_1m`\nWHERE bucket_start BETWEEN TIMESTAMP('2026-03-09') AND TIMESTAMP('2026-03-10')\nAND route LIKE '%/models/%'\nGROUP BY route, region, bucket_start\nORDER BY queued DESC\nLIMIT 500;",
+    "-- 3) throttle events by reason (throttle_count, reason tag)\nSELECT region, gpu_family, throttle_reason, COUNT(1) as throttle_events, SUM(throttled_tokens) as tokens_throttled\nFROM `redwood-telemetry.infra.throttle_events`\nWHERE event_time BETWEEN TIMESTAMP('2026-03-09') AND TIMESTAMP('2026-03-10')\nGROUP BY region, gpu_family, throttle_reason\nORDER BY throttle_events DESC;",
+    "-- 4) correlate capacity pressure with autoscaler actions\nSELECT event_time, region, pool_id, metric, value, autoscaler_action, target_replicas\nFROM `redwood-telemetry.autoscaler.actions` a\nJOIN `redwood-telemetry.cluster.metrics_1m` m ON a.pool_id = m.pool_id AND ABS(TIMESTAMP_DIFF(a.event_time, m.bucket_start, SECOND)) < 60\nWHERE a.event_time BETWEEN TIMESTAMP('2026-03-09') AND TIMESTAMP('2026-03-10')\nORDER BY event_time;",
+    "-- 5) request-level tail latency for throttled requests (sampled)\nSELECT request_id, route, region, gpu_type, is_throttled, throttle_reason, total_latency_ms\nFROM `redwood-telemetry.requests.requests_sampled`\nWHERE is_throttled = TRUE AND request_time BETWEEN TIMESTAMP('2026-03-09') AND TIMESTAMP('2026-03-10')\nLIMIT 200;"
+  ],
+  "sample_output_csv": "region,gpu_type,node_id,window_start,avg_gpu_util\nus-west1,A100-80C,node-182,2026-03-09T14:00:00Z,97.4\nus-east1,A10G,node-44,2026-03-09T14:05:00Z,92.1\neu-west1,H100-node,node-99,2026-03-09T14:00:00Z,88.6",
+  "columns_definitions": "region: cloud region\ngpu_type: instance family / accelerator\nnode_id: internal node identifier\nwindow_start: start of sample window (5m/1m)\navg_gpu_util: average GPU utilization percent\nqueued: number of requests waiting in scheduler queue\navg_wait_ms: average queue wait in ms\nthrottle_events: number of throttle events recorded\nthrottled_tokens: tokens impacted by throttles",
+  "quick_checks": "Checklist for data pulls:\n- Confirm timezone is UTC for all timestamps\n- Use 5m buckets for node-level utilization and 1m for request queueing where possible\n- Pull both raw events and aggregated windows to validate aggregation logic\n- Cross-check throttle counts against billing-metering logs (billing:gpu_throttle_events)\n- Snapshot active deployments (deploy metadata table) for routes that hit throttles",
+  "initial_findings": "Preliminary observations (scratch):\n- us-west1 A100 pool showed sustained >95% avg for 30+ minutes during incident spike (approx 14:00-14:40 UTC)\n- Queue depth for /models/seq2seq-heavy route spiked to 800+ queued requests in 1m buckets before throttles triggered\n- Throttle_reason tag 'capacity_saturated' accounts for ~83% of recorded throttle events; other reasons were 'policy_rate_limit' and 'per-user_limit'\n- Autoscaler reacted with +20 nodes in us-west1 after ~12 minutes; observed delayed provisioning due to GPU image pull backoff on some hosts (see linked GH PR below)",
+  "open_questions": "- Was any workload colocated with background batch jobs that caused ephemeral IO pressure? (check batch-job-runlog-2026-03-09)\n- Did preemptible pools on us-east1 contribute by auto-evicting capacity?\n- Are there specific model versions that correlate with longer KV-cache startup times?",
+  "recommended_next_steps": "Short-term:\n- Backfill 1-minute samples for top-5 impacted routes and attach CSV to Confluence\n- Run node-level GPU memory pressure query and correlate with image-pull errors in node kubelet logs\n- Add an alert to detect sustained avg_gpu_util > 90% for 10m per pool (sensitivity tweak)\nMedium-term:\n- Evaluate burst buffer pools (warm spare nodes) for A100 in us-west1\n- Investigate faster node image caching, pre-pulled images for canary kernels\n- Postmortem action: lock a new autoscaler cooldown of 5m to avoid oscillation",
+  "notes_for_author": "This is a working sheet. Keep it minimal, paste query outputs and annotate rows. Replace SAMPLE_OUTPUT_CSV with full CSV export where possible. For final postmortem, convert the summary section into Confluence-friendly bullets and attach CSVs and dashboards.",
+  "contributor_signoff": "Maya Chen (eng-infrastructure) - draft prepared. Next: Ravi to validate queries; Diego to run BigQuery exports and attach CSVs. Aim to have finalized numbers by 2026-03-18.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "body_2",
+    "query_snippets",
+    "sample_output_csv",
+    "columns_definitions",
+    "quick_checks",
+    "initial_findings",
+    "open_questions",
+    "recommended_next_steps",
+    "notes_for_author",
+    "contributor_signoff"
+  ],
+  "dataset_doc_uuid": "dsid_7f1d6c2d03ea464eadea72e63de0b04a"
+}

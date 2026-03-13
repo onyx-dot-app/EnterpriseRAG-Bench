@@ -1,0 +1,51 @@
+{
+  "title": "Attention kernel / paged-KV / continuous-batching \u2014 regression lab notes",
+  "owner": "Aisha Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/applied-ml/",
+  "doc_type": "doc",
+  "created_at": "2025-11-18",
+  "last_modified": "2026-03-01",
+  "collaborators": [
+    "Ben Cole",
+    "Marco Liu",
+    "Sofia Ramirez"
+  ],
+  "team": "eng-applied-ml",
+  "status": "in_review",
+  "tags": [
+    "flash-attention",
+    "paged-kv",
+    "continuous-batching",
+    "onboarding",
+    "regression",
+    "prompt-sets"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/runtime/pull/8721",
+    "ENG-5492",
+    "https://confluence.redwood.ai/display/AM/attn-pagedkv-playbook"
+  ],
+  "summary": "Lab-first writeup capturing a set of small but reproducible regressions observed after toggling the new flash-attention kernel and paged-KV eviction policy together with continuous batching enabled. This doc collects prompt-set level deltas, sample traces, e2e eval results, and short hypotheses for root cause plus actionable mitigations.",
+  "test_harness": "Runner: ml-eval-v2 harness (container tag: eval-runner:2026-02-24). Models: fp16-open-7b-v1 (baseline kernels), fp16-open-7b-v1+flash (flash-attn enabled), fp16-open-7b-v1+flash+pagedkv (paged KV enabled), fp16-open-7b-v1+all (continuous-batching enabled). Hardware: p4d.24xlarge and local dev GPU (A10x4). Variants tested with sequence lengths: 128, 512, 1024, 2048; batching configs: microbatch=1/2/4, cont-batch-window=20ms/50ms/100ms. Measurements recorded: median latency (p50), p95 latency, tokens/sec, memory peak (GB), kv-evictions, kernel-fallback-counts. Logs collected with tracing: trace-id header applied, kv-metrics, kernel-selection debug enabled.",
+  "prompt_sets": "Three prompt sets used (short names):\n1) mgmt-instr: 50 prompt templates (instruction format, ~40-120 tokens), heavy named-entity outputs.\n2) dialogue-long: multi-turn chat prompts with historical context up to 1024 tokens; 200 examples.\n3) codegen-snippets: code completion tasks with long sequences and nested brackets; 120 examples often pushing kv size.\nNotes: each prompt set was run 10x per config; we captured raw outputs for quality-diff comparisons and tokenization-aligned logprobs for regression detection. Also included a small synthetic adversarial prompt list designed to stress KV eviction (kv-stress-12.txt).",
+  "eval_results": "High-level: most regressions are small but repeatable on certain combos.\n- Baseline -> flash: no material quality regressions; latency improved ~10% median p50 for seq<=512.\n- flash -> flash+pagedkv: observed tokens/sec drop at seq>=1024 and p95 latency spikes (2.5x) on p4d in ~12/200 dialogue-long cases.\n- flash+pagedkv -> +continuous-batching: further variability: median latency sometimes improves for small batches but p95/p99 tail gets worse for dialogue-long when cont-batch-window >50ms.\nQuantitative sample (dialogue-long, seq=1024, microbatch=2):\n- baseline: p50=210ms, p95=420ms, tokens/sec=620\n- flash: p50=180ms, p95=390ms, tokens/sec=700\n- flash+pagedkv: p50=190ms, p95=1030ms, tokens/sec=350 (observed kv-eviction spikes)\n- flash+pagedkv+contbatch(50ms): p50=170ms, p95=1200ms, tokens/sec=320 (occasionally CPU fallback observed)\nQuality regressions (surface-level): 7/200 dialogue-long examples had formatting errors (missing closing tags) when paged-KV + cont-batch enabled; likely due to partial KV misses during streaming decode. Exact logprobs showed abrupt drop in token probability around eviction boundaries.",
+  "regression_examples": "Example A (dialogue-long #87):\n- Prompt: user asked multi-turn question referencing earlier session\n- Baseline output: coherent multi-sentence answer with correct reference\n- flash+pagedkv output: answer truncated mid-sentence at the turn boundary; final tokens: '<assistant> I think the best approach is' and then termination.\nTrace excerpt: kernel-selection=flash, kv-load-time=14ms, kv-evict-count=3 during decode; at token-234 we saw kvcache-miss-on-read and a synchronous block causing request to fall back to CPU kernel for 80ms.\nExample B (codegen-snippets #42):\n- Baseline: completed function with closing brace\n- flash+pagedkv+contbatch(100ms): missing closing brace and indentation broken. Logprobs show mismatch where context window used older KV page leading to shifted generation.\nRepro command (internal): ./run_eval --config tests/attn_pagedkv_contbatch.yaml --example 87 --trace\nAttached raw traces in linked_artifacts (confluence page).",
+  "investigation_notes": "Hypotheses (ordered by likelihood):\n1) Eviction timing + continuous-batching window interacts such that in-flight requests see inconsistent KV pages (read-old, then eviction, then read-miss) leading to semantic context loss.\n2) Flash-attention kernel has an edge-case where certain seqLen & microbatch combinations trigger an unaligned memory access on A10y that forces a synchronous copy, increasing p95 and causing kernel-fallbacks.\n3) Race in kernel-selection path: cont-batch aggregator may merge requests with different KV lifetimes, and paged-KV eviction didn't mark the merged trace correctly.\nEvidence:\n- Kernel-fallback-count correlates strongly with p95 spikes in traces where kv-evict-count>0.\n- CPU fallback traces show a short period (~40-120ms) of blocked decode before resuming; these blocks align with eviction events in kv logs.\n- Reproduced locally on A10x4 with synthetic kv-stress: toggling eviction-threshold from 64MB->128MB reduces occurrences by ~60%.\nOpen questions:\n- Do different backends (p4d vs a10x4) surface different failure modes due to SDK cuda driver versions?\n- Is there a correctable ordering guarantee missing between cont-batch flush and paged-KV eviction callback?",
+  "action_items": "1) Add stronger invariants in cont-batch merge: ensure combined requests have matched KV lifetimes or reject merge \u2014 assigned to Marco Liu \u2014 ENG-5583.\n2) Instrument paged-KV with a global generation id and assert reads include gen check; add unit test around eviction-read races \u2014 assigned to Ben Cole \u2014 PR #8721.\n3) Add a temporary guard: if kv-evict-count>0 during decode, prefer synchronous pipeline (slightly higher median latency but avoids tail spikes) \u2014 short-term patch, owner Sofia Ramirez.\n4) Expand eval harness to include kv-stress-12 in CI and run full dialogue-long set nightly for a week after patch \u2014 owner Aisha Patel.\n5) Add kernel-selection debug telemetry to correlate kernel fallback with driver version and microbatch sizes \u2014 owner Marco Liu.\nEstimated impact: items 1-3 should reduce p95 regressions by ~70%.",
+  "next_steps": "Short term (48-72h):\n- Branch and PR for paged-KV generation id + test (Ben).\n- Quick cont-batch merge protection rollback option toggled via feature flag for canary (Marco).\n- Nightly run configured with new metrics; alert on p95 regressions >30% (Aisha).\nMedium term (2-4 weeks):\n- Perf regression sweep across seqLen grid with new invariant enforced; measure cost impact of fallback guard.\n- Postmortem-style doc if we hit customer-facing incidents; contact CS for any customers on Dedicated with heavy long-context workloads.\nNotes to reviewers: this doc mixes experimental log excerpts and hypotheses; please annotate with references to PRs or counter-evidence if you reproduced different behavior. If you can't reproduce locally, record exact driver/CUDA/cudnn/runtime versions \u2014 we suspect driver differences matter.",
+  "body": "Raw lab journal (chronological):\n\n2025-11-18 09:12 \u2014 kicked off first run using eval-runner:2025-11-17. Noticed improvement p50 at seq<=512 across matrix, all good.\n2025-11-18 12:45 \u2014 enabling paged-KV introduced occasional p95 spike on dialogue-long; looked like eviction spikes.\n2025-11-19 08:02 \u2014 reproduced locally on A10x4 using kv-stress-12; traced a read-miss then eviction then sync fallback.\n2025-11-20 14:10 \u2014 toggled eviction threshold to 128MB; p95 spikes reduced but still present on some examples.\n2025-12-02 11:00 \u2014 enabled continuous-batching in combination; microbatch merge occasionally combined requests with unequal KV life leading to mismatched context. Repro rate ~6% on dialogue-long, seq>=1024.\n2025-12-05 16:30 \u2014 ran with kernel debug enabled: found kernel-selection fallback occurs right after an eviction callback. Suspect ordering issue between cont-batch flush and eviction callback.\n2026-01-09 09:00 \u2014 ran longer sweep on p4d; behavior similar but frequency lower; p4d driver stack appears to hide some synchronous copies but not all.\nFeedback loop: recorded traces and pushed small reproducer (kv-repro/evict-repro.py) to github PR #8721.\n\nUnresolved notes / TODOs:\n- Add a minimal unit test that simulates two requests with adjacent KV pages and forces eviction mid-decode.\n- Confirm whether streaming-decoder path (incremental token emission) interacts differently than batch decode path.\n- Validate that changing cont-batch-window to <=10ms eliminates most merges; measure throughput cost.\n\nIf you run these reproductions, please paste command and exact docker tag and cuda version into the PR review comments.\n\nEnd of lab notes.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "test_harness",
+    "prompt_sets",
+    "eval_results",
+    "regression_examples",
+    "investigation_notes",
+    "action_items",
+    "next_steps",
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_c57b6121dfbb4a1c96f3a50c885d1151"
+}

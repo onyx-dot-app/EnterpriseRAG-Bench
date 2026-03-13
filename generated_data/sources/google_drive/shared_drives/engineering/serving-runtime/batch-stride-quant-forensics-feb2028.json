@@ -1,0 +1,36 @@
+{
+  "title": "Batch-stride quant forensics and scheduler tiling investigation",
+  "owner": "Aisha Kumar",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/batch-stride-quant-forensics-feb2028.json",
+  "doc_type": "doc",
+  "created_at": "2028-02-15",
+  "last_modified": "2028-02-28",
+  "collaborators": [
+    "Diego Alvarez",
+    "Marta Li",
+    "Connor O'Neal"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "quantization",
+    "profiling",
+    "scheduler",
+    "AWQ",
+    "GPTQ",
+    "INT8",
+    "FP8"
+  ],
+  "linked_artifacts": [
+    "GITHUB:github.com/redwood-inference/serve-runtime/pull/4123",
+    "JIRA:SRV-1892",
+    "CONFLUENCE:serving-runtime/tiling-scheduler-notes"
+  ],
+  "content": "Summary:\nThis note records a focused forensics run to explain an observed perf quality tradeoff when using AWQ and GPTQ variants on LLaMA2-13B under our tiled scheduler and variable batch shapes. The regression shows high p95 latency increases for INT8/AWQ kernels on A100 across bursty client mixes (short chat + long completions). Goal is to capture reproducible signals, eliminate hypothesis space, and propose mitigations for the scheduler/kernel interaction.\n\nWhat we saw (motivation):\n- Production traces (SRV-1892) show p50 ~115ms baseline for hosted small-chat workload, but p95 spikes to 860ms during mixed-burst periods when using AWQ-int8.\n- Switching the same model to GPTQ-int8 reduced p95 to ~420ms, tokens/sec improved 1.6x.\n- FP8 runs show more stable tail but slightly higher median compared to GPTQ-int8.\n\nHypotheses to test:\n1) Tiling/scheduler chooses a kernel variant expecting homogeneous batch stride; AWQ kernels are more sensitive to irregular per-request sequence length distribution, causing serialization inside the kernel.\n2) Memory fragmentation from dynamic KV caching + INT8 packing causes extra copies in the warmth path, affecting AWQ more than GPTQ.\n3) Thread contention in the tiled GEMM path when lanes operate at mixed microbatches (thread steal causes long tails).\n\nExperimental setup (repro steps):\n- Hardware: A100 40GB (prod runner), H100 test node for comparison.\n- Model: LLaMA2-13B v2 (v2.1.0) with tokenizer set frozen.\n- Quant variants: AWQ-int8, GPTQ-int8, FP8-e4m3 (compiler-backed), baseline fp16.\n- Scheduler knobs: tiling_size {64,128,256}, batch_stride_policy {static, dynamic, adaptive}, worker_threads {32,64}.\n- Workload: synthetic mix script (mixgen) with 70% short chat (avg 16 tokens), 25% medium (avg 128 tokens), 5% long (avg 2048 tokens) replayed at controlled RPS bursts (100 -> 800).\n- Metrics captured: p50/p90/p95 latency, tokens/sec, kernel occupancy (perf counters), memcpy counts, KV-cache copy counts, nvtx regions.\n- Command snippets: (omitted here, saved in linked PR)\n\nKey findings (short):\n- AWQ-int8 shows a 2.1x increase in p95 at tiling_size=64 vs tiling_size=256 for mixed bursts on A100. GPTQ-int8 is largely insensitive to tiling_size.\n- Memcpy profiling shows AWQ-int8 path doing an extra packing copy for lanes with sequence length != tile size; these copies are frequent at tiling_size=64.\n- Kernel occupancy: AWQ kernels launch smaller GEMM tiles for odd-length lanes, causing many more kernel launches (kernel amplification).\n- H100 is more forgiving: same configuration yields ~30% lower p95 amplification for AWQ; suggests hardware scheduling/SM efficiency matters but does not eliminate issue.\n\nInterpretation:\n- AWQ's packing format is optimal when batches align to tile boundaries. Under variable-length mixes the runtime currently pads/truncates differently which forces per-request packing; small tile sizes amplify overhead. GPTQ uses a packing path with coalesced writes and is less sensitive. FP8 uses different kernel with fused pack+gemm which reduces copies at the cost of slightly higher median compute.\n\nRepro artifacts (short):\n- Repro harness: mixgen-v2 (CLI in linked PR).\n- Perf traces: nvprof + nvtx captured, pointers in PR.\n- Microbench snippet: microbench/pack-compare-run-2028-02-20.json (attached in PR).\n\nImmediate mitigations tested:\n- Increase default tiling_size to 256 for AWQ-int8 on A100 in dedicated pools. Reduced p95 from 860ms -> 420ms in repro; median unchanged.\n- Add a cheap heuristic: for mixed-batch traffic detect variance(seq_len) > threshold and switch batch_stride_policy to \"coalesce-pack\" (experimental). In our test this reduced extra copies by ~70% and lowered tail.\n- Introduced an adaptive path: if kernel launch count > X in 1s window, force aggregate packing and single larger kernel invocation. This reduces parallelism slightly but dramatically reduces kernel-launch overhead.\n\nOpen questions and next steps:\n- Is extra packing unavoidable for AWQ's compression layout, or can we refactor AWQ packer to emit coalesced writes when sequences misalign? (ENG-RFC).\n- Evaluate tradeoffs on memory hot paths: does coalesced packing increase peak memory and long-term fragmentation? Need a memory smoke-run on 1k-concurrency.\n- Backcompat: should we change tiling defaults per hardware class in the routing table? Propose a short experiment to expose tiling hints in model catalog.\n- Run the same workload on dedicated 8xA100 clusters used by Dedicated customers to measure impact at scale.\n\nNotes to reviewer / TODOs:\n- Diego: can you add counters for \"pack-copy-bytes\" to runtime traces?\n- Marta: split AWQ packer PR into two commits (path refactor + optimization) and link performance regression tests.\n- Connor: schedule H100 soak for FP8 coalesced path to validate stability under 48h run.\n- Add a small one-pager for product explaining why we recommend tiling=256 for AWQ-int8 on hosted tier for mixed chat workloads.\n\nAppendix (observational table - textual):\n- Config A (AWQ-int8, tile=64, dynamic_stride, A100): p50 115ms, p95 860ms, tokens/sec 120k\n- Config B (AWQ-int8, tile=256, coalesce-pack, A100): p50 118ms, p95 420ms, tokens/sec 195k\n- Config C (GPTQ-int8, tile=64, dynamic_stride, A100): p50 112ms, p95 430ms, tokens/sec 210k\n- Config D (FP8-e4m3, tile=128, adaptive, H100): p50 132ms, p95 310ms, tokens/sec 185k\n\nConcluding notes:\nThis write-up is intentionally pragmatic \u2014 shows a clear scheduler <-> kernel interaction hitting AWQ packing semantics. Next technical work should focus on packer coalescing and exposing tiling hints to routing so we can preserve median latency while preventing tail amplification.\n\nEnd of note.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_77410f62fcf24f42b09826d7d11f82cc"
+}

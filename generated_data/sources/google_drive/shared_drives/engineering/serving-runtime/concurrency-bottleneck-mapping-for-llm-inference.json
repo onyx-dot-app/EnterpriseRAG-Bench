@@ -1,0 +1,50 @@
+{
+  "title": "Concurrency bottleneck mapping for LLM inference",
+  "owner": "Maya Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/concurrency-bottleneck-mapping-for-llm-inference.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-12",
+  "last_modified": "2026-03-01",
+  "collaborators": [
+    "Daniel Park",
+    "Lina G\u00f3mez",
+    "Ethan Bloom"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "multi-gpu",
+    "profiling",
+    "throughput",
+    "latency",
+    "NCCL",
+    "batching"
+  ],
+  "linked_artifacts": [
+    "https://confluence.redwood/INFR-7692",
+    "GH: redwood/serve-runtime#487",
+    "JIRA: INF-1123"
+  ],
+  "summary": "Working notes from exploratory experiments that map how increasing concurrent request load interacts with tensor/pipeline parallel regions, NCCL saturation, and per-GPU utilization for a family of 13B and 34B models. Goal: identify clear signals to drive autoscaler and fallback routing heuristics.",
+  "key_metrics": [
+    "end-to-end p50 latency (ms)",
+    "p95 latency (ms)",
+    "tokens/sec per-GPU",
+    "NVLink utilization (%)",
+    "PCIe xfer bytes/sec",
+    "NCCL bandwidth observed (GB/s)",
+    "stall cycles due to synchronization (%)"
+  ],
+  "content": "Purpose:\\nThis doc records a set of controlled experiments to understand how concurrency (parallel in-flight requests) interacts with multi-GPU serving for medium-large autoregressive models. We want to surface deterministic bottlenecks (comm, compute, scheduling) and produce actionable heuristics for the runtime: when to increase batching, when to drop to a smaller variant, and when to steer traffic away from a node due to interconnect saturation.\\n\\nHigh-level hypothesis:\\n1) At low concurrency, throughput is compute-bound and good NVLink/PCIe headroom exists.\\n2) As concurrency increases, asynchronous KV-cache pressure and PCIe transfers for KV flushes create periodic bursts that coincide with NCCL collectives during attention phases, leading to latency tail spikes.\\n3) Pipeline-parallel padding (uneven micro-batch distribution) amplifies sync waits \u2014 more so for models with shallow pipeline stages.\\n\\nExperiment matrix (summary):\\n- Models: rwd-13B-fp16, rwd-34B-fp16 (same architecture family, different shard counts).\\n- Parallel configs: TP-only (tensor parallel 2/4), PP-only (pipeline 2/4), TP+PP mixed (TP=2, PP=2).\\n- Network: DGX-A100 style NVLink mesh (full bisection) vs. Ethernet+PCIe host (simulated by toggling NCCL P2P and limiting interconnect).\\n- Concurrency sweep: 1, 4, 8, 16, 32 concurrent requests.\\n- Request shape: greedy decode, prompt lengths {16, 64}, generation length 128 tokens.\\n\\nInstrumentation and signals captured:\\n- nvprof / nsight metrics: SM utilization, DRAM throughput, kernel durations.\\n- nvidia-smi sampling (1s): GPU memory, %util, encoder/decoder kernel names.\\n- NCCL_TRACE and NCCL_P2P_LEVEL logs parsed for bandwidth and synchronization windows.\\n- Runtime traces: per-request span durations, queue time, batch-assembly time, KV cache hits/evictions.\\n- Packet-capture style counters: PCIe bytes transferred per-step (approximated via driver counters).\\n\\nRepresentative findings:\\n1) Low concurrency (1\u20134):\\n   - rwd-13B in TP=2 shows steady throughput ~210 tokens/s per-GPU, p50 latency ~180ms. NVLink utilization ~45% (headroom).\\n   - rwd-34B with PP=2 has slightly higher p50 due to pipeline stage skew but stable p95.\\n\\n2) Medium concurrency (8\u201316):\\n   - Sudden divergence between throughput and expected linear scaling. Measured tokens/sec per-GPU increases sublinearly with concurrency past 8.\\n   - NCCL windows show frequent small collectives (all-reduce and reduce-scatter) with reduced effective bandwidth (~40% of theoretical) due to contention with host-to-device transfers for KV cache state.\\n   - Observed pattern: many requests complete their compute kernels but then sit waiting in a synchronization barrier while another request triggers a large PCIe flush. Tail latency spikes correspond to those barriers.\\n\\n3) High concurrency (32):\\n   - NVLink counters approach saturation on the worst links; per-step bandwidth oscillates wildly.\\n   - GPUs report transient memory pressure as KV caches evict; this causes extra host roundtrips that serialize with NCCL.\\n   - p95 latency balloons (2\u20134x) and overall tokens/sec sometimes regresses compared to concurrency 16 due to starvation and backpressure.\\n\\nMicro-observations and oddities:\\n- On TP-only configs, the library\u2019s kernel fusion helps hide some communication but only when batch composition aligns (micro-batches of uniform length). Varied prompt lengths break fusion and expose many small NCCL collectives.\\n- Pipeline stages with unbalanced operator counts create deterministic hold-ups: the longer stage becomes a choke point; increasing micro-batch interleaving reduced this but at cost of more frequent small collectives.\\n- Enabling CUDA IPC between processes reduced PCIe traffic but increased CPU scheduling pressure and sometimes increased jitter for small requests.\\n\\nProfiles and snippets (textual):\\n- Example NCCL snapshot (TP+PP, concurrency=16, rwd-34B):\\n  - reduce-scatter: avg size 1.2MB, avg latency 2.8ms, occuring every decode step; effective bandwidth ~35GB/s vs link peak 63GB/s.\\n  - all-reduce: bursts aligned to positional embedding updates; several microseconds of idle before collective start.\\n\\n- Runtime trace example: request X -> queue wait 12ms, batch assembly 5ms, compute kernels 48ms, KV flush 3ms, NCCL wait 26ms, output serialize 2ms.\\n\\nImplications for autoscaler and routing heuristics:\\n- Trigger autoscale-up on sustained NVLink > 70% and NCCL effective bandwidth > 60% of measured baseline for >30s. This is a better signal than GPU %util which lags.\\n- Prefer routing short prompt, short-generation traffic to nodes with low concurrent KV cache usage (we measured 3\u20135x lower tail when KV cache contention is low).\\n- For mixed prompt-length workloads, enable micro-batch homogenization in the batcher (delay short prompts briefly to coalesce) \u2014 reduces small collective count and p95 at cost of minimal median increase.\\n- When pipeline imbalance detected (per-stage avg compute time variance > 25%), trigger interleaved scheduling or recommend TP adjustments.\\n\\nQuick recommended action items:\\n1) Add NVLink/NCCL derived signals to per-node telemetry with 10s resolution (NVLink bytes/s, NCCL effective BW, host->device PCIe bytes).\\n2) Implement a conservative routing rule: if NCCL_eff_bw > 60% and concurrency > 8, prefer lower-concurrency nodes or fall back to a smaller model variant.\\n3) Prototype micro-batch homogenizer inside the assembler with two knobs: delay_threshold_ms and max_coalesce_count. Run ablation to quantify median vs p95 trade.\\n4) Add a small experiment to test CUDA IPC vs host PCIe tradeoff across mixed-length prompts and document CPU scheduling overhead.\\n\\nOpen questions / follow-ups:\\n- How general are these observations across different vendor topologies (A100 vs H100 vs other meshes)? Need matched experiments.\\n- Can we modify NCCL tuning parameters (ring vs tree, algorithmic thresholds) dynamically in the runtime? Risks and gain quantification required.\\n- Is it viable to offload KV cache spill handling to a co-located CPU process to avoid interfering with NCCL windows?\\n\\nAppendix: raw commands used (abridged)\\n- launcher invocation: ./run_inference_bench --model rwd-13B --tp 2 --pp 2 --concurrency 16 --prompt-shape 64 --gen 128 --trace-level perf\\n- NCCL logs: NCCL_DEBUG=INFO NCCL_P2P_LEVEL=SYS ./run_inference_bench ...\\n- perf counters: sudo nvidia-smi nvlink --query-gpu=nvlink.bandwidth --format=csv\\n\\nNotes to reviewers:\\n- These are early experiments; some numbers vary with kernel versions and driver combinations. Please check GH PR redwood/serve-runtime#487 for the instrumentation code and INF-1123 for the autoscaler feature request.\\n- I expect the micro-batch homogenizer to be the lowest-effort high-impact mitigation for p95.\\n\\nSigned-off-by: Maya",
+  "footnotes": [
+    "Driver: CUDA 12.2, cuDNN 9.x, NCCL 2.18 (test bed)",
+    "Hardware: DGX-like nodes with 8x A100 NVLink mesh and a fallback host-only cluster with 4x GPUs per node behind PCIe"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_b6092742b30643ab8e466d0b4e74f34f"
+}

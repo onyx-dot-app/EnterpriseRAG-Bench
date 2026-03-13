@@ -1,0 +1,45 @@
+{
+  "title": "Overprovision gap analysis - capacity incident telemetry aggregation",
+  "owner": "Daniel Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/infrastructure/overprovision-gap-analysis-2027-04-18.json",
+  "doc_type": "sheet",
+  "created_at": "2027-04-18",
+  "last_modified": "2027-04-19",
+  "team": "engineering-infrastructure",
+  "status": "draft",
+  "collaborators": [
+    "Aisha Kapoor",
+    "Marcos Rivera",
+    "Priya Nambiar"
+  ],
+  "tags": [
+    "capacity",
+    "gpu",
+    "postmortem",
+    "overprovision",
+    "queueing",
+    "throttle"
+  ],
+  "linked_artifacts": [
+    "ENGINC-8721",
+    "https://confluence.redwood.ai/display/INF/overprovision-gap-analysis",
+    "https://github.com/redwood-inference/infra/pull/614"
+  ],
+  "queries_executed": [
+    "SELECT region, cluster, minute_bucket, sum(allocated_gpus) as allocated_gpus, avg(active_gpu_pct) as avg_active_pct, avg(queue_depth) as avg_queue_depth, sum(throttle_events) as throttle_count FROM telemetry.gpu_usage WHERE minute_bucket BETWEEN '2027-04-10T00:00:00Z' AND '2027-04-18T23:59:00Z' GROUP BY region, cluster, minute_bucket",
+    "SELECT region, minute_bucket, percentile_cont(0.95) within group (ORDER BY latency_ms) as p95_latency FROM telemetry.request_traces WHERE model_family = 'redwood-instruct' AND minute_bucket BETWEEN '2027-04-14' AND '2027-04-18' GROUP BY region, minute_bucket",
+    "SELECT region, cluster, minute_bucket, sum(prefilled_cache_hits) / nullif(sum(prefilled_cache_lookups),0) as cache_hit_rate FROM telemetry.kv_cache WHERE minute_bucket BETWEEN '2027-04-10' AND '2027-04-18' GROUP BY region, cluster, minute_bucket"
+  ],
+  "content": "Purpose:\nThis sheet aggregates the telemetry slice used to investigate the mid-April 2027 capacity incident where application latency spiked after an autoscaling rebalancing job coincided with low fill-factor across Dedicated pools. Goal is to produce a compact, shareable data summary for the postmortem that focuses on the 'overprovision gap' phenomenon (allocated GPUs idling + sudden routing shifts => transient queueing and throttle cascades).\n\nTime window analyzed:\n- Baseline window: 2027-04-10 00:00 UTC -> 2027-04-13 23:59 UTC\n- Pre-incident ramp: 2027-04-14 00:00 UTC -> 2027-04-16 07:59 UTC\n- Incident window: 2027-04-16 08:00 UTC -> 2027-04-16 12:30 UTC\n- Recovery window: 2027-04-16 12:30 UTC -> 2027-04-18 23:59 UTC\n\nDefinitions / derived metrics (computed in the queries above):\n- allocated_gpus: GPUs attached/allocated to a cluster/pool in each minute bucket (includes idle reserved units)\n- active_gpu_pct: measured fraction of GPU utilization relative to theoretical peak (0-100)\n- fill_factor = avg_active_pct * (allocated_gpus / effective_demand_gpus) -> used as shorthand in hypotheses (not stored directly in telemetry)\n- avg_queue_depth: mean request queue length seen by the serving layer for that cluster in the minute bucket\n- throttle_count: total requests throttled by the serving runtime (rate-limiting + capacity bails)\n- cache_hit_rate: prefilled KV cache hit ratio (0-1) computed per cluster\n\nSample aggregated time-series snapshot (incident window samples, one row per 10m):\nTime,Region,Cluster,Allocated_GPUs,Avg_Active_%,Avg_Queue_Depth,Throttle_Count,KV_Cache_Hit_Rate\n2027-04-16T08:10Z,us-west1,dl-cluster-7,64,12.3,0.8,4,0.62\n2027-04-16T08:20Z,us-west1,dl-cluster-7,64,11.9,1.2,22,0.60\n2027-04-16T08:30Z,us-west1,dl-cluster-7,64,13.1,3.7,180,0.58\n2027-04-16T08:40Z,us-west1,dl-cluster-7,64,15.8,9.8,973,0.55\n2027-04-16T08:50Z,us-west1,dl-cluster-7,64,18.4,6.1,412,0.52\n\nObservations / anomalies detected:\n1) Low fill-factor preceding incident: across several clusters (us-west1 & eu-central1) avg_active_pct over the baseline week was ~10-18% while allocated_gpus grew by scheduled maintenance reservations on 2027-04-13. This produced large idle capacity percentages (overprovision).\n2) Autoscaler rebalance at 08:24 UTC on 2027-04-16 re-assigned routing weights to favor dl-cluster-7 to reduce cross-zone egress. The rebalance caused a sudden influx of queued requests to the receiving cluster because many requests were routed before KV cache warmup completed.\n3) KV cache hit rate dropped from ~0.62 -> ~0.52 in the first 20 minutes after rebalancing; lower cache hits increased per-request inference cost and elongated per-request time, which amplified queueing.\n4) Throttle events surged (peak ~973 in one 10-min bucket) as the serving runtime's internal backpressure activated to prevent OOMs on a subset of hosts that experienced temporary KV miss pressure.\n5) Regional coupling: eu-central1 showed a similar pattern but smaller magnitude; however, cross-region fallback policy briefly forwarded traffic between regions during the rebalance window, increasing blast radius.\n\nHypotheses (ranked):\n- H1: Idle reservations + sudden routing changes led to cache cold-starts and a step increase in per-request latency that exceeded the autoscaling reaction time (caused queue depth > threshold -> throttles).\n- H2: The rebalance logic did not await KV cache stabilization signals; routing change executed as soon as new host attachments completed, not considering warmup metrics.\n- H3: A config mismatch in the serving runtime (max-inflight-per-gpu) between clusters allowed transient hotspots where a small subset of GPUs received disproportionate load, triggering local throttle counters.\n\nQuick quant metrics supporting H1/H2:\n- Pre-incident cache_hit_rate (10m avg) = 0.61; post-rebalance first 30m avg = 0.54 (relative drop ~11%).\n- Median request latency (p95) for relevant model family increased from 290ms -> 710ms in the 30 minutes after 08:24 UTC in us-west1.\n- Autoscaler loop observed queue_depth > 5 for 22 consecutive minutes before reactive scaling completed (measured 30s resolution).\n\nData quality notes / caveats:\n- allocated_gpus metric is sourced from cluster provisioning logs and may lag actual attach/detach events by up to 30s in the snapshot. We filtered for that but small alignment gaps persist.\n- Some throttle events are coarse: runtime reports both soft bails and hard rejection in the same counter; downstream logs need to be merged if exact causal type is required (see linked tickets).\n- Cross-region routing logs were sampled at 1m resolution and may undercount short spikes; consider re-running with 10s resolution for critical minutes if deeper root cause analysis required.\n\nActionable follow-ups (short-term):\n- Short: Add an explicit KV cache warmup gate to the rebalance orchestration: route <X% traffic until cache_hit_rate > 0.50 sustained for 5m. (Owner: Aisha)\n- Short: Adjust rebalance rollout to apply traffic-shift in <10% increments with 60s hold window (Owner: Marco).\n- Med: Introduce a fill-factor alert that triggers when avg_active_pct < 25% and allocated_gpus > historical_demand_by_region * 1.3 for >12h (Owner: Priya).\n- Med: Split throttle counters into soft_vs_hard buckets in telemetry for clear attribution (Owner: SRE-telemetry).\n- Long: Simulate rebalance + cache-warmup scenarios in the chaos playground to verify new gating logic and autoscaler timing (Owner: infra-sim).\n\nNotes for postmortem write-up:\n- Emphasize operational tradeoff: reserved capacity for predictability vs. wasted fill-factor that increases window for cold-start effects during rebalancing.\n- Recommend explanation of why rebalance executed at that specific time (maintenance reservation + traffic pattern). Attach maintenance calendar snippet in PM.\n\nRaw sample charts to generate for the write-up (suggested):\n- time-series: avg_queue_depth vs. allocated_gpus (stacked) by region, 1m resolution, incident window\n- heatmap: KV cache hit rate by cluster (1h prior -> 1h after)\n- bar: throttle_count by cluster and throttle_type (soft/hard once separated) for incident minute buckets\n- latency distribution: p50/p95/p99 for model family during windows\n\nAppendix: quick SQL snippets used (already in queries_executed above), and a short list of suspects for configuration drift:\n- max-inflight-per-gpu across clusters\n- rebalance rollout step-size (percent per minute)",
+  "next_steps": [
+    "Create an ownership ticket to add KV-warmup gate to rebalance pipeline (ENGINC-8721)",
+    "Schedule chaos test for rebalance scenario in staging (target week 2027-05-02)",
+    "Add dashboard panel for fill-factor by region and alert when sustained low fill-factor observed"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_245fc903e401485d93b445a783515fb6"
+}

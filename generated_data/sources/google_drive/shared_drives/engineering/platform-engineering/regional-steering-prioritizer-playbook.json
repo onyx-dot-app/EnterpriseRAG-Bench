@@ -1,0 +1,39 @@
+{
+  "title": "Regional steering prioritizer playbook",
+  "owner": "Priya Desai",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/platform-engineering/regional-steering-prioritizer-playbook.json",
+  "doc_type": "doc",
+  "created_at": "2024-11-15",
+  "last_modified": "2024-12-02",
+  "team": "eng-platform-engineering",
+  "status": "draft",
+  "collaborators": [
+    "Ethan Park",
+    "Maria Gonzalez",
+    "Liam O'Connor"
+  ],
+  "tags": [
+    "platform",
+    "steering",
+    "multi-region",
+    "latency",
+    "cost",
+    "reliability",
+    "decision-tree",
+    "playbook"
+  ],
+  "linked_artifacts": [
+    "PLAT-2345",
+    "PLAT-2410",
+    "https://redwood.atlassian.net/wiki/spaces/PLAT/pages/12345/Smart+Routing+Notes",
+    "https://github.com/redwood-inference/platform/pull/789",
+    "https://slack-redwood.slack.com/archives/C01234567/p1699000000000"
+  ],
+  "body": "Status: draft. Goal: capture a compact, operationally-actionable prioritizer for steering requests across regions and model variants when tradeoffs between latency, cost and reliability are non-trivial. This is a working playbook intended to be lighter-weight than the full policy DSL spec; it focuses on a decision heuristic and examples we can prototype in the orchestrator.\n\nContext and problem framing:\n- We run inference endpoints in multiple regions and capacity tiers (hosted fast/expensive, dedicated predictable, fallback cheap burst).\n- Traffic should be steered to satisfy customer SLOs (latency p95 target, availability SLA) while minimizing unit cost and avoiding overloaded regions.\n- Key constraints: routing decisions must be cheap to evaluate (sub-ms), resilient to missing telemetry, and stable (avoid flapping).\n- This doc is intentionally pragmatic: combine a lightweight scoring function + hysteresis + decision-tree overrides for critical classes (e.g., enterprise customers with strict SLA).\n\nDesign principles (short):\n1) Explainability: every decision should be attributable to scores (latency, cost, reliability).\n2) Fast eval: the prioritizer runs inline in the control plane path; avoid heavy ML models.\n3) Safe defaults and escape hatches: global fallback policy, per-customer pins.\n4) Adaptivity: weights can be tuned by workload, and real-time signals can temporarily bias decisions.\n\nSignal set (what we rely on):\n- regional_p95_latency_ms (derived from recent 1\u20135 min window)\n- token_cost_per_region (billing estimate per token for the variant in region)\n- region_health_score (0\u20131, aggregated from node errors, infra alerts, and capacity headroom)\n- customer_priority (tier: free, standard, enterprise)\n- route_hints: explicit model pins, region exclusions from customer config\n\nScore functions (normalized 0..1 where higher is better):\n- latency_score = clamp(1 - (p95_ms - ideal_ms) / (max_acceptable_ms - ideal_ms), 0, 1)\n  - ideal_ms = 50 by default, max_acceptable_ms = customer_p95_slo or 500ms fallback.\n- cost_score = 1 - normalize(cost_per_unit) where normalize maps expected token cost across candidate regions to 0..1 (cheapest=1).\n- reliability_score = region_health_score (already 0..1).\n\nCombined utility:\nutility = w_lat * latency_score + w_cost * cost_score + w_rel * reliability_score\n- baseline weights: w_lat=0.5, w_rel=0.35, w_cost=0.15 (tuned for low-latency apps)\n- enterprise override: w_lat=0.4, w_rel=0.45, w_cost=0.15 (prioritize reliability)\n- cost-optimized override for batch/embeddings: w_lat=0.2, w_rel=0.3, w_cost=0.5\nNotes on normalization: cost normalization should use a recent 1h median cost estimate to avoid pricing spikes caused by occasional long inference runs.\n\nDecision tree (operational flow, ascii):\n1) If customer has explicit region pin -> route to pinned region(s) (respect exclusion list).\n2) If region_health_score < 0.2 for all candidate regions -> global-fallback route to \"safest\" cold capacity tier and create incident marker.\n3) Filter out regions where error_rate_recent > 5% or p95 > max_acceptable_ms * 1.5.\n4) Compute utility for remaining candidates.\n5) Select region with highest utility.\n6) If utility_gap (best - second_best) < 0.05 and both utilities are low (<0.4) -> prefer the more reliable region (tie-break by reliability_score).\n7) Apply hysteresis: if the chosen region differs from last_routed_region and last_routed_region utility >= 0.9 * current_best_utility -> keep last_routed_region to avoid flapping for user sessions.\n\nExamples (quick):\n- Example A: two regions A/B, p95_A=60ms, p95_B=120ms, cost_A=1.2c, cost_B=0.8c, health both 0.95; baseline weights choose A (latency wins).\n- Example B: embeddings batch job, weights cost-heavy -> choose B even though p95 higher.\n- Example C: region B health drops to 0.1 -> filter out B and route to A even if cost higher.\n\nPolicy language sketch (for future DSL):\n- prioritize_by(\"utility\") {\n    metrics: [latency_score, reliability_score, cost_score]\n    weights: [0.5, 0.35, 0.15]\n    filters: [error_rate < 0.05, p95 < max_acceptable * 1.5]\n    hysteresis: {min_delta: 0.05, cool_down_sec: 300}\n  }\nThis is intentionally small \u2014 real DSL will include conditional branches, per-customer overrides and rollout flags.\n\nHysteresis and stability notes:\n- cooldown windows are critical: 1\u20135 minutes depending on SLO sensitivity.\n- store last_n utilities per user (n=3) for session affinity decisions.\n- apply exponential backoff to re-evaluate noisy metrics (smoothed EWMA over 60s).\n\nTelemetry and observability we need:\n- per-route: decision_reason (scores and weights), utilities, chosen_region, fallback_used, timestamp.\n- alerts: if we see >1% traffic with fallback_used=true for more than 10m, page on-call.\n- dashboards: utility distribution per-region, weight sensitivity heatmap (how routing changes if we tweak weights).\n\nRollout plan (safe):\n1) Unit test scoring functions offline with synthetic traces.\n2) Canary in internal region for low-traffic machine users.\n3) Shadow mode (decisions logged, not enforced) for 48\u201372h across mixed traffic.\n4) Gradual traffic ramp with 2% increments and automated rollback if fallback rate > threshold.\n\nOpen questions / tradeoffs (todo):\n- Should we add a short-term price volatility dampener? (idea: clamp cost_score changes to 10% per 10m)\n- How to encode contractual exceptions (SLA kill-switch) cleanly without creating policy spaghetti?\n- Investigate a tiny ML model to predict p95 for next 2m and add as an input (but that increases complexity).\n\nOperational runbook snippets (for SRE):\n- If global fallback > 5%: check region control-plane logs, capacity autoscaler, and recent deploys; escalate to platform step 2.\n- If hysteresis prevents expected failover: temporarily disable hysteresis for affected customer and create ticket PLAT-2410.\n\nNotes to self: add per-model quantization availability as a signal (some regions may not support quantized path, affecting cost_score). Also capture per-region spot GPU preemption risk for dedicated pools.\n\nAppendix: quick metric definitions and formulas (copy/paste friendly):\n- p95_ms: 95th percentile server processing latency over last 1m window.\n- error_rate_recent: errors / requests over 1m.\n- region_health_score = min(1, 1 - normalized_error_rate) * capacity_headroom_factor.\n\nReferences and related tickets: PLAT-2345 (routing telemetry), PLAT-2410 (hysteresis failure incident), PR #789 (orchestrator routing prototype).\n\nIf this looks OK I will spin up a small orchestrator sandbox and implement a shadow evaluator. Comments welcome \u2014 especially from SRE and solutions-eng folks on safety thresholds and cooldown windows.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_cbfbc378900249239579d85b6ec08007"
+}

@@ -1,0 +1,75 @@
+{
+  "title": "local kv offsets & seqlen anomalies \u2014 scratch",
+  "owner": "Ava Martinez",
+  "drive_area": "users",
+  "path": "users/local-kv-offsets-seqlen-anomalies.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-04",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Samir Patel",
+    "Liu Chen"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "kv-cache",
+    "attention-kernel",
+    "seqlen",
+    "bug-hunt",
+    "debug",
+    "regression"
+  ],
+  "linked_artifacts": [
+    "https://linear.app/REDWOOD/issue/RINF-487-kv-offset-bug",
+    "https://github.com/redwood-inference/serving-runtime/pull/1423",
+    "confluence.redwood/team/serving-runtime/kvcache-notes"
+  ],
+  "commands_tried": [
+    "./run_infer.sh --model redwood-v2-small --seq-len 1024 --batch 1 --trace=kvcache,attn",
+    "python repro/run_repro.py --seed 42 --seq-len 2048 --patch kvcache-offset --profile",
+    "git checkout bisect/kvcache-offset && docker-compose up --build --abort-on-container-exit",
+    "nvidia-smi --query-gpu=name,utilization.gpu --format=csv",
+    "python -c \"from serving.runtime import KernelSelector; print(KernelSelector.describe(architecture='gpt2', seq_len=1536))\""
+  ],
+  "observed_errors": [
+    "MismatchError: KV cache write offset != expected_offset (got 37824, expected 37888)",
+    "RuntimeWarning: attention kernel fallback triggered: 'fast_attn_v2' -> 'generic_attn'",
+    "TokenAlignmentException: token_id 50256 repeated at position 1023 after recompute",
+    "OOM avoided by fallback but produced length-truncation (approx -1 tokens)",
+    "Trace log: kvcache.set(key=layer3, offset=0x930) then kvcache.get(key=layer3, offset=0x918)"
+  ],
+  "hypotheses": [
+    "Edge-case sequence lengths (just above page/chunk boundary, e.g., 1024/1536) cause kernel selector to choose a generic kernel that writes KV with a different alignment (8 vs 16 byte), producing an off-by-1-timestep offset.",
+    "Quantized kernels (int8 path) use a packed layout for keys/values; packing alignment change + prefetching leads to mis-index when prefix caching is active.",
+    "Race between async KV flush and attention compute when using continuous batching: older requests flushes KV for shorter seqlen, next request expects last_write_offset == current_offset but gets stale offset due to reorder.",
+    "A protective fallback introduced in PR #1423 (kernel mux) didn't update legacy KV writer offsets; regression introduced for tensor shapes > 1536.",
+    "Inconsistent pad/truncate logic in preprocess -> runtime input slicing leads to off-by-pad in stamp stored in kvcache metadata (pad_count vs true_length)."
+  ],
+  "reproduction_steps": [
+    "1) Start local runtime with kvcache tracing: ./run_infer.sh --trace kvcache --kvcache-mode local",
+    "2) Send two requests back-to-back: first seq_len=768 (warm), then seq_len=1025 (edge) with same conversation_id param to hit prefix cache path.",
+    "3) Observe traces in /tmp/runtime-traces: grep 'kvcache' | less -> look for inconsistent offsets or repeated keys.",
+    "4) Run regression build: git bisect between v2025.09 and main to isolate commit that first changes KernelSelector thresholds.",
+    "5) Reproduce with quantized vs fp16 model variants to see if int8 path differs.",
+    "6) If reproduced, attach full trace and run small patch that forces KernelSelector to pick old kernel: export FORCE_KERNEL=fast_attn_v1 and re-run.",
+    "7) Capture memmaps: export KV_DEBUG_DUMP=/tmp/kvdump && reproduce -> inspect binary offsets using hexdump -C kvdump_layer3.bin"
+  ],
+  "notes": "Timeline + informal log:\\n\\n2025-11-04 initial discovery: noticed a customer report about 'stutter' when sending chat messages that crossed 1024 tokens. Repro locally with redwood-v2-small: observed token repeat at boundary.\\n\\n2025-11-05 ran quick bisect: suspected kernel selector thresholds. Put an initial workaround: force kernel selection to fast_attn_v1 = reduces failures but increases latency.\\n\\n2026-01-14 after release 2026.01.11, recurrence in dedicated capacity with larger batches. Now see fallbacks to generic_attn but also OOM-avoided truncation. Traces show kvcache writes being performed with different offsets depending on kernel path.\\n\\nTrace snippet (sanitized):\\n  [kvcache] set layer=3 offset=0x930 len=16384 ts=1700003452 request_id=abc123\\n  [attn] kernel=fast_attn_v2 seq_len=1536 choose=heuristic(seq_len>1280)->v2\\n  [kvcache] get layer=3 offset=0x918 len=16384 ts=1700003452 request_id=def456\\n  --> mismatch (0x930 vs 0x918)\\n\\nImmediate theory: writer alignment changed from 0x8 stepping to 0x10 stepping when v2 kernels pack KV differently. read path still expects old stepping.\\n\\nOther notes:\\n- Observed that using conversation_id isolation (per-request cache key) mitigates the issue; suggests collision/reuse rather than pure math bug.\\n- Repro is flaky: ~60% on CPU debug builds, ~95% on optimized quantized builds on A100. Flakiness suggests timing/race.\\n- Adding a short sleep (0.01s) between warm request and edge request reduces incidence. Points to race between async KV flush and next request read.\\n\\nFiles to attach to ticket: full runtime trace, hexdump of kvdump, kernel selection logs, small repro script.\\n\\nOpen questions to triage:\\n- Does KernelSelector.describe() have an up-to-date mapping for quantized models? (Samir to check mapping table)\\n- Is there any code path that updates kvcache metadata asynchronously without atomically swapping base_offset?\\n- Are we using the same packer/unpacker across all kernel codepaths?\\n\\nShort-term mitigation ideas:\\n- Add a runtime assertion in kvcache.get that compares caller_expected_alignment vs stored_alignment and fails fast (debug only).\\n- Force kernel selector to a single codepath for sequences in [1024, 1600] as a canary for customers (config flag).\\n- Add a lightweight spin-wait for outstanding kvcache flushes when prefix cache is enabled (trade latency for correctness).\\n\\nTODOs:\\n- [ ] Create reproducer PR with deterministic timing (use freeze-time/timers) and attach to Linear RINF-487.\\n- [ ] Add kvcache alignment fields to trace dumps (layer metadata).\\n- [ ] Samir: audit PR #1423 for missing offset update.\\n- [ ] Liu: run quantized delta runs on A100 vs V100 to measure frequency.\\n\\nIf I step away and forget: this was the seqlen boundary + kernel fallback -> misaligned kv writes hypothesis. Key debugging knobs: FORCE_KERNEL, KV_DEBUG_DUMP, and adding 10ms pause between requests.\\n\\nEnd of scratch.",
+  "next_steps": [
+    "Create small PR that atomically swaps kvcache.base_offset and adds a unit test for mixed-kernel reuse.",
+    "Add alignment metadata to trace exports and re-run failing workflows on dedicated capacity.",
+    "Coordinate with QA to run nightly repro with quantized models on A100; collect dataset of failing seeds.",
+    "Consider short-term release that pins kernel selector thresholds behind a runtime flag until root cause fixed."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "notes",
+    "hypotheses",
+    "reproduction_steps",
+    "observed_errors",
+    "commands_tried",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_4d0410eb85f44b3f84e84ce064273468"
+}

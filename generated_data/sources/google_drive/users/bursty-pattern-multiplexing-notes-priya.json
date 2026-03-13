@@ -1,0 +1,35 @@
+{
+  "title": "Bursty-client multiplexing notes",
+  "owner": "Priya Shah",
+  "drive_area": "users",
+  "path": "users/",
+  "doc_type": "doc",
+  "created_at": "2026-02-18",
+  "last_modified": "2026-03-11",
+  "collaborators": [
+    "Evan Chen",
+    "Olivia Patel"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "throughput",
+    "bursty-clients",
+    "multiplexing",
+    "p99",
+    "kv-cache"
+  ],
+  "linked_artifacts": [
+    "PROJ-1423",
+    "https://github.com/redwood-inference/serving-runtime/pull/267",
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/123456"
+  ],
+  "content": "Objective:\\nQuick scratchpad capturing experiments on how bursty client patterns and client-side multiplexing affect tail latency and effective batching in the serving runtime. Trying to capture reproducible configs and observations for follow-up investigations and an eventual perf note.\\n\\nEnvironment:\\n- Model: rw-gpt-large-v1 (seq len 1024)\\n- Hardware: 4x A100 (pinned to one host for these runs)\\n- Runtime: serving-runtime@main (PR 267 local build)\\n- KVS cache: enabled with 128k entries, LRU eviction\\n- Client harness: custom Golang harness (multi-client multiplex mode), poisson and correlated-burst generators\\n\\nTest harness and patterns:\\n- Baseline: steady poisson arrivals at 200 qps for 10 minutes.\\n- Bursty pattern A: 10s bursts where instantaneous qps spikes to 2000 for 5s then quiet for 25s (repeat).\\n- Bursty pattern B (correlated clients): 50 clients each multiplexing up to 8 simultaneous streams; bursts triggered in one cohort (simulates warm user cohort).\\n- Multiplexing modes tested: naive (one connection per request), client-multiplex (8 streams/conn), server-batching aggressive (batch_timeout=20ms) vs conservative (batch_timeout=5ms).\\n\\nMetrics captured (per-run): p50/p95/p99 latency (ms), overall QPS sustained, GPU util %, KV-cache hit %. Also recorded batch size distribution.\\n\\nRuns (summary):\\n1) Baseline poisson (200 qps), client-multiplex=off, batch_timeout=20ms\\n   - Duration: 10m\\n   - p50: 32 ms; p95: 78 ms; p99: 210 ms\\n   - QPS: 198\\n   - GPU util: 44%\\n   - KV-cache hit: 6%\\n   - Batch size median: 4; mean: 5.1\\n   - Notes: stable, good batching but low cache reuse due to randomized prompts.\\n\\n2) Bursty A (spike 2k qps bursts), client-multiplex=on (8 streams/conn), batch_timeout=20ms\\n   - Duration: 30m (many spike cycles)\\n   - p50: 38 ms; p95: 190 ms; p99: 1,120 ms\\n   - QPS (avg over cycle): 480; peak QPS: 1970\\n   - GPU util: 92% peak, 55% avg\\n   - KV-cache hit: 14%\\n   - Batch size distribution (during spikes): 12/16/32/64 (percentiles 25/50/75/95 roughly)\\n   - Notes: During spikes, batch sizes grow (good throughput) but queueing causes p99 to blow up for some requests. Multiplexing reduces connection overhead and allows larger batches but increases serialization delay for single-request latency.\\n\\n3) Bursty B (correlated clients), client-multiplex=on, batch_timeout=5ms (aggressive low latency)\\n   - Duration: 20m\\n   - p50: 45 ms; p95: 120 ms; p99: 360 ms\\n   - QPS avg: 620; peak: 1600\\n   - GPU util: 85%\\n   - KV-cache hit: 28%\\n   - Batch size median: 3; mean: 5.8 (more small batches because low timeout)\\n   - Notes: Lowering batch timeout reduced worst tails relative to run 2 but throughput dropped and more small batches observed. Better p99 than 2 but still noticeably higher than baseline. KV-cache hit increased because correlated clients tended to reuse prefixes.\\n\\n4) Control: Bursty B but client-multiplex=off, batch_timeout=5ms\\n   - p50: 40 ms; p95: 140 ms; p99: 820 ms\\n   - QPS avg: 590\\n   - GPU util: 62%\\n   - KV-cache hit: 26%\\n   - Notes: Without multiplexing, GPU utilization is lower (more CPU network overhead), and p99 gets worse \u2014 suggests server-side batching benefits from multiplexing to fill batches quickly.\\n\\nQuick ASCII histogram (p99 across runs):\\nBaseline       |===            (210 ms)\\nBursty A       |============================= (1120 ms)\\nBursty B lowTO |========        (360 ms)\\nBursty B noMux |================ (820 ms)\\n\\nObservations / Interpretations:\\n- Multiplexing + longer batch_timeouts improves throughput and GPU utilization but can worsen tail latency during extreme spikes due to queuing behind large batches.\\n- Reducing batch_timeout cuts tails significantly but at cost of throughput and effective batch sizes (more small batches). There's a sweet spot depending on workload SLOs.\\n- Correlated client cohorts increase KV-cache hits; this helps latency and cost. So encourage client-side pinning or reuse patterns when possible.\\n- The worst p99 observed correlates with peak GPU saturation + a high incoming burst; those requests that arrive just after a large batching window suffer the most.\\n- Multiplexing prevents connection churn and allows batch-formation faster, which raises GPU throughput; but also increases head-of-line blocking risk for per-request latency.\\n\\nImmediate follow-ups / experiments to run next:\\n- Run same Bursty A but with dynamic batch_timeout (increase timeout when queue short, decrease when queue length > X) to see if adaptivity reduces p99 while keeping throughput.\\n- Try hybrid mode: small-first batching (prioritize small/low-token requests to avoid them getting stuck behind big requests).\\n- Simulate a mixed-size workload (short chat turns vs long generations) to understand cross-impact on batching.\\n- Add tracing on request enqueue time -> batch dispatch -> GPU start to pinpoint which stage contributes most to p99.\\n\\nNotes to self:\\n- Save harness config in repo PR 267 testdata dir.\\n- Follow up with SRE (Evan) about adding a metric for \"max queueing time before batch dispatch\" to telemetry.\\n- Consider a short internal writeup for product (2-pager) summarizing tradeoffs for exposing batch_timeout/multiplexing defaults in Hosted API.\\n\\nRaw logs / important sample lines (grep-ready):\\n- 2026-02-20T14:05:03Z spike-start qps=1987 batch_mean=28 gpu_util=94 p99=1180\\n- 2026-02-20T14:05:07Z spike-peak qps=1974 batch_mean=32 enqueue_wait_p99=980\\n- 2026-03-02T09:22:41Z correlated-burst cohort=47 kv_hit=0.27 p99=354\\n\\nEnd of scratchpad.\\n",
+  "source": "google_drive/users/bursty-pattern-multiplexing-notes-priya.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_e21a824f158646a2af077c08299bcc06"
+}

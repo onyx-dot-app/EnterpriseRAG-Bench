@@ -1,0 +1,34 @@
+{
+  "title": "Signal Sleuth \u2014 Kernel Diary (Mayra Gomez)",
+  "owner": "Mayra Gomez",
+  "drive_area": "users",
+  "path": "users/signal-sleuth-kernel-diary-mayra.json",
+  "doc_type": "doc",
+  "created_at": "2026-03-10",
+  "last_modified": "2026-03-12",
+  "collaborators": [
+    "Ishaan Rao",
+    "Evelyn Cho"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "kernel",
+    "p99",
+    "nvlink",
+    "triage",
+    "todo",
+    "investigation"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/842",
+    "SERV-1314",
+    "https://linear.app/redwood/issue/INF-2578"
+  ],
+  "content": "2026-03-10 / morning quick log - signal-sleuth\n\nGoal: capture reproducible trigger for intermittent SIGSEGV seen during KV-cache eviction when serving v2 models. Today mostly a lightweight capture + triage to avoid noisy deploys.\n\nSummary of observations\n- Error class: segmentation fault (SIGSEGV) triggered in module path handling kernel-level memory for KV cache shuffle. Not happening in stable small-batch runs.\n- Frequency: ~3 crashes per 10k requests on node-3 during high-concurrency bursts (concurrent requests ~48). Repro window narrow: appears after sustained 90s of 48-concurrency load.\n- Affected binary: serving-runtime v1.14.3 built with gcc 12 + custom kernel module helpers (nvlink buffer manager).\n- Crash artifact: small core dump, backtrace shows PC inside nvlink mapping routine (map_nvlink_buffer) -> kernel_qsort fallback -> memmove.\n\nNext: capture fuller backtrace + perf stat and a minimal repro.\n\nTimeline / actions\n07:45 - quick devstack repro with local small model (opt 8-bit) to reproduce: could not reproduce locally (no nvlink, single GPU).\n08:10 - ssh into node-3 (prod-like infra): nvidia-smi shows 4 GPUs, nvlink topology intact.\n08:17 - start pinned workload: 48 concurrent requests, seq-len 1024, batch size 1, no prefix cache. After 83s reproduced 1 crash.\n08:20 - collected dmesg, gdb backtrace from core dump (attached below).\n\nRepro steps (short)\n1) Run load generator: ./tools/loadgen --model tiny-v2 --concurrency 48 --tokens-per-request 850 --duration 5m --use-kv-cache\n2) On node-3: tail -F /var/log/messages and dmesg -w\n3) After crash: sudo gdb -c /var/crash/core.* /opt/serving-runtime/bin/serving-runtime -ex \"set pagination off\" -ex bt full > /tmp/trace-$(date +%s).log\n\nQuick artifacts captured\n- /tmp/trace-170000.log: bt shows frame in map_nvlink_buffer+0x94 -> nvlink_copy_chunk -> memmove\n- dmesg excerpt: kernel: serving-runtime[4219]: segfault at 0 ip 00007f8a3c1a2bfc sp 00007ffdd7a1b2c0 error 6 in libnvlink.so.1[7f8a3c160000+12000]\n- nvidia-bugreport: attached in linked artifact (note: sanitized due to customer data)\n\nHypotheses (ranked)\n- H1: race in nvlink buffer mapping when two eviction threads try to remap overlapping regions. Evidence: crash occurs under sustained concurrent eviction workload.\n- H2: stale pointer from KV cache after a compaction/resize path that doesn't update the map bookkeeping atomically. Evidence: logs show compaction event ~10s before crash.\n- H3: driver issue in libnvlink interacting with custom memmove usage pattern. Lower probability because driver version same across nodes and only node-3 shows crashes (but node-3 has slightly older kernel).\n\nImmediate mitigations tried\n- Reduced eviction concurrency from 8 -> 4 via env var SERVE_KV_EVICT_CONCURRENCY: crash frequency dropped (from 3/10k -> ~0.2/10k) but still non-zero.\n- Enabled extra sanity checks in runtime (bounds checks) via env SERVE_DEBUG_BOUNDARY=1 and restarted: crash turned into explicit assert in one run (good signal).\n\nData to collect next\n- Full perf stat during high-concurrency window: perf stat -e cycles,task-clock,context-switches,cpu-migrations,page-faults -p <pid> -- sleep 120\n- strace -f -o /tmp/strace.pid.log <pid> during load (careful, noisy).\n- Rebuild runtime with ASAN-enabled subset for kernel helpers (if feasible) or add more assert/guard pages around nvlink mapping region.\n\nDebug commands & quick snippets\n- gdb backtrace capture: sudo gdb -c /var/crash/core.* /opt/serving-runtime/bin/serving-runtime -ex \"set pagination off\" -ex bt full > /tmp/trace.log\n- tail for compaction events: sudo journalctl -u serving-runtime -n 500 | grep -i compaction\n- check kernel messages: sudo dmesg | tail -n 120 | egrep \"serving-runtime|nvlink|segfault\"\n- nvlink topology: nvidia-smi topo -m\n- check open file descriptors: sudo ls -l /proc/<pid>/fd | wc -l\n\nOpen TODOs (short-term)\n- [P0] Add per-eviction lock and run 30m stress test on node-3 (Mayra) - aim: 0 reproductions in 30m.\n- [P0] Push small runtime build with boundary checks turned to hard-fail and narrow the assert to the smallest function possible (Ishaan).\n- [P1] Start nightly canary that runs eviction-heavy synthetic workload on a staging cluster with identical kernel (Evelyn).\n- [P2] File upstream bug with vendor driver if reproduces on other nodes (Mayra).\n\nNotes to self / heuristics learned\n- Crash happens only when concurrent eviction rate exceeds ~300 evictions/min. Use that as a throttle knob for quick mitigation.\n- If assert turns into clean failure via boundary check, we get a deterministic trace which helps narrow to bookkeeping.\n- Keep staging kernel in sync with prod nodes for better repro fidelity.\n\nParking lot (longer-term)\n- Investigate replacing custom memmove loop with cudaMemcpyAsync path in nvlink helper; likely lower-level change and will need perf validation.\n- Add deterministic eviction scheduler for testing (makes unit tests easier).\n- Consider switching to atomic 64-bit counters for KV region versioning instead of pair of 32-bit values (reduce ABA risk).\n\nSlack references\n- initial alert: #serving-runtime-alerts (March 10 07:58)\n- triage thread: #serving-runtime (see thread t/abc123 for logs)\n\nAttachments / artifacts to upload to ticket\n- /tmp/trace-170000.log (gdb bt)\n- sanitized nvidia-bugreport (linked)\n- perf stat output (pending)\n\nQuick end-of-day notes (2026-03-12)\n- Ishaan pushed a debug build with extra bounds checks and reproduced assert locally with a smaller microbench; good progress.\n- Will run 24h stress on node-3 with eviction concurrency=4 overnight and report numbers tomorrow.\n\nIf nothing else: keep this log as the canonical scratch for reproducer steps. Share clipped repro script with SRE before wider rollout.\n\n-- Mayra\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_96687385c19a440eabd49af55989ed20"
+}

@@ -1,0 +1,35 @@
+{
+  "title": "Cobalt \u2014 handoff scratch & ephemeral runbook",
+  "owner": "Maya K. Singh",
+  "drive_area": "users",
+  "path": "users/cobalt-handoff-scratch.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-11",
+  "last_modified": "2025-03-02",
+  "collaborators": [
+    "Evan Brooks",
+    "Lina Torres"
+  ],
+  "team": "site-reliability-engineering",
+  "status": "draft",
+  "tags": [
+    "on-call",
+    "handoff",
+    "runbook",
+    "scratch",
+    "latency",
+    "cache"
+  ],
+  "linked_artifacts": [
+    "https://redwood.atlassian.net/browse/OPS-342",
+    "https://github.com/redwood-inference/serving-runtime/pull/2123",
+    "slack://channel?id=C123ABC",
+    "confluence://pages/Edit?space=OPS&page=ephemeral-cache-flush"
+  ],
+  "content": "Quick note: this is a scratch/handoff doc \u2014 do not paste secrets here.\n\nSHIFT SUMMARY (start 2025-03-01 23:00 PT -> end 2025-03-02 07:00 PT)\n- Primary for shift: Maya K. Singh (me). Follow: Evan (first 2 hrs), Lina (last 3 hrs).\n- Quiet overall, two small items: one transient latency spike at ~01:10 and a cache churn event at ~03:40 that I mitigated with a temporary TTL bump.\n- No open P1s at handoff. Leaving a few follow-ups (see below).\n\nCURRENT SYSTEM STATE (high-level)\n- Hosted API: green. Error rate steady at ~0.03% on production routes.\n- Dedicated pools: 1/3 nodes in pool-alpha showing elevated GPU mem high water (spikes during long-context jobs).\n- Redis prefix-cache: eviction rate spiked between 03:30-03:45 -> caused increased token-generation cost for a small cohort.\n- Fallback routing: saw 12 automatic fallbacks to model-compat variants between 01:00-02:00 due to transient scheduler latency. Observed ~120ms added latency on those requests.\n\nINCIDENTS / NOTES (chrono)\n- 2025-03-02 01:10: latency-blip-01 (transient)\n  - Symptom: p50->p90 jump on /v1/generate for route 'chatty-bot' (p95 ~1.2s -> 2.7s for 4m). No errors.\n  - Quick triage: looked at autoscaler logs (k8s HPA) \u2014 correlated with a small surge from one client sending many short messages.\n  - Mitigation: temporarily adjusted per-route concurrency throttle from 50 -> 35 to protect downstream KV store. Throttle reverted automatically at 01:20.\n  - Notes: raised a follow-up to product to add a per-client rate-limit flag for heavy short-message workloads (OPS-342).\n\n- 2025-03-02 03:40: redis-eviction-churn\n  - Symptom: cache miss rate up 8x for embed-prefix-cache, Redis memory usage bumped to 92%. Evictions visible.\n  - Quick triage: background re-index job (daily batch) started earlier than expected due to cron drift on worker-2. That triggered a lot of large prefix writes.\n  - Mitigation performed: bumped prefix cache TTLs for non-critical prefixes (temporary) and disabled the re-index cron on worker-2 (manual cronstop + ticket to cron team).\n  - Commands I ran (notes):\n    - kubectl -n infra exec deploy/redis-primary -- redis-cli INFO MEMORY | sed -n '1,30p'\n    - REDIS_KEYS=$(kubectl -n infra exec deploy/redis-primary -- redis-cli --scan --pattern \"prefix:*\" | wc -l)\n    - kubectl -n infra exec deploy/redis-primary -- redis-cli CONFIG SET maxmemory 10gb\n  - Caveat: increased maxmemory is temporary; please revert once re-index job moved to offpeak.\n\nHEALTH CHECKS TO RUN ON TAKEOVER (short):\n- curl -sS https://api.redwood.ai/health | jq .routes | grep -A2 chatty-bot\n- kubectl -n serving get pods -l app=model-server -o wide  # check node restarts/ooms\n- kubectl -n infra exec deploy/redis-primary -- redis-cli INFO | egrep 'used_memory_human|evicted_keys|instantaneous_ops_per_sec'\n- curl -sS https://console.redwood.ai/metrics?q=latency&p90\n- grep -i \"fallback\" /var/log/serving/runtime/*.log | tail -n 100\n\nQUICK TROUBLESHOOT PLAYBOOKS (ephemeral, for common things)\n1) Model server OOM / high GPU mem (fast triage)\\   - Symptoms: pod restarts, GPU mem approaching 100%, large GSUtil jobs or long-context runs correlated.\\   - Quick checks: nvidia-smi (inside pod), kubectl describe pod -> look for OOMKilled, dmesg for out-of-memory.\\   - Temporary mitigations:\\     - cordon node if multiple pods thrash: kubectl cordon <node>\\     - scale down concurrent replicas for that deployment: kubectl scale deploy/<model> --replicas=1\\     - enable fallback routing for that model to cheaper-variant: rctl route set --route <route> --fallback model-compat-v2\\   - Follow-up: open GH issue with model owner, include trace + token counts\n\\2) Sudden spike of fallbacks (scheduler latency)\\   - Symptoms: increase in fallback counts, higher p95 on affected route, scheduler controller logs show 'slow-schedule' warnings.\\   - Triaged by: check scheduler pod latency, controller-manager logs.\\   - Temp action: increase scheduling window to 250ms (serving-scheduler config) and re-evaluate. Use observability to watch delta.\n\\3) Redis eviction loop (what I did)\\   - Symptoms: eviction_count rising, useful prefix misses.\\   - Steps:\\     - Pause any large batch jobs (cron team), bump temp maxmemory if safe, bump TTL for non-critical keys, move heavy writes to dedup queue.\\     - Useful command: kubectl -n infra exec deploy/redis-primary -- redis-cli INFO MEMORY | egrep 'evicted_keys|used_memory'\n\nTEMPORARY SCRIPTS / SNIPPETS (save for next oncall)\n- quick-cache-flush-for-route.sh  (do NOT run in prod without approval)\\  # sample snippet for local testing only\n  #!/bin/bash\n  ROUTE=$1\n  for k in $(kubectl -n infra exec deploy/redis-primary -- redis-cli --scan --pattern \"prefix:${ROUTE}:*\"); do\n    kubectl -n infra exec deploy/redis-primary -- redis-cli DEL \"$k\"\n  done\n\n- list-high-gpu-pods.sh\n  kubectl -n serving get pods -l app=model-server -o jsonpath='{range .items[*]}{.metadata.name} {.status.containerStatuses[0].restartCount} {.spec.nodeName}\\n{end}' | column -t\n\nFOLLOW-UPS (to leave for next shift)\n- Ticket OPS-342 (rate-limit flag) assigned to Evan \u2014 needs product scoping.\n- Re-index cron: follow up with infra-cron team to schedule to 03:00-04:00 UTC only (was drifted). Lina owning the coordination.\n- Revert temporary Redis maxmemory bump after cron is moved and eviction rate returns to baseline. (I set a calendar reminder 2025-03-03 to check)\n- Add an automated alert to fire when eviction rate > 5/min for > 3m. (Alert draft in PagerDuty under 'redis-evictions-v2')\n\nOPEN QUESTIONS / WISH LIST\n- Can we add per-client rate-limiting at the gateway layer? (current rate-limiting is per-route only)\n- Is there a safe way to snapshot and restore a subset of prefix keys to avoid heavy re-writes during re-index? (thinking: export important prefixes daily)\n- Should we give the re-index job a ",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_7f23c8a9f6a040338c1ba1286649df1a"
+}

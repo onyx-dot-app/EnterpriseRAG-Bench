@@ -1,0 +1,36 @@
+{
+  "title": "KVCache eviction regression log",
+  "owner": "Maya Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/kvcache-eviction-regression-log.json",
+  "doc_type": "doc",
+  "created_at": "2024-09-18",
+  "last_modified": "2024-10-02",
+  "collaborators": [
+    "Diego Ramirez",
+    "Priya Nair",
+    "Alex Ford"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "kvcache",
+    "latency",
+    "canary-compare",
+    "profiling",
+    "bisect"
+  ],
+  "linked_artifacts": [
+    "JIRA-ENG-1729",
+    "https://grafana.redwood-internal.com/d/abc123/kvcache-heatmap",
+    "https://github.com/redwood-inference/serve-runtime/pull/642"
+  ],
+  "summary": "Working notes tracing a recent latency regression that correlated with higher KV-cache eviction rates. Includes dashboard observations, bisect plan, microbenchmark results, and suggested instrumentation to improve detection and automatic triage.",
+  "body": "Context:\nWe started seeing intermittent 95th/99th p95 spikes in text-generation paths on the rtx-pool during the 2024-09-14 canary window. Root signal in the alert: token-latency-surge (threshold 2.1x baseline) triggered across multiple models at once. Initial blamestack pointed to increased upstream request spread, but the profile snapshots show a pattern: simultaneous rise in KV cache evictions and a corresponding increase in top-of-stack attention re-computation time.\n\nHigh-level hypothesis:\nWhen KV-cache eviction rate increases (shortened cache TTL or memory pressure), the serving runtime spends more cycles reloading prefix KV and redoing attention recompute for long-context requests. This disproportionately impacts tail latency because large-context requests are less frequent but expensive when cache is cold. The canary had a subtle infra change that reduced per-container page cache reservation (OOM tuning), pushing working sets a hair over threshold for some instance types.\n\nWhat we observed (dashboards & quick metrics):\n- Grafana panel 'kvcache/evictions_per_min' shows a 3-5x step up starting 2024-09-14 02:30 UTC on canary nodes (query: sum by(node) (rate(kvcache_evictions_total[5m]))).\n- Tail latency (p99-token-latency) correlates with evictions with a lag of ~20\u201340s on several spikes.\n- CPU cycles in the attention kernel per-token increased ~18% on sampled traces where evictions count > 0 for that session.\n- Microbench harness reproduced the spike when we artificially forced KV-cache misses on sequences >1024 tokens.\n\nReproduction steps used in the lab:\n1) Run microbench-gen.py with a mixture of short (64) and long (2048) sequences at ramped concurrency.\n2) Toggle the evict flag in the runtime (runtime.conf:kvcache.force_eviction=true) and observe p95/p99 deltas.\n3) Collect per-request trace (trace-id header) and map trace to kvcache.metrics.\n4) Compare canary vs baseline images (image tags: canary-2024-09-12 vs baseline-2024-08-30).\n\nKey tracing snippets (observed):\n- Requests where kvcache.evictions > 0: attention.recompute_ms median 56ms vs 28ms with evictions == 0.\n- Memory allocation churn increases shortly after eviction events (heap allocs + transient buffers).\n\nBisect plan & experiments executed:\n- Step A: Isolate infra variable: rollback the page-cache tuning change on a subset of canary instances. Result: evictions drop and p99 returns near baseline for that subset.\n- Step B: Isolate runtime change: deploy baseline runtime with canary infra; evictions persist \u2014 suggests infra is primary driver.\n- Step C: Stress test with baseline infra but upgraded runtime kernel selection (PR #642). Minor improvements in burst handling but not enough alone.\n\nCanary comparison methodology used:\n- Use deterministic workload (microbench v2) with fixed seed, two buckets: 90% short / 10% long. Run 30-minute windows on canary vs baseline.\n- Capture: per-token latency distribution, kvcache.evictions per-session, attention.kernel-ms histogram, and GC/paging counters.\n- Do 5 independent runs per variant and report median and IQR for p95/p99.\n\nBenchmarks & numbers (abridged):\n- Baseline: p95 token latency = 12ms, p99 = 28ms, evictions per 5m = 1.1\n- Canary (with page-cache change): p95 = 13ms, p99 = 42ms, evictions per 5m = 4.6\n- Canary + kvcache eviction mitigation (runtime flag): p95 = 12.5ms, p99 = 32ms, evictions per 5m = 2.0\n\nImmediate mitigations applied:\n- Rollback page-cache tuning on affected AZs (reduced burst evictions).\n- Added short-term config: kvcache.max_evict_per_min = 10 to throttle accidental mass evictions during high churn.\n- Enabled per-container eviction alarm in alerting stack (new alert: evictions-rate-high-5m).\n\nInstrumentation & detection improvements recommended:\n1) Add per-request kvcache.touch_count and kvcache.eviction_reason to structured traces (so triage can differentiate policy vs memory-pressure evictions).\n2) Emit a summarized trace tag when a request sees >0 evictions during lifetime (makes Grafana pivoting simpler).\n3) Add heatmap panel that cross-slices node.memory.used, page-cache settings, and eviction spikes (we already added a provisional panel at linked_artifacts[1]).\n4) Add a canary-specific comparative dashboard widget that automatically overlays baseline vs canary p99 and eviction rates for the last 1h.\n\nOpen questions & follow-ups:\n- Why did the page-cache tuning change cause a >3x eviction rate on this particular GPU instance family? Need infra deeper dive (SRE + infra kernel logs).\n- Are there workload patterns (prompt batching, long-conversation demos) that amplify the effect? We should run customer-like traces from the replay bucket.\n- Is our current eviction policy optimal for multi-tenant containers? Consider per-tenant quotas or soft pinning of long-context sessions.\n\nNext action items (owners):\n- Maya: finalize the microbench reproduction script and check it into eng-serving-runtime/tools (due 2024-09-22).\n- Diego: coordinate kernel/oom tuning rollback and get kernel logs for the affected window (JIRA-ENG-1729).\n- Priya: instrument trace schema additions and add kvcache tags to span format (PR draft 642 referenced).\n- Alex: update Grafana panels and wire an automated canary overlay (dashboard id abc123).\n\nNotes to self / informal observations:\n- We are seeing an interesting non-linear effect: small increases in eviction rate cause outsized p99 movement because a single long-context request can cascade \u2014 it pulls back a lot of prefixes from storage and temporarily blocks other concurrent requests on the same worker.\n- Triage playbook suggestion: when evictions spike, quickly correlate with node-level memory metrics and page-cache changes before blaming runtime.\n- This doc is a snapshot \u2014 keep evolving as infra audit log arrives.\n\nAttachments / snippets:\n- microbench invocation: python microbench-gen.py --seed 9843 --short 0.9 --long 0.1 --duration 1800 --trace\n- Grafana quicklink: https://grafana.redwood-internal.com/d/abc123/kvcache-heatmap\n- Repro PR (runtime flags): https://github.com/redwood-inference/serve-runtime/pull/642\n\nEOF\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_a3cd70b5afd148528251464f55f8e4dd"
+}

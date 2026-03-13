@@ -1,0 +1,34 @@
+{
+  "title": "Latency fingerprint runbook - Quentin",
+  "owner": "Quentin Morales",
+  "drive_area": "users",
+  "path": "users/latency-fingerprint-runbook-quentin",
+  "doc_type": "doc",
+  "created_at": "2024-11-15",
+  "last_modified": "2024-12-08",
+  "collaborators": [
+    "Mira Patel",
+    "Liam Chen"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "profiling",
+    "burst",
+    "kv-cache",
+    "runbook",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "GH: redwood/serving-runtime#2146",
+    "JIRA: INF-1428",
+    "Slack: #runtime-bench-2024-11-20"
+  ],
+  "content": "Quick personal runbook / scratchpad for fingerprinting latency shapes under asymmetric arrival patterns.\n\nGoal:\n- Build a compact procedure I can rerun quickly to detect if a change (quantization, kernel swap, scheduler tweak) introduces a new tail mode.\n- Capture minimal artifacts so I can triage offline and correlate to KV cache hit-patterns and GPU warmup behaviour.\n\nHigh-level hypothesis:\n- Tail regressions often come from a small set of causes: cold KV cache on long prefixes, unexpected blocking in batching queue (timer vs size), or occasional spike in CPU-side preprocessing.\n- If I can classify the fingerprint (cold-cache vs batching pause vs CPU stall) using 3 signals (latency histogram, live Q depth trace, KV hit-rate trace) I can reduce mean MTTR.\n\nTestbed (quick):\n- Model: opt-6.7b-quant (local dev cluster with 1xA10-like)\n- Runtime: local build helm-image: bench-2024-11-10 (with lightweight tracing enabled)\n- Workload generator: benchdriver v0.9 (poisson + clumped arrivals), 8 worker clients\n- Ingest pattern targets: baseline steady 150 qps, asymmetric pattern: 6s quiet, then 2s burst @ 950 qps (repeat), and a long-prefix probe with 60-token prompt occasionally\n- Metrics collected: p50/p90/p95/p99, max latency, per-request KV-cache-hit boolean, queue-length timeseries (10ms resolution), CPU% on preproc thread\n\nExperiment runs (notes):\n1) Baseline steady-state run (2024-11-15 14:02)\n- Steady 150 qps for 10m, warmup 3m\n- Results: p50 38ms, p90 68ms, p99 142ms, max 410ms\n- KV hit-rate steady ~94%\n- No obvious periodic spikes\n\n2) Burst pattern (3 cycles, 2024-11-16 10:10)\n- Burst shape: 6s quiet, 2s @ 950 qps, return to quiet\n- Observations: immediate p99 jump during burst to ~880ms, with per-burst tail mass concentrated in first 400ms of the burst window\n- Queue-length trace: sharp ramp up, then a sawtooth as batching drained\n- KV hit-rate: falls from 94% -> 71% in first burst, recovers to ~90% mid-burst; indicates prefix divergence / cache warmup\n- CPU preproc: slight spike ~10-15% on average; occasional 60ms preproc outliers correlated to top 5% latencies\n\n3) Long-prefix probe (ad-hoc) (2024-11-18 09:40)\n- Introduced 60-token prompts at 1% of requests during bursts\n- Observations: these probe requests had p99 ~1200ms and pulled a disproportionate number of KV misses for downstream requests for ~300ms after probe\n- Conclusion: long-prefix requests pollute cache and cause localized tail extension\n\n4) Timer vs size batching sensitivity (2024-11-20 15:30)\n- Tuning: timer=6ms/size=8 vs timer=12ms/size=16\n- Results: smaller timer reduced p50 slightly but increased p99 during bursts (due to more batch churn), larger timer reduced tail but increased median by ~6ms\n- Practical tradeoff: for our SLA (p99 under 500ms), larger timer is preferable when burstiness >600 qps\n\nFingerprint classification rules (initial):\n- Cold-cache fingerprint:\n  - Immediate KV hit-rate drop at burst start (>15pp drop)\n  - Latency tail concentrated in first ~200-600ms of burst\n  - Queue depth: ramp then quick drain once cache warms -> sharp tail mass early\n- Batching pause fingerprint:\n  - Queue depth shows plateau (requests accumulate waiting for timer)\n  - Tail mass more uniformly spread across burst window\n  - KV hit-rate stable (no big drop)\n- CPU preproc-outlier fingerprint:\n  - CPU% spikes on preproc thread; isolated latency outliers not clustered at burst start\n  - KV hit-rate unchanged, queue depth not strongly correlated\n\nLightweight triage script (manual steps):\n1) Run benchdriver pattern for 2 bursts, capture traces (latency histogram, short Q depth series, kv-hit boolean list)\n2) Plot per-request latency vs timestamp and color by kv-hit to see correlation\n3) Compute early-window (first 500ms of burst) fraction of p99 mass -> if >70% and kv-hit drop >12pp classify as cold-cache\n4) Otherwise look at Q depth plateau vs ramp to decide batching pause\n5) If neither, pull CPU flame or perf on preproc thread for top outliers\n\nQuick ASCII chart from one run (burst latency over time, 0..2000ms):\n- Time axis: 0s (burst start) to 2s (end)\n- Represent p99 in ms at 250ms step points:\n  0.0s: 860ms  |###########\n  0.25s: 530ms |######\n  0.5s: 210ms  |###\n  0.75s: 150ms |##\n  1.0s: 120ms  |##\n  1.5s: 100ms  |#\n  2.0s: 90ms   |#\n\nNotes / oddities observed so far:\n- A single 60-token probe can cause a cascade of KV misses for ~200-350ms afterwards; eviction timing and segment granularity look relevant. Need to check whether backend uses per-req prefix hashing or per-candidate shard hashing.\n- When we configured batch timer to be tiny (2ms) we saw more jitter under burst start: small batches reduce per-token latency for median but create more scheduling overhead during ramp-up.\n- Some machines show persistent 10-20ms higher preproc latency; correlated with a library version (numpy 1.25 vs 1.24) on one canary. Check build pinning.\n\nFollow-ups (concrete actions):\n- Add a controlled long-prefix probe to CI bench (1% of requests) and assert that p99 change < 150ms over baseline (INF-1428)\n- Add a lightweight kv-hit annotation to production traces for 30-day sample window (instrumentation ticket)\n- Run focused eviction-granularity experiment: change cache segment size 8KB -> 32KB and rerun burst profile (assign to Mira)\n- Validate preproc lib versions across fleet and pin the build image where deviation found (assign to Liam)\n\nNotes to self (todo):\n- Turn the classification rules into a tiny python tool that takes three CSVs (latency, qdepth, kvhits) and returns the fingerprint. Keep it minimal so SREs can run it ad-hoc.\n- When drafting a postmortem, include the simple ascii fingerprint chart \u2014 quickly communicates the shape.\n\nReferences / contextual links (for me):\n- Upstream discussion: Slack thread #runtime-bench-2024-11-20 (pinned)\n- Previous similar note: queue-dynamics-phase-space-scratchpad-alexandra.json (look for batching plateau)\n\nEnd of scratchpad.\n\n-- QM\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_64598764b13740c8b981a82d4a34ef23"
+}

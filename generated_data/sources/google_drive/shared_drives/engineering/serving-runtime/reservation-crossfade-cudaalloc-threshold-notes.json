@@ -1,0 +1,37 @@
+{
+  "title": "Reservation crossfade and cudaAlloc threshold notes",
+  "owner": "Rohan Gupta",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/reservation-crossfade-cudaalloc-threshold-notes.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-05",
+  "last_modified": "2026-02-20",
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "collaborators": [
+    "Maya Chen",
+    "Luis Alvarez",
+    "Priya Nair"
+  ],
+  "tags": [
+    "oom",
+    "fragmentation",
+    "cudamalloc",
+    "kv-cache",
+    "reservation",
+    "defrag",
+    "telemetry"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-rt/allocator-crossfade",
+    "JIRA-RT-4123",
+    "github.com/redwood-inference/runtime/pull/788",
+    "slack://channel/eng-serving-runtime/thread/CP9J4K2"
+  ],
+  "content": "Summary:\nThis note captures an investigation into a recurrent OOM class that surfaced after the recent reservation policy change (auto-shrink + burst buffer). Symptoms: transient OOMs on multi-tenant pools during synthetic k-v cache growth tests and production tail spikes after short high-concurrency bursts. Root cause hypothesis is a timing/crossfade mismatch between reservation deallocation and cudaMallocAsync's free list reuse that leads to small-object amplification, tombstoned free-list entries, and pinned host pages remaining resident until the next epoch decommit.\n\nKey observations and why this is different from previous fragmentation notes: \n- The failure correlates to reservation policy transitions (burst -> on-demand) rather than steady-state fragmentation.\n- cudaMallocAsync fallbacks (cudaMalloc) occur in a narrow window where slabs are partially freed but still referenced by in-flight requests (stream ordering edge cases).\n- Small allocation amplification (2x-4x) observed when allocator switches from reserved slabs to 'heuristic shrink' mode; not purely due to aggregate free space shortage.\n\nReproduction steps (replay test):\n1) Start 8-host synthetic workers against a dedicated pool with KVCACHE enabled and reservation set to [reserved=24GB, burst=48GB].\n2) Issue ramped key-set population with 700\u20131200 concurrent requests, average sequence length 512 tokens, p95 tokens 1024 for 60s.\n3) At t=45s, send sudden 10x short bursts (10ms interarrival) for 15s to trigger ephemeral working set expansion + autoscaler shrink policy (configured with cooldown 30s).\n4) Watch allocator logs and metrics (allocation_latency_ms, free_list_tombstones, slab_ref_counts). Expected: transient cudaMalloc fallbacks and OOM raised by runtime (not infra).\n\nTelemetry highlights: \n- Allocation latency: median 0.8ms, 99th 12.6ms during crossfade window.\n- Free-list tombstones spike: from baseline ~10/min to ~230 within 30s.\n- Host pinned pages (uvm) retention: +1.8GB retained per GPU for ~40s after shrink.\n- KV cache growth rate: 18MB/s during bursts, which overwhelms slab coalescence heuristics.\n\nRepresentative log snippets: \n[2026-02-07T14:12:31Z] allocator: reserve_epoch=42 -> shrink_request(ts=161)\n[2026-02-07T14:12:31Z] cuda_mempool: free_list_coalesce_skipped(reason=partial_stream_owner, slab_id=0x7ffbd)\n[2026-02-07T14:12:31Z] cuda_alloc: fallback_to_cudamalloc(size=1.2MB) latency=18.9ms\n[2026-02-07T14:12:32Z] oom: tenant=acme-corp pool=dedicated-12G attempts=3 working_set=29.4GB\n\nHypotheses (ranked):\n1) Stream ownership mismatch: when reservations are partially released, some slabs still have outstanding per-stream refs; coalescer sees free-chunks but cannot coalesce due to stream-order constraints, leaving fragmented unusable space.\n2) Tombstone accumulation in free-lists: during crossfade we create many transient small free blocks; allocator marks them tombstoned to preserve concurrency safety, but they are not reclaimed fast enough.\n3) Heuristic shrink threshold too aggressive: autoscaler shrinks capacity before the allocator finishes asynchronous defrag/epoch decommit work.\n\nExperiments run and results: \nA) Increase epoch-grace window from 2s -> 8s (simulated): reduced tombstone spike by 70%, OOMs ceased in synthetic runs but tail latency increased ~3% due to delayed reuse.\nB) Force synchronous coalescence on shrink path: removed cudaMalloc fallbacks but introduced a 40ms blocking pause per shrink event (bad for p99 latency).\nC) Decouple kV cache reservation from general workspace pool (alloc set): prevented saturation completely in test, suggested immediate engineering option.\n\nShort-term mitigations recommended (low-risk):\n- Increase reservation-crossfade-grace to 6\u20138s in default profile for Dedicated pools (config flag: alloc.crossfade_grace_s).\n- Bump cudamallocasync_retry from 1 -> 3 to reduce fallback probability; added backoff to avoid burst latencies.\n- Enable light-weight periodic compaction on idle GPUs (background thread that does non-blocking coalesce).\n- Rate-limit autoscaler shrink when concurrent in-flight streams > N (N=64 empirically).\n\nLonger-term fixes (engineering work):\n- Per-stream deferred-free tagging: attach deferred-free epoch ids so coalescer can safely merge free ranges earlier once all dependent streams ack.\n- Free-list reclamation scheduler: limit tombstone lifetime and proactively consolidate small blocks into larger ones when fragmentation ratio > 25%.\n- Reservation-aware KVCACHE sharding: isolate hot KVCACHE reservations to separate pool to prevent noisy neighbor churn.\n\nRunbook fragment for on-call (short):\nSymptom: transient per-tenant OOMs with cudaMalloc fallbacks in logs during recent reservation change window.\n1) Check metric: allocator.free_list_tombstones (alert if > 50 in 1m).\n2) If alerts present, temporarily set alloc.crossfade_grace_s=8 and restart pool agent (no full restart required).\n3) If OOM persists, set pool.min_capacity to previously known steady-state and open JIRA-RT-4123 with snapshot.\n\nOpen action items: \n- [ASSIGN] implement deferred-free epoch acks (owner: Priya) due EOW 2026-03-05.\n- [PR] runtime#788 contains prototype compaction loop; needs perf gating and opt-in flag (reviewers: Luis, Maya).\n- [DOC] add 'crossfade' section to allocator troubleshooting page on Confluence (owner: Rohan).\n\nNotes and unanswered questions: \n- Need to measure memory pressure behavior on A100 vs H100 (are UVM retention heuristics different?).\n- Could defrag be offloaded to spare CPU cores more aggressively? tradeoffs unknown.\n- How does multi-GPU NVLINK peer allocations affect coalescer visibility? add to experiment matrix.\n\nAppendix: quick commands used in local replay harness:\n- python tools/replay.py --profile=kvcache-burst --tenants=8 --pool=dedicated-12G --duration=90\n- TRACE=allocator,kv python3 tools/trace_collector.py --since=2026-02-07T14:00:00Z --out=trace-epoch42.json\n\nIf you pick up this ticket, start by running the synthetic harness with crossfade_grace_s=2 (baseline) and then iterate A/B with 6 and 8s settings. Logs and raw traces are stored under S3: s3://redwood-rt/experiments/2026-02-crossfade/\n\nEnd of note.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_612e9a15571d40cfa7e06d4afc2cfc21"
+}

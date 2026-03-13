@@ -1,0 +1,35 @@
+{
+  "title": "Admission-control Reservoir Batch Playbook",
+  "owner": "Ava Martinez",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime",
+  "doc_type": "doc",
+  "created_at": "2025-07-10",
+  "last_modified": "2025-07-22",
+  "collaborators": [
+    "Rahul Singh",
+    "Maya Patel",
+    "Josef Reinhardt"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "batching",
+    "concurrency",
+    "p95",
+    "cost-model",
+    "queueing",
+    "reservoir"
+  ],
+  "linked_artifacts": [
+    "JIRA-RTM-842",
+    "github.com/redwood-inference/runtime/pull/1847",
+    "docs.redwood.company/confluence/serving/reservoir-ideas"
+  ],
+  "body": "Purpose\n---\nWorking scratchpad for a different take on continuous-batching sizing: combine an admission-control \"reservoir\" concept with tapered concurrency limits to reduce p95 tail while preserving token-unit economics. This doc captures simulation notes, heuristics, spreadsheet links, and a proposed rollout checklist for experiments on staging.\n\nTL;DR recommendations\n---\n- Default policy for medium-throughput routes (avg QPS 10-200): use a small Reservoir (R = 4 concurrent batches) + windowed batch cap W_ms = 12 ms + per-instance concurrency cap C_max = 8.\n- For heavy steady streams (QPS > 300): increase reservoir to R = 8, W_ms = 8 ms, C_max = 16 and enable prefix-KV cache hot-path.\n- For spiky low-duty routes (QPS < 5): favor low C_max (2-4) with longer W_ms = 25 ms to capture microbursts into single batch.\n- Monitor: p95 latency, queue depth, batch occupancy, and cost-per-token. Aim p95 budget = configured SLO * 0.9 before rollout.\n\nMotivation / intuition\n---\nContinuous batching reduces per-token GPU compute by amortizing kernel startup and memory copy. But naive continuous batching + high concurrency can produce long queueing tails when arrival processes are bursty. The \"reservoir\" pattern: maintain a small pool of active batch slots (reservoir size R). New requests can only start a batch if reservoir has free slots. When reservoir is saturated, admission-control applies backpressure (reject or degrade to lower-cost model) rather than letting queueing escalate.\nThis controls extreme queueing tail while still allowing concurrency to scale across instances. The reservoir is intentionally small (1-10 slots) to keep queuing latency budgets tight.\n\nSimulation notes (event-driven emulation)\n---\n- Arrival models tested: poisson, two-state Markov (idle/burst), and empirical traces (customer A 2025-03).\n- Service-time model: token-generation time approximated by linear function + overhead: service_ms = base_ms + tokens * per_token_ms (base_ms 12ms, per_token_ms 1.2ms for model-16b quantized).\n- Batching behavior: batch forms for up to W_ms or max_batch_size. For continuous batching we use W_ms timer and dynamic max based on prefix-match heuristics.\n- Concurrency scheduling: when a batch completes, reservoir slot frees. Concurrency per-instance capped by C_max.\n\nKey results summary (spreadsheet rows excerpt)\n---\n- Markov burst (burst_len 300ms, burst_qps 120): naive continuous (W_ms=10, C_max=32) -> p95 = 760ms, median = 85ms, cost-per-1M-tokens = $52.\n- Reservoir (R=6, W_ms=10, C_max=32) -> p95 = 210ms, median = 92ms, cost-per-1M-tokens = $58. Slightly higher cost because some spare capacity wasted, but p95 dramatically improved.\n- Tapered C_max (R=6, W_ms=10, C_max=16) -> p95 = 170ms, cost-per-1M-tokens = $61.\n- Low QPS (avg 2): long W_ms=25 + R=2 -> reduces number of tiny batches, cost down 18% vs naive while p95 within SLO.\n\nInterpretation and tradeoffs\n---\n- Reservoir reduces worst-case queueing at the expense of peak utilization; good for customer-facing routes with tight p95 SLOs.\n- Tapered concurrency prevents multiplying batch queueing across many in-flight batches. Empirically the sweet spot is C_max ~= 1.5 * R for mixed arrivals, but this varies by model latency curve.\n- For cost-sensitive internal workloads where p95 is less critical, prefer larger R and higher C_max to maximize throughput.\n\nDefault knobs and suggested defaults (first-pass)\n---\n- reservoir_size (R): default 4 (range 1-12)\n- batch_timer_ms (W_ms): default 12 ms (range 6-50)\n- instance_concurrency_cap (C_max): default 8 (range 2-64)\n- backpressure_behavior: soft-throttle (preferred) or hard-reject\n- degraded_fallback_model: model-small-quant (optional)\n\nDeployment experiment plan (staging -> canary -> prod)\n---\n1) Implement reservoir admission control as a feature flag (runtime/serving).\n2) Run A/B on synthetic trace replay (staging) comparing naive vs reservoir across 3 traffic shapes. Capture p50/p95/p99, cost-per-token, and batch occupancy histograms.\n3) Canary: enable for 10% of traffic for a single region, route under conservative defaults. Monitor: p95, error rate, instance utilization.\n4) Expand canary to 50% if p95 reduced and error rate stable.\n5) Roll to 100% for routes that benefit.\n\nOpen questions / TODOs\n---\n- Admission policy when reservoir saturated: prefer soft-throttle (increase client-side retry hints) vs immediate fallback to smaller model? We need UX and SLA implications. (Action: SRE + Product decision).\n- How to auto-tune R per-route based on measured arrival distribution? Proposed metric: reserve R such that P(queueing_delay > budget) < 1% over last 24h. Need an efficient estimator.\n- Interaction with autoscaler: if reservoir increases apparent queuing, autoscaler may spin up instances causing feedback loops. Add hysteresis and queue-aware autoscaling signals.\n- Spreadsheet to convert simulation outcomes into $/1M-tokens needs to be consolidated with platform billing (linked).\n\nReference artifacts and spreadsheets\n---\n- Simulation workbook: gsheets: /sheets/reservoir-sims-2025 (internal) [placeholder].\n- Quick cost calc (tab): assumptions: $/gpu-hour = $3.8, avg tokens/sec per instance computed from sim.\n- PR: github.com/redwood-inference/runtime/pull/1847 (prototype reservoir admission code).\n\nAction items\n---\n- [Ava] flesh out estimator for auto-tuning R (due 2025-07-28).\n- [Rahul] add queue-aware metric to autoscaler (Spike, due 2025-08-04).\n- [Maya] draft product note on fallback UX and SLA implications (due 2025-07-30).\n\nNotes to self\n---\n- Keep doc intentionally pragmatic; more of a playbook than a theoretical paper. Include more empirical traces (customer B) before finalizing defaults.\n- When writing rollout docs for Console, surface reservoir as a per-route toggle with recommended presets (low/mid/high throughput).\n\nEnd.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_0aedeb3ab79d4f48afd11a42eb42e868"
+}
