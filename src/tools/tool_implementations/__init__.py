@@ -1,6 +1,7 @@
 from src.tools.tool_implementations.document_read import DocumentReadTool
 from src.tools.tool_implementations.finish import FinishTool
 from src.tools.tool_implementations.glob import GlobTool
+from src.tools.tool_implementations.grep import GrepTool
 from src.tools.tool_implementations.ls import LsTool
 from src.tools.tool_implementations.mkdir import MkdirTool
 from src.tools.tool_implementations.mvdir import MvdirTool
@@ -17,6 +18,7 @@ __all__ = [
     "DocumentReadTool",
     "FinishTool",
     "GlobTool",
+    "GrepTool",
     "LsTool",
     "MkdirTool",
     "MvdirTool",
