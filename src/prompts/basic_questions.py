@@ -1,6 +1,7 @@
 BASIC_QUERIES_PROMPT = """
 You are an expert dataset engineer. Given a single document sampled from a dataset, generate a query based on that document. The query should be fully answerable from the document without any additional context or assumptions. \
 The query must include enough detail for a search system to retrieve the document, but not so much detail (or obvious giveaways like the document ID) that retrieval becomes trivial. \
+Limit or avoid the use of very specific terms that would make the retrieval too trivial. \
 The query should ask for only one thing (no multi-part questions unless the second part is the actual question of interest and the first part is a necessary qualifier). \
 The query does not need to include every qualifiers and details (see example 1 below). It can include constraints or scoping details, but should remain short. \
 Queries should resemble realistic user questions or requests to an LLM-powered enterprise search tool, and should vary in phrasing, specificity, and style (including request-like statements).
@@ -36,13 +37,13 @@ CRITICAL: Output ONLY the query, do not provide any other text or explanation.
 
 
 SEMANTIC_QUERIES_PROMPT = """
-You are an expert dataset engineer. Given a single document sampled from a dataset, generate a semantic query based on that document which would be used to retrieve the document. \
+You are an expert dataset engineer whose task is to generate a difficult RAG query that does not have strong lexical matches to the document. \
+Given a single document sampled from a dataset, generate a semantic query based on that document which can be used to retrieve the document and answer the query. \
 It should simulate a situation where a user does not have the document in front of them and therefore cannot provide a strong lexical/keyword match to the document. \
-The query must include enough detail for a search system to retrieve the document, but not so much detail (or obvious giveaways like the document ID) that retrieval becomes trivial. \
-The query should ask for only one thing (no multi-part questions unless the second part is the actual question of interest and the first part is a necessary qualifier). \
-The query does not need to include every qualifiers and details (see example 1 below). It can include constraints or scoping details, but should remain short. \
-Queries should be short and concise to simulate real user questions. Avoid multi-part questions and avoid overusing qualifying details. \
-Queries should resemble realistic user questions or requests to an LLM-powered enterprise search tool, and should vary in phrasing, specificity, and style (including request-like statements).
+Strongly limit or avoid the use of very specific terms that would make the retrieval too trivial. It is ok to sparingly use some specific terms like project names, partners, internal technologies, etc. but it should be limited (if not avoided). \
+The query must include enough detail for a search system to reasonably be able to retrieve the document, but not so much detail (or any obvious giveaways like the document ID) that retrieval becomes trivial. \
+The query should ask for only one thing, avoid multi-part questions and avoid overusing qualifying details. The query can include some constraints or scoping details but it should not need to include every qualifiers and details (see example 1 below). \
+Queries should resemble realistic user questions or requests to an LLM-powered enterprise search tool. It is encouraged for the query to show variance in phrasing, specificity, and style (including request-like statements).
 
 CRITICAL: This is intended to be a more challenging, loose match, semantic type query for a dataset compared to a basic natural language query. Limit your use of exact terms and phrase matches.
 
