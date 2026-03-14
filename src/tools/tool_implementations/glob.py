@@ -7,6 +7,13 @@ import re
 from src.tools import GLOB_TOOL
 from src.tools.interface import ToolInterface
 
+DEFAULT_LIMIT = 100
+
+TRUNCATION_MESSAGE = (
+    "\n\nThe results are cut off due to line limit, "
+    "you are encouraged to provide more specific parameters."
+)
+
 
 class GlobTool(ToolInterface):
     """Tool for matching files using glob patterns."""
@@ -92,10 +99,15 @@ class GlobTool(ToolInterface):
                 if os.path.isfile(match):
                     rel_path = os.path.relpath(match, self._base_dir)
                     relative_matches.append(rel_path)
+                    if len(relative_matches) >= DEFAULT_LIMIT:
+                        break
 
             if not relative_matches:
                 return "No files matched the pattern."
 
-            return "\n".join(relative_matches)
+            result = "\n".join(relative_matches)
+            if len(relative_matches) >= DEFAULT_LIMIT:
+                result += TRUNCATION_MESSAGE
+            return result
         except Exception as e:
             return f"Error globbing pattern: {e}"

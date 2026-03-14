@@ -5,6 +5,13 @@ import os
 from src.tools import LS_TOOL
 from src.tools.interface import ToolInterface
 
+DEFAULT_LIMIT = 100
+
+TRUNCATION_MESSAGE = (
+    "\n\nThe results are cut off due to line limit, "
+    "you are encouraged to provide more specific parameters."
+)
+
 
 class LsTool(ToolInterface):
     """Tool for listing files in a directory using ls."""
@@ -85,13 +92,16 @@ class LsTool(ToolInterface):
 
             # Mark directories with trailing /
             result = []
-            for entry in entries:
+            for entry in entries[:DEFAULT_LIMIT]:
                 entry_path = os.path.join(full_path, entry)
                 if os.path.isdir(entry_path):
                     result.append(f"{entry}/")
                 else:
                     result.append(entry)
 
-            return "\n".join(result)
+            output = "\n".join(result)
+            if len(entries) > DEFAULT_LIMIT:
+                output += TRUNCATION_MESSAGE
+            return output
         except Exception as e:
             return f"Error listing directory: {e}"

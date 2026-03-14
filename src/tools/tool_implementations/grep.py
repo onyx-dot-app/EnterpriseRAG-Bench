@@ -6,6 +6,13 @@ import re
 from src.tools import GREP_TOOL
 from src.tools.interface import ToolInterface
 
+DEFAULT_LIMIT = 100
+
+TRUNCATION_MESSAGE = (
+    "\n\nThe results are cut off due to line limit, "
+    "you are encouraged to provide more specific parameters."
+)
+
 
 class GrepTool(ToolInterface):
     """Tool for searching file contents by text pattern."""
@@ -98,6 +105,8 @@ class GrepTool(ToolInterface):
         matches: list[str] = []
         for root, _dirs, files in os.walk(search_dir):
             for filename in sorted(files):
+                if len(matches) >= DEFAULT_LIMIT:
+                    break
                 full_path = os.path.join(root, filename)
                 try:
                     with open(full_path) as f:
@@ -107,8 +116,13 @@ class GrepTool(ToolInterface):
                         matches.append(rel_path)
                 except Exception:
                     continue
+            if len(matches) >= DEFAULT_LIMIT:
+                break
 
         if not matches:
             return "No files matched the pattern."
 
-        return "\n".join(sorted(matches))
+        result = "\n".join(sorted(matches))
+        if len(matches) >= DEFAULT_LIMIT:
+            result += TRUNCATION_MESSAGE
+        return result
