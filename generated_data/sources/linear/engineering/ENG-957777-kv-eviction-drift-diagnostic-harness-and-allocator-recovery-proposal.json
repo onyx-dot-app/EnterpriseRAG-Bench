@@ -1,0 +1,57 @@
+{
+  "key": "ENG-957777",
+  "team": "engineering",
+  "title": "KV eviction drift diagnostic harness and allocator recovery proposal",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-14",
+  "creator": "Ava Martinez",
+  "assignee": "Noah Patel",
+  "project": "runtime-memory-stability",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-28",
+  "labels": [
+    "allocator",
+    "kv-cache",
+    "cuda",
+    "investigation",
+    "memory-leak"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.21",
+  "security_review_required": "false",
+  "description": "Summary:\nWe are observing gradual GPU RSS growth on long-running inference containers serving continuous batching workloads that heavily exercise the KV cache. Symptoms look like a leak: resident memory climbs over hours until OOM or significant latency regressions. Unlike prior allocator-fragmentation tickets, current traces point to an interplay between the KV eviction path and cudaMallocAsync pooling: evicted KV entries are returned to a host-side staging pool and freed asynchronously on non-owned streams. If frees are not reconciled with the cudaMallocAsync pool epoch, slabs become effectively pinned (not returned to the device pool), which leads to slow buildup of \u2018stale\u2019 resident arenas.\n\nObservations and hypothesis:\n- Memory growth correlates with number of distinct model rollouts + variable sequence-length requests (long-tail seqlen distribution).\n- nvml snapshots show host pinned staging memory spikes during eviction bursts; GPU RSS increases more slowly but never trims.\n- Instrumentation (alloc/free timestamps) shows a consistent delay between the logical free of a staging buffer and when cudaMallocAsync reports the space back to the pool: last_free_ts often lags by multiple seconds when the eviction path races with model swap and stream-reset logic.\n- There are a few cases where cudaFreeAsync (or pool return) is executed on a transient stream that gets torn down before stream synchronization completes. We suspect missing streamWait/streamFence in one eviction-to-free handoff.\n- Prior mitigations (periodic pool trim and global batch-size limits) only delay the onset; they do not root-cause fix the \"orphaned slab\" pattern.\n\nReproduction steps (minimal harness):\n1) Deploy inference container with CUDA_MALLOC_ASYNC=1 and our runtime build (instrumented branch: allocator/eviction-harness).\n2) Start a steady continuous-batching load: 80% short (32 tokens), 20% long (2048 tokens).\n3) Trigger frequent KV churn by rotating model sharded variants every ~10 minutes (simulate A/B rollout).\n4) Monitor: nvml GPU_RSS, host pinned bytes, per-multipool slab residency (instrumented metric), async_free_backlog, stream-liveness histogram.\nExpected: within 6\u201312 hours, host pinned staging count shows sustained accumulation and GPU_RSS increases with slabs in \"reserved\" state that never returned to freelist.\n\nImmediate diagnostics added in this ticket:\n- instrument/allocator: add per-free frame tags including stream_id, stream_epoch_id, free_request_ts, last_stream_event_ts (string metric).\n- prometheus: export async_free_backlog and slab_resident_count by pool_id and model_tag.\n- micro-trace: on kv-eviction path capture the last two stream events and emit a compact event to the trace service if free latency > 500ms.\n- lightweight reproducer: python harness that cycles through sequence length distributions and model swap patterns to reproduce locally (docker-compose + small GPU instance).\n\nLog excerpts (sanitized):\n[2026-03-03T14:12:02Z] eviction:evict_key model=bert-base shard=3 size=68MB stream=0x7f9a31f02000\n[2026-03-03T14:12:02Z] staging:alloc host_pinned=68MB id=stg-1432\n[2026-03-03T14:12:02Z] free_request queued stg-1432 on stream=0x7f9a31f02000 epoch=42\n[2026-03-03T14:12:03Z] stream-destroy stream=0x7f9a31f02000 (no event signalled)\n[2026-03-03T14:12:03Z] cuda_pool:free_async returned delayed for stg-1432 (observed delay 2.3s)\n[2026-03-03T14:12:05Z] slab-resident: pool=64 id=sp-19 resident=3\n\nPreliminary root-cause theory:\nA small fraction of eviction frees are enqueued to transient streams or streams that race with model swap/teardown. If the runtime does not insert an appropriate event/synchronization, cudaMallocAsync's pool may not observe the free in time or loses the association with the epoch, leaving slab segments marked as resident. Over time these uncollected residues sum up, producing persistent growth. Additionally, host pinned staging allocations are not reclaimed because the host staging pool expects an event/ack from the device side before reusing or releasing pages.\n\nProposed mitigations (short-term and medium-term):\nShort-term (low-risk, quick):\n- After eviction enqueue, immediately record a cudaEvent and call cuStreamWaitEvent on the default pool-reclaim stream before scheduling cudaFreeAsync. This ensures the free observes the correct dependency ordering. Implement as a guarded flow: only for frees > 16KB or when the free is on a non-persistent stream.\n- Add periodic aggressive pool trim job (configurable) that calls cuMemPoolTrim and drains stale allocations older than threshold T (experiment T=30s, 60s).\n- Expose runtime flag rtx.force_pool_fence which enables the event insertion for affected frees to test impact in canary clusters.\n\nMedium-term (higher-quality):\n- Rework eviction-to-free handshake: switch to using a persistent reclaim stream (owned by allocator) for all async frees. The reclaim stream will have clearly defined lifetime and be synchronized on pool-trim intervals. This removes race windows with transient streams.\n- Enhance the cudaMallocAsync integration to track free-request provenance (stream+epoch) and add a fallback path: if a free request is not committed after X seconds, allocator should forcibly reclaim the slab by issuing a blocking synchronization against the owning stream and returning memory to pool.\n- Consider host staging redesign: prefer device-to-device evictions when possible to avoid host pinned roundtrips; only use host-pinned staging for eviction under memory pressure with stricter fencing semantics.\n\nAcceptance criteria / Success metrics:\n- Reproducer no longer leaks GPU RSS over 12 hours under baseline load in canary cluster when rtx.force_pool_fence=on.\n- async_free_backlog metric reduced to near-zero after implementing persistent reclaim stream in canary.\n- No observable latency regression (>5th percentile) for short requests in the canary with the event-fence flow.\n\nImplementation plan and PRs:\n- Branch: allocator/eviction-harness (WIP).\n- PR # TBD: add per-free event fencing and metrics (small change, low risk). Target for canary rollout: runtime-1.21.1-canary\n- PR # TBD: persistent-reclaim-stream prototype (larger, includes unit tests and integration test harness). Target for runtime-1.22.\n\nOpen questions / trade-offs:\n- Extra fencing could increase tail latency for eviction-heavy bursts. Need to measure and possibly gate via adaptive heuristics (only fence when slab-size > threshold or when pool_heat_metric > X).\n- Forced blocking reclaim (fallback) is heavier but would guarantee leaks do not persist; this is a last-resort safety net and must be configurable per-customer/Tier.\n- Does cuMemPoolTrim semantics differ significantly across CUDA versions we support? Need matrix testing across 11.x/12.x drivers/rtls.\n\nNext steps:\n1) Build and run local reproducer with current instrumented branch (Noah) \u2014 ETA 2026-03-18.\n2) Deploy rtx.force_pool_fence to canary cluster and monitor async_free_backlog and p50/p99 latency (Ava + SRE) \u2014 ETA 2026-03-21.\n3) Start persistent reclaim stream design doc and perf microbench (Noah) \u2014 ETA 2026-03-25.\n4) If canary looks stable, roll short-term patch to more clusters and prepare for runtime-1.21.1 canary release (Release owner: Maya Chen).",
+  "comments": [
+    "2026-03-02 - Ava Martinez: Initial triage: saw reproducer show accumulation on test g4dn. Added basic async_free_backlog metric to prometheus. Assigned to Noah for deeper repro.",
+    "2026-03-04 - Noah Patel: Local reproducer ran for 8 hours and reproduced the gradual RSS increase. Captured stack traces showing frees on transient streams with no events. Preparing patch to insert event fencing for queued frees.",
+    "2026-03-06 - SRE (Jin-Soo Park): Canary ideas: enable rtx.force_pool_fence for 10% of traffic in us-west-2 and observe for 48h. Also pushed NVML collection every 5s to capture spikes.",
+    "2026-03-10 - Ava Martinez: Observed very slight p99 increase (~2%) in canary with fence enabled but async_free_backlog dropped ~85% compared to baseline. Looks promising.",
+    "2026-03-12 - Noah Patel: Started prototype of persistent reclaim stream. Need review: design doc link in attachments. Plan unit tests to simulate stream teardown races.",
+    "2026-03-14 - Ava Martinez: Moving ticket to In Progress; priority remains P1 given customer impact for long-running Dedicated customers."
+  ],
+  "attachments": [
+    "link:github.com/redwood/runtime/pull/xxxxx (WIP allocator/eviction-harness)",
+    "link:confluence.redwood.ai/display/RUNTIME/KV+Eviction+Fencing+Design",
+    "link:dashboard.redwood.ai/d/alloc/kv-eviction-backlog?orgId=1",
+    "link:logs.redwood.ai/q/eviction-harness-2026-03-03"
+  ],
+  "dependencies": [
+    "ENG-21388",
+    "ENG-40780"
+  ],
+  "sub_issues": [
+    "ENG-957778",
+    "ENG-957779"
+  ],
+  "notes": "This ticket intentionally focuses on the eviction->free handshake and allocator-side recovery. It complements existing fragmentation investigations but should avoid duplicating slab compaction work until we confirm whether faulty free ordering is the dominant contributor.",
+  "owner": "runtime-team",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_6c5a6a3238554df293804ed1ed2a66e9"
+}

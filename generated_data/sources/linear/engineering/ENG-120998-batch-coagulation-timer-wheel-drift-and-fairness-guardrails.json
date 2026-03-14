@@ -1,0 +1,60 @@
+{
+  "key": "ENG-120998",
+  "team": "engineering",
+  "title": "Batch coagulation & timer-wheel drift causing intermittent tail spikes and tenant unfairness",
+  "status": "In Review",
+  "priority": "P1",
+  "created_at": "2025-11-04",
+  "updated_at": "2025-11-12",
+  "creator": "Aisha Patel",
+  "assignee": "Miguel Santos",
+  "project": "continuous-batcher-stability",
+  "cycle": "2025-W45",
+  "estimate": "5",
+  "due_date": "2025-11-20",
+  "labels": [
+    "incidents",
+    "batching",
+    "kv-cache",
+    "fairness",
+    "postmortem"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Summary:\\nOn 2025-11-02 we observed repeated tail-latency spikes (~95-99.9p increase) for the continuous-batcher service across multiple production clusters. The immediate symptom was long-lived requests (>2s extra latency) and unequal request throughput across tenants: a small set of heavy tenants were seeing disproportionate throughput while many low-priority tenants experienced starvation. The cluster maintained overall QPS, but batch formation rates dropped and many micro-batches (size 1-3) were emitted leading to higher per-token cost and long tails.\\n\\nWhy this matters:\\n- Tail latency regression impacted SLAs for Dedicated customers in EU and East US regions.\\n- Cost increase due to smaller average batch size.\\n- Fairness regressions led to at least two customer support escalations (CS-1129, CS-1132).\\n\\nWhat happened (short):\\nA confluence of (1) timer-wheel drift after Kubernetes node reschedules, (2) an aggressive adaptive-window shrinker introduced in runtime-1.19, and (3) KV-cache eviction thrash on hot prefixes produced persistent batch \"coagulation\" (our term for many tiny batches clustering over time). The timer-wheel drift caused batcher heartbeats to misalign; the shrinker reacted by reducing window sizes aggressively; eviction churn removed pinned KV contexts forcing requests to re-prime caches. The net effect: batch formation paused or produced very small batches, starving low-priority queues and amplifying tail latency.\\n\\nDetection & Alerting:\\n- Pager fired at 2025-11-02T03:18Z for elevated 99.9p latency (alert rule: continuous-batcher-tail-99.9p > 600ms for 5m).\\n- Oncall runbook led to temporary fallback to simple-batcher in affected shards (manual toggles via /admin/route/fallback).\\n- Investigation discovered timer drift correlated with K8s kubelet restarts during node reclaim windows.\\n\\nRoot cause analysis (detailed):\\n1) Timer-wheel drift: The batcher uses a timer wheel to drive coalescing windows. Node reschedules produced transient clock/heartbeat jitter (kubelet restart & container pause). The wheel algorithm lacked a correction path for >100ms drift; internal counters advanced incorrectly and epochs misaligned which effectively stalled the window aggregation loop for some shards for 30-90s.\\n2) Adaptive-window shrinker policy (runtime-1.19): The new shrinker aggressively reduces the coalescing window when it sees perceived latency regressions. When the timer-wheel misaligned, the shrinker interpreted low formation rates as a signal to shrink windows, creating a feedback loop producing tiny batches.\\n3) KV-cache eviction churn: Hot prefix eviction triggered replays and cache warm-up per request; since the shrinker reduced windows the re-warming often happened inside very small windows producing repeated cache misses and additional latency.\\n4) Priority-weighting implementation quirk: Priority tokens are placed into the same logical slot; when many high-weight requests arrive simultaneously, the slot fills and low-weight queues are deferred without a soft reservation, producing unfairness.\\n\\nEvidence and artifacts:\\n- Correlated metrics: timer-drift-metric, batch-formation-rate, batch-size-histogram (by tenant), kv-hit-rate, abort-rate. See dashboard: https://dashboards.redwood.ai/d/continuous-batcher/incident-2025-11-02\\n- GitHub PRs referenced during rollouts and fixes: https://github.com/redwood-inference/runtime/pull/4921 (adaptive-window-revert-hotfix), https://github.com/redwood-inference/runtime/pull/4948 (timer-wheel-drift-detection)\\n- Incident ticket: INC-2025-348 (on-call timeline & runbook actions) \u2013 Confluence: https://confluence.redwood.ai/display/INC/INC-2025-348\\n\\nImmediate mitigations taken (timeline):\\n- 2025-11-02T03:26Z: Manual toggle to fallback to simple-batcher in affected AZs (reduced tail rapidly; action by oncall: Miguel Santos).\\n- 2025-11-02T04:05Z: Reverted aggressive shrinker via hotfix PR#4921 (deployed with canary).\\n- 2025-11-02T06:12Z: Increased kubelet node drain grace to reduce reschedule frequency during peak hours (ops action).\\n\\nLonger-term action items (owners & due dates):\\n- Introduce timer-wheel drift correction and telemetry (owner: Miguel Santos, due: 2025-11-20). Action: detect >50ms heartbeat gaps and re-sync epoch counters; expose metric timer_drift_seconds.\\n- Implement soft-reservations for pinned prefixes and a KV warmup token-bucket to prevent re-prime thrash (owner: Priya Nair, due: 2025-12-05). Action: reserve a tiny fraction of KV cache for recently-used prefixes per-tenant.\\n- Add per-tenant batch-size histograms and fairness alerting (owner: Ashwin Rao, due: 2025-11-15). Action: new Prometheus histograms and alert when median batch size per-tenant < 3 and p99 latency > 300ms.\\n- Rework adaptive-window controller to include hysteresis and rollback thresholds (owner: Miguel Santos, due: 2025-12-01). Action: add backoff/backfill and require sustained signal for 60s before window shrink.\\n- Introduce priority-aware slot reservations (owner: Lena Fischer, due: 2026-01-10). Action: ensure low-weight queues get minimum slot share under pressure.\\n- Update runbooks and add a pre-approved fast-fallback toggle for Dedicated customers (owner: SRE oncall rotation / Matthew Greene, due: 2025-11-10).\\n\\nTesting & rollout plan:\\n- Unit + integration tests for timer resync (automated), KV warmup (simulated load).\\n- Chaos test: schedule kubelet restart and node eviction scenarios in staging (owner: Chaos eng / Ashwin Rao, by 2025-11-18).\\n- Canary rollout: stage -> canary (2% traffic) -> grad 10% -> 50% -> 100% across regions. Each stage waits 2 hours and observes batch-size histograms and p99 latency.\\n\\nPost-incident retro notes & decisions:\\n- Decision 1: Revert aggressive shrinker policy from runtime-1.19 until hysteresis is in place. Rationale: quick removal of positive feedback loop with minimal impact. (Approved by runtime leads: Miguel, Priya)\\n- Decision 2: Treat timer-wheel drift > 50ms as severity-2 alert in the short term to enable faster ops response.\\n- Decision 3: Add tenant-level fairness SLOs to the console so customers can opt-in for 'fair-share' mode on Dedicated clusters.\\n\\nFollow-ups (open subtasks):\\n- ENG-121102 (create dashboard panels for tenant batch-size distribution) \u2013 owner: Ashwin Rao\\n- ENG-121150 (implement timer-wheel drift detector + auto-resync) \u2013 owner: Miguel Santos\\n- ENG-121201 (run KV warmup prototype & benchmark) \u2013 owner: Priya Nair\\n\\nConclusion:\\nThis incident was caused by an interaction between a control-policy (adaptive shrinker), low-level timing assumptions (timer-wheel), and cache behavior (KV thrash) in conditions with node restarts. The mitigations are both immediate (fallback & revert) and mid-term (resync logic, KV soft reservations, fairness knobs). We will monitor the canary rollout and close this issue once all action items are implemented and the staging chaos tests pass.\\n",
+  "comments": [
+    "2025-11-02 03:22 - Miguel Santos (oncall): Investigating 99.9p spikes; toggled fallback for high-load shards; collecting batch histograms.",
+    "2025-11-02 04:00 - Aisha Patel (engineer): Deployed hotfix PR#4921 to revert shrinker; p99 dropped ~60% in canary.",
+    "2025-11-03 10:12 - Priya Nair (infra): Observed KV eviction churn correlated with hot deployment on tenant-42; started KV warmup prototype.",
+    "2025-11-05 09:30 - Matthew Greene (SRE): Runbook updated (link: https://confluence.redwood.ai/display/RB/continuous-batcher-runbook) to add fast-fallback instructions and timer_drift alerting.",
+    "2025-11-07 16:47 - Ashwin Rao (metrics): Added tenant-level batch-size histogram panels and new alert rule: tenant_batch_median_lt_3_and_p99_gt_300ms.",
+    "2025-11-12 11:03 - Miguel Santos (engineer): Draft PR for timer-wheel resync ready: https://github.com/redwood-inference/runtime/pull/4948 \u2014 requesting review from runtime leads."
+  ],
+  "attachments": [
+    "https://confluence.redwood.ai/display/INC/INC-2025-348",
+    "https://github.com/redwood-inference/runtime/pull/4921",
+    "https://github.com/redwood-inference/runtime/pull/4948",
+    "https://dashboards.redwood.ai/d/continuous-batcher/incident-2025-11-02",
+    "runbook: https://confluence.redwood.ai/display/RB/continuous-batcher-runbook"
+  ],
+  "dependencies": [
+    "ENG-121102",
+    "ENG-121150",
+    "ENG-121201"
+  ],
+  "parent_issue": [
+    "ENG-120500"
+  ],
+  "sub_issues": [
+    "ENG-121102",
+    "ENG-121150",
+    "ENG-121201"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_2e5b9b12ef284c208560be9ead3eb70a"
+}

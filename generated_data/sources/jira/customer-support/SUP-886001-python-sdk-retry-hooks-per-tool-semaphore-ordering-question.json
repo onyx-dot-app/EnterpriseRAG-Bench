@@ -1,0 +1,77 @@
+{
+  "key": "SUP-886001",
+  "project": "customer-support",
+  "issue_type": "Question",
+  "summary": "Clarification on Python SDK retry hooks and per-tool semaphore ordering to avoid duplicated function invocations",
+  "status": "In Progress",
+  "priority": "P2",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-11",
+  "reporter": "Maya Chen",
+  "assignee": "Arjun Patel",
+  "customer_company": "Nova Analytics",
+  "customer_tier": "dedicated",
+  "severity": "Sev2",
+  "components": [
+    "sdk-python",
+    "serving-runtime",
+    "api-gateway"
+  ],
+  "labels": [
+    "idempotency",
+    "retries",
+    "function-calling",
+    "ordering",
+    "support-guidance"
+  ],
+  "environment": "prod/us-west",
+  "affected_models": [
+    "redwood/gpt-4o-instruct-v1"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "linked_issues": [
+    "SUP-301001",
+    "INT-330"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/sdk-python/pull/512"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/12345/funcall-idempotency-best-practices"
+  ],
+  "description": "Issue summary:\nCustomer integration uses the Python SDK to orchestrate long-running orchestration jobs via a local background TaskQueue. Each job emits multiple function/tool calls (external webhooks and internal microservice actions). They are seeing duplicate downstream effects when the client experiences transient network timeouts and the SDK retries.\n\nImpact:\n- Duplicate invoices and duplicate downstream webhook posts for ~30% of jobs when a client worker restarts under load.\n- Customer-facing correctness issue; blocking a few pilot customers on Dedicated capacity.\n\nEnvironment:\n- Nova Analytics Dedicated cluster in us-west-2; SDK version: 1.9.2 (python).\n- Using a local task queue that batches logical operations and uses a per-tool semaphore (concurrency limit) to avoid overloading downstream services.\n\nSteps to reproduce (customer provided):\n1) Start long-running orchestration that schedules 5 function calls A->B->C in sequence.\n2) Worker batches two calls and sends them as two near-simultaneous requests to Redwood.\n3) Network hiccup: a TCP RST on call #2 around 1s after send.\n4) SDK retry middleware retries the failed request with default idempotency scope.\n5) Downstream webhook receives duplicate POSTs (same business effect) despite the original having succeeded on the server.\n\nExpected behavior:\n- SDK retries should not cause duplicate side effects if the original request was already accepted and executed. Per-action idempotency guidance should be possible for batched/multiplexed clients.\n\nActual behavior:\n- Observed duplicates when the client-level retry happens and the client-generated idempotency key collides or is not preserved across batched/replayed messages.\n\nAttachments / logs (sanitized):\n- Client trace IDs: trace-20260310-9a2c, trace-20260310-9a2d\n- Server response (first attempt): 202 Accepted, func_call_id=fc_0a1b2c ts=2026-03-10T17:01:21Z\n- Client retry attempt: no server ack received -> retry -> server processes second request and returns 200 OK func_call_id=fc_0a1b2c (duplicate effect)\n\nCustomer asks:\n1) Is there a supported way in the Python SDK to attach a stable per-action idempotency token that survives batching/queueing and retry hooks?\n2) Can SDK-level retry hooks be used to consult a local durable store to prevent duplicate sends? Any recommended patterns?\n3) Will a per-tool semaphore (client-side) guarantee ordering and single-execution semantics, or are there caveats for multiplexed/batched clients?\n",
+  "comments": [
+    "2026-03-10 - Maya Chen (customer): We've tried setting idempotency_key on the function call metadata but when we batch/aggregate our queue items the key gets normalized by our own batching layer; we suspect the SDK is also normalizing per-HTTP-request. We need guidance on how to guarantee once semantics across retries.",
+    "2026-03-10 - Support (Arjun Patel): Thanks for the detailed traces. We're triaging \u2014 asking eng to validate server-side dedupe assumptions. Can you paste a sanitized sample of the request headers (idempotency header, content-length, and any client-generated nonce)?",
+    "2026-03-11 - Customer (Maya Chen): Sent headers via secure upload (included trace ids above). Notable header: X-Redwood-Idempotency: ephemeral-20260310-abc123 (generated per-HTTP-send by our batcher).",
+    "2026-03-11 - Support (Arjun Patel): Confirmed we found two server-side accept events with same func_call_id but two different request hashes. Eng to follow up with recommended SDK pattern."
+  ],
+  "investigation_notes": [
+    "2026-03-11 - Eng (SRE): Server dedupe operates on idempotency token + model + route. If the token is changed by client-side batching normalization the server will treat retried HTTP requests as new requests. Batching layers that rewrap payloads can drop original per-action idempotency metadata.",
+    "2026-03-11 - SDK Eng: Python SDK 1.9.2 provides a retry hook (Client.retry_callback) but it currently exposes only the HTTP request object and does not automatically rehydrate a per-action idempotency key if your batcher rewrites the payload. The SDK does not persist idempotency state by default.",
+    "Hypothesis: Customer's batcher generates ephemeral X-Redwood-Idempotency per HTTP send instead of per-logical action. When the worker restarts, the persisted mapping between logical action ID and idempotency token is lost, so retry attempts produce a new token leading to duplicate execution.",
+    "Evidence: server logs show two distinct incoming idempotency header values for the same business operation correlated by customer-provided func_call_id in body."
+  ],
+  "resolution_notes": "Workaround and recommended patterns provided to customer. Key guidance: 1) Generate and persist a stable per-logical-action idempotency_key in the orchestrator (durable KV or DB) before you enqueue/batch. Use that token as X-Redwood-Idempotency on every HTTP attempt for that logical action. 2) When batching multiple actions into a single HTTP request, ensure the SDK payload contains per-action idempotency keys in the function call metadata (\"idempotency_key\"). The SDK will forward those through to the server dedupe layer. 3) Use the SDK retry_hook (Client.retry_callback) to consult a durable dedupe store: before retrying, check whether the server already returned an ack for that logical action (fc_*) and skip retry if ack present. 4) Per-tool semaphores help limit concurrent execution but DO NOT replace persisted idempotency keys \u2014 semaphores are in-memory and lose state on worker restart. 5) If ordering is critical, prefer explicit sequence numbers and server-side transactional confirm endpoint (call -> server returns provisional token -> client calls confirm endpoint after durable local commit) to ensure exactly-once ordering.\n\nAction items delivered to customer:\n- Example code snippet (Python) with patterns: generate idempotency_key, persist to SQLite/Redis, attach to func call metadata, implement retry_callback that consults Redis and short-circuits resends.\n- Link to internal SDK PR adding a small helper in next SDK release to persist idempotency mapping for background taskqueues (see PR https://github.com/redwood-inference/sdk-python/pull/512).\n- Recommend configuration change on Dedicated: enable per-action dedupe TTL=7d for heavy batch workloads (ops can flip this flag per-customer).\n",
+  "workaround_steps": "1) Before enqueue: for each logical action create stable_id = sha256(run_id + action_index + customer_id) and write mapping stable_id -> idempotency_key to Redis (ttl 30d).\n2) When emitting widget func calls, set metadata['idempotency_key'] = persisted idempotency_key and set HTTP header X-Redwood-Idempotency to the same value.\n3) Implement SDK retry_callback that does: if redis.exists(stable_id) and server_ack_exists(stable_id): return SKIP_RETRY else allow retry.\n4) As an interim mitigation, reduce client retry attempts and increase initial timeout to avoid double-submit windows while you instrumentation corrects idempotency mapping.",
+  "related_links": [
+    "https://redwood.statuspage.io/incidents/example",
+    "https://github.com/redwood-inference/sdk-python/pull/512",
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/12345/funcall-idempotency-best-practices"
+  ],
+  "final_resolution": "Pending - customer to validate workaround in staging and confirm. Engineering scheduled a small SDK helper in the 1.10.0 release to make persisting idempotency mappings easier. Ops will review enabling per-action dedupe TTL change for this customer once they validate in staging.",
+  "notes_for_followup": "- Track customer validation result by 2026-03-18.\n- If duplicate effects persist after pattern adoption, open a targeted Dedicated config change (enable per-action dedupe TTL extension) and capture full request/response bodies for eng replay.\n- Consider adding SDK built-in durable idempotency store option in roadmap (timeline Q2 2026).",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes",
+    "workaround_steps",
+    "final_resolution",
+    "notes_for_followup"
+  ],
+  "dataset_doc_uuid": "dsid_9e08d8047b6840fc8a8c7229a3628573"
+}

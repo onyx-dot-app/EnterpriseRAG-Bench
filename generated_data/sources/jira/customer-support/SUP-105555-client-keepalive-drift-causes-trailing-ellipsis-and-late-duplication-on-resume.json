@@ -1,0 +1,93 @@
+{
+  "key": "SUP-105555",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Client keepalive drift causes trailing ellipsis and duplicated suffix on stream resume",
+  "status": "Resolved",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Maya Chen",
+  "assignee": "Diego Alvarez",
+  "customer_company": "Acme Payments",
+  "customer_tier": "enterprise",
+  "environment": "prod us-east-1",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "edge-proxy"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "proxy",
+    "keepalive"
+  ],
+  "affected_models": [
+    "redwood/ggml-7b-chat",
+    "open-llm/longform-13b"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-10",
+  "first_response_due_at": "2026-03-10",
+  "description": "Issue summary: Customers reported that long streaming responses (SSE and websocket) occasionally finish with a trailing ellipsis (...) and then, after the client reconnect/resume, a duplicated final clause or sentence is appended. Impact: user-visible duplicated suffix or hanging punctuation in final output that confuses downstream post-processing and fails strict JSON validators for structured responses. Observed with enterprise customer behind an aggressive corporate proxy and mobile webview clients.",
+  "steps_to_reproduce": [
+    "1) Start a long multi-paragraph generation request using the streaming endpoint for redwood/ggml-7b-chat with temperature=0.7 and max_tokens=800.",
+    "2) Let stream emit for ~20\u201340s until the model returns the closing paragraph and likely a final punctuation mark.",
+    "3) Trigger a transient network change on the client (corporate proxy rebind or mobile network suspend) causing a keepalive gap of ~12\u201318s.",
+    "4) Client reconnects and sends resume token / session id; server emits remaining fragments and occasionally emits a duplicate of the last sentence or an extra ellipsis then duplicate suffix.",
+    "5) Reproduces reliably behind Acme Payments' corp-proxy which has an idle-teardown of 10s when reauthenticating.\n"
+  ],
+  "logs": [
+    "2026-03-10T14:02:11Z TRACE session=abc123 client=10.5.4.3 keepalive=22s last_chunk='...'",
+    "2026-03-10T14:02:23Z WARN proxy=corp-edge rebind token-refresh teardown idle=10s connection-rst",
+    "2026-03-10T14:02:34Z INFO resume received session=abc123 resume_token=rt-789 trace_id=tx-5543",
+    "2026-03-10T14:02:34Z DEBUG serving-runtime choice-emit chunk_id=457 last_choice='final clause.'",
+    "2026-03-10T14:02:34Z DEBUG serving-runtime choice-emit chunk_id=458 duplicate_of=457 'final clause.'",
+    "2026-03-10T14:02:34Z ERROR parser detected unexpected trailing '...final clause.' in stream (tx-5543)",
+    "Links: https://grafana.redwood.internal/d/streams/tx-5543 , Slack: #support-acme-payments-thread/ABCD1234"
+  ],
+  "investigation_notes": [
+    "Initial triage (Support): confirmed multiple occurrences from same customer in us-east over 3 distinct days. Pattern: short-lived network gaps of ~10\u201320s followed by resume, duplicates only on longest streams.",
+    "Hypothesis A: KV-cache re-priming race where resumed worker replays buffered tail while prior worker also emits trailing fragment (double-emit).",
+    "Hypothesis B: Edge-proxy keepalive extension mismatch causes client to receive a heartbeat-only chunk (ellipsis) interpreted by SDK as content, then resumed content appended leading to duplication.",
+    "SRE reproduction: simulated proxy-teardown at 10s while streaming long responses; reproduced duplicate tail when proxy dropped connection and resume routed request to a different worker with overlapping session state.",
+    "Trace analysis: tx-5543 shows two downstream emits (chunk 457 and chunk 458) with same choice payload and consecutive sequence ids; both workers reported chunk emission for same session id due to race on resume-claim.",
+    "Root cause narrowed: race during resume claim across serving nodes when proxy rebind causes an ephemeral reconnect; resume path allowed a second worker to re-emit cached tail before exclusive resume-claim was fully reconciled in the control plane.",
+    "Customer environment note: Acme's corp-proxy performs TLS re-termination + 401 reauth flow which triggers connection close and immediate reconnects; their idle-teardown (10s) is shorter than our resume-claim lock timeout in some code paths.",
+    "Repro notes: duplication more likely when final chunk is small (ellipsis or short clause) because the SDK merges heartbeat-like fragments into content and treats them as partials."
+  ],
+  "comments": [
+    "Customer (2026-03-10T14:05Z) - Jordan L.: We're seeing truncated outputs followed by a weird repeated sentence when the user switches networks. It's intermittent but painful for downstream JSON parsing.",
+    "Support (2026-03-10T14:18Z) - Maya C.: Thanks Jordan \u2014 collecting logs, can you confirm whether clients are behind an edge proxy or using an SDK? Any screenshots of the duplicated text would help.",
+    "Customer (2026-03-10T14:22Z) - Jordan L.: They are behind a corporate TLS reauth proxy. Using in-house webview. Provided live request-id tx-5543.",
+    "SRE (2026-03-10T15:05Z) - Diego A.: Able to reproduce with proxy teardown @10s. Suspect resume-claim race on workers. Creating follow-up INT ticket for fix rollout. See PR: https://github.com/redwood-inference/serving-runtime/pull/1124",
+    "SRE (2026-03-11T09:40Z) - Diego A.: Deployed hotfix behind feature flag: enforce single-resume-claim via optimistic lock + short garbage-collection window for session tails. Enabled for us-east canary at 09:30 UTC.",
+    "Customer (2026-03-11T11:12Z) - Jordan L.: Verified on our side \u2014 duplicate tail no longer observed in 30+ test runs. Thanks!",
+    "Support (2026-03-12T08:00Z) - Maya C.: Closing ticket after monitoring 48h of no regressions. Follow-up: recommend customers behind aggressive proxies increase idle timeout or enable resume-delay client-side backoff.\n"
+  ],
+  "linked_issues": [
+    "INT-4012",
+    "SUP-311845"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/1124"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.internal/display/OPS/Streaming+Resume+Race+Runbook"
+  ],
+  "resolution": "Root cause: race condition in session resume where two workers could emit a cached trailing fragment when corporate proxy rebind closes the original socket. Fix: added an optimistic resume-claim lock in the control plane and tightened the session tail GC window; also added defensive de-duplication in the serving runtime for back-to-back identical tail emits. Rollout: hotfix canary in us-east on 2026-03-11 09:30 UTC, global rollout completed 2026-03-11 18:00 UTC. Customer instructed to adjust proxy idle teardown to >15s or enable client resume backoff as mitigation. Monitoring: alert created stream-resume-duplicate-rate >0.1% per minute with dashboard link.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_457ba512d24b40d1a4010702009194c0"
+}

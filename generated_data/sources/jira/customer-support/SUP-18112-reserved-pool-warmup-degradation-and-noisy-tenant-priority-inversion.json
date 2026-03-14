@@ -1,0 +1,79 @@
+{
+  "key": "SUP-18112",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Reserved pool warmup causing transient p95/p99 latency spikes and priority inversion with on-demand tenants",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-02-23",
+  "reporter": "Asha Patel",
+  "assignee": "Riley Chen",
+  "customer_company": "BrightDocs, Inc.",
+  "customer_tier": "dedicated",
+  "environment": "prod-us-east",
+  "components": [
+    "serving-runtime",
+    "scheduler",
+    "autoscaler",
+    "routing"
+  ],
+  "labels": [
+    "noisy-neighbor",
+    "warmup",
+    "priority-inversion",
+    "p99-latency"
+  ],
+  "affected_models": [
+    "redwood/opt-2.7b-v3",
+    "open/gptj-6b-quant"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-02-20T16:30:00Z",
+  "first_response_due_at": "2026-02-20T14:00:00Z",
+  "linked_issues": [
+    "SUP-7851",
+    "SUP-50385"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/runtime/pull/1423"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/Reserved+Pool+Warmup+Runbook"
+  ],
+  "description": "Issue summary:\nCustomer BrightDocs is observing intermittent p95/p99 latency spikes and token throttling across their dedicated reserved pool. Spikes occur during short bursts (1\u20135 minutes) after a period of low activity and correlate with a high rate of prefetch/eviction churn on the GPU nodes. Symptoms point to priority inversion where on-demand/burst allocations trigger kernel preemptions and eviction storms that delay warmup of pinned reserved workers, causing downstream queueing and token-level throttling at the API layer.\n\nImpact:\n- BrightDocs reports elevated p95/p99 for generate and streaming requests; customer-facing features degrade for end users.\n- Observed increased 429s/timeouts for some high-concurrency routes routed to the dedicated pool.\n- Customer is on a committed reserved pool; they expect predictable latency.\n\nEnvironment:\n- Dedicated reserved pool in us-east, mixed GPU types (A10g + A100 lite).\n- Autoscaler: predictive+threshold policy; burst capacity enabled.\n- Workload mix: short chat-style requests (seq len < 512) and occasional long-context tests.\n\nWhy unique/important:\nThis is not a simple capacity shortage: nodes have spare GPU memory and utilization looks moderate, but eviction/reload churn at the driver/kernel level is causing transient throughput regression. The packet of behavior suggests scheduling/kernel preemption interactions with our eviction prefetch logic and the autoscaler's burst routing rules.",
+  "steps_to_reproduce": [
+    "1) Simulate low baseline load on reserved pool for 10+ minutes (idle warm cache).",
+    "2) Fire a sustained burst of short concurrent requests (50\u2013200 RPS) with mixed routes pinned to reserved pool; include on-demand burst traffic aimed at same region.",
+    "3) Observe p95/p99 latency spikes within 30\u201390s of burst start and increased eviction/prefetch log lines on affected nodes.",
+    "4) Reduce burst; note that latencies take ~2\u20136 minutes to return to baseline depending on kernel cache warmup and batching behaviour."
+  ],
+  "logs": [
+    "2026-02-20T13:17:42Z node-09 kernel: evict:kv_cache miss -> reload (size=1.2GB) duration=237ms",
+    "2026-02-20T13:17:43Z serving-runtime: prefetch evict sequence for tenant=brightdocs-01 removed 6 segments",
+    "2026-02-20T13:18:01Z scheduler: allocate burst slot on-demand -> placed on shared-pool-node-21 (preempted reserved-worker node-09)",
+    "2026-02-20T13:18:05Z api-gateway: route=generate tenant=brightdocs-01 p95=842ms p99=2120ms tokens=~450"
+  ],
+  "investigation_notes": "Initial hypothesis: autoscaler burst routing will place on-demand bursts onto shared nodes and occasionally trigger kernel-level preemption of reserved workers. When reserved workers are preempted, their KV caches + eager-prefetch window are invalidated leading to a rebuild cost that inflates tail latencies. Observed correlation between preempt events and first request latency for the next 50\u2013200 requests.\n\nWhat we checked:\n- Node-level GPU memory usage and process lists: no out-of-memory; memory free but frequent allocation/free patterns seen.\n- Kernel driver logs: repeated page migration/eviction entries matching timestamps of spikes.\n- Routing decisions: short window where policy allowed placement of on-demand tasks on same node due to aggressive burst allowance.\n- Autoscaler logs: predictive policy mis-specified affinity thresholds caused burst placements to favor shared nodes rather than cold-start new reserved nodes.\n\nHypotheses to validate:\n- Lowering on-node preemption frequency (stronger isolation) will reduce p99.\n- Tuning prefetch eviction policy to be more conservative on reserved pool will reduce rebuild cost.\n- Autoscaler policy change: prefer new node allocation for burst if reserved-workers would be preempted.\n\nTemporary mitigations tried:\n- Disabled burst-placement-to-shared for BrightDocs (immediate reduction in p99 within 3 minutes).\n- Applied a conservative eviction window (increasing retention) for reserved pool; observed reduced KV reload counts.\n\nRemaining unknowns:\n- Exact kernel-level threshold where eviction cost dominates vs. capacity tradeoffs for cold-start vs. preemption.\n- Potential impact on overall cluster utilization if we restrict burst placements.",
+  "comments": [
+    "Support (Asha Patel) 2026-02-20T14:05: Customer reported that enabling a smaller concurrent limit temporarily reduces errors but latency still spikes intermittently.",
+    "SRE (Miguel Torres) 2026-02-20T15:10: We reproduced a similar pattern in staging with a mixed A10/A100 pool; attaching kernel logs to the ticket. Preemption correlates with eviction churn.",
+    "Engineer (Riley Chen) 2026-02-21T09:34: Rolled a conservative eviction config to reserved-pools in staging (flag: reserve.eviction_window=extended). Need to monitor 24h results before prod change.",
+    "Customer (BrightDocs contact - Lina Gomez) 2026-02-21T12:00: Thank you \u2014 we saw improvement after you disabled burst-to-shared. Can you quantify the expected latency SLO restoration and any cost implications?"
+  ],
+  "resolution": "Workaround implemented: disabled burst placement to shared nodes for BrightDocs' reserved pool and applied a conservative eviction window for reserved workers. Short-term results: p95 reduced by ~38% and p99 by ~54% for observed bursts.\n\nPlanned permanent actions:\n- Implement autoscaler rule change to prefer new node allocation over preempting reserved workers when predicted burst would cause >20% eviction churn. (PR: github.com/redwood-inference/runtime/pull/1423)\n- Add telemetry to detect preemption-induced eviction storms and auto-disable burst placement for affected pools until warmup completes.\n- Follow-up runbook and SLO communication to customer, including expected recovery times and operational tradeoffs.\n\nFollow-ups/owner:\n- Riley Chen to drive PR and rollout (ETA 2026-03-02).\n- SRE Miguel Torres to add observability alert for eviction-churn -> preemption correlation (ETA 2026-02-28).",
+  "related_incident_id": "INC-2026-02-0197",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_8689628c8b044a5ca788a5a150d80015"
+}

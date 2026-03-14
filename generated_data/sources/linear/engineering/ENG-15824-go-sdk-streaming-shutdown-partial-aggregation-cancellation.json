@@ -1,0 +1,46 @@
+{
+  "key": "ENG-15824",
+  "team": "engineering",
+  "title": "Go SDK: streaming shutdown semantics, partial-response aggregation, and cancellation + retries interaction",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "creator": "Alyssa Hart",
+  "assignee": "Diego Murthy",
+  "project": "go-sdk-streaming",
+  "cycle": "2026-W11",
+  "estimate": "5",
+  "due_date": "2026-03-28",
+  "labels": [
+    "sdk",
+    "go",
+    "streaming",
+    "retries",
+    "cancellation"
+  ],
+  "parent_issue": [
+    "ENG-15001"
+  ],
+  "dependencies": [
+    "ENG-13021"
+  ],
+  "customer_impact": "medium",
+  "release": "go-sdk-0.14.0",
+  "security_review_required": "false",
+  "description": "Context\nThe Go SDK currently exposes a streaming API that delivers token/chunk events from the server as they arrive. Consumers use context.Context to cancel or deadline the stream. In practice we have several gaps: (1) lack of a clear graceful-shutdown API for draining/partial results before canceling; (2) ambiguous semantics around what 'cancellation' means for in-flight partial responses and for the retry layer; (3) poor ergonomics for users trying to resume or detect truncated responses; (4) inconsistent examples across repos showcasing best practices with context timeouts.\n\nGoals\n1) Define and implement clear streaming shutdown semantics: explicit Close/Abort variants that indicate intent (drain vs abort).\n2) Ensure partial-response aggregation is deterministic and observable (so apps can decide whether to present partial output or mark as truncated).\n3) Make cancellation semantics play nicely with automatic retries: retries should not accidentally reissue partially-fulfilled requests unless explicitly idempotent or resumed.\n4) Provide easy-to-use examples and helper utilities (FlushPartial, ResumeToken) and update docs.\n\nAcceptance criteria\n- SDK exposes Stream.Close() and Stream.Abort(error) with documented behavior.\n- When Close() is called, SDK will attempt a short, configurable drain window (default 150ms) to receive remaining chunks, then return consolidated result and io.EOF.\n- When Abort(err) is called, SDK cancels underlying transport immediately and returns provided error to caller; no retries will be attempted.\n- If user cancels context.Context used to start the stream, behave like Abort(context.Canceled) but preserve ability to differentiate between user Abort() vs context cancellation in logs.\n- Partial responses include a boolean metadata field \"truncated\" in returned final metadata to indicate incomplete content.\n- Automatic retry middleware will not attempt full-request retries if a previous attempt produced any partial response unless the request is marked resumable with a ResumeToken.\n- Add examples in examples/go/streaming_shutdown.md and tests covering corner cases (deadline during drain window, server-side termination, network flaps).\n\nDesign notes\n- API: introduce type Stream struct { Chunks <-chan Chunk; Err() error; Close() error; Abort(err error) error; ResumeToken() string }\n  - Chunk: { Data string; Index int; Timestamp string } (Chunk is an SDK struct, not nested in this ticket)\n- Close vs Abort: Close is cooperative; SDK sets a 150ms drain deadline and waits for more chunks. Abort is immediate and suppresses retries. Close default drain timeout configurable via client options (e.g., WithStreamDrain(time.Duration)).\n- Context interactions: Starting a stream requires ctx. If ctx is canceled by user, we treat it as Abort(context.Canceled) but add a telemetry tag origin=context-canceled to help debugging. If user calls Abort explicitly then context can be background; explicit Abort takes precedence.\n- Partial-response semantics: The SDK will produce a final metadata struct when the stream ends (successful or truncated). The final metadata will include \"truncated\":\"true|false\" and \"received_token_count\":\"<n>\". For JSON schema simplicity we expose a FinalMessage() string and FinalMetadata() map in the public API surface in later work; for now we rely on Err() returning a sentinel ErrTruncated to indicate truncation.\n- Retries: The retry middleware will consider a request idempotent only when no partial chunks were observed on prior attempt. If ResumeToken() is present and request opts mark it resumable, next attempt will include resume token header to request server-side resume (server must support). Otherwise we do not retry and surface ErrPartialResponse to caller.\n\nMigration notes\n- Existing users that rely on context cancellation behavior will see similar semantics but can opt into the new semantics by calling Stream.Abort to signal immediate abort. Backward compatibility: context cancellation will still abort but with different telemetry tag.\n- Because we add a small drain delay on Close(), long-running clients with tight deadlines should explicitly Abort when they want immediate termination to avoid extra latency.\n\nExamples\n1) Graceful shutdown pattern (recommended):\n\nctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)\ndefer cancel()\nstream, err := client.StreamGenerate(ctx, req)\nif err != nil { return err }\nvar buf strings.Builder\nfor chunk := range stream.Chunks {\n  buf.WriteString(chunk.Data)\n  if someAppLevelStopCondition() {\n    // We want as much as possible but not to wait longer than drain window\n    _ = stream.Close()\n    break\n  }\n}\nif err := stream.Err(); err != nil && err != io.EOF {\n  return fmt.Errorf(\"stream failed: %w\", err)\n}\nfmt.Println(\"final text:\", buf.String())\n\n2) Immediate cancel when deadline is missed (low latency use-case):\n\nctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)\ndefer cancel()\nstream, err := client.StreamGenerate(ctx, req)\nif err != nil { return err }\n// If we detect we must stop immediately, prefer Abort so SDK won\u2019t wait for drain.\n_ = stream.Abort(fmt.Errorf(\"user timeout\"))\n// read or discard chunks until Err() then return\n\nTesting plan\n- Unit tests: fake transport delivering chunk sequences, simulate network pause during drain window, simulate server resume token available.\n- Integration: e2e test against a local test model that sends N chunks and supports resume tokens. Validate retry middleware behavior when a partial response was observed.\n- Load tests: ensure Close drain window does not materially affect throughput for high concurrency scenarios. Add telemetry counters for drain-wait durations and truncated responses.\n\nDocs and examples\n- Add new markdown doc examples/go/streaming_shutdown.md and update docs/sdk/go/streams.md with code snippets above.\n- Add a short migration guide notes in docs/CHANGELOG.md for go-sdk-0.14.0.\n\nTelemetry and observability\n- Tag events: stream.start, stream.close.drain_wait_ms, stream.abort.reason, stream.partial.truncated. Ensure these tags allow correlating to request-id and client-side telemetry.\n\nRisks and trade-offs\n- Adding a drain delay (default 150ms) can increase tail latency slightly for callers who always want immediate stop. Mitigation: Abort exists.\n- Retry policy complexity: opting not to retry after partial responses is conservative but avoids duplicate side-effects. We will revisit once resumable server-side semantics are more widely supported.\n\nLinks\n- Design notes (doc): https://drive.redwood.ai/docs/go-streaming-shutdown-design (placeholder link)\n- Related ticket: ENG-13021 (streaming reconnect and deadline propagation)\n- Proposed PR: https://github.com/redwood-inference/go-sdk/pull/402 (draft)",
+  "comments": [
+    "2026-03-12: Alyssa Hart created initial RFC and prototype tests. Added design proposal and acceptance criteria.",
+    "2026-03-12: Diego Murthy assigned. Noted need to coordinate with retry middleware owners (ENG-13021).",
+    "2026-03-13: Feedback from PM (Ravi Singh): ensure we expose a clear example for low-latency apps to call Abort to avoid drain waits.",
+    "2026-03-13: Review from infra (Lina Zhao): suggested reducing default drain window to 100ms and making it configurable. We agreed to keep 150ms as default and add client option.",
+    "2026-03-14: Implementation: added Stream.Close/Abort skeleton and unit tests for drain behavior. Draft PR opened: go-sdk#402 (WIP).",
+    "2026-03-14: QA: added flaky test case for network pause during drain; investigating intermittent fail on CI under high concurrency."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_ff670b0659b54de29093db41fbc6adee"
+}

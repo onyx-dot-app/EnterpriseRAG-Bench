@@ -1,0 +1,67 @@
+{
+  "key": "SUP-101112",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Batched ingest packing offset caused extra embedding dimensions, rerank top-K drift and increased latency",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Asha Mehta",
+  "assignee": "Diego Ramos",
+  "customer_company": "LexaSearch Inc",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "embed-ingest",
+    "reranking-service",
+    "storage"
+  ],
+  "labels": [
+    "embeddings",
+    "rerank-quality",
+    "latency",
+    "investigation"
+  ],
+  "environment": "prod | us-east",
+  "affected_models": [
+    "embedder-large-v2",
+    "embedder-small-quant"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-14T18:00:00Z",
+  "first_response_due_at": "2026-03-12T14:30:00Z",
+  "linked_issues": [
+    "SUP-91455",
+    "SUP-31721"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/platform/pull/4821"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/Embed+Ingest+Runbook"
+  ],
+  "description": "Issue summary:\nCustomer LexaSearch reported that after a large batched embedding ingest job (approx 250k docs) their reranker exhibits non-deterministic top-K changes and a 2-3x latency increase on rerank calls that use recently ingested vectors. Impact:\n- Rerank quality: previously stable top-5 for test queries now shows frequent permutation of results (low reproducibility)\n- Latency: median rerank RT increased from 45ms to 120ms for affected queries, 95th percentile spikes to 600ms\n- Customer is on Dedicated; visible in their us-east serving pool and dedicated vector store\nEnvironment:\n- Dedicated cluster: d-ed-us-east-01\n- Embedder: embedder-large-v2 (float32 path) for primary ingest; some fallback items used embedder-small-quant (int8)\n- Storage: vector-store-s3-backed with local packing/cache layer\nSteps to reproduce:\n1) Run the customer's ingest job (provided sample) which batches 1k docs per request with 'pack=true' and 'pack_offset=auto'\n2) Immediately run their rerank pipeline (embedding lookup + cosine rerank) for a fixed prompt set\n3) Observe top-K and latency compared to baseline (before ingest)\nObserved behavior:\n- During and for ~20 minutes after ingest, rerank returns inconsistent orderings; similarity scores show small but noisy differences (~0.001-0.01) which flip ranks\n- Rerank service logs show occasional fallback to CPU scoring paths with messages: \"kv-shape-mismatch: fallback to cpu-sim\"\n- Vector-store reports some vectors with length 129 instead of expected 128 (spot-checked)\nExpected behavior:\n- All stored embeddings should be consistent in dimension (128) and rerank results deterministic for identical inputs unless model changes\n- Latency should remain within historical percentiles; no CPU fallback for standard cosine scoring on dedicated capacity\nLogs and traces (excerpt):\n- rerank-service: \"2026-03-12T09:41:12Z WARN scorer: vector-length-mismatch id=doc-7f2 len=129 expected=128 action=fallback\"\n- storage: \"packer: wrote blob batch-338 size=129*1000 offset=64 pack_offset=auto\"\n- serving-runtime: trace id=tx-0a3f: batch_size=1 seq_len=256 model=embedder-large-v2 kernel=opt_float\nAttachments: LexaSearch provided sample ingest manifest, subset of bad vectors (hex), and their rerank request trace\n",
+  "comments": [
+    "2026-03-12 10:02 - Asha Mehta (Support): Triage done. Customer reports reproducible after large batched ingest. Asking for sample payloads and small repro dataset.",
+    "2026-03-12 11:05 - Diego Ramos (SRE): I reproduced vector-length=129 for ~0.2% of entries when pack_offset=auto. Suspect off-by-one in packer when quantized sub-batches are appended.",
+    "2026-03-12 12:30 - LexaSearch (customer): We can reproduce with the supplied repro. Happy to grant access to a staging dataset for deeper debug. Concerned about production impact\u2014requesting mitigation.",
+    "2026-03-12 15:10 - Diego Ramos (SRE): Added temporary ingest-side validation to drop vectors with unexpected length as a stop-gap. This will be applied to LexaSearch's dedicated cluster only after approval.",
+    "2026-03-13 09:22 - Priya Ramanathan (Support): Noted customer acceptance for temporary validation. Filed internal task INT-33045 to add extended packer tests to CI.",
+    "2026-03-14 08:44 - Diego Ramos (SRE): Root cause hypothesis: packer logic concatenates a partial quantized block when pack_offset=auto. For mixed-precision ingest (float32 + int8) the offset calc can produce len+1 for some boundary cases. Creating fix PR and running extended regression suite.",
+    "2026-03-14 12:05 - Asha Mehta (Support): Customer notified of mitigation and ETA for full fix (eta in resolution)."
+  ],
+  "investigation_notes": "Steps taken:\n- Reproduced locally with customer's sample manifest; confirmed length=129 on a deterministic subset\n- Inspected packer code path: packer.append() branch that merges last partial block had a conditional using `if (offset + remainder) % pack_size == 0` which misses a boundary when remainder==pack_size-1 under mixed precision\n- Observed that when storage writes a blob containing an extra zero byte the vector deserializer interprets it as an extra float slot leading to len=129\n- CPU fallbacks occur because scorer validates vector length and triggers safe but slower path\nHypotheses:\n- pack_offset=auto interacts poorly with mixed-precision ingest; packer should normalize to target dimension post-quantization\n- Some older embedder-small-quant rows are being merged into float32 batches due to batch-mixing logic\nNext steps:\n- Prepare PR to normalize and assert vector dim before storage write (hotfix)\n- Add packing boundary unit tests and a fuzz test for mixed-precision batched appends\n- Apply temporary validation rule on LexaSearch dedicated cluster to drop and log bad vectors (already applied after customer approval)",
+  "resolution": "Mitigation applied: temporary validation on ingest rejected 129-length vectors and logged affected doc IDs (rolled out 2026-03-12 15:30 UTC to LexaSearch dedicated pool).\nPlanned fix: code change to packer condensate and post-quantize normalize dimension before write. PR created: https://github.com/redwood-inference/platform/pull/4899 (under review).\nPostmortem action items:\n- INT-33045: extend packer unit tests (owner: Diego Ramos)\n- OPS-2026-09: add monitoring alert when >0.01% vectors have unexpected lengths for any customer\n- Notify affected customers via ops bulletin once fix is merged and rolled out to all dedicated clusters\nResolution status: fix in progress; workaround in place. Customer agreed to keep ticket open until fix is deployed across all dedicated clusters.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_5295507243f348419bf27d4ed9ff9fcc"
+}

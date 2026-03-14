@@ -1,0 +1,111 @@
+{
+  "key": "ENG-31822",
+  "team": "engineering",
+  "title": "KV buffer offset overwrite caused by dynamic kernel handoff in tiled-attn path",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-27",
+  "updated_at": "2026-03-13",
+  "creator": "Maya Chen",
+  "assignee": "Rafael Ortiz",
+  "project": "runtime-kernels",
+  "cycle": "2026-W09",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "regression",
+    "kv-cache",
+    "kernel-selection",
+    "hotfix-blocker"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-2.4",
+  "security_review_required": "false",
+  "description": "After landing the tiled-attention micro-tiling and dynamic kernel handoff optimizations, we observed rare correctness regressions for long-context generation workloads (>= 16k). Outputs show silent numerical drift and token-level divergence that accumulates over long sequences. Investigation points to out-of-band writes into the KV buffer when the runtime switches from single-piece prefill kernels to tiled decode kernels under high concurrency and mixed-precision blending. This ticket tracks root-cause analysis, repro artifacts, immediate mitigations, and a tested fix path.",
+  "steps_to_reproduce": [
+    "1) Checkout runtime-2.4 branch with tiled-attn and dynamic-kernel-selection enabled (flags: --enable-tiled-attn --dk-handshake=on).",
+    "2) Start a multi-worker serving instance with 3 GPUs, model: gptx-16k-fp16-quant (context 16384), batch mix: many small prefill requests + 1 long prefill (length 12k) followed by concurrent decode streams.",
+    "3) Send a long-context generation prompt that exercises cache reuse (e.g., repeated prefix + appended new content) and enable deterministic sampling (top-k with fixed seed).",
+    "4) Observe divergence: token 1024-1500 shows mismatched logits compared to baseline without tiled-attn. Re-run with logging enabled (KV_INDEX/DEBUG) to capture offsets.",
+    "5) Repro rate observed ~1 in 250 runs in cluster stress tests; increases when prefill-to-decode handoff coincides with high kernel-switch churn.",
+    "6) Local constrained reproducible test harness included in /playgrounds/kv-repro/ with run_repro.sh and a saved model snapshot (sha:abc123)."
+  ],
+  "logs": [
+    "2026-02-25 14:12:01 [worker-2] WARN kernel_selector: switching kernel group from prefill_v1 to tiled_decode_v2 mid-request (request id 0x7f8e3a)",
+    "2026-02-25 14:12:01 [worker-2] DEBUG kv_store: writing chunk idx=15 offset=4096 size=2048 target_addr=0x7f3c0000",
+    "2026-02-25 14:12:01 [worker-1] DEBUG kv_store: writing chunk idx=15 offset=8192 size=2048 target_addr=0x7f3c0800",
+    "2026-02-25 14:12:01 [worker-2] ERROR decoder: kv-index mismatch expected_offset=8192 observed_offset=4096 (request id 0x7f8e3a)",
+    "2026-02-26 09:04:11 [repro-harness] TRACE mmap: mapped shared-kv region at 0x7f3c0000 length=2MB mode=rw"
+  ],
+  "investigation_notes": [
+    "Initial hypothesis: race between kernel handoff and async KV write completion leads to stale write landing at earlier buffer offset (address reuse).",
+    "Memory analysis shows two workers using the same physical page group for KV chunks when handoff happens within the same allocation slab; allocator does not always fence writes across kernel group boundaries.",
+    "Reproduced locally with instrumentation: toggling ON the 'force_fence_on_handoff' flag eliminates repro (0/1000 runs), indicating missing memory fence/ordering is causal.",
+    "FP32 vs FP16: numerical drift magnitude larger with mixed-precision blending because smaller quantized blocks are more sensitive to small misplacements in KV indices leading to downstream softmax differences.",
+    "Concurrency pattern: high-frequency micro-batching ramps up allocator slab reuse which amplifies window for overlapping async device->host copies and kernel launch reorderings.",
+    "Relevant subsystems: kernel_selector, allocator/kv_slab, async_copy_executor, tiled_attn codepath, decode scheduler.",
+    "Observed that fallback path (single-kernel decode) bypasses the handoff and does not reproduce.",
+    "Heap/Slab metadata corruption not observed; corruption limited to stale/incorrect offset writes rather than buffer overflow or out-of-bounds.",
+    "Cross-check with valgrind-style memory tools on CPU harness is noisy; best visibility comes from device-level tracking and deterministic logging of KV-index writes.",
+    "Found a low-probability ordering: Kernel A schedules async copy( chunk X ), kernel B assumes chunk X free and issues write to chunk X before copy completes -> stale overwrite."
+  ],
+  "root_cause": "Allocator slab reuse combined with missing ordering/fence between async device transfers and kernel handoff. The dynamic kernel selection path can cause two kernel groups to issue overlapping writes to the same KV chunk index without a synchronization barrier, producing offset mismatches and subtle numerical drift when mixed-precision tiled attention reinterprets the overwritten chunk.",
+  "mitigations": [
+    "1) Hotfix: enable conservative fencing on kernel handoff (force_fence_on_handoff=true) in runtime config for all customer-facing clusters running runtime-2.4. This avoids races at the cost of ~1-3% tail latency increase.",
+    "2) Emergency patch: allocator will mark recently-allocated chunks as 'quarantined' for N ms after async copies and avoid reusing identical slab pages until safe.",
+    "3) Add runtime telemetry to count 'overlapping_kv_writes' and log per-request stack trace when detected to aid triage.",
+    "4) Notify SRE + Customer Success for high-usage tenants (internal list) to opt-in to hotfix rollout.",
+    "5) Rollback tiled-attn dynamic handoff via feature-flag for impacted clusters if high error rates observed.",
+    "6) Add a deterministic unit test that simulates allocator race windows using injected delays to prevent regression."
+  ],
+  "proposed_fix": "Implement a two-part fix: A) update async_copy_executor to expose a completion fence API and ensure kernel_selector invokes a fence before reassigning slab pages to a different kernel group; B) allocator changes to include per-chunk generation counters and compare-on-write to reject stale writes (and log). Include e2e test harness and perf benchmarks to measure latency impact. Target is to land fix in runtime-2.4.1 with regression tests.",
+  "plan": [
+    "2026-02-28: create reproducible harness and add failing unit test (done).",
+    "2026-03-01: rollout conservative fencing as cluster config (done on canary).",
+    "2026-03-03: implement fence API in async_copy_executor (PR queued: github.com/redwood/runtime/pull/4921).",
+    "2026-03-07: allocator per-chunk generation counter implementation (draft PR: github.com/redwood/runtime/pull/4938).",
+    "2026-03-10: merge tests and run full perf matrix, measure tail latency and throughput regressions.",
+    "2026-03-13: prepare runtime-2.4.1 release candidate, run smoke on dedicated clusters and customer canaries.",
+    "2026-03-20: target GA release of runtime-2.4.1 if canary metrics are green.",
+    "Post-GA: backfill telemetry dashboards and add a long-running stress job to CI (nightly)."
+  ],
+  "linked_prs": [
+    "https://github.com/redwood/runtime/pull/4921",
+    "https://github.com/redwood/runtime/pull/4938",
+    "https://github.com/redwood/runtime/pull/4945 (tests)"
+  ],
+  "related_issues": [
+    "ENG-27653",
+    "ENG-24681"
+  ],
+  "notes_for_release": [
+    "runtime-2.4.1 includes a correctness fix for KV slab reuse races when dynamic kernel handoff is enabled.",
+    "Default behavior: conservative fencing is enabled for all clusters upgrading to 2.4.1; feature flag will control future performance-optimized handoff once fix validated.",
+    "Operators should watch 'runtime.kv.overlapping_writes' metric and report any non-zero counts.",
+    "See postmortem draft in Confluence: https://confluence.redwood.ai/display/RUNTIME/KV+Handoff+Race+PM-31822"
+  ],
+  "comments": [
+    "2026-02-27 Maya Chen: Filed after customer report and internal stress runs produced divergent tokens. Assigned to Rafael for triage.",
+    "2026-02-28 Rafael Ortiz: Reproduced locally with repro harness. Adding instrumentation to log per-chunk generation ids. Initial hotfix (force_fence_on_handoff) applied to canary cluster.",
+    "2026-03-02 Priya Menon (SRE): Canary metrics showed a 2.1% tail-latency regression but zero correctness errors after hotfix applied. Rolling to 20% of clusters.",
+    "2026-03-05 Tomasz Kowalczyk (ML Research): Confirmed numerical drift disappears when fencing is enabled. Provided guidance on minimizing fence cost via fine-grained completion signaling.",
+    "2026-03-09 Liza Park (QA): Added stress test that simulates allocator slab churn with mixed precision. Test fails on 1.0.0 build, passes on fence-enabled build.",
+    "2026-03-11 Rafael Ortiz: Submitted PRs. Benchmarks show ~0.8% median latency impact and 2.4% P99 increase in worst-case tiled-attn-heavy workloads. Preparing release notes and rollback plan.",
+    "2026-03-13 Maya Chen: Marking In Progress -> awaiting PR review and SRE canary validation. Notifying CS for impacted customers.",
+    "Unresolved: decide on long-term allocator design (generation counters vs slab-level quiesce). Rafael to propose by 2026-03-16."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "root_cause",
+    "mitigations",
+    "proposed_fix",
+    "plan",
+    "notes_for_release",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_c1b3b38fe2f74d00a5385a38bc843b99"
+}

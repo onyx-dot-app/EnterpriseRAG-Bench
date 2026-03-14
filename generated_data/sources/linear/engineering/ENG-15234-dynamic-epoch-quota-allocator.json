@@ -1,0 +1,101 @@
+{
+  "key": "ENG-15234",
+  "team": "engineering",
+  "title": "Dynamic epoch-based quota allocator and commit-window enforcement",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-03-01",
+  "creator": "Ava Chen",
+  "assignee": "Diego Martinez",
+  "project": "billing-core",
+  "cycle": "2026-W06",
+  "estimate": "13",
+  "due_date": "2026-03-15",
+  "labels": [
+    "quota",
+    "billing",
+    "reserved-capacity",
+    "migration",
+    "rate-limiting"
+  ],
+  "description": "Introduce an epoch-based quota allocator that unifies daily/monthly anchoring and rolling-window semantics into a single, efficient commit window model. This change targets correctness of usage accounting across hosted and reserved capacity products, reduces burst reconciliation complexity, and enables sub-second enforcement for API rate limiting. The allocator will maintain compact epoch counters per tenant+route, support configurable commit windows (aligned, rolling, and hybrid), and allow zero-downtime migration with backward-compatible read/write paths.",
+  "acceptance_criteria": [
+    "1) Quota consumption is recorded in epoched counters and reconciles to the same per-tenant totals as the legacy system within +/- 0.01% for a representative workload",
+    "2) Rolling-window semantics (e.g., 30-minute sliding window) can be expressed and enforced via epoch spans without per-request full history scans",
+    "3) Reserved capacity commitments are enforced against epoched quotas with correct priority (reserved first, shared pool second), and no customer sees unexpected token throttles during migration",
+    "4) API compatibility: existing quota APIs (GET /quota, POST /consume) work unchanged during rollout; new endpoints for diagnostic introspection are available behind a feature flag",
+    "5) Performance: median quota-check latency <= 2ms additional overhead at P95 tail under production concurrency compared to baseline"
+  ],
+  "design_decisions": [
+    "Use fixed-length epoch buckets (configurable granularity: 1m, 5m, 1h) stored in Redis for hot counters and periodically persisted to primary metering store (Postgres) for long-term accounting",
+    "Model rolling windows as a sum across the N most-recent epochs (sliding-sum) to avoid per-request scanning of event logs",
+    "Reserved capacity tracked as separate quota-class; allocator first decrements reserved epoch counters, then falls back to shared epoch counters with optional throttling policy",
+    "Adopt optimistic write-through strategy: write to Redis (fast path) and enqueue durable write to metering pipeline. On Redis miss fallback to metering store read-repair",
+    "Provide read-after-write guarantees per request using a local in-process cache for the request lifecycle to ensure idempotency in retries"
+  ],
+  "implementation_notes": [
+    "Schema: add epochs table in Postgres: (tenant_id, route, epoch_start_iso, epoch_granularity, consumed_units) \u2014 note: store as text/date/number columns; migrations will backfill from existing usage_events",
+    "Redis layout: key pattern quota:epoch:{tenant}:{route}:{granularity}:{epoch_start} -> integer consumed. Use HINCRBY for atomic increments during consume path",
+    "API: keep existing quota endpoints; add ?version=epoch to query epoched breakdown. New internal endpoint POST /internal/quota/commit to atomically flush an epoch batch to Postgres",
+    "Instrumentation: emit 'quota.epoch.consume' histograms and 'quota.reconcile.delta' gauges. Tag by tenant, environment, and reserved=true/false",
+    "Concurrency: use short TTL locks (50ms) only for rare cross-process reconciliation; main path must be lock-free to meet tail latency goals",
+    "Backfill: daily job to convert last 90 days of usage_events into epoched aggregates. Backfill runs in low-traffic windows and can be paused per-tenant",
+    "Fallbacks: if Redis unavailable, proxy consumes to a degraded synchronous path that writes directly to Postgres with rate-limiters to protect DB"
+  ],
+  "rollout_plan": [
+    "Phase 1 (canary): implement epoch allocator behind feature flag; route 5 internal test tenants and internal tooling (dev/staging) to new path. Monitor correctness metrics and latency for 72h",
+    "Phase 2 (opt-in customers): enable for selected small external tenants with non-critical SLAs and run comparative accounting for 7 days",
+    "Phase 3 (mixed): enable for 20% of production traffic using header-based routing and run reconciliation job nightly. Support automated rollback via feature flag",
+    "Phase 4 (full): flip feature flag for all tenants, retire legacy rolling-window aggregator after 14-day observation and final reconciliation",
+    "Migration: run backfill job in parallel to populate historical epochs; once parity achieved, switch read path to epoched store for downstream billing exports"
+  ],
+  "testing_plan": [
+    "Unit tests for epoch summation logic and reserved-first decrement semantics",
+    "Integration harness that replays production trace (1h sample) against both legacy and epoch allocator and asserts totals match within tolerance",
+    "Chaos test: simulate Redis partitions and ensure fallback path preserves correctness and emits alerts",
+    "Load test: synthetic traffic to validate P95 latency budget at target QPS and verify no DB saturation during fallback",
+    "E2E billing validation: run sample invoices using epoched exports and verify numbers against current billing pipeline for 30 customers"
+  ],
+  "monitoring_and_alerting": [
+    "Dashboards: Quota-epoch ingestion rate, redis hit rate, reconcile delta distribution, per-tenant reserved vs shared consumption",
+    "Alerts: reconcile.delta > 0.5% across production tenants for >1h, redis error rate > 0.5% for 10m, direct-postgres-fallback > 1% of consumes",
+    "SLOs: consumer-facing quota-check added latency P95 < 10ms, correctness regression < 0.1% from baseline",
+    "Runbooks: link to incident runbook for \"epoch-allocator divergence\" and steps to toggle feature-flag and backfill"
+  ],
+  "customer_impact": "medium",
+  "dependencies": [
+    "ENG-14800",
+    "ENG-15002"
+  ],
+  "parent_issue": [
+    "ENG-14200"
+  ],
+  "links": [
+    "https://confluence.redwood.ai/display/INF/epoch-based-quota-allocator+design",
+    "https://github.com/redwood-inference/platform/pull/4123",
+    "https://grafana.redwood.ai/d/dBQuotas/epoch-allocator-overview"
+  ],
+  "comments": [
+    "2026-02-12 - Ava Chen: Initial design doc posted. Decided on Redis hot buckets + Postgres cold store to meet tail latency goals. See Confluence link above.",
+    "2026-02-18 - Diego Martinez: Spike completed. Prototype Redis HINCRBY path shows median +0.9ms, P95 +3.1ms on dev cluster. Need to optimize network hop for cross-AZ traffic.",
+    "2026-02-22 - PM feedback (Jordan Lee): Ensure reserved capacity enforcement precedence is documented; customers should never lose committed throughput during migration. Added acceptance criterion.",
+    "2026-02-26 - QA: Integration replay harness validated for 6h trace; totals differed by 0.06% (within tolerance). Found edge-case with midnight epoch boundaries for monthly anchored quotas.",
+    "2026-02-28 - Security review requested: storing epoch metadata handled with tenant scoping; security_review_required=false per initial assessment",
+    "2026-03-01 - Diego Martinez: Open PR linked. Next: implement read-repair for Redis misses and add alerting for reconcile.delta > 0.5%"
+  ],
+  "release": "billing-2026.03",
+  "security_review_required": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "design_decisions",
+    "implementation_notes",
+    "rollout_plan",
+    "testing_plan",
+    "monitoring_and_alerting",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_ca2c71851349489e94a9ee234fc8b0e5"
+}

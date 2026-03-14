@@ -1,0 +1,102 @@
+{
+  "key": "ENG-523581",
+  "team": "engineering",
+  "title": "Investigate pinned host-staging oscillation causing steady GPU RSS growth under continuous batching",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-11-03",
+  "updated_at": "2025-11-12",
+  "creator": "Maya Chen",
+  "assignee": "Luca Romano",
+  "project": "serving-runtime-memory-stability",
+  "cycle": "2025-W45",
+  "estimate": "5",
+  "due_date": "2025-11-20",
+  "labels": [
+    "kv-cache",
+    "cudaMallocAsync",
+    "memory",
+    "continuous-batching",
+    "investigation"
+  ],
+  "description": "Production inference pools with continuous batching enabled show a slow but steady increase in GPU resident set and host pinned memory over 24+ hour runs. Pattern emerges when KV prefetch is enabled and workloads have many small lookups (tail latencies low, throughput high). Symptoms: rising RSS on GPU (nvidia-smi), increase in host pinned pages, and longer contagion of cudaFree completion times in logs. This ticket tracks root-cause tracing, short-term mitigations, and permanent fixes to allocator/free-path behavior.",
+  "steps_taken": [
+    "Created small repro harness that simulates continuous batching with synthetic prompts and randomized KV prefetch sizes (256B-16KB) - repo: github.com/redwood/repro/eng/ENG-523581",
+    "Collected heap snapshots from the runtime with MALLOC_TRIM, jemalloc stats, and custom allocator counters at 1h intervals",
+    "Enabled CUpti/cudaMemGetInfo sampling and captured per-stream allocation histograms for 12h on a busy Dedicated cluster node",
+    "Instrumented allocator metadata to log stream_id, arena_id, allocation_size, and event fence timestamps for allocations > 512 bytes",
+    "Pulled node telemetry (prometheus): allocator.free_latency_seconds_bucket, cuda_async_pending_events, host_pinned_bytes, gpu_resident_bytes over 72h"
+  ],
+  "hypotheses": [
+    "Pinned host-staging allocations are being created as a fallback when device pool allocation misses; these pinned allocations are not returned promptly because their free-work is queued on a stream that frequently stalls under continuous batching.",
+    "cudaMallocAsync per-stream arena trim callbacks are not firing due to backpressure: event callbacks are scheduled on the same streams used for inference, and long-running batches block trimming, preventing return-to-OS or to fallback pools.",
+    "Small, highly fragmented allocation sizes from KV prefetch cause slab internal fragmentation and keep many arenas partially occupied, preventing full slab reclamation.",
+    "An interaction between our KV prefetch concurrency and allocator's async-decommit watermark causes constant churn between device and host-staging pools leading to oscillating pinned memory peaks and gradual leak-like residue.",
+    "Race condition in deferred-free queue where remote stream frees are delayed by a misordered event fence, leaving allocations in 'quarantine' until stream drain which can be arbitrarily delayed under load."
+  ],
+  "findings": [
+    "Reproducer shows steady host_pinned_bytes growth when concurrent prefetch threads >= 8 with average prefetch size < 8KB. Lower concurrency or larger prefetch sizes reduce growth rate.",
+    "Per-stream histograms show many small allocations pinned to worker streams and frees posted to a central 'reclaim' stream; drains for the reclaim stream are delayed by ~50-200ms under peak batching windows, accumulating queued frees.",
+    "Allocator internal metrics show deferred_free_queue length correlates with host_pinned_bytes spikes. When queue length > 10k entries, pinned memory climbs until manual throttle applied.",
+    "nvtx traces reveal event callbacks used by cudaMallocAsync trim are scheduled on the inference streams; when a stream runs long microbatches, the trim callback latency spikes and the allocator does not trim arenas.",
+    "No evidence of a kernel-level driver leak; cudaMemReport and driver traces show allocations are accounted for but release timing is delayed, causing effective growth in resident set until eventual reclamation.",
+    "Captured one reproducible race where an allocation's free fence was signaled on the wrong stream in a rare code-path when fallback host staging was used concurrently with prefetch cancellation; this caused the allocation to remain 'reachable' by the allocator's arena and not be recycled.",
+    "Pinned staging pool size increases as allocator prefers returning small freed device blocks to host staging instead of merging them into larger device arenas when fragmentation thresholds are high."
+  ],
+  "short_term_mitigations": [
+    "Throttle KV prefetch concurrency by default in the runtime config (max_prefetch_concurrency: 4) to reduce small-allocation tail under load. Deployed to canary pool on 2025-11-06.",
+    "Increase host-staging pool cap per-GPU temporarily to avoid OOMs while we instrument deeper (staging_pool_cap_bytes: +25%).",
+    "Enable an emergency background 'free-runner' thread per node that consumes deferred_free_queue and uses a dedicated reclaim stream to process frees even if worker streams are busy. (Patch applied behind flag: runtime.free_runner_enabled=true)",
+    "Add temporary alert: allocator.deferred_free_queue_length > 2000 -> page on oncall and auto-throttle prefetch rate for affected node."
+  ],
+  "proposed_long_term_fixes": [
+    "Offload all allocator trimming and free processing to a dedicated reintegrator thread/stream to avoid relying on worker streams for critical trims.",
+    "Change host-staging allocation policy: prefer coalesced staging for many small prefetches by aggregating small KV prefetch requests into a single backed pinned buffer, reducing slab fragmentation.",
+    "Introduce adaptive trim thresholds for cudaMallocAsync arenas based on observed stream stall percentiles and deferred_free_queue growth; tune to proactively trim when drain latency rises.",
+    "Fix the identified free-fence race by auditing fallback paths and ensuring frees always attach fences to the reclaim stream. Add unit tests that simulate concurrent cancellation, fallback, and prefetch interleaving.",
+    "Add allocator-level metrics: per-arena fragmentation ratio, scheduled_trims_pending, last_trim_latency_millis for observability and runbook automation",
+    "Experiment with small-allocation coalescer in the KV prefetcher to group many <4KB prefetches into single device allocations with internal indexing, evaluate latency trade-offs.",
+    "Roll out phased canaries and monitor: runtime-1.22 with reclamation-thread and adaptive-trim (canary -> 5% -> 25% -> full)."
+  ],
+  "next_steps": [
+    "Create PR with reclaim-thread implementation and unit/integration tests (ENG-523581/reclaim-thread) - target: 2025-11-14",
+    "Prototype coalescer in KV prefetcher as opt-in flag; bench memory usage and p50/p95 latency impact - assigned to @anika-s (research pairing)",
+    "Add new Prometheus gauges and alerts for allocator.per_arena_fragmentation and allocator.last_trim_latency - infra ticket INF-1187",
+    "Schedule runtime perf run against Dedicated cluster using 4xA100, run 24h stable workload with continuous batching to validate regression on memory slope",
+    "Prepare rollout plan and runbook covering emergency rollback (disable reclaim-thread, revert prefetch throttle), include postmortem template."
+  ],
+  "linked_prs": [
+    "https://github.com/redwood/runtime/pull/8542 - reclaim-thread: background deferred-free processor (WIP)",
+    "https://github.com/redwood/kv/pull/299 - opt-in small-allocation coalescer (prototype)",
+    "https://github.com/redwood/infra/pull/412 - prometheus exporter: allocator metrics"
+  ],
+  "artifacts_links": [
+    "https://confluence.redwood.ai/display/MM/ENG-523581+-+Pinned+staging+oscillation+investigation",
+    "s3://redwood-dumps/ENG-523581/heap_snapshots/2025-11-05/",
+    "https://grafana.redwood.ai/d/allocator/allocator-deferred-free?orgId=1&from=now-7d&to=now",
+    "https://drive.google.com/drive/folders/1X_repro_eng_523581_traces"
+  ],
+  "comments": [
+    "2025-11-04 Maya Chen: Initial hypothesis drafted after first 12h of traces. I can reproduce growth locally with synthetic KV workload; setting up longer run on Dedicated canary.",
+    "2025-11-06 Luca Romano: Deployed prefetch throttle and reclaim-thread flag to canary. After 48h canary shows flat host-pinned bytes vs previous 8% daily growth. Need to validate at scale.",
+    "2025-11-08 Ops (Sanjay Patel): Observed one canary node where deferred_free_queue still creeps after 72h, attaching logs to artifact bucket. Workload there had many cancellations; investigate cancellation path.",
+    "2025-11-10 Design review with Research: coalescer prototype looks promising for memory but adds 1-3ms median prefetch latency in worst cases; acceptable for some classes of service.",
+    "2025-11-11 Security (Aria Gomez): Reviewed reclaim-thread design for potential timing side-channels with KMS operations; no issues found but recommended audit when enabling in Private deployments.",
+    "2025-11-12 Luca Romano: Found fix for free-fence race, adding test that simulates concurrent fallback+cancel. Opening PR today."
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_taken",
+    "hypotheses",
+    "findings",
+    "short_term_mitigations",
+    "proposed_long_term_fixes",
+    "next_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_59792a9d7a6d4c77a57549bb9a49ba7f"
+}

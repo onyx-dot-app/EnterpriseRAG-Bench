@@ -1,0 +1,50 @@
+{
+  "key": "ENG-472019",
+  "team": "engineering",
+  "title": "Soft-fence anchored multi-region routing with capacity-token steering",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Kumar",
+  "assignee": "Diego Morales",
+  "project": "multi-region-reliability",
+  "cycle": "2026-W09",
+  "estimate": "8",
+  "due_date": "2026-04-01",
+  "labels": [
+    "routing",
+    "slo",
+    "circuit-breaker",
+    "capacity",
+    "prod-readiness"
+  ],
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Goal: Implement a production-safe routing policy that balances latency SLOs, geo-locality preferences, and exhausted-region capacity without hard ejects. We call this the 'soft-fence anchored routing' approach.\n\nMotivation: Current geo-pin + hedge strategies either send too much traffic to a pinned region during transient overload (causing cascading latency violations) or eject aggressively and lose locality (increasing egress and token costs). We need a policy that: 1) preserves locality as primary objective when SLOs are healthy, 2) gracefully shifts load under capacity constraints, 3) keeps latency SLO regressions bounded via regional circuit breakers and hedging, and 4) exposes clear observability and rollback knobs in Console.\n\nKey concepts introduced by this ticket: \n- Capacity tokens: per-region, time-windowed token buckets representing remaining serving capacity that incorporate GPU util, queuing, and KV cache miss penalty. Tokens are decremented at admission and periodically refilled based on autoscaler hints and measured throughput.\n- Soft-fence anchor: each customer request has a preferred region anchor (geo-pin) and an elasticity window. When anchor region tokens > high-watermark, prefer anchor. When tokens in anchor drop below low-watermark, begin probabilistic spillover to fallback lanes instead of immediate hard ejection.\n- Graded circuit breakers: regional CBs with three states (Closed, Soft-Open, Hard-Open). Soft-Open enables traffic shaping: reduce per-second token grants, raise hedging rate with shorter hedging TTL, and shift a bounded percentage of new requests to fallbacks. Hard-Open triggers fast-hedging + immediate falls to regional fallbacks and back-pressure responses (429/503 patterns per API tier).\n- Hysteresis windows and SLO weighting: SLO evaluation uses a sliding 3-min window and an exponential backoff for reversion to Closed, preventing flapping on noisy signals. Weight SLOs by customer tier: enterprise tenants have higher locality retention thresholds.\n\nRouting algorithm (high level): \n1) On request arrival, compute anchor region (geo pin) and candidate fallbacks ordered by latency score + capacity_token_ratio.\n2) Query regional token buckets for anchor & top-3 fallbacks.\n3) If anchor.tokens >= high_watermark: route to anchor.\n4) Else if anchor.tokens between low_watermark and high_watermark: probabilistic routing: route to anchor with p = anchor.tokens/high_watermark, else route to highest scored fallback.\n5) Else (anchor.tokens < low_watermark): consult regional CB state. If Soft-Open -> route to fallback with p=0.75, otherwise if Hard-Open -> route to fallback (p=1) and return overload hints to client via headers (X-Redwood-Overload: region=us-west1; suggested=us-east1).\n6) If no fallback has tokens, engage global back-pressure: controlled 429 (soft quota) or queue admission if request latency budget allows.\n\nTelemetry & metrics to surface in Console (initial set): \n- per-region capacity_tokens_available (gauge), refill_rate (gauge), tokens_consumed/sec (counter)\n- region_cb_state{region} (enum metric) \n- routed_requests{region,via_fallback,anchor_hit} (counter)\n- hedged_requests{region,origin} (counter) and hedged_tail_latency (histogram)\n- SLO_window_p99 and SLO_window_p50 per route & region (histogram)\n- rejection_rate{region,reason} (counter)\n\nExample PromQL checks for alerts: \n- High-risk of cascade: increase in tokens_consumed per second with anchor_hit_ratio dropping: sum(rate(tokens_consumed[1m])) by (region) > 0.9 * provisioned_qps AND increase in fallback routed fraction > 15% over 5m.\n- Circuit-breaker transition: increase when region_cb_state == \"Soft-Open\" for >3m triggers page.\n\nDesign tradeoffs: \n- Why tokens vs simple util thresholds: tokens let us blend multiple signals (GPU util, queue length, KV cache miss penalty, observed tail latency) and provide a smooth admission control primitive.\n- Probabilistic spillover avoids synchronized traffic bursts to fallbacks which lead to thundering herd failures.\n- Soft-Open + hysteresis increases complexity but reduces flapping compared to strict per-second threshold-based ejections.\n- Cost: Increased cross-region traffic during spillover and hedging; we'll tune enterprise tier thresholds to limit egress for paid customers.\n\nImplementation plan: \nPhase A (prototype, non-prod): \n- Implement capacity token agent in runtime (C++/Rust module) that exposes gRPC query endpoint. Instrument token metrics.\n- Add routing decision extension point that can query token agent and CB state.\n- Build a simulator (Python) to run traffic replay for 8-week production traces and verify no SLO regressions across 1000 customers.\n\nPhase B (canary): \n- Enable policy for internal test tenants only. Create a canary route that receives 1% of traffic. Monitor tokens, hedging rate, latency SLOs for 1 week.\n- Guardrails: automatic rollback if p99 increases by >10% or fallback rate > 20% for 15 minutes.\n\nPhase C (gradual rollout): \n- Expand to small external customers, increase to 10% -> 30% -> 100% with manual signoffs and postmortem after each stage.\n\nTesting & validation: \n- Unit tests for token refill and consumption invariants. \n- Integration tests for CB transitions under synthetic load with traffic shapes: ramp, spike, slow-stop. \n- Chaos experiments: region-level isolation, packet loss, delayed refill. \n- Performance: microbench routing latency added must be <150us p95 on the control path.\n\nMonitoring & runbooks: \n- New Console dashboard: Routing Health (anchor_hit_rate, fallback_fraction, CB_state timeline) and Capacity Tokens heatmap. \n- Runbook snippets: soft-open remediation (reduce ingress by N%, increase refill rate via autoscaler hint, temporarily raise low_watermark). Hard-open remediation: region evacuation playbook: run ENG-evacuate-2025 procedure + increment global hedging TTL.\n\nRollout artifacts & links: \n- Design doc: https://confluence.redwood.ai/display/INF/Soft-Fence+Anchored+Routing (draft)\n- Simulator repo: https://github.com/redwood-inference/route-sim (branch: soft-fence-proto)\n- Canary PR: https://github.com/redwood-inference/redwood-runtime/pull/4581\n- Draft Console dashboard: https://console.redwood.ai/dashboards/d/route-health/soft-fence (viewable internally)\n\nOpen questions / follow-ups: \n- Exact watermarks per region and per tier (need 1-week of baseline telemetry to pick values).\n- How to expose suggested fallback hints to SDKs vs raw REST. Proposal: include header and a structured response object for SDKs that opt in.\n- Policy persisted config: per-customer pinned-anchors with override windows. Need PM + Privacy review for mutable geographic preferences.\n\nNext steps (this ticket): \n- Implement token agent prototype + basic routing hook (ENG-472020 will track runtime impl subtasks).\n- Land simulator and run 7-day replay to propose default watermark values.\n- Create Console dashboard skeleton and alert rules.\n\nThis ticket contains the high-level policy, rollout plan, and observability footprint. Subsequent tickets will split runtime code, autoscaler hints, SDK surface, and console UX work.",
+  "comments": [
+    "2026-02-21 - Aisha K: Kickoff meeting notes added. Agreed on token-bucket primitive and soft-open concept. Action: Diego to prototype token agent.",
+    "2026-03-01 - Diego M: Prototype token agent running in test runtime build. Initial refill uses moving-average of last 5m GPU util and queue length. PR: #4558 internal.",
+    "2026-03-05 - SRE: Observed small spike during stress test where fallback fraction hit 22% under synthetic 5x load. Adjusted soft-open threshold upward. Filed follow-up ENG-472021 for tuning.",
+    "2026-03-10 - PM (Marta Chen): Confirmed enterprise tier anchor retention requirement. Added to project plan and estimate increased by 2 points.",
+    "2026-03-12 - Diego M: Canary PR opened for runtime hook (PR 4581). Scheduler integration pending; simulator results uploaded to route-sim branch.",
+    "2026-03-12 - Notes: Updated rollout guardrails and added automatic rollback thresholds."
+  ],
+  "dependencies": [
+    "ENG-472020",
+    "ENG-472021"
+  ],
+  "parent_issue": [],
+  "sub_issues": [
+    "ENG-472020"
+  ],
+  "customer_impact": "medium",
+  "notes": "This design targets typical cross-region traffic patterns. We will tune per-customer thresholds and document egress cost implications for Marketplace customers.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_73eba366385342b8b1e378348ebe657b"
+}

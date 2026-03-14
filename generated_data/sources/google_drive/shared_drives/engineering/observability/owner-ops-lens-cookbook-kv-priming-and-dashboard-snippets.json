@@ -1,0 +1,37 @@
+{
+  "title": "Owner Ops Lens: KV priming, small-batch latency and dashboard snippets",
+  "owner": "Ava Martinez",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/observability/owner-ops-lens-cookbook-kv-priming-and-dashboard-snippets.json",
+  "doc_type": "doc",
+  "created_at": "2024-11-12",
+  "last_modified": "2026-02-10",
+  "collaborators": [
+    "Liam O'Connor",
+    "Priya Natarajan",
+    "Diego Alvarez"
+  ],
+  "team": "eng-observability",
+  "status": "draft",
+  "tags": [
+    "kv-cache",
+    "latency",
+    "small-batch",
+    "dashboard",
+    "operator-playbook",
+    "quantile",
+    "runbook"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-OBS-LENS-234",
+    "JIRA-OPS-8721",
+    "https://github.com/redwood-inference/observability/pull/418"
+  ],
+  "content": "Purpose and scope:\nThis is a compact, hands-on playbook for oncall/operator folks to diagnose small-batch and KV-priming related latency anomalies and to ship small dashboard snippets that accelerate triage. It is intentionally prescriptive \u2014 quick checks, minimal queries, panel templates, and trace anchors.\n\nWhy this exists (problem statement):\n- We repeatedly see short-lived latency spikes that only surface when traffic is in small-batch mode (low QPS with many single-request sessions).\n- Those spikes often correlate with cold KV cache / prefix miss patterns or with different kernel-paths triggered by very short sequence lengths.\n- Operators need a 5\u201310 minute checklist and a couple of dashboard panels to confirm hypothesis and trigger mitigations (prefetch, temporary routing changes, fallback to smaller model variant).\n\nQuick triage checklist (5\u201310 min):\n1) Confirm scope: is the signal concentrated to a single tenant/route or widespread?\n   - Query: top 5 tenants by 95th-token-latency in last 10m.\n2) Is KV cache hit rate depressed for affected tenant(s)?\n   - Metric: kv.prefix_hit_rate (tenant-scoped, 1m rollup).\n   - Quick gauge: if < 70% and latency high -> strong hint for cold-cache.\n3) Check small-batch signature: fraction_single_request_sessions = single_req_sessions / total_sessions (1m).\n   - If > 60% and 95th latency elevated, follow small-batch path below.\n4) Pull sample traces anchored on token generation spans (span: token.generate).\n   - Look for repeated cpu/gpu-wait spans, and for kv.fetch spans with remote-rt > 10ms.\n5) If KV misses + small-batch -> consider ephemeral prewarm or route to prewarmed pool.\n\nKey metric definitions (operator-focused):\n- token.generate.latency.p50/p95/p99: end-to-end time between request.accept and response.close (ms).\n- kv.prefix_hit_rate: 1 - (kv.prefix.miss_count / kv.prefix.request_count) per tenant, 1m window (ratio).\n- session.single_request_rate: sessions_with_only_one_request / sessions_started, 5m window (ratio).\n- small_batch_tail_ratio: fraction of requests served in batches of size <=2 vs total served (1m).\n- batch.aggregation_delay_ms: time waiting to form a batch (median/95th).\n\nSuggested alerting anchors (conservative):\n- P95 token.generate latency > 600ms for production tier with traffic > 5 RPS sustained for 3m.\n- kv.prefix_hit_rate < 0.6 for a tenant for 5m AND p95 latency > 300ms -> page oncall.\n- single_request_rate > 0.7 AND small_batch_tail_ratio > 0.6 AND p95 latency delta > +2x baseline -> paged SEV.\n\nTrace instrumentation notes (what to look for in spans):\n- span names / attributes to prioritize:\n  - token.generate (attr: model_variant, seq_length, batch_size)\n  - kv.fetch (attr: prefix, hit=true/false, backend_host)\n  - batch.wait (attr: wait_ms, deadline_ms)\n  - gpu.exec (attr: kernel_path, quant_mode)\n- Recommended trace filter: traces where token.generate.p95 > 200ms and kv.fetch.hit=false OR batch.wait > 10ms.\n- Add an annotation on token.generate with short_profile=true if seq_length < 16 and batch_size <= 1 to ease visual search.\n\nMinimal dashboard snippets (copy/paste for rapid creation) \u2014 suggestions for three small panels:\n1) \"Owner Lens: small-batch heat\" (heatmap)\n   - X axis: minute timestamps (last 60m)\n   - Y axis: tenant id (top 30 by requests)\n   - Cell metric: p95(token.generate.latency)\n   - Color stretch: 0 -> 800ms\n   - Use additional small-legend: single_request_rate as sparkline per tenant.\n2) \"KV priming summary\" (table)\n   - Columns: tenant, kv.prefix_hit_rate (1m), p95 token.generate, single_request_rate, last_kv_miss_host\n   - Sort by kv.prefix_hit_rate asc.\n3) \"Batching stack\" (stacked bar + line)\n   - Bars: count of requests by batch_size (0,1,2,3+) per minute\n   - Line overlay: batch.aggregation_delay_ms.p95\n\nPanel thresholds and quick actions mapped to panels:\n- KV priming table: if kv.prefix_hit_rate < 0.6 -> show button \"Start ephemeral prewarm\" (ops playbook action).\n- Small-batch heat: if tenant row has sustained p95 > 2x baseline for 10m -> escalate to SEV workflow.\n\nRemediation cookbooks (short):\n- Cold KV priming temporary mitigation:\n  1) Trigger prewarm job with top 50 recent prefixes for tenant X (backfill from request logs).\n  2) Increase short-term batch window to 40ms for tenant X (only if operator control plane allows).\n  3) If above not available, route a fraction (10%) of traffic for 20m to prewarmed pool by model routing policy.\n- Persistent fix path: create a cache-warming job as part of rollout (see linked Confluence page).\n\nInvestigation queries (SQL-like pseudocode for quickcards):\n- Recent prefixes that missed most:\n  SELECT prefix, count(*) as misses\n  FROM kv.fetch_events\n  WHERE tenant = 'TENANT_X' AND hit = false AND ts > now() - interval '60 minutes'\n  GROUP BY prefix ORDER BY misses desc LIMIT 200;\n\n- Batch size distribution for tenant:\n  SELECT batch_size, count(*) FROM token.requests WHERE tenant='TENANT_X' AND ts > now() - interval '30 minutes' GROUP BY batch_size ORDER BY batch_size;\n\nNotes to self / unresolved questions (working doc):\n- How noisy will the kv.prefix_hit_rate be for very low-request tenants? Need sample smoothing strategy (EWMA or min-window).\n- Consider adding tenant-weighted baseline for p95 (so small tenants don't create false positives).\n- Should we add a synthetic probe that primes top prefixes every 10 minutes for low-QPS tenants? Pros/cons in linked Confluence.\n\nFollow-ups and next steps:\n- Wire these three mini-panels into the operator microdash (PR: observability#418).\n- Run a two-week experiment: enable ephemeral prewarm triggered by kv.prefix_hit_rate < 0.6 for a test cohort. Track cost delta and p95 improvement. (JIRA-OPS-8721).\n- Draft a short onboarding slide (1\u20132 slides) for oncall run deck with this checklist and two screenshot examples.\n\nAppendix: quick glossary (operator shorthand):\n- KV priming / prewarm: proactive population of per-tenant prefix keys into the KV layer to avoid remote fetches on first request.\n- Small-batch mode: traffic regime with majority of requests arriving solo rather than being coalesced into larger batches; often increases per-token overhead.\n- Batch aggregation delay: the latency introduced while waiting briefly to coalesce more requests into one GPU batch.\n\n-- end of draft --\n\n",
+  "file_path": "sources/google_drive/shared_drives/engineering/observability/owner-ops-lens-cookbook-kv-priming-and-dashboard-snippets.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_cd5cc3cd8d32498c91fd2ece81b97029"
+}

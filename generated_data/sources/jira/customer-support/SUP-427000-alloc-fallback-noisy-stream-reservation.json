@@ -1,0 +1,66 @@
+{
+  "key": "SUP-427000",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Dedicated pool throughput collapse: allocator holding reservations due to noisy short-stream tenant and autoscaler non-reactivity",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Maya Chen",
+  "assignee": "Priya Nair",
+  "customer_company": "GreenDraft AI",
+  "customer_tier": "dedicated",
+  "environment": "prod | us-east",
+  "components": [
+    "serving-runtime",
+    "autoscaler",
+    "allocator",
+    "scheduler"
+  ],
+  "labels": [
+    "noisy-neighbor",
+    "gpu-shortage",
+    "reservation-hold",
+    "throughput-drop"
+  ],
+  "affected_models": [
+    "redwood-7b-quantized"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-10",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-271998",
+    "SUP-712909"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/allocator/pull/8421"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/Autoscale+Failure+Patterns"
+  ],
+  "description": "Issue summary:\nCustomer GreenDraft reports a sudden drop in dedicated pool throughput for their pinned redwood-7b-quantized route. Traffic shows many short, low-latency streams interleaving with medium-length requests. During the window the autoscaler did not increase GPU count and the allocator kept several reservations in a 'pending-attach' state for >10 minutes, leading to effective GPU scarcity for the tenant's steady traffic.\n\nImpact:\n- GreenDraft reported 60% reduction in sustained throughput for 40 minutes across their reserved pool; several customer operations timed out (500s) and degraded user experience.\n- Other tenants in the same reserved cluster experienced elevated p99 as the allocator struggled to satisfy attach requests.\n\nTimeline (local):\n- 2026-03-10 09:12 UTC: GreenDraft support pinged #support with elevated 5xxs.\n- 09:15 UTC: CS opened this ticket and collected traces.\n- 09:20 UTC: Metrics show burst of short-stream connections from tenant T-1427 and repeated prefetch attempts.\n- 09:28 UTC: Autoscaler telemetry shows decision loop skipped scaling due to stale heartbeat metric from allocator (delta > 60s).\n- 09:40 UTC: Several reservations in \"pending-attach\" for >600s; attach attempts retried but failed due to allocator-side attach backoff.\n\nEnvironment:\n- Dedicated reserved pool cluster: reserved-cluster-7\n- Region: us-east-1\n- Customer-tier: dedicated (monthly commit)\n- Model pinned: redwood-7b-quantized (q4_0)\n\nSteps to reproduce (observed pattern):\n1) Create mixed workload with many short live streams (<2s) interleaved with regular long requests (10-30s).\n2) Issue repeated prefetch/kvcache requests from a single tenant at high fanout (~200 concurrent short streams).\n3) Observe allocator reservations being created then stuck in pending-attach; autoscaler does not trigger additional GPUs until heartbeat recovers.\n\nObserved behavior:\n- Allocator holds reservations in pending state and does not release them quickly (lock-time ~10m).\n- Autoscaler decision loop reports stale heartbeat (allocator.telemetry.heartbeat_lag > 60s) and suppresses scale-up to avoid thrashing.\n- Small-stream tenant appears to cause kv-cache churn and ephemeral slot-locks that block larger batch assignments.\n\nExpected behavior:\n- Allocator should either free stale reservations after a short timeout or escalate attach attempts; autoscaler should consider alternative telemetry (queue depth) to trigger scale-up when heartbeat is stale.\n\nLogs / metrics attached (excerpt):\n- allocator.attach.pending_count spikes from 3 -> 42 between 09:18-09:29 UTC\n- autoscaler.decision.suppressed_due_to_heartbeat_lag = true at 09:28 UTC\n- gpu.attach.retry_backoff increased to 120s for several attach attempts\n- kvcache.evictions per-sec elevated on nodes hosting tenant T-1427\n\nInitial triage summary:\n- Triage indicates noisy short-stream tenant causing slot fragmentation and a separate allocator heartbeat edge-case where heartbeat lag suppressed autoscaler scale-ups.\n- Priority raised to P1 because this is customer-impacting on a reserved contract.\n\nImmediate mitigations attempted:\n- 09:35 UTC: Support increased per-tenant short-stream throttle for T-1427 via emergency override (reduced short-stream concurrency from ~200->40) \u2014 partial recovery in p50 but p99 remained elevated.\n- 09:43 UTC: Manually cleared 18 pending reservations via allocator admin command; some slots freed and attach retried successfully.\n\nNext steps (engineering):\n- SRE to examine allocator heartbeat root cause (possible slow metric exporter on nodes) and implement temporary lower timeout for pending-attach for dedicated clusters.\n- Autoscaler team to add fallback signal (queue_depth or attach_fail_rate) for scale decisions when heartbeat is stale.\n- Recommend policy to rate-limit short-stream fanout per tenant for dedicated pools until a durable fix is rolled out.\n",
+  "comments": [
+    "2026-03-10 09:22 | Maya Chen (Support): Collected first traces and CPU/GPU attach logs from the customer's route. Pushing details here and requested customer to reduce concurrency while we investigate.",
+    "2026-03-10 09:36 | Priya Nair (SRE): Observed allocator.attach.pending_count spike; I cleared a few stuck reservations to free GPUs. Need allocator team to look at exporter lag on node 'reserved-cluster-7-03'.",
+    "2026-03-10 09:44 | Arjun Patel (Allocator team): Found repeated NACKs from node-side attach agent correlated with a kernel-driver transient. Opening a follow-up infra ticket and linking PR to fix retry logic (see related_github_prs).",
+    "2026-03-10 10:05 | Maya Chen (Support): Customer confirms partial throughput recovery after temporary throttling; they still see intermittent p99 spikes. Customer requests RCA and mitigation timeline.",
+    "2026-03-11 11:12 | Priya Nair (SRE): Autoscaler team proposes change: if heartbeat_lag > 45s and queue_depth > threshold, treat as scale-required. Draft PR being reviewed."
+  ],
+  "investigation_notes": "Detailed findings:\n- Root-cause chain appears to be: noisy tenant T-1427 opens many short streams causing high kvcache eviction and prefetch churn -> allocator creates many reservations to satisfy ephemeral attachments -> node-side attach agent experienced transient kernel driver timeouts (seen as NACKs) causing pending-attach backlog -> exporter on one allocator node lagged, marking heartbeat stale -> autoscaler suppressed scale-up.\n- Reproduced in staging with synthetic short-stream generator; pending-attach timeout default (10m) too long for dedicated pools with high churn.\n- Allocation logs reference kernel error codes: CU_DRIVER_TIMEOUT (sampled) and repeated socket ECONNRESET during attach handshakes.\n- Related config: reserved-cluster-7 uses attach_retry.backoff=30s, pending_attach_timeout=600s.\n",
+  "resolution": "Temporary fixes implemented:\n- Short-term: Per-tenant short-stream concurrency limit applied for GreenDraft; manual clearing of pending reservations restored baseline throughput.\n- Mid-term: Reduced pending_attach_timeout from 600s -> 120s for high-churn dedicated pools (config roll-out scheduled).\n- Autoscaler change: Emergency patch to consider queue_depth when heartbeat_lag detected merged to canary (PR https://github.com/redwood-inference/autoscaler/pull/4002).\n- Infra follow-up: Allocator node agent updated to improve attach retry semantics and surface clearer metric for attach_fail_rate.\n\nFollow-ups (action items):\n- Allocator team to land more robust attach idempotency and reduce reliance on long pending timeouts (owner: Arjun Patel). Target: 2026-03-20.\n- Autoscaler team to add queue-depth fallback and write integration test for heartbeat-lag scenario (owner: Lena S\u00f8rensen). Target: 2026-03-18.\n- Support/Customer Success to schedule RCA call with GreenDraft and share mitigation plan and timeline.\n\nTicket status: In Progress (tracking remediation and customer communication).",
+  "resolution_notes": "Applied config change to pending_attach_timeout and rolled autoscaler fallback to canary in us-east; monitoring shows pending_attach_count reduced by 70% and GreenDraft p50/p90 recovering to expected. Continued monitoring for 72 hours recommended.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_0e618f76e4984ef4842613f2aa5059ca"
+}

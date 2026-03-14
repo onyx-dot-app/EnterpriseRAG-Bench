@@ -1,0 +1,68 @@
+{
+  "key": "SUP-143712",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Streaming callback correlation header rotates mid-stream causing callback mismatch and duplicate downstream tool executions",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-11",
+  "reporter": "Maya Chen",
+  "assignee": "Ethan Rodriguez",
+  "customer_company": "NeuraHealth",
+  "customer_tier": "dedicated",
+  "components": [
+    "streaming",
+    "sdk-python",
+    "api-gateway",
+    "callback-webhook"
+  ],
+  "labels": [
+    "retry",
+    "correlation-token-rotation",
+    "streaming",
+    "tool-calls",
+    "urgent"
+  ],
+  "environment": "prod/us-west-2",
+  "affected_models": [
+    "rw-inference-7b",
+    "open-13b-gptq"
+  ],
+  "affected_regions": [
+    "us-west"
+  ],
+  "sla_due_at": "2026-03-10T18:00:00Z",
+  "first_response_due_at": "2026-03-10T11:00:00Z",
+  "linked_issues": [
+    "SUP-912345",
+    "INT-330"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/5842"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.internal/docs/support/streaming-correlation-runbook"
+  ],
+  "description": "Issue summary:\nCustomer observes duplicated downstream tool executions when using the Python SDK's streaming API with their webhook-based callback handler. The correlation header (X-RW-Callback-Id) attached to callback posts appears to change partway through a single streaming session; downstream services treat the new value as a separate invocation which results in duplicate side-effects.\n\nImpact:\n- Multiple duplicate database writes and alerts in customer production environment (NeuraHealth) for affected workflows.\n- Seen on 8% of long-lived streams (>60s) since 2026-03-09 03:00 UTC.\n- Customer requested immediate mitigation (dedicated customer, P1 SLA).\n\nEnvironment:\n- Redwood Dedicated deployment (customer-managed VPC) in us-west-2.\n- SDK versions: python-sdk v2.7.1 (customer), go-sdk v0.9.4 (not used in repro).\n- API gateway: ingress via ALB and internal edge-sidecar that rewrites tracing headers.\n- Callback endpoint: customer's webhook behind Cloud Run with autoscaling and retries enabled.\n\nSteps to reproduce (customer):\n1) Start a long-lived streaming session using python-sdk v2.7.1 to model rw-inference-7b with function/tool calls enabled. Session sends continuous user tokens for ~90s.\n2) Customer webhook receives callback posts for tool invocations. They assert correlation by X-RW-Callback-Id header to de-duplicate downstream work.\n3) For ~8% of streams, the header shifts value mid-stream (new UUID-like value). Their dedupe key uses the header so second value is treated as a new invocation, causing duplicate side effects.\n\nExpected behavior:\n- Correlation header should remain stable for the lifetime of the logical session (or SDK should provide explicit stable idempotency token for tool invocations).\n\nActual behavior:\n- Correlation header changes during session after an SDK retry/backoff or when a refresh token exchange occurs. Customer reports this correlates with short network blips and SDK reconnects.\n\nLogs / excerpts (customer provided):\n- Example headers observed (timestamps):\n  - 2026-03-09T03:14:02Z X-RW-Callback-Id: cb-7f3a-1a91\n  - 2026-03-09T03:14:15Z X-RW-Callback-Id: cb-9b2c-4f0e\n  - HTTP body identical aside from event sequence number.\n\nWorkarounds attempted by customer:\n- Added short-term dedupe using combination of session_id + tool_name + payload hash instead of header alone (reduced duplicates but not eliminated).\n- Disabled automatic SDK reconnect (caused increased session resets and worse UX).\n\nAdditional notes:\n- Customer included a pcap and full request/response traces to our secure upload (link in comments).\n- They reported similar behavior when using a small percentage of clients on python-sdk 2.6.x but rate increased after upgrading to 2.7.1.",
+  "comments": [
+    "2026-03-10T09:05:00Z - Maya Chen (Support): Acknowledged and triaged. Assigned to runtime oncall. Requested customer pcap + sample webhook logs. Action: oncall to reproduce in staging using customer's request pattern.",
+    "2026-03-10T09:27:00Z - Ethan Rodriguez (Runtime Eng): Got the traces, thank you. Initial hypothesis: edge-sidecar or SDK is normalizing/replacing correlation header on reconnect. Reproducing locally with long stream + forced network hiccups. Linking test harness (GH): https://github.com/redwood-inference/serving-runtime/pull/5842 .",
+    "2026-03-10T11:14:00Z - NeuraHealth (Customer): Confirmed duplicates reduced when we concatenate session_id into dedupe key. Happy to test any SDK patch. They can reproduce reliably by introducing 100ms TCP resets every 15s in their test harness.",
+    "2026-03-10T13:02:00Z - SRE (Luis Gomez): Noted ALB idle-timeout and sidecar keepalive config. Observed connection resets correlated with ALB health checks at 15s intervals; need to confirm interaction with SDK reconnect logic. Added INT-330 for internal infra config review.",
+    "2026-03-11T07:46:00Z - Ethan Rodriguez (Runtime Eng): Reproduced locally with sidecar header rewrite + forced reconnect. Found that when SDK recreates a sub-connection it requests a fresh callback token from the control plane, which increments the correlation value. Putting a patch together to prefer session-scoped stable id token for callback posts rather than per-subconnection token.",
+    "2026-03-11T12:30:00Z - Maya Chen (Support): Notified customer that an interim client-side mitigation is to use session_id+event_seq for dedupe. ETA for runtime patch requested.",
+    "2026-03-11T15:10:00Z - NeuraHealth (Customer): Will stand by for patch; confirmed session_id workaround is acceptable for now. Asked about timeline for SDK release."
+  ],
+  "investigation_notes": "Findings:\n- Reproducible when ALB/sidecar performs micro-reconnects that cause SDK to tear down and re-establish the streaming subchannel.\n- Current control-plane issues fresh callback correlation tokens on any subchannel creation. This design assumed single-channel sessions and did not account for transparent reconnects.\n- Python SDK v2.7.1 requests a new callback token on reconnect by calling /v1/sessions/<id>/callback-token without preserving the prior token scope.\n- Edge-sidecar also rewrites X-Trace headers which complicates matching.\nHypothesis:\n- The token rotation is intended for short-lived security tokens but should be scoped such that tool invocation correlation remains stable. Rotating the externally-visible correlation header during a session leads to downstream duplication.\nNext steps:\n1) Implement server-side option to return a session_scoped_callback_id that remains stable for session lifetime. (runtime PR drafted).\n2) Push a small python-sdk guard: continue sending previous callback-id for in-flight sessions unless token expiration explicitly occurs. (client PR planned).\n3) Add integration test in qa that injects reconnects and asserts stable callback-id across session.\n4) Update runbook and docs to clarify correlation token semantics for dedicated deployments and sidecars.",
+  "resolution_notes": "Workaround (applied 2026-03-11):\n- Customer implemented server-side dedupe fallback using session_id + payload-hash which reduced duplicates to <0.5%.\n- Temporary runtime change: control plane now returns both 'session_scoped_callback_id' (stable) and 'subchannel_token' (ephemeral). Backport patch deployed to staging for validation (PR 5842).\nPlanned permanent fix:\n- Runtime: guarantee session_scoped_callback_id for entire session and only rotate ephemeral tokens for subchannel auth.\n- Python SDK: landing a minor release (v2.7.2) that prefers session_scoped_callback_id for headers when present and falls back to ephemeral token only if session token explicitly expired.\nRollout notes:\n- Patch will be staged to a small subset of dedicated customers the week of 2026-03-17 for 48h. Post-deploy monitoring will check duplicate-tool-exec rate and header stability metrics.\nFollow-ups:\n- Documentation update to explain correlation vs auth tokens. Confluence page created (linked above).\n- INT-330 tracks infra idle-timeout alignment to reduce unnecessary reconnects.\n- Customer to verify SDK 2.7.2 in their pre-prod before full rollout.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_94ae4f6114b04ad5a5d33a620a58f765"
+}

@@ -1,0 +1,58 @@
+{
+  "key": "ENG-177482",
+  "team": "engineering",
+  "title": "Concurrent selector backpressure leads to kernel state teardown and cache-region corruption",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-02-10",
+  "updated_at": "2025-02-28",
+  "creator": "Anika Patel",
+  "assignee": "Marco Li",
+  "project": "runtime-performance-2025",
+  "cycle": "2025-W06",
+  "estimate": "5",
+  "due_date": "2025-03-07",
+  "labels": [
+    "regression",
+    "kernel-selection",
+    "prefetch",
+    "data-corruption",
+    "high-pri"
+  ],
+  "release": "runtime-1.22",
+  "customer_impact": "high",
+  "security_review_required": "false",
+  "description": "Summary:\nAfter rolling out the adaptive kernel selector with backpressure-aware prefetching (opt-in via feature flag runtime.selector.backpressure=true) we have observed intermittent correctness failures in long-running decode sessions: token duplication, attention-score drift beyond acceptable eps, and eventual slab allocator inconsistencies that manifest as KV cache 'holes' (reads returning zeros for previously cached keys).\n\nScope and hypothesis:\n- Regressions appeared after landing fusion of selector decision + speculative prefetching (PR: https://github.com/redwood-inference/runtime/pull/6421).\n- Hypothesis 1: concurrent selector state machine can tear down kernel contexts while in-flight prefetch tasks still hold references, causing stale pointers and partial writes into cache slabs.\n- Hypothesis 2: backpressure windowing logic incorrectly signals readiness to older employments of fused kernels, producing mixed-precision reduction applied with wrong accumulation state -> numerical drift.\n- Hypothesis 3: allocator free path raced with prefetch completion callback, resulting in reclamation of slabs that are later written leading to corruption visible as non-deterministic token shifts.\n\nReproduction steps (known flaky reproduction):\n1) Deploy runtime with feature flag enabled on a small dedicated pool (2 x A100).\n2) Run a mixed workload with long prefix generation (prefill length > 512) followed by heavy decode burst (concurrent streams 24).\n3) Observe rare (~1 in 200) sessions where logits deviate and token duplication occurs after ~200 decode steps; within a minute some sessions crash with memory sanitizer reports or allocator checksum mismatch in logs.\n\nSignals and artifacts collected:\n- Traces: Distributed trace traces/runtime/selector/2025-02-11-14:23 (link: https://console.redwood/workloads/traces/selector-20250211-1423).\n- Logs: runtime node stderr (attached) showing \"slab-checksum-mismatch\" and prefetch completion events with stale ctx ids.\n- Heap dumps: core dump from instance i-rt-12 (s3://rwd-dumps/ENG-177482/core-rt-12-20250212.gz).\n- Repro harness: perf/repro/selector_race_case.py (branch: fixes/177482).\n\nImmediate mitigation applied:\n- Rolled out temporary guard: serialized kernel-selector critical section around context teardown (hotfix PR: https://github.com/redwood-inference/runtime/pull/6480) to stop concurrent frees. This reduced crash rate to near zero in canary but added measurable CPU contention (~3% CPU increase) and 2-3ms tail latency increase under heavy concurrency.\n\nNext steps and owner requests:\n- Deep root-cause analysis to confirm whether allocator or reference lifetimes are primary cause (owner: Marco Li).\n- Implement finer-grained refcounting on kernel-context and ensure prefetch callbacks take strong reference to context until commit/abort (owner: infra-kernels team).\n- Add instrumentation: context lifetime tracepoints, prefetch completion timestamps, slab sequence numbers.\n- Add unit and fuzz tests in allocator & selector interaction path and a deterministic repro harness to run nightly.\n\nAcceptance criteria for \"Done\":\n- Deterministic repro exists that reproduces corruption in CI locally with sanitized builds OR root cause fully ruled out with comprehensive tests.\n- Patch landed that removes the need for the serialized hotfix while restoring pre-hotfix latency characteristics (<=1ms median extra, <=1% CPU noise).\n- Post-fix monitoring dashboard added (selector context leak rate, slab-checksum-mismatch rate) and alert set to P1.\n\nNotes on related work and trade-offs:\n- The adaptive fusion change was intended to reduce kernel launch overheads by merging selector decision path with lightweight prefetching for predicted variant. The optimization aggressively freed unused kernel-contexts to reduce memory pressure; this is likely the root of a use-after-free style corruption in the presence of concurrent prefetch ordering replays.\n- Trade-off: serialized teardown fixes correctness faster but reduces throughput under high concurrency. Goal is to implement refcounting/ownership semantics to retain perf benefits.\n",
+  "comments": [
+    "2025-02-11 - Marco Li: Initial triage: confirmed slab-checksum-mismatch in canary. Attached log snippets and core. Repro is flaky but observed on two different instances. Marking P0 due to potential data corruption and customer impact.",
+    "2025-02-12 - Anika Patel: Hotfix PR #6480 deployed to canary (serialized teardown). Canaries show no further checksum mismatches in 48h. However latency tail rose on heavily batched workloads. Rolling to limited scope to reduce risk.",
+    "2025-02-13 - Sasha Ivanov (allocator): Investigating allocator free path. Observed that release path can run on completion callback thread which sometimes races with decoupled background GC. Adding assert to slab freelist to detect double-free windows (branch: allocator/asserts/ENG-177482).",
+    "2025-02-14 - Marco Li: Added tracepoints and increased prefetch callback logging. Early traces show prefetch completion callback running after context_teardown event in ~12% of recorded failing sessions. This matches Hypothesis 1.",
+    "2025-02-17 - QA - Priya Menon: Built deterministic harness that replays prefill+decode with seeded scheduling (perf/repro/selector_race_case.py). Deterministic reproduction achieved under TSan build; failing session reproduces corruption within 3-4 runs.",
+    "2025-02-19 - Marco Li: Proposed fix: add per-kernel-context refcount and require prefetch completion to acquire ref before writing into slab. Posting design doc: https://confluence.redwood/runtime/ENG-177482-kernel-refcount-design (permission: internal).",
+    "2025-02-21 - Design review - Anika Patel: Reviewed PR design. Concern about refcount cost; recommend using optimistic inline ref + fallback to atomic refcount only on concurrent paths. Also request to add telemetry for refcount contention to ensure we don't regress hot path.",
+    "2025-02-24 - Implementation - Marco Li: Prototype landed in branch fixes/177482-refcount (PR: https://github.com/redwood-inference/runtime/pull/6542). Benchmarks show median latency increase <0.5ms and no checksum mismatches in 1000 deterministic runs. Need broader load test.",
+    "2025-02-26 - Load testing - Performance team: Running 24h soak across mixed workload on dedicated pool (4 x A100). Observed no data corruption and perf hit within acceptable bounds (1.1% CPU delta, median latency +0.4ms). Preparing for staged rollout to production with feature gating.",
+    "2025-02-28 - Anika Patel: Decision: keep hotfix serialized-teardown for emergency, but merge refcount fix behind runtime.selector.refcount=true feature flag. Plan staged rollout: canary -> 10% -> 50% -> 100% over 2 weeks if no regressions. Add alert: slab-checksum-mismatch -> page on-call and auto-disable feature flag.",
+    "2025-02-28 - Marco Li: Next action: create follow-up tasks: ENG-177820 (add allocator fuzz tests), ENG-177821 (add telemetry dashboard), ENG-177822 (post-mortem doc). Adding dependency links in ticket metadata.",
+    "2025-03-01 - Post-mortem draft: initial write-up started. Will include timeline, decisions, and suggested long-term changes to selector lifecycle management."
+  ],
+  "dependencies": [
+    "ENG-177820",
+    "ENG-177821",
+    "ENG-177822"
+  ],
+  "parent_issue": [],
+  "attachments": [
+    "https://github.com/redwood-inference/runtime/pull/6480",
+    "https://github.com/redwood-inference/runtime/pull/6542",
+    "s3://rwd-dumps/ENG-177482/core-rt-12-20250212.gz",
+    "https://console.redwood/workloads/traces/selector-20250211-1423"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_1a43afc116fd469c94dd5de66431e0d5"
+}

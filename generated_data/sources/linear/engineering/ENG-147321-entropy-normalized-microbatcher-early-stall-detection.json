@@ -1,0 +1,61 @@
+{
+  "key": "ENG-147321",
+  "team": "engineering",
+  "title": "Entropy-normalized microbatcher with early-stall detection for streaming chat",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-03-10",
+  "creator": "Aisha Patel",
+  "assignee": "Marco Reyes",
+  "project": "streaming-batcher-revamp",
+  "cycle": "2026-W06",
+  "estimate": "8",
+  "labels": [
+    "runtime",
+    "batching",
+    "kv-cache",
+    "streaming",
+    "gpu-memory"
+  ],
+  "description": "Problem statement: Streaming chat workloads with long-lived sessions cause fragmented microbatches and uneven GPU memory pressure because KV cache sizes vary drastically by session. The current time/window-based microbatcher sometimes waits on low-entropy turns (clients sending short prompts or expecting short replies) which produces long waits and spikes in per-GPU KV memory. This leads to higher latency p95 and occasional OOMs on high-density hosts. Goal: implement a new batch formation heuristic \u2014 the \"entropy-normalized microbatcher\" \u2014 combined with an early-stall detection system and lightweight KV-tiling eviction hints to (1) reduce p95 streaming tail latency, (2) smooth GPU memory utilization across slabs, and (3) avoid end-user stalls/504s when hosts approach memory pressure. Scope: runtime changes to batcher and session metadata, small agent to annotate KV cache hotness, and a conservative rollout path behind a config flag. Non-goals: rewriting kernel-level GPU allocation \u2014 we rely on slab reservations and existing allocator APIs. Success metrics: reduce streaming p95 latency by >=10% on convo-heavy models, reduce host OOM rate by 95% in synthetic KV-heavy tests, and preserve model quality (no measurable degradation in next-token perplexity on held-out eval sets).",
+  "approach": "Heuristic summary:\n1) Entropy-normalized priority score: for each incoming request we compute a microheuristic score = normalized(next-token entropy) / sqrt(session_kv_weight) * urgency_boost, where session_kv_weight = clipped(KV_size_bytes / session_budget_bytes, 0.1, 4.0). The estimator uses the runtime's cached softmax logits when available or an inexpensive n-gram fallback for extremely short prompts. Lower entropy (more predictable next token) yields higher bundling affinity because these requests typically finish faster and benefit from coalescing.\n2) Early-stall detection: track per-batch queue_wait_ms and per-host gpu_mem_pct. If queue_wait_ms > 35ms and predicted batch completion time exceeds stall_threshold, force immediate flush of pending microbatch and activate fast-path single-request scheduling for the next N requests from that session.\n3) KV-tiling eviction hints: add a lightweight per-session \"tiling_score\" combining recency, token-entropy, and generation-length heuristic. If a session's tiling_score falls below a threshold, mark it as a candidate for KV compaction (eviction to disk or lower-priority slab). This is advisory for the allocator; the allocator decides final eviction.\n4) Slab reservation combinator: maintain a small adaptive reservation per host for high-entropy sessions so that unpredictable sessions do not force full compaction during peaks. Reservation size is a percentile-based function (e.g., reserve min(12GB, 90th-percentile session_kv)).",
+  "design_decisions": "Trade-offs considered:\n- We could use strict recency-based eviction (LRU) but that ignores predictability. Entropy gives a signal about remaining generation length, which empirically correlates with how quickly a KV will be unused.\n- Aggressive eviction reduces memory but increases recompute/cache-miss cost; we choose advisory eviction with allocator-level final decision to avoid quality regressions.\n- Early flush reduces average wait but can increase microbatch count (more small batches). To limit throughput regression we apply early-stall heuristics only when predicted GPU-mem_pct > 78% or when queue_wait_ms consistently exceeds 35ms for 3 consecutive windows.\n- Complexity vs observability: All new signals are instrumented (entropy, tiling_score, stall_events) to allow rapid rollback if we see regressions.",
+  "implementation_plan": "1) Runtime: Add entropy estimator hook and session_kv_weight field to session metadata (ENG runtime change).\n2) Batcher: Compute priority score at enqueue-time; sort within short-window buckets (5-10ms) rather than global sort to bound scheduling latency.\n3) Eviction hints: emit tiling_score to allocator via existing metadata API; allocator accepts 'hint' and logs decisions.\n4) Early-stall detector: host agent aggregates queue_wait_ms and gpu_mem_pct; triggers policy switch.\n5) Feature flag + rollout: start with 5% hosts (canary), then 25%, 50%, 100% after validation.\n6) Observability: dashboards for p50/p95/p99 latency, host OOMs, KV eviction count, and model quality regressions.\n7) Docs + runbook: update Console rollout docs and incident playbook if nodes see OOMs.\nLinks: Confluence design: https://confluence.redwood.ai/display/INF/Entropy+Microbatcher (internal), initial PR: https://github.com/redwood-inference/runtime/pull/6421 (WIP), allocator side PR: https://github.com/redwood-inference/allocator/pull/1198",
+  "experiments_and_results": "Local microbench harness (synth-convo-heavy):\n- Baseline: p95 streaming latency 820ms, host OOMs 4/1k runs, avg gpu_mem_pct 74.3%\n- Entropy microbatcher (canary config): p95 730ms (-11%), host OOMs 0/1k runs, avg gpu_mem_pct 69.8%\n- With early-stall aggressive flush: p95 710ms (-13.4%), throughput reduced by 3.2% under max-load synthetic test.\nNotes: Per-session perplexity on next-token eval held stable within 0.2% absolute delta. KV eviction readbacks increased 18% but recompute CPU time remained within acceptable limits on Dedicated hosts. Full fleet synthetic (subset of 200 hosts) runs pending; initial canary passed latency and OOM thresholds.",
+  "acceptance_criteria": "1) Canary (5% hosts) shows: p95 streaming latency reduction >=8% and no increase in user-facing errors.\n2) No production OOMs traceable to the change during 72-hour canary.\n3) KV eviction + recompute cost increase < 25% CPU on average for affected hosts.\n4) Observability metrics (entropy, tiling_score, stall_events) instrumented and alerting thresholds defined.\n5) Approved design review with PM and SRE and completed security checklist.",
+  "risks_and_mitigation": "- Risk: Eviction hints cause quality regressions if allocator over-evicts. Mitigation: keep hints advisory and add conservative knob to reduce eviction aggressiveness.\n- Risk: Entropy estimator overhead increases per-request CPU. Mitigation: fast-path approximate estimator with early bailout for short prompts; memoize per-session where possible.\n- Risk: Increased small microbatches reduce GPU throughput. Mitigation: limit early-stall flush to high-pressure conditions and bounded rate of single-request fast-path activation.\n- Risk: Telemetry noise. Mitigation: add tagging to correlate events with feature-flag cohorts and host types.",
+  "rollout_plan": "- Phase 0 (dev): unit tests + local harness (complete).\n- Phase 1 (canary 5%): enable on low-risk regions and GPU types; monitor 48 hours.\n- Phase 2 (expanded 25%): after passing canary metrics for 72 hours.\n- Phase 3 (50%): 1 week observation.\n- Phase 4 (full): gradual ramp to 100% with rollback window.\nRollback criteria: spike in host OOMs, p95 latency regression >3% vs baseline, or customer-facing error rate increase.\nRunbook: If OOMs observed revert config and trigger allocator throttle; contact SRE on-call.",
+  "comments": [
+    "2026-02-12 Aisha Patel: Initial write-up and motivation. Shared with runtime and allocator owners.",
+    "2026-02-15 Design review with Hannah Liu (SRE) and Marco Reyes. Action: add early-stall threshold tied to gpu_mem_pct and require 3-window confirmation before flush.",
+    "2026-02-20 Marco Reyes: Prototype batcher changes landed in runtime branch 'entropy-microbatcher-proto'. Initial microbench looks promising; added metric tags: batch_entropy_mean, tiling_score_hist.",
+    "2026-03-01 QA: Synthetic KV-heavy test produced OOMs on one host variant (A100-80GB). Root cause: allocator ignored advisory hints due to bug; filed allocator fix PR. See allocator PR #1198.",
+    "2026-03-05 Bench results: canary run (20 hosts) p95 improved 12% and no OOMs. Noted 17% increase in small-io reads to backing store when using disk-backed KV compaction. Need cost analysis for dedicated customers.",
+    "2026-03-08 PM review (Daniel Park): Approved plan for 5% canary, flagged cost-of-eviction as a follow-up ticket depending on billing impact.",
+    "2026-03-10 Marco Reyes: Feature-flag gate added and canary rollout scheduled. Preparing dashboards and alerts."
+  ],
+  "dependencies": [
+    "ENG-14220",
+    "ENG-41207"
+  ],
+  "parent_issue": [
+    "ENG-223500"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.23",
+  "security_review_required": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "approach",
+    "design_decisions",
+    "implementation_plan",
+    "experiments_and_results",
+    "acceptance_criteria",
+    "risks_and_mitigation",
+    "rollout_plan",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_795f920329284137bac1fa1c54a8cf5c"
+}

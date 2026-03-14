@@ -1,0 +1,46 @@
+{
+  "key": "ENG-994321",
+  "team": "engineering",
+  "title": "Partition-aware inflight limiter + graceful worker shutdown to reduce retry storms",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-01-20",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Patel",
+  "assignee": "Diego Ramirez",
+  "project": "async-refactor-2026",
+  "cycle": "2026-W06",
+  "estimate": "5",
+  "due_date": "2026-03-25",
+  "labels": [
+    "tech-debt",
+    "redis",
+    "kafka",
+    "backpressure",
+    "reliability"
+  ],
+  "dependencies": [
+    "ENG-430112",
+    "ENG-812457"
+  ],
+  "release": "runtime-2.3",
+  "security_review_required": "false",
+  "customer_impact": "medium",
+  "description": "Background:\nOur current worker topology uses a global semaphore for inflight request limits and a best-effort shutdown that waits for in-flight tasks with a static timeout. This has surfaced multiple forms of flakiness in high-throughput scenarios: partition hotspots lead to per-partition queueing and head-of-line blocking, global semaphores allow tenant A to starve tenant B, and abrupt shutdowns cause large retry storms (duplicate work + cascade failures).\n\nGoal:\nReplace the global inflight semaphore with a partition-aware token bucket limiter and implement a graceful shutdown handshake for both Redis and Kafka worker types such that:\n- inflight capacity is enforced per-kafka-partition and per-redis-stream-consumer-group shard\n- backpressure is signalled upstream (where possible) and shed gracefully otherwise\n- shutdown is cooperative (drain + lease transfer) with a fallback timed drain to avoid long stalls\n- migrate away from blocking Redis/Kafka client calls in hot paths to the async client APIs to eliminate blocking thread pool exhaustion\n\nScope/What we will deliver:\n- new PartitionInflightLimiter component (token-bucket with jittered refill + soft/hard limits)\n  - keys: kafka://<topic>#<partition> and redis://<stream>#<consumer-shard>\n  - default soft limit 100, hard limit 150 per partition (configurable per-tenant)\n  - metrics: limiter.current_tokens, limiter.soft_drop_count, limiter.hard_reject_count, limiter.wait_ms_p50/p95\n- graceful shutdown protocol for workers\n  - step 1: mark as DRAINING and stop pulling new messages from assigned partitions/streams\n  - step 2: attempt in-place lease transfer (Kafka rebalance for consumer groups; Redis consumer group XCLAIM for stream ownership) within 5s\n  - step 3: wait for inflight to drop below soft limit for up to 30s, then force-commit in-flight safe checkpoints and exit\n  - feature-flag behind runtime.enable_cooperative_shutdown\n- migrate Redis client from Jedis blocking calls to Lettuce/reactive client for async XREADGROUP/XCLAIM flows\n- upgrade kafka-clients to 3.5.x and replace any blocking poll-with-timeout hotspots with non-blocking reactive wrappers where feasible\n- add end-to-end tests: partition hot-spot simulation, coordinated shutdown integration test, retry-storm regression test\n- dashboards and alerts: a Grafana board for limiter metrics and a PagerDuty alert if hard_reject_count spikes > 1% over 1m\n\nDesign trade-offs and decisions made so far:\n- Chose token-bucket per-partition instead of credit-based scheduler to keep implementation deterministic and easy to reason about for ops. Token refill uses workload-aware rate suggestions from Optimize service later (out of scope for this ticket).\n- Cooperative shutdown is best-effort: Redis consumer groups and Kafka rebalances are inherently eventually consistent. We implement fast-path XCLAIM + rebalance sync but still include a timed fallback to avoid long drains during network partitions.\n- We will not attempt tenant auto-resizing in this ticket; capacity knobs remain config-driven.\n\nAcceptance criteria (must satisfy all):\n- PartitionInflightLimiter implemented and exercised by unit tests\n- Worker shutdown implements cooperative handshake and falls back to timed drain; integration test demonstrates reduced retry volume vs current baseline (>= 60% reduction in induced retries in test harness)\n- All blocking Redis/Kafka calls on worker hot paths converted to async/reactive APIs; no blocking calls in core worker request path (validated by thread-dump checks in CI)\n- Metrics emitted and Grafana dashboard created; alert rule authored in perf-oncall folder\n- PRs reviewed and merged; canary rollout plan listed and feature-flag gating present\n\nRollout plan:\n1) Feature-flag behind runtime.enable_cooperative_shutdown default false\n2) Merge and run canary on staging cluster with synthetic workload (partition-hotspot test) for 48h\n3) Enable on 5% of production worker pool with aggressive monitoring for 1h\n4) Ramp to 25% if no regressions, then 100% over 24h\n5) If hard_reject_count > 0.5% or request latency regresses > 20% for 5m, rollback feature flag\n\nOpen questions / Risks:\n- Some legacy integrations expect immediate ack semantics; forced timed drain may cause duplicate processing beyond retries tracked by our idempotency layer. Need to confirm idempotency coverage for high-throughput tenants.\n- Upgrading kafka-clients may require version alignment with other services (coordination with infra).\n- XCLAIM semantics vary by Redis version; we must pin supported Redis minor versions in runtime-2.3 release notes.\n\nImplementation notes and links:\n- Proto PR (draft): https://github.com/redwood-inference/redwood-runtime/pull/1428\n- Design doc (Confluence): https://redwood-internal.atlassian.net/wiki/spaces/ENG/pages/44321/partition-aware-limiter\n- Synthetic workload harness (k8s job): https://github.com/redwood-inference/chaos-harness/tree/partition-limiter\n",
+  "comments": [
+    "2026-01-25 - Aisha Patel: Initial spike completed. Verified token-bucket semantics with microbench harness. Found Jedis blocking call on XREADGROUP is the largest contributor to worker threadpool exhaustion.",
+    "2026-02-02 - Diego Ramirez: Implemented PoC of PartitionInflightLimiter and added unit tests for token accounting. Pushed draft PR https://github.com/redwood-inference/redwood-runtime/pull/1399. Observed 45% reduction in retries in local sim.",
+    "2026-02-15 - QA (Maya Chen): Integration test added for cooperative shutdown. Observed odd rebalance timing issues under high network jitter; added additional XCLAIM retries and short random backoff.",
+    "2026-02-28 - Diego Ramirez: Migrated Redis hot path to Lettuce reactive API. CI thread-dump checks show no blocking threads in worker pool under synthetic load. Draft PR updated: https://github.com/redwood-inference/redwood-runtime/pull/1428",
+    "2026-03-03 - Infra (Liam O'Neill): Noted kafka-clients 3.5.x dependency bump has transitive conflict with metrics-collector. Working on coordinated upgrade PR in infra monorepo.",
+    "2026-03-08 - SRE (Janelle Park): Added Grafana board (dash id: 7543) and alert rule in perf-oncall/policies: limiter-hard-rejects > 0.5% over 1m. Will run alert noisiness check during canary.",
+    "2026-03-12 - Diego Ramirez: Canary started on staging cluster. Early numbers: limiter.soft_drop_count increased (expected) and hard_reject_count = 0. Metrics link: https://grafana.redwood.internal/d/7543/partition-limiter?orgId=1",
+    "2026-03-12 - Aisha Patel: Next steps - finish e2e retry-storm regression test, finalize release notes for runtime-2.3, and schedule dependency sync with infra next week."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_1074ce1d725e4b2683c24fede14f883a"
+}

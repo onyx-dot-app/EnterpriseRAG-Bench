@@ -1,0 +1,85 @@
+{
+  "key": "SUP-98123",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Hybrid-embedding mix causing non-monotonic rerank scores and intermittent latency spikes on /v1/rerank",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-13",
+  "updated_at": "2026-03-14",
+  "reporter": "Sofia Patel",
+  "assignee": "Daniel Kim",
+  "customer_company": "LuminaSearch Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "rerank-service",
+    "embeddings-encoder",
+    "api-gateway",
+    "cache-service"
+  ],
+  "labels": [
+    "hybrid-embeddings",
+    "nonmonotonic-scores",
+    "latency-spike",
+    "regression"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "hybrid-embed-v2-concat",
+    "redwood-embed-encoder-large"
+  ],
+  "affected_regions": [
+    "us-east",
+    "eu-west"
+  ],
+  "sla_due_at": "2026-03-13T20:00:00Z",
+  "first_response_due_at": "2026-03-13T16:30:00Z",
+  "description": "Issue summary:\\nCustomers using LuminaSearch have reported that rerank responses for the /v1/rerank endpoint show non-monotonic score order (results are not consistently descending by score) and occasional 200 responses that contain unexpected score inversions. In parallel, end-to-end latency to /v1/rerank has spiked from p95 ~120ms to p95 ~950ms for batches with >= 8 candidates.\\nImpact:\\n- Production impact for LuminaSearch search relevance; observed user-visible result reordering and slower page load.\\n- Affects both streaming and non-streaming rerank flows when hybrid embeddings (concatenation of sparse token features + dense vector) are used.\\nEnvironment:\\n- Prod us-east cluster serving dedicated tenant LuminaSearch. Rerank service behind API gateway, using per-tenant embedding encoder which can return either pure-dense or hybrid embeddings depending on dataset.\\nSteps to reproduce (observed by customer + reproducible via repro):\\n1) Create a rerank request with 1 query and 16 candidates. Ensure encoder returns hybrid embeddings (dense 768 concat sparse 128).\\n2) Call /v1/rerank with rerank_type=cosine and top_k=5.\\n3) Observe returned scores: sometimes candidate with lower cosine distance has higher returned score and appears above better-scoring candidate.\\n4) Repeat ~10-20 times; non-deterministic inversion occurs ~15-25% of runs in prod for these payloads.\\n5) Observe latency spikes on same requests correlated with CPU fallback traces and cache misses.\\nLogs / sample traces:\\n- API Gateway trace: request_id=req-8a7f, latency=1.2s, route=/v1/rerank\\n- Rerank service: trace_id=rr-3c4a, stage=score_compute, kernel_path=quant-fallback-cpu, kv_cache_hit=false\\n- Encoder logs: encoder_resp=(type=hybrid, dims=[896], format=concatenated, encoding_version=2026-02-28)\\n- Score diff snapshot: candidate A cosine=0.842, candidate B cosine=0.856, returned_score_A=0.89, returned_score_B=0.83\\nObserved anomalies / notes:\\n- Inversions only appear when encoder returns concatenated hybrid vectors. Pure-dense-only requests do not exhibit the inversion.\\n- When rerank service triggers quantized kernel fallback to CPU (on certain nodes under memory pressure), scores can flip.\\n- KV prefix cache behavior: some repeated queries have cache miss leading to recomputation on a different codepath, coincident with inversions.\\n- The encoder version header differs from the model catalog entry for this tenant (encoder reports 2026-02-28 vs catalog expects 2026-03-02).\\nHypotheses:\\n1) Mixing sparse and dense components without consistent normalization leads to non-comparable cosine outputs when different compute paths apply different post-processing (e.g., legacy L2-normalization applied on dense-only path but skipped on hybrid path).\\n2) Quantization/CPU-fallback uses an alternate scoring implementation that treats concatenated vectors incorrectly (e.g., applies per-segment scaling twice).\\n3) Cache invalidation creates replay on nodes with mismatched encoder versions causing inconsistent normalization.\\nAffected customer impact: high. Customer reported production-facing regression and asked for immediate workaround while we investigate.",
+  "comments": [
+    "2026-03-13 15:12 - Sofia Patel: Customer LuminaSearch reported rerank result ordering changes plus latency. Provided example payloads and sample request_ids. Requested P1 escalation.",
+    "2026-03-13 15:40 - Daniel Kim: Acknowledged. Started repro locally using customer's payload. Observed non-deterministic score inversions. Raising to Serving-Infra. Linked to quant fallback traces.",
+    "2026-03-13 16:05 - Priya Rao (Serving Infra): On initial look, nodes that hit the quant-fallback path show a different postprocess flag. Adding hypothesis that normalization step is conditionally skipped for concat vectors in CPU path.",
+    "2026-03-13 17:10 - LuminaSearch (customer): Confirmed issue reproducible across EU and US traffic. They can force encoder to output dense-only as a temporary change but that reduces recall and is not acceptable long-term.",
+    "2026-03-14 09:23 - Daniel Kim: Deployed repro instrumented build to a staging pod (rr-staging-3). Captured detailed per-segment norms: dense_norm=0.999, sparse_norm=0.42 on CPU fallback; dense_norm=0.999, sparse_norm=0.98 on GPU path.",
+    "2026-03-14 13:02 - Priya Rao: Created draft PR to align normalization code paths between GPU and CPU kernels (github.com/redwood/serving/pull/2049). Still running perf tests; early results show inversion frequency drop to <2%.",
+    "2026-03-14 14:40 - Daniel Kim: Notified customer of mitigation steps and plan for a hotfix. Customer requested timeline for production patch and asked for a config toggle to force dense-only encoding as short-term mitigation.\n"
+  ],
+  "investigation_notes": [
+    "Repro: local repro with customer's encoder payload produced similar non-monotonic outputs ~18% of runs.",
+    "Trace analysis: quant-fallback CPU path applies per-segment scale factor 'sparse_scale' that is double-applied in current CPU scoring microcode (confirmed by reading scoring.cc:line~412).",
+    "Caching: prefix/KV cache miss correlated with recompute on node with older scoring binary (v1.11) leading to inconsistent behavior when autoscaler moves traffic.",
+    "Encoder-version drift: tenant-bound encoder images on some dedicated nodes are 1 commit behind catalog, likely due to staggered deploys for dedicated clusters."
+  ],
+  "next_steps": [
+    "Ship hotfix aligning CPU and GPU normalization code paths (PR 2049) and roll out to prod us-east in canary then full rollout.",
+    "Add a server-side feature flag to force encoder to emit dense-only vectors for affected tenants as temporary mitigation.",
+    "Invalidate and warm KV prefix cache for LuminaSearch after rollout to avoid mixed-codepath replays.",
+    "Schedule postmortem and add a regression test in CI covering hybrid embeddings across quant/fallback paths.",
+    "Notify customer of timeline: canary deploy in next 4 hours, full rollout within 24 hours pending telemetry."
+  ],
+  "linked_issues": [
+    "SUP-91455",
+    "INT-412"
+  ],
+  "related_github_prs": [
+    "github.com/redwood/serving/pull/2049",
+    "github.com/redwood/encoders/pull/118"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/Hybrid+Embedding+Scoring+Runbook",
+    "https://confluence.redwood.ai/display/SEC/Encoder+Version+Policy"
+  ],
+  "resolution_notes": [
+    "TBD - awaiting hotfix verification in canary. Will update when full rollout completes."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "next_steps",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_b86daf9769f94936bca334c52f1a047a"
+}

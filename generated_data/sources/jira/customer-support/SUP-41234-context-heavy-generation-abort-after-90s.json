@@ -1,0 +1,87 @@
+{
+  "key": "SUP-41234",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Generation aborts and streaming disconnects for extremely long prompts + large max_tokens (\u224890s timeout)",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Priya Nair",
+  "assignee": "Diego Ramirez",
+  "customer_company": "LexAlign AI",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "api-gateway",
+    "streaming-proxy"
+  ],
+  "labels": [
+    "timeout",
+    "long-context",
+    "streaming",
+    "dedicated-customer",
+    "investigation"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "redwood-extended-ctx-70k",
+    "gptk-13b-q4_0"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-12T19:00:00Z",
+  "first_response_due_at": "2026-03-12T13:00:00Z",
+  "linked_issues": [
+    "INT-7882"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/3045"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SRE/streaming-timeout-debugging-playbook"
+  ],
+  "description": "Issue summary:\nCustomer reports generation jobs aborting around ~90 seconds for requests that combine a very long prompt (40\u201380k tokens) with a large requested max_tokens (20\u201350k). The client observes an HTTP stream disconnect and a 504-style error on the SDK call. Impact: customer LEXALIGN uses these long-context generations for document summarization and is experiencing aborted runs and duplicate billing attempts.\n\nImpact:\n- Multiple failed batches during nightly summarization pipelines for 8 production customers.\n- Customer reports increased retries and replays, driving higher token consumption and cost.\n- Customer is on a Dedicated pool; they report the jobs schedule is time-sensitive.\n\nEnvironment:\n- Dedicated pool (cluster d-lexalign-prod-us-east)\n- prod-us-east region\n- Node types: A100-80GB\n- SDK: redwood-js v2.4.1, redwood-python v1.9.0\n\nSteps to reproduce (provided by customer):\n1) POST to /v1/generate with model redwood-extended-ctx-70k\n2) body contains a prompt ~52k tokens (concatenated docs) and max_tokens=30_000\n3) enable streaming=true and set timeout client-side to 120s\n4) run request from a single stream connection\n\nObserved behavior:\n- Streaming connection disconnects at ~88\u201395s with an error response (SDK surfaces as 504 / upstream timeout).\n- Server-side logs show the request was accepted and entered the serving runtime, but the connection to streaming-proxy is torn down.\n- Some aborted runs are recorded as partial usage; customer sees charged tokens for initial decoding but no final completion.\n\nExpected behavior:\n- Long runs should either stream until completion within the customer's client timeout or return a clear 5xx with guidance. No silent disconnects.\n\nAdditional context:\n- Customer reports the issue started ~2026-03-10 after a runtime change (kernel selector updates rolled out 2026-03-09).\n- Customer provided a capture of the request headers and a pcap of the streaming session (attached to ticket).",
+  "comments": [
+    "2026-03-12 14:10 - Priya Nair (Support): Acknowledged and opened INT-7882 for internal follow-up. Asked customer for reproduction script and pcap \u2014 they uploaded artifacts.",
+    "2026-03-12 15:05 - Diego Ramirez (SRE): Initial triage \u2014 confirmed repeated disconnects from streaming-proxy logs. No OOMs on GPU nodes. Observed increased per-request memory during KV cache handling for extended context models.",
+    "2026-03-12 16:30 - Diego Ramirez (SRE): Hypothesis 1 \u2014 streaming-proxy connection idle-time or proxy buffer exhaustion when many intermediate chunks are buffered before flush. Added extra logging for chunk flush timing (PR: runtime#3045).",
+    "2026-03-13 09:12 - Customer (LexAlign support@lexalign.ai): Provided repro snippet and noted that lowering max_tokens to 16k succeeds but is unacceptable for coverage. Asked if we can recommend a safe configuration.",
+    "2026-03-13 11:48 - Maya Chen (Runtime Eng): Reproduced locally with equivalent model and prompt shape. Observed that kernel selection changed decode scheduling: larger decode passes with delayed flush when prefix cache is large. That increases time-to-first-chunk and pushes higher memory pressure in streaming-proxy, which then closed the TCP stream.",
+    "2026-03-13 14:22 - Diego Ramirez (SRE): Deployed a staging fix that forces more frequent flushes from runtime to streaming-proxy for long-context decodes. Ran a validation run on a canary dedicated node \u2014 sustained 300-second generation completed successfully in staging.",
+    "2026-03-14 08:30 - Priya Nair (Support): Informed customer about temporary workaround and ETA for production patch. Customer requested rollback window details.",
+    "2026-03-14 12:10 - Diego Ramirez (SRE): Production rollout planned at 2026-03-14 18:00 UTC (one-hour maintenance window) for runtime patch: runtime#3045. Post-rollout we'll monitor streaming disconnect rate and token billing anomalies.",
+    "2026-03-14 12:45 - Customer (LexAlign): Approved maintenance window. Will pause heavy nightly jobs during rollout and validate next-day runs."
+  ],
+  "investigation_notes": "Summary of findings:\n- Root cause appears related to a decode scheduling change in kernel selector (rolled 2026-03-09) that batches decode work differently when prefix KV cache is large. This causes the runtime to buffer more tokens before emitting incremental chunks, increasing latency to first streamed chunk and increasing memory pressure in streaming-proxy.\n- streaming-proxy has a soft buffer threshold and aggressive connection termination when backpressure persists; with very large max_tokens and long prefix, the end-to-end pipeline hit that state.\n- No GPU crashes or scheduler OOMs observed.\nEvidence:\n- streaming-proxy logs show repeated \"flush_timeout\" events tied to request SUP-41234's trace-id.\n- runtime metrics show spike in per-request rss and chunk_latency for affected runs.\n- Staging reproduction validated the behavior and the proposed mitigation (more frequent flushes) eliminated disconnects in test runs.",
+  "workaround": "Recommended short-term workarounds provided to customer:\n1) Reduce max_tokens to <= 16k when possible.\n2) If full output needed, split the prompt into smaller segments and concat outputs server-side.\n3) For Dedicated customers, request a temporary increase to streaming-proxy buffer/timeouts via support request (we can apply per-pool).",
+  "resolution_plan": "Planned actions:\n- Roll out runtime patch (runtime#3045) that forces earlier chunk flushes and improves backpressure signaling to streaming-proxy. Target: 2026-03-14 18:00 UTC.\n- Post-deploy: monitor streaming disconnect rate, chunk_latency, and per-request RSS for the affected pool for 48 hours.\n- Follow-up internal task INT-7882 created to add long-context regression tests and an alert for sudden increases in streaming-proxy flush_timeouts.\n- Communicate to customer: patch rolled and validated; recommend re-running nightly jobs and report anomalies.\n\nResolution notes will be appended after rollout and verification.",
+  "resolution": "",
+  "follow_up_tasks": [
+    "INT-7882",
+    "INT-7925"
+  ],
+  "notes_for_billing": "Customer reported duplicate retry billing induced by aborted runs. Finance to be looped if retries billed in next invoice. Created billing placeholder to track potential credits. See linked billing ticket INT-7925.",
+  "attachments": [
+    "lexalign_pcap_2026-03-12.zip",
+    "repro_script_lexalign.sh"
+  ],
+  "public_update": "We are investigating streaming disconnects for very long-context generations. We have identified a runtime decoding scheduling change that increases buffering for long prefixes and are deploying a fix to reduce buffered chunk latency. If you are affected, temporary workarounds (lower max_tokens or split prompts) are available and Support can request a per-pool timeout increase.",
+  "estimated_time_to_fix": "Production patch scheduled for 2026-03-14 18:00 UTC; verification window 48h post-deploy",
+  "cc": [
+    "sre-oncall@redwood.ai",
+    "account-exec@redwood.ai"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "workaround",
+    "resolution_plan",
+    "public_update"
+  ],
+  "dataset_doc_uuid": "dsid_45f1ba77fc3348cd920c05e97f1d7c14"
+}

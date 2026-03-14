@@ -1,0 +1,90 @@
+{
+  "key": "SUP-845123",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Intermittent candidate-id misassociation after proxy buffer rotation causing rerank order flips and elevated tail latency",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "customer_company": "AtlasSearch Ltd",
+  "customer_tier": "enterprise",
+  "components": [
+    "embed-ingest",
+    "reranker",
+    "proxy",
+    "serving-runtime"
+  ],
+  "labels": [
+    "rerank-quality",
+    "latency-spike",
+    "http2",
+    "envoy"
+  ],
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Maya Chen",
+  "assignee": "Liam O'Connor",
+  "environment": "prod us-east-1",
+  "affected_models": [
+    "open-embed-v2",
+    "redwood-reranker-2.1"
+  ],
+  "affected_regions": [
+    "us-east-1",
+    "eu-west-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "linked_issues": [
+    "SUP-663322",
+    "SUP-41109"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving/pull/1823"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/Reranker-Probing-Runbook"
+  ],
+  "description": "Issue summary: Customer reports intermittent rerank result order flips accompanied by 95th/99th percentile latency spikes (~400-1200ms) for rerank requests. The failures correlate with requests that include batched embedding payloads and HTTP/2 multiplexing across an edge Envoy proxy.\n\nImpact: AtlasSearch saw degraded relevance (top-5 order changes) impacting search quality for ~2% of queries during peak and a 7% increase in tail latency. Affects enterprise production traffic in us-east and sporadically in eu-west.\n\nEnvironment: Production, traffic through the managed edge (Envoy) -> api-gateway -> embed-ingest -> reranker path. Customer uses pinned model open-embed-v2 for embeddings and redwood-reranker-2.1 for reranking; requests originate from AtlasSearch's multi-tenant front end using HTTP/2 keepalive with request multiplexing.\n\nObserved behavior: Some rerank responses return candidates with mismatched metadata (candidate ids that belong to a different query) or correct candidates but incorrect scores, and the request logs show additional queueing on the reranker pod that correlates with Envoy stream resets and buffer rotation events.\n\nExpected behavior: Reranker returns scores for candidates submitted in the same envelope and preserves ID mapping and order. Latency should remain within SLA (p95 < 250ms).",
+  "steps_to_reproduce": [
+    "1) Use customer-supplied repro: batch size 16 embeddings with variable-length vectors (256-1024) and send over HTTP/2 multiplexed streams with concurrent 12 streams from a single client connection.",
+    "2) Route through edge Envoy configured with response-buffering and HTTP/2 stream multiplexing (customer and Redwood default configs).",
+    "3) Trigger sustained load for ~10 minutes at 120 qps and observe rerank order and tail latencies.",
+    "4) Compare candidate ids returned to the original request envelope; mismatch and order flips occur intermittently (~1-3% of requests in repro)."
+  ],
+  "logs": [
+    "2026-03-10T14:22:11Z  INFO  envoy proxy: stream id=45 buffer-rotation triggered for connection=10.2.3.14:43722",
+    "2026-03-10T14:22:11Z  WARN  api-gateway: incoming batch id=atlas-req-9832; assigned mux-tag=0x7f3a",
+    "2026-03-10T14:22:11Z  ERROR reranker[replica-3]: candidate-id mismatch detected; expected ids=[c1,c2,...] got ids=[c1,cX,...] correlation_id=atlas-req-9832",
+    "2026-03-10T14:22:11Z  METRIC queue_time_ms reranker.replicas.replica-3 p95=512 p99=1118",
+    "2026-03-10T14:22:12Z  INFO  ingest[proxy-shim]: http2 stream reset code=NO_ERROR stream_id=45 connection=10.2.3.14:43722"
+  ],
+  "investigation_notes": [
+    "Initial hypothesis: Envoy's response buffer rotation + HTTP/2 stream reuse resulted in ephemeral header/mux-tag recycling; the request envelope tag used by reranker for candidate mapping was overwritten or misattributed under high concurrency.",
+    "Confirmed correlation between Envoy buffer-rotation events and reranker queueing/p95 spikes using traces from TRACE_ID=trace-atlas-20260310-14-22. See span sequence: envoy->api-gateway->embed-ingest->reranker; a short-lived stream reset precedes the mismatch in ~78% of sampled failures.",
+    "Reproducer validated on staging by toggling HTTP/2 max-concurrent-streams from 100->25; incidence dropped from 2.3% -> 0.1% in 30m window. Suggests a concurrency-sensitive bug in mux/tag handling.",
+    "Found a race in the embed-ingest proxy-shim: when a stream reset occurs with pending chunks, the shim can reassign the internal envelope id to a new incoming stream before the reranker has consumed the pending batch. This leads to candidate metadata mapping to the wrong envelope in the reranker input buffer.",
+    "Related code pointers: proxy-shim request-id assignment (github/serving/pkg/proxy/shim.go line ~412), suspected race around ResetHandler and AssignEnvelope calls."
+  ],
+  "comments": [
+    "2026-03-10T15:03: Sarah (Support): Acknowledged. Escalating to SRE for priority investigation and providing a repro to Eng. SLA first response met.",
+    "2026-03-10T16:10: Liam O'Connor (SRE): Reproduced on staging with customer repro. Observed same Envoy buffer-rotation events. Creating a scoped jt for a fix and adding temporary mitigation flag to edge Envoy config to disable response buffering for affected routes.",
+    "2026-03-11T09:22: Maya Chen (Support): Customer confirmed improvement after mitigation; quality regressions dropped but still seeing rare occurrences under sustained load. Customer asks for ETA on permanent fix and whether any data integrity was lost.",
+    "2026-03-11T10:05: Liam O'Connor (SRE): No data was permanently lost; affected requests returned incorrect candidate mapping but logs show both versions; we'll roll forward a patch to ensure envelope ids are immutable once assigned and survive stream resets. Target patch in PR #1823."
+  ],
+  "resolution_notes": [
+    "Workaround applied: disabled response buffering + reduced max-concurrent-streams on the edge Envoy for AtlasSearch route (rolled 2026-03-11 02:30 UTC). Observed reduction in incidence to <0.2% during 6h smoke test.",
+    "Fix in progress: code change to make envelope id assignment atomic and retained across stream lifecycles in proxy-shim. PR opened: https://github.com/redwood-inference/serving/pull/1823. Patch includes unit tests that simulate stream reset race and an integration test in staging.",
+    "Planned rollout: staged deploy to prod canary (5% traffic) 2026-03-13; full rollout pending 24h canary metrics (p95 latency, mismatch-rate).",
+    "Follow-ups: add an automated alert for candidate-id mismatch rate >0.1% and update reranker ingest contract with stronger envelope immutability guarantees. Notify security/compliance that there was no exfiltration."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_9d98d19bc56e4ee789768a5b35a861a6"
+}

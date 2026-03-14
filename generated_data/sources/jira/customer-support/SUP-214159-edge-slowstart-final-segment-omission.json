@@ -1,0 +1,68 @@
+{
+  "key": "SUP-214159",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "edge slow-start causes final stream segment omission on large streaming responses",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Maya Chen",
+  "assignee": "Arjun Patel",
+  "customer_company": "BrightCart",
+  "customer_tier": "enterprise",
+  "components": [
+    "api-gateway",
+    "edge-proxy",
+    "serving-runtime"
+  ],
+  "labels": [
+    "streaming",
+    "edge",
+    "investigation",
+    "workaround-detected"
+  ],
+  "environment": "prod | us-east",
+  "affected_models": [
+    "rw-compat-7b",
+    "rw-compat-13b"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "description": "Issue summary:\nCustomers on BrightCart report that long streaming responses (multiple kilobyte final paragraphs) occasionally end without the final segment (last 1-3 sentences) \u2014 the stream connection terminates and the client does not receive the concluding text or the terminal event. This appears to happen only for large responses (8k+ tokens in aggregate) and is intermittent (~0.5% of streams during peak).\n\nImpact:\n- BrightCart critical customer-facing chat flows missing concluding instructions, causing UX mistakes.\n- Affects enterprise contract SLA; customer flagged as P1.\n\nEnvironment:\n- prod via edge region us-east -> api-gateway -> nginx-based edge-proxy -> internal route to serving-runtime.\n- Customer traffic patterns: long single-turn generations (high prefix + long completion).\n\nSteps to reproduce (observed / suggested):\n1) Use the customer prompt used in their repro bundle (attached) that reliably produces ~2200 tokens completion.\n2) Open SSE connection to /v1/stream with keepalive enabled and accept chunked transfer encoding.\n3) Observe a successful stream most times; intermittently the client receives everything except the final 1-3 sentences and no terminal 'done' event.\n\nRepro notes:\n- Repro increases when artificially delaying client reads (simulate slow consumer) and when packetization coalescing at the edge is enabled.\n- Repro is NOT observed when bypassing the edge-proxy (direct node -> serving-runtime) in our staging environment.\n\nInitial logs / traces attached:\n- request ids: req-us-12345-mln, req-us-12378-mln (examples where final segment missing).\n- edge access logs show 200 and normal Content-Type but edge metrics show 'finish_write' occurred before final chunk flushed to downstream in ~60% of repro cases.\n\nSuggested urgency: P1 / Sev1 because enterprise customer and SLA risk.",
+  "comments": [
+    "Support (Maya): Initial triage with customer produced sample request bundle and capture from their client (client includes headers + raw bytes). Customer confirms bypassing corporate proxy reduces occurrence.",
+    "SRE (Anika): I can see correlated spikes in edge write latency for the request ids. Opening a packet capture next. Assigned to Arjun for deeper tracing into edge config.",
+    "Customer (BrightCart Eng): We can reproduce locally with our mobile emulator when the connection enters a slow-start (cellular) profile. Happily provided curl traces and chrome net internals dumps.",
+    "Engineering (Arjun): Running targeted repro in staging with edge-proxy in front of serving-runtime. Observed chunk coalescing in nginx buffers where final '\\n' terminator became coalesced with keepalive probe and downstream client parsed stream as closed without final event. Working on further instrumentation.",
+    "SRE (Anika): Added temporary log to edge layer to emit flush timestamps and chunk boundary markers. We saw multiple cases where the last data write had a timestamp equal to the keepalive write and downstream connection closed shortly after."
+  ],
+  "investigation_notes": "Hypothesis 1: Edge proxy (nginx) buffer coalescing + keepalive/fast-finish race causes final data chunk to be merged with a zero-length or keepalive write that a client or CDN interprets as end-of-stream, dropping the terminal metadata.\n\nWhat we ran:\n- Reproduced with instrumented edge in staging: toggled proxy sendfile/chunked_transfer and proxy_buffering flags. Disabling proxy_buffering reduced failures from ~0.5% -> ~0.01% for the test set.\n- Verified that direct bypass of edge (same serving-runtime) shows no failures.\n- Captured tcpdump: last small packet often contained only keepalive frames and then an RST from an intermediate NAT (customer corp NAT) in some cases.\n- Correlated with client-side slow-consumer behavior: slower read windows cause nginx to buffer more aggressively and coalesce writes when connection resumes.\n\nRelated signals / links:\n- Grafana dashboard: https://grafana.redwood.example/d/streams/edge-write-latency (pan to 2026-03-10 15:00 - 17:00)\n- Slack thread: #support BrightCart / messages: https://redwood.slack.com/archives/C01234ABC/p1641212345678\n- Packet captures attached in Confluence runbook: https://confluence.redwood.example/display/SUPPORT/edge-slowstart-packets\n\nPreliminary root cause: Combined behavior of nginx proxy_buffering + edge keepalive writes can cause final application chunk to be combined with a keepalive/zero-length probe which some intermediate network elements (corporate NATs, CDNs) treat as a connection-stealing probe, resulting in the final terminal-data never being delivered to the client. The serving-runtime did emit the final tokens and terminal event; loss is happening between edge and client.\n\nNext steps (in progress):\n- Deploy temporary mitigation in prod us-east: set proxy_buffering off and reduce proxy_send_timeout for customer route.\n- Implement additional guard in serving-runtime to emit an explicit final terminator event (unique token) before closing the stream so downstream coalescing won't hide terminal metadata.\n- Create an edge-safe flushing PR to ensure last chunk is flushed as its own packet when stream is ending.",
+  "related_github_prs": [
+    "https://github.com/redwood-inference/edge-proxy/pull/1423",
+    "https://github.com/redwood-inference/serving-runtime/pull/907"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.example/display/SUPPORT/Edge+Slow-Start+Stream+Omission+Runbook"
+  ],
+  "linked_issues": [
+    "INT-8832",
+    "SUP-214160"
+  ],
+  "resolution": "Mitigation in place: prod us-east edge route updated to disable nginx proxy_buffering for BrightCart routes and proxy_send_timeout reduced. Serving-runtime patched to emit explicit terminal event token prior to stream close and PR created to make this behavior configurable. These mitigations reduced observed failure rate in canary to <0.02% for the test traffic.",
+  "resolution_notes": "Fix summary:\n- Short-term: Disabled proxy_buffering + tuned timeouts for target route (rolled 2026-03-11 02:30 UTC).\n- Medium-term: Serving-runtime change (PR #907) to append explicit '\\n--END-STREAM-TERMINATOR--\\n' marker before closing stream (configurable via 'stream.terminator_token'). Deployed to canary and then to us-east.\n- Long-term: Edge-proxy PR #1423 adds an option to force last-chunk-flush (sets tcp_nodelay and flush after final send) and monitoring alert to catch increase in edge coalescing metrics.\n\nFollow-ups / action items:\n- Postmortem doc + customer-facing incident summary to be drafted by CS (Maya) by 2026-03-14.\n- Runbook update to include proxy_buffering checklist for streaming workloads (owner: Anika).\n- Instrumentation: add metric edge.final_chunk_coalesce_rate (owner: Observability team).\n\nCustomer communication:\n- Notified BrightCart of interim mitigation and asked them to validate on their end. They confirmed reduced occurrence in their QA fleet. Next: schedule joint verification window 2026-03-13 18:00 UTC.\n\nStatus: In Progress \u2014 mitigations deployed to production us-east; monitoring in place; preparing full rollout and postmortem.",
+  "related_incident_id": "INC-2026-0310-03",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_08c6e5ea004a4798b9a8ab8ebd1b947c"
+}

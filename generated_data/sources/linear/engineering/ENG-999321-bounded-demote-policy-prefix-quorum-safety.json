@@ -1,0 +1,99 @@
+{
+  "key": "ENG-999321",
+  "team": "engineering",
+  "title": "Bounded demotion policy with prefix quorums for KV cache correctness",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-26",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Raman",
+  "assignee": "Mateo Alvarez",
+  "project": "runtime-kv-stability",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-25",
+  "labels": [
+    "kv-cache",
+    "eviction",
+    "gpu-memory",
+    "continuous-batching",
+    "safety"
+  ],
+  "dependencies": [
+    "ENG-61234",
+    "ENG-331210"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Problem: Continuous batching and long-lived prefix inference patterns are exposing a race between aggressive LRU/TTL eviction and in-flight KV usage on GPU. When a large micro-batch pins references across multiple CUDA kernels, a straight LRU or TTL eviction can free slots while the batch still needs them, causing either correctness violations (stale/missing KV lookups) or costly synchronous spills.\n\nProposal: Implement a 'bounded demotion' eviction path combined with a prefix quorum mechanism and batch-pin extension. Instead of immediately reclaiming a slot when it becomes eligible for eviction, we move it to a demoted slab with a demotion epoch and grace window. A prefix quorum (per tenant/prefix group) must observe unanimous demotable state before final reclamation, preventing cross-prefix races in continuous batching. Additionally, batches that reference KV entries will extend a 'pin' lease scoped to the batch epoch to prevent demotion during kernel windows.\n\nThe goal is to provide pragmatic correctness guarantees (no in-flight lookup fails, deterministic demotion progress) while keeping GPU footprint bounded and preserving throughput for small-latency requests.",
+  "acceptance_criteria": [
+    "Unit + integration tests prove no KV lookup returns a missing entry when batch-pin is honored (fuzzed across interleavings)",
+    "Fuzzbench runs (existing harness) show zero linearizability violations for prefix-scoped operations under heavy continuous batching load",
+    "Memory reclamation latency stays within 1.5x of current best-case for steady-state workloads (measured on 80/20 seq length distribution)",
+    "99th-percentile token-latency regression <= 5% on our perf harness for standard demo models",
+    "Operational metrics and events emitted for demotion transitions (demoted->reclaimed) and prefix-quorum stalls"
+  ],
+  "design_doc_link": "https://redwood.atlassian.net/wiki/spaces/ENG/pages/kv/bounded-demotion-prefix-quorum-design",
+  "prs": [
+    "https://github.com/redwood-inference/runtime/pull/5421",
+    "https://github.com/redwood-inference/runtime/pull/5439"
+  ],
+  "implementation_notes": [
+    "Add two new allocation slabs: ACTIVE, DEMOTED. Demoted slab uses compact LRU but is excluded from immediate reuse until demotion_grace_ms expires or prefix quorum clears.",
+    "Introduce per-prefix DemotionEpoch counter stored with slot metadata (64-bit epoch + bitflags). In-flight pins include the epoch they observed; reclamation requires demotion_epoch > observed_epoch and grace window elapsed.",
+    "BatchPin extension: when a request enters continuous-batching pipeline, it registers pins for referenced prefixes. Pins are lightweight refcounts stored in shared host memory and atomically incremented/decremented around kernel launches.",
+    "Prefix quorum: each prefix group keeps a bloom-filter-like ack map across local partitions; final reclamation requires local partition to report 'no active pins' and global quorum (fast path) or delayed single-partition reclaim (slow path) to ensure progress.",
+    "Backpressure: when demoted slab high-watermark reached, we emit a scheduling signal to throttle admission of new large cross-prefix batches and trigger prefetch hints to avoid synchronous spills.",
+    "Telemetry: track demotion_count, reclamation_count, demotion_latency_ms, batch_pin_holds, and quota_throttle_events. Expose per-tenant breakdown in Console.",
+    "Make demotion_grace_ms tunable per deployment profile; default 50ms for hosted, 20ms for dedicated low-latency tier.",
+    "Add fast-path optimizations for single-prefix heavy workloads: if prefix ownership local and no multi-prefix crossing detected, bypass quorum and use local demotion to reduce latency."
+  ],
+  "testing_plan": [
+    "Extend existing eviction fuzz harness to model continuous-batching: interleave pin acquisition, kernel delays, TTL ticks, and demotion triggers across 50k randomized trials",
+    "Unit tests for epoch monotonicity and demotion_idempotence (simulate restarts and partial failures)",
+    "Integration test in CI with real CUDA small model (gpt-mini) with synthetic workload that holds pins across kernel launches",
+    "Perf bench: run our 95/99th token latency and throughput sweep on runtime-1.22 branch, compare baseline and feature branch under scaled tenant mix",
+    "Chaos test: kill a partition leading to quorum lag and verify slow-path reclamation completes without stalls or leaks"
+  ],
+  "rollout_plan": [
+    "Feature gated behind runtime flag kv.bounded_demotion.enabled=false by default",
+    "Canary deploy: enable on 5% of traffic in hosted for 48h, monitor demotion metrics and 99p latency",
+    "If canary stable, increase to 25% for 24h. Then enable for dedicated customers who opt-in with tuned grace window",
+    "After 7 days of stable telemetry, enable globally and bake into runtime-1.22 default config",
+    "Provide rollback knob to force immediate synchronous reclaim (for emergency memory pressure scenarios), with alerting when used"
+  ],
+  "risks": [
+    "Increased GPU memory usage due to demoted slab holding entries during grace window; worst-case could amplify tail pressure under pathological workloads",
+    "Quorum protocol increases cross-partition metadata traffic and complexity; buggy implementation could cause stalls or live locks",
+    "If batch-pin is not applied consistently across all batch codepaths (e.g., newer compiled kernels), we may still see race conditions",
+    "Operational complexity: tuning demotion_grace_ms per deployment adds knobs teams may misconfigure leading to regressions"
+  ],
+  "notes": [
+    "Related literature: 'lease-based cache eviction' papers and 'epoch-based reclamation' in concurrent data structures were used as references",
+    "We intentionally pick demotion+quorum vs global locks to preserve throughput for typical PLG workloads while protecting correctness in cross-prefix heavy cases",
+    "Design doc contains formal invariants (prefix atomicity, demotion idempotence, pin-safety) with small proof sketches",
+    "Coordination with SDK teams required: pin lease handshake must be exposed in low-level C API used by Python/Rust SDKs"
+  ],
+  "comments": [
+    "2026-02-27 - Aisha Raman: Initial proposal posted; added sketch of demoted slab and batch-pin idea. Requesting design review from core runtime and batching owners.",
+    "2026-03-01 - Mateo Alvarez: Performed micro-benchmark simulation; demotion_grace_ms=50ms increases memory by ~3% but avoids 95% of synchronous spills on our trace workloads.",
+    "2026-03-03 - Lena Cho (Infra): Question about quorum metadata replication; recommended using existing leased-offset watermark to piggyback instead of extra RPCs.",
+    "2026-03-05 - Perf Team: Ran throughput sweep; observed 2% throughput dip for multi-prefix pathological workload, acceptable under P1 trade-off.",
+    "2026-03-07 - Security Review (ops): No direct secrets exposure; added acceptance criterion to ensure metrics don't leak tenant ids in aggregated logs.",
+    "2026-03-09 - QA (Jon Meyer): Fuzzbench found a rare race where TTL expiration and pin decrement coincided causing premature reclaim in one partition. Repro instructions attached to PR #5439.",
+    "2026-03-12 - Mateo Alvarez: Implemented conservative fix (atomic pin/decrement ordering) and updated tests; pushing for canary after PR review."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "implementation_notes",
+    "testing_plan",
+    "rollout_plan",
+    "risks",
+    "notes",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_b7d1ba9e5bc94766bde4b2f5bfb1cb5b"
+}

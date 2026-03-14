@@ -1,0 +1,64 @@
+{
+  "key": "ENG-880888",
+  "team": "engineering",
+  "title": "stream-wrangler-cancellation-interop-timeout-safety",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-02-14",
+  "updated_at": "2025-03-01",
+  "creator": "Aisha Patel",
+  "assignee": "Liam O'Connor",
+  "project": "go-sdk-streaming-reliability",
+  "cycle": "2025-W09",
+  "estimate": "5",
+  "labels": [
+    "go-sdk",
+    "streaming",
+    "cancellation",
+    "timeouts",
+    "ergonomics"
+  ],
+  "customer_impact": "medium",
+  "release": "go-sdk-1.9.0",
+  "description": "Problem: Consumers of the Go SDK streaming API see surprising behavior when their local context deadlines or cancellations race with server-side stream termination or network flaky conditions. Current examples show leaked goroutines, partially-acknowledged prefetch windows, and ambiguous error values that make retry/rollback logic fragile.\n\nGoal: Implement a small, well-documented StreamWrangler helper and associated ergonomics so that client code can: (1) attach a configurable \"soft deadline\" that triggers a graceful drain and detach window before cancelling the underlying transport; (2) ensure cancellations propagate to the server with a reproducible sentinel error; (3) preserve KV/prefetch state where possible for resumable streams; (4) avoid goroutine leaks and make Close semantics deterministic.\n\nScope: The ticket implements the API surface, internal wiring in the SDK runtime shim, tests, and examples. It does not change server contracts or wire protocol beyond sending a cancellation reason metadata header when available.",
+  "technical_design": "Design summary: Introduce a StreamWrangler wrapper around the existing stream iterator. Key concepts: softDeadline (linger window), drainHandshake, cancelReason metadata, sentinel client-side error (ErrStreamCancelledByClient), and normalized error mapping.\n\nComponents:\n- StreamWrangler struct: wraps the existing Stream and coordinates lifecycle. Exposes Next(ctx) and Close(ctx, reason string).\n- Soft deadline helper: WrapContextWithSoftDeadline(ctx, d time.Duration) returns a ctx that, on expiry, triggers a cooperative drain (drainHandshake) and then cancels after linger window. This gives in-flight message handlers time to finish and lets the SDK send a graceful CANCEL metadata to the server.\n- Cancel reason propagation: When Close is called or soft deadline expires, StreamWrangler injects an outgoing metadata header X-Client-Cancel-Reason (or uses gRPC/HTTP canonical fields) with a short token (e.g., \"client_timeout_soft\") to aid server-side debugging and metrics.\n- Sentinel error: Define var ErrStreamCancelledByClient = errors.New(\"stream cancelled by client\") and map to codes.Canceled when translating to gRPC/HTTP errors. This makes upstream retry logic straightforward: treat ErrStreamCancelledByClient as a non-transient cancellation unless the caller explicitly retries.\n- Leak safety: StreamWrangler installs a bounded goroutine watchdog to ensure any background prefetch or readPump goroutine exits within softDeadline + jitter window. If it doesn't, we log a severe metric and forcibly cancel the transport to avoid resource exhaustion.\n\nAPI (proposal):\n- type StreamWrangler struct { /* opaque */ }\n- func NewStreamWrangler(ctx context.Context, s Stream, opts ...StreamWranglerOption) *StreamWrangler\n- func (w *StreamWrangler) Next(ctx context.Context) (Message, error) // honors ctx deadlines, returns ErrStreamClosed when stream is finished\n- func (w *StreamWrangler) CloseWithReason(ctx context.Context, reason string) error // cooperative close with reason\n- func WrapContextWithSoftDeadline(ctx context.Context, d time.Duration) context.Context // attaches metadata, triggers graceful drain\n\nCompatibility: Existing code using the raw Stream remains supported. StreamWrangler is opt-in. The helper should be small and well-documented so customers can adopt incrementally.",
+  "api_examples": "Example usage (illustrative):\n\n// create a stream w/ a 250ms soft deadline for local handlers\nctx := WrapContextWithSoftDeadline(parentCtx, 250*time.Millisecond)\nw := NewStreamWrangler(ctx, underlyingStream)\nfor {\n    msg, err := w.Next(ctx)\n    if err == ErrStreamClosed {\n        break\n    }\n    if err != nil {\n        // treat ErrStreamCancelledByClient as an intentional cancellation,\n        // not a server transient failure.\n        if errors.Is(err, ErrStreamCancelledByClient) {\n            log.Printf(\"client cancelled: %v\", err)\n            break\n        }\n        // otherwise surface for retry logic\n        return err\n    }\n    handleMessage(msg)\n}\n// cooperative close with reason sent to server for observability\n_ = w.CloseWithReason(context.Background(), \"user-abort:signup-flow-timeout\")\n\nNotes: The soft deadline only affects the SDK-side cooperative shutdown. Callers may still cancel the parent context to force immediate teardown.",
+  "acceptance_criteria": [
+    "StreamWrangler is implemented and exported in the go SDK package",
+    "WrapContextWithSoftDeadline attaches metadata and triggers drain handshake when the soft deadline fires",
+    "CloseWithReason sends a cancel-reason header when transport supports it (unit test mocks ensure header set)",
+    "ErrStreamCancelledByClient sentinel is documented and returned on client-initiated cancellations",
+    "Unit tests cover graceful drain, forced cancellation after linger window, and watchdog triggering",
+    "Integration test demonstrates no goroutine leaks with repeated Start/Close cycles (race-tested)",
+    "Example snippet added to README and streaming ergonomics doc page"
+  ],
+  "tasks": [
+    "spec: finalize API names and options (1d)",
+    "implement StreamWrangler core lifecycle and metadata wiring (3d)",
+    "unit tests: error mapping, soft deadline, watchdog, CloseWithReason (2d)",
+    "integration test: repeated open/close stress test and race sanitizer run (1d)",
+    "docs: add examples and migration guide (0.5d)",
+    "code review and iterate based on feedback (1d)",
+    "release notes and changelog entry for go-sdk-1.9.0 (0.5d)"
+  ],
+  "test_plan": "Unit tests will use a fake transport that simulates slow reads, server-initiated close, and metadata acceptance. Cases to cover:\n- Next respects provided ctx deadlines and returns appropriate sentinel errors.\n- Soft deadline triggers the drainHandshake path and allows in-flight handler to complete within linger window.\n- Forced cancellation after linger window tears down the transport and returns ErrStreamCancelledByClient mapped to codes.Canceled.\n- Watchdog triggers if background reader goroutine doesn't exit and results in forced cancel; counter metric is incremented.\n\nIntegration tests:\n- Run stress test with 1k short-lived streams in a loop for 3 minutes under race detector to surface goroutine leaks.\n- Measure that average extra latency introduced by softDeadline flow is within SLAs for normal workloads.\n\nE2E can be validated against staging runtime by enabling client-cancel-reason metadata and checking server logs for the X-Client-Cancel-Reason tag.",
+  "rollout_plan": "Feature gated behind go-sdk config flag StreamWranglerEnabled (default false).\n- Canary (internal): enable for 10% of internal CI jobs and run stress integration.\n- Beta (selected customers): enable for 1-2 early SDK adopters with opt-in flag and collect logs/metrics for cancel-reason headers and watchdog events.\n- General availability: flip default to true after 2 weeks of stable canary and customer beta.\n\nTelemetry to collect: number of soft-deadline triggers, average linger window utilization, number of watchdog-forced-cancels, and the distribution of cancel reasons seen server-side.",
+  "notes": "Trade-offs considered: full automatic resume semantics were considered but deferred since they require server-side checkpoints and stronger protocol guarantees. We aim for better cancellation ergonomics first and can iterate to add resumability later.\n\nSecurity: cancel reason tokens are short ASCII strings; avoid leaking PII. Docs and example emphasize using opaque tags (e.g., \"signup-flow-timeout\") rather than user identifiers.\n\nOpen questions:\n- canonical header name across HTTP vs gRPC (we currently send both: X-Client-Cancel-Reason and grpc-metadata-x-client-cancel-reason when using gRPC transport)\n- should soft-deadline be expressed as absolute timestamp in ctx metadata for better server correlation? (defer)\n\nImplementation owners: Liam O'Connor (owner), Aisha Patel (spec review), Marco Ruiz (qa/integration lead)",
+  "related_links": [
+    "https://github.com/redwood-inference/go-sdk/issues/412",
+    "https://confluence.company/internal/go-sdk/streaming-ergonomics",
+    "https://github.com/redwood-inference/runtime/pull/2793 (server side: accept cancel reason header - WIP)"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "technical_design",
+    "api_examples",
+    "acceptance_criteria",
+    "tasks",
+    "test_plan",
+    "rollout_plan",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_c17473ce3ed04625b32729fc47e0634f"
+}

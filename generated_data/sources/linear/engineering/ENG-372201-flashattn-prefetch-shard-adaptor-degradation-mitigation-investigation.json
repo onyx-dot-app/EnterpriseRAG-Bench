@@ -1,0 +1,113 @@
+{
+  "key": "ENG-372201",
+  "team": "engineering",
+  "title": "FlashAttention prefetch-shard adaptor and degradation mitigation investigation",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-03-14",
+  "creator": "Aisha Patel",
+  "assignee": "Marco Ruiz",
+  "project": "Serving Runtime - Kernel Optimization",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-28",
+  "labels": [
+    "runtime",
+    "flashattn",
+    "prefetch",
+    "regression",
+    "long-context",
+    "mixed-precision"
+  ],
+  "release": "runtime-1.22",
+  "dependencies": [
+    "ENG-130001",
+    "ENG-204536"
+  ],
+  "customer_impact": "medium",
+  "security_review_required": "false",
+  "description": "Problem: Since integrating FlashAttention v3 builds selectively for some model classes, we've observed intermittent decoding latency spikes and OOMs for long-context mixed-precision workloads during prefill -> decode handoff. Behavior is more frequent on multi-tenant Dedicated hosts where microbatch sizes vary. This ticket investigates root causes and implements a pragmatic adaptor that prefetches and shards KV workspace reservations to avoid catastrophic kernel selection regressions.\n\nObserved symptoms: p95 decode latency jumps (x2-x5) on 2048+ contexts; occasional CUDA OOMs during concurrent prefill + decode on same GPU; increased variance in kernel choice selector for sequences > 1024 tokens leading to suboptimal FlashAttention variant chosen.\n\nHypothesis: The kernel selector's heuristics assume worst-case contiguous workspace availability. On mixed workloads the runtime fast-path picks v3 kernels that require a larger transient workspace. When prefill and decode overlap the allocator fragments the workspace and the kernel falls back late into a slower variant or triggers OOM. Combined with our continuous-batching and prefetch pipeline, this causes jitter and degradation.\n\nGoal: 1) Reproduce reliably in an isolated microbench 2) Add a prefetch-shard adaptor that reserves and fragments workspace before kernel selection to make choice deterministic 3) Add staged rollback/canary and perf guardrails so hosted/dedicated users see minimal disruption.\n\nAcceptance criteria:\n- Repro case that fails > 90% of runs before fix and succeeds > 95% after fix on same hardware images.\n- p95 decode latency reduction on target long-context benchmark: from 540ms -> <= 260ms (measured on p4d.24xlarge analog).\n- No increase in memory tail OOMs during 1h soak at 16 concurrent workers.\n\nNotes on scope: This is a runtime-level mitigation; a later follow-up ticket will implement kernel autotuning table updates and a permanent scheduler change if necessary.",
+  "steps_to_reproduce": [
+    "Checkout runtime branch: git checkout feature/flashattn-prefetch-adaptor",
+    "Build test image: tools/ci/build_inference_image.sh --tag=adv-prefetch-test",
+    "Run microbench: ./benchmarks/long_context_prefill.sh --model=gpt-3-xl --seq=2048 --batch=4 --concurrent=8 --precision=fp16",
+    "Observe: run sample 10 times; prior to fix expect 6/10 runs with p95 > 500ms or OOMs; after fix expect < 2/10 failures"
+  ],
+  "benchmarks": [
+    "Baseline (before): throughput=125 tokens/sec, p50=62ms, p95=540ms on p4-sim; OOM rate ~6% over 100 runs",
+    "After prefetch-shard adaptor (local dev): throughput=160 tokens/sec, p50=58ms, p95=240ms; OOM rate 0/100",
+    "Canary (small fleet): throughput change +18%, p95 stable at ~250ms over 6h soak"
+  ],
+  "proposed_approach": [
+    "Add a prefetch-shard adaptor layer between allocator and kernel selector that: probes required transient workspace for candidate kernels, reserves fragmented slices of workspace (shards) for prefill and decode paths, and guarantees deterministic kernel selection based on reserved shards.",
+    "Introduce a soft reservation API for workspace that falls back to conservative kernels when total free contiguous workspace < threshold.",
+    "Instrument allocator telemetry (fragmentation ratio, failed reservations) and add eviction counters to monitor in console dashboards.",
+    "Staged rollout: dev -> perf-canary -> dedicated canary -> global. Feature flag gate with fallback=true option to allow automatic rollback to prior behaviour if SLOs degrade."
+  ],
+  "decision_log": [
+    "2026-02-23: Decided to implement adaptor shim instead of changing kernel implementations to keep integration risk low (Aisha/Marco/Jing).",
+    "2026-03-02: Chose deterministic shard reservation over greedy coalescing to prioritize stability for Dedicated tenants (engineering sync).",
+    "2026-03-10: Agreed to expose allocator fragmentation metrics in Console and add an automatic canary guard that rejects rollout if fragmentation ratio > 0.45 over 10m windows."
+  ],
+  "implementation_notes": [
+    "Adapter lives in runtime/allocator/prefetch_shard_adaptor.cc and exposes C++ API reserve_shards(vector<size_t> shards) \u2014 unit tests should mock CUDA allocator.",
+    "Feature flag: runtime.prefetch_shard_adaptor.enabled (default=false); rollout controlled by release manager.",
+    "Add unit + integration tests under tests/allocator/test_prefetch_shard_adaptor.py and e2e bench harness in infra/benchmarks/long_context_with_overlap.py",
+    "Update kernel selector scoring to consider reserved_shard_count and reserved_contiguous_bytes as tie-breakers.",
+    "Backwards compatibility: adaptor must gracefully no-op when flashattn v3 not available; will fall back to existing selection heuristics."
+  ],
+  "risks_and_mitigation": [
+    "Risk: Additional reservation overhead could reduce peak throughput. Mitigation: soft reservation path that releases shards if utilization is low and falls back to coalesced allocation after prefill completes.",
+    "Risk: Uncovered edge-case where reserved shards still produce fragmentation for very large models. Mitigation: guardrail to pin kernel version to v2 for problematic model classes via model manifest until autotuner is improved.",
+    "Risk: Rollout might trigger regressions on older GPU drivers. Mitigation: driver compatibility matrix check in canary and automatic disable on failed driver profiles."
+  ],
+  "rollout_plan": [
+    "Step 1 (dev): Merge to feature branch behind flag; run full unit and integration suite (automatic).",
+    "Step 2 (perf-canary): Deploy to 4 canary hosts running long-context soak for 48h, monitor p95, OOMs, fragmentation metrics. Threshold to proceed: no p95 regression and OOM count unchanged.",
+    "Step 3 (dedicated-canary): Enable for 2 small Dedicated customers (consent obtained) for 1 week with SLA guardrails.",
+    "Step 4: Global staged rollout across Dedicated and Hosted; monitor for 72h with automatic rollback if fragmentation ratio spikes or p95 increases > 15%."
+  ],
+  "monitoring_and_alerting": [
+    "New metrics: allocator.fragmentation_ratio, allocator.failed_reservations, adaptor.reserved_shards_count",
+    "Dashboards: Add long_context_prefill board showing p50/p95 for prefill and decode, OOM rate, fragmentation ratio",
+    "Alerts: p95_decode > baseline * 1.25 for 5m; OOM_rate > 0.5% over 10m; failed_reservations > 3/min\t"
+  ],
+  "links": [
+    "https://github.com/redwood-inference/runtime/pulls/4521 (WIP PR: prefetch-shard-adaptor)",
+    "https://github.com/redwood-inference/runtime/compare/feature/flashattn-prefetch-adaptor...main",
+    "https://confluence.redwood.ai/display/RUNTIME/FlashAttention+v3+integration+notes",
+    "https://grafana.redwood.ai/d/allocator/long-context-prefill?orgId=1"
+  ],
+  "attachments": [
+    "benchmarks/2026-03-11/prefetch_adaptor_local_runs.log",
+    "perf-profiles/flashattn_v3_fragmentation_summary_2026-02-28.csv",
+    "screenshots/console-dashboard-fragmentation-2026-03-12.png"
+  ],
+  "comments": [
+    "2026-02-21 - Marco Ruiz: Initial triage \u2014 reproduced locally using the long_context_prefill harness. Created adapter prototype that reserves single contiguous region; observed improvement but still brittle under concurrency.",
+    "2026-02-25 - Aisha Patel: Added telemetry hooks to allocator; fragmentation ratio reported 0.52 during failing runs. See attached CSV.",
+    "2026-03-01 - Jing Wei: Reviewed prototype \u2014 suggested shard approach to allow multiplexing between prefill and decode instead of single contiguous reservation.",
+    "2026-03-06 - Marco Ruiz: Implemented shard reservation & deterministic kernel tie-breaker. Local bench shows p95 improvement from 540ms -> 240ms. Pushed WIP PR (link above).",
+    "2026-03-12 - Ops: Deployed perf-canary image to 4 hosts; early telemetry shows fragmentation ratio stable ~0.32 and no OOMs in 12h. Will continue 48h soak.",
+    "2026-03-14 - Aisha Patel: Preparing rollout checklist and emailing release manager for canary approvals."
+  ],
+  "sub_issues": [
+    "ENG-372202",
+    "ENG-372203"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "benchmarks",
+    "proposed_approach",
+    "decision_log",
+    "implementation_notes",
+    "risks_and_mitigation",
+    "rollout_plan",
+    "monitoring_and_alerting",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_0c219e9dc9274e39bbe990c3d3040eea"
+}

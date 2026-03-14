@@ -1,0 +1,76 @@
+{
+  "key": "SUP-523678",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Ingress queue reordering causes canary commit skew and unintended fallback routing",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Fernandez",
+  "assignee": "Eric Liang",
+  "customer_company": "OrbitApps Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "ingress-gateway",
+    "rollout-coordinator",
+    "serving-runtime",
+    "edge-proxy"
+  ],
+  "labels": [
+    "canary",
+    "pinning",
+    "fallback",
+    "ingress-order",
+    "investigating"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "gpt-open-13b-v2"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "linked_issues": [
+    "SUP-4721",
+    "SUP-31147"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/rollout-coordinator/pull/942"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.com/display/RUNBOOK/Canary+commit+ordering+runbook"
+  ],
+  "description": "Issue summary: During a scheduled canary weight increase for OrbitApps (dedicated tenant in prod-us-east), a subset of commit events for the rollout were applied out of order at the rollout-coordinator. This produced transient mismatch between tenant pin state and edge routing cache, triggering fallback routing to the legacy model variant and intermittent 5xx for some streams.\n\nImpact: Customers (OrbitApps) observed 10-15% of requests being served by the older model variant for ~8 minutes during a weight shift. Some streaming sessions dropped with 502/504. Business impact: degraded user experience for production traffic; OrbitApps flagged as P1.\n\nInitial hypothesis: ingress event queue (SQS-like) reordering combined with non-idempotent commit handling allowed a later rollback/health-check event to be applied before the successful commit, causing the coordinator state machine to transiently revert and then reapply commits in a way that left edge caches inconsistent.",
+  "steps_to_reproduce": "1) Create a staged canary rollout for a dedicated tenant pinned to gpt-open-13b-v2.\n2) Generate ~2000 rps of traffic from multiple edge nodes to exercise distributed commit propagation.\n3) Inject synthetic small delay and reorder on one ingress instance (simulate slow ACK from queue consumer).\n4) Trigger health-check probe failure on canary instance, then restore, then increase canary weight.\n5) Observe routing decisions at edge and check tenant pin state in rollout-coordinator and edge cache.\n\nExpected: commits applied in causally consistent order leading to consistent pin state across edge and coordinator.\nObserved: coordinator logged commit IDs in non-monotonic order and edge returned older variant for subset of tokens until cache TTL expired or explicit invalidation applied.",
+  "logs": "[2026-03-10T14:02:10Z] rollout-coordinator: commit_id=abc123 applied weight->20% for tenant=orbitapps\n[2026-03-10T14:02:11Z] ingress-gateway-3: dequeued event commit_id=abc125 (rollback healthcheck)\n[2026-03-10T14:02:11Z] rollout-coordinator: commit_id=abc125 applied weight->5% for tenant=orbitapps (healthprobe-triggered)\n[2026-03-10T14:02:12Z] ingress-gateway-1: dequeued event commit_id=abc123\n[2026-03-10T14:02:13Z] edge-proxy-9: cache miss tenant=orbitapps, routing->legacy-variant, response=502\n[2026-03-10T14:09:20Z] support: received customer alert: \"Some sessions are being answered by older model, intermittent errors\"\n",
+  "investigation_notes": "- Reproduced locally by adding artificial dequeue jitter; confirmed reordering risk when multiple ingress consumers read from an at-least-once delivery queue and do not coordinate commit sequence.\n- Coordinator lacked strict commit-sequence enforcement: commits applied based on arrival timestamp without verifying monotonic commit sequence IDs.\n- Edge cache TTL (30s) combined with delayed invalidation allowed older routing to persist beyond coordinator reconciliation window.\n- Autoscaler/drain events create additional churn that increases likelihood of reordered deliveries.\n- No evidence that serving-runtime served wrong weights; root cause is orchestration/commit ordering gap between ingress and coordinator.\n- Telemetry shows spike in commit_out_of_order counter between 14:02-14:10 for tenant orbitapps.\n- Related previous tickets SUP-31147 and SUP-4721 surfaced similar pin inconsistency patterns but were tied to cache warmup; this one differs due to explicit queue reordering and commit application race.",
+  "comments": [
+    "2026-03-10T14:15:00Z - Support (Aisha Fernandez): Notified SRE and assigned to Eric. Customer reported degraded UX; asked for steps being taken and ETA.",
+    "2026-03-10T14:27:12Z - SRE (Eric Liang): Confirmed logs show commit_id ordering mismatch. Immediately increased edge cache invalidation frequency for orbitapps route as a stop-gap. Asking infra to preserve delivery ordering for rollout events.",
+    "2026-03-10T15:02:45Z - Customer (OrbitApps - product lead Jenna Park): We see intermittent fallbacks; appreciate quick action. Can you provide a rollback plan if issue persists?",
+    "2026-03-10T15:10:02Z - Support (Aisha): Provided manual pin override steps to force tenant to desired commit and initiated a canary pause. Shared temporary rollback playbook.",
+    "2026-03-11T09:04:33Z - Rollout eng (Marta Kaur): Patch proposed to coordinator to enforce monotonic commit sequence validation and make commit application idempotent. Preparing PR and integration tests."
+  ],
+  "resolution_notes": "Temporary workaround: Applied targeted edge cache invalidation for tenant routes and performed manual pin override to re-establish desired model variant while investigation continued. This reduced fallback rate to <1% within 3 minutes.\n\nPermanent fix (in progress): 1) Add monotonic-sequence guard in rollout-coordinator: reject or queue commits with lower sequence numbers than last_applied for that tenant. 2) Make coordinator commit application idempotent (store commit_id and short-term dedupe). 3) Improve ingress consumer to tag events with global sequence numbers sourced from coordinator when possible, and otherwise persist ordering in a lightweight sequence log. 4) Update edge cache invalidation to accept explicit invalidation events tied to commit_id. 5) Add new telemetry metric commit_reorder_count and dashboard alerts.\n\nPlanned rollout of fix: merge PR -> canary deploy to staging -> dedicated tenant pilot (not affecting public tenants) -> prod canary -> full rollout. Target ETA for prod fix: 2026-03-20.",
+  "follow_up_actions": [
+    "Create a runbook for manual pin override and edge invalidation (owner: support) - due 2026-03-13",
+    "Merge coordinator monotonic-sequence PR and add unit/integration tests (owner: rollout team) - due 2026-03-17",
+    "Instrument commit_reorder_count metric and add alert for >0.1% reorders per minute (owner: telemetry) - due 2026-03-15",
+    "Perform chaos test simulating ingress consumer jitter on staging to validate fix (owner: reliability) - due 2026-03-18",
+    "Postmortem and customer communication once fix is live (owner: SRE+CS) - due after prod rollout"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution_notes",
+    "follow_up_actions"
+  ],
+  "dataset_doc_uuid": "dsid_39780c3302754216ab04d41aa69080cd"
+}

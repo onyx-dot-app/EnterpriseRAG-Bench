@@ -1,0 +1,104 @@
+{
+  "key": "ENG-91007",
+  "team": "engineering",
+  "title": "Normalize token attribution for multipart requests with async retries",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-11-03",
+  "updated_at": "2025-11-18",
+  "creator": "Priya Nair",
+  "assignee": "Alex Chen",
+  "project": "metering-reliability",
+  "cycle": "2025-W45",
+  "estimate": "8",
+  "due_date": "2025-11-22",
+  "labels": [
+    "billing",
+    "metering",
+    "streaming",
+    "quotas",
+    "high-priority"
+  ],
+  "dependencies": [
+    "ENG-51789",
+    "ENG-84533"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Summary: Intermittent client reconnects and asynchronous retry semantics can cause multipart/multi-fragment requests to be double-counted or misattributed in the usage ledger. This ticket standardizes fragment-level attribution and introduces idempotent commit semantics so retries and out-of-order fragment arrival do not inflate token consumption or incorrectly charge quotas.\n\nBackground: We observe recurring incidents where long inputs split into multiple fragments (prefix frames, streamed attachments, or chunked tokenization outputs) are re-sent by clients or replayed by edge proxies. Our current pipeline attributes tokens at several places (gateway, tokenizer, and ledger) and relies on per-request idempotency alone. When fragments are retried or arrive out of sequence, partial commits and race conditions have resulted in: (1) duplicated input token counts, (2) output tokens billed to the wrong request id after mid-stream model switch, and (3) quota breaches triggered incorrectly leading to throttles/premature rate-limit responses.\n\nThis work aligns billing behavior with user expectations: a single logical request (potentially multipart) should be billed exactly once for each token produced/consumed regardless of retries or transport reordering.",
+  "acceptance_criteria": [
+    "Fragment-level canonicalization: each fragment has a stable fingerprint and sequence index; ledger only credits unique fingerprints per logical request.",
+    "Idempotent commit API: a two-phase commit where token contributions are tentatively recorded and only finalized once a terminal fragment sequence is received or a configurable timeout elapses.",
+    "Rate limiter integration: quota checks use tentative reservations that are subtracted at finalize time; no double-counting on retries.",
+    "End-to-end tests: deterministic test harness reproduces reconnect/retry scenarios and shows zero double-charges for 1000 simulated retry events.",
+    "Monitoring: new dashboards show fragment duplication rate, finalize latency, and frequency of forced timeouts with alerts at >0.5% duplication.",
+    "Backward compatibility: clients that do not send fragment sequence metadata still get correct billing (slow-path fingerprinting), but with increased finalize latency documented.",
+    "Migration: reconciliation job corrects historical overcharges for a targeted window (script produces audit report for finance review)."
+  ],
+  "steps_to_reproduce": [
+    "Configure client to split a 6k token prompt into 3 fragments and enable automatic retry on connection loss.",
+    "Simulate network drop after fragment 2 and let client retry fragments 2-3 with a new connection id but same request id.",
+    "Observe ledger entries: currently we see two separate reservations and two final credits for input tokens for the same logical request.",
+    "Trigger a mid-stream model switch (fallback model) and confirm output tokens are attributed to the wrong request id in the current pipeline.",
+    "Run existing reconciliation script and verify it cannot deterministically collapse the duplicates without additional fragment metadata."
+  ],
+  "proposed_design_links": [
+    "https://confluence.redwood.ai/display/METER/fragment-attribution-design-v1",
+    "https://drive.redwood.ai/attachments/fragment-idempotency-proto.pdf"
+  ],
+  "implementation_notes": [
+    "Add per-fragment fields: fragment_seq (int), fragment_hash (sha256 as hex), tentative=true/false flag stored in ledger rows (tentative flag implemented as separate column).",
+    "Gateway: compute fragment_hash before forwarding to tokenizer; attach fingerprint to in-flight frames and include in streaming resume headers.",
+    "Tokenizer: emit token_count and fragment_hash; if tokenizer cannot determine deterministic hash (legacy client), fallback to content-hash of normalized text with a note in logs.",
+    "Ledger: dedupe on (request_id, fragment_hash) when applying finalized credits. Introduce finalize endpoint that moves tentative reservations to committed tokens and releases tentative locks on quota accounting.",
+    "Rate limiter: consume tentative tokens from quota pool when fragment first arrives; finalize will persist final charge. If finalize fails due to quota, run a predefined rollback to unit-test behavior and alert ops.",
+    "Reconciliation job: new offline job that groups tentative fragments and uses fragment_hash and sequence metadata to collapse duplicates for windows where finalize did not complete.",
+    "Feature flag: behind meter.fragment-idempotency; default off for canary rollout."
+  ],
+  "work_log": [
+    "2025-11-03 - Triage: Priya Nair - Identified as regression impacting monthly billing audits; elevated to P0.",
+    "2025-11-05 - Design kickoff: Alex Chen, Priya Nair, Marina Kov\u00e1cs - Captured split/fingerprint approach; agreed two-phase commit model.",
+    "2025-11-08 - Spike: Alex Chen - Built prototype on dev-gateway; fragment_hash collisions negligible in preliminary tests (0/100k).",
+    "2025-11-11 - Review: Security and privacy reviewed fingerprint approach; salt per-tenant recommended to prevent cross-tenant fragment correlation.",
+    "2025-11-13 - Implementation: Started ledger schema migration branch (WIP) - added tentative_token_count column and uniqueness constraint on (request_id, fragment_hash).",
+    "2025-11-16 - Integration test: Ran streaming retry harness with 10k sessions; duplicate rate reduced from 1.4% to 0.02% on prototype but observed a 3% increase in finalize latency under load. Added performance tuning action item.",
+    "2025-11-17 - Blocked: Waiting on tokenizer patch to emit fragment_hash reliably (ENG-84533).",
+    "2025-11-18 - Design refinement: Added slow-path fingerprinting and admin reconciliation endpoint for finance requests."
+  ],
+  "risks_and_mitigations": [
+    "Risk: fragment_hash collisions could incorrectly collapse distinct fragments -> Mitigation: include fragment_seq and per-tenant salt in fingerprint; reject finalize if sequence gaps detected.",
+    "Risk: increased finalize latency under heavy load leading to perceived quota delays -> Mitigation: optimistic tentative reservations sized small, backpressure on gateway, and canary rollout with performance monitoring.",
+    "Risk: migration of ledger schema causes DB migration lock -> Mitigation: online migration with write-path feature flag and small batch backfill during low-traffic windows.",
+    "Risk: clients without sequence metadata might get slower billing -> Mitigation: document expected behavior and provide SDK update with auto-fragment headers."
+  ],
+  "rollout_plan": [
+    "Phase 1 (internal): Deploy feature-flagged gateway + tokenizer changes to staging; run synthetic harness for 100k reconnects.",
+    "Phase 2 (canary): Enable for 5% of production accounts with monitoring on finalize latency and duplication rate.",
+    "Phase 3: Gradually expand to all accounts over 72 hours if duplication <0.1% and finalize P95 < 3s.",
+    "Phase 4: Run reconciliation job for historical 7-day window and surface finance audit report."
+  ],
+  "related_prs": [
+    "https://github.com/redwood-inference/gateway/pull/4120",
+    "https://github.com/redwood-inference/ledger/pull/271",
+    "https://github.com/redwood-inference/tokenizer/pull/998"
+  ],
+  "related_dashboards": [
+    "https://grafana.redwood.ai/d/7xX0m/fragment-duplication",
+    "https://grafana.redwood.ai/d/usage/ledger-finalize-latency"
+  ],
+  "notes_for_finance": [
+    "Produce audit CSV with columns: request_id, fragment_hash, tentative_tokens, finalized_tokens, timestamp, action_taken",
+    "If reconciliation reduces charges for customers in the run window, create credit memos and attach audit CSV for review."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "steps_to_reproduce",
+    "implementation_notes",
+    "risks_and_mitigations",
+    "rollout_plan"
+  ],
+  "dataset_doc_uuid": "dsid_b0206970dc834c55892e21f6c52645f7"
+}

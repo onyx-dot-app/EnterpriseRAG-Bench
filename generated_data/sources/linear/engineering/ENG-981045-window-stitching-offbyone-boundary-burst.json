@@ -1,0 +1,96 @@
+{
+  "key": "ENG-981045",
+  "team": "engineering",
+  "title": "Window-stitching off-by-one causes boundary double-count / transient burst credits",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-13",
+  "creator": "Ava Martinez",
+  "assignee": "Devon Chen",
+  "project": "billing-consistency",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "billing",
+    "rate-limiting",
+    "shard-aggregator",
+    "bug",
+    "high-impact"
+  ],
+  "release": "runtime-1.26",
+  "security_review_required": "false",
+  "description": "Summary: We observed transient overage windows where clients were allowed to consume burst credits that should have been blocked when multiple quota windows (per-key minute, per-org hour, per-route day) overlap a boundary. The enforcement path uses a \"window stitching\" heuristic to reconcile different window lengths across shards; an off-by-one in the stitch math combined with late-committed shard aggregations leads to double-counting at boundaries and temporary under-enforcement.\n\nThis ticket tracks investigation, repro, mitigation, and a safe rollout of a correctness fix to the policy evaluation and shard reconciliation code paths. Impact visible on production metrics (see Metrics below).",
+  "steps_to_reproduce": [
+    "Create an org-scoped hourly quota (3600s window) and a per-key per-minute quota (60s window) for the same route.",
+    "Send a steady stream of requests that consume near the per-minute quota and simultaneously push aggregated hourly usage close to the hourly limit.",
+    "At a minute boundary (t mod 60 == 0) force a shard reassign (simulate shard migration) so one aggregator flushes while another accepts writes.",
+    "Observe enforcement decisions returned to client and check accounting records in the shard-aggregator log: double-count of a small subset (1-3%) of tokens across the boundary."
+  ],
+  "observed_logs": [
+    "2026-03-01T12:00:00.124Z shard-agg-12 flush commit_ts=1677676800124 window_floor=1677676740000 counts=[{key:abc, c:58}]",
+    "2026-03-01T12:00:00.128Z policy-eval route=/generate org=org-92 key=abc decision=allow reason=per-minute-under; per-hour-raw=3598",
+    "2026-03-01T12:00:00.129Z shard-agg-7 accept write commit_ts=1677676800129 counts=[{key:abc, c:5}]",
+    "2026-03-01T12:00:00.130Z meter-reconciler stitch_window calc: floor_div(seconds,60) -> off-by-one adjusted=-1 resulting in overlapping contribution for minute boundary"
+  ],
+  "impact": "High \u2014 temporary bursts of ~0.5-2% of traffic observed with customers seeing >100% of their minute quotas for 1-2 window boundaries per day. Affected customers are primarily mid-tier Dedicated orgs with high shard-churn (autoscaling, rebalancing). Business impact: a handful of customers reported unexpected overages; internal billing pipeline flagged reconciliation alerts leading to manual investigations.",
+  "metrics": [
+    "Increase in per-minute allowance violations: +1.6% at 12:00 UTC on repro days (prod dashboards: billing.minute_violation_rate)",
+    "Shadow-meter discrepancy: shadow_usage - committed_usage = +0.8% (billing.reconciliation.delta)",
+    "Spike in billing incident tickets correlated with shard rebalances (ops.incident_count tag=shard_rebalance)"
+  ],
+  "root_cause": "A combination of (1) window-floor arithmetic in the stitcher using inclusive boundaries while downstream aggregators used exclusive commit semantics, and (2) race between flush commits from an old shard and writes accepted by a new shard during reassign. The stitcher applied an adjustment (-1) when converting long windows into short-window contributions; the adjustment was wrong for exact-boundary timestamps, producing overlapping attribution for a tiny set of requests.",
+  "proposed_fix": "1) Correct the stitch math to use consistent half-open [floor, floor+window) semantics across both the policy-eval stitcher and shard-aggregator commit logic. 2) Add a monotonic commit token to flushes so late-commits are rejected or idempotent when applied to the new shard. 3) Add a fast shadow-check in policy-eval that detects >0.5% delta between shadow meter and authoritative shard reply and falls back to conservative deny.\n\nImplementation details: Update stitch_window() in policy/runtime/quota_stitch.go to compute floor = timestamp - (timestamp % window) and explicitly document half-open behavior; change aggregator flush to attach commit_epoch and compare before accepting cross-shard contributions. Unit tests and property tests will drive boundary cases.",
+  "design_decisions": [
+    "Prefer consistency (half-open windows) over permissive behavior: deny on ambiguous overlaps to avoid billing/regulatory exposure.",
+    "Avoid synchronous global locks \u2014 use commit_epoch tokens to achieve idempotency rather than blocking the write path.",
+    "Short-term conservative fallback (shadow-check deny) enabled via feature flag to allow staged rollout."
+  ],
+  "rollout_plan": [
+    "Feature-flagged release in runtime-1.26 behind ff=billing-window-fix.",
+    "Canary: enable for 2 Dedicated customer orgs with low churn for 24h; monitor billing.minute_violation_rate and reconciliation.delta.",
+    "Stage: enable for 10% of traffic (region-based) for 48h if canary green.",
+    "Full: enable globally after 72h stable, then flip flag to permanent and remove feature-gated shadow-check after 30 days.",
+    "Rollback: if violation rate increases or false-denies >0.1%, revert ff and patch with emergency hotfix."
+  ],
+  "testing_plan": [
+    "Unit tests for stitch_window edge cases (t exactly divisible by window, t-1, t+1, randomized fuzz with property tests).",
+    "Integration tests simulating shard reassign during flush with deterministic fake clocks.",
+    "E2E load test on staging with synthetic traffic mimicking Dedicated autoscale churn and traffic peaks.",
+    "Shadow rollout in prod with audit logs shipped to billing-audit-s3 for 30d retention."
+  ],
+  "dependencies": [
+    "ENG-271819",
+    "ENG-421007"
+  ],
+  "links": [
+    "https://github.com/redwood-inference/platform/pull/12345",
+    "https://confluence.redwood.ai/display/BILL/Window+Stitching+Design+Notes",
+    "https://grafana.redwood.ai/d/ops/billing-minute-violations?orgId=1&var-range=24h"
+  ],
+  "owner_notes": "Devon to lead implementation with help from storage team for commit_epoch integration. Plan to pair with SRE for canary. Provide daily updates until merged.",
+  "comments": [
+    "2026-03-02 - Maya Patel (PM): prioritizing as P0 due to customer impact; please include suggested communications for customers if we need to throttle during canary.",
+    "2026-03-03 - Devon Chen (assignee): identified failing unit tests in stitcher; pushing patch to branch 'fix/window-stitch'. PR soon.",
+    "2026-03-05 - Jorge Alvarez (SRE): planned shard-reassign job for canary region on 2026-03-10 02:00 UTC \u2014 will coordinate blackout window for safety.",
+    "2026-03-08 - QA: integration tests show no double-count in 99.9pct windows; still seeing a micro-case with monotonic clock skew in fakes \u2014 adding more assertions.",
+    "2026-03-12 - Devon Chen: code review passed; PR linked above. Feature-flag rollout ready; scheduled canary for 2026-03-14."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_logs",
+    "impact",
+    "metrics",
+    "root_cause",
+    "proposed_fix",
+    "design_decisions",
+    "rollout_plan",
+    "testing_plan",
+    "owner_notes",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_6be5b71f855f4e2eb2a84766fdb0fa42"
+}

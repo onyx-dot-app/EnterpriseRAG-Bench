@@ -1,0 +1,120 @@
+{
+  "key": "SUP-935321",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Python SDK streaming: cancel() + immediate retry causes long-running function call to lose confirmation webhook (missing tool-confirmation)",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Maya Chen",
+  "assignee": "Diego Morales",
+  "customer_company": "QuickDocs Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "python-sdk",
+    "streaming",
+    "serving-runtime",
+    "orchestrator"
+  ],
+  "labels": [
+    "idempotency",
+    "asyncio",
+    "stream-resume",
+    "tool-calls",
+    "investigation"
+  ],
+  "environment": "prod - us-east",
+  "affected_models": [
+    "gptx-3.8-rlhf"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-13",
+  "first_response_due_at": "2026-03-12",
+  "linked_issues": [
+    "SUP-472999",
+    "SUP-315799"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/realtime-sdk/pull/2145"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SUPPORT/streaming-retry-guidance"
+  ],
+  "description": "Issue summary:\nCustomer uses the Python streaming SDK (asyncio) to send a chat that triggers a long-running function/tool (external webhook invoked by Redwood). The client cancels the stream (await stream.close() / cancellation of asyncio task) after receiving a partial streaming response, then immediately retries the same high-level request using what they believe is the same idempotency key. On retry the backend appears to start the tool execution again, but the external webhook confirmation callback (the 'tool-confirmation' POST from their service to our callbacks endpoint) is never emitted for the second attempt, leaving the customer uncertain whether the tool ran and causing duplicated compensation runs on their side when they re-run the tool manually.\n\nImpact:\n- Customer reports missing confirmation callbacks in ~25% of cancel+retry cases for long-running tools (>20s).\n- Leads to orphaned manual re-runs and customer data duplication.\n- Reproducible with their workload and our Python SDK usage pattern.\n\nEnvironment:\n- Python SDK v1.8.2 (asyncio streaming helper)\n- Backend: Dedicated capacity, us-east cluster, serving-runtime 2.2.1\n- Callback endpoint: HTTPS webhook behind customers' ALB (mutual TLS not used)\n\nSteps to reproduce (customer-provided):\n1) Start an asyncio streaming session with python-sdk, send a chat that causes the model to issue a function call to 'generate_invoice' which triggers an external webhook.\n2) Shortly after stream begins and before the webhook completes (~3-10s after tool invocation), cancel the client task with task.cancel() and close the stream socket.\n3) Immediately start a new stream and resend the same high-level prompt, using the same idempotency key header value as before (customer expects server-side dedup).\n4) Observe that our callback endpoint receives a webhook from the first run, but the second run does not produce a webhook confirmation (or produces it inconsistently).\n\nObserved behavior:\n- First connection: webhook POST received and acknowledged by customer service.\n- After cancel and immediate retry: server logs show a new internal tool execution trace started, but customer callback logs show no confirmation for the retry attempt. In other cases the retry produces a confirmation but with stale metadata (missing confirmation_token header).\n\nExpected behavior:\n- If idempotency key is reused, server should either deduplicate the tool invocation (return existing execution/confirmation) or emit a clear confirmation event for the retry with appropriate confirmation token. Customer expects at-most-once semantics when reusing idempotency key.\n\nRequest IDs / traces attached by customer:\n- trace: rwi:us-east:trace:8a12f3-req-4421 (first run)\n- trace: rwi:us-east:trace:8a12f3-req-4422 (retry)",
+  "steps_to_reproduce": [
+    "Use python-sdk v1.8.2 streaming asyncio example",
+    "Trigger a long-running function that calls external webhook",
+    "Cancel the asyncio task after partial stream and immediately retry with same idempotency key",
+    "Check callback logs for missing confirmation"
+  ],
+  "logs": [
+    "2026-03-12T15:02:11Z serving-runtime[req-4421] INFO: started tool generate_invoice session=abc123",
+    "2026-03-12T15:02:22Z webhooker INFO: callback POST /callbacks/confirm 200 session=abc123",
+    "2026-03-12T15:02:24Z serving-runtime[req-4422] INFO: started tool generate_invoice session=def456 (retry)",
+    "2026-03-12T15:02:46Z webhooker INFO: no callback delivered for session=def456, upstream connection closed"
+  ],
+  "customer_notes": [
+    "We are reusing our own idempotency header X-CUSTOM-IDEMP across retries",
+    "This only reproduces when the tool takes >15-20s, short tools are fine",
+    "We see the server trace indicating a retry started but we never get a second webhook; sometimes we get one with missing headers"
+  ],
+  "comments": [
+    "Support (Maya Chen) 2026-03-12: Thanks for the detailed repro steps and traces \u2014 escalating to runtime team and assigning to Diego.",
+    "Eng (Diego Morales) 2026-03-13: I can reproduce locally with python-sdk asyncio repro harness. Initial hypothesis: confirmation token generation is tied to ephemeral connection state and is not persisted across client-initiated stream cancellation, causing the retry to lack the token the webhooker expects.",
+    "Eng (Diego Morales) 2026-03-13: Added logging to the orchestrator to capture confirmation_token lifecycle. I filed an internal follow-up to verify ack-window handling: INT-1209.",
+    "Customer (QuickDocs) 2026-03-13: Workaround we tried: adding a 1.5s sleep before retry reduces occurrence but does not eliminate it. We need a robust fix because we cannot add sleeps to production workloads."
+  ],
+  "investigation_notes": [
+    "Reproducer: python-sdk v1.8.2 streaming cancels by cancelling the asyncio task; confirmed orchestrator marks session as CLOSED by client and spins up a new session on retry",
+    "Observation: when initial session is cancelled mid-tool, the 'pending_confirmation' object is stored in volatile in-memory map keyed by connection-id but not by idempotency-key; immediate retry creates a new connection-id and a new pending_confirmation that does not get the original confirmation_token attached",
+    "Hypothesis: race between client cancellation and background confirmation token persistence; token persisted on successful completion path but cancellation triggers short-circuit cleanup that drops token mapping",
+    "Corroborating logs: confirmation_token assigned at t+1s in first run, but cleanup of connection-bound state at t+1.5s removed mapping before retry processing tied idempotency key to existing execution",
+    "Related: found similar mitigation in SUP-472999 (stream-resume header rewrite) but root cause differs (state keyed by connection-id vs idempotency-key)",
+    "Proposed short-term mitigation: extend pending-ack grace window to 60s for dedicated tier and persist confirmation_token keyed by idempotency-key in Redis; long-term: make confirmation_token lifecycle independent of ephemeral socket and ensure server dedup checks consult idempotency store before starting a fresh tool execution"
+  ],
+  "impact_assessment": [
+    "Customer-visible: high (P1) \u2014 leads to duplicated manual runs or inconsistent tool side-effects",
+    "Surface area: streaming with long-running external tool webhooks, Python asyncio cancel pattern; likely affects other SDKs with similar cancel semantics (TS/Go) but reproducibility lower due to client disconnect semantics"
+  ],
+  "resolution_plan": [
+    "Short-term (hotfix): patch serving-runtime to persist pending_confirmation entries into Redis with key = (customer_id, idempotency_key) and extend pending-ack grace window to 60s. Deploy to dedicated us-east canary 2026-03-15.",
+    "Medium-term: change orchestrator so confirmation_token is generated and stored atomically in idempotency store at tool-start, and returned to client streaming metadata so retries can reference it explicitly.",
+    "SDK change: publish python-sdk v1.8.3 that exposes the confirmation_token in stream metadata and adds a helper to attach it during retry; update docs with recommended retry pattern for streaming cancel + retry.",
+    "Customer workaround: avoid immediate retry \u2014 either reuse existing live stream (resume) or pause 2-3s before retry; or include explicit confirmation_token in retry request if available from prior run"
+  ],
+  "resolution_notes": [
+    "2026-03-14 Diego Morales: Hotfix PR opened and linked: https://github.com/redwood-inference/serving-runtime/pull/3297 \u2014 persists pending_confirmation to Redis and increases grace window. Canaries scheduled for 2026-03-15.",
+    "2026-03-14 Maya Chen: Provided QuickDocs with temporary config toggles to enable extended grace window on their dedicated cluster; they confirmed reduced occurrence during brief test (10 runs).",
+    "Follow-up: plan SDK release and confluence update to be completed by 2026-03-21"
+  ],
+  "status_history": [
+    "2026-03-12 New - ticket created by Maya Chen",
+    "2026-03-13 In Progress - assigned to Diego Morales and escalated to runtime",
+    "2026-03-14 In Progress - hotfix PR opened and customer provided temporary config change"
+  ],
+  "attachments": [
+    "repro_harness.py (customer-supplied) - saved to case storage",
+    "trace-req-4421-4422.json - subset of server trace exported to support logs"
+  ],
+  "cc_list": [
+    "support+dedicated@redwood.ai",
+    "runtime-oncall@redwood.ai"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "customer_notes",
+    "comments",
+    "investigation_notes",
+    "impact_assessment",
+    "resolution_plan",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_0a7c0fa59cbe404baa9d951ac24acb88"
+}

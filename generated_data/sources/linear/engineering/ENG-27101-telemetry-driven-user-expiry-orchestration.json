@@ -1,0 +1,47 @@
+{
+  "key": "ENG-27101",
+  "team": "engineering",
+  "title": "SCIM: telemetry-driven user expiry orchestration with safe rollback",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-03-10",
+  "creator": "Ava Chou",
+  "assignee": "Diego Marquez",
+  "project": "identity-and-access",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "scim",
+    "sso",
+    "deprovisioning",
+    "observability",
+    "safety",
+    "rbac-v2"
+  ],
+  "parent_issue": [
+    "ENG-26999"
+  ],
+  "dependencies": [
+    "ENG-25400"
+  ],
+  "customer_impact": "medium",
+  "release": "private-2026.03",
+  "security_review_required": "true",
+  "body": "Summary: We need a safe, observable orchestration for SCIM-driven user lifecycle expiration (soft-suspend -> final removal) that uses telemetry signals to gate progress and supports idempotent retries, tenant-scoped rate limiting, and admin-initiated rollbacks. This ticket implements the orchestration layer, metrics/audit events, and an operator UI hook so support can intervene during the grace window.\n\nBackground: Multiple customers have reported accidental mass-deprovisions when third-party IdPs return stale group deltas or when SCIM delta jobs are retried aggressively. Existing SCIM workers perform deletions and emit basic audit logs, but we lack a standardized state machine and telemetry gates to safely escalate from soft-suspend to permanent removal.\n\nGoals / Acceptance criteria:\n- Implement a three-state user lifecycle: ACTIVE -> SOFT_SUSPENDED (tombstone candidate, reversible) -> PENDING_DELETE (finalization) -> DELETED, with configurable grace window per org.\n- All state transitions must emit audit events with trace IDs and user/actor/tenant fields (events: scim.user.suspend.requested, scim.user.suspend.applied, scim.user.delete.requested, scim.user.delete.completed).\n- Provisioning orchestration must be idempotent: retries from SCIM webhook or background job should not cause double-deletes or inconsistent group membership.\n- Add telemetry gates that prevent promotion from SOFT_SUSPENDED to PENDING_DELETE when: recent failures for tenant > 5% over 1h OR audit-sampled restore rate > 0.5% over 24h OR active rollback flag set by SRE/product.\n- Tenant-scoped rate limiting for finalization: at most X final deletions per minute per tenant (configurable), with circuit-breaker that pauses finalization on high error rate and surfaces runbook.\n- Integrate with Console: admin-facing list of users in SOFT_SUSPENDED with restore button and timeline.\n- End-to-end tests + integration test against Okta/OneLogin sandbox and a fault-injection harness.\n\nProposed design:\n1) Orchestration state machine lives in identity-service: lightweight DynamoDB table (or Postgres table namespace) containing user_id, tenant_id, state, state_version, last_updated_at, tombstone_expires_at, pending_ops (dedup token). To avoid race conditions with concurrent SCIM deltas, include an epoch-based state_version and require compare-and-set updates.\n2) When SCIM delta indicates user removal, mark SOFT_SUSPENDED with tombstone_expires_at = now + tenant_grace_period and emit scim.user.suspend.applied audit event. Do not remove group links yet.\n3) Background finalizer worker scans SOFT_SUSPENDED records whose tombstone_expires_at <= now and attempts to transition to PENDING_DELETE after evaluating telemetry gates. Telemetry gates implemented as queries against metrics store (Prometheus/Influx) and recent audit logs.\n4) Finalizer performs tenant-scoped batching and uses a token bucket to limit deletion throughput. Each deletion is recorded with a unique op_id; deletion idempotency achieved by storing op_id in pending_ops and using idempotent delete endpoints to external identity providers.\n5) If finalizer sees high error rate or gate triggered, it will pause for tenant (exponential backoff with jitter) and mark a pause_reason in the orchestration table. Admins can resume or rollback from Console.\n6) Rollback path: within the grace window, Console can hit an endpoint to move user from SOFT_SUSPENDED back to ACTIVE. For PENDING_DELETE we allow a short undo window (30 minutes) if the finalization job has not yet processed the external delete step. Once external delete succeeded, we emit scim.user.delete.completed and only a manual account-restore (reprovision) is possible.\n\nTelemetry & auditing:\n- Metrics to add: counter scim.user.suspend.count{tenant}, scim.user.finalize.attempts{tenant}, scim.user.finalize.failures{tenant}, scim.user.rollback.count{tenant}, scim.user.restore.count{tenant}.\n- Histograms: scim.finalizer.duration (ms).\n- Alerts: tenant-specific alert when finalize_failures/attempts > 0.1 over 15m (configurable) and global incident if many tenants show elevated failure rates.\n- Audit events must include correlation_id (trace id) and link to the Console action event. Store audit events in the existing audit-log pipeline and ensure retention aligns with compliance policies.\n\nFailure modes & mitigations:\n- Duplicate SCIM deltas: use dedup token and state_version CAS to avoid double-applying transition; idempotent calls to external IdP.\n- Partial external failures (Okta times out): finalizer marks item PENDING_DELETE with last_error and retries with backoff; expose last_error in Console.\n- Large tenant blasts: tenant-scoped throttling and circuit-breaker to prevent noisy-neighbor impact.\n- Operator mistakes: soft-suspend grace window and explicit restore action in Console.\n\nMigration & rollout plan:\n- Phase 1 (canary): implement state machine and soft-suspend path for 5 pilot tenants (low-risk) and enable verbose logging + feature flag.\n- Phase 2: add finalizer job behind feature flag; run as read-only dry-run (simulate finalization) for 2 weeks and collect metrics.\n- Phase 3: enable finalization for more tenants with conservative rate limits; open 72h rollback window for first 50 tenants.\n- Phase 4: full rollout and deprecation of old immediate-delete path.\n\nTesting strategy:\n- Unit tests for state transitions and CAS semantics.\n- Integration tests against a mocked Okta SCIM server covering success, 429, 5xx, and network failure.\n- Chaos test: interrupt finalize worker mid-batch and verify idempotency and correct resume.\n- Manual end-to-end with an Okta sandbox tenant and Console restore flow.\n\nImplementation tasks (high level):\n- identity-service: orchestration table, API endpoints for suspend/restore/finalize (Diego).\n- finalizer-worker: tenant-scoped batching, telemetry gating, circuit-breaker (SRE pairing with Diego).\n- console: admin UI for soft-suspended users and restore button (FRONTEND ticket to be created).\n- metrics: Prometheus instrumenters + dashboards (Nikhil).\n- docs: runbook + runbook play for high-failure tenant (PM/Support).\n\nLinks & artifacts:\n- Design doc: https://redwood.atlassian.net/l/cp/SCIM-telemetry-expiry (internal)\n- Draft schema PR: https://github.com/redwood-inference/identity/pull/412\n- Example Console mockups: https://drive.google.com/drive/folders/SCIM-Console-Mocks\n\nOpen questions:\n1) Should tombstone_expires_at be tenant-configurable via Console configs or only via org policy? (PM preference is per-tenant config behind RBAC).\n2) Where to persist last_error and pause_reason: orchestration table or separate incidents table? Storing with orchestration row simplifies debugging but increases row size.\n3) Do we need per-tenant SLAs for finalization latency? current assumption: best-effort within 24h for normal tenants.\n\nNext steps (short term):\n- Implement orchestration schema migration and unit tests (Diego) by 2026-02-28.\n- Create finalizer skeleton and metric counters in a feature branch (Diego + SRE) by 2026-03-05.\n- Schedule review with Security and Compliance for audit retention and event shape (Ava to schedule).",
+  "comments": [
+    "2026-02-22 - Diego: Implemented initial schema migration in branch feature/scim-expiry-schema. PR #412 opened for review. Basic unit tests added.",
+    "2026-02-24 - Nikhil Rao (SRE): Reviewed rate-limiter design, suggested tenant token-bucket per region to avoid global contention. Requested integration metrics for per-region error spikes.",
+    "2026-03-01 - PM review by Marta Lopez: Asked to make grace window configurable in Console and add an audit checkbox for orgs that require manual approval before finalization.",
+    "2026-03-05 - Security review kickoff: Need to confirm audit retention policy and whether audit events include PII; Security requested a scrubbed field list. Assigned to Ava for follow-up.",
+    "2026-03-09 - Diego: Finalizer worker prototype completed in staging and ran in dry-run mode for pilot tenant. Observed 0.4% simulated restore events (within acceptable threshold). Preparing canary toggle.",
+    "2026-03-10 - SRE: Added runbook draft: scim-finalizer-pause and manual-restore steps. Will refine after first canary run."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_3fb0733b650f449eb08d50e4fc27e09f"
+}

@@ -1,0 +1,85 @@
+{
+  "key": "ENG-214509",
+  "team": "engineering",
+  "title": "Coalescer scheduling leads to slab misalignment and fp-accumulation bias in streaming decode",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Patel",
+  "assignee": "Liam Chen",
+  "project": "serving-runtime-performance",
+  "cycle": "2026-W09",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "kv-cache",
+    "scheduler",
+    "numerical-drift",
+    "streaming-decode",
+    "investigation"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Summary: Intermittent correctness failures observed in streaming decode under mixed-batch coalescing. Symptoms include subtle token reorderings in long-prefix scenarios, occasionally corrupted KV slab pointers in a small subset of requests, and small but measurable floating-point accumulation bias that diverges across runs. This appears to be correlated with the coalescer's micro-batching of prefill and decode lanes when using the adaptive scheduler on GPUs with heterogeneous sequence lengths.\n\nWhy it matters: These errors are reproducible on customer workloads hitting Dedicated pools and cause downstream hallucinations and nondeterministic diffs in evals. Production incidents (see incident links) drove urgency; impact is customer-visible in the form of token inconsistencies and rare token truncation.\n\nScope: Observed on runs using runtime-1.20/1.21 and repro'd locally with the adaptive coalescer enabled. Affects mixture-of-length batched traffic and workloads that use prefix caching (KV cache warm paths). Not observed in single-request decode or fully synchronized batch paths.\n",
+  "steps_to_reproduce": [
+    "Enable adaptive coalescer with mixed sequence length workloads (prefixes between 64-2048 tokens)",
+    "Run streaming prefill concurrently with small decode batches (prefill arrival skew ~5-30ms)",
+    "Use model variants with fused attention kernels and mixed-precision enabled (fp16 math + bf16 accumulators)",
+    "Collect outputs across multiple runs (>=1000 requests) and diff token sequences for nondeterminism",
+    "Capture per-request KV slab pointers and prefill/decode scheduling timestamps via the runtime trace flags"
+  ],
+  "investigation_log": [
+    "2026-03-01: Customer report received; reproduced locally against runtime-1.21 on p4-16g with synthetic traffic using seed corpus from customer. Noted rare token reorders and small numeric deltas in softmax accumulators.",
+    "2026-03-03: Added extra tracing in coalescer (coalesce.debug=true) and KV slab allocator to log slab base/tail pointers. Observed transient slab pointer offsets when a prefill worker yielded mid-coalesce.",
+    "2026-03-05: A/B test: disabled adaptive coalescer -> no repro. Re-enabled with strict serial coalescing (no lane interleaving) -> repro rate drops to near zero. Confirms scheduler/coalescer interaction.",
+    "2026-03-07: Reproduced in unit test harness by introducing prefill scheduling jitter and forcing an interleaving of memory writes; observed accumulation differences in the final softmax which explain token probability shifts.",
+    "2026-03-09: Profiling shows a race between the coalescer shadow-warmup path and KV slab rotation: warmup can rotate slab pointers while decode lane still referencing prior slot when micro-batching merges lanes, producing a stale pointer deref leading to partial overwrite of shared slab region.",
+    "2026-03-11: Confirmed floating-point accumulation bias stems from non-associative reduction ordering across coalesced micro-batches; kernel selection logic switches between two reduction kernels depending on inferred lane homogeneity causing divergent rounding order.",
+    "2026-03-12: Drafted patch to serialize slab rotation with a lightweight epoch/sequence and to normalize reduction ordering across kernels. Preparing PR and safety rollout plan."
+  ],
+  "root_cause": "A combination of coalescer micro-batching interleaving and an unsynchronized slab rotation path allowed decode lanes to reference stale KV slots while the allocator moved base offsets. Simultaneously, kernel selector chose a different reduction implementation for coalesced vs homogeneous batches, producing a consistent-but-different rounding order that accumulates bias over long prefixes. The concurrency window is small, so failures are low-frequency but high-impact.",
+  "proposed_fix": "1) Add an epoch-based guard to the KV slab allocator so any slab rotation increments an epoch visible to coalescer/delivery paths; lanes must check/stabilize epoch before dereferencing slot pointers. 2) Force the kernel selector to use a single deterministic reduction implementation for all micro-batched streaming decode codepaths (config flag runtime.coalescer.force_deterministic_reduction=true). 3) Add unit and fuzz tests that simulate prefill/decode interleaving and validate slab pointer stability and bitwise-identical decode on deterministic mode.",
+  "proposed_patch_branch": "github.com/redwood-inference/runtime/tree/eng/ENG-214509-coalescer-fix",
+  "related_prs": [
+    "https://github.com/redwood-inference/runtime/pull/15823 (WIP - slab epoch + deterministic reduction)"
+  ],
+  "tests_added": [
+    "unit: coalescer_epoch_stability_test (reproduces slab pointer race with injected jitter)",
+    "integration: mixed_length_streaming_determinism (1000-request smoke to assert identical outputs across runs)",
+    "fuzz: kv_allocator_rotate_fuzz (randomized slab rotations while streaming)"
+  ],
+  "validation_plan": "Run CI with added unit/integration tests, run canary on Dedicated pool with adaptive coalescer disabled then enabled in deterministic mode, monitor per-request diffs and KV pointer stability. Target < 0.01% repro rate before wide rollout. Use nightly eval harness (reference prompts) to ensure numerical parity with baseline where deterministic reduction is enabled.",
+  "rollback_strategy": "If regressions in latency/throughput are observed, revert kernel selector change and instead keep slab epoch guard only while we iterate on deterministic reduction performance. Ability to toggle runtime.coalescer.force_deterministic_reduction via config without restart for rapid rollback.",
+  "deployment_plan": "1) Merge PR to eng/next after two approvals and perf-signoff. 2) Canary to Dedicated pool subset (10% capacity) with detailed tracing enabled for 48h. 3) Gradual 25/50/100 rollout with health gates (token-error-rate, decode-latency-p50/p95, token-diff-rate).",
+  "metrics_to_monitor": [
+    "token-diff-rate",
+    "kv-slab-epoch-mismatch-count",
+    "coalescer-microbatch-size-distribution",
+    "decode-p99-latency",
+    "per-request-softmax-delta-stat"
+  ],
+  "notes": "Trade-offs: forcing deterministic reduction may have a ~1-3% perf regression on some hardware; we will profile and if unacceptable, implement a fast-path deterministic reducer optimized for common shapes. Also need to audit other allocators for similar epoch-free rotations. Coordination required with Dedicated ops to schedule canary.",
+  "links": [
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/INF/pages/Coalescer+Slab+Race+ENG-214509",
+    "Incident postmortem: https://drive.redwood.com/incident-2026-02-28-coalescer-decode",
+    "Dashboard: https://grafana.redwood.com/d/serve/coalescer-kv-incident",
+    "Repro harness: https://github.com/redwood-inference/repro-harness/tree/main/eng/eng-214509"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "investigation_log",
+    "root_cause",
+    "proposed_fix",
+    "tests_added",
+    "validation_plan",
+    "rollback_strategy",
+    "deployment_plan",
+    "metrics_to_monitor",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_c6355e09d9b445a6ab9e4249a3223f86"
+}

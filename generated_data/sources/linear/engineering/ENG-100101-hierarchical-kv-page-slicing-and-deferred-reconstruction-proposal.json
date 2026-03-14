@@ -1,0 +1,57 @@
+{
+  "key": "ENG-100101",
+  "team": "engineering",
+  "title": "Hierarchical KV page-slicing and deferred reconstruction proposal",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-06-12",
+  "updated_at": "2025-07-02",
+  "creator": "Lena Zhang",
+  "assignee": "Miguel Torres",
+  "project": "kv-memory-optimizations",
+  "cycle": "2025-W25",
+  "estimate": "8",
+  "due_date": "2025-07-15",
+  "labels": [
+    "kv-cache",
+    "gpu-paging",
+    "continuous-batching",
+    "memory-optimization",
+    "runtime-1.22"
+  ],
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "customer_impact": "medium",
+  "description": "Background:\n\nWe currently manage the KV (key-value) activation cache using monolithic page units which leads to fragmentation when large activation ranges are sparsely used across batches. This increases GPU memory pressure and causes expensive whole-page swaps during oversubscription. Existing proposals in the repo focus on eviction heuristics, block allocators, and host-prefetching around whole page boundaries.\n\nGoal:\n\nIntroduce a hierarchical page-slicing mechanism that allows a single 'page' to be split into variable-size slices (micro-pages) and support deferred reconstruction of contiguous activation ranges at the time of decode. Combined with a lightweight slice directory, the system should: \n- reduce wasted resident memory by enabling fine-grained residency for partial hotsets\n- avoid immediate expensive recomposition of slices on miss by deferring reconstruction until the decode kernel actually needs contiguous KV ranges\n- remain compatible with continuous batching and token-affinity optimizations\n\nNon-goals:\n- This PR does not aim to replace the global eviction policy or the batching scheduler.\n- Not targeting multi-GPU sharding changes in this iteration; single-GPU and host-staged variants only.\n\nDesign overview:\n\n1) Slice Directory: a compact host-resident index per model that maps (page_id, slice_offset) -> slice_descriptor (resident_location, length, version). Implemented as a fixed-size hash table with open addressing and epoch-based tombstones. The directory is intentionally small (a few KB) to retain cacheability in the control plane thread.\n\n2) Micro-pages: logical subdivisions of a page (e.g., 512B-8KB depending on model token geometry). Pages are still the atomic unit for long-term on-disk/host staging; micro-pages allow selective residency.\n\n3) Deferred Reconstruction: when a decode requires a contiguous KV span that crosses multiple resident micro-pages and some are missing, we enqueue a reconstruction task that:\n   - merges resident micro-pages and pulls missing micro-pages from host staging into a temporary reconstruction buffer (pinned host or ephemeral GPU buffer depending on size),\n   - performs a lightweight stitch step in CUDA that produces the contiguous KV segments required by the decoder kernel,\n   - updates the slice directory atomically for future hits.\n\n4) Fast-path for small token affinities: if the decode only needs micro-pages that are already resident, proceed without any stitching; this keeps the common low-latency path unchanged.\n\nAPI/config knobs:\n\n- slice_size_hint: integer (bytes) default 4096 -> used to pick micro-page sizing per model at load time\n- reconstruction_budget_ms: integer default 2 -> time budget for inline reconstruction before deferring to background worker\n- slice_eviction_granularity: enum {micro, page} default micro -> controls eviction unit under pressure\n\nTelemetry and observability:\n\nEmit the following counters/histograms:\n- slice_hit_rate (per-model, per-seq-len bucket)\n- reconstruction_latency_ms (P50/P95/P99)\n- memory_wasted_by_page_internal_fragmentation_bytes\n- resident_slice_count and resident_page_count\n- percent_decodes_triggering_reconstruction\n\nBenchmarks and evaluation plan:\n\n1) Synthetic microbench: simulate a mix of decoding traffic with varying token affinities to measure resident memory vs page-based baseline. Key metrics: tokens/sec, mean latency (token), P99 latency, and GPU resident bytes.\n2) Replay traces from production (small-talk conversational workload and long-form generation) to estimate effect on cost and tail latency.\n3) Stress test oversubscription: force >1.4x resident demand and compare OOM rate and graceful-fallback behavior.\n\nRollout strategy:\n\n- Stage 1 (canary): enable slice directory in host-staged mode only, slice_eviction_granularity=page, reconstruction off. Observe telemetry for regressions.\n- Stage 2 (opt-in): enable micro slicing and deferred reconstruction behind runtime flag; limited to a small set of tenants with low latency requirements.\n- Stage 3 (ramp): broader rollout with adaptive slice_size_hint tuning based on observed fragmentation metrics.\n\nRisks and mitigations:\n\n- Risk: Reconstruction can increase tail latency for cold spans. Mitigation: reconstruction_budget_ms and background worker fallback; also dynamic threshold to promote frequently reconstructed spans to resident whole pages.\n- Risk: Complexity blowup and lock contention on the slice directory. Mitigation: per-core partitioned directories and epoch GC to avoid global locks.\n- Risk: Memory churn from temporary reconstruction buffers. Mitigation: bounded pooled buffers and prefer pinned host staging for large reconstructions.\n\nCompatibility notes:\n\n- The decoding path is backwards compatible: if slice metadata is absent, runtime falls back to page-based fetch.\n- Host-staged and dedicated modes supported first; private on-prem may require tuning of slice_size_hint for different NICs and mmapped staging semantics.\n\nOpen questions:\n\n- What are the correct heuristics to promote micro-pages back into full-page residency? Candidate signals: reconstruction frequency, slice_hit_rate, and decode-window overlap.\n- Should slices be compressed in host staging to save bandwidth? Compression trade-offs need evaluation.\n- Interaction with KV encryption/HSM: do we keep slices encrypted independently or at page-level?\n\nArtifacts and references:\n\n- Design doc (internal): https://confluence.redwood.ai/display/INF/Hierarchical+KV+Slicing\n- Prototype PR: https://github.com/redwood-inference/runtime/pull/2491\n- Trace replays (GCS): gs://redwood-traces/2025-05-kv-frag-replays\n\nAcceptance criteria:\n\n- Correctness: no functional regression in token-level outputs for smoke tests.\n- Memory reduction: >=15% reduction in resident bytes for the small-talk trace under nominal load.\n- Latency: P99 decode latency increase <= 5% on steady-state traffic; any higher regressions must be explained and controlled by flags.\n",
+  "comments": [
+    "2025-06-13 - Lena Zhang: Initial write-up complete. Added sketch of slice directory and deferred reconstruction. Posting for design review.",
+    "2025-06-18 - Miguel Torres: Implemented prototype of slice directory in branch feat/kv-slicing. Early microbench shows ~12% memory reduction but P99 tail increased on cold startups. Investigating reconstruction path.",
+    "2025-06-22 - Priya Menon (review): Great direction. Please add telemetry for reconstruction vs eviction-induced misses and a counter for temporary buffer allocations. Also recommend a per-model adaptive policy in later iteration.",
+    "2025-06-25 - Miguel Torres: Added telemetry hooks and adaptive promotion heuristic based on reconstruction_count > threshold. Pushed update to PR 2491.",
+    "2025-07-01 - Eng-Infra rotation: Observed lock contention on slice directory under synthetic 128-core load; Miguel to partition directory and re-run stress tests. Blocking rollout until contention fixed.",
+    "2025-07-02 - Miguel Torres: Partitioned directory implemented (per-NUMA shard). Re-ran stress tests; contention dropped and reconstruction latency P99 regressed by <=2%. Moving ticket to In Progress for canary rollout prep."
+  ],
+  "attachments": [
+    "https://confluence.redwood.ai/display/INF/Hierarchical+KV+Slicing",
+    "https://github.com/redwood-inference/runtime/pull/2491",
+    "gs://redwood-traces/2025-05-kv-frag-replays"
+  ],
+  "dependencies": [
+    "ENG-100050",
+    "ENG-98333"
+  ],
+  "sub_issues": [
+    "ENG-100102",
+    "ENG-100103"
+  ],
+  "related_issues": [
+    "ENG-93721",
+    "ENG-94822"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_ab8213977e78478498e66fbfb1a6b9f9"
+}

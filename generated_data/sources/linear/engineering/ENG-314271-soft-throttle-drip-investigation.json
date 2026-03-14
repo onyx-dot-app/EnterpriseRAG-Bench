@@ -1,0 +1,59 @@
+{
+  "key": "ENG-314271",
+  "team": "engineering",
+  "title": "Intermittent soft-throttle 'drip' during traffic spikes causing prolonged ramp to full throughput",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-03-01",
+  "creator": "Aisha Patel",
+  "assignee": "Marcus Nguyen",
+  "project": "Rate Engine Stability",
+  "cycle": "2026-W05",
+  "estimate": "5",
+  "due_date": "2026-03-05",
+  "labels": [
+    "bug",
+    "rate-limiter",
+    "billing-impact",
+    "investigation",
+    "high-priority"
+  ],
+  "dependencies": [
+    "ENG-712908",
+    "ENG-241000"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.19.2",
+  "security_review_required": "false",
+  "description": "Summary:\nSeveral customers have reported that after a sudden traffic spike, their requests are not allowed through at the expected rate. Instead of quickly ramping to the provisioned/observed throughput, the system issues small allowances in a steady 'drip' (small increments every 2\u20135s) for 30\u201390s before reaching steady-state. This causes timeouts on client-side request bursts and creates significant tail latency for bursty features (batch embeddings, batched chat turns).\n\nObserved behavior and scope:\n- Affects per-key and per-org enforcement paths when the incoming demand spikes from near-zero to >5x baseline within a short window (e.g., cold clients or after long idle).\n- Present on both hosted and Dedicated nodes in region-us-east-1; not isolated to a single shard.\n- Billing/usage counters are updated correctly when tokens are emitted, but customers see degraded effective throughput during the drip window, causing perceived SLA violations.\n- Happens ~0.7% of spike events across production traffic; higher for routes with long-tail sequence lengths.\n\nInitial data / signals:\n- Enforcer logs show repeated small \"emit_tokens\" events with identical token_count=16 spaced ~2\u20134s apart instead of a single larger emit event.\n- Lease & shard traces show a small delay (~200\u2013500ms) in route metadata reconciliation on some nodes during failover, but this alone doesn't explain the multi-second drip.\n- Token refill/credit-smoothing metric (rate_engine.credit_rehydrate_latency_ms) shows a bimodal distribution with a long tail correlating with drip incidents.\n- No corresponding upstream admission control throttles or external circuit breakers triggered.\n\nHypothesis 1 (primary):\nThe permissive refill algorithm contains a smoothing/decay term intended to avoid a sudden burst of credits when a shard obtains fresh metadata. Under edge timing (stale remote snapshot + local pending credits), the algorithm clamps refills to a conservative tranche size and re-applies an exponential backoff between tranches, producing the visible multi-second drip. The logic was added to protect backend capacity but disproportionally impacts correctness for low-latency burst clients.\n\nHypothesis 2 (secondary):\nA race between per-route lease refresh and cross-shard aggregated snapshot application causes the local enforcer to believe it should rely on an older remote snapshot rate. When the local pending credits are non-zero, the code path merges snapshots using a minimum or median heuristic, which produces incremental token emission rather than an immediate full refill.\n\nRepro steps (incidents reproduced in lab):\n1) Start a traffic generator that is idle for 10+ minutes for a synthetic org/key.\n2) Burst >200 RPS for 20s to a rate-limited route with per-route burst allowance configured.\n3) Observe enforcer logs and metrics; compare tokens_emitted/sec vs expected capacity.\n4) Repeat with a controlled jitter of 100\u2013400ms on metadata propagation to simulate shard reconciliation delays.\n\nImpact & priority rationale:\n- Customer-visible latency and request failures during common bursty patterns (uploads, batched calls).\n- Can cause SLO misses on latency-sensitive integrations and increases support tickets that cite perceived throttling even though billing is not undercounting.\n- Acts as P0 because it degrades customer experience and can cascade into retries and higher cost.\n\nProposed immediate mitigation (short-term):\n- Tweak smoothing parameters to reduce exponential backoff cap for tranches to 100ms and increase tranche size limit from 16 to 256 tokens for routes with observed low-latency SLAs. Deploy as a feature flag gated to 10% of traffic and a control group of affected customers.\n\nProposed long-term fix (preferred):\n- Remove the \"clamp-to-median\" merge heuristic. Change the merge logic to prefer the freshest local snapshot when local pending credits exist, and use a max-based refill for the initial ramp for up to N seconds (configurable). Add deterministic safeguards to avoid catastrophic multi-tenant bursts (per-node global cap).\n- Add a short-lived optimistic path: if demand > 3x baseline and token pool empty for < 2s, allow a single larger tranche emission up to a configurable fraction of global burst budget.\n\nRollout plan:\n1) Canary: feature-flag smoothing-override to 10% traffic in us-east-1 for 48h, monitor metrics defined below.\n2) Widen to 50% after 48h with no regression, then 100% in 72h.\n3) Long-term merge and optimistic path implemented behind a separate flag with staged rollout and A/B measurement of ramp-up latency.\n4) Backout: revert feature flags or toggle off the new heuristic; previous behavior is preserved by default config.\n\nMetrics to monitor (alerts & dashboards):\n- per_key.ramp_up_p50_seconds (new): time from first request in spike to reaching 80% of steady throughput.\n- rate_engine.tokens_emitted_per_sec by node, route, key.\n- rate_engine.emit_tranche_size distribution.\n- infra.retries_per_request and client_observed_timeouts (increase implies regression).\n- billing.delta_unbilled_requests_during_drip (to detect divergence in perceived vs allowed requests).\n\nAcceptance criteria:\n- p50 ramp_up time reduces by >= 70% across sampled incidents in canary group.\n- No increase in overshoot (burst over-allow) incidents; monitor >99.9th percentile for accidental over-allow.\n- No increase in billing misattribution incidents; counters should remain consistent.\n\nNotes / open questions:\n- Need review from runtime kernel team: will larger early tranches increase peak mem/kv load?\n- Edge case: Org-level hierarchical quotas that co-exist with per-route burst budgets \u2014 ensure we don't temporarily violate parent quotas when doing optimistic tranches.\n- Evaluate whether Dedicated customers with strict isolation should have different defaults.\n\nRelated artifacts and links:\n- Dashboard (prod-spike): https://grafana.redwood.internal/d/rl_spike/drip-investigation\n- Raw enforcer snippets and traces: https://drive.redwood.internal/drive/spikes/drip-logs-2026-02\n- Proposal doc for merge heuristic changes (Confluence): https://confluence.redwood.internal/display/ENG/Rate+Engine+Refill+Proposal\n- Experimental PR (WIP): https://github.com/redwood-inference/rate-engine/pull/1987\n",
+  "comments": [
+    "2026-02-11 Marcus Nguyen: Reproduced locally with synthetic workload. Confirmed emit_tranche_size locked at 16. Attaching enforcer logs and flame graphs. Next: instrument the refill merge path to log snapshot sources (local vs remote).",
+    "2026-02-13 Aisha Patel (PM): Customer A reported 12% error-rate increase during their morning syncs. Flagging as P0. Coordinate communications with Support to acknowledge investigation. Pending: decide whether to enable short-term smoothing tweak today or after more telemetry.",
+    "2026-02-16 Sophia Rivera (SRE): Canary cluster prepared in us-east-1. Added synthetic spike job that runs every 6h to catch regressions. Alert rule added: per_key.ramp_up_p50_seconds > 6s for 5m triggers pager.",
+    "2026-02-20 Marcus Nguyen: Deployed smoothing-override flag to 5% of traffic for one day. Early results: ramp_up_p50 down 40% for canary keys, no overshoot observed. Need longer run and more routes (embedding vs chat).",
+    "2026-02-25 Marcus Nguyen: Implemented detailed merge logging in PR #1987. Observed that during several incidents the node treated a slightly-stale remote snapshot as authoritative because local pending_credit metadata was missing a timestamp. Fix candidate: ensure pending_credit carries fresh_ts and prefer local when fresh_ts within 1s. Adding unit tests.",
+    "2026-03-01 Aisha Patel: Moving issue to In Progress. Prepare customer-facing blurb for Support (what happened, mitigation, ETA for full fix)."
+  ],
+  "attachments": [
+    "https://github.com/redwood-inference/rate-engine/pull/1987",
+    "https://grafana.redwood.internal/d/rl_spike/drip-investigation",
+    "https://confluence.redwood.internal/display/ENG/Rate+Engine+Refill+Proposal",
+    "https://drive.redwood.internal/drive/spikes/drip-logs-2026-02"
+  ],
+  "recommended_fix": "Prefer freshest local snapshot when local pending credits exist; replace median/min merge with conservative max-based initial refill and configurable optimistic tranche. Add unit and integration tests that simulate metadata jitter and validate immediate ramp behavior. Tune tranche caps by route SLA tier.",
+  "test_plan": [
+    "Unit tests for merge logic: deterministic snapshots (local fresh vs remote stale) should prefer local when fresh_ts within threshold.",
+    "Integration: synthetic spike harness running across canary nodes to measure ramp_up_p50 under jittered metadata propagation.",
+    "Chaos: introduce metadata propagation delays and verify no excessive over-allow across tenants.",
+    "Load test: 2h run at synthetic 10k RPS bursts to ensure kernel memory & KV pressure remain acceptable with larger tranches."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "recommended_fix",
+    "test_plan"
+  ],
+  "dataset_doc_uuid": "dsid_60c83b258f2e4ade866ddb7a3eb30fa8"
+}

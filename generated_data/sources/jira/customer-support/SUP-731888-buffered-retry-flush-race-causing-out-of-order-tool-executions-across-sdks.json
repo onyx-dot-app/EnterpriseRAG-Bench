@@ -1,0 +1,99 @@
+{
+  "key": "SUP-731888",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Buffered retry flush race causing out-of-order tool executions across SDKs",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Maya Chen",
+  "assignee": "Priya Patel",
+  "customer_company": "AcmeAI",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "sdk-ts",
+    "sdk-python",
+    "sdk-go",
+    "edge-proxy"
+  ],
+  "labels": [
+    "retries",
+    "ordering",
+    "tool-calls",
+    "streaming",
+    "investigation"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "redwood-3b-v1",
+    "redwood-7b-quant"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-10T18:30:00Z",
+  "linked_issues": [
+    "SUP-4720",
+    "SUP-505432"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/sdk-js/pull/4125",
+    "github.com/redwood-inference/serving-runtime/pull/2098"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/ordering+and+retries+runbook"
+  ],
+  "description": "Issue summary: Customers report that when using the SDKs with client-side buffered retries enabled, tool/function calls sometimes execute out of order or are replayed after later calls have already completed. This produces duplicated side-effects and violates expected execution ordering for chained tool workflows.\n\nImpact: Several AcmeAI production orchestrations (dedicated cluster in us-east) experienced duplicated webhook posts and a reordered sequence of charge events. The problem is reproducible with the TS and Python SDKs and was observed intermittently with the Go SDK. Customer impact: financial reconciliation mismatches and user-visible duplicated actions.\n\nEnvironment: prod (dedicated), us-east, SDKs: ts-sdk@2.8.1, python-sdk@1.14.2, go-sdk@0.9.7, serving-runtime commit: 9f3a1b2, edge-proxy: envoy-1.30 custom config.\n\nObserved behavior: When the client SDK is under transient network pressure it batches outbound tool invocations into an internal retry buffer. On connection recovery the buffer flush path can race with live outbound calls. In cases where the buffered flush uses optimistic backoff the server receives replays with older logical sequence numbers after newer tool calls have already been processed. The server currently enforces idempotency only by per-call idempotency token; chained workflows rely on ordering semantics that are not protected by token alone.\n\nExpected behavior: Retries from the client buffer should be delivered with preserved ordering relative to in-flight requests originating on reconnect, or at minimum tagged so the server can reorder/ignore replays that would violate causal ordering. Tool side-effects should not be executed out-of-order.\n\nTemporary workaround: Ask customers to disable client-side buffered retries (set X-RW-Client-Retry-Mode: passthrough) or attach a per-action sequence header (X-RW-Seq) that the server can use to drop out-of-order replays. Recommend conservative retry backoff in the SDK until server-side ordering enforcement is implemented.",
+  "steps_to_reproduce": [
+    "1) Start a streaming session using the TS SDK with buffered retries enabled (default).",
+    "2) Send a sequence of three tool calls A -> B -> C where B performs a side-effect observable via webhook and C depends on B's external effect,",
+    "3) Introduce a short network partition (e.g., iptables drop, ~1-3s) to force the SDK to queue B and C into the retry buffer while A is in-flight,",
+    "4) Restore network connectivity and immediately send another new tool call D from the client (simulating user action),",
+    "5) Observe server execution order via trace/ingress logs: in the bug case server records show D processed before buffered B replay, and B replay executes after D leading to duplicated webhook firing or ordering inversion."
+  ],
+  "logs": [
+    "2026-03-10T15:02:11Z ingress[svc-ingress] trace_id=abc123 recv: toolcall A seq=100 client-id=acme-01",
+    "2026-03-10T15:02:12Z ingress[svc-ingress] recv: toolcall D seq=103 client-id=acme-01",
+    "2026-03-10T15:02:13Z serving-runtime[worker] accepted: replayed-tool B seq=101 client-retry-id=buf-7fd3",
+    "2026-03-10T15:02:13Z webhook[processor] delivered: POST /hooks/charge id=chg-882 DUPLICATE=true",
+    "stack excerpt: sdk-ts internal: retry-buffer/flush.go: line 78: flushQueue() called; concurrentFlush=true"
+  ],
+  "investigation_notes": [
+    "2026-03-10 16:00 - Maya: initial triage with AcmeAI CS rep, captured SDK logs and packet capture over affected window.",
+    "2026-03-10 16:30 - Eng-SRE (Diego Ramos): confirmed ordering inversion in traces; ingress accepted D before buffered B replay. Attached trace ids in logs field.",
+    "2026-03-10 17:10 - Runtime eng (Liam O'Connor): observed that server idempotency lookup is per-token and does not consider an 'original_seq' header that the SDK could supply. Proposed server-side guard to drop replays with lower seq than last-committed seq per-session.",
+    "2026-03-11 09:40 - SDK eng (Anika Mehta): reproduced locally using ts-sdk@2.8.1 with mock proxy; root cause appears to be unguarded concurrent flush() in retry-buffer which interleaves with new outbound call path. Grep: retry-buffer mutex is only used for enqueue, not for flush notifications.",
+    "2026-03-11 11:00 - Security: reviewed workaround headers; no PII risk adding X-RW-Seq header. Recommended opt-in control for customers.",
+    "Hypothesis: race between flush worker and outbound path allows enqueued calls to be emitted after newer calls because buffered items are not stamped with an ordering tag that server respects."
+  ],
+  "comments": [
+    "Support - Maya Chen (2026-03-10): Customer reported duplicated webhook deliveries and a reconciliation delta. Collected SDK debug logs and pcaps; attaching to ticket.",
+    "SRE - Diego Ramos (2026-03-10): Confirmed via traces that replayed toolcall had earlier logical seq but arrived after newer calls. Investigating ingress ordering guarantees; forwarding to runtime team.",
+    "Runtime - Liam O'Connor (2026-03-11): Reproduced in a local harness. I can push a temporary server-side defensive check to compare an optional X-RW-Seq header and drop events with seq <= last_committed_seq. Will coordinate a canary.",
+    "SDK - Anika Mehta (2026-03-11): Working on a patch to make flush atomic and to attach X-RW-OrigSeq to buffered items. Draft PR: github.com/redwood-inference/sdk-js/pull/4125",
+    "Customer - AcmeAI Ops (2026-03-11): Able to apply a short-term client config to disable buffered retries; reported no duplicates in the following 6 hours. Requesting timeline for server-side fix and recommended permanent mitigation.",
+    "Support - Priya Patel (2026-03-12): Coordinating rollout plan: 1) publish recommended config for customers, 2) land SDK atomic-flush patch, 3) deploy server-side seq-guard in canary, 4) full rollout after monitoring."
+  ],
+  "next_steps": "1) Runtime: implement seq-guard in serving-runtime to reject out-of-order replays when X-RW-Seq or X-RW-OrigSeq is present (branch: runtime/seq-guard). 2) SDKs: land atomic flush + attach orig_seq header in ts/python/go PRs. 3) SRE: canary server patch in us-east on 2026-03-14, monitor duplicate webhook rate and request latency. 4) Support: circulate configuration docs and mitigation steps to affected customers.",
+  "workaround": "Customers can set header X-RW-Client-Retry-Mode: passthrough to disable buffered retries, or include X-RW-Seq on every tool invocation with a monotonic sequence; both mitigate duplicates until server fix is live.",
+  "resolution": "",
+  "attachments": [
+    "pcap_acmeai_20260310.zip",
+    "sdk-ts-debug-logs-03-10.gz",
+    "trace_abc123.json"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "next_steps",
+    "workaround"
+  ],
+  "dataset_doc_uuid": "dsid_bb419d8650fa4ec7927a7168501facf4"
+}

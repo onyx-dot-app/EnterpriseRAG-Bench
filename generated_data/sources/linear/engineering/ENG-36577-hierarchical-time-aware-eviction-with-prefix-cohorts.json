@@ -1,0 +1,88 @@
+{
+  "key": "ENG-36577",
+  "team": "engineering",
+  "title": "Hierarchical Time-Aware Eviction with Prefix Cohorts for GPU KV Cache",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-12",
+  "updated_at": "2026-03-08",
+  "creator": "Ariana Costa",
+  "assignee": "Devon Meyer",
+  "project": "kv-cache-optimizations",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-31",
+  "labels": [
+    "kv-cache",
+    "eviction",
+    "gpu-memory",
+    "batching",
+    "prefix-awareness",
+    "safety"
+  ],
+  "parent_issue": [
+    "ENG-24167"
+  ],
+  "dependencies": [
+    "ENG-5824",
+    "ENG-33421"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.23",
+  "security_review_required": "false",
+  "description": "Problem: As continuous batching increases request concurrency, the GPU KV cache experiences fragmentation and uneven prefix retention. Current global LRU/TTL heuristics either over-evict hot prefixes (hurting tail latency) or retain cold prefixes (wasting GPU memory). We need an eviction policy that (1) preserves correctness for prefix-scoped KV entries across concurrent batched requests, (2) minimizes 99th-percentile latency regressions, and (3) reduces worst-case memory footprint without requiring large static reservations.\n\nThis ticket scopes design and implementation of a hierarchical, prefix-cohort-based eviction policy that combines TTL decay, cohort-weighted LRU, and admission/leaky-bucket controls to align cache lifetime with workload patterns while providing correctness guarantees for prefix isolation and atomic invalidation.",
+  "proposal": "High-level algorithm:\n- Partition KV entries into prefix cohorts using the request prefix hash (cohort = top-N bytes of prefix id). Cohorts are moderately sized to balance locality and agility (configurable; default 256 cohorts per shard).\n- Each cohort maintains two soft watermarks (warm, cold) computed from recent hit-rate and observed sequence-length distribution.\n- Eviction priority: (1) TTL-expired entries within cold cohorts -> remove first; (2) within warm cohorts, apply cohort-local LRU trimmed by per-cohort budget; (3) global fallback: weighted LRU where weight = inverse(hit_rate + alpha * cohort_activity).\n- Admission control: leaky-bucket credits per cohort to limit immediate KV writes from hot spiky prefixes. Credits replenish based on observed throughput and available global memory. This prevents a single prefix from filling a shard during bursty batching.\n- Correctness safeguards: versioned tombstones + optimistic sequence checks ensure that an entry removed concurrently with an in-flight batch is never re-used for a different prefix without explicit invalidation. Eviction records are written with a monotonic generation ID for the shard to allow clients/serving threads to detect stale caches.\n\nStrong guarantees targeted:\n- Prefix isolation: eviction cannot make a later request observe KV entries belonging to a different prefix generation (monotonic generation + tombstone applies).\n- Forward progress: eviction ensures that admission and reclamation interplay does not deadlock (leaky-bucket fallback to global reclaim when memory pressure high).\n- Batching safety: multi-request batch paths check per-request generation stamps before using cached KV to avoid cross-request contamination.",
+  "implementation_plan": [
+    "Draft spec + microbench design: finalize cohort sizing, watermark heuristics, and credit algorithm (2d).",
+    "Prototype in dev branch: implement per-shard cohort metadata, TTL buckets, cohort-local LRU queues, and leaky-bucket admission counters (3w).",
+    "Unit tests: eviction ordering, tombstone/generation semantics, and race injection tests for concurrent batch admission (1w).",
+    "Integration tests: run end-to-end benchmarks with continuous batching harness + memory fragmentation simulator; validate 99p latency and memory goals (1w).",
+    "Canary rollout behind feature flag: enable on 10% of serving fleet, monitor eviction churn, tail latency, and OOMs (2w).",
+    "Production rollout and postmortem: expand to 50%/100% with rollback criteria and dashboards (1w)."
+  ],
+  "acceptance_criteria": [
+    "Unit tests cover: cohort membership, TTL-priority eviction, cohort-local LRU behavior, tombstone/generation checks, and admission credit exhaustion paths.",
+    "Integration bench: under representative continuous-batching trace (median batch size >= 8, bursty prefixes), memory footprint reduced by >= 18% vs baseline for same hit rate, and 99th-percentile latency regression <= 5%.",
+    "No reproducible cross-prefix KV contamination in chaos tests that inject concurrent evictions during multi-request batches.",
+    "Feature flag metrics: eviction churn, per-cohort hit-rate, admission-block rate, and generation tombstone errors are visible in Console; alert thresholds configured.",
+    "Canary stability: no increased OOMs or increased tail-SLO breaches during 72h at 10% fleet share."
+  ],
+  "notes": [
+    "Cohort sizing trade-off: more cohorts => finer locality, higher metadata cost; fewer cohorts => coarse isolation but lower overhead. Default 256 chosen by early microbench to balance metadata bytes vs hit-rate gains.",
+    "We prefer soft watermarks so transient bursts can reclaim from TTL expiry rather than immediate cross-cohort evictions; this reduces tail latency from hot prefix oscillation.",
+    "Tombstone approach: lightweight generation ID per shard (64-bit) avoids storing per-entry version in hot path; we record generation on write and check-only in read path when eviction races occur.",
+    "This design intentionally avoids global locking: all cohort metadata updates are per-shard and use atomic ops where possible. Global weighted-LRU fallbacks are computed via periodic sampling instead of synchronous global state updates."
+  ],
+  "risks": [
+    "Complexity: more moving parts increases maintenance burden; mitigation: strong test coverage and feature-flagged rollout.",
+    "Metadata overhead: cohort state increases GPU-host pinned memory; mitigation: compact counters (u32/u16) and optional cohort count tuning per deployment class.",
+    "Incorrect tuning could starve low-volume but latency-sensitive prefixes; mitigation: conservative defaults and ability to pin prefixes (pinlist) via Console for enterprise users.",
+    "Race windows around eviction + batch reads could cause false negatives in tombstone checks if not thoroughly tested; mitigation: targeted race-injection CI and a short-term conservative fallback to global reclamation under ambiguity.",
+    "Interaction with continuous batching: admission throttling may increase request queuing; mitigation: integrate with batch scheduler to surface backpressure instead of silent drops."
+  ],
+  "comments": [
+    "2026-02-12 Ariana Costa: Initial problem write-up and high-level proposal. Recorded microbench results showing 22% memory saving for a 512-cohort variant in local sim.",
+    "2026-02-18 Devon Meyer: Reviewed algorithm with serving runtime team. Requested stronger invariants around tombstone generation and a plan for minimal per-entry metadata.",
+    "2026-02-26 Priya Shah (SRE): Asked for specific alerting thresholds for eviction churn and OOM; added to acceptance_criteria.",
+    "2026-03-03 Github PR #4281: prototype implements cohort metadata and TTL-first evictor. Perf tests added (link below).",
+    "2026-03-05 QA: ran chaos evictions during 10k-batch scenario \u2014 found an edge case where cohort credit replenishment lagged incorrectly when shard rotated; fix landed in PR #4302.",
+    "2026-03-08 Devon Meyer: Updated spec after benching and added canary rollout steps. Marking In Progress and scheduling canary for 2026-03-15."
+  ],
+  "links": [
+    "https://confluence.internal/redwood/kv-cache/hierarchical-eviction-spec",
+    "https://github.com/redwood-inference/inference/pull/4281",
+    "https://github.com/redwood-inference/inference/pull/4302",
+    "https://dashboards.redwood.internal/d/kv-eviction/eviction-overview?orgId=1"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "proposal",
+    "implementation_plan",
+    "acceptance_criteria",
+    "notes",
+    "risks",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_fbf6b04941814f14a4c255865028cb94"
+}

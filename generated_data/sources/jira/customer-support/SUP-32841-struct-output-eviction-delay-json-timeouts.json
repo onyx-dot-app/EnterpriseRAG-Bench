@@ -1,0 +1,109 @@
+{
+  "key": "SUP-32841",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Structured-output buffer eviction delay causing sporadic request timeouts in JSON-mode",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-13",
+  "reporter": "Aisha Khan",
+  "assignee": "Samir Gupta",
+  "customer_company": "ClariFin Analytics",
+  "customer_tier": "enterprise",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "streaming-decoder",
+    "cache",
+    "console"
+  ],
+  "labels": [
+    "structured-output",
+    "json-mode",
+    "latency",
+    "long-tail",
+    "streaming",
+    "customer-impact"
+  ],
+  "environment": "prod | us-east",
+  "affected_models": [
+    "redwood-7b-v2",
+    "openlm-13b-quant"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-20345",
+    "SUP-19862"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/812",
+    "https://github.com/redwood-inference/platform/pull/1790"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/4321/JSON+Mode+Streaming+Runbook"
+  ],
+  "related_incident_id": "INC-20260310-27",
+  "description": "Issue summary:\nCustomer reports intermittent request timeouts and long-tail latency when using structured-output (JSON) streaming mode. Problem appears after ~20-60s for some requests; other requests complete normally. Impact is end-to-end timeouts surfaced to the customer application (HTTP 504 / SDK timeout).\n\nImpact:\n- Multiple failed inference calls for 10 active users at ClariFin Analytics (enterprise tenant on dedicated capacity).\n- Estimated 2-5% of requests hitting timeouts during peak load window (13:00\u201315:00 UTC).\n- Downstream data processing pipelines backpressure due to missing structured outputs.\n\nObserved behavior:\n- Request initiates, initial token stream begins as expected.\n- Streaming stalls mid-response while server still reports active worker handling the request.\n- After ~30\u201360s stall, client times out and request is marked failed. No 5xx returned from API gateway.\n- Replaying identical requests in non-JSON mode (plain text) returns normally and quickly.\n\nHypothesis: eviction/flush of structured-output buffer or decoder finalization logic can block when certain metadata fields are present (multi-field arrays), causing long-tail stalls in the streaming decoder / postprocess step.\n\nNotes: customer attached sample prompts and the failing request IDs in comments below.",
+  "steps_to_reproduce": [
+    "1) Use customer tenant credentials and call /v1/chat/stream with mode=structured-json and schema that includes nested arrays and 4 'metadata' fields.",
+    "2) Observe initial tokens emitted, then wait \u2014 some requests stall after emitting ~80% of tokens.",
+    "3) Re-run identical request switching to mode=plain-text; observe normal completion within expected latency.",
+    "4) Run load test with 50 concurrent streams for 5 minutes to reproduce long-tail under sustained load.",
+    "5) Collect request IDs from customer logs and cross-check with serving-runtime traces.",
+    "Sample failing request ids: req-20260310-7a2f, req-20260310-7b9c"
+  ],
+  "logs": [
+    "2026-03-10T13:12:04Z srv-01 streaming-decoder INFO request=req-20260310-7a2f tokens_emitted=182 status=streaming",
+    "2026-03-10T13:12:35Z srv-01 streaming-decoder WARN request=req-20260310-7a2f stall_detected=1 last_token_timestamp=2026-03-10T13:12:05Z",
+    "2026-03-10T13:12:40Z api-gateway INFO request=req-20260310-7a2f client_timeout=60000 returned_http=504",
+    "Worker traces show no OOM, CPU at 45-60%, and GPU util ~30% at stall time."
+  ],
+  "comments": [
+    "2026-03-10T14:20:12Z - Aisha Khan (Support): Opened ticket after customer escalation. Attached sample prompt and request IDs.",
+    "2026-03-10T15:05:43Z - Samir Gupta (SRE): Acknowledged. Will collect runtime traces and enable additional debug logging on the affected dedicated pool.",
+    "2026-03-10T17:02:01Z - Marco Liu (Platform Eng): Noted similar pattern to SUP-20345 where structured-output postprocessing held a mutex during finalization; adding hypothesis to investigation.",
+    "2026-03-11T09:30:22Z - Samir Gupta (SRE): Temporarily increased decoder flush timeout and verified reduction in observed customer timeouts (from 3% to ~0.5%) during a 2-hour window. Planning a safer hotfix.",
+    "2026-03-12T11:11:09Z - Priya Patel (Customer Success): Customer confirmed they can reproduce reliably with their schema that includes arrays of metadata and trailing optional fields. They provided sample schema and data (attached in customer portal).",
+    "2026-03-13T08:44:55Z - Samir Gupta (SRE): Added link to PR with instrumentation and a candidate fix for buffer eviction race: https://github.com/redwood-inference/serving-runtime/pull/812"
+  ],
+  "investigation_notes": [
+    "- Reproduced stall locally using customer's schema when structured-output contains nested arrays > 3 levels and > 500 total elements across fields.",
+    "- Thread dump shows streaming-decoder main loop waiting on eviction condition variable while postprocessor holds the output buffer lock for extended time.",
+    "- CPU profiling indicates a synchronous JSON serialization pass in postprocess that occasionally spikes to 500ms for large payloads; this coincides with stalls.",
+    "- Non-JSON streaming bypasses postprocess serializer; explains why plain-text mode unaffected.",
+    "- No evidence of GPU or memory pressure; issue localized to CPU-side finalization path.",
+    "- Candidate root cause: structured-output finalization path performs full in-memory JSON assembly under a global lock causing head-of-line blocking for other streams on same worker.",
+    "- Affected customers appear to be on dedicated pools with default worker concurrency=8 leading to head-of-line blocking when one request enters heavy serialization.",
+    "- Related to prior issue SUP-19862 but different trigger (large nested arrays vs. rare unicode causing decoder hang).",
+    "- Instrumentation added to measure per-request serialization time and lock hold time (PR linked above)."
+  ],
+  "workaround": [
+    "1) Customer: Reduce nested array sizes or paginate metadata into separate follow-up requests.",
+    "2) Temporary server-side mitigation: lowered default worker concurrency on affected dedicated pool from 8 -> 4 to reduce contention (rolled out 2026-03-11 05:00 UTC).",
+    "3) Increased per-request streaming flush timeout to avoid client hits for 60s windows while hotfix is validated.",
+    "4) Recommend customers use plain-text mode for extremely large structured arrays until fix is released."
+  ],
+  "next_steps": [
+    "- Validate PR 812 in staging with large nested-array test corpus (owner: Marco Liu) by 2026-03-14.",
+    "- If tests pass, schedule hotfix rollout to affected dedicated pools with canary at 5% traffic, monitor serialization_time metric and 504 rate.",
+    "- Postmortem to capture mitigation, RCA, and long-term design (consider async serializer and per-request buffer quotas).",
+    "- Communicate ETA to customer and propose a post-deployment verification window before closing"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "workaround",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_505b74e43e9a4117bcd9559b912cb449"
+}

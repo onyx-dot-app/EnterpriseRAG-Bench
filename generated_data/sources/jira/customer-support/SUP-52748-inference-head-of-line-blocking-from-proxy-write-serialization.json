@@ -1,0 +1,85 @@
+{
+  "key": "SUP-52748",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Intermittent head-of-line blocking from proxy write-serialization causing long tail inference latency and stream stalls",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-02-12",
+  "updated_at": "2026-02-14",
+  "reporter": "Asha Patel",
+  "assignee": "Marcus Reed",
+  "customer_company": "LumenDocs",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "edge-proxy",
+    "serving-runtime",
+    "networking"
+  ],
+  "labels": [
+    "latency",
+    "streaming",
+    "proxy",
+    "investigation",
+    "kb:"
+  ],
+  "environment": "prod | us-east",
+  "affected_models": [
+    "lama-13b-quant-v2",
+    "redwood-mini-1.1"
+  ],
+  "affected_regions": [
+    "us-east",
+    "us-west"
+  ],
+  "sla_due_at": "2026-02-12T19:00:00Z",
+  "linked_issues": [
+    "SUP-27644",
+    "SUP-91827"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/edge-proxy/pull/442"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/ENG/Edge+Proxy+Timeouts+Runbook"
+  ],
+  "description": "Issue summary:\nCustomers observed elevated p95/p99 generation latency and occasional streaming stalls for long-running completions (>30s). The pattern is intermittent across sessions and manifests as: initial tokens stream normally, then a ~10-30s pause with no bytes (stream silence), followed by either a connection reset or a burst of buffered tokens. Impact: customer-facing UX degradation (chat UI stalls), increased token cost due to retries, and some 504s for requests that exceed ALB idle window.\n\nImpact:\n- Affected customer: LumenDocs (dedicated cluster).\n- Several production sessions across us-east and us-west.\n- Observed p99 spike from ~1.2s -> 18-45s for some requests.\n\nEnvironment and scope:\n- Dedicated capacity (reserved GPUs) behind our edge proxy and internal API gateway.\n- TLS termination at ALB, downstream edge-proxy (envoy-based) maintaining upstream connections to serving runtime pods.\n- Observed primarily on streaming generate endpoints with large trace headers and frequent auth token rotation.\n\nSteps to reproduce (observed method):\n1) Start a long generation with streaming enabled and a prompt that triggers a KV-cache warmup (context >2k tokens).\n2) Simultaneously rotate client auth cookies every ~8s (customer-side telemetry) and enable verbose trace headers (x-trace-id, x-client-meta).\n3) Observe the stream for 20-60s.\n\nObserved behavior:\n- Mid-stream silence (no bytes forwarded) for 10-30s, then resume with a burst of accumulated tokens or a TCP RST.\n- Edge logs show upstream write attempts blocking on socket buffer flush (write throttled) during periods of header growth and small-chunk coalescing.\n- ALB metrics show occasional ConnectionsClosedByClient coincident with proxy stalls.\n\nExpected behavior:\n- Continuous streaming with gradual token emission. Proxy should not block or coalesce writes in a way that starves warmup requests.\n\nImmediate customer workaround suggested:\n- Reduce client-side header churn (avoid rotating cookies while streaming) and disable verbose trace headers; use a stable x-trace for the session.\n- If using dedicated routing, temporarily pin to a shorter sequence length or lower batch size to avoid prolonged KV warmup windows.\n\nAttachments:\n- Edge proxy logs (redacted) and packet capture slices attached in internal artifact store: s3://redwood-support/artifacts/SUP-52748/",
+  "comments": [
+    "2026-02-12 09:12 UTC - Elena Martinez (LumenDocs): We're seeing chat sessions freeze mid-response; frontend shows spinner for ~20s then gets data. Happening multiple times per hour.",
+    "2026-02-12 09:34 UTC - Asha Patel (Support): Thanks Elena \u2014 collecting session IDs and asking for a HAR. Can you confirm you're rotating auth tokens every request?",
+    "2026-02-12 10:01 UTC - Elena Martinez (LumenDocs): Yes, we have a short-lifetime session cookie for security that refreshes often. We'll try pinned token in our next test and report back.",
+    "2026-02-12 14:22 UTC - Marcus Reed (SRE): Observed blocking writes in edge-proxy logs for connections to node-7/serving-runtime. TCP send buffer growth correlates with header update bursts. Uploading pcap extract to artifact store.",
+    "2026-02-13 07:49 UTC - Marcus Reed (SRE): Reproduced locally by replaying requests with rotating Authorization header. When header mutation occurs mid-stream, proxy coalesces writes into larger frames and stalls until flush conditions are met. Working hypothesis posted in investigation notes.",
+    "2026-02-14 11:05 UTC - Asha Patel (Support): Sent mitigation steps to customer (stable session tokens + reduce trace headers). Customer confirmed reduced incidents after change. Planning follow-up to deploy proxy fix."
+  ],
+  "investigation_notes": [
+    "2026-02-12 - Initial triage: dashboards show high WriteWait duration on edge-proxy instances serving the customer cluster (instance ids: ep-03, ep-07). Cumulative stalls line up with 5-15s gaps in streaming traces.",
+    "Packet capture (pcap) observation: TLS record sizes occasionally shrink to tiny frames when headers rotate; opposite burst when flush occurs. This pattern suggests write coalescing and delayed flush in the proxy (envoy) path.",
+    "Hypothesis v1: Frequent header updates cause the proxy to rewrite or reserialize HTTP/2 header frames and buffer data until HPACK table updates settle, leading to short-term head-of-line blocking for that stream.\nEvidence: http2 debug logs show multiple CONTINUATION frames and HPACK table churn timed with silence windows.",
+    "Hypothesis v2: Underlying kernel/Nagle interactions on upstream socket combined with small TLS records cause the socket send buffer to be held until a coalescing threshold or timer triggers.\nEvidence: socket sndbuf growth and tcp_info shows delayed ACK pacing during stall window.",
+    "Cross-checks: Other customers with low header churn and fewer small-chunk uploads are not impacted on same proxies. Replaying requests without header rotation reproduced the issue consistently at ~90% reproduction rate.",
+    "Metric links: Edge Proxy write_wait graph: https://monitoring.redwood.ai/d/proxy/write-wait?orgId=1&var-cluster=dedicated-lumendocs",
+    "Related runbooks: Edge proxy HPACK tuning and h2 stream management (internal)."
+  ],
+  "root_cause": "Combination of HTTP/2 header churn (frequent header/token rotation) and proxy write/coalescing behavior under small TLS record patterns caused transient write serialization. This produced head-of-line-like stalls for the affected stream, manifesting as mid-stream silence and occasional connection resets when upstream idle timers expired.",
+  "resolution": "Mitigation deployed: temporary config change on dedicated edge-proxy pool - reduce header coalescing timeout and enable immediate flush for streaming responses on paths matching /v1/generate-stream. Deployed to ep-03/ep-07. Customer advised to stabilize session tokens as short-term mitigation; confirmed reduction in incidents.\nPermanent fix: upstream PR to envoy fork to adjust HTTP/2 HPACK table update handling and to bypass coalescing for streaming endpoints merged (https://github.com/redwood-inference/edge-proxy/pull/442). Rolling restart of proxy pool scheduled during low-traffic window (2026-02-20 02:00 UTC).",
+  "follow_up_tasks": [
+    "Deploy proxy rolling restart to remaining dedicated pools (2026-02-20) and monitor write_wait and p99 latency for streaming endpoints.",
+    "Add a telemetry alert to flag incremental HPACK churn per-connection > 50 updates/min and correlate with write_wait spikes.",
+    "Update customer-facing KB: guidance on session token rotation best practices for streaming (add to support knowledge base).",
+    "Add integration test to the edge-proxy test harness that replays header-rotation scenarios and asserts no streaming stalls >3s.",
+    "Postmortem: draft postmortem page linking artifacts and root cause analysis (owner: Marcus Reed, due 2026-02-25)."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "root_cause",
+    "resolution",
+    "comments",
+    "follow_up_tasks"
+  ],
+  "dataset_doc_uuid": "dsid_ae663492e5e448ad8b9addd51678b5ef"
+}

@@ -1,0 +1,71 @@
+{
+  "key": "SUP-864000",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "VPCE multipath UDP rewrite causing DNS transaction ID collisions and intermittent control-plane resolution failures",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2025-02-10",
+  "updated_at": "2025-02-12",
+  "reporter": "Priya Nair",
+  "assignee": "Miguel Torres",
+  "customer_company": "BrightHealth",
+  "customer_tier": "private",
+  "environment": "prod | us-east-1",
+  "components": [
+    "vpce",
+    "egress",
+    "dns",
+    "networking",
+    "control-plane"
+  ],
+  "labels": [
+    "vpc-egress",
+    "udp-rewrite",
+    "dns-query-id",
+    "multipath",
+    "private-deploy"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "first_response_due_at": "2025-02-10",
+  "linked_issues": [
+    "SUP-712345",
+    "SUP-93188"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/infra/commit/9f4a2d"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/ENG/VPCE+DNS+Multipath+Analysis"
+  ],
+  "description": "Issue summary:\nCustomer BrightHealth's private deployment started seeing intermittent control-plane DNS resolution failures around 2025-02-10 03:00 UTC coincident with increased east-coast traffic. Failures manifest as: control-plane host lookups timing out (dns timeout) or returning wrong answers, which causes serving-node config fetch retries and model pull stalls.\n\nImpact:\n- Intermittent control-plane auth/heartbeat delays across ~12 serving nodes in us-east-1 AZs\n- Increased grpc reconnects (observed spike in client-side backoff) and noisy autoscale events\n- Customer reported increased 5xxs in application logs for ~10 minutes, repeated over a 6-hour window\n\nEnvironment:\n- Private VPC with VPCE to Redwood control plane\n- VPCE configured with multiple equal-cost egress paths through transit gateways and a customer edge router performing cross-az multipath hashing\n- Customer uses internal DNS forwarder (172.20.2.53) that forwards to public resolvers via a carrier-grade NAT + edge load balancer\n\nObserved behavior:\n- Packet captures from serving nodes show duplicate DNS transaction IDs for distinct queries within 1-2ms windows.\n- Upstream capture at the VPCE shows an egress device rewriting UDP source ports in a manner that collapsed different flows to the same 5-tuple and same transaction ID mapping when multipath rebalanced packets.\n- When reply packets arrive they are delivered to an incorrect socket (wrong flow) resulting in bogus DNS answers or dropped responses.\n\nExpected behavior:\n- DNS queries with distinct source ports / transaction IDs should map one-to-one to their responses. Multipath egress should preserve flow 5-tuple uniqueness so responses are routed back to correct sockets.\n\nWhy this is unusual / root hypothesis summary:\n- We suspect the customer's transit/egress device is performing an intermediate UDP port rewrite and then applying a multipath hashing that can map different original flows to the same egress 5-tuple in short windows. This, combined with DNS transaction ID reuse by the resolver (or NAT device normalizing IDs), produces collisions where a response matches the transaction ID but not the original socket.\n\nImmediate customer-facing symptoms we saw in logs:\n- control-plane: \"dns: lookup \"control.redwood.ai\" timed out\"\n- serving-node: repeated \"model pull retry: shard fetch failed: dns mismatch\"\n- application: burst of 502/504 during the windows where control-plane lookups failed\n",
+  "steps_to_reproduce": "1) Deploy a small traffic generator inside a private VPC with VPCE and enable multipath hashing on the egress device.\n2) Configure an internal DNS forwarder that sends queries through a carrier NAT + edge load balancer.\n3) Run high QPS (~2000 qps) of short DNS queries with varying source ports and transaction IDs.\n4) Capture UDP traffic on the VPCE and at the internal resolver. Observe rewritten source ports and cases where different original queries get collapsed into identical egress 5-tuples leading to mismatched responses.\n",
+  "logs": "(excerpts)\n- pcap at serving node: frame 20123: DNS query id=0x2a1b from 10.0.3.14:53112 \n- pcap at vpce egress: frame 4012: DNS query id=0x2a1b rewritten source 198.51.100.22:40001 \n- pcap at vpce egress: frame 4018: DNS query id=0x2a1b rewritten source 198.51.100.22:40001 (different original src)\n- dns proxy logs: WARN query-id-collision: received reply id=10747 for unmatched flow; cached stale answer returned\n- control-plane logs: 2025-02-10T03:07:12Z ERROR resolver: lookup control.redwood.ai: i/o timeout\n",
+  "investigation_notes": "- Collected pcaps from customer (serving node, vpce edge, and resolver) and matched timestamps.\n- Confirmed multipath egress has uneven hashing windows; device sometimes rebalances in-flight flows, causing two different internal sockets to map to the same external src-port within ~5ms.\n- Observed the customer NAT/device normalizes DNS transaction ID on retransmit in one path and the resolver reuses transaction IDs quickly under load.\n- Hypothesis: combination of (a) source-port rewrite by NAT, (b) multipath rebalancing, and (c) resolver txid reuse leads to collisions that break UDP DNS semantics.\n- Corroborating metrics: spike in resolver qps and retransmits, increased dns-timeout rate in control-plane traces, ephemeral increase in serving node CPU due to retries.\n- Consulted with Networking team on port-preservation and hashing requirements.\n",
+  "short_term_workaround": "1) Temporarily configure the customer's resolver/VPCE to enable TCP fallback for DNS (force DNS over TCP or TCP for large responses) so queries avoid UDP collisions while we remediate.\n2) On Redwood control-plane, increase DNS retry timeout and enable a TCP fallback in resolver library for this customer's connection.\n3) Ask customer to reduce DNS QPS or enable EDNS0 buffer size to encourage TCP fallback for large responses.\n",
+  "long_term_fix_and_rollout_notes": "- Customer needs to adjust egress NAT/load-balancer configuration: preserve source port entropy and avoid collapsing distinct internal flows into identical egress 5-tuples. Recommended setting: 5-tuple based ECMP hashing (src/dst IP, src/dst port, protocol) with per-flow stickiness longer than typical DNS RTT (>=100ms).\n- Networking infra PR (infra#4521) implements a detect-and-log mode to flag source-port normalization and will be rolled out to VPCE fleet in canary on 2025-02-13.\n- We will add a resolver-side defensive change: prefer DNS-over-TCP after N UDP timeouts for VPCE-origin traffic and add extra validation that response IP/port matches the expected socket before accepting. PR: github.com/redwood-inference/renderer/pull/778.\n- Post-deploy validation plan: run synthetic DNS QPS workload and confirm no query-id collisions in pcaps across 1M queries, monitor control-plane dns-timeout metric for 24 hours, and coordinate with customer to observe reduced 5xxs.\n",
+  "resolution": "In progress: applied short-term TCP-fallback change to the customer's resolver cluster and increased control-plane DNS retry window (temporary mitigation). Customer made a config change to the transit-edge to enable 5-tuple hashing stickiness for DNS flows in a single AZ which reduced collision windows. Full infra canary (infra#4521) scheduled for 2025-02-13 to add detection and automatic avoidance on our VPCE path. Final resolution pending post-canary validation.\n",
+  "comments": [
+    "2025-02-10 05:12 Priya Nair (Support): Customer reports intermittent model pulls and control-plane timeouts. Asked for pcaps, flow logs, and resolver config.",
+    "2025-02-10 06:08 Miguel Torres (SRE): Received pcaps. Initial read shows multiple queries reuse same txid and rewritten src ports at VPCE edge. Opening deeper network investigation with infra team.",
+    "2025-02-10 08:20 Aaron Lee (Network Eng): Confirmed VPCE egress had ECMP rebalancing. Customer edge NAT is doing port normalization under high QPS. Recommend short-term TCP fallback and request customer disable src-port normalization for DNS flows.",
+    "2025-02-10 11:03 BrightHealth (Customer): Applied egress change to increase flow stickiness and enabled TCP fallback on their resolver. Reports reduced errors in next 2h window. Will coordinate for scheduled VPCE change.",
+    "2025-02-12 09:45 Miguel Torres (SRE): Deployed resolver-side TCP fallback and added stricter response socket validation to control-plane resolver. Monitoring metrics; no repeat collisions in the last 36h on monitored nodes.",
+    "2025-02-12 10:00 Priya Nair (Support): Updated ticket with mitigation steps and linked infra PR. Marking as In Progress while we complete infra canary and customer validation."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "short_term_workaround",
+    "long_term_fix_and_rollout_notes",
+    "resolution",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_e00fef3f806c4def9d1af31f280e59a4"
+}

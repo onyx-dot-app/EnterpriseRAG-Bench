@@ -1,0 +1,78 @@
+{
+  "key": "SUP-372881",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "VPCE TLS sticky session + ALPN shift causes range validation failures on sharded artifact downloads",
+  "status": "Triage",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Priya Kapoor",
+  "assignee": "Unassigned",
+  "customer_company": "Fleetware Inc.",
+  "customer_tier": "private",
+  "components": [
+    "vpce",
+    "nlb",
+    "serving-runtime",
+    "network",
+    "artifact-store"
+  ],
+  "labels": [
+    "range-download",
+    "s3-presigned",
+    "vpce",
+    "alpn",
+    "tls-session-sticky",
+    "shard-integrity"
+  ],
+  "environment": "prod - us-west-2",
+  "affected_models": [
+    "custom-13b-sharded"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-15",
+  "linked_issues": [
+    "SUP-712345"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/4187"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/8573/VPCE+ALPN+and+archive+artifact+fetches"
+  ],
+  "description": "Issue summary:\nFleetware reports intermittent checksum mismatches and 'shard corrupt' errors when their private deployment fetches large sharded model artifacts using presigned URLs. The failures appear only for range requests that happen across resumed TLS sessions (session reuse / session ticket). Observed behavior is a 200 OK returning a full object or merged byte ranges instead of a 206 Partial Content for one or more Range requests, leading to validator checksum mismatch.\n\nImpact:\n- Nightly retrain/model-push jobs failing intermittently (10-30% of runs).\n- Automated serving rollbacks triggered due to shard validation failures.\n- Customer reported increased latency and manual intervention to re-fetch shards.\n\nEnvironment:\n- Fleetware private deployment (Redwood Private) via VPCE interface endpoint + internal NLB in us-west-2.\n- Serving nodes run latest 2026.02 runtime.\n- Artifact store: S3 presigned URLs served via internal cache/proxy in customer network (corporate accelerator).\n\nSteps to reproduce (customer):\n1) Deploy a model with sharded artifacts (custom-13b-sharded).\n2) Start a fetch that requests shard ranges (Range: bytes=0-5242879 then subsequent ranges).\n3) Allow the underlying TLS session to be resumed (application-level keepalive / session ticket).\n4) Observe on ~2/10 attempts that the client receives HTTP 200 for a range request or receives merged byte ranges that fail checksum validation.\n\nObserved logs / headers (sanitized):\n- TLS: Session-Resumed=true, Ticket-Age=0; ALPN offered: h2; negotiated: h2 -> later response shows http/1.1\n- NLB/VPCE: Set-Cookie: stickysess=AZb; X-Forwarded-Proto: https\n- Response: HTTP/1.1 200 OK\n  Content-Length: 5242880\n  Content-Range: missing or ranges merged\n- Runtime: shard-validator: checksum mismatch for shard-12 (expected XYZ, got ABC)\n\nTemporary workaround (customer tried):\n- Disabled application-layer cache on corporate accelerator: reduced failure rate but not eliminated.\n- Disabled TLS session reuse on the serving node client: eliminated failures (diagnostic) but unacceptable for perf.\n\nRequest from customer:\n- Root cause analysis: is VPCE/NLB or the corporate accelerator rewriting ALPN or coalescing range responses across session resume?\n- Permanent mitigation guidance and recommended configuration defaults for Redwood Private NLB/VPCE to avoid this class of corruption.\n",
+  "comments": [
+    "2026-03-12 10:14 - Support (Priya Kapoor): Acknowledged. Assigned to Triage for initial data collection. Asked customer for tcpdump + example presigned URL and shard checksum. SLA first response due 2026-03-12.",
+    "2026-03-12 13:22 - Customer (Ops lead, Fleetware): Uploaded sanitized tcpdump and sample headers to the ticket. Noting that failures spike during their cross-AZ failover window.",
+    "2026-03-13 09:05 - SRE (Martin O'Neill): Observed ALPN downgrade in captured headers (h2 -> http/1.1) and Set-Cookie stickiness coming from a VPCE proxy appliance. Hypothesis: proxy is terminating TLS then re-establishing to S3, and its range handling combined with session-resume/pipelining is merging responses.",
+    "2026-03-13 15:40 - Support (Priya Kapoor): Suggested diagnostic: toggle NLB TLS mode to TCP (pass-through) and test. Customer to try this in canary AZ.",
+    "2026-03-14 08:12 - Customer (Ops lead, Fleetware): Confirmed toggling NLB to TCP mode removed the merged-range responses in 200/200 tests. Will schedule a controlled test to disable VPCE proxy stickiness next.",
+    "2026-03-14 11:30 - SRE (Martin O'Neill): Noted that runtime should be defensive; opened linked GH PR to add range-revalidate fallback when Content-Range missing or Content-Length mismatches (see related PR)."
+  ],
+  "investigation_notes": [
+    "Captured tcpdump shows TLS session resume between client <-> VPCE-proxy and a separate TLS session between VPCE-proxy <-> S3 (double-termination).",
+    "ALPN negotiation differs across the two legs; proxy is downgrading to http/1.1 for backend, while client sends h2. This mismatch correlates with merged responses.",
+    "VPCE-set cookie indicates cookie-based session stickiness is configured on the customer appliance/NLB which may coalesce multiple range requests into single backend request for optimization.",
+    "Changing NLB to TCP mode eliminates proxy termination in-path and reproductions dropped to 0/30 in customer's canary test \u2014 strong signal that TLS termination + app-layer caching is culprit.",
+    "Runtime currently trusts 206/Content-Range headers; there is no defensive re-request on missing Content-Range, which allows silent data corruption to propagate to shard validator failure instead of triggering a re-fetch.",
+    "Potential contributing factor: HTTP/2 multiplexing semantics at proxy boundary when converting to HTTP/1.1 on backend might be collapsing or concatenating ranges for performance, leading to server returning 200 with merged content."
+  ],
+  "resolution": [
+    "Workaround applied: Customer disabled NLB cookie-based stickiness and switched NLB to TCP (pass-through) for the VPCE interface. Immediate effect: merged-range responses stopped, production shard fetch success rate returned to baseline.",
+    "Code mitigation: Merged PR https://github.com/redwood-inference/serving-runtime/pull/4187 that implements a defensive revalidate path: if Content-Range is missing or content-length doesn't match expected range, runtime will re-request the offending range(s) rather than accepting merged response. Backported to 2026.03 runtime patch.",
+    "Operational guidance: Document recommending 'VPCE/NLB: use TCP pass-through for artifact fetch endpoints' and 'disable application-layer response coalescing for presigned range downloads' added to Confluence and the VPCE runbook.",
+    "Follow-ups: Customer to run a 48-hour soak with NLB TCP mode; SRE to monitor artifact fetch error-rate and validate patched runtime behavior in staging. Ticket to remain open until soak completes (target close 2026-03-16)."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_a8e1bbf354314ac2b181ef7b0e14b267"
+}

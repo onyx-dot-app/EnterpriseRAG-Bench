@@ -1,0 +1,94 @@
+{
+  "key": "SUP-83619",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "SDK connector headroom exhaustion causing request stalls and perceived timeouts",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-13",
+  "reporter": "Alex Rivera",
+  "assignee": "Maya Chen",
+  "customer_company": "Fathom Analytics",
+  "customer_tier": "dedicated",
+  "environment": "prod us-east",
+  "components": [
+    "sdk",
+    "api-gateway",
+    "serving-runtime",
+    "load-balancer"
+  ],
+  "labels": [
+    "latency",
+    "sdk-config",
+    "connection-pool",
+    "backoff",
+    "customer-impact"
+  ],
+  "affected_models": [
+    "redwood-phi-7b",
+    "open-mix-13b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-61234",
+    "SUP-32011"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/platform/pull/1428"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SUPPORT/Connection+Pool+Runbook"
+  ],
+  "description": "Issue summary: Customer reports large numbers of streaming requests from their service appear to stall for 2\u20136s intermittently and then either succeed or time out. Impact: Customer's real-time summarization pipeline sees elevated tail latency and partial response failures (~8% increase in 5xx/timeouts over last 24h), affecting SLAs for their enterprise customers. Environment: Dedicated tenant on prod us-east, SDK v1.4.2 (Python), using streaming endpoints with default SDK connection pool and backoff settings. Observed during normal QPS (approx 120 r/s) with occasional load bursts to 350 r/s.\n\nSteps to reproduce: 1) Use customer SDK config (example below) to open 50 concurrent streaming requests for 30s against the tenant endpoint. 2) Observe per-request response times and note pileups when connection handshakes exceed pool headroom. 3) Repeat with SDK max_connections set to 100 and with default (16).\n\nCustomer SDK example (Python):\nfrom redwood import RedwoodClient\nclient = RedwoodClient(api_key=\"<REDACTED>\", max_connections=16, backoff_strategy=\"expo\", max_retries=5)\n# spawn 50 concurrent streaming calls to tenant endpoint\n\nObserved behavior: With default max_connections=16 and high concurrency the customer sees requests queuing on the client side for multiple seconds. When the SDK hits the per-tenant connection limit enforced at the gateway, retries are synchronized (exponential backoff without jitter) and cause head-of-line blocking. When connections are available again the queued requests complete in short bursts which looks like intermittent latency spikes.\n\nLogs/metrics (excerpts):\n- customer-side SDK logs: \"ConnectionPool exhausted (max_connections=16) - queuing request\" repeated at high rate.\n- gateway logs: 429s spike correlating to connection limit exceeded for tenant_id=ftm-42 between 2026-03-09T09:12:21Z and 2026-03-09T09:15:03Z.\n- serving-runtime: no JVM OOM, CPU stable; per-GPU concurrency reached rollout thresholds during bursts.\n- Observed metric: inflight_queue_depth (sdk) rising to ~320 while active connections stayed near 16.\n",
+  "steps_to_reproduce": [
+    "Deploy SDK v1.4.2 with default connection pool (max_connections=16)",
+    "Simulate 50+ concurrent streaming requests from a single host against the dedicated tenant endpoint",
+    "Monitor client-side ConnectionPool exhausted logs and gateway 429 events",
+    "Change max_connections to 100 and observe queue depth change"
+  ],
+  "logs": [
+    "[2026-03-09T09:12:21Z] SDK INFO ConnectionPool exhausted (max_connections=16) - queuing request id=5f3a",
+    "[2026-03-09T09:12:22Z] Gateway WARN 429 Tenant ftm-42 connection_quota_exceeded",
+    "[2026-03-09T09:13:05Z] SDK ERROR request id=5f3a timeout after 6000ms"
+  ],
+  "comments": [
+    "2026-03-10 10:12 - Alex Rivera (reporter): Customer attached time-series showing tail latency jump around 09:10 UTC. Requests appear queued on client until a connection frees up.",
+    "2026-03-10 11:03 - Support (Maya Chen): Acknowledged. Asking SRE to check gateway per-tenant connection quotas and recent deployment changes in us-east.",
+    "2026-03-10 11:28 - SRE (Jordan Patel): Confirmed tenant connection quota was set to 16 (legacy override). Saw 429 bursts at 09:12. No recent gateway deploys at that time. Investigating autoscaling headroom on front-line proxies.",
+    "2026-03-11 08:44 - Customer (Fathom Eng - Priya Kumar): We can temporarily increase our SDK max_connections but worried about overwhelming the gateway - what is safe?",
+    "2026-03-11 09:10 - Maya Chen: Recommended incremental increase to 32 and enable jitter on backoff. Also created follow-up to review per-tenant connection caps and to add warning to SDK docs.",
+    "2026-03-13 14:02 - Eng (Rohit Singh): Implemented gateway telemetry flag to track per-tenant connection headroom and pushed a patch to allow short-term headroom bump for affected tenant (PR#1428)."
+  ],
+  "investigation_notes": "Hypothesis: Combination of low per-tenant connection quota (16) + SDK default max_connections=16 + exponential backoff with no jitter produced synchronized retries and client-side queueing. This is amplified when ephemeral connector threads exhaust file descriptors and keepalive isn't reusing connections effectively. Evidence: gateway 429s aligned with client queueing spikes; inflight_queue_depth metric tallied against active connections. We measured that enabling jitter and increasing SDK pool to 32 reduced queuing in a controlled test. Also observed keepalive_disabled on some customer hosts leading to higher TCP churn. No evidence of serving-runtime CPU/GPU saturation outside normal burst autoscale windows.",
+  "root_cause": "Per-tenant connection cap (legacy override) too low for customer's burst profile combined with SDK defaults that do not enable jitter for retries and have conservative max_connections, causing synchronized retry storms and head-of-line blocking on the client side.",
+  "workaround": "1) Customer temporary mitigation: set SDK max_connections=32, enable backoff_jitter=true, reduce max_retries to 3. 2) If using many hosts, spread connections across hosts to avoid single-host headroom exhaustion. 3) Request temporary per-tenant headroom bump from platform ops.",
+  "resolution": "Applied temporary gateway headroom bump for tenant ftm-42 (2026-03-12 02:15 UTC) and pushed SDK guidance to customer. Customer observed tail-latency improvement from ~2\u20136s spikes down to 200\u2013400ms. Engineering created PR to add jitter by default in next SDK minor (target v1.5.0) and documentation callout for per-tenant caps. Follow-up: scheduled a permanent increase of tenant connection cap after capacity plan review.",
+  "follow_up_actions": [
+    "Add SDK default jitter to backoff policy (PR merged, release scheduled v1.5.0)",
+    "Update Support runbook: troubleshooting steps for ConnectionPool exhausted and recommended SDK settings",
+    "Capacity review: evaluate per-tenant connection cap policy and auto-bump criteria",
+    "Add alerting in Console for per-tenant connection headroom < 20%"
+  ],
+  "notes_for_customer": "Thank you for raising this. Short-term please update SDK config as advised (max_connections=32, backoff_jitter=true, max_retries=3). We have temporarily increased your tenant headroom and will follow up with a capacity assurance plan. Expect a final confirmation after the capacity review (target 2026-03-20).",
+  "public_postmortem_link": "",
+  "attachments": [
+    "attachment-logs-ftm42-2026-03-09.tar.gz"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "root_cause",
+    "workaround",
+    "resolution",
+    "follow_up_actions",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_4eb1f69c3efd4f7ca1f56e0d25c4088b"
+}

@@ -1,0 +1,102 @@
+{
+  "key": "ENG-20347",
+  "team": "engineering",
+  "title": "KV-slab hysteresis + cudaMallocAsync: fragmentation and delayed free causing intermittent OOMs under continuous batching",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-13",
+  "creator": "Ava Patel",
+  "assignee": "Jonah Kim",
+  "project": "serving-runtime-memory",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "kv-cache",
+    "cudaMallocAsync",
+    "memory",
+    "investigation",
+    "high-priority"
+  ],
+  "dependencies": [
+    "ENG-20105",
+    "ENG-19988"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "We observe intermittent OOMs on continuous-batching workloads (small variable-length inference requests) that correlate with sustained KV cache growth and increased resident fragmentation. Initial traces show cudaMallocAsync pool growth with delayed actual device memory reclamation and many small allocations for KV entries and per-request scratch buffers. The allocator appears to hold onto freed blocks (pool hysteresis) and the slab layout for KV entries fragments under mixed-size inserts/evictions, ultimately preventing large contiguous allocations and causing OOMs on long-running hosts.",
+  "repro_steps": [
+    "1) Deploy model X (gpt-7b-fp16) with continuous batching enabled (max_batch 128, batching_strategy=continuous).",
+    "2) Send a steady stream of short/long mixed-length requests for 6+ hours (synthetic trace: 40% short, 60% long).",
+    "3) Enable KV cache (per-session caching) and simulate high QPS with many active sessions (approx 800 sessions).",
+    "4) Observe resident memory, cudaMallocAsync pool sizes, and allocator arena logs over time; reproduce OOM after ~4\u20138 hours on p4d-8xlarge equivalent nodes."
+  ],
+  "investigation_logs": [
+    "2026-03-10 09:12 - Start: collected heap profiles (nvprof + custom allocator hooks) from failing host; uploaded to s3://redwood-logs/ENG-20347/heap-1.tar.gz",
+    "2026-03-10 14:40 - Found long-lived device allocations belonging to slab buckets sized 64B-4KB; many freed logically but still present in cudaMallocAsync pool (cudaFreeAsync latency is low but pool retention metric high).",
+    "2026-03-11 11:05 - Replayed trace in staging with allocator debug enabled; observed repeated small allocations pinned to different streams causing split arenas and fragmentation. Added metrics: slab_frag_ratio, pool_retention_bytes.",
+    "2026-03-12 16:20 - Memory profiler snapshot: free_list contains many small blocks but total free contiguous region < required 256MB allocation for model KV checkpoint in peak windows."
+  ],
+  "analysis_summary": "Root causes likely compound: (1) cudaMallocAsync pooling retains freed device memory to avoid syscall overhead, but our workload's allocation size distribution plus stream-locality leads to free blocks scattered across arenas, reducing contiguous free regions; (2) KV cache insertion/eviction churn produces many small allocations and deallocations, triggering slab bucket usage patterns that create internal fragmentation; (3) continuous batching mixes request lifetimes so slab turnover doesn't compact quickly enough; and (4) our current GC/eviction thresholds for per-session KV are too lax for long-tail sessions, increasing steady-state memory pressure.",
+  "temporary_mitigations": [
+    "1) Reduce continuous batching window (lower max_batch to 64) for affected host pools to decrease simultaneous KV growth.",
+    "2) Enable proactive KV aging in config: session_ttl_seconds=600 and aggressive LRU for inactive sessions.",
+    "3) Restart policy: schedule staggered restarts (rolling) for hosts exceeding pool_retention_bytes > 75% for > 2 hours as emergency relief.",
+    "4) Apply runtime flag --cuda-malloc-async-max-retain=256MB on canary nodes to limit pool hysteresis (experiment)."
+  ],
+  "proposed_fixes": [
+    "A) Slab compaction: implement periodic compaction pass that coalesces free blocks across slab buckets for KV allocator (configurable cadence and budget).",
+    "B) Stream-aware pooling: modify cudaMallocAsync usage to prefer cross-stream reuse heuristics and introduce stream-local caches with spill-to-global behavior to reduce arena scattering.",
+    "C) Eviction tuning: add adaptive KV GC that reacts to pool_retention_bytes and triggers background eviction or materialization to disk for cold sessions.",
+    "D) Allocation batching: replace many small per-KV allocations with a segmented contiguous buffer per session to reduce allocator churn (proto design in RFC-1243).",
+    "E) Metrics & Alerts: add slab_frag_ratio alert and a dashboard panel for pool_retention_bytes per host; correlate with OOMs and create runbook."
+  ],
+  "tradeoffs": [
+    "- Compaction increases CPU and device memcpy overhead; risk of higher latency during compaction windows. We'll schedule compaction on low-load windows and allow operator budget limits.",
+    "- Reducing cudaMallocAsync retention lowers memory headroom for bursts and increases cudaMallocAsync syscall rate; test for latency regressions.",
+    "- Segmented contiguous buffers require careful lifecycle management; initial rollout limited to opt-in models to reduce risk."
+  ],
+  "acceptance_criteria": [
+    "1) No OOMs observed in 72h soak test under the synthetic long-running mixed-length continuous batching workload on canary cluster (same repro as above).",
+    "2) slab_frag_ratio reduces by >= 50% in steady-state compared to baseline and contiguous free region size increases enough to allow 256MB allocations.",
+    "3) CPU and 99th latency regressions < 5% for production traffic after compaction and pooling changes (monkey-tested).",
+    "4) New metrics (pool_retention_bytes, slab_frag_ratio) are emitted and Grafana panels + alerts are in place."
+  ],
+  "rollout_plan": [
+    "Phase 1 (canary): apply --cuda-malloc-async-max-retain and enable KV aggressive aging on a small fraction of serving nodes; monitor for 48h.",
+    "Phase 2 (instrumentation): deploy slab_frag_ratio metrics and pool_retention_bytes; run compaction in passive (read-only) mode to validate correctness.",
+    "Phase 3 (opt-in models): enable segmented contiguous buffers for non-critical models and measure allocator churn.",
+    "Phase 4 (wide): enable compaction + stream-aware pooling cluster-wide with staggered rollout and run 72h soak."
+  ],
+  "comments": [
+    "2026-03-10 12:00 - Jonah Kim: Started heap dump analysis; initial signal points to 64B-4KB slab buckets. Filing ticket to centralize fixes.",
+    "2026-03-11 13:15 - Mei Chen (PM): Prioritize this P0 for customers with long-running sessions; flag for on-call awareness. Please add dashboard links.",
+    "2026-03-12 09:30 - Rafael Torres (SRE): We can schedule rolling restarts for emergency mitigation; added runbook entry RB-73 and will automate detection.",
+    "2026-03-12 18:00 - Jonah Kim: PoC of --cuda-malloc-async-max-retain applied to canary; retention dropped ~40% and OOM not reproduced in short test. Need soak."
+  ],
+  "attachments": [
+    "https://github.com/redwood-inference/serving/pull/4892 - PoC: limit cudaMallocAsync retention flag",
+    "https://github.com/redwood-inference/serving/pull/4907 - RFC-1243: segmented session buffers for KV allocations",
+    "https://grafana.redwood.ai/d/serving/memory?var-host=canary-1 - canary memory dashboard",
+    "s3://redwood-logs/ENG-20347/heap-1.tar.gz - heap dumps and nvprof traces"
+  ],
+  "notes": "Next actions: (1) run 72h soak on canary with PoC flags, (2) implement minimal slab_frag_ratio metric ASAP, (3) prototype compaction routine in a branch and verify correctness on staging. If soak passes, schedule phased rollout with SRE.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "repro_steps",
+    "investigation_logs",
+    "analysis_summary",
+    "temporary_mitigations",
+    "proposed_fixes",
+    "tradeoffs",
+    "acceptance_criteria",
+    "rollout_plan",
+    "comments",
+    "attachments",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_3883358c4e3f4f23ba23f4f1c483c718"
+}

@@ -1,0 +1,57 @@
+{
+  "key": "ENG-62789",
+  "team": "engineering",
+  "title": "Memory-slab reclamation and prefix-consistency proofs for KV eviction",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-01-12",
+  "updated_at": "2025-02-03",
+  "creator": "Aisha Patel",
+  "assignee": "Liam Chen",
+  "project": "runtime-kv-reliability",
+  "cycle": "2025-W05",
+  "estimate": "8",
+  "due_date": "2025-02-14",
+  "labels": [
+    "kv-cache",
+    "eviction",
+    "gpu-memory",
+    "correctness",
+    "batching"
+  ],
+  "description": "Problem: As continuous batching increases throughput and KV caching becomes denser on GPUs, we need an eviction mechanism that reclaims slab-aligned GPU memory without violating prefix consistency guarantees used by model decoding (i.e., no request should reobserve missing KV for an in-flight prefix). Existing LRU/TTL heuristics are efficient but can race with concurrent inference batches and prefix-affine workloads, causing subtle correctness regressions (stale tokens, hallucinated completions) and difficult-to-debug flakiness in production.\n\nScope & goals:\n- Design an eviction protocol that:\n  1) Reclaims GPU memory in slab units for allocator efficiency.\n  2) Preserves prefix-consistency: any active sequence (prefix) must retain all its KV entries until it completes or is explicitly invalidated.\n  3) Cooperates with continuous batching: eviction decisions must not introduce requests-to-requests data races when batches share KV pins.\n  4) Provides formal invariants we can assert in unit/property tests and runtime assertions.\n  5) Be practical to implement in the runtime (bounded metadata overhead, <5% perf regression on tail latency).\n\nNon-goals:\n- Full global transactional KV (out of scope).\n- Changing API semantics for customers.\n\nProposed design (high level):\n1) Memory-slab allocator: allocate KV storage in immutable slabs (power-of-two or tunable size). Slabs are the unit of eviction and migration. Each slab contains KV entries for multiple prefixes.\n2) Prefix pinning + lease: when a request (or batch) references a prefix, it acquires a lightweight in-memory pin (lease id + epoch). Pins are per-worker and per-request but represented as compact counters so pins can be aggregated per-slab. Pins auto-expire after a short lease (configurable, e.g., 2s) and are extended by continuations (streaming increments) to support long-running sessions.\n3) Eviction eligibility: a slab is eligible if: (a) its aggregate pin count == 0 and (b) it has not been recently used within an LRU window OR TTL has expired. Eligibility is calculated using atomic counters; eviction proceeds only after a two-phase commit: mark-for-eviction -> wait for grace window (one scheduler tick + outstanding batch drain) -> reclaim slab.\n4) Two-phase commit and generation tags: to avoid races where a slab is reclaimed and reallocated while an in-flight request expects it, every slab carries a generation tag. When a pin is taken, the current generation is read; eviction increments generation after mark-for-eviction so future pins see new generation and cannot bind to the soon-to-be-evicted slab. Requests always validate the generation before using KV; if generation mismatches, the request triggers a fallback to reload prefix from backing store or a safe no-cache path.\n5) Prefix-aware LRU delta: maintain a lightweight prefix access bitmap per slab that approximates which prefixes dominate the slab. On eviction candidates, prefer slabs with low prefix overlap with active prefixes (reduces risk of reloading hot prefixes).\n\nCorrectness invariants (we will assert these in code/tests):\n- Invariant A (No mid-use reclamation): Once a request successfully pins a slab for generation G, that slab (generation G) will not be reclaimed until the pin is released or lease expires.\n- Invariant B (Atomic slab rebind): Reclaim -> reallocate to new generation must be visible to new pins; no pin can refer to older generation after reclamation completes.\n- Invariant C (Prefix-complete reads): Any request observing KV for a prefix must observe either the complete set of entries for that prefix for a given generation or must trigger a reload/fallback; partial prefix observations are disallowed.\n- Invariant D (Batch isolation): When a batch references multiple prefixes that map to same slab, eviction cannot interleave reclamation between any of the pinned reads for that batch.\n\nTesting strategy:\n- Unit/property tests: model the slab allocator and pin counters in a small Rust crate with randomized concurrent pin/evict schedules; check invariants A-D.\n- Deterministic concurrency tests: stress harness using our local worker scheduler that can force context switches at critical points (after mark-for-evict, before reclaim) to reproduce races.\n- Integration test: run model-decoding pipelines with fuzzer-generated prefix access patterns (short/long sessions, heavy prefix reuse) to compare outputs between 'no-eviction' baseline and the new protocol. Expect identical outputs or safe fallback logs.\n- Performance tests: 99th percentile tail latency and throughput on t4g-like and a100-like hardware; measure extra metadata overhead and effect on batching (target: <5% tail latency regression).\n\nTelemetry & observability:\n- Emit events for mark-for-eviction, reclamation, failed generation validation (fallbacks), and lease expirations.\n- Dashboard: slab health (live pins, last-accessed), generation churn, rehydration rate (reloads from disk/backing store), fallback rate per model/route.\n\nRollout plan:\n1) Feature-flagged implementation in canary fleet (runtime-1.20/canary).\n2) Enable for low-traffic models first (non-critical routes), observe fallback and reload rates for 48h.\n3) If stable, widen to 10% traffic and run load/chaos tests.\n4) Full rollout gated on: fallback rate < 0.01% and no correctness regressions in integration tests.\n\nMigration considerations:\n- Slabs must be backward-compatible with older worker processes: use feature negotiation at worker boot; new generation semantics degrade gracefully (older workers treat generation writes as no-op but cannot reclaim new slabs).\n- On upgrade, start with conservative slab sizes and longer leases.\n\nTrade-offs and open questions:\n- Lease length vs GC latency: longer leases reduce false reloads for long sessions but delay reclamation and increase memory pressure. Propose adaptive lease tuning by measuring session tail lengths.\n- Slab granularity: smaller slabs reduce wasted memory but increase metadata and possible fragmentation. We propose start with 256KiB slabs (empirical) and expose tuning flag.\n- Cost of generation validation: extra read/compare per pin; optimize by coalescing generation checks at batch boundaries and leveraging CPU prefetch.\n\nSecurity & compliance: no customer-visible API change; generation tags are internal bookkeeping (no secret leakage). Marking security_review_required: false.\n\nAcceptance criteria (high level):\n- Implementation passes all unit/property tests asserting invariants A-D.\n- No end-to-end correctness regressions on canary traffic for 72h.\n- Fallback rate remains <0.01% and memory reclaimed effectively under GC stress tests.\n- Performance overhead <= 5% P99 tail latency increase for sampled models.\n\nLinks and artifacts:\n- Design doc (Confluence): https://confluence.redwood.ai/display/RUN/Memory+Slab+Eviction+Protocol+Design\n- RFC: https://redwood-internal/repo/rfcs/00023-kv-slab-eviction.md\n- PoC PR: https://github.com/redwood-inference/runtime/pull/4237\n- Test harness: https://ci.redwood.ai/artifacts/kv-slab-harness/2025-01-28\n\nNotes: This ticket focuses on correctness-first eviction for prefix-affine workloads. Later work will consider global cost-aware heuristics (bandit-based eviction policies) that trade correctness budget for lower reload cost when models are cold.",
+  "comments": [
+    "2025-01-13 - Aisha Patel: Initial write-up and design sketch. Punted on exact slab size; suggested 256KiB as starting point.",
+    "2025-01-18 - Jonas Meyer (review): Strong +1 on generation tags; asked for clarity on cross-worker invalidation semantics. Action: add small 'feature negotiation' note for mixed-version clusters.",
+    "2025-01-24 - Sofia Ruiz (performance): Ran microbenchmarks on N1; generation checks add ~0.8% CPU per pin. Suggested batch-coalescing validation to reduce overhead; acknowledged in design.",
+    "2025-01-30 - Liam Chen: Started PoC implementation (worker pin counters + mark-for-evict path). Found race in slab reallocation when grace window was zero; added 1 scheduler tick wait in PoC.",
+    "2025-02-03 - QA: Added deterministic concurrency test cases; reproduced a case where two batches with overlapping prefixes caused a fallback spike when leases were too short. Increase default lease to 2s fixed the case."
+  ],
+  "dependencies": [
+    "ENG-61234",
+    "ENG-33421"
+  ],
+  "parent_issue": [
+    "ENG-50123"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "acceptance_criteria": [
+    "All unit/property tests for invariants A-D pass",
+    "No E2E correctness regressions on canary for 72h",
+    "Fallback rate < 0.01% under canary",
+    "P99 overhead <= 5% for sampled routes"
+  ],
+  "notes": [
+    "Keep implementation feature-flagged behind KV_SLAB_EVICTION_V1",
+    "Consider a follow-up ticket to expose adaptive lease policy based on observed session durations",
+    "Coordinate with infra team to add slab-level telemetry to Console rollout dashboard"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_90ac77af7bf64d0592293deeb84cf6b0"
+}

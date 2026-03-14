@@ -1,0 +1,54 @@
+{
+  "key": "ENG-52711",
+  "team": "engineering",
+  "title": "Investigate shared KV slab pointer rotation causing cross-worker aliasing and numerical drift",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-02-20",
+  "updated_at": "2025-03-05",
+  "creator": "Ava Martinez",
+  "assignee": "Liam Chen",
+  "project": "runtime-stability-2025",
+  "cycle": "2025-W09",
+  "estimate": "8",
+  "due_date": "2025-03-12",
+  "labels": [
+    "kv-cache",
+    "race-condition",
+    "prefill",
+    "softmax",
+    "allocator",
+    "high-priority"
+  ],
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "customer_impact": "high",
+  "description": "Summary:\nWe are observing sporadic numerical drift (softmax output skew and token misalignment) in long-context prefill->decode runs on multi-GPU Dedicated nodes. Initial investigation points to the shared KV slab allocator: during slab reclamation and shard migration we see a pointer rotation race where two workers temporarily alias the same slab memory region. This produces stale KV entries being read by a different stream which leads to subtle softmax perturbation and rare token shifts in generated outputs.\n\nWhy this matters:\n- Correctness: downstream decoding can diverge leading to nondeterministic outputs for the same request observed across retries.\n- Reliability: causes hard-to-reproduce production regressions on long-horizon chat sessions and batched requests.\n- Performance: current mitigation (global allocator lock) significantly regresses throughput for high-concurrency workloads.\n\nObserved symptoms / telemetry:\n- Increased softmax variance on sequences > 1024 tokens (90th percentile) correlated with KV eviction events.\n- Error-rate spike on a handful of customer workloads during overnight batches; not an outright crash.\n- Sampling of process memory maps shows same slab address referenced by two different worker threads for ~5-20ms windows.\n- Trace shows slab migrate path called concurrently from Prefill finalize and Background shard compactor.\n\nReproduction steps (non-deterministic):\n1) Start dedicated runtime on 8xA100 nodes with concurrent prefill streams (batch size 16) and high frequency of short-lived inference jobs.\n2) Prime KV store with multiple long-context conversations (sequence length ~2048).\n3) Trigger artifact: run the 'long-horizon stress' harness for 30 minutes.\n4) Collect traces and heap/slab maps when softmax variance threshold exceeded.\n\nInitial triage findings:\n- Root cause hypothesis: slab allocator uses a per-shard freelist but relies on a migration handshake that is non-atomic across worker A (evict) and worker B (adopt). A reorder in the migration steps allows B to see a pointer to a slab before the ownership bit and epoch are updated, causing transient aliasing.\n- Kernel path: aliasing leads to KV reads returning old values for specific kv (layer idx, head idx) resulting in small but compounding numerical differences in attention scores.\n- Race window measured at 2-30ms depending on compaction frequency and CPU scheduling.\n\nShort-term mitigations tried:\n- Global allocator lock during migration: fixes correctness but reduces throughput ~18% under heavy load.\n- Increase epoch fencing: reduces incidence but does not eliminate race under high concurrency.\n- Rate-limit compactor: drops occurrence but unacceptable for long runs (memory bleed).\n\nProposed fix plan (3 phased):\nPhase A (safety): Add an atomic migrate flag and two-phase publish (mark->copy->publish) to guarantee consumers never read partially-published slab pointers. Keep as a short-term feature flag to enable rollforward without full rollout. Estimate 3 points.\nPhase B (perf): Implement per-shard versioned pointer with lock-free double-buffering for slab handoff. This avoids global locks while preserving atomicity. New handoff uses atomic compare-and-swap on pointer+version pair. Estimate 5 points.\nPhase C (validation + rollout): Add deterministic stress harness, fuzzing for allocator races, concrete unit tests that simulate scheduler preemption and compactor interleaving. Gradual canary on dedicated pool and telemetry SLOs. Estimate 2 points.\n\nTelemetry / instrumentation changes required:\n- Emit allocator events: MIGRATE_START, MIGRATE_COPY_DONE, MIGRATE_PUBLISH with shard id, slab addr, epoch, worker id.\n- Add sampling for slab alias windows to correlate with softmax variance.\n- Dashboard: per-node allocator race rate and average alias window duration.\n\nTesting plan:\n- Unit tests for two-phase publish semantics and CAS retries.\n- Deterministic simulation harness that replays recorded interleavings and scheduler preemptions.\n- Perf benchmark comparing throughput and latency on baseline, Phase A flag, and Phase B implementation.\n- Canary rollout to dedicated cluster with shadowing enabled (no external customer traffic initially).\n\nRollback criteria for rollout:\n- Any reproducible increase in token divergence rate relative to baseline >0.1% at 95th percentile during canary.\n- Throughput regressions >5% (unless explicitly accepted for first rollout and compensated elsewhere).\n\nRelated artifacts and links:\n- Internal log dump: gs://redwood-logs/2025/02/kv-slab-alias-sample-20250219.log\n- Repro harness: github.com/redwood-inference/runtime/tree/main/tools/allocator-fuzz\n- Prior related tickets: ENG-31822 (kv-buffer-offset-rotation), ENG-37456 (async-kernel-pruning-token-reorder).\n\nAcceptance criteria:\n- Phase B implemented with no observed slab alias windows in deterministic harness and <1e-6 observed alias rate in 72 hour production canary.\n- No increase in token divergence in canary; throughput within -5% of baseline.\n\nOwners / stakeholders:\n- Runtime: Liam Chen (assignee), Priya Nair (reviewer)\n- Observability: Mateo Ruiz\n- QA: Ren\u00e9e Park\n",
+  "comments": [
+    "2025-02-20 - Ava Martinez: Created ticket after correlating allocator traces with softmax variance. Attached initial logs and repro notes.",
+    "2025-02-22 - Liam Chen: Confirmed pointer aliasing in live heap maps. Reproduced alias window locally using stress harness with scheduler preemption. Starting Phase A prototype.",
+    "2025-02-25 - Liam Chen: Phase A prototype in feature branch. Global lock replaced with atomic migrate flag for safety. Unit tests added. Perf impact: -16% throughput on heavy c10k benchmark.",
+    "2025-02-27 - Priya Nair: Reviewed Phase A. Acceptable as short-term mitigation but we need Phase B for performance goals. Suggested adding allocator event telemetry ASAP.",
+    "2025-03-03 - Liam Chen: Began Phase B design doc: lock-free double-buffer handoff with pointer+version CAS. Need code review and perf cluster run. Proposed canary window starting 2025-03-10.",
+    "2025-03-05 - Mateo Ruiz: Observability changes merged to telemetry staging; dashboard skeleton added. Will enable sampling in canary.\n"
+  ],
+  "attachments": [
+    "https://github.com/redwood-inference/runtime/pull/1427",
+    "gs://redwood-logs/2025/02/kv-slab-alias-sample-20250219.log",
+    "https://grafana.redwood.company/d/alloc-races/kv-allocator-race-overview"
+  ],
+  "dependencies": [
+    "ENG-31822",
+    "ENG-37456"
+  ],
+  "parent_issue": [],
+  "sub_issues": [],
+  "notes": "This ticket is sensitive: allocator changes can have far-reaching correctness impact. Coordinate closely with QA and SRE before enabling Phase B in production.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_46d45755266b427d99114e2f4d66eb9c"
+}

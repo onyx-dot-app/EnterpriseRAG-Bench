@@ -1,0 +1,99 @@
+{
+  "key": "SUP-246810",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Client-side semaphore leak causes silent retry replays and mismatched funcall confirmations across Python/Go SDKs",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Patel",
+  "assignee": "Liam Chen",
+  "customer_company": "WaveDesk Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "sdk-python",
+    "sdk-go",
+    "serving-runtime",
+    "edge-proxy"
+  ],
+  "labels": [
+    "idempotency",
+    "retry",
+    "funcall",
+    "streaming",
+    "multiregion"
+  ],
+  "environment": "prod (us-east)",
+  "affected_models": [
+    "rw-open-7b-v1",
+    "llama-3-13b"
+  ],
+  "affected_regions": [
+    "us-east",
+    "eu-west"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-531407",
+    "SUP-412530"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/sdk-python/pull/412",
+    "https://github.com/redwood-inference/edge-proxy/pull/88"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/SUPPORT/pages/Client+Retry+Semantics"
+  ],
+  "description": "Issue summary: WaveDesk reports intermittent duplicate side effects (external webhooks executed twice) and occasionally missing funcall confirmations after client retries. This occurs only for long-running streaming sessions where the client issues both streaming tokens and explicit function/tool calls in the same session.\n\nImpact: Customer sees duplicated downstream webhook posts (billing and order-processing systems) and a handful of lost confirmations that look like the server never acknowledged a funcall even though the call executed. Affects production traffic in us-east and spillover routed to eu-west via failover.\n\nObserved behavior: When the client triggers a retry (network blip, http2 stream reset), some funcalls are executed on the server but the client-side SDK logs show a different confirmation mapping (older inflight id). In other cases, the SDK never releases its internal semaphore for in-flight funcalls, preventing subsequent requests from attaching the correct confirmation tokens and causing silent replays on reconnect.",
+  "steps_to_reproduce": [
+    "1) Provision a Dedicated WaveDesk workload in us-east using rw-open-7b-v1 pinned model.",
+    "2) Use the Python SDK to open a streaming session and interleave streamed text chunks with funcall requests (call external tool via function calling).",
+    "3) Simulate a transient network reset (tcp reset or http2 stream reset) while a funcall is inflight. Repeat with Go SDK orchestration client calling the same backend concurrently.",
+    "4) Observe per-request logs and webhook endpoints for duplicate posts and check SDK client logs for \"inflight semaphore\" warnings (see logs below)."
+  ],
+  "logs": [
+    "[python-sdk] 2026-03-10T18:22:41Z WARN retry_coordinator.py:178 - inflight_semaphore acquire timeout, inflight_count=7, max_inflight=8",
+    "[python-sdk] 2026-03-10T18:22:42Z INFO funcall_client.py:242 - sent funcall id=fc-7b2a0, awaiting confirmation token=<redacted>",
+    "[edge-proxy] 2026-03-10T18:22:43Z INFO proxy.go:512 - http2: stream reset by peer, streamID=42",
+    "[serving-runtime] 2026-03-10T18:22:44Z INFO router.go:304 - routed request id=req-88ab to model rw-open-7b-v1 node=n1-us-east",
+    "[python-sdk] 2026-03-10T18:22:45Z ERROR retry_coordinator.py:206 - confirmation mapping mismatch for funcall fc-7b2a0 -> observed confirmation fc-3c9f2",
+    "[wave-webhook] 2026-03-10T18:22:46Z POST /orders 200  (duplicate payload detected by order_id=ORD-20260310-991)"
+  ],
+  "investigation_notes": [
+    "Initial repro confirmed with WaveDesk using a reproducible harness that performs stream+funcall interleaving and explicit http2 resets.",
+    "Python and Go SDK clients both exhibit the problem, but Go repro required multiplexing two goroutines that share the SDK retry coordinator in a particular pattern.",
+    "Heap of evidence points to client-side resource accounting: a semaphore/counter that tracks inflight funcalls is not always decremented on cancel/error paths introduced in the streaming backpressure refactor (SDK change in v2.8.0).",
+    "Server logs show the funcall executed and webhook posted; server emitted confirmation token A, but client later associated confirmation token B (stale mapping) leading to 'missing' confirmation for the original funcall."
+  ],
+  "comments": [
+    "Aisha Patel (Support) 2026-03-10: Received initial ticket from WaveDesk, requested session IDs and webhook timestamps. Asked for SDK versions and orchestration pattern.",
+    "WaveDesk (customer) 2026-03-10: Provided session ids session-9c3a and session-1d77, noted duplicates happened ~18:22 UTC and ~18:45 UTC.",
+    "Liam Chen (SRE) 2026-03-11: Confirmed stream reset spikes in our edge-proxy around same timestamps; capturing tcp resets and HTTP/2 RST_STREAM events. Forwarding to SDK team for deeper dive.",
+    "Priya Rao (SDK eng) 2026-03-12: Able to reproduce locally against a test harness; suspect missing semaphore.release() in on_cancel path of retry_coordinator for interleaved streaming+funcall code path. Preparing small patch (PR linked)."
+  ],
+  "root_cause": "A race between the streaming backpressure drain path and the funcall retry coordinator: when a stream reset or early cancel occurs while a funcall is inflight, the SDK falls into an error path that does not decrement the inflight semaphore and does not remove the temporary funcall->confirmation mapping. Subsequent requests reuse slot indices and the confirmation mapping becomes inconsistent, causing duplicate downstream side effects or apparent 'missing' confirmations.",
+  "workaround": "1) For affected customers in production, advise immediate temporary mitigation: reduce concurrency (max_inflight) to 1 for streaming sessions that interleave funcalls, and increase retry delays to avoid overlapping inflight windows.\n2) On the server/consumer side, make webhook receivers idempotent by checking order_id/correlation_id to avoid duplicate processing.",
+  "resolution": "Investigation ongoing. SDK engineers prepared a candidate fix that ensures the inflight semaphore is always released on every error and cancel path, and improves mapping hygiene for confirmation tokens. Patch PR submitted for python SDK (see related_github_prs). QA scheduled for 2026-03-13. Will coordinate a 2.8.1 patch release if QA passes.",
+  "next_steps": [
+    "1) SDK eng to land the semaphore-fix PR for both python and go SDKs and add unit tests that simulate cancel/reset during inflight funcall (owner: Priya Rao).",
+    "2) QA to run end-to-end repro harness using WaveDesk session traces and confirm duplicates no longer happen (owner: TestEng).",
+    "3) If QA green, coordinate a patch release and notify WaveDesk of a planned rollout window (owner: ReleaseManager).",
+    "4) Postmortem draft to capture lessons about streaming+funcall interplay and add regression tests to the SDK suite (owner: Reliability)."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "root_cause",
+    "workaround",
+    "resolution",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_169f2368980b478fa5cfde804be00305"
+}

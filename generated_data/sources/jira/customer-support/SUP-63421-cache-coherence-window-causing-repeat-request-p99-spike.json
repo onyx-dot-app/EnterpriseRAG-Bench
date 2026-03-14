@@ -1,0 +1,73 @@
+{
+  "key": "SUP-63421",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Cache coherence window causing repeat-request p99 latency spikes after short idle",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-13",
+  "reporter": "Aisha Kumar",
+  "assignee": "Marcus Chen",
+  "customer_company": "ShopRight Inc.",
+  "customer_tier": "dedicated",
+  "environment": "prod-us-east",
+  "components": [
+    "serving-runtime",
+    "kv-cache",
+    "router",
+    "observability"
+  ],
+  "labels": [
+    "latency-regression",
+    "kv-coherence",
+    "hot-prefetch",
+    "customer-impact"
+  ],
+  "affected_models": [
+    "rw-open-7b-v2"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "related_incident_id": "INC-2026-03-us-east-12",
+  "sla_due_at": "2026-03-12",
+  "first_response_due_at": "2026-03-12",
+  "linked_issues": [
+    "SUP-61748",
+    "SUP-90512"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/1289",
+    "https://github.com/redwood-inference/kv-store/commit/4f3ad2b"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/Cache+Coherence+Runbook"
+  ],
+  "description": "Issue summary:\nCustomer (ShopRight Inc.) reports repeated user prompts take ~10-50ms normally but p99 jumps to 1.2-1.6s for repeat prompts after short idle (~20-60s). This started 2026-03-11 ~14:00 UTC and affects their dedicated pool in us-east.\n\nImpact:\n- Elevated p99 for identical prompts after ~30s idle causing timeouts for edge UI flows (error surfaced to end-users).\n- Affects ~8% of requests from the customer's dedicated pool during observed windows.\n\nEnvironment:\n- Redwood Dedicated (customer-scoped GPU pool) in us-east.\n- Model: rw-open-7b-v2 pinned by customer.\n- Serving runtime v2026.02.3, KV-store (metadata) v1.8.2.\n\nSteps to reproduce:\n1) From a dedicated API key tied to the customer's pool, send prompt A (short prompt, deterministic).\n2) Wait 30-45s idle.\n3) Re-send prompt A.\n4) Observe latency distribution: p50 ~ 40ms, p95 ~ 120ms, p99 ~ 1.2s-1.6s.\n\nObserved behavior:\n- The follow-up (repeat) prompt triggers synchronous remote KV fetch for prefix metadata and blocks the request thread until KV returns.\n- Logs show a KV \"coherence lookup\" and subsequent shard revalidation on the RPC path.\n- Traces correlate the p99 spike to a 1.0s+ wait on kv-metadata.replica-read.\n\nExpected behavior:\n- Repeat prompt after short idle should hit local prefix cache / speculatively prefetch and return with ~baseline latency (no >1s waits).\n\nRelevant logs / metric pointers:\n- Trace: https://observability.redwood.internal/traces/trace-20260312-8342 (shows stall at kv-metadata.replica-read)\n- Dashboard: https://observability.redwood.internal/dashboards/kv-coherence (spike at 2026-03-11 14:02 UTC)",
+  "investigation_notes": "Hypothesis: cache coherence window (soft TTL + lease refresh) allows a short period after idle where the local prefix cache marks entries stale and triggers synchronous revalidation with the central KV store. For hot keys this causes head-of-line blocking when several concurrent requests for the same prefix race to revalidate and the first revalidation path does not publish the new lease until completion, forcing others to wait.\n\nFindings so far:\n- Reproduced against a customerdedicated cluster in staging. Identical sequence produced p99 ~1.3s and traces match prod behavior.\n- KV-store metrics show increased replica-read latency coincident with spikes; one node reported GC pause ~150ms in same interval.\n- Hot-key contention observed: when multiple clients replay repeat prompts within coherence window, only one prefetch is allowed and others block.\n- Prefetch is currently synchronous on cache miss by design; there is no request-level speculative background prefetch for identical prompts.\n\nTemporary mitigations tested (staging):\n- Increasing prefix_cache.soft_ttl from 30s -> 300s eliminated the repeat p99 spikes for test workload but increases memory footprint.\n- Enabling speculative async prefetch (feature flag) caused follow-ups to hit warm cache and reduced p99 to baseline.\n\nNext investigative actions:\n- Correlate shard leadership changes and recent shard rebalance (possible contributing factor).\n- Test async prefetch at scale and evaluate memory/cost tradeoffs.\n- Check for other customers in the same pool experiencing same pattern.\n",
+  "comments": [
+    "2026-03-12 09:14 UTC - Aisha Kumar (Support): Initial report from customer. Provided reproducible steps and example request IDs. Opened ticket and escalated to SRE.",
+    "2026-03-12 11:01 UTC - Marcus Chen (SRE): Reproduced in staging. Captured traces and linked dashboards. Hypothesizing coherence window + hot-key blocking. Assigned to SRE oncall for mitigation.",
+    "2026-03-12 12:45 UTC - Priya Nair (Prod Infra): Observed temporary GC pause on kv-node-07 at spike time; investigating if it exacerbated replica-read latency. Marked as potential contributor.",
+    "2026-03-12 14:10 UTC - Marcus Chen (SRE): Applied temporary config increase to prefix_cache.soft_ttl for ShopRight ded pool (prod-us-east) as a mitigation. Monitoring for side effects.",
+    "2026-03-13 08:30 UTC - Support (Aisha Kumar): Customer confirmed noticeable improvement in their UI flows after mitigation. No user-facing errors reported in last 10 hours.",
+    "2026-03-13 12:00 UTC - Engineering (Liam O'Neill): Preparing PR with async prefetch and singleflight deduping to avoid head-of-line blocking (see related_github_prs)."
+  ],
+  "resolution": "Mitigation applied: prefix_cache.soft_ttl increased from 30s to 300s for ShopRight's dedicated pool in prod-us-east; speculative async prefetch feature-flag enabled for same pool.\n\nRollout notes:\n- Hotfix applied 2026-03-12 14:10 UTC to customer pool only. Verified improvement via customer and dashboards.\n- No regressions in baseline latency observed for other traffic during limited rollout.\n\nPermanent fix plan:\n1) Merge async prefetch + singleflight dedupe PR to prevent multiple concurrent revalidations (PR linked).\n2) Add a local lease publish path so the first revalidation can publish new lease faster to peer caches.\n3) Add alert for kv-coherence replica-read p95 > 200ms.\n4) Post-mortem and adjust default soft_ttl algorithm to be workload-aware.\n\nFollow-ups / action items:\n- ENG-1287: evaluate memory/cost of increased soft_ttl across customer base.\n- OPS-442: add runbook step to trigger async prefetch flag for affected pools.\n- QA: add integration test that simulates hot repeat prompts after variable idle times.\n",
+  "notes": "Related slack thread: #support (https://slack.redwood.com/support/archives/C03KJ2H9); customer-provided request IDs: rq_20260311_140207_{a..c}.",
+  "attachments": [
+    "trace-20260312-8342.json",
+    "kv-node-07-gc.log"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "comments",
+    "resolution",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_287f0d39c6e44346b22318664e4a662c"
+}

@@ -1,0 +1,55 @@
+{
+  "key": "ENG-22109",
+  "team": "engineering",
+  "title": "Architecture- and SeqLen-aware kernel tuning policy and online autotune loop",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-28",
+  "updated_at": "2026-03-12",
+  "creator": "Avery Chen",
+  "assignee": "Marcus Del Toro",
+  "project": "runtime-autotune",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-31",
+  "labels": [
+    "kernel-selection",
+    "autotune",
+    "seqlen",
+    "heterogeneous-gpus",
+    "performance"
+  ],
+  "dependencies": [
+    "ENG-11329",
+    "ENG-9124"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Problem statement:\nWe currently pick kernels primarily by static model family and a small set of heuristics (prefill vs decode, rough seqlen buckets). As we onboard more heterogeneous hardware (A100/H100/RTX series) and quantized variants (fp16/int8/4-bit), the static rules produce suboptimal latency and throughput for many real workloads with skewed sequence-length distributions. We need a compact policy and a safe online autotune loop that picks kernels at runtime based on: architecture, observed sequence-length histogram, KV cache hit patterns (prefill-heavy vs interactive decode-heavy), and quantization profile.\n\nGoals:\n- Define a kernel selection policy spec that composes static constraints (hardware/quantization/compatibility) with dynamic signals (seqlen distribution, batch size, warm cache percentage).\n- Implement a lightweight online autotuner that runs cheap microbenchmarks and shadow selection to validate choices without impacting tail latency.\n- Prevent oscillation (flapping) and ensure safe rollback to baseline kernels.\n- Expose decision telemetry in Console for per-route debugging (why kernel X was chosen).\n\nDesign summary:\n1) Inputs to policy: GPU architecture tag (A100/H100/RTXX), model fingerprint (layers, heads), dtype/quantization, recent-seqlen-histogram (windowed, 1k requests), average batch size, warm-kv-rate (percent of traffic with cached prefixes), target SLO (latency vs throughput preference).\n2) Kernel candidates: we maintain a short ranked list per model/dtype: {baseline (stable), fast-compile, unrolled-attn, fused-attn, int8-optimized}. Each candidate annotated with supported constraints.\n3) Cost model: predictive cost = alpha * expected_p95 + beta * per-token-cost. Alpha/beta derived from route SLO (latency-first sets alpha high). Expected_p95 estimated from measured microbenchmarks interpolated over seqlen buckets.\n4) Online autotune loop: periodically (configurable, default 15m) selects a small percentage (shadow or mirrored) of traffic to run with alternative kernels and collects micro-latency + correctness checks. If candidate shows >8% p95 improvement and no regression in correctness or memory footprint for 3 consecutive windows, promote it for canary rollout (5% of production). Canary success triggers full rollout with gradual ramp and automatic rollback criteria.\n5) Safety: compile-time caching, prewarming of kernels, and a forced minimum time between kernel switches per VM to avoid jitter.\n\nTrade-offs considered:\n- Aggressive autotuning reduces unit cost but risks increased compile jitter and memory fragmentation; therefore we gate compile-heavy candidates behind canary only.\n- Shadow testing adds overhead; keep sample size tiny and use asynchronous microbench harness where possible.\n- Per-request kernel switching is expensive; policy chooses kernel per-worker or per-routing-group and only switches at safe boundaries (idle window or after N requests).\n\nAcceptance criteria:\n- Implementation selects a non-baseline kernel for at least 25% of routes with skewed seqlen distributions and shows >=5% median token-cost improvement in staging.\n- No customer-facing p99 latency regressions observed in a 2-week canary run for routes opted into autotune.\n- Console shows kernel decision traces for routes and a histogram of seqlen-driven promotions.\n\nImplementation notes and plan:\n- Phase 1 (this ticket): policy data model + telemetry + inexpensive shadow experiments. Add metrics: kernel_selected, kernel_latency_samples, seqlen_histogram_1min. Instrument Console panels.\n- Phase 2: autotune promotion engine + canary orchestration + safe rollback and compile prewarm hooks.\n- Phase 3: integrate quantization-specific kernels and cost model tuning.\n\nTesting and benchmarks:\n- Perf harness PR: https://github.com/redwood-inference/runtime/pull/4321 (microbench scaffolding for seqlen buckets).\n- Canary dashboard: https://grafana.internal.redwood/runtime-autotune/d/seqlen-promotions (internal link).\n- Baseline bench IDs to compare: bench-seq-16-32-64-128 (see bench registry in repo).\n\nObservability:\n- Per-route trace: kernel.reason tag with fields: reason=(seqlen|latency|cost|compat) and confidence score.\n- Console view: per-model kernel choice timeline and rollout status.\n\nOpen questions / discussion items:\n- Confidence threshold for promotion should vary by SLO tier (enterprise customers might require higher evidence). Proposal: SLO-tier multiplier on improvement threshold (enterprise=12%, standard=8%, low=5%).\n- How to handle multi-tenant GPUs where kernel promotion might impact co-tenants? Initial policy will restrict autotune to Dedicated pools unless pool-level opt-in is set.\n- Should we store learned policy per-model per-region or keep ephemeral? We'll persist successful promotions for 7 days then re-evaluate to adapt to workload drift.\n\nRelated artifacts and links:\n- Design doc (draft): https://docs.internal.redwood/notes/kernel-tuning-policy (internal confluence)\n- PR for microbench harness: https://github.com/redwood-inference/runtime/pull/4321\n- Early prototype tests: https://github.com/redwood-inference/benchmarks/commit/8a3d2f\n\nNotes on timeline and next steps (updates):\n- 2026-02-28 (Avery Chen): Ticket created, design sketch attached. Assigned to Marcus. Blocking: need perf harness merged (PR above).\n- 2026-03-03 (Marcus Del Toro): Implemented seqlen histogram aggregator in runtime; started pushing metrics to statsd. Local synthetic tests show fused-attn wins for seqlen < 64 on H100 for a small model.\n- 2026-03-07 (Sanjay Patel): Reviewed cost model; suggested adding warm-kv-rate as input (done). Raised a note about quantized fallback path; added to Phase 3.\n- 2026-03-10 (Marcus Del Toro): Shadow-run scaffolding complete. Began running 0.5% shadow traffic for 3 internal routes. Observed one case of compile-time spike; blocked promotion for that candidate and added compile prewarm step.\n- 2026-03-12 (Avery Chen): Updated acceptance criteria to require no p99 regressions over 2-week window. Planning canary rollouts after Phase 2 is merged.\n\nRisks and mitigations:\n- Risk: kernel flapping increases tail latency. Mitigation: enforce minimum dwell time and strong canary gating.\n- Risk: cross-VM memory blowups from specialized kernels. Mitigation: track memory footprint during shadow experiments and fail promotion if >10% increase.\n\nNext immediate actions (owner: Marcus):\n1) Land metrics PR and add kernel.reason tags to traces (ETA 2026-03-16).\n2) Expand shadow-run coverage to 8 routes and collect 72h of samples (ETA 2026-03-22).\n3) Start canary orchestration prototype for a single Dedicated pool (ETA 2026-03-26).\n\nIf this ticket is blocked after 2026-03-20, escalate to runtime leads and schedule a short design review to resolve the compile-prewarm tradeoff.",
+  "acceptance_criteria": "1) Non-baseline kernel selected for >=25% of skewed routes in staging with >=5% median token-cost improvement. 2) No p99 regressions in 2-week canary. 3) Console shows decision traces and promotion history.",
+  "related_prs": [
+    "https://github.com/redwood-inference/runtime/pull/4321",
+    "https://github.com/redwood-inference/runtime/pull/4332"
+  ],
+  "benchmarks": [
+    "bench-seq-16",
+    "bench-seq-32",
+    "bench-seq-64",
+    "bench-seq-128"
+  ],
+  "testing_plan": "1) Run shadow experiments at 0.5% then 2% traffic across diverse routes. 2) Validate p95/p99, memory, and correctness fuzzing. 3) Canary rollout to 5% then 25% then 100% with automatic rollback criteria. 4) Post-rollout monitor for 72h.",
+  "notes": "Keep autotune as opt-in per pool for first release. Persist promotions for 7 days to allow for workload drift adaptation. Consider enterprise opt-out flag.",
+  "attachments": [
+    "https://docs.internal.redwood/notes/kernel-tuning-policy",
+    "https://grafana.internal.redwood/runtime-autotune/d/seqlen-promotions"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "testing_plan",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_cf3c271a02dd437a934184eadb0b2a65"
+}

@@ -1,0 +1,68 @@
+{
+  "key": "SUP-278554",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Chat SSE/WebSocket session terminated mid-generation after worker preemption during KV checkpoint",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2025-03-10",
+  "updated_at": "2025-03-12",
+  "reporter": "Liam Chen",
+  "assignee": "Ava Martinez",
+  "customer_company": "BlueArc Analytics",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "scheduler",
+    "kv-cache",
+    "api-gateway"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "websocket",
+    "preemption",
+    "kv-checkpoint",
+    "high-p99-latency"
+  ],
+  "environment": "prod/us-east-1",
+  "affected_models": [
+    "rwkv-14b-q4",
+    "gptx-open-3b"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2025-03-10",
+  "first_response_due_at": "2025-03-10",
+  "linked_issues": [
+    "INT-4021",
+    "SUP-997234"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/serving-runtime/pull/4892",
+    "github.com/redwood-inference/scheduler/pull/210"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.com/display/RUN/Streaming+Preemption+Runbook"
+  ],
+  "description": "Issue summary:\nCustomer BlueArc Analytics reports that SSE/WebSocket chat sessions are stopping mid-generation for long responses. The connection often remains established but no further token chunks are emitted until the client times out. This started after a rolling change to the dedicated pool scheduler (2025-03-09) and correlates with background KV checkpoint activity for quantized model variants.\n\nImpact:\n- Affects 1 dedicated customer (BlueArc Analytics) on their us-east dedicated pool (pool-id: ded-usa-73).\n- ~12% of long-stream requests (>=1024 tokens) experience silent stall then eventual client timeout.\n- Observed p99 token latency spikes from ~6s to ~18s immediately prior to stall.\n\nTimeline (UTC):\n- 2025-03-09 22:18: start of scheduler tweak rollout (rate-limit on evictions lowered).\n- 2025-03-10 15:22: customer reported first spike and mid-stream stop. Trace ID: trace=abc123-prod.\n- 2025-03-10 15:23: server logs show KV_CHECKPOINT_START and worker eviction events near-simultaneously.\n- 2025-03-10 15:24: Support investigation ticket opened.\n\nEnvironment:\n- Dedicated pool: ded-usa-73 (prod/us-east-1)\n- Model pinned: rwkv-14b-q4 v2025-02-03 (quantized)\n- Client: BlueArc web app using SSE, keepalive=20s, concurrency=8 per user session\n\nSteps to reproduce (observed in staging):\n1) Pin a dedicated pool with quantized model and active KV caching enabled.\n2) Start multiple concurrent streaming chat sessions requesting long responses (>=1024 tokens).\n3) Trigger a KV checkpoint (manually or wait for periodic checkpoint).\n4) Under scheduler eviction policy tuned to be aggressive, observe one or more streams that stop emitting further data while connection remains established.\n\nObserved behavior:\n- Stream stops emitting token chunks mid-generation. The HTTP connection stays open for ~60s then client times out. No explicit 5xx returned to client in most cases.\n- Server logs show worker eviction (PREEMPT_EVICT) and synchronous KV_CHECKPOINT_WRITE occurring concurrently with token generation. Generation coroutine appears blocked waiting on KV mutex.\n\nExpected behavior:\n- Long-running generation should either finish or be gracefully failed with proper error response. Preemption should not silently stop chunk emission for active streaming sessions.\n\nRelevant log excerpts (redacted IDs):\n- [2025-03-10T15:23:01.872Z] serving-runtime[wk-3]: TRACE=abc123 KV_CHECKPOINT_START model=rwkv-14b-q4 pool=ded-usa-73\n- [2025-03-10T15:23:02.113Z] scheduler[evictor]: PREEMPT_EVICT worker=wk-3 reason=pool-scale-down request=evict-001\n- [2025-03-10T15:23:02.115Z] serving-runtime[wk-3]: STREAM_CHUNK_EMIT token_idx=512 trace=abc123\n- [2025-03-10T15:23:02.116Z] serving-runtime[wk-3]: KV_CHECKPOINT_WRITE_START file=/var/lib/kvcache/ckpt-985\n- [2025-03-10T15:23:18.412Z] serving-runtime[wk-3]: SIGTERM received during KV_CHECKPOINT_WRITE\n- [2025-03-10T15:23:18.420Z] serving-runtime[wk-3]: STREAM_CHUNK_EMIT suspended waiting for KV mutex\n\nPreliminary investigation notes:\n- SRE reproduced the issue in staging by forcing a KV checkpoint while high-concurrency streaming is active and pushing the scheduler to evict warm workers.\n- Root cause hypothesis: The KV checkpoint code path performs a synchronous write while holding a mutex that the generation coroutine needs to emit the next chunk. When the scheduler preemption triggers eviction, the preemption path doesn't wait for the generation mutex to be released and the worker is taken offline (SIGTERM), which leaves the streaming coroutine unable to emit further chunks. Because the connection remains open, the client observes a silent stall until timeout.\n- Observed correlation with quantized model variants because their checkpoint code currently uses synchronous file operations for atomic writes.\n\nWorkaround implemented:\n- For BlueArc: temporarily lowered scheduler eviction aggressiveness for pool ded-usa-73 (reverted to previous eviction window) and disabled periodic KV checkpoint for that pool. Early telemetry shows ~90% reduction in mid-stream stalls for their traffic.\n- Suggested customer workaround: pin requests to a non-quantized model variant or reduce concurrent streaming concurrency while we deploy a fix.\n\nNext steps and mitigation plan:\n- Short-term (hotfix, 72h ETA): Add guard in scheduler to avoid evicting workers with active streaming coroutines holding generation handles. Patch PR opened: github.com/redwood-inference/scheduler/pull/210 (backport + emergency deploy). Eng owner: Sergio Patel.\n- Medium-term (2 weeks): Modify KV checkpoint path to perform atomic write without blocking generation coroutine (switch to async buffered commit or release generation mutex prior to durable write). PR planned: github.com/redwood-inference/serving-runtime/pull/4892.\n- Add metrics and alerting for \"streaming-suspension-by-evict\" to catch regressions.\n\nAction owners:\n- Engineering (Sergio Patel) - hotfix + medium-term change.\n- SRE (Priya Desai) - monitor pool and rollback eviction config for affected customers as needed.\n- Support (Ava Martinez) - coordinate customer communications and confirm workaround efficacy.\n\nStatus: In Progress. No full-resolution yet; hotfix PR under review and a temporary config rollback applied for the customer.\n",
+  "comments": [
+    "2025-03-10 15:28 - BlueArc Support Rep (Jordan Miles): Customer reports that several user sessions observed silence at approx 15:22 UTC. They saw last emitted tokens then client-side keepalive but no data until timeout. Provided trace abc123-prod and sample client logs.",
+    "2025-03-10 15:33 - Support (Ava Martinez): Acknowledged. Opening this incident and escalating to SRE/Eng. Asking customer for any recent config changes and whether they're using quantized model variants. Suggested temporary rate-limit reduction on concurrency while we investigate.",
+    "2025-03-10 16:10 - SRE (Priya Desai): Reproduced in staging by simulating checkpoint while streaming. Confirmed PREEMPT_EVICT coincident with KV_CHECKPOINT_WRITE. Attaching staging repro steps. Marking hypothesis: blocking KV write + preemption race. Will test scheduler rollback for that pool.",
+    "2025-03-10 18:05 - Engineering (Sergio Patel): Investigating code paths for KV checkpoint. Found synchronous fsync in kv cache writer that holds mutex. Drafting a change to decouple emission mutex from checkpoint durability. Opened PR for scheduler guard to skip eviction when stream handles active: github.com/redwood-inference/scheduler/pull/210.",
+    "2025-03-11 09:12 - Support (Ava Martinez): Applied temporary change to reduce eviction aggressiveness for ded-usa-73 and disabled periodic KV checkpoint. Customer reports immediate improvement in telemetry; asking to keep changes until hotfix deploy. Customer agrees to pin to non-quantized variant for critical flows.",
+    "2025-03-12 11:47 - Engineering (Sergio Patel): Hotfix PR passed tests and is in canary; observations pending. Medium-term change to async commit queued for sprint. ETA full fix ~2025-03-24. Will update this ticket once hotfix finishes rollout.",
+    "2025-03-12 12:05 - BlueArc (Jordan Miles): Confirming that after temporary config change we see far fewer stalls. Thanks for quick mitigation. Please notify before full rollback or change to checkpoint cadence."
+  ],
+  "resolution_notes": "Temporary mitigations applied: lowered eviction aggressiveness for affected dedicated pool and disabled periodic KV checkpoint for that pool. Hotfix to prevent evicting workers with active streaming coroutines is in canary (PR 210). Medium-term fix to make KV checkpoint non-blocking has been scheduled. Customer advised to pin to non-quantized variant if immediate stability is required.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_361c74ef78f04f938d648d02e908308b"
+}

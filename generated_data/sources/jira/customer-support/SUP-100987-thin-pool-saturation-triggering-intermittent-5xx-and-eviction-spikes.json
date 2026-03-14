@@ -1,0 +1,78 @@
+{
+  "key": "SUP-100987",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Intermittent 5xxs caused by API gateway thin-pool backlog and runtime eviction spikes",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-13",
+  "updated_at": "2026-03-14",
+  "reporter": "Aisha Patel",
+  "assignee": "Marco Ruiz",
+  "customer_company": "NovaAssist",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "prefetcher",
+    "autoscaler"
+  ],
+  "labels": [
+    "5xx",
+    "connection-backlog",
+    "gpu-eviction",
+    "prefetch",
+    "urgent"
+  ],
+  "environment": "prod/us-east",
+  "affected_models": [
+    "redwood/rlhf-13b",
+    "open-7b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-13T15:30:00Z",
+  "linked_issues": [
+    "SUP-331210",
+    "INT-482"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood/serving-runtime/pull/658"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.com/display/OPS/Prefetch+Backlog+Runbook"
+  ],
+  "description": "Issue summary: Customers (NovaAssist) observed intermittent 502/503 responses for generation and streaming endpoints across multiple tenants. The errors started during a midday traffic shift and clustered around a short period of sustained prefetch-heavy traffic.\n\nImpact: Multiple requests returned 5xx (~2-4% error rate over a 30m window) resulting in degraded product experience for NovaAssist customers on dedicated capacity. Latency also increased for some long-poll streaming sessions.\n\nTimeline: 2026-03-13 11:34 UTC - first reports from NovaAssist via support token. 11:40 - monitoring alert: apigw 5xx rate > 1.5%. 11:44 - SRE paged. 11:52 - temporary mitigation (rate-limits + scale) applied.\n\nEnvironment: prod/us-east dedicated fleet for NovaAssist. Affected routes include /v1/generate and /v1/stream.\n\nSteps to reproduce: 1) Reproduce traffic pattern: sustained prefetch + N concurrent long-lived streaming sessions (keepalive every 15s). 2) Observe apigw accept queue and thin-pool metrics rising. 3) Hit generation endpoint with medium-size prompts (avg 600 tokens).\n\nObserved behavior: Apigw accept backlog increases to the configured thin-pool limit, new connections experience 502; serving-runtime shows GPU eviction spikes and several runtimes exited with SIGSEGV around the same window. Prefetch workers reported persistent thread exhaustion and high memory growth in heap profiles.\n\nExpected behavior: Requests should be queued gracefully or retried without amplifying to runtime restarts. Runtime should avoid GPU eviction cycles under this load pattern.\n\nRelevant logs/metrics: apigw.accept_queue.length spiked to 1200 (configured soft limit 1024); apigw.5xx_rate peaked at 3.9%. runtime.gpu.evictions spiked with correlating OOM logs and SIGSEGV stack dumps at 0x7fffa3. Heap profiles from prefetcher show sustained growth over 20 minutes.\n",
+  "investigation": "Initial hypothesis: combination of prefetch worker leak + connection backlog causing apigw thin-pool saturation which amplifies retries and forces the serving runtime into memory pressure and GPU eviction.\n\nWhat we checked:\n- Correlated apigw metrics with runtime restarts (trace id map).\n- Collected heap profiles from prefetcher and runtime core dumps from the two affected containers. Heap profiles show unbounded list growth in prefetcher request context objects.\n- Kernel logs show repeated NVidia driver notifications about memory pressure prior to evictions.\n- Tracing indicates a high rate of prefix prefetch requests for NovaAssist tenant between 11:20-11:50 UTC.\n\nPartial findings:\n- Prefetcher threadpool saturated: live threads == max threads and queue length in worker pool trending to max backlog.\n- Prefetcher memory retention appears to be caused by a not-cleared metadata cache (pat: prefetchCache.entries not trimmed under high-concurrency).\n- Apigw thin-pool accept backlog fill resulted in 502 responses instead of graceful backpressure due to a short-circuit path in the proxy when backlog >= hard_limit.\n- Runtime crash (SIGSEGV) likely secondary to GPU eviction under memory pressure; core dump suggests an invalid pointer in kv-cache eviction path (stack trace attached to INT-482).\n\nNext investigative steps: enable verbose prefetcher GC logging for the pool, collect further heap profiles at 1m intervals, and reproduce in staging with a synthetic traffic script to validate the backlog->eviction path.\n",
+  "actions_taken": [
+    "11:55 UTC - Applied ad-hoc rate limit on NovaAssist tenant route (30 rps) to reduce prefetched concurrency",
+    "12:02 UTC - Scaled prefetcher worker pool for NovaAssist to 3x (temporary) to drain backlog",
+    "12:10 UTC - Restarted 2 affected runtimes in the pool (rolling restart) to clear corrupted state",
+    "12:25 UTC - Adjusted apigw accept queue soft_limit to 2048 while we triage (temporary)",
+    "12:40 UTC - Opened PR https://github.com/redwood/serving-runtime/pull/658 to fix prefetchCache trimming and add defensive checks in kv-cache eviction"
+  ],
+  "comments": [
+    "Aisha Patel (2026-03-13 11:48): Customer reports intermittent 502s for generation. Attached example request ids and sample trace headers.",
+    "Marco Ruiz (2026-03-13 11:50): Pulling metrics now. I see accept_queue growth and multiple runtime restarts in the same window. Paging runtime on-call.",
+    "Samantha Li (SRE) (2026-03-13 11:58): Confirmed prefetcher heap growth on host i-0a3f. Collecting heap profiles and core dumps.",
+    "Customer (NovaAssist) (2026-03-13 12:05): Noted immediate improvement after your mitigation but want permanent fix. Provided traffic pattern details (prefetch enabled, heavy streaming).",
+    "Dev (Pedro Gomes) (2026-03-13 12:30): Initial fix in PR 658 adds trimming and monitoring around prefetch cache; needs QA and load testing in staging."
+  ],
+  "resolution_notes": "Workaround implemented: temporary rate limit and scaled prefetcher pool reduced immediate 5xx rate to baseline. Rolling restarts cleared corrupted runtime state. Long-term fix: merge PR 658 (prefetchCache trim + kv-cache defensive guards), add circuit-breaker path in apigw to return 429 instead of 502 when accept backlog crosses soft limit, and harden runtime eviction logic to avoid SIGSEGV on eviction race.\n\nFollow-ups:\n- QA: reproduce traffic pattern in staging and run soak test (owner: Pedro Gomes, target 2026-03-18).\n- Instrumentation: add prefetch cache size alert and apigw backlog graceful-fail metric (owner: Marco Ruiz, target 2026-03-17).\n- Postmortem: write-up and impact analysis for NovaAssist and update runbook (owner: Aisha Patel, target 2026-03-20).",
+  "resolution_status": "Workaround applied; fix in flight",
+  "cc": [
+    "sre-oncall@redwood.com",
+    "cs-novaassist@redwood.com"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation",
+    "actions_taken",
+    "comments",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_0bfae15279714fa688efbcc2f6ba9b56"
+}

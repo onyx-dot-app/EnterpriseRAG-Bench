@@ -1,0 +1,104 @@
+{
+  "key": "SUP-462089",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Multiplexed connection ID reuse causes mid-stream silence and 408 timeouts for long chat sessions",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-11",
+  "reporter": "Aisha Patel",
+  "assignee": "Marco Liu",
+  "customer_company": "EchoWrite Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "edge-proxy",
+    "serving-runtime",
+    "api-gateway",
+    "load-balancer"
+  ],
+  "labels": [
+    "streaming",
+    "multiplexing",
+    "timeout",
+    "dedicated-customer",
+    "investigation"
+  ],
+  "environment": "prod us-east",
+  "affected_models": [
+    "redwood-llama-13b-v2",
+    "redwood-7b-q4v3"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-11",
+  "linked_issues": [
+    "SUP-832917",
+    "SUP-409207"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/edge-proxy/pull/402",
+    "https://github.com/redwood-inference/serving-runtime/pull/1187"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.com/display/OPS/Stream+Diagnostics+Runbook"
+  ],
+  "description": "Issue summary: Customers using long-form streaming chat report the SSE/WebSocket stream becoming silent mid-generation followed by a client 408 timeout. Impact: Several long-running conversations (10-60s) with EchoWrite on Dedicated pool show repeated mid-stream silence in ~2% of sessions, causing degraded UX and failed message deliveries. Environment: prod us-east, dedicated pool for EchoWrite, traffic via edge ALB -> edge-proxy -> serving-runtime. Observed since 2026-03-09 22:00 UTC after an edge-proxy config push.\n\nImpact: User-visible interruptions for long responses, highest on multiplexed clients and clients using HTTP/2 connection reuse. No complete worker crashes or 5xx reported; downstream reconnections sometimes succeed and sometimes require client to re-issue the prompt.",
+  "steps_to_reproduce": [
+    "1) Using EchoWrite test client configured to multiplex 6 logical SSE streams over a single HTTP/2 connection to api.redwood.com",
+    "2) Start a long-generation chat (system + ~3 user turns) that triggers ~40-80 tokens/sec output from model redwood-llama-13b-v2",
+    "3) Observe the SSE stream: generation starts normally, then at ~12-35s of generation the client sees no new events for 8-25s and eventually times out with HTTP 408 or client-level socket timeout",
+    "4) Repeat under different TCP keepalive/idle settings and observe higher failure rate when connection reuse is enabled on client (multiplex=true)"
+  ],
+  "observed_behavior": "Active generation produces tokens for 10-30s, then the HTTP/2 stream associated with the client's logical SSE path stops sending frames while the underlying connection stays open. Server logs show the worker continuing generation and periodically flushing small chunks, but the client receives no frames until it times out or reconnects. Postmortem traces show mismatch between HTTP/2 stream ID in edge-proxy and stream frames arriving at the client after connection reuse events.",
+  "expected_behavior": "SSE/WebSocket multiplexed streams should deliver tokens continuously during generation. Connection reuse/multiplexing should not cause tokens to be dropped or routed to the wrong client stream. No 408s or client-visible silence should occur for healthy sessions within SLOs.",
+  "logs": [
+    "edge-proxy INFO 2026-03-09T22:03:12Z conn=abcd1234 stream_id=15 flush: sending 128 bytes to client",
+    "edge-proxy WARN 2026-03-09T22:03:25Z conn=abcd1234 stream_id=15 idle-ping-timeout=8s - no client ACKs observed",
+    "serving-runtime DEBUG 2026-03-09T22:03:25Z worker=wp-77 gen-token idx=128 flush_size=64 - write to outbound buffer",
+    "edge-proxy INFO 2026-03-09T22:03:30Z conn=abcd1234 stream_id=31 reusing connection for new client multiplex stream_id=31",
+    "edge-proxy ERROR 2026-03-09T22:03:37Z conn=abcd1234 stream_id=15 unexpected frame for stream_id=31 - dropped"
+  ],
+  "network_traces": [
+    "tcpdump excerpt: IP client -> edge 10.1.2.3:52344 -> ALB 52.95.1.12:443; TLS packets show ALPN=h2; HTTP/2 frames: WINDOW_UPDATE for stream 15 at 22:03:16",
+    "http2 frame dump: HEADERS stream=15 status=200; DATA stream=15 seq=0..10 then silence; HEADERS stream=31 appearing for unrelated logical session at 22:03:30"
+  ],
+  "investigation_notes": [
+    "Initial triage: high correlation with multiplexed HTTP/2 clients that reuse a single TLS connection and with a recent edge-proxy config change on 2026-03-09 (connection pooling tweaks).",
+    "Hypothesis: edge-proxy is incorrectly recycling HTTP/2 stream identifiers or mis-associating DATA frames to logical SSE sessions when connection reuse and aggressive stream-id reuse are enabled on the ALB/edge proxy layer.",
+    "Repro attempt: Re-running with single-stream (no multiplex) removes the failure in 10/10 runs. Re-enabling multiplexing with max concurrent streams=2 reproduces failure ~3/20 runs. Increasing client keepalive frequency reduces window where reuse occurs and lowers failure rate.",
+    "Tracebacks: no worker OOM or crash. Serving runtime indicates continued token generation and flushing; only edge-proxy logs show frame routing anomalies.",
+    "Related artifacts: PRs linked above include an experimental HTTP/2 stream pool change that may have introduced a race when streams are torn down while another logical stream is attached to the same connection.",
+    "Customer impact: EchoWrite customers on dedicated pool hit 2-3% session failures for long responses; rollback of edge-proxy change reduced failures to ~0.1% in canary subset."
+  ],
+  "mitigation": [
+    "Immediate workaround: disable HTTP/2 multiplexing for EchoWrite via per-customer edge config (set multiplexing=false) \u2014 applied at 2026-03-10 09:15 UTC; mitigated visible errors.",
+    "Short-term: revert the edge-proxy connection pool change in canary and schedule full rollback pending root-cause fix (PR revert applied 2026-03-10 12:30 UTC).",
+    "Medium-term: add per-stream sequence verification at edge-proxy to detect and reject misrouted frames and failfast the connection so clients can reconnect without silent stalls.",
+    "Long-term: harden HTTP/2 stream-id bookkeeping in edge-proxy and add regression tests for multiplexed SSE/WebSocket scenarios; consider a streaming SLO test in CI."
+  ],
+  "resolution": "Rollback applied to edge-proxy configuration in prod us-east and per-customer multiplex disable for EchoWrite. Incident mitigated 2026-03-10 12:30 UTC. Root cause pending final fix in edge-proxy codebase (tracking PR https://github.com/redwood-inference/edge-proxy/pull/412).",
+  "comments": [
+    "2026-03-10T08:22Z - Aisha Patel (Support): Customer report received via support@echoWrite.com. Included client SDK logs and sample session IDs. Escalated to SRE.",
+    "2026-03-10T09:05Z - Marco Liu (SRE): Confirmed pattern on canary dedicated pool. Reproduced with EchoWrite test harness. Suspect edge-proxy HTTP/2 stream reuse race.",
+    "2026-03-10T09:20Z - Elena Gomez (Platform Eng): Rolling back connection-pool change in canary now. Adding additional http2 frame logging for deployed edge-proxy instances.",
+    "2026-03-10T12:35Z - Marco Liu (SRE): Rollback successful in us-east. Customer multiplexing disabled as a safety toggle. Monitoring for failures; no new customer 408s in last 30m.",
+    "2026-03-11T10:12Z - EchoWrite Support (Customer): Thank you \u2014 impact reduced. Requesting ETA for permanent fix and whether this will affect other dedicated customers."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "logs",
+    "network_traces",
+    "investigation_notes",
+    "mitigation",
+    "resolution",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_9cec4238b8f240aea8b1c8a39306689c"
+}

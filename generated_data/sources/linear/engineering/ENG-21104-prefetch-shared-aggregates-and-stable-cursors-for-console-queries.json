@@ -1,0 +1,95 @@
+{
+  "key": "ENG-21104",
+  "team": "engineering",
+  "title": "Prefetch shared aggregates and stable cursors for Console dashboard queries",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-02-18",
+  "updated_at": "2025-02-26",
+  "creator": "Anika Rao",
+  "assignee": "Samuel Ortiz",
+  "project": "console-performance-2025",
+  "cycle": "2025-W08",
+  "estimate": "8",
+  "due_date": "2025-03-10",
+  "labels": [
+    "dashboard",
+    "analytics",
+    "db-indexes",
+    "cache",
+    "tenant-aware"
+  ],
+  "description": "Problem: Several console dashboard endpoints that surface usage analytics (tokens per route, active tenants, top-models, per-token cost over time) have erratic P95 latency spikes and cause high DB load during peak queries. Current cursor-based pagination is brittle when we rebuild or reindex analytic tables, and many dashboard widgets execute overlapping aggregations that repeat work across requests.\n\nGoal: Reduce read latency and backend DB CPU by introducing a small set of tenant-aware materialized aggregates + a shared prefetch cache layer, and make cursor tokens stable across index rebuilds using snapshot-based sequence anchors. Provide fallback to live queries for very fresh data. Maintain strong consistency guarantees for owner-facing dashboards (<=30s eventual consistency) and avoid long maintenance windows during schema changes.",
+  "acceptance_criteria": [
+    "P95 API latency for target dashboard routes decreases by >=40% under synthetic load compared to baseline",
+    "Average number of DB rows scanned per dashboard call reduces by >=60%",
+    "Cursor pagination tokens remain valid after index rebuilds or MV refresh (no 500s or 400s due to invalid cursor) during canary window",
+    "Cache hit ratio for shared prefetch layer >=70% for top-50 tenants during peak",
+    "Safe rollback path: health checks will cut traffic to old query path without data loss"
+  ],
+  "technical_notes": [
+    "Introduce two new per-tenant materialized tables: tenant_daily_usage_agg (partitioned by date) and tenant_top_routes_mv (top-k routes weekly). Both are lightweight summaries with approximate counters for cost and token counts.",
+    "Create a small in-process shared prefetch service (Go) inside console-backend that precomputes the required aggregate tiles for a requested dashboard route and populates an LRU-backed memory cache keyed by (tenant_id, tile_type, date_range, snapshot_id). TTLs: 30s for near-real-time tiles, 10m for weekly top-k.",
+    "Stable cursor design: cursor token = base64(JSON) with fields {snapshot_id, sequenced_range_start, sequenced_range_end, anchor_time}. snapshot_id is the timestamp of the MV snapshot or a monotonically increasing logical generation id from MV refresh job. On index rebuild, snapshot_id changes but cursors referencing an older snapshot remain readable by translating sequenced offsets using a translation table kept for 24h.",
+    "MV refresh strategy: incremental refresh jobs using insert/update into partitioned MV and write through a small journal table (mv_generation_journal) to record snapshot_id -> partition_end_time mapping. Refreshes scheduled every 15s for daily tiles and hourly for weekly top-k during peak; full rebuilds only in maintenance windows.",
+    "Query fallback: if prefetch cache miss or MV stale beyond defined freshness threshold, route to optimized live query path that uses new composite indexes (see migration DDL below). Live queries include LIMIT + seek-based pagination to avoid full scans.",
+    "DB changes: add composite index ON analytics.events (tenant_id, date, route_id, created_at) USING btree; create partitioning by range(date) for tenant_daily_usage_agg; add partial indexes for heavy tenants if needed.",
+    "Data correctness: MV uses deterministic aggregations (SUM, COUNT) and last-value for small metadata columns to ensure stable pagination ordering. Index rebuilds will not change ordering because order uses (snapshot_id, route_id, created_at).",
+    "Observability: Add new perf dashboards: MV refresh lag, cache hit ratio, prefetch QPS, DB rows scanned per query, request path breakdown (prefetch vs live)."
+  ],
+  "rollout_plan": [
+    "Phase 0 (dev): implement prefetch service and MV schema in staging. Add unit tests and local benchmarks (Feb 18\u2013Feb 24).",
+    "Phase 1 (staging canary): Enable prefetch + MV for 5 internal tenants and run 48h of query load tests. Monitor latency and DB load (Feb 25\u2013Mar 3).",
+    "Phase 2 (prod limited): Canary to 10% of tenant traffic for non-critical dashboards; validate cursor stability across an index rebuild simulated in canary group (Mar 4\u2013Mar 10).",
+    "Phase 3 (full roll): Gradually increase to 100% following success criteria and sweep for per-tenant corner cases; schedule full MV rebuild outside business hours (Mar 11\u2013Mar 15).",
+    "Rollback: feature flag to turn off prefetch and route back to legacy queries; MV refresh journal preserved for safe rehydration."
+  ],
+  "testing_plan": [
+    "Unit tests for cursor encode/decode and translation logic (including translation table expiry).",
+    "Integration test: simulate index rebuild while cursors are active and assert no 4xx/5xx for paginated calls.",
+    "Load test: k6 script that reproduces dashboard traffic pattern from top-50 tenants and measures p50/p95 with and without prefetch. Baseline derived from 2025-01-12 run.",
+    "A/B canary comparison using server-side feature flag to measure DB CPU, query counts, and cache hit ratio over 48h.",
+    "Chaos test: induce MV refresh job delays and ensure fallback to live queries does not cause excessive latency amplification (>2x expected)."
+  ],
+  "metrics": [
+    "api.console.dashboard.tokens/p95 latency (ms) target: reduce from 1200ms -> <=700ms",
+    "db.query.rows_scanned_per_request target: <= 20k",
+    "prefetch.cache.hit_ratio target: >=70% on top-50 tenants",
+    "mv.refresh_lag target: <=30s for daily tiles, <=10m for weekly top-k",
+    "error.rate for dashboard endpoints target: <0.1% (no increase during rollout)"
+  ],
+  "dependencies": [
+    "ENG-18960 - Add partition management utilities to infra-migrations (must land before partition DDL)",
+    "ENG-20211 - Feature-flagging infra update to support dynamic routing of query paths",
+    "INFRA-341 - Increase DB connection pool for console-backend during canary"
+  ],
+  "links": [
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/OPS/pages/14123/Console+Prefetch+Design",
+    "PR draft: https://github.com/redwood-inference/console/pull/5123 (prefetch service + cursor codec)",
+    "Perf scripts: https://stash.redwood.com/analytics/perf/k6_dashboard_prefetch"
+  ],
+  "comments": [
+    "2025-02-19 - Samuel Ortiz: Initial spike shows 3x reduction in rows scanned for synthetic top-k query with MV materialization. Need to confirm snapshot translation overhead.",
+    "2025-02-21 - Maria Chen (DB): Added DDL suggestions for partial indexes on heavy tenants; recommended testing with 5 candidate tenants first.",
+    "2025-02-23 - Product (Liam Park): Prioritize this for dashboard SLO improvements; customer-reported latency incidents for billing dashboard should be mitigated by this work.",
+    "2025-02-25 - Samuel Ortiz: Implemented stable cursor codec prototype. We are storing translation entries in mv_cursor_translation (TTL 24h). Observed negligible overhead in staging.",
+    "2025-02-26 - QA (Priya Singh): Added load tests to k6 harness and scheduled 48h run for Feb 27\u2013Mar 1. Will validate canary gating metrics.",
+    "2025-02-26 - Anika Rao: Marking P0 due to repeated customer escalations on console dashboard latency and billing accuracy."
+  ],
+  "customer_impact": "high",
+  "release": "console-2025.03",
+  "security_review_required": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "technical_notes",
+    "rollout_plan",
+    "testing_plan",
+    "metrics",
+    "dependencies",
+    "links",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_1d8123725e9c40c4a2d2362923d1d1cc"
+}

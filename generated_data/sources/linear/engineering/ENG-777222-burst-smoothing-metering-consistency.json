@@ -1,0 +1,50 @@
+{
+  "key": "ENG-777222",
+  "team": "engineering",
+  "title": "Ensure metering correctness across rate-limit burst-smoothing and streaming resume windows",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-03-03",
+  "creator": "Alex Chen",
+  "assignee": "Priya Patel",
+  "project": "billing-integrity",
+  "cycle": "2026-W09",
+  "estimate": "8",
+  "due_date": "2026-03-15",
+  "labels": [
+    "metering",
+    "streaming",
+    "rate-limiter",
+    "quota",
+    "postmortem"
+  ],
+  "dependencies": [
+    "ENG-314159",
+    "ENG-681220"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.24",
+  "security_review_required": "false",
+  "links": [
+    "https://github.com/redwood-inference/redwood/compare/pr-4832",
+    "https://confluence.redwood.ai/display/INF/Burst+Smoothing+Metering+Design",
+    "https://grafana.redwood.ai/d/ops/metering-rate-limiter-overview?var-panel=streaming",
+    "https://github.com/redwood-inference/redwood/pull/4899",
+    "https://docs.redwood.ai/runbooks/metering-reconciliation.md"
+  ],
+  "description": "Background:\nRecent incidents showed transient double-crediting and delayed credit finalization for streaming sessions that crossed rate-limiter burst windows. In particular, when a client resumes a streaming session after a short network blip, the burst-smoothing logic (which allows short-term bursts without immediate quota exhaustion) can cause token deltas emitted by the runtime to be applied twice or to be delayed until the smoothing window commits. The billing pipeline currently receives fragment-level token counts, aggregates them into session deltas, and writes final credits when a terminal event occurs. The interaction with the rate-limiter's smoothing window creates three edge cases:\n\n1) Over-credit: fragment credits are applied pre-smoothing and then re-applied when smoothing window flushes, resulting in ~1-2% overbilling for affected sessions.\n2) Under-credit / delayed credit: smoothing defers the final committed count until the window flush, causing quota checks to see an outdated counters and occasionally reject legitimate requests (false throttles).\n3) Attribution drift across model-variant fallback: when a streaming session triggers an automatic fallback (e.g., to a cheaper quantized model) during smoothing, the pipeline sometimes attributes the earlier tokens to the fallback variant instead of the original model.\n\nScope and goals:\n- Ensure exact-once semantics for final token crediting across smoothing windows and streaming resumes.\n- Preserve low-latency quota checks for active streams (no >50ms added to hot path).\n- Maintain robust attribution to model variant used for generation at the time tokens were produced.\n- Limit storage/IO overhead added by fixes to <1% increase in writes across production clusters.\n\nAcceptance criteria:\n- Unit and integration tests cover resume/partition/reapply scenarios with synthetic fuzzing; no observed over-crediting in 1000 randomized replays.\n- End-to-end canary run on dedicated cluster for 72 hours with no billing regressions vs baseline.\n- Dashboards show zero duplicated credits from the smoothing path in canary namespace.\n\nProposal (design summary):\n1) Attach monotonic fragment_seq to every stream frame emitted by the runtime (already present in most clients but not always preserved through proxies). Guarantee that metering frontend stores fragment_seq -> token_delta as idempotent entries.\n2) Switch final crediting to a two-phase commit pattern for streams: provisional apply (fast, in-memory, visible to quota checks) + commit marker written once per fragment_seq when the smoothing window flushes. The final billing write is idempotent keyed on (session_id, fragment_seq).\n3) For model-variant attribution, include variant_id and a server-side timestamp per applied fragment and compute attribution at commit time using the fragment_seq timeline rather than last-seen model variant.\n4) Compact compensation log: when duplicates are detected, the reconciler writes a compensating negative entry rather than attempting in-place subtraction in the hot counters. This keeps runtime counter updates append-only and auditable.\n\nTrade-offs considered:\n- Extra writes vs correctness: committing per-fragment sequence increases write amplification. To mitigate, we batch writes for fragments within the smoothing window into a single commit write (summary of seq ranges + checksum).\n- Latency vs accuracy for quota checks: provisional applies are used for immediate quota decisions; this risks temporary divergence between provisional and committed totals. We minimize risk by enforcing a short provisional-to-commit window (configurable, default 250ms) and conservative provisional allowances for high-risk tenants.\n\nImplementation plan (milestones):\n- Feb 12 (done) - Design doc posted in Confluence; proposal reviewed by infra and billing leads.\n- Feb 18 (done) - PoC in local dev: runtime emits fragment_seq and provisional_apply path implemented in metering-frontend (branch pr-4832).\n- Feb 24 - Implement idempotent commit store and compensating log (backend PR #4899).\n- Mar 01 - Integration tests + fuzz harness for network partitions and out-of-order fragments.\n- Mar 04 - Internal canary (10% dedicated cluster traffic) and dashboarding.\n- Mar 11 - Full canary and rollout plan to runtime-1.24.\n\nTesting strategy:\n- Add deterministic replay tests that inject duplicate frames with the same fragment_seq and validate net token delta = expected.\n- Fuzz tests that randomize fragment ordering, drop frames, and resume sessions to exercise smoothing boundaries.\n- Load test with synthetic clients to measure write amplification; target less than 1.5x baseline for commit writes.\n\nRollout and migration notes:\n- Backwards compatibility: clients lacking fragment_seq will fall back to the current behavior but will be placed in a compatibility path that tags sessions as \"legacy-smoothing\" and will be rate-limited conservatively. We will run a migration instrument to identify legacy clients and work with SDK teams to push updates.\n- Database migration: add a commit-index column to session metering table (online schema change). Migration runbook in runbooks/metering-reconciliation.md.\n\nRisks and mitigations:\n- Risk: consumer services reading provisional counters make decisions that are later rolled back by compensating entries. Mitigation: make provisional allowances conservative and surface provisional/committed delta in console so customers can understand transient behavior.\n- Risk: write amplification overloads metadata DB during canary. Mitigation: rate-limit commit writes and degrade non-critical per-fragment auditing temporarily.\n\nOpen questions:\n- Should provisional applies be included in usage analytics (billing analytics pipeline) or excluded until commit? (Ops/Finance input required)\n- Can we compress fragment_seq ranges further for very long-lived high-throughput streams?\n\nRecent updates:\n- 2026-02-12 Alex Chen: Design doc added; requested infra review for schema impact.\n- 2026-02-18 Priya Patel: PoC validated idempotent commit keying; observed 1.3x write increase in dev cluster.\n- 2026-02-25 Tomas M\u00fcller (review): Suggested compensating-entry approach vs in-place decrement; approved compensating log pattern.\n- 2026-03-01 QA (Rita Gomez): Integration harness added; found edge-case where fragment_seq wrap-around for very long sessions caused key collision in test harness; added 64-bit monotonic to spec.\n- 2026-03-03 Priya Patel: Backend PR #4899 opened; integration tests passing locally. Preparing dashboards for canary: Grafana panel 'metering.duplicate_credits' added.\n\nNext actions (short term):\n- Merge backend PR and deploy to staging (Priya).\n- Coordinate SDK owners to emit fragment_seq and update compatibility docs (Alex + SDK leads).\n- Run 72h canary and monitor 'duplicate_credits' and 'provisional_vs_committed_delta' metrics (on-call: billing-oncall).\n\nArtifacts and references:\n- Confluence design: https://confluence.redwood.ai/display/INF/Burst+Smoothing+Metering+Design\n- PRs: https://github.com/redwood-inference/redwood/pull/4832, https://github.com/redwood-inference/redwood/pull/4899\n- Runbook: https://docs.redwood.ai/runbooks/metering-reconciliation.md\n- Dashboard: https://grafana.redwood.ai/d/ops/metering-rate-limiter-overview?var-panel=streaming\n\nIf anything blocks progress (DB migration slowdown, or significant increase in write amplification), we will revert the provisional path and ship only the commit-idempotency change as a hotfix to eliminate over-crediting.\n\nStakeholders: Priya Patel (owner), Alex Chen (design), Tomas M\u00fcller (infra review), Rita Gomez (QA), Finance (billing accuracy signoff).\n",
+  "updates": [
+    "2026-02-12: Design doc created (Alex Chen).",
+    "2026-02-18: PoC validated provisional_apply; dev metrics show 1.3x writes (Priya).",
+    "2026-02-25: Compensating log approach approved by infra (Tomas).",
+    "2026-03-01: QA found seq-wrap edge added 64-bit monotonic (Rita).",
+    "2026-03-03: Backend PR opened and integration tests passing locally (Priya)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "updates"
+  ],
+  "dataset_doc_uuid": "dsid_18ba80eefb8e448291ab4cc09265230c"
+}

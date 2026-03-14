@@ -1,0 +1,69 @@
+{
+  "key": "SUP-160021",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Keepalive oscillation driving intermittent 5xx for tenant; upstream runtime prefetch starvation observed",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Leah Nguyen",
+  "assignee": "Marco Alvarez",
+  "customer_company": "NimbleDocs",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "scheduler",
+    "console"
+  ],
+  "labels": [
+    "5xx",
+    "keepalive",
+    "streaming",
+    "prefetch",
+    "high-impact"
+  ],
+  "environment": "prod | us-east",
+  "affected_models": [
+    "redwood-villiage-7B",
+    "open_llama_13B"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-10T15:30:00Z",
+  "first_response_due_at": "2026-03-10T13:00:00Z",
+  "linked_issues": [
+    "SUP-472901",
+    "SUP-211345"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/8421"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/Keepalive+Oscillation+Runbook"
+  ],
+  "description": "Issue summary:\nCustomer NimbleDocs (dedicated tenant) reported ~12 minutes of elevated 5xx errors affecting streaming and short-request generation routes. Errors surfaced at ~2026-03-10T11:42Z and remitted at ~2026-03-10T11:54Z after automated fallback triggers.\n\nImpact:\n- Multiple customer endpoints returned 502/503/504 for user-facing generation and streaming sessions.\n- Affected traffic ~7% of tenant's p95 throughput; degraded UX for editors using real-time suggestions.\n- No data exfiltration or model corruption suspected.\n\nEnvironment:\n- Tenant: nimbledocs-prod (dedicated pool)\n- Region: us-east\n- Models: redwood-village-7B (primary), open_llama_13B (fallback)\n- Infra: dedicated GPU pool (A100), api-gateway h2 multiplexing enabled, prefetch=enabled, kvcache-locking=on\n\nSteps to reproduce (observed pattern):\n1) Send concurrent streaming sessions (10\u201315 concurrent short streams, ~20 token responses) that keep connections open for ~90s using HTTP/2 multiplexing and client keepalive probes every 20s.\n2) After 6\u201310 minutes, gateway starts returning RST/502 to a subset of streams and new generation requests.\n3) Runtime logs show an increasing backlog on prefetch queue followed by GPU scheduler throttles and occasional runtime restart events.\n\nObserved behavior / evidence:\n- api-gateway metrics: spike in upstream_5xx_rate from 0.2% to 12% between 11:42Z\u201311:54Z. Accept queue depth increased and HTTP/2 stream reset count jumped.\n- Runtime logs (snippet):\n  [2026-03-10T11:44:03Z] prefetch_manager WARN: shard-8 prefetch_wait_count=62, lock_holders=4\n  [2026-03-10T11:44:07Z] gpu-scheduler INFO: throttle=0.35, inflight_kernel_invocations=128\n  [2026-03-10T11:44:09Z] runtime ERROR: watchdog triggered restart (oom-like schedule stall)\n- Tracing shows backpressure originated at multiplexed keepalive probes: repeated half-open streams caused per-connection socket churn and TLS session reuse thrashing.\n- Observability: p95 token latency for affected routes increased from 120ms -> 850ms prior to 5xx wave.\n\nExpected behavior:\n- Keepalive probes should not induce stream tombstone churn; backpressure should be absorbed by queueing and cache reuse without escalating to runtime restarts and 5xx.\n\nInitial mitigation performed:\n- Automated routing fallback triggered: traffic shifted from primary variant to cold-fallback model (open_llama_13B) at 11:46Z, dropping 5xx to baseline by ~11:54Z.\n- Support temporarily disabled HTTP/2 multiplexing for the NimbleDocs tenant at 11:50Z as an emergency mitigation; this reduced stream resets immediately.\n- Notified customer and escalated to SRE.\n\nCustomer-reported logs and attachments:\n- Customer provided client-side errors: repeated stream RST and TLS_unexpected_message at probe intervals.\n\nNext steps listed below in investigation_notes.",
+  "comments": [
+    "2026-03-10 12:05Z - Leah Nguyen (Support): Initial triage completed. Escalated to SRE; applied temporary mux-disable; informed customer of workaround. Asked SRE for runtime logs and NVML dumps.",
+    "2026-03-10 12:22Z - Priya Das (SRE): Collected runtime NVML and perf counters from affected pool. Observed elevated context-switching and prefetch_wait spikes aligning with customer traffic pattern. Adding scheduler traces to ticket.",
+    "2026-03-10 12:40Z - Marco Alvarez (Oncall Eng): Reproduced locally in staging using synthetic client that sends keepalive probes + long-lived multiplexed streams. Observed identical prefetch lock growth and stream tombstone churn. Hypothesis: small window where keepalive probes interleave with stream close path, leaving multiplexed streams in half-closed state while prefetch resources still held, causing exponential backpressure under tenant burst.",
+    "2026-03-11 09:12Z - Marco Alvarez (Oncall Eng): Created PR to add defensive timeout on prefetch lock and added metric prefetch_lock_wait_seconds. PR: https://github.com/redwood-inference/runtime/pull/8421",
+    "2026-03-12 10:30Z - Leah Nguyen (Support): Customer confirmed UX restored after mux-disable; asked for ETA on permanent fix and whether tenant should keep mux disabled.",
+    "2026-03-12 14:05Z - Marco Alvarez (Oncall Eng): Recommended keeping mux disabled for nimbledocs until runtime patch is rolled. Coordinating canary rollout of fix to low-risk customers first."
+  ],
+  "investigation_notes": "Findings summary:\n- Root hypothesis: interaction between HTTP/2 multiplexed keepalive probes and our prefetch locking path created a fast path to prefetch_lock contention. When the keepalive probes caused rapid half-close events across multiple streams, prefetch manager failed to clear pending requests quickly; this increased GPU scheduler pressure and led watchdog-triggered restarts in the runtime.\n- Reproducible in staging with synthetic workload. Reproduced at lower scale when socket churn frequency matches 20s keepalive pattern.\n- Similar to patterns seen in SUP-472901 (connection-thrashing) but distinct because primary trigger is keepalive probe timing + prefetch lock behavior rather than accept-queue collapse.\n\nInstrumentation added:\n- Added prefetch_lock_wait_seconds metric and a prefetch_lock_holder_count gauge.\n- Added tracing span around stream-close -> prefetch-release to capture ordering.\n\nHypotheses considered and triaged:\n1) TLS renegotiation or cert churn - ruled out (no cert logs).\n2) Edge ephemeral port exhaustion - inconclusive but metrics low.\n3) Prefetch lock thrash due to client probe pattern - supported by staging reproduction.\n\nProposed permanent fixes:\n- Short-term code fix: add bounded wait + backoff in prefetch manager to avoid blocking the GPU scheduler; release prefetch reservations earlier when stream tombstone detected. (PR submitted).\n- Medium-term: resilient keepalive handling in api-gateway to coalesce probes and avoid interleaving with stream close path for multiplexed connections.\n- Operational: add alert if prefetch_lock_wait_seconds > 5s and automatic soft-disable of mux for tenant until resolved.",
+  "resolution_notes": "Status: patch in progress (PR 8421).\nActions taken so far:\n- Emergency: disabled HTTP/2 multiplexing for NimbleDocs tenant as a safe workaround.\n- Engineering: PR adds bounded prefetch lock wait and emits new metrics; will roll canary to 5% of dedicated pools after QA.\n- Observability: dashboards updated to include prefetch_lock_wait_seconds and prefetch_lock_holder_count.\n- Post-incident: plan runbook entry to handle keepalive-induced thrash and guidance for tenants on keepalive probe frequency.\n\nFollow-ups / open items:\n- Schedule canary roll (Marco) and link outcome back to ticket.\n- Confirm with NimbleDocs whether they prefer mux re-enabled post-canary or keep disabled until full rollout.\n- Run synthetic soak test for 48h to ensure no regression in unrelated workloads.\n\nIf patch merges and canary is clean, next steps will be to re-enable mux for nimbledocs in a controlled window and monitor the new metrics closely.",
+  "resolution": "Mitigation applied (mux disabled) and patch under review",
+  "closed_at": "",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_27f52b4899484923bd392b6384c276aa"
+}

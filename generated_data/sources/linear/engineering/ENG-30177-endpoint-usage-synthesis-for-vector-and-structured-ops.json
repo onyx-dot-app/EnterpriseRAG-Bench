@@ -1,0 +1,49 @@
+{
+  "key": "ENG-30177",
+  "team": "engineering",
+  "title": "Synthesize accurate usage events for vector & structured non-chat endpoints",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-03-02",
+  "creator": "Ava Chen",
+  "assignee": "Diego Morales",
+  "project": "billing-core",
+  "cycle": "2026-W05",
+  "estimate": "8",
+  "due_date": "2026-03-15",
+  "labels": [
+    "billing",
+    "metering",
+    "embeddings",
+    "non-chat",
+    "structured-output",
+    "high-impact"
+  ],
+  "release": "billing-2.8",
+  "security_review_required": "false",
+  "customer_impact": "high",
+  "description": "Background:\n\nWe occasionally observe discrepancies between tokens/units charged and the golden request payloads for non-chat endpoints (vectorize/embed, rerank endpoints, and structured-output/function-calling flows invoked via non-chat routes). Symptoms reported by customers and internal analytics: unexpected spikes in billed units after retries, double-counting when a function-calling hook triggers multiple downstream tool requests, missing attribution when structured outputs are returned in streaming chunks, and inconsistent rate-limit enforcement for multi-stage requests.\n\nProblem statement:\n\nOur current billing pipeline relies on optimistic per-request accounting emitted from the frontend router and augmented by downstream workers. This model is fragile for multi-stage non-chat flows where a single user request can spawn:\n- one or more embedding vector calls (document+query),\n- a rerank call that performs internal candidate scoring, and/or\n- a function/tool invocation (HTTP/webhook) that itself triggers structured responses and retries.\n\nBecause events are emitted from multiple places and some components only emit final summaries while others emit per-chunk/stream events, we see:\n- Overcounting: duplicate meter events for the same logical unit when retries or fallbacks occur.\n- Undercounting: when streaming chunks are not reconciled into the canonical final usage event.\n- Misattribution: cost assigned to the wrong endpoint/model/route (e.g., tool-call charges appearing under the parent requester).\n- Incorrect rate limiting: burst limits are bypassed when sub-requests are handled in separate quota contexts.\n\nGoal:\n\nDesign and implement a canonical usage-event synthesis layer for non-chat endpoints (embeddings, rerank, structured output, and function-calling flows) that:\n1) Emits exactly one canonical usage event per logical user request for billing,\n2) Attributes cost to the correct customer/model/route,\n3) Correctly handles streaming vs final completion semantics, retries, and partial failures, and\n4) Restores correct quota/rate limit behavior across multi-stage request graphs.\n\nProposed approach:\n\n1) Canonical request id propagation: ensure every incoming non-chat API request is stamped with a deterministic request_id at the edge and propagated to all downstream workers and tool-call contexts. For generated sub-requests (rerank steps, internal vector requests) keep a parent_request_id tag.\n\n2) Event types and lifecycle: define small set of usage event types: request.start, token.delta (streaming chunks), request.complete, request.fail, subrequest.attribution. Only request.complete (or request.fail) will be considered the authoritative event for billing reconciliation; token.delta events will be used for near-real-time dashboards but ignored by the final billing pass unless a final complete never arrives within a bounded window.\n\n3) Deterministic aggregation window: if request.complete does not appear within 30s of the last token.delta, a reconciliation job marks the request as timed_out and attempts to synthesize a complete event based on observed deltas and KV cache usage.\n\n4) Tool-call accounting: when a user-request triggers an external tool call, the tool-call meter must report to billing with parent_request_id and tool_request_id. The synthesis layer will collapse tool-call charges into either the parent request (default) or present them as separate line-items if the caller is explicitly configured to bill separately (tenant-level setting).\n\n5) Quota enforcement: implement a pre-check at edge that reserves quota for the entire logical request graph (best-effort estimate based on prompt sizes + model profile). Downstream quota checks use the reserved token budget and only charge against it. On fallback/hot-reload where a different model variant is used, the reserve is reconciled to the final model's unit cost at request.complete time.\n\nAcceptance criteria:\n\n- Unit tests and integration tests that demonstrate single canonical billing event for: simple embed request, embed+rerank pipeline, rerank with function-call that triggers one external tool, and rerank with partial-tool failure and retry.\n- Reduction of duplicate billing events in production traces by >= 90% for affected flows.\n- Quota checks prevented >95% of cross-tenant burst bypass cases in staging.\n- Audit logs show parent_request_id present for all synthesized billing events in a 48-hour sample.\n\nImplementation plan:\n\nPhase 1 (spike, 1 week):\n- Implement deterministic request_id propagation in the edge router and SDKs.\n- Add lightweight event schema and start emitting request.start and token.delta for non-chat endpoints.\n- Create test harness to simulate multi-stage request graphs.\n\nPhase 2 (core synthesis, 2 weeks):\n- Build the synthesis service that listens to stream of events and emits authoritative request.complete events, with de-duplication logic keyed by request_id + parent_request_id.\n- Add reconciliation job for timed_out requests.\n- Extend current billing pipeline to accept synthesized canonical events.\n\nPhase 3 (tool-call & quota, 2 weeks):\n- Wire tool-call attribution into synthesis service and implement tenant-level billing policy flag.\n- Implement quota reservation API at edge and downstream quota reconciliation.\n\nPhase 4 (QA & rollout, 1 week):\n- Run end-to-end tests in staging, run shadow billing against production, and roll forward gate by usage percentage.\n\nMonitoring and metrics:\n\n- New metrics: canonical_events_emitted, duplicate_events_detected, synthesized_timeouts, quota_reservations_success, quota_bypass_attempts.\n- Dashboards: per-route duplicate-rate, per-tenant spend-delta (shadow vs live), percent of events missing parent_request_id.\n- Alerts: duplicate_events_detected > 0.5% for 10m, synthesized_timeouts spike > 2x baseline.\n\nRollout plan:\n\n- Stage: shadow billing in prod for 1 week (no customer impact).\n- Canary: 5% of requests routed to synthesis pipeline with actual billing enforcement for internal test tenants.\n- Gradual ramp: 5 -> 25 -> 50 -> 100 over 2-3 days with sanity checks at each step.\n\nDocumentation and customer communication:\n\n- Update Billing FAQ and Quota docs to explain canonical events and how tool-call billing is attributed.\n- Prepare a customer-facing note for tenants who were previously affected, with a link to a CSV export tool to reconcile historical differences.\n\nRisks and mitigations:\n\n- Risk: missed request.complete events for long-running tool calls. Mitigation: extend reconciliation window for configured tenants and ensure token.delta durable storage.\n- Risk: increased latency at edge due to quota reservation. Mitigation: best-effort reserve with non-blocking fallback and retryable reconciliation at completion time.\n\nOpen questions:\n\n- Should tenants have an opt-out to keep tool-call charges separate by default? (PM decision pending)\n- What is the exact SLA for synthesizing timed_out requests for billing (30s vs 120s)?\n\nLinks and artifacts:\n\n- Design doc (confluence): https://confluence.redwood.ai/display/BILL/Canonical+Usage+Events+for+Non-Chat+Flows\n- Spike notes and event schema: https://drive.redwood.ai/drive/folders/0B_spike_nonchat_events\n- Draft PRs: https://github.com/redwood-inference/platform/pulls?q=is%3Apr+canonical-usage\n",
+  "comments": [
+    "2026-02-11 - Triage: PM Priya reviewed and flagged as P0 due to two enterprise customers reporting billing anomalies; assigned to Diego for implementation plan.",
+    "2026-02-16 - Spike complete: edge request_id propagation implemented in router (branch: edge/request-id) and basic token.delta emits validated in staging traces.",
+    "2026-02-20 - Eng review: decided to treat request.complete as authoritative for billing and keep token.delta for near-real-time dashboards only. See review notes: https://gh.redwood.ai/r/12345",
+    "2026-02-24 - Design review: Product asked for tenant opt-out flag for tool-call separation; added to scope for Phase 3.",
+    "2026-03-01 - PR opened for synthesis service: platform/pulls/478 - initial de-dup and timed_out reconcilier. Requesting review from billing and infra.",
+    "2026-03-02 - QA: integration tests added for embed+rerank+toolcall graphs; found edge case where retry-after header caused duplicate subrequest.attribution; patch planned."
+  ],
+  "dependencies": [
+    "ENG-29802",
+    "ENG-30010"
+  ],
+  "sub_issues": [
+    "ENG-30178",
+    "ENG-30179"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_f9baf79f328c4b8a96f1da4ceccdfda7"
+}

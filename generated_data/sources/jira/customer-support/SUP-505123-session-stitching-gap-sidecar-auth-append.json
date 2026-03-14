@@ -1,0 +1,73 @@
+{
+  "key": "SUP-505123",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "SSE session stitching gap when small append payloads follow sidecar auth refresh",
+  "status": "Resolved",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Aisha Rahman",
+  "assignee": "Marco Liu",
+  "customer_company": "ClearDocs Inc.",
+  "customer_tier": "dedicated",
+  "environment": "prod-us-east",
+  "components": [
+    "serving-runtime",
+    "api-gateway",
+    "sidecar-proxy"
+  ],
+  "affected_models": [
+    "redwood-verified-7b"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "auth-refresh",
+    "sidecar",
+    "session-stitching"
+  ],
+  "sla_due_at": "2026-03-13",
+  "linked_issues": [
+    "SUP-314271"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood/inference/pull/8745"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/streaming-session-stitching-runbook"
+  ],
+  "description": "Issue summary:\nCustomer reported intermittent truncation and duplicate partial sentences when resuming SSE streams immediately after a sidecar-driven auth refresh. The pattern only appears when the model emits very small 'append' chunks (< 200 bytes) directly after the auth rotation handshake.\n\nImpact:\n- Customer ClearDocs (dedicated) sees ~1-2% of streams where the last sentence is missing and a duplicate prefix appears after a client retry.\n- Affects streaming UX for long-form generation (multi-paragraph outputs).\n\nEnvironment:\n- Dedicated pool in us-east (prod) behind sidecar-proxy version 2.12.3.\n- Client: ClearDocs web-app using native EventSource SSE; reconnect handler expects a terminal 'event: done' marker.\n- Model: redwood-verified-7b; typical generation lengths 400-1200 tokens.\n\nSteps to reproduce (internal repro):\n1) Issue a streaming SSE generation while toggling auth rotation on the sidecar (simulate short-lived token swap).\n2) Force the auth refresh to occur while the server emits a terminal small append chunk (< 200 bytes) containing closing punctuation and the 'event: done' line.\n3) Observe that client sometimes receives the trailing punctuation but not the 'event: done' marker, then performs a reconnect; server replays a prefix and client displays duplicate partial sentence.\n\nObserved behavior:\n- The 'data:' lines containing the final text arrive, but the trailing 'event: done' line is occasionally dropped by the sidecar when an auth refresh occurs concurrently. The client never receives the explicit termination event and decides to reconnect, which triggers a short re-run and results in duplicate leading text.\n\nExpected behavior:\n- Sidecar should preserve SSE event boundaries and ensure 'event: done' (or the equivalent terminal delimiter) is delivered atomically with the final data chunk. Reconnect should only occur when a real network loss or explicit error happens.\n\nLogs / traces attached:\n- Sample proxy trace: sidecar log shows 'auth-refresh: start' followed by 'chunk-flush: 176 bytes' then 'connection-proxy-rewrite' and no outgoing 'event: done' line in the emitted byte stream.\n- Server side serving-runtime trace shows finalization code path completed and emitted full terminal event to local socket.\n- Customer-supplied network HAR shows client saw CRLF-CRLF and then a small TCP FIN from sidecar shortly after (timing consistent with auth handoff).\n\nAttachments:\n- excerpt_sidecar_trace.txt\n- serving_runtime_final_emit.log\n- ClearDocs_har_2026-03-12.har\n\nUrgency and customer impact:\n- P1 / Sev1 due to visible user-facing truncation and duplication for paid dedicated customer. Requested hotfix with minimal blast radius.",
+  "comments": [
+    "2026-03-12 09:11 - ClearDocs (support agent): 'We see the final sentence missing ~1.3% of the time. Reloading the page duplicates the first half of the last paragraph. Happening across multiple users.'",
+    "2026-03-12 09:25 - Aisha Rahman (Support): Acknowledged. Collecting traces and asking for an HAR and sidecar logs. Escalating to SRE/serving runtime triage.",
+    "2026-03-12 11:02 - Marco Liu (SRE): Reproduced locally with auth-rotation simulator. Observed sidecar performing a tiny buffer rewrite that drops the trailing event marker in ~10% of runs. Captured pcap and attached to ticket.",
+    "2026-03-12 15:40 - Marco Liu (SRE): Hypothesis: sidecar's fast-path that injects a rotated Authorization header can cause an extra chunk flush without preserving the final CRLF-delimited event boundary when payloads are below the chunk-size threshold. Working on a minimal patch to preserve delimiter frames during auth swaps.",
+    "2026-03-13 02:12 - Eng (serving-runtime): Confirmed server always wrote terminal delimiter to local socket; loss occurs between sidecar read and outgoing socket write. Also saw increased syscall EAGAIN during concurrent auth-refresh window.",
+    "2026-03-13 20:35 - Marco Liu (SRE): Deployed hotfix to sidecar v2.12.4 to preserve SSE boundaries during header rewrite and to force an atomic flush of final event frames. Rolling to us-east dedicated hostgroups first.",
+    "2026-03-14 03:10 - ClearDocs (support agent): After patch, customer reports no further duplicated prefixes in a 12-hour sampling window. Closing check requested.",
+    "2026-03-14 04:05 - Marco Liu (SRE): Verified metric 'stream_termination_malformed' dropped from 1.1% -> 0.02% in us-east dedicated fleet. Marking resolved. Follow-up: add unit test and e2e test in proxy for tiny-chunk auth-rotation case."
+  ],
+  "investigation_notes": "Summary of findings:\n- Reproducible locally with auth-rotation simulator and sidecar v2.12.3.\n- Server emits terminal 'event: done' atomically, but sidecar rewrite path sometimes issues a split chunk write that omits the trailing 'event' line to downstream.\n- Root cause: sidecar fast-path attempts to minimize copies and assumes chunk boundaries can be safely coalesced; but the SSE consumer expects line-delimited atomicity for 'event' markers.\n- Race window: ~20-80ms during auth refresh handshake; probability increases for tiny final payloads.\n\nActions taken:\n- Hotfix (v2.12.4) implemented: when performing header rewrite or auth rotation, sidecar enforces 'preserve_event_boundaries = true' and performs an atomic flush for any chunk containing '\n\n' event termination or 'event: done' token.\n- Rollout: staged to us-east dedicated pool (canary -> 25% -> 100%) with metric monitoring for 'stream_termination_malformed' and customer-reported errors.\n- Added e2e test that simulates auth-refresh during final small append and asserts client-visible terminal event is present.\n\nOpen follow-ups:\n- Add a CI fuzz test for chunking patterns with various sidecar buffer sizes.\n- Consider adding 'terminal-heartbeat' explicit marker at server side to reduce client reliance on single 'event: done' line.",
+  "resolution": "Hotfix deployed: sidecar v2.12.4 preserves SSE event boundaries during auth header rotation by forcing atomic flushes when terminal markers are present. Deployed to prod-us-east dedicated pool on 2026-03-13 20:35 UTC (canary -> full). Metric 'stream_termination_malformed' reduced to baseline. Customer ClearDocs confirmed fix in 12-hour verification window. Follow-up tickets created for e2e coverage and CI fuzzing.",
+  "resolution_notes": "- Hotfix PR: https://github.com/redwood/inference/pull/8745\n- Rollout timeline: 2026-03-13 20:35 UTC canary (5 hosts), 2026-03-13 22:10 UTC 25% rollout, 2026-03-14 01:00 UTC 100% in us-east.\n- Postmortem planned and will be linked to this ticket when complete.",
+  "next_steps": [
+    "Create CI fuzz test for sidecar chunking patterns",
+    "Add runbook entry for 'auth-rotation during streaming' edge case",
+    "Consider server-side explicit terminal heartbeat as optional mitigation"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution",
+    "resolution_notes",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_59e290d0a4b342018d75257f66324f9b"
+}

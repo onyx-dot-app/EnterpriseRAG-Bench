@@ -1,0 +1,40 @@
+{
+  "key": "ENG-482621",
+  "team": "engineering",
+  "title": "Interleaved sparse KV eviction causing device-side slab fragmentation under continuous batching",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-28",
+  "updated_at": "2026-03-12",
+  "creator": "Diego Soto",
+  "assignee": "Aisha Raman",
+  "project": "runtime-defrag-2026",
+  "cycle": "2026-W09",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "kv-cache",
+    "cudaMallocAsync",
+    "allocator",
+    "continuous-batching",
+    "investigation"
+  ],
+  "parent_issue": [
+    "ENG-21388"
+  ],
+  "dependencies": [
+    "ENG-142309",
+    "ENG-31500"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Summary:\nWe are seeing gradual GPU RSS growth and sustained resident slab fragmentation in workloads that interleave very sparse KV cache reads (few KB per request) with periodic large-generation batches. Symptoms appear after ~6\u20138 hours under continuous batching and do not reproduce with purely large or purely small request streams.\n\nWhy this ticket: several previous allocator investigations focused on bulk-prefetch or dedupe hot-slices, but this pattern looks like an interaction between the KV eviction flow, per-request tiny allocations, and cudaMallocAsync's async-free lifecycle causing small slabs to be orphaned across streams. This ticket captures a reproducible case, telemetry, hypotheses, and a plan for targeted mitigations.\n\nObserved behavior (telemetry):\n- GPU RSS increases by ~10\u201315% over long runs; top-resident arenas are small-size slab buckets (8KB-64KB).\n- cudaMemPool metrics (via CUPTI + cudaMemGetAttribute) show a rising count of \"deferred frees\" and growing outstanding allocation count in the async pool despite overall application allocation rate flattening.\n- Per-stream allocation timelines show short-lived allocations created on high-priority inference streams but freed asynchronously on background worker streams; free callbacks delayed by scheduling; staged allocator retains blocks in a pinned \"staging\" sub-pool.\n- KV cache eviction pattern: many tiny evictions (evict 2\u20138 entries) triggered during large generation windows; these evicted entries cause immediate small re-allocations on subsequent requests.\n- Host pinned staging usage increases when sparse eviction rate is high; we see higher host->device pinned allocations concurrently with slab fragmentation.\n\nSteps to reproduce (dev cluster):\n1) Start continuous batching runner with mixed workload: 80% long-gen requests (seq_len 1024\u20132048), 20% sparse KV read requests (seq_len 32, KV touch size 4\u201312KB).\n2) Enable per-process cudaMemPool and allocator tracing: heap timeline, pool-resident counts, stream->alloc-id mapping, and RTV event traces.\n3) Run for >6 hours; capture nvtx annotated traces and periodic cudaMemPool stats. Repro rate ~70% on p4d and A100 nodes with current runtime-1.21.\n\nInitial findings / hypotheses:\n- Hypothesis A: Mixed-size eviction churn prevents slab coalescing because small allocations become orphaned across multiple size classes; the slab coalescer is conservative to avoid races and therefore never compacts.\n- Hypothesis B: async free path depends on stream completion callbacks which are delayed due to priority inversion: inference streams preempt background worker streams which process the free callbacks, leading to transient residency accumulation that becomes long-lived when combined with slab bin fragmentation.\n- Hypothesis C: KV cache eviction and immediate prefetch/repopulation keeps working set bouncing across size classes, preventing reuse and causing the allocator's small-pool greedy retention to hold onto lots of small slabs rather than returning them to the device pool.\n\nExperiments run so far (results):\n- Experiment 1: Force synchronous frees after KV eviction (synchronize stream after evict) -> lower RSS in short run but adds ~3\u20138ms p99 latency to sparse requests, unacceptable for SLOs.\n- Experiment 2: Increase coalescer aggressiveness (merge across adjacent bins at compile-time) -> reduced number of orphan slabs but introduced a race on concurrent alloc/free; required locks caused a throughput regression.\n- Experiment 3: Introduce epoch reclamation (periodic global sweep on low-load) -> temporarily reduced fragmentation but did not eliminate leak under steady mixed churn.\n\nProposed next steps (priority order):\n1) Implement a lightweight deferred-free pump in the runtime: free callbacks will enqueue to a low-latency reclamation worker pinned to a high-priority stream capable of processing async frees without major scheduling inversion. Target: process frees within 100ms under normal load.\n2) Add a small-pool fragmentation metric exposed in Console: percent of pool blocks below 2x average utilization per-size-class and count of single-slab non-coalesced blocks. This will allow alerting for gradual drift.\n3) Modify KV eviction to batch tiny evictions into grouped reclaim operations (aggregate and free N entries in single operation) to reduce number of tiny allocations/frees crossing streams.\n4) Add a runtime config knob: \"aggressive_small_slab_return\" that will force the allocator to return idle small slabs back to the CUDA pool earlier when residency exceeds threshold; guarded by telemetry and default off.\n5) Create e2e test harness that runs mixed workload for 24h in CI infra (nightly job) and fails if GPU RSS growth > 5% or fragmentation metric crosses threshold.\n\nAcceptance criteria:\n- Reproducer no longer shows steady-state RSS drift after 12 hours in 95% of runs on both A100 and H100 nodes with continuous mixed workload.\n- Console fragmentation metric reported and dashboard created; regression alerting wired to SLO channel.\n- Patch implementing deferred-free pump and grouped KV eviction in runtime landed behind feature flags and validated on a canary pool with no >5% throughput regressions on high-volume tests.\n\nRisks / trade-offs:\n- Processing frees on a higher-priority reclamation worker risks adding jitter to inference streams if reclamation work saturates the stream \u2014 mitigate by rate limiting and accounting.\n- Returning small slabs to CUDA pool more aggressively may increase allocation churn and slightly raise p50 latency for cold requests; we will gate with feature flag and telemetry.\n\nArtifacts / links:\n- Reproducer script + harness: https://github.com/redwood-inference/runtime/blob/eng/allocator/repro/mixed_kv_repro.sh\n- Trace sample (nvtx + CUPTI snapshot): https://drive.google.com/drive/fake-trace-482621\n- Design doc: https://docs.redwood.ai/confluence/display/RUNTIME/Small+Slab+Reclamation+Design (draft)\n- PR (draft): https://github.com/redwood-inference/runtime/pull/1438\n\nNotes / follow-ups:\n- Coordinate with infra to run overnight canaries on dedicated fleet (request sent to infra-team on 2026-03-03).\n- If deferred-free pump reduces leakage, follow up with tuned slab compaction heuristic that is lock-free (work with allocator library upstream).\n\nOwner / contacts:\n- Primary: Aisha Raman (assignee)\n- Secondary: Diego Soto (creator), Jun Park (allocator lead), Priya Menon (KV cache owner)\n\nUpdate log:\n- 2026-02-28: Ticket opened after initial customer-facing canary showed RSS drift.\n- 2026-03-03: Reproducer validated across two node types; experiment designs added.\n- 2026-03-09: Deferred-free pump prototype merged to feature branch for internal validation.\n- 2026-03-12: Early results: prototype reduces orphan slab count by ~60% in 4h run; p99 latency for sparse requests increased by ~2ms.\n\nNext milestone: \"deferred-free pump\" canary rollout (runtime-1.22-canary) scheduled for 2026-03-18.",
+  "notes": "Please add any test outputs, traces, or PR links as plain strings in this ticket. If you cannot reproduce, include node type and job config used.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_2d9b7197a701488c8ebac33ff63543d7"
+}

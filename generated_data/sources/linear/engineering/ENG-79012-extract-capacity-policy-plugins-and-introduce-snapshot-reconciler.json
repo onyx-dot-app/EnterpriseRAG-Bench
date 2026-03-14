@@ -1,0 +1,47 @@
+{
+  "key": "ENG-79012",
+  "team": "engineering",
+  "title": "Extract capacity policy plugins and introduce snapshot reconciler for safer node lifecycle changes",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-03-01",
+  "creator": "Maya Chen",
+  "assignee": "Liam O'Connor",
+  "project": "GPU Fleet Stability",
+  "cycle": "2026-W05",
+  "estimate": "8",
+  "due_date": "2026-03-15",
+  "labels": [
+    "tech-debt",
+    "autoscaler",
+    "capacity-planner",
+    "node-lifecycle",
+    "observability"
+  ],
+  "description": "Summary:\nWe need to reduce fragile coupling in the capacity planner and node lifecycle controller so we can iterate on policy heuristics without risk of fleet-wide regressions. This ticket extracts capacity decision logic into a plugin interface (capacity policy plugins) and implements a read-only \"snapshot reconciler\" that can run in shadow mode to validate decisions before they are applied in production. The change also prepares the codebase for a staged rollout of new preemption and eviction heuristics for preemptible GPUs.\n\nBackground / motivation:\nCurrent capacity planner mixes low-level provisioning concerns (leases, node creation/teardown, provider APIs) with high-level policy heuristics (when to scale up/down, balancing across pools, preemptible preference). That tight coupling makes small policy tweaks risky and requires long feature flags for rollbacks. Additionally, node lifecycle reconciliation has been an origin of several incidents where an unexpected provisioning loop caused transient capacity loss (see ENG-27654 and ENG-37256 for incident traces).\n\nGoals:\n- Introduce a capacity policy plugin interface so multiple heuristic implementations (current, predictive, cost-aware) can coexist and be A/B tested.\n- Implement a snapshot (shadow) reconciler that consumes real cluster state and emits decisions to a dry-run endpoint and to local test harnesses.\n- Add safety gates (rate limits, confidence scoring) so plugin decisions are gated before being applied by the live reconciler.\n- Add observability around policy divergence (shadow vs live decisions) and slow reconciliation loops.\n\nNon-goals:\n- Rewriting provider adapters or cluster provisioning backends (this ticket scopes only policy extraction and shadow validation).\n\nDesign overview:\n1) CapacityPolicy interface: a minimal interface with methods: EvaluateScale(candidateClusterState) -> Decision, and Metadata() -> {name, version}. Implementations must be pure functions with deterministic outputs for a given input.\n2) Plugin loader: simple registration model (static for now) with plans to load dynamic plugins later. The default plugin will wrap existing planner logic (thin adapter) so behavior is unchanged initially.\n3) Snapshot reconciler: a new controller that subscribes to the same cluster state feed as the live reconciler but runs in read-only mode. It will call the enabled policy plugin(s) and emit a dry-run decision object to a k/v store and to the metrics pipeline.\n4) Safety gates: decisions are scored for confidence. Confidence is a heuristic combining historical error of the plugin, fraction of nodes with inconsistent leases, and rate-of-change of queued requests. If confidence < threshold, the live reconciler will either reject the decision or fallback to the legacy planner.\n5) Observability: new metrics: policy_divergence_count, shadow_decisions_total, policy_confidence_score (gauge), reconcile_latency_histogram, lease_stall_rate. Dashboards and alert thresholds will be created in Console.\n\nProgress updates:\n- 2026-02-12: Spike completed. Prototyped minimal CapacityPolicy interface and adapter for existing planner. Wrote local test harness that replays historical cluster snapshots. Found two non-deterministic spots in current planner (use of time.Now() in cost smoothing and a map iteration dependency). Logged follow-up ENG-79013 to remove time.Now() calls.\n- 2026-02-18: Implemented initial plugin adapter and wired shadow reconciler to read state from the cluster state feed. Shadow reconciler emits dry-run artifacts to /tmp and increments Prometheus metrics.\n- 2026-02-22: Integration test against staging cluster revealed a sync race where shadow reconciler processed state at the same time as live reconciler but with slightly older KV leases; added a short (250ms) jitter to improve determinism.\n- 2026-02-25: UX for policy management in Console sketched (PM + Design consulted). Decided to keep policy selection as an infra-only flag for the first rollout; full Console controls deferred.\n- 2026-02-28: Security review request submitted for the snapshot artifacts path (PR: https://github.com/redwood-inference/fleet-manager/pull/1482).\n\nOpen PRs and artifacts:\n- Design doc (Confluence): https://confluence.redwood.ai/display/INF/Capacity+Policy+Plugins+and+Snapshot+Reconciler\n- Spike branch: https://github.com/redwood-inference/fleet-manager/compare/spike/capacity-plugins\n- Draft PR (shadow reconciler): https://github.com/redwood-inference/fleet-manager/pull/1482 (WIP)\n- Test harness replay dataset (GDrive): https://drive.redwood.ai/drive/folders/1A2B3-capacity-replay\n\nRollout plan / safety:\n1) Merge plugin interface and adapter with feature flag off in live reconciler. Deploy to staging.\n2) Deploy snapshot reconciler in staging, run for 72h against synthetic traffic and 2 weeks replay pass. Verify shadow vs live divergence < 2% and no false-positive scale-downs in staging.\n3) Enable shadow reconciler in production (read-only) with metric dashboards and an alert when divergence > 5%. Run for 48h.\n4) Enable safety gates in live reconciler but default to fallback behavior (use legacy planner when confidence < 0.7). Monitor for 1 week and collect rollback telemetry.\n5) Flip default to plugin-based planner for one GPU pool (canary), monitor for 2 weeks, then expand.\n\nTest plan:\n- Unit tests for CapacityPolicy implementations and deterministic replay of snapshots.\n- Integration tests where shadow reconciler runs alongside live reconciler in a small e2e environment (k8s-in-docker).\n- Load test: simulate 10k concurrent small requests that historically caused lease contention and verify no increase in reconciliation errors.\n- Chaos test: randomly kill manager pods and verify shadow reconcilers tolerate transient leader elections without applying decisions.\n\nMonitoring and success criteria:\n- policy_divergence_count < 5% in staging and < 10% in early production canary.\n- reconcile_latency_p50 < 150ms and p99 < 1s.\n- lease_stall_rate reduced by 25% after we deploy gated decisions and remove the pathological provisioning loop.\n\nRisks and mitigations:\n- Risk: Shadow reconciler sees slightly different state than live reconciler leading to noise. Mitigation: use replayed snapshot window and score decisions by staleness; add jitter to align processing windows.\n- Risk: New plugin introduces a regression causing large scale-downs. Mitigation: confidence gates + forced fallback to legacy planner + canary on single pool.\n- Risk: Increased operational complexity. Mitigation: keep plugin API small, add clear docs, and batch smaller changes into follow-up tickets.\n\nRelated tickets / dependencies:\n- ENG-27654 (node lifecycle incidents) \u2014 referenced for incident analysis\n- ENG-37256 (capacity planner decomposition) \u2014 prior work that extracted some plumbing\n- ENG-79013 (follow-up: remove non-deterministic time calls from planner) \u2014 created during spike\n\nNext steps (this week):\n- Finish PR #1482: add CI tests and resolve lint failures (assigned Liam).\n- Add Prometheus export for policy_confidence_score and wire to Console dashboard (assigned Maya).\n- Prepare A/B test harness to compare current planner vs plugin outputs on 7 days of replay data (blocked on GDrive dataset access until 2026-03-03).\n\nIf blocked or questions: ping @maya.chen or @liam.oconnor on Slack.\n",
+  "comments": [
+    "2026-02-12 - Maya Chen: Spike found two sources of non-determinism (time.Now smoothing + map iteration). Filing ENG-79013 to address the timer usage.",
+    "2026-02-18 - Nisha Patel (PM): Sketch looks good; keep Console controls out of scope for initial rollouts. We want infra-first visibility before productizing.",
+    "2026-02-22 - Andrej Novak (Reviewer): Please add stronger invariants to the CapacityPolicy interface (inputs must be immutable snapshots) and include decision hashing for easier divergence detection.",
+    "2026-02-28 - Security team: We need to ensure dry-run artifacts do not contain any customer identifiers. Added a checklist item in PR #1482.",
+    "2026-03-01 - Liam O'Connor: PR updated with CI tests and removed a hidden dependency on global rand.Seed. Ready for review."
+  ],
+  "dependencies": [
+    "ENG-27654",
+    "ENG-37256",
+    "ENG-79013"
+  ],
+  "sub_issues": [
+    "ENG-79013"
+  ],
+  "release": "runtime-2.4",
+  "security_review_required": "true",
+  "customer_impact": "medium",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_a4e6150845a04dad90aeac74a4c22e51"
+}

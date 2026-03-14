@@ -1,0 +1,97 @@
+{
+  "key": "SUP-648213",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Deferred response timeouts on deep-context requests when server-side batching is enabled",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "customer_company": "Draftly",
+  "customer_tier": "dedicated",
+  "created_at": "2026-03-05",
+  "updated_at": "2026-03-09",
+  "reporter": "Aisha Patel",
+  "assignee": "Marco Liu",
+  "environment": "prod-us-east",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "batcher",
+    "kv-cache",
+    "router"
+  ],
+  "affected_models": [
+    "redwood-v1-large",
+    "open-gptx-15b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-05",
+  "first_response_due_at": "2026-03-05",
+  "labels": [
+    "timeout",
+    "long-context",
+    "batching",
+    "customer-impact"
+  ],
+  "linked_issues": [
+    "SUP-29541",
+    "SUP-53721"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving/pull/9821"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/Long+Context+Timeouts+Runbook"
+  ],
+  "description": "Issue summary: Customer reports a pattern of streaming responses that begin normally for very long prompts (deep contexts + large max_tokens) but then stall for a prolonged period and eventually time out or result in a client connection reset. Impact: customer Draftly (Dedicated) experiences frequent content-generation failures for batch jobs that synthesize large documents, blocking workflows and causing SLA alerts.\n\nObserved behaviour: initial tokens stream out, then a long pause (~45-90s) with no bytes emitted, followed by either 504 from edge or TCP RST observed by the customer. This occurs only when server-side batching is enabled on the route and for requests with large context + max_tokens (examples below).\n\nBusiness impact: blocking for Draftly's nightly batch document generation; several failed jobs reported, customer escalated to account team.",
+  "steps_to_reproduce": [
+    "Create a request to /v1/generate with model=redwood-v1-large and batching=true",
+    "Compose prompt ~28k tokens of combined system+history and request max_tokens=120000",
+    "Send request via streaming websocket or SSE client that keeps keepalive enabled",
+    "Observe initial stream chunks for first 5-10 tokens, then stall for 45-90s, then client observes RST or server returns 504",
+    "Repeat with batching disabled: request completes (very slow) but does not hit the stall pattern"
+  ],
+  "logs": [
+    "2026-03-05T03:12:14Z request_id=kc-7b4f2 customer=Draftly route=/generate model=redwood-v1-large batching=true context_tokens=28234 max_tokens=120000 status=streaming_started",
+    "2026-03-05T03:12:19Z request_id=kc-7b4f2 serving-runtime: emitted 12 tokens latency_ms=120",
+    "2026-03-05T03:13:05Z request_id=kc-7b4f2 batcher: request 0 delayed for 46s waiting for batch window (window_ms=50) reason=kv_prefetch_lock",
+    "2026-03-05T03:13:05Z request_id=kc-7b4f2 scheduler: kernel-swap detected for GPU node gpu-46 action=preempt candidate=lower-priority-batch",
+    "2026-03-05T03:13:20Z request_id=kc-7b4f2 api-gateway: upstream timeout 504 after 65s while waiting for response",
+    "Customer-side tcpdump: 03:13:21.123 RST from 52.14.9.11 to client 10.2.1.44"
+  ],
+  "comments": [
+    "2026-03-05 03:25 - Aisha Patel (Support): Logged initial report and requested request_id and sample payloads from customer. Escalated to SRE and assigned to Marco.",
+    "2026-03-05 03:40 - Rajiv Menon (Draftly): Provided three failing request_ids and a minimal repro script. Noted that toggling batching=false avoided the timeout.",
+    "2026-03-05 04:05 - Elena Gomez (SRE): Acknowledged receipt, started tracing through batcher and scheduler logs for gpu-46 cluster. Noted several kernel preemptions around the same timestamp.",
+    "2026-03-06 09:12 - Marco Liu (Oncall): Reproduced locally against a staging pool using customer's payload. Observed batching-induced queuing with kv-cache prefetch lock while large context triggered kernel swap. Created temporary route override to disable continuous batching for requests with context_tokens > 25000.",
+    "2026-03-07 14:30 - Rajiv Menon (Draftly): Confirmed that after route override their nightly jobs completed successfully; asked for root cause and permanent fix ETA.",
+    "2026-03-09 11:02 - Marco Liu (Support): Noted that a scheduler patch has been prepared to reduce kernel-swap preemption for long-context batches and to add an explicit bypass for requests with very large max_tokens. Rolling to canary tonight."
+  ],
+  "investigation_notes": [
+    "Hypothesis 1: Batcher is grouping long-context requests which trigger heavy kv-prefetch and kernel work; combined with kernel swap policy this caused those requests to be preempted and queued behind other work, resulting in long stalls and edge timeouts.",
+    "Hypothesis 2: Continuous batching window logic (50ms) has a path where kv-cache locks are held into the scheduling decision, causing a dead-time when a later batch member induces a kernel swap.",
+    "Finding: Correlated events in node gpu-46 show kernel-preemption events coincident with stalled request_ids. Batcher log shows request moved to pending queue with reason=kv_prefetch_lock and wait durations matching customer-observed stall time.",
+    "Reproduction: Staging run with batching=true and context_tokens >25000 produced identical stall pattern. Disabling batching completed the same payload without the stall (long but steady throughput).",
+    "Temporary mitigation: Route override to disable batching for requests where context_tokens > 25000 or max_tokens > 80000. This reduced customer failures to zero for the observed jobs.",
+    "Root cause (provisional): Interaction between batched KV prefetch locking and kernel-swap preemption on nodes with mixed-priority workloads. When a batched request requires a kernel that causes a swap, the batcher holds the slot and waits while the node preempts; other batch members remain blocked leading to a long stall rather than fast failover to a fallback model.",
+    "Next steps: harden batcher to detect long-context members and either schedule them to isolated pools or run them unbatched; adjust kernel-swap policy to avoid preempting long-running inference kernels; add observability metric for batch-member wait time and kv-lock durations."
+  ],
+  "resolution": [
+    "Workaround implemented 2026-03-06: route override to disable batching for large-context requests for Draftly's dedicated pool. This restored nightly job success while patch progressed.",
+    "Fix in progress: scheduler/batcher patch to skip batching for requests meeting large-context thresholds and to avoid holding kv-cache locks across preemption windows. PR #9821 opened and under code review. Canary rollout scheduled 2026-03-09 22:00 UTC.",
+    "Customer communication: Informed Draftly that a temporary workaround is in place and provided ETA for canary and full rollout. Offered support to keep route override until full rollout completes.",
+    "Follow-ups: (1) Add automated integration test for batching with large-context payloads. (2) Update runbook to include batching bypass for dedicated pools handling >25k context tokens. (3) Postmortem to be written after stable rollout."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_c97cb2915bd341ee8304dcad690b63cc"
+}

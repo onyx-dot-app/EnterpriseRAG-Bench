@@ -1,0 +1,115 @@
+{
+  "key": "INT-910377",
+  "project": "internal-support",
+  "issue_type": "Bug",
+  "summary": "Temporal priority decay computation miscalibration causing stale SLA priorities",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev2",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-05",
+  "reporter": "Priya Menon",
+  "assignee": "David Chen",
+  "components": [
+    "sla-service",
+    "routing-engine",
+    "template-compiler",
+    "reporting"
+  ],
+  "labels": [
+    "sla",
+    "routing",
+    "templating",
+    "investigation",
+    "time-series"
+  ],
+  "environment": [
+    "prod-us-east",
+    "prod-eu-west"
+  ],
+  "linked_issues": [
+    "INT-223401",
+    "INT-34123"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/platform/pull/5421",
+    "github.com/redwood-inference/sla-service/pull/218"
+  ],
+  "related_confluence_pages": [
+    "Confluence: SLA Decay Design",
+    "Confluence: Routing Macros Runbook"
+  ],
+  "description": "Issue summary: The background 'temporal priority decay' job that lowers ticket routing priority over time is producing incorrect decay values across multiple templated routing cohorts. Impact: Tickets remain at high-priority longer than intended, causing skewed routing to SRE/Oncall and elevated workload in specific escalation cohorts. This also contaminates weekly SLA reports and inflates mean time to respond metrics.\n\nEnvironment: Observed in prod-us-east and prod-eu-west. Affected subsystems: sla-service (decay calculator), routing-engine (priority application), template-compiler (cohort binding).\n\nObserved behaviour: Decay curve values are ~3x slower than expected for tickets created after 2026-02-28 02:00 UTC; some cohorts show no decay for 12+ hours. Expected behaviour: Decay should follow configured half-life windows per-template (e.g., 6-hour half-life for P1->P2).\n\nInitial detection: Weekly SLA report (2026-03-01) flagged a jump in P1 open-ticket median age; on-call flagged unusual manual escalations.\n\nWhy this is unique: Unlike previous routing-template drift tickets, this appears tied to timebase calculation and leader-election interactions causing double-application of timezone normalization logic for cohorts created near DST boundary and for templates created by the new template-authoring flow (template-compiler v2).",
+  "steps_to_reproduce": [
+    "1) Create a test routing template with a temporal-priority-decay window: half_life_hours=6 and cohort tag=prod-escalation-test",
+    "2) Create several tickets with created_at timestamps near a DST/UTC boundary (e.g., 2026-02-28 01:30 UTC to 03:30 UTC), assign cohort tag",
+    "3) Observe decay job runs (scheduled every 10 minutes) and record computed priority at T+1h, T+3h, T+6h",
+    "4) Expect exponential decay per half-life; actual values show near-linear or no change for some cohorts",
+    "5) Reconcile logs from sla-service and routing-engine to see if normalized_timestamp or local_timestamp used twice"
+  ],
+  "logs": [
+    "2026-03-01T02:10:00Z sla-service DECAY computed cohort=prod-escalation-test ticket=SUP-xxxx old_priority=1 computed_priority=1 (expected 1->1 or 0.79)",
+    "2026-03-01T02:20:00Z sla-service DECAY cohort=prod-escalation-test debug normalized_timestamp=2026-02-28T01:20:00-01:00 local_timestamp=2026-02-28T02:20:00+00:00",
+    "2026-03-01T02:20:15Z routing-engine APPLY_PRIORITY cohort=prod-escalation-test ticket=SUP-xxxx applied_priority=1 source=decay-job",
+    "2026-03-01T02:20:20Z leader-election sla-service info acquired_leader=true pod=slasvc-2",
+    "2026-03-01T02:20:30Z sla-service DECAY computed cohort=prod-escalation-test ticket=SUP-xxxx computed_priority=1 (recomputed by pod slasvc-1)"
+  ],
+  "investigation_notes": [
+    "2026-03-01 09:15 - Support (Priya): Noted replication in prod, created a synthetic cohort and observed same no-decay symptom.",
+    "2026-03-01 11:00 - SRE (David): Pulled logs and saw two decay computations close together; hypothesis: leader-election race caused two pods to run decay for overlapping ticket ranges.",
+    "2026-03-01 13:40 - Platform Eng (Ana Rodriguez): Found commit in template-compiler v2 that changes template creation timezone metadata to 'local_tz' instead of 'utc' (PR referenced). This metadata is consumed by sla-service and may result in double-normalization.",
+    "2026-03-02 08:30 - Analytics (Mark Li): Weekly report query shows cohorts created after the template-compiler v2 migration show the highest discrepancy; older templates behave normally.",
+    "2026-03-03 15:20 - Hypothesis A: Two contributions combine to produce the symptom: (1) template metadata includes local_tz causing sla-service to apply a timezone shift, (2) leader-election race causes both old and new pods to run decay without de-duplication for a short window, leading to inconsistent window anchors.",
+    "2026-03-04 10:10 - Reproduction attempt: Ran decay job in staging with leader election disabled \u2014 decay values matched expected half-life. Re-enabled leader election and reproduced failure pattern.",
+    "2026-03-04 14:05 - Data dump: Extracted 72h of decay computation traces and grouped by pod_id; found 2.2% of tickets had overlapping computations within the same 10-min window. Overlap correlates strongly with templates created by template-compiler v2."
+  ],
+  "analysis": [
+    "Root causes identified so far:",
+    "- Template metadata change (local_tz instead of utc) introduced in template-compiler v2 causes sla-service to apply an extra timezone normalization in some code paths.",
+    "- Leader-election race condition allows short windows where multiple pods may run decay job for the same cohort due to sharding key changes during pod churn.",
+    "- Combination results in anchor timestamps drifting and effectively resetting decay counters for affected tickets, appearing as stalled decay.",
+    "Edge cases considered:",
+    "- DST transitions and manual template migrations exacerbate the mismatch; tickets created exactly in the impacted window have highest failure rate.",
+    "- Race only manifests when pods with differing template-parsing code co-exist (rollout partials)."
+  ],
+  "workaround": [
+    "1) Temporarily disable template-compiler v2 feature flag for new template creation to stop new templates from carrying local_tz metadata (frontend toggle done 2026-03-02 18:00 UTC).",
+    "2) Backfill: Run a one-off decay-correction job that recomputes priority using canonical UTC anchor for cohorts in the impacted time range (job scheduled 2026-03-03 02:00 UTC).",
+    "3) Short-term: Increase decay job leader lease timeout to reduce overlaps until a code fix is deployed (config change applied to prod 2026-03-04 04:00 UTC)."
+  ],
+  "next_steps": [
+    "1) Patch sla-service to canonicalize template timezone at ingest boundary and ensure idempotent decay computations (owner: David Chen, ETA: 2026-03-08).",
+    "2) Add de-duplication guard in decay scheduler keyed by (cohort, window_anchor) with an atomic lease (owner: SRE, ETA: 2026-03-07).",
+    "3) Add end-to-end tests covering DST and leader-election churn in the sla-service integration suite (owner: Platform Eng, ETA: 2026-03-15).",
+    "4) Update reporting query to exclude or mark cohorts created during migration window until backfill completes (owner: Analytics, ETA: 2026-03-06).",
+    "5) Post-mortem and runbook update: Document this class of failure and remediation steps; notify support and on-call rotation (owner: Priya Menon, ETA: 2026-03-10)."
+  ],
+  "comments": [
+    "Priya Menon (2026-03-01): Initial ticket created after weekly report flagged P1 median age spike. Included synthetic cohort for reproduction.",
+    "David Chen (2026-03-01): I see duplicate decay runs in logs. Assigning to myself to triage and gather traces. Linking to INT-223401 which touched scheduler changes.",
+    "Ana Rodriguez (2026-03-02): Noted template metadata change in template-compiler v2 (PR referenced). Will coordinate to disable the flag temporarily.",
+    "Mark Li (2026-03-03): Analytics QA confirmed cohort discrepancy; will prepare report slices for templates-by-compiler-version.",
+    "SRE-Team (2026-03-04): Increased leader lease TTL to 30s in prod as protective measure; monitoring for overlaps."
+  ],
+  "resolution": "Mitigation applied: template v2 flag disabled and leader lease increased. A code patch to canonicalize timezone and add decay job de-duplication is in review (PR referenced). Backfill job scheduled and running. Final verification pending post-deploy metrics.",
+  "resolution_date": "",
+  "notes": [
+    "Escalation channel: #internal-support and #platform-ops",
+    "Potential follow-ups: audit template migrations for similar metadata drift, add template-compiler version to cohort telemetry.",
+    "Business impact: moderate \u2014 misrouted workload increases oncall fatigue and contaminates operational metrics; no customer-facing outage reported."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "analysis",
+    "workaround",
+    "next_steps",
+    "comments",
+    "resolution",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_c708020a9f044bec85e4b39f68b8c481"
+}

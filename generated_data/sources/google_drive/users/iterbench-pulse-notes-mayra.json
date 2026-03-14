@@ -1,0 +1,32 @@
+{
+  "title": "Iterbench pulse: batcher-window sweep & tail characterization",
+  "owner": "Mayra Singh",
+  "drive_area": "users",
+  "path": "users/perf-scratch/iterbench-pulse-notes-mayra",
+  "doc_type": "doc",
+  "created_at": "2024-11-07",
+  "last_modified": "2024-11-20",
+  "collaborators": [
+    "Arjun Rao",
+    "Lina Zhao"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "throughput",
+    "p99",
+    "batching",
+    "warmup"
+  ],
+  "linked_artifacts": [
+    "JIRA-ENG-2148",
+    "github.com/redwood-inference/runtime/pull/392"
+  ],
+  "content": "Quick notes from a light-weight iteration bench (personal scratchpad). Goal: validate the new batching window heuristic (adaptive-window) vs the baseline fixed-window (12ms) on medium bursty load and capture tail behaviors + warmup penalty.\n\nSummary/claim: adaptive-window reduced p99 by ~18\u201322% at 200\u2013500 qps for mixed short/long requests with modest impact on p50. However, we still see discrete tail spikes correlated with collector cycles and occasional kernel wakeups at very low concurrency.\n\nExperiment context\n- node image: rwinf-prod-runtime:v2024-10-29-experiments\n- model: llama-13b-8bit-q4 (quantized test build)\n- sequence length: 512 prompt + 256 generation (avg tokens 420)\n- hardware: 1x A10G, 32GB; pinned to CUDA device 0\n- runtime flags: --batcher=adaptive-window --window-min-ms=2 --window-max-ms=20 --max-batch=64\n- baseline flags: --batcher=fixed-window --window-ms=12 --max-batch=64\n- client: wrk2 (kept arrival rate steady), payloads: mix_short (50% 8 tokens), mix_long (50% 160 tokens)\n- runs: 3 warm runs + 5 samples each point; each sample = 10m steady phase + 2m cooldown\n\nKey commands (repro)\n- start runtime (adaptive): ./run_server.sh --model=llama-13b-q4 --flags=\"--batcher adaptive-window --window-min-ms 2 --window-max-ms 20\" &\n- wrk2: wrk2 -t8 -c200 -d600s -R200 --script=payload_mix.lua http://localhost:8080/generate\n\nAggregate numbers (median across samples)\n- QPS target: 200, 350, 500\n\nBaseline (fixed 12ms):\n- qps=200: p50=38ms, p95=142ms, p99=312ms, tokens/sec (server)=77k, GPU util=62%\n- qps=350: p50=53ms, p95=220ms, p99=470ms, tokens/sec=132k, GPU util=78%\n- qps=500: p50=71ms, p95=320ms, p99=840ms, tokens/sec=186k, GPU util=92%\n\nAdaptive-window:\n- qps=200: p50=41ms, p95=122ms, p99=255ms, tokens/sec=79k, GPU util=65%\n- qps=350: p50=56ms, p95=185ms, p99=370ms, tokens/sec=136k, GPU util=82%\n- qps=500: p50=74ms, p95=290ms, p99=690ms, tokens/sec=188k, GPU util=94%\n\nObservations:\n- p99 improvement is consistent across points (18\u201322% reduction) for adaptive. Biggest win at mid QPS (350).\n- p50 slightly increases (~5\u20138ms) under adaptive; likely due to waiting window being slightly larger for coalescing small requests. Tradeoff expected.\n- tokens/sec and GPU util increased slightly with adaptive (better packing -> higher throughput).\n- At qps=500 tail still grows (p99 ~690ms) \u2014 likely saturation + occasional long kernel wakeups. Need to investigate kernel latencies + driver-level jitter.\n\nTail analysis (traces + sampling)\n- captured 1s histograms and stack-sampled traces during worst tails. Two dominant patterns:\n  1) long syscall blocking in NVML driver around GPU memory accounting (20\u201360ms) \u2014 infrequent but visible; correlates with OS-level nv-hostcalls.\n  2) occasional Python GC pause in the control-plane process when trace/span aggregation spikes (10\u201340ms). We saw p99 spikes aligned with trace flush intervals.\n\nWarmup behavior\n- cold-to-steady: first 30s show increased p95/p99 (cache misses for KV cache priming + initial CUDA kernel compilation). Adaptive-window slightly worsened the first few seconds for tiny bursts because it lets a few tiny requests wait to fill batches -> measured as larger absolutes. Mitigation: small startup fast-path (window-min-ms=1 for first 45s) seems to help.\n\nNotes / hypotheses\n- Hypothesis A: reduce p99 further by jittering batch release slightly (random between min and computed window) to avoid aligned kernel wakeups.\n- Hypothesis B: move trace aggregation off the hot path or throttle flushes under load to avoid GC-induced tailing.\n- Hypothesis C: investigate kernel driver NVML settings or upgrade driver to newer minor that reduces nv-hostcall stalls.\n\nQuick TODOs (next local experiments)\n- [ ] Run adaptive-window + randomized-release (seeded) at qps=350/500 and collect p99 histograms (MUST sample 10m).\n- [ ] Add controlled stress on trace aggregator: toggle TRACE_LEVEL sampling to mimic prod and measure delta.\n- [ ] Re-run with --window-max-ms=12 (tighter cap) to measure midpoint tradeoff.\n- [ ] Create lightweight evict/prime script to pre-warm CUDA kernels before client arrival (warmup helper).\n\nSlack references and context\n- Posted initial numbers in #eng-serving-runtime (thread: \"iterbench adaptive window results\") \u2014 Arjun saw similar on his A40 host but with slightly lower GC noise.\n- Related PR: github.com/redwood-inference/runtime/pull/392 (adaptive-window proto).\n- Relevant JIRA: JIRA-ENG-2148 (batcher tuning epic).\n\nMisc scribbles (notes-to-self)\n- watch for too-high window-min (2ms is borderline for low-latency clients). Try 1ms early-fastpath.\n- consider a hybrid: small-requests shortcut if estimated service latency < 30ms (fastpath).\n- log-level: enable fine tracing only during tail sampling windows to avoid extra overhead in steady-state.\n\nConclusion (working): adaptive-window looks promising for unit economics (more tokens/sec) and tail reduction across typical burst ranges. Need focused tail-hunting for kernel/GC sources before promoting as default. For next demo to product, prepare a short deck showing p99 reductions + cost-per-token delta.\n\nAppendix: lightweight ascii histogram (qps=350, adaptive, 10m sample)\n[>-- latency buckets (ms) --]<br>\n0-20: ************** (p10)\n20-50: *********************** (p25-p50)\n50-120: **************** (p75)\n120-250: ****** (p95)\n250-500: ** (p99)\n500+: * (outliers)\n\nEnd of notes.\n\n-- mayra (quick scratch, save to drive, iterate)",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_90896a5d6a9b470caa555b1391743502"
+}

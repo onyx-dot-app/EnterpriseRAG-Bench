@@ -1,0 +1,61 @@
+{
+  "key": "ENG-553322",
+  "team": "engineering",
+  "title": "Client telemetry\u2013driven backpressure, prefetch cancellation, and ephemeral-orchestration",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-02-12",
+  "updated_at": "2025-03-05",
+  "creator": "Maya Chen",
+  "assignee": "Diego Mart\u00ednez",
+  "project": "streaming-reliability",
+  "cycle": "2025-W10",
+  "estimate": "5",
+  "due_date": "2025-03-15",
+  "labels": [
+    "streaming",
+    "backpressure",
+    "telemetry",
+    "kv-cache",
+    "slo",
+    "function-calling"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Context:\nRedwood's streaming API must handle a wide range of client behaviors (abrupt disconnects, slow consumers, intermittent reconnects) while preserving throughput and keeping unit cost low. Current heuristics for orphaned partial generations and prefetch cancellation are reactive and coarse: long TTLs for ephemeral outputs and conservative prefetch retention lead to wasted GPU cycles and KV cache pressure in high-concurrency workloads.\n\nProblem statement:\n- Clients may disconnect mid-generation (network flaps, app crashes) leaving partial outputs and pinned KV prefixes.\n- Preemptive prefetching (for tool calls and function-call structured outputs) holds resources; when clients never resume, these resources should be reclaimed quickly.\n- Backpressure decisions are currently based on fixed windows; we need more granular telemetry-informed eviction and graceful client cutoffs to reduce cost and meet tail-latency SLOs.\n\nGoals:\n- Use client telemetry (heartbeat frequency, reconnect probability, prior-resume-history) to drive adaptive TTLs and prefetch cancellation decisions.\n- Introduce an ephemeral-orchestration layer that tracks prefetched resources and partial generations with lightweight leases that can be revoked when probability of resume drops below a threshold.\n- Reduce wasted GPU/kv-cache time for non-resuming clients by 40% in spike scenarios while keeping resume success rate > 95% for healthy clients.\n\nNon-goals:\n- Not rearchitecting the serving runtime kernel selection; this is an orchestration/metadata layer and policy change only.\n- Not changing public SDK semantics for stream ordering or function-call atomicity; compatibility shims will preserve existing guarantees.\n\nAcceptance criteria (high-level):\n- New telemetry-driven TTL policy is enabled behind a feature flag and observable.\n- We have metrics for orphaned-prefetch-time, reclaimed-prefetch-count, resume-success-rate, and cost-saved-estimate.\n- Integration tests validate resume behavior with simulated reconnects and abrupt disconnects for function-call and structured-output flows.\n- No regressions in 95th/99th percentile token latency for steady-state traffic.\n\nDesign proposals (options considered):\nA) Heuristic TTL buckets: maintain multiple static TTL buckets based on client tier and last-heartbeat. Simple but coarse.\nB) Probabilistic lease revocation: compute a small state machine per client-stream that estimates P(resume | last_n_heartbeats, historical_resume_rate, client-tier). Revoke leases when P < threshold.\nC) Hybrid: use fast lightweight model (logistic regression) with features from telemetry to make revocation decisions; fallback to static bucket if telemetry missing.\n\nChosen approach: Hybrid probabilistic lease revocation (C). Rationale: balances accuracy and runtime cost; degrades gracefully when telemetry is sparse. Implementation uses a tiny logistic classifier executed in the control plane (no external ML infra) with tunable coefficients.\n\nData & features for classifier (all telemetry fields are optional):\n- time_since_last_heartbeat_seconds\n- heartbeats_per_minute (recent window)\n- reconnect_attempts_in_session\n- historical_resume_rate_for_key (decayed per-customer metric)\n- client_sdk_version (compat shim: older SDKs default to conservative TTLs)\n- route_priority (hosted vs dedicated)\n\nLease model and state transitions:\n- When generation begins, allocate an ephemeral lease record with initial TTL = base_ttl(route_priority).\n- Each successful heartbeat extends lease by heartbeat_extend_seconds up to max_ttl_for_tier.\n- On disconnect: evaluate P(resume). If P >= resume_threshold, keep lease until base_disconnected_ttl; otherwise mark for prefetch-cancel and schedule immediate reclaim (fast-path).\n- Stale-lease reclamation job runs every 30s for fast reclamations and daily for long-tail collectors.\n\nPrefetch cancellation specifics (tool/function calling):\n- Prefetches associated with a generation are grouped under the lease id. If lease revocation occurs, issue prefetch-cancel to the prefetch subsystem and decrement prefetched_resource_counter.\n- For function-call shims that require atomicity, we keep a short grace window (atomic_grace_ms) to allow in-flight tool responses to be committed to logs before revocation.\n\nKV cache and kernel pressure mitigation:\n- When a lease is revoked, mark associated KV prefixes eligible for soft-eviction and tag them with metadata \"revoked_at\" + lease_age. This allows the serving plane to evict low-value prefixes preferentially.\n- Add a sampling probe for prefix usage after revocation: if a revoked prefix is frequently accessed again within short time, increase historical_resume_rate_for_key for that customer.\n\nCompatibility / SDK implications:\n- Older SDKs that don't send explicit heartbeats will be treated conservatively: longer default TTLs and fewer prefetch cancellations.\n- SDKs that implement new heartbeat/telemetry fields gain better economics and faster reclamation.\n- Documented behavior: no change to final generation fidelity or structured-function-call guarantees when resume occurs; revocation only affects resource retention, not committed outputs.\n\nObservability & instrumentation (must ship with feature):\n- Metrics (per-route and global): orphaned_prefetch_seconds_histogram, revoked_leases_count, reclaimed_gpu_seconds, resume_success_ratio_by_tier.\n- Tracing: generate leaseLifecycle spans with tags {lease_id, decision, p_resume, revoked_by}.\n- Dashboards: streaming-reclaim overview and customer-impact drilldown.\n- Alerts: if resume_success_ratio drops > 5% from baseline within 1h after rollout, page SRE.\n\nTesting strategy:\n- Unit: classifier decision tests, lease TTL edge cases, prefetch-cancel handshake.\n- Integration: synthetic client harness that simulates 10k concurrent streams with configurable disconnect patterns; assert reclaimed resources and resume rates.\n- Load: run in staging with production-like traffic for 24h; verify CPU/GPU usage, KV hit-rates, and latency SLOs.\n\nRollout plan:\n1) Canary (2% traffic, hosted only) with feature flag and verbose telemetry. Monitor metrics for 48h.\n2) Expand to 20% with conservative classifier coefficients for 72h.\n3) Enable for dedicated pools behind opt-in; collect enterprise customer feedback.\n4) Full rollout after successful validation and SRE signoff.\n\nOpen questions / trade-offs:\n- Threshold tuning: initial resume_threshold set to 0.12 (favor reclamation). Sales/Support may request more conservative defaults for high-value customers.\n- State storage: store ephemeral lease metadata in fast KV (redis) vs gossiping to serving nodes. Chosen: control-plane redis cluster scoped per-region for O(1) lease lookups.\n- GDPR/PII: telemetry is low-cardinality and aggregated but we need to confirm retention policy. Security review required? (set to false for now; raised to security if customer requests).\n\nImplementation tasks (tentative):\n- CONTROL-101: control-plane lease table schema + redis client integration (Diego)\n- RUNTIME-101: prefetch-cancel RPC hook and KV prefix tagging (runtime team, owner: Priya Rao)\n- SDK-telemetry-PR: heartbeat SDK spec + sample client implementation (owner: Aisha Patel)\n- TEST-101: harness for reconnect scenarios and integration test definitions (owner: Omar Ruiz)\n- OBS-101: dashboards, histograms, and tracing spans (owner: Lina Novak)\n\nNext steps (short-term):\n- Complete prototype logistic coefficients and run offline validation on 7 days of historical telemetry (ETA 2025-02-20).\n- Wire control-plane lease create/delete APIs (ETA 2025-02-28).\n- Coordinate with runtime to implement prefetch-cancel shim (ETA 2025-03-07).\n",
+  "comments": [
+    "2025-02-12 - Maya Chen: Initial ticket created after postmortem for a customer incident where bursts of mobile disconnects caused 27% uplift in GPU reservations due to long TTLs.",
+    "2025-02-18 - Diego Mart\u00ednez: Prototype logistic model trained on 14 days of telemetry. Early results show 42% reduction in reclaim latency for non-resumes with 97% resume retention on holdout set. Pushing config to control-plane staging.",
+    "2025-02-25 - Priya Rao (runtime): Implemented prefetch-cancel hook in serving runtime. Added prefetched_resource_counter metric. PR: https://github.com/redwood-inference/runtime/pull/1342",
+    "2025-03-01 - Lina Novak (obs): Dashboards created in staging; initial alert thresholds set. Observed reclaimed_gpu_seconds metric correlate with lower per-token cost in staging run.",
+    "2025-03-04 - QA: Integration harness shows one regression case where function-call responses delayed by 200ms were revoked during atomic_grace_ms window. Tuned atomic_grace_ms from 50ms to 300ms; re-ran tests."
+  ],
+  "dependencies": [
+    "ENG-821507",
+    "ENG-33411"
+  ],
+  "parent_issue": [],
+  "attachments": [
+    "https://confluence.redwood.ai/display/STREAM/telemetry-lease-design",
+    "https://drive.google.com/file/d/1Xy-example-proto/logs.zip"
+  ],
+  "reviewers": [
+    "Priya Rao",
+    "Lina Novak",
+    "Aisha Patel"
+  ],
+  "acceptance_criteria": [
+    "Feature flag toggles behaviour and is observable",
+    "Metrics: orphaned-prefetch-time reduced by >=40% in spike test",
+    "Resume success rate >=95% for healthy clients",
+    "No >5% regression in 95th token latency on canary"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "acceptance_criteria"
+  ],
+  "dataset_doc_uuid": "dsid_bcfc703fc0ba424a9bba889402d1f6c9"
+}

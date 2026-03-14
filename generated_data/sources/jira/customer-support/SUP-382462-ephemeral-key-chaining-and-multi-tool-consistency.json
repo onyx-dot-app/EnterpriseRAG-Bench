@@ -1,0 +1,102 @@
+{
+  "key": "SUP-382462",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Ephemeral auth chaining + cross-tool idempotency mismatch causes duplicated downstream side-effects",
+  "status": "Triage",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Romero",
+  "assignee": "Ben Carlson",
+  "customer_company": "NovaApps",
+  "customer_tier": "enterprise",
+  "components": [
+    "sdk-python",
+    "sdk-ts",
+    "api-gateway",
+    "webhooks",
+    "serving-runtime"
+  ],
+  "labels": [
+    "idempotency",
+    "retries",
+    "auth-refresh",
+    "multi-tool",
+    "investigation"
+  ],
+  "environment": "prod:us-west",
+  "affected_models": [
+    "vicuna-13b",
+    "mix-small-rlhf"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-11",
+  "description": "Customer reports duplicated external side-effects (multiple webhook posts and duplicated DB writes) when using ephemeral API keys that are chained across long-running multi-tool calls. Pattern observed only when (1) client performs mid-request ephemeral key rotation/refresh, (2) a long-running function/tool call is in-flight, and (3) the SDK retries the request after a transient 5xx or connection drop. Customer uses a hybrid workflow: initial orchestration in TypeScript (serverless) then delegates to a Python worker to run a long tool chain that performs external webhooks and enqueues background jobs. They see duplicate downstream actions ~10-30% of the time during scale tests.",
+  "steps_to_reproduce": [
+    "1) Create an ephemeral API key with 30s TTL and configure SDK to auto-refresh via delegated token endpoint.",
+    "2) In TypeScript serverless, start a streaming chat that invokes two tools sequentially: (A) outbound webhook POST to third-party, (B) enqueue job to internal queueing service.",
+    "3) Hand off session metadata (ephemeral token + idempotency token) to a Python background worker that invokes the same Redwood function chain (tools executed in-process).",
+    "4) During the Python worker execution, simulate a transient backend 502 on the final acknowledgement (or close the socket mid-chunk) to trigger SDK retry behavior and a token refresh.",
+    "5) Observe whether the webhook receives duplicate POSTs and whether the queue service shows duplicate enqueued jobs.",
+    "6) Repeat with variable TTLs (15s, 30s, 60s) and with/without explicit per-tool idempotency keys."
+  ],
+  "logs": [
+    "2026-03-10T18:11:32.423Z INFO ts-orch: starting session session_id=sn_94a3 ttl=30s ephemeral_key=ek_...",
+    "2026-03-10T18:11:35.990Z DEBUG py-worker: received handoff, idemp_token=idt_12345 tools=[webhook_post, enqueue_job]",
+    "2026-03-10T18:11:38.120Z WARN py-worker:webhook: remote 502 on POST https://external.vendor/api/orders 502 Bad Gateway",
+    "2026-03-10T18:11:38.121Z ERROR sdk:stream - connection reset by peer during final ack; client will retry; token refresh starting",
+    "2026-03-10T18:11:38.450Z INFO auth-service: issued new ephemeral ek_... (chained refresh) for session sn_94a3",
+    "2026-03-10T18:11:38.768Z INFO sdk:retry - replaying last chunk with idemp idt_12345; resulted in second webhook POST",
+    "2026-03-10T18:11:39.032Z INFO external-webhook: Received POST order_id=ord_99 payload=...",
+    "2026-03-10T18:11:39.345Z INFO external-webhook: Received POST order_id=ord_99 payload=..."
+  ],
+  "investigation_notes": [
+    "Initial hypothesis: idempotency token scope is tied to ephemeral key lifetime; when token is reissued mid-flight the SDK normalizes the idempotency header differently between TS orchestration and Python worker leading to a mismatch on server-side dedupe.",
+    "Reproduced locally with a synthetic 502 injected into the last chunk. Observed that TypeScript client includes header 'X-Idemp: idt_12345' in handoff metadata, but the Python worker SDK re-encodes it as 'X-Idemp: idt_12345::ek_<new>' when it refreshes/attaches new ephemeral key. Server dedupe uses exact header match, so second replay is treated as distinct request.",
+    "Checked server logs: two distinct request IDs processed for the same logical operation within 500ms; dedupe keys did not match due to appended ephemeral key tag in the dedupe hashing path.",
+    "Edge-case: if the initial ephemeral key expires before the final ack, the runtime attaches 'auth-chain' baggage to outgoing tool calls; baggage serialization varies by SDK (python vs ts), causing inconsistent normalization across services.",
+    "Verified that disabling auto-attach of token metadata in the Python SDK avoided duplication (workaround), but this is not ideal for customers relying on seamless key rotation."
+  ],
+  "comments": [
+    "2026-03-10 | Aisha Romero (Customer): We consistently see duplicates when running our k6 scale test. Can you confirm whether the idempotency key should survive an ephemeral key refresh?",
+    "2026-03-10 | Ben Carlson (Support): Thanks Aisha \u2014 we are triaging. Can you share a small repro? Preferably a minimal TS orchestrator and Python worker snippet and access to a webhook endpoint we can hit during repro.",
+    "2026-03-11 | Aisha Romero (Customer): Uploaded repro gist to private GitHub link and opened temporary webhook at https://hook-repro.novaapps/example (valid for 24h). TTL used was 30s. We also tried 60s with same behavior.",
+    "2026-03-11 | Eng (runtime): Observed SDK header normalization bug \u2014 Python SDK appends ephemeral auth tag to idempotency header during implicit refresh. TS SDK does not. Filing INT follow-up to normalize behavior across SDKs.",
+    "2026-03-12 | Ben Carlson (Support): Confirmed repro internally. Workaround documented below; planning SDK patch and server dedupe fallback to normalized base idempotency key."
+  ],
+  "linked_issues": [
+    "INT-99021",
+    "SUP-305305"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/sdk-python/pull/842",
+    "github.com/redwood-inference/serving-runtime/pull/676"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood/redwood/runbooks/idempotency-baggage-normalization",
+    "https://confluence.redwood/redwood/arch/auth-chaining-design"
+  ],
+  "follow_up_actions": [
+    "1) Create INT ticket to align SDK idempotency header serialization across languages (python/ts/go).",
+    "2) Implement server-side fallback dedupe that canonicalizes idempotency keys by stripping ephemeral auth suffix for a short grace window (30s).",
+    "3) Ship patch to Python SDK to avoid appending ephemeral key to idempotency header when SDK performs implicit refresh; add opt-in behavior toggle.",
+    "4) Notify customer when workaround & patch lands and advise on short-term mitigations (explicit per-tool idempotency keys or disabling token auto-attach)."
+  ],
+  "resolution": "",
+  "notes": "Customer impact: duplicates of external webhook and queue writes leading to idempotency protection failures on third-party systems. Priority elevated given production-scale tests failing.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "follow_up_actions",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_89b0a54d70b14658b0f860d8e90ddb56"
+}

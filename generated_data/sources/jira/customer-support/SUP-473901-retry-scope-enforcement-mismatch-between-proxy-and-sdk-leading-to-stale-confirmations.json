@@ -1,0 +1,72 @@
+{
+  "key": "SUP-473901",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Retry-scope enforcement mismatch between edge proxy and client SDK causing stale confirmation tokens and duplicate tool side-effects",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-13",
+  "reporter": "Maya Rodriguez",
+  "assignee": "Ethan Li",
+  "customer_company": "BrightHealth AI",
+  "customer_tier": "enterprise",
+  "environment": "prod | us-east",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "sdk-python",
+    "edge-proxy"
+  ],
+  "labels": [
+    "retries",
+    "idempotency",
+    "function-calling",
+    "edge-proxy"
+  ],
+  "affected_models": [
+    "redwood-3b-v2",
+    "open-llama-13b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-14",
+  "first_response_due_at": "2026-03-11",
+  "linked_issues": [
+    "SUP-615209",
+    "SUP-472999"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/sdk-python/pull/842",
+    "https://github.com/redwood-inference/edge-proxy/pull/341"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SUPPORT/stream-retry-guidance",
+    "https://confluence.redwood.ai/display/ENG/edge-proxy-retry-behavior"
+  ],
+  "description": "Issue summary: Customer reports repeated double-execution of external tool/webhook calls for long-running streaming sessions after a recent SDK upgrade and concurrent use of BrightHealth's internal HTTP reverse-proxy. Impact: Duplicate side-effects (duplicate payment request webhook deliveries) leading to customer operational burden and potential billing issues. Environment: Production, us-east, traffic routed through company-managed reverse-proxy + our edge-proxy. SDKs involved: python client v1.9.0 (recently upgraded from v1.7.3) and a lightweight Go orchestrator.\n\nObserved behavior: When streaming sessions experience transient network hiccups, client-side retry logic emits a retry that the edge-proxy rewrites (normalizes) certain headers and shortens the confirmation token. The SDK then sends a follow-up which the server accepts as a new request instead of a resumed session, triggering re-execution of previously-confirmed tool calls.\n\nFields of note: confirmation token format is the SDK-generated 128-bit nonce base64 URL-safe string in header X-RW-Confirm; edge-proxy has header sanitizer configured to trim >100 chars; reverse-proxy also applies header folding.\n",
+  "steps_to_reproduce": "1) Use python SDK v1.9.0 to open a streaming chat session that makes two sequential function/tool calls (webhook POST to customer endpoint). 2) Introduce a transient drop (iptables reject or simulate 100ms connection reset). 3) Client retries per SDK backoff and resends resumed stream metadata. 4) The company reverse-proxy rewrites/folds long headers; edge-proxy also canonicalizes header names. 5) Server treats the resumed stream as a new session because confirmation token no longer exactly matches stored in-flight key, replaying tool calls.\n\nExpected behavior: Resumed stream should match in-flight session by preserved confirmation token or server tolerance to canonicalized token representation and not re-execute already-acked tool calls.",
+  "logs": "Customer-provided excerpt (redacted):\n- client: INFO Retry attempt 1 for session s=abc123 nonce=QmFzZTY0... (128 chars)\n- reverse-proxy: DEBUG folded header X-RW-Confirm into two segments\n- edge-proxy: WARN header-length > 100, truncating trailing bytes\n- server: INFO no matching in-flight session for token QmFzZTY0... (truncated), starting new session and re-scheduling webhooks\n- webhook endpoint: 2026-03-09T21:12:32 - Received POST /payments/create (duplicate)\n",
+  "comments": [
+    "2026-03-10 - Maya Rodriguez: Customer opened ticket after finding 3 duplicates within a 24h window. They are able to reproduce reliably in prod behind their proxy.",
+    "2026-03-11 - Ethan Li: Assigned. Reproduced in staging with a synthetic proxy that truncates header > 100 bytes. Hypothesis: header sanitizer at customer-side + our edge-proxy header length guard cause token mismatch on resume path.",
+    "2026-03-12 - SRE Team: Ran a capture in us-east and confirmed a pattern where resumed session headers differ in canonicalization (case + folding) and truncated bytes. Correlation id rw-req-5591 shows two executions for same original sequence id.",
+    "2026-03-13 - Customer (BrightHealth AI): Confirmed they can disable header folding and saw no duplicates over 6h of testing. Need a longer-term fix; disabling folding is not viable for their infra.",
+    "2026-03-13 - Ethan Li: Proposed server-side tolerant matching fallback: normalize and compare first-N-bytes of confirmation token plus timestamp window; also proposed adding per-action idempotency token header as short hashed token as a workaround."
+  ],
+  "investigation_notes": "Summary of findings: 1) The SDK produces a 128-char base64 nonce in X-RW-Confirm. 2) Customer reverse-proxy folds and sometimes inserts linear whitespace which changes byte representation. 3) Our edge-proxy currently enforces a hard header-length drop for safety; truncated tokens no longer match in-flight session keys. 4) When match fails, runtime treats message as new request and replays queued tool calls (webhook delivery).\n\nHypotheses tested: - Increasing server match tolerance to ignore whitespace and case-normalize headers prevented most duplicates in staging. - Short-hash idempotency header (sha1 of confirmation nonce) prevents re-exec when full token mangled because short-hash survives folding; however this relies on consistent hashing on client side. - Adjusting edge-proxy to preserve header bytes above 100 chars introduced DOS risk for malformed clients; needs safer boundary checks.\n\nTech notes: Relevant code paths: serving-runtime session resume uses exact-match on confirmation_token string (source: runtime/session_manager.go: Kill switch on mismatch). SDK change in v1.9.0 moved to longer nonce to avoid collisions; unintended side-effect with middleboxes.",
+  "resolution": "Workarounds rolled out: 1) Short-term: Customer disabled header folding on their reverse-proxy (validated no duplicates). 2) Deploy server change: tolerant resume matcher that normalizes linear whitespace, lowercases header name, and allows first-96-bytes prefix match for confirmation tokens for 72-hour grace period (rollback safe). 3) SDK mitigation: patch released in python SDK v1.9.1 to emit an additional header X-RW-Confirm-Hash (sha256 hex truncated to 16 chars) derived from nonce; server now checks this short hash as a second-level match. 4) Edge-proxy configuration: increase header-length allowance for X-RW-Confirm specifically, with a max cap and validation.\n\nFollow-ups: - Create guidance doc for customers about header canonicalization pitfalls and recommended minimum header length handling. - Add e2e test in CI to simulate header folding/truncation and ensure duplicate prevention. - Engineering task to remove temporary 96-byte prefix matcher and rely on hash check within 30 days after SDK adoption reaches >90% of affected customers.\n\nStatus: Mitigations applied in prod us-east on 2026-03-13. Monitoring set up to alert on duplicate webhook deliveries (threshold 3 duplicates per hour).",
+  "resolution_date": "2026-03-13",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_9f2c9a2ef1ab4d4ab14c6219c235f8aa"
+}

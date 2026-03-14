@@ -1,0 +1,71 @@
+{
+  "key": "ENG-4821",
+  "team": "engineering",
+  "title": "Duplicate usage prevention: idempotency and accounting correctness for retries/timeouts",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-14",
+  "creator": "Aisha Patel",
+  "assignee": "Marco Reyes",
+  "project": "billing-and-metering",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-28",
+  "labels": [
+    "billing",
+    "idempotency",
+    "metering",
+    "rate-limiting",
+    "backend"
+  ],
+  "parent_issue": [
+    "ENG-4500"
+  ],
+  "sub_issues": [
+    "ENG-4822",
+    "ENG-4823"
+  ],
+  "dependencies": [
+    "PM-318",
+    "ENG-4401"
+  ],
+  "customer_impact": "high",
+  "release": "billing-2026.03",
+  "security_review_required": "true",
+  "description": "Problem summary:\nCustomers and internal billing audits have observed rare but material duplicate usage records leading to double billing. Root causes correlate with at-least-once ingestion paths: client retries after timeouts, network retransmits, and backend consumer reprocessing during transient failures. These duplicates manifest as repeated tokens/embedding units in billing streams and show up as immediate overcharges or (more commonly) as downstream reconciliation adjustments that require manual refunds.\n\nObjective:\nDesign and implement a robust idempotency and duplicate-detection strategy across the API ingestion edge, rate-limiter layer, and usage ledger that: 1) prevents double counting for common retry patterns; 2) minimizes added latency and storage overhead; 3) preserves compatibility with existing clients while enabling stronger guarantees for new/opt-in clients.\n\nKey constraints and requirements:\n- Primary correctness goal: prevent duplicate billed units for the same logical request (same customer intent) in the face of client retries and at-least-once delivery semantics.\n- API/SDK changes must be backward compatible; we cannot force all existing clients to upgrade immediately.\n- Rate limiting and quota enforcement must remain precise; deduplication checks must not be exploitable to bypass quotas.\n- Monitoring and reconciliation must detect residual duplicates and support automated crediting where safe.\n\nHigh-level approach (phased):\nPhase 1 \u2014 Detection & instrumentation (hotpath, low risk):\n- Add high-fidelity tracing and tagging of ingestion events (request_id, X-Idempotency-Key if present, client-generated request fingerprint, producer host, ingestion-offset).\n- Add metrics for duplicate-suspected events per-customer (hash collisions, repeated request_id).\n- Run a passive dedup detector in parallel to serving path to measure prevalence and false positive rates.\n\nPhase 2 \u2014 Soft dedup at edge (best-effort, no schema changes):\n- Implement a short-window dedup cache in front of the usage-enqueue step (Redis/KeyDB with local LRU fallback). Cache key = sha256(customer_id + request_fingerprint) with TTL configurable (default 30s).\n- If an event matches recent key: mark as DUPLICATE in metadata and drop from immediate billing ingestion; still send an audit event to the passive detector to validate correctness.\n- This phase protects against common quick client retries while keeping latency overhead sub-ms for cache hits.\n\nPhase 3 \u2014 Idempotent write path & ledger semantics (stronger guarantee):\n- Require/encourage X-Idempotency-Key on billed API endpoints (CreateCompletion, Embeddings). New SDKs will set UUIDs by default; header optional for legacy.\n- On write to billing ledger, perform an idempotency check using a durable idempotency store (partitioned by customer_id) with TTL of 7 days for long-running operations. Write path becomes: check-store -> conditional-insert (CAS) -> emit usage event. Ensure the conditional insert is atomic w.r.t. the ledger append (transactional or via monotonic sequence).\n- Represent each ledger entry with an idempotency_key + ingestion_id pair; ledger dedup id is enforced in append logic.\n\nPhase 4 \u2014 Reconciliation & corrective actions:\n- Keep an offline reconciler that groups events by (customer_id, idempotency_key, fingerprint) across the ingestion window and detects duplicates that bypass online layers.\n- Automated remediation for low-risk cases: issue offsetting credits in the next billing cycle with clear audit trail. High-risk cases create customer support tickets for manual review.\n- Add a customer-facing audit API so customers can query raw usage events and idempotency metadata for disputed charges.\n\nEdge cases and trade-offs:\n- TTL selection: longer TTL reduces duplicate risk for retries spread hours apart but increases metadata storage and potential for legitimate repeat requests being blocked. Defaulting to 7 days on durable idempotency store with opt-in per-customer is a compromise.\n- Collisions: use 256-bit fingerprints (sha256) + include timestamp bucket for streaming requests to reduce false dedup probability. Monitor collision rate and surface as alert.\n- Rate limiter interactions: dedup decisions should not allow bypassing quota checks. We attach quota tokens to logical requests keyed to idempotency_key; repeated attempts within TTL should not consume additional quota.\n- Backpressure / latency impact: online durable idempotency checks may add ~1\u20135ms; benchmarked in Phase 2 to ensure SLA. Provide feature flag to disable strong-idempotency for customers who prefer lower p99 latency.\n\nImplementation details (components):\n- API layer: accept X-Idempotency-Key and compute request_fingerprint fallback (customer+model+prompt_hash+params). Inject idempotency metadata into request context.\n- Edge Dedup Cache: Redis cluster with partitioning by customer shard; short TTL (30s) for quick retry protection. Local LRU for single-node fallback in case of Redis outage.\n- Durable Idempotency Store: append-optimized KV (CockroachDB table or Dynamo-style) storing idempotency_key -> (ingestion_id, created_at, status). Use conditional writes and a background GC to expire keys.\n- Billing Ledger: append-only ledger that enforces ledger-level dedup constraint on idempotency_key. If CAS fails (key exists), return existing ingestion_id to client and do not double-count.\n- Reconciler: Spark/Flink job that computes duplicate sets and triggers credits/tickets.\n\nAcceptance criteria:\n- No duplicates for synthetic retry tests covering common patterns (immediate retry, retry after 200\u2013500ms, retried after backend transient) for 99.999% of requests.\n- Duplicate-charge rate in production must drop to < 0.001% of billed events within 2 weeks of soft rollout for enrolled customers.\n- Latency impact p50 increase < 2ms and p99 increase < 10ms for idempotent endpoints with strong-idempotency enabled.\n- All remedial credit actions must include pre/post usage snapshots and be traceable via a ticket.\n\nTesting plan:\n- Unit tests for idempotency-store CAS logic and collision handling.\n- Integration tests: simulate replayed ingestion, partition failover, consumer reprocessing; assert single ledger entry per idempotency_key.\n- Chaos tests: drop idempotency-store writes mid-request, restart consumers, ensure reconciler converges and creates exactly one active billed entry or an automated credit.\n- Load tests: measure redis dedup cache hit rate and latency under 10k rps model token generation.\n- Backward compatibility tests: legacy clients without X-Idempotency-Key fall back to fingerprint-based dedup; ensure no functional regression.\n\nRollout plan:\n- Week 0: deploy passive detector and instrumentation; collect baseline for 2 weeks.\n- Week 2: enable soft dedup cache behind feature flag for 10% traffic weighted by customer size (prefer repeat-prone patterns).\n- Week 4: enable durable idempotency writes for new SDK clients (opt-in) and run reconciliation in dry-run mode for legacy traffic.\n- Week 6\u20138: expand durable idempotency to all traffic with feature flag off-by-default; enable for customers who opt-in or have higher risk SLA.\n- Post-rollout: run retro-credit job for confirmed duplicates during migration window and provide customer-facing incident summaries.\n\nMonitoring and alerts:\n- Metric: duplicates_detected_rate (per-customer, per-endpoint). Alert if > 0.01% sustained over 1h for any top-50 customer.\n- Metric: idempotency_store_write_errors. Alert on >0.1% error rate.\n- Dashboards: top duplicate fingerprints, top customers by duplicate count, reconciler backlog.\n\nOpen decisions and follow-ups:\n- Final TTL for durable idempotency store (default 7 days vs configurable per-customer).\n- Durable store implementation choice: CockroachDB (strong consistency) vs Dynamo-style eventually consistent store with leader election for partition. Engineering to evaluate latency/cost trade-offs (ENG-4822).\n- UX for customers to opt into long TTL idempotency and trade latency for stronger protection (PM owns pricing/sla implications).\n\nRelated artifacts and PRs:\n- Confluence design doc: https://redwood.atlassian.net/wiki/spaces/ENG/pages/3278/duplicate-usage-prevention-design\n- Prototype PR (edge dedup cache): https://github.com/redwood-inference/platform/pull/7123\n- Ledger change PR (draft): https://github.com/redwood-inference/platform/pull/7169\n- Reconciler job spec: https://governance.redwood.com/docs/reconcilers/duplicate-usage\n\nOwner and next steps:\n- Owner: Marco Reyes (assignee).\n- Next: pair with PM (Sofia Chen) to finalize TTL policy and customer opt-in UX, complete ENG-4822 (durable store evaluation), and begin Phase 1 instrumentation sprint this cycle.",
+  "updates": [
+    "2026-03-01: Ticket created by Aisha Patel. Initial triage and priority P1 assigned. Linked to ENG-4500 (billing correctness epic).",
+    "2026-03-05: Prototype edge dedup cache implemented; benchmark shows median extra latency 0.6ms. See PR #7123.",
+    "2026-03-09: Passive detector running on prod shadow stream for 48 hours; observed duplicate rate 0.035% concentrated in 3 customers with flaky clients.",
+    "2026-03-12: Design review with PM and security. Security requested TTL audit and encryption-at-rest for idempotency store (action item ENG-4822).",
+    "2026-03-14: Decision to roll Phase 2 to 10% traffic starting 2026-03-20 behind feature flag. Reconciler job spec updated."
+  ],
+  "acceptance_criteria": [
+    "Synthetic replay tests produce single ledger entry per logical request for 99.999% cases.",
+    "Production duplicate-charge rate < 0.001% for enrolled customers within 2 weeks of rollout.",
+    "Latency impact within agreed SLOs (p50 +2ms, p99 +10ms).",
+    "Automated credits/reconciler run creates audit trail for every corrective action."
+  ],
+  "test_plan": [
+    "Unit tests for idempotency store CAS and lookup behavior.",
+    "Integration tests across API edge, Redis cache, durable idempotency store, and ledger append.",
+    "Chaos experiments to simulate partial writes and consumer replays.",
+    "Load tests to validate cache sizing and latency at expected peak throughput."
+  ],
+  "links": [
+    "Confluence design: https://redwood.atlassian.net/wiki/spaces/ENG/pages/3278/duplicate-usage-prevention-design",
+    "Edge dedup PR: https://github.com/redwood-inference/platform/pull/7123",
+    "Ledger PR (draft): https://github.com/redwood-inference/platform/pull/7169",
+    "Reconciler spec: https://governance.redwood.com/docs/reconcilers/duplicate-usage",
+    "Customer audit API proposal: https://redwood.atlassian.net/browse/PM-318"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "updates",
+    "acceptance_criteria",
+    "test_plan"
+  ],
+  "dataset_doc_uuid": "dsid_baa89fd4837c4bed86566a5314690b90"
+}

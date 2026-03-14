@@ -1,0 +1,81 @@
+{
+  "key": "SUP-707707",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "prefetch-handshake-and-pin-race-on-canary-resume-causes-transparent-fallback",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2025-11-02",
+  "updated_at": "2025-11-05",
+  "reporter": "Asha Patel",
+  "assignee": "Lena Hoffman",
+  "customer_company": "ScribeAnalytics",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "orchestrator",
+    "prewarm-service",
+    "edge-proxy",
+    "api-gateway"
+  ],
+  "labels": [
+    "canary",
+    "pinning",
+    "prefetch",
+    "regression",
+    "high-priority"
+  ],
+  "environment": "prod:us-west",
+  "affected_models": [
+    "redwood/opt-6.7b-quantized-v2",
+    "redwood/opt-6.7b-compat-legacy"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2025-11-03",
+  "first_response_due_at": "2025-11-02",
+  "linked_issues": [
+    "SUP-314271",
+    "SUP-246799"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/orchestrator/pull/1428",
+    "https://github.com/redwood-inference/prewarm-service/pull/317"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SUP/Canary+prefetch+handshake+runbook",
+    "https://confluence.redwood.ai/display/ENG/Pinning+coherence+design"
+  ],
+  "description": "Issue summary:\nCustomer observed that after resuming a paused canary slice for a model rollout, a subset of traffic was routed to a compatibility/legacy variant instead of the pinned canary variant. This happened even though the customer had an explicit version pin for several long-lived sessions.\n\nImpact:\n- ScribeAnalytics reported degraded output quality for ~12% of in-flight requests for a 45 minute window.\n- Requests received responses from a legacy compat variant that uses a different tokenizer and older prompt preprocessing, producing tokenization mismatches and downstream parse errors for structured output.\n- No 5xx errors, but a quality regression and increased error rates in the customer's downstream parsers.\n\nEnvironment:\n- Dedicated cluster in prod:us-west, tenant: scribe-analytics-prod, reserved pool rp-west-04\n- Model targeted for rollout: redwood/opt-6.7b-quantized-v2 (canary slice id: cs-923)",
+  "steps_to_reproduce": "1) Customer has model pin set via route with pinned_version=opt-6.7b-quantized-v2.\n2) Start staged canary: create canary slice cs-923 with 7% weight and prewarm enabled.\n3) Pause canary for manual checks.\n4) Resume canary by increasing weight back to 7% via console/rollout API.\n5) Observe a subset of previously pinned sessions routed to compat-legacy variant during the first 10 minutes.\n\nObserved vs Expected:\n- Observed: Some sessions dropped pin affinity and were served by redwood/opt-6.7b-compat-legacy after canary resume.\n- Expected: Pinned sessions should maintain affinity to the explicitly pinned version across canary pause/resume cycles unless pin is explicitly modified.",
+  "logs_and_traces": "Edge logs (excerpt):\n[2025-11-02T10:14:02Z] ingress: tenant=s-022 session=abc123 route=/nlp/generate prewarm_handshake=START cs-923\n[2025-11-02T10:14:03Z] orchestrator: session=abc123 pin_lookup=OK pin=opt-6.7b-quantized-v2 prewarm_status=IN_PROGRESS\n[2025-11-02T10:14:04Z] prewarm-service: session=abc123 prewarm_commit=DELAYED reason=orchestrator-commit-race\n[2025-11-02T10:14:04Z] routing: session=abc123 final_variant=opt-6.7b-compat-legacy fallback_reason=prefetch_commit_timeout\n\nTrace notes:\n- Prefetch handshake completed but prewarm commit to the routing snapshot was delayed by a race with the orchestrator epoch advance.\n- When the orchestrator advanced the epoch, routing snapshot included compat fallback entries for new traffic; pinned affinity for long-lived sessions was not reapplied atomically during resume window.",
+  "workaround": "- Immediate: Customer restarted affected streams (client reconnect) to re-establish pin affinity. That rebind caused subsequent requests to route correctly to the pinned variant.\n- Short term: We set a temporary guard in the edge proxy to prefer explicit route pins over snapshot fallback for sessions with active session tokens. This reduces the blast radius for resumed canaries (rolled by SRE).",
+  "comments": [
+    "2025-11-02 11:00 - Support (Asha Patel): Acknowledged. Eng and SRE looped in; open triage. Asking customer for session ids and sample request IDs.",
+    "2025-11-02 12:15 - Customer (ScribeAnalytics - Daniel Kim): Provided sample session ids abc123, def456 and examples of malformed structured outputs. Noticed the problem only for sessions active before the resume.",
+    "2025-11-02 14:05 - SRE (Omar Li): Captured routing snapshots and noticed commit_for_epoch failure around 10:14:04Z; prewarm-service reported DELAYED commit. Hypothesis: prewarm commit ordering can lose pin-binding if orchestrator advances epoch while commit pending.",
+    "2025-11-03 09:20 - Eng (Lena Hoffman): Reproduced in staging by simulating paused resume with synthetic long-lived sockets; confirmed prewarm commit race where snapshot merge uses fallback entries when pin commit not applied atomically.",
+    "2025-11-04 16:00 - Eng (Lena Hoffman): Pushed PR to change prewarm handshake: make prewarm commit idempotent and introduce ephemeral hold on epoch-advance until pinned-affinity commits are confirmed (see PR #1428). Requesting canary deploy of fix to prod-labs.",
+    "2025-11-05 10:30 - SRE (Omar Li): Deployed edge guard (prefer explicit pin header) as mitigation. Monitoring shows pinned sessions re-bound and customer error rate returning to baseline.",
+    "2025-11-05 15:45 - Customer (Daniel Kim): Confirms decreased error rates and that reconnect workaround fixed active streams. Asking for root cause and permanent fix ETA."
+  ],
+  "investigation_notes": "Timeline and root cause hypothesis:\n- When canary was resumed, the orchestrator advanced epoch to include the canary slice. The prewarm-service had outstanding prewarm_commits for some in-flight sessions.\n- Orchestrator epoch advance triggered a snapshot merge which included fallback routing entries for fresh allocation in case prewarm didn't complete quickly.\n- Because the prewarm commit path was non-atomic with respect to pin rebind, sessions that had not completed prewarm_commit fell back to compat variant in the merged snapshot.\n- Key contributing factors: (1) non-atomic commit ordering between prewarm-service and orchestrator, (2) no strong preference for explicit pins in the snapshot merge, (3) long-lived session model where reconnects are uncommon.\n\nReproducibility:\n- Reproducible in staging with dedicated reserved pools when simulating a pause/resume and adding artificial latency to prewarm commit.\n\nNext steps agreed:\n- Engineering change to make prewarm commit idempotent and block epoch-advance until pin-affinity commits are acknowledged for sessions with active tokens (PR #1428).\n- Add a snapshot-merge rule: prefer explicit pinned_version headers over fallback mapping when session token present.\n- Run a canary of the fix in prod-labs, then staged rollout to prod with strict monitoring of affinity drift metrics.",
+  "resolution": "(pending) Mitigation applied: edge-proxy guard prefers explicit pinned headers; customer reconnect workaround documented. Engineering PR submitted to make prewarm_commit atomic with orchestrator epoch commit (see PR #1428). Planned rollout: prod-labs canary on 2025-11-07, followed by gradual promotion. Permanent resolution requires successful canary and monitoring of pinned_affinity_loss < 0.1% over 24h.",
+  "attachments": [
+    "s3://redwood-support-attachments/SUP-707707/session-logs-abc123.log",
+    "s3://redwood-support-attachments/SUP-707707/canary-snapshot-diff-2025-11-02.json"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs_and_traces",
+    "workaround",
+    "investigation_notes",
+    "resolution",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_1c16125c6c8146eba410b3d331429029"
+}

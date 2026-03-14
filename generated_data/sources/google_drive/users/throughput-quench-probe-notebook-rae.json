@@ -1,0 +1,34 @@
+{
+  "title": "Throughput quench probe: two\u2011phase ramp / quick\u2011drop experiments",
+  "owner": "Rae Patel",
+  "drive_area": "users",
+  "path": "users/throughput-quench-probe-notebook-rae.json",
+  "doc_type": "doc",
+  "created_at": "2025-01-18",
+  "last_modified": "2025-02-02",
+  "collaborators": [
+    "Marco Li",
+    "Evelyn Soto"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "throughput",
+    "latency",
+    "cold-ramp",
+    "quench",
+    "priming",
+    "p99"
+  ],
+  "linked_artifacts": [
+    "JIRA: INF-4821",
+    "GitHub: https://github.com/redwood-inference/serving-runtime/pull/2145",
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/INF/pages/Throughput+Quench+Design"
+  ],
+  "content": "Purpose:\\nQuick informal writeup of a set of 'quench' experiments I ran to understand latency tail behaviour when a high QPS ramp is abruptly quenched to a low steady QPS (simulates flash-sale style traffic that then drops). Goal is to capture observable prime/decay dynamics, KV cache hit interplay, and where warmup/eviction penalties show up in p95/p99.\\n\\nRun summary (high level):\\n- Model: rw-v2-3B-quant (FP16-ish quant profile) mounted as variant v2025-01-q1\\n- Serving pool: dedicated smallpool-A (4xA10G, 32GB per GPU), 8 worker replicas, shared KV cache across workers via local LRU (8M entries)\\n- Sequence length: typical 128 tokens request, median prompt 72 tokens\\n- Client pattern: two-phase per trial:\\n    1) RAMP: linear from 5 qps -> 350 qps over 60s (aggressive ramp)\\n    2) QUENCH: sudden drop to 10 qps sustained for 300s\\n- Duration per trial: 6m (including settling windows)\\n- Trials: 8 full trials over 2 hours (varied cooling threshold and warm-cache percentage)\\n\\nWhy this pattern:\\n- Common for e\u2011commerce or notification blasts where a surge finishes quickly then a long tail of low traffic remains. We suspect evictions + background GC + kernel coldstart produce two separate latency components: an immediate transient (50\u2013120s) and a longer tail (200\u2013600s) as caches re-equilibrate.\\n\\nInstrumentation collected:\\n- Per-request: client-side timestamp, server enqueue, start_exec, end_exec, kv_hit(bool), worker_id, kernel-version tag\\n- Periodic: gpu_util, mem_used, swap_pressure, OS page-in/out counters, per-worker KV cache size\\n- Aggregates: p50/p90/p95/p99, QPS, concurrency, kv_hit_rate over 5s windows\\n\\nKey observations (numbers are medians/aggregates across trials):\\n- During ramp peak (300\u2013350 qps):\\n    - p50 ~ 55 ms, p95 ~ 140 ms, p99 ~ 310 ms\\n    - KV overall hit-rate falls ~ 0.72 -> 0.61 when ramp crosses 200 qps (eviction pressure)\\n    - GPU util steady ~ 92\u201396% (saturated path)\\n- Immediately after quench (first 30s):\\n    - p50 drops quickly to 48 ms, but p95/p99 spike: p95 ~ 220 ms, p99 ~ 720 ms (worst trials up to 1.1s)\\n    - Concurrently observed a surge of page-in activity on two workers (worker 3 & 6) and small GC cycles triggered (Python worker-level heap compaction)\\n- Medium term (30\u2013180s after quench):\\n    - p95 decays slowly from 220 -> 120 ms; p99 from 720 -> 260 ms\\n    - KV hit-rate recovers gradually back to ~0.70 over ~150\u2013200s\\n    - Observed periodic microspikes (200\u2013400ms) on a single worker every ~45s \u2014 correlated with disk I/O flush on that worker (log rotation triggered at 00:00 UTC mistakenly during a long run)\\n- Long tail (>180s):\\n    - Metrics stabilize: p50 ~ 46 ms, p95 ~ 100 ms, p99 ~ 160 ms\\n    - Background eviction/gc quiets; util ~ 12\u201320% at 10 qps\\n\\nNotable failure modes / anomalies:\\n- One trial exhibited persistent p99 ~ 500ms for >8 minutes after quench. Root cause: worker 6 had a transient NVME latency spike (thermal throttle) causing OS-level page-in stalls; correlated with hotter-than-usual storage temps reported by infra logs.\\n- Another trial had elevated p95 due to a kernel variant fallback: on worker 1 the serving runtime switched to safer matmul kernel (fallback) for 90s when a micro assert hit early in the ramp \u2014 increased latency but avoided errors. The fallback was controlled by 'kernel-safety' patch that recently landed (PR #2145).\\n\\nQuick ASCII timeline (one representative trial, averaged windows):\\n- 0\u201360s: ramp -> qps climbs 5 -> 350; p99 climbs steadily (100ms -> 300ms)\\n- 60s (quench): qps jumps to 10; p50 drops, p99 spikes then decays\\n\\nTime (s) | QPS  | p50(ms) | p95(ms) | p99(ms) | kv_hit\\n0        | 5    | 48      | 110     | 190     | 0.74\\n30       | 120  | 52      | 130     | 240     | 0.69\\n60       | 350  | 55      | 140     | 310     | 0.61\\n90       | 10   | 50      | 220     | 720     | 0.56\\n240      | 10   | 47      | 120     | 260     | 0.67\\n420      | 10   | 46      | 100     | 160     | 0.70\\n\\nHints / hypotheses:\\n- Quench spike likely from two sources: (1) sudden drop causes concurrency to collapse and a fraction of in-flight requests face cache misses and kernel reinitialization overheads, (2) OS-level paging/IO contention uncovered under high memory churn during ramp.\\n- The KV cache policy (LRU global across workers) seems to produce suboptimal steady-state when quench moves working set quickly \u2014 consider sticky per-worker segments + fast re-warm path.\\n- Kernel fallback events amplify spikes; we should ensure metrics flag fallback occurrences as high-severity alerts (current alerting only logs them).\\n\\nNext steps / actionable items:\\n- Repeat with: (A) per-worker pinned KV segments (50/50 split) vs global LRU; (B) reduced logging at high throughput to avoid NVME pressure; (C) run with kernel-safety toggled off for comparison to measure pure latency impact (controlled run).\\n- Add histograms + waterfall traces for the first 120s after quench so we can separate queuing vs exec vs kv-miss costs.\\n- Ask infra to check NVME thermal profile on pool-A (ticket created INF-4917).\\n- Create a lightweight SLO checkpoint: emit a \"quench_event\" marker to traces and a per-replica kv_miss_breakdown; useful for automated regression detection.\\n\\nNotes to self:\\n- Write a short PRD note for sticky-cache experiment and link to community notes.\\n- This pattern reproduces in staged Dedicated pools and in private VPC infra; might be customer-visible for bursty ecommerce clients.\\n\\nAppendix: quick run checklist used for each trial:\\n- Clear KV cache snapshot (start-of-trial marker)\\n- Restart workers (graceful) -> ensure kernel-variant consistent\\n- Sync clocks (ntp) and start client driver (replay tool v0.9b)\\n- Collect logs: /var/log/serving/*.log and /proc/diskstats every 5s\\n\\nEnd.\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_c2cb6451d8aa47cd97989e55c3714786"
+}

@@ -1,0 +1,66 @@
+{
+  "key": "ENG-991827",
+  "team": "engineering",
+  "title": "Multi-tenancy soft-preempt policy with KV-age prioritization",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-28",
+  "updated_at": "2026-03-12",
+  "creator": "Priya Shah",
+  "assignee": "Carlos Mendes",
+  "project": "runtime-batching",
+  "cycle": "2026-W09",
+  "estimate": 8,
+  "labels": [
+    "continuous-batching",
+    "kv-cache",
+    "preemption",
+    "slo-scheduling",
+    "gpu-memory",
+    "performance"
+  ],
+  "parent_issue": [
+    "ENG-7421"
+  ],
+  "dependencies": [
+    "ENG-61257",
+    "ENG-21011"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.22",
+  "security_review_required": false,
+  "description": "Summary:\nWe need a soft-preemption and fairness controller for our continuous batcher that incorporates KV cache age as a first-class signal. The goal is to reduce SLO violations for latency-sensitive tenants while preserving overall throughput and minimizing KV churn that causes expensive GPU memory thrashing. This ticket outlines the algorithm, memory accounting changes, experiments, rollout plan, and monitoring hooks.\n\nBackground and motivation:\n- Continuous batching currently optimizes throughput by keeping many active slices in flight. Under high multi-tenant load this leads to KV cache pressure, large tail latency spikes for tenants whose KV working set was evicted, and expensive re-warm token costs.\n- Purely size-based eviction or blunt preemption causes oscillation: tenants reacquire KV pages, blow out memory, then get preempted again.\n- Existing SLO-aware preemptors consider request latency budgets but do not account for the age/recency of KV entries nor the cost to rehydrate them. Our experiments have shown that retaining slightly older but frequently referenced KV entries reduces tail latency more than retaining recently created but cold entries.\n\nGoals:\n- Implement a soft-preemption policy that: (1) favors slices that preserve high-utility KV entries by tracking per-tenant KV age/heat; (2) prefers preemption from tenants with slack against their SLOs; (3) avoids thrashing by amortizing KV reheat cost in preemption decisions.\n- Extend GPU memory accounting to separately track KV resident pages, pinned kernels, and temporary allocations used during attention and decoding so preemption decisions can be made without full device-wide locks.\n- Provide telemetry that shows KV rehydrate cost, preempted-slices per minute, and SLO delta per tenant.\n\nNon-goals:\n- This ticket does not attempt wholesale changes to model quantization or fundamental kernel selection strategies. It focuses on scheduling and memory accounting.\n\nDesign proposal (high level):\n1) KV Age Heatmap: maintain a lightweight sliding-window counter per KV key-bucket capturing last-access timestamp and reference frequency. Aggregate per-tenant a 3-value heat vector: hot (last N min & freq > T), warm (last M min), cold (older). Implement as approximate LRU buckets using a 64-bit bloom-like token to avoid per-key locks.\n\n2) Soft-preempt scoring: compute a preemption \"cost\" for each active slice as a weighted sum: slice_cost = a * kv_rehydrate_estimate + b * expected_slo_penalty + c * fairness_credit_penalty + d * gpu_memory_fragmentation_penalty. Lower cost = better candidate to preempt.\n- kv_rehydrate_estimate derives from KV heatmap: cold entries imply high rehydrate cost. Hot entries near eviction imply high cost to evict.\n- expected_slo_penalty is estimated from current latency window vs tenant SLO; use EWMA of p95 delta.\n- fairness_credit_penalty represents tenant weight and historical preemption counts (we add credit accrual so tenants that were recently protected are more likely to be preempted later).\n\n3) Soft pause and evict stages: when rebalancing is required, we prefer to (A) pause low-cost slices (save token context), (B) mark their KV entries as speculative-evict (LRU age bump but delay actual free by 500ms), (C) if pressure remains, perform physical KV eviction with priority ordering to minimize hotset loss.\n\n4) Admission control handshake: include a fast negotiation between router and batcher where the router provides tenant SLO weight, estimated sequence length, and short-term priority. The batcher returns an admission token that contains a preemption-risk score; routers can choose to route lower-priority requests to alternate regions/models if preemption-risk > threshold.\n\n5) GPU memory accounting: introduce per-slab residency counters and a compact per-tenant allocation ledger that can be read without full device stop-the-world. This ledger exposes \"soft-reservations\" that the preemptor can reclaim preferentially before touching pinned kernel pages.\n\nAlgorithmic trade-offs considered:\n- Strong preemption leads to predictable latency at the cost of throughput; we intentionally bias toward soft actions to preserve throughput.\n- Tracking per-key heat precisely is expensive; we use approximate buckets and sample-based updates to limit overhead to <2% CPU on host.\n- Delay between marking speculative-evict and physical free adds memory headroom for short-lived bursts but increases worst-case memory usage; we choose conservative defaults and make them tunable per deployment.\n\nTesting and experiments planned:\n- Microbenchmarks: measure p95/p99 tail behavior for 8 synthetic tenants with mixed short/long contexts and hot/warm KV distributions. Key metrics: p50/p95/p99, tokens/sec, KV rehydrate tokens/sec, eviction churn/sec, GPU mem high-water mark.\n- Canary: rollout to dedicated dev pool with 4-node replica, enable telemetry and a kill-switch. Run A/B against current hard-preemptor for 48 hours.\n- Shock test: inject sudden hot-tenant and verify system avoids oscillation for at least 5 minutes without exceeding p99 SLO by >2x.\n\nTelemetry and dashboards:\n- New metrics: kv_rehydrate_estimate_total, kv_speculative_evictions, preempt_candidates_per_min, preemption_success_rate, tenant_fairness_credit, per-tenant p95_delta_vs_baseline.\n- Alerting rules: if preemption_success_rate < 80% or avg p99 increase > 15% for more than 10m, rollback.\n\nRollout plan:\n- Stage 1: Feature flag + unit tests (PR) -> merge to runtime-edge.\n- Stage 2: Canary on non-critical dev pool (2 weeks of synthetic load).\n- Stage 3: Small production cohort (5% traffic, runtime-1.22 branch) with kill-switch + observability.\n- Stage 4: Gradual ramp to 100% if metrics stable for 72 hours.\n\nBack-of-envelope expected impact (based on lab runs):\n- p95 tail reduction for latency-sensitive tenants: ~18-30%\n- KV eviction churn down by ~22%\n- Overall throughput change: within +/- 3%\n\nImplementation notes and files to touch:\n- batcher/scheduler/soft_preemptor.cc (new), batcher/kv_heatmap.h/.cc (new), runtime/gpu_ledger.[h,cc] (modify), router/admission_v1.proto (extend), observability/metrics_registry.md (register new metrics).\n\nOpen questions / decisions needed:\n- Weight defaults for a/b/c/d in slice_cost: propose start: a=0.5, b=0.25, c=0.15, d=0.1. Ask PM for SLO-weighting guidance.\n- How long to keep speculative-evict delay: 500ms vs 2s? Propose param exposed in runtime config.\n\nDocumentation and operator controls:\n- Add console toggles: enable/disable soft-preempt, speculative-evict-time-ms, high-preempt-threshold. Document behavior in runbook with rollback steps.\n\nConformance with ticket metadata rules: this ticket includes design rationale, trade-offs, testers to run, and a rollback plan.\n\n",
+  "acceptance_criteria": [
+    "New soft-preemptor implemented and unit-tested in batcher codepath.",
+    "KV heatmap produces per-tenant hot/warm/cold aggregates with <2% CPU overhead.",
+    "Canary shows p95 improvement for latency-sensitive tenants by >=10% without throughput loss >5%.",
+    "Console exposes feature-flag and speculative-evict tuning, and dashboards show new metrics.",
+    "SLO-aware admission handshake implemented and documented in router proto."
+  ],
+  "notes": [
+    "Experiment 2026-02-20: simulated 8 tenants, p99 dropped by 26% when weighting KV heat higher (a=0.7).",
+    "Talked to PM (Radhika Kumar) on 2026-03-03; she requested clear customer-impact tags for orgs with strict latency SLAs.",
+    "We should coordinate with infra team before changing GPU slab behavior; Carlos will book sync for 2026-03-15."
+  ],
+  "comments": [
+    "2026-03-01 Priya Shah: Initial draft posted. Seeking feedback on the speculative-evict delay parameter and KV heat approximation approach.",
+    "2026-03-02 Carlos Mendes: Reviewed algorithm. Concern about per-tenant ledger read cost; will prototype a read-copy update to avoid stop-the-world reads.",
+    "2026-03-04 Radhika Kumar (PM): Agrees with approach. Wants per-customer opt-out for early enterprise customers with guaranteed pinning.",
+    "2026-03-08 Eng SRE (Liam O'Connor): Suggested adding a fallback fallback: if speculative-evict rate spikes > threshold, back off to simple size-based eviction for 60s.",
+    "2026-03-12 Carlos Mendes: Implemented kv_heatmap prototype and basic scoring. Microbenchmarks show 1.6% CPU overhead at 1000 TPS; pushing PR for review (linked)."
+  ],
+  "links": [
+    "https://confluence.redwood.ai/display/RUNTIME/Soft+Preempt+Design+Doc",
+    "https://github.com/redwood-inference/runtime/pull/2748",
+    "https://grafana.redwood.ai/d/kv-preempt/kv-preempt-dashboard?orgId=1",
+    "https://drive.google.com/file/d/1abcd_sample_experiment_results"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "notes",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_71780147c8e1424fad1dc8beabd24db6"
+}

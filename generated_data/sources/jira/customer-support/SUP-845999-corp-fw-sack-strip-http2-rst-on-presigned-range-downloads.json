@@ -1,0 +1,93 @@
+{
+  "key": "SUP-845999",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Corporate firewall strips TCP SACK option causing HTTP/2 RST_STREAM during large presigned range downloads",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Priya Singh",
+  "assignee": "Jordan Kim",
+  "customer_company": "Mariner Analytics",
+  "customer_tier": "private",
+  "components": [
+    "egress-networking",
+    "control-plane",
+    "artifact-store",
+    "http-proxy"
+  ],
+  "labels": [
+    "private-deploy",
+    "presigned-s3",
+    "http2",
+    "tcp-options"
+  ],
+  "environment": "prod | us-east-1",
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "affected_models": [
+    "redwood/open-6b"
+  ],
+  "sla_due_at": "2026-03-13",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-342001"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/runbooks/vpc-presigned-download-debugging"
+  ],
+  "description": "Issue summary: Customer reports intermittent failures when the private deployment requests large model artifact ranges via presigned S3 URLs. Downloads fail partway through with HTTP/2 RST_STREAM from the serving node, leading to corrupted artifacts or repeated range retry loops. Impact: Model pulls for new model versions fail ~15% of the time on artifact range requests >8MB, causing slower rollouts and serving node restarts in the customer VPC environment. Environment: Private deployment (customer-managed egress) in us-east-1. Occurs from multiple serving nodes and during peak concurrency windows.\n\nObserved behavior:\n- GET range requests to presigned S3 URLs start successfully and transfer multiple megabytes.\n- After a short period the client side sees HTTP/2 RST_STREAM (stream error) and the TLS connection remains up.\n- Artifact downloader retries with shifted range offsets; sometimes the reassembled object fails checksum.\n\nWhy we think it's networking-related:\n- Failures correlate with higher concurrent download fan-out (many parallel range requests).\n- tcpdump from a serving node consistently shows the server and S3 peer offering SACK in TCP options, but packets observed on the customer egress path lack SACK and occasionally show altered TS and WS values.\n\nCustomer impact and ask: Customer requests either a configuration bypass for the firewall to allow SACK/TCP options or guidance on recommended download parameters and a short-term mitigation we can apply on the serving node side.",
+  "steps_to_reproduce": [
+    "1) Deploy private agent in customer's us-east-1 VPC with default artifact fetcher config.",
+    "2) Trigger a model rollout that requires the serving nodes to download a large model artifact (>200MB) that our downloader splits into concurrent ranged GETs (default parallelism = 8).",
+    "3) Observe client-side downloader logs and capture tcpdump on the serving node and at the customer egress NAT/edge device.",
+    "4) Reproduce under moderate concurrency (30-60 parallel pulls across nodes) to increase likelihood of suppression by stateful egress device."
+  ],
+  "logs": [
+    "[2026-03-10T09:14:22Z] downloader: GET /artifact.part (range: bytes=0-8388607) => 200, received 8,388,608 bytes",
+    "[2026-03-10T09:14:23Z] downloader: GET /artifact.part (range: bytes=8388608-16777215) => started",
+    "[2026-03-10T09:14:23Z] http2: RST_STREAM id=15 code=INTERNAL_ERROR - remote\n",
+    "tcpdump snippet (serving node egress): TCP Options: MSS=1460,SACK_PERM,TS val 34567890 ecr 12345678,WS=7",
+    "tcpdump snippet (captured on customer edge): TCP Options: MSS=1460,TS val 34567890 ecr 12345678,WS=7 (SACK_PERM missing)"
+  ],
+  "investigation_notes": [
+    "2026-03-10 Priya (Support) - collected tcpdumps and downloader traces; customer confirms managed NGFW in egress path (inline).",
+    "2026-03-10 Jordan (SRE) - observed consistent SACK stripping between serving node and egress capture; S3 <-> serving side shows SACK, customer edge shows SACK absent. Hypothesis: inline NGFW is normalizing TCP options (dropping SACK), causing retransmission/reordering to be handled differently and breaking http2 stream reassembly under our concurrent range strategy.",
+    "Checked server kernel: tcp_sack enabled on serving nodes (net.ipv4.tcp_sack = 1). Serving nodes show fast retransmits on missing SACK information which can lead to out-of-order ACKs surfaced to HTTP/2 layer as stream errors.",
+    "Tried reproducing using a single-threaded download (parallelism = 1): no RST_STREAM observed in 50/50 test runs - supports parallelism + SACK-stripping interaction hypothesis.",
+    "Customer firewall vendor reports a default \"TCP option normalization\" feature enabled for traffic inspection; vendor doc references SACK-stripping in certain throughput-protection modes."
+  ],
+  "comments": [
+    "2026-03-10 10:05 - Priya Singh (Support): Thanks for opening. Can you confirm the egress device vendor and whether there's inline TLS inspection enabled? Also requested tcpdump from both sides (attached).",
+    "2026-03-10 11:30 - Mariner NetOps (customer): We use an inline NGFW (vendor: Oakridge Networks) and have not enabled TLS inspection for the presigned S3 host. We'll provide packet captures from the edge tomorrow morning local time.",
+    "2026-03-10 14:12 - Jordan Kim (SRE): I've compared the serving-node capture and the edge capture. SACK options are present on the node but absent on the edge capture; the timestamps/seq spacing indicates the ngfw is touching TCP options. Opening an internal note to Eng for guidance on mitigations.",
+    "2026-03-11 08:04 - Elena Park (Eng): Confirmed that HTTP/2 implementation treats packet reordering/retransmit patterns without SACK less robustly at high parallelism. Suggestion: reduce parallel range concurrent requests as short-term, and propose a downloader flag to switch to sequential ranges + retry with backoff. Also raised possibility of enabling selective TLS bypass for presigned S3 host on NGFW.",
+    "2026-03-12 09:20 - Mariner NetOps: We're willing to test a policy change to preserve TCP options for traffic to S3 endpoints. Awaiting exact hostnames/IP ranges to whitelist."
+  ],
+  "workarounds": [
+    "1) Short-term: Set artifact fetcher parallelism to 1 or 2 to avoid concurrent range reassembly sensitivity. This was validated in-house and reduced failure rate to <1% in tests.",
+    "2) Customer-side: Configure NGFW to preserve TCP options (disable TCP option normalization / SACK stripping) for traffic to presigned S3 hostnames or IP ranges. This requires a rule change on their appliance.",
+    "3) Serve-side patch: engineering proposes adding a downloader mode 'sequential-range-with-retries' (slow-path) for private deployments as a safety for customers behind aggressive middleboxes.\n"
+  ],
+  "resolution": "In Progress - temporary mitigations applied: customer set downloader parallelism to 2 and observed immediate reduction in failures. Customer will test NGFW policy change to preserve TCP options for S3 traffic; Eng to schedule prioritized implementation of a sequential-range download mode for private deployments if policy change is not possible.",
+  "next_steps": [
+    "1) Support to coordinate with customer to apply NGFW whitelist for S3 hostnames and validate with packet captures (owner: Priya).",
+    "2) Engineering to scope and estimate sequential-range downloader mode and a configuration flag for private deployments (owner: Elena, ETA: 2026-03-20).",
+    "3) After customer confirms NGFW rule change, run 24h soak with normal parallelism and capture tcpdumps to validate SACK preservation and no RST_STREAMs (owner: Customer + Jordan)."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "workarounds",
+    "resolution",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_2ab47b4533844ea3abd679088e264b45"
+}

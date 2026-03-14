@@ -1,0 +1,84 @@
+{
+  "key": "SUP-923456",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Tailback pressure causes 504 timeout for hyperlength single-turn generation with streaming",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Ava Martinez",
+  "assignee": "Liam Chen",
+  "customer_company": "Podscribe Inc",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "finalizer",
+    "kv-cache",
+    "scheduler"
+  ],
+  "labels": [
+    "timeout",
+    "long-context",
+    "streaming",
+    "queueing"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "redwood-open-6B-quant"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-14T20:00:00Z",
+  "linked_issues": [
+    "SUP-31674",
+    "SUP-472190"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/2145"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/98765/Finalizer+queueing+runbook"
+  ],
+  "description": "Customer reports 504 Gateway Timeout when issuing a single-turn generation with an extremely long prompt (large context + large max_tokens) using streaming: connection closes before final chunks are emitted. Customer is on a Dedicated cluster in us-east. They reported this started after a spike in similar requests last week and is reproducible for one specific job id. The request uses the /v1/generate endpoint with streaming=true and max_tokens=150000. Impact: Podscribe's nightly ingestion job fails intermittently, causing downstream indexing delays and backfills.",
+  "steps_to_reproduce": "1) Use customer API key on prod-us-east cluster. 2) POST to /v1/generate with model=redwood-open-6B-quant, streaming=true, max_tokens=150000, and a ~180k-token priming prompt (concatenated customer documents). 3) Keep TCP connection open and allow streaming chunks. 4) Observe 504 or connection reset after ~115-125s; occasional partial chunks delivered then finalizer error. Example curl provided to customer during triage: curl -i -N -X POST https://api.redwood.com/v1/generate -H 'Authorization: Bearer <REDACTED>' -H 'Content-Type: application/json' -d '{\"model\":\"redwood-open-6B-quant\",\"stream\":true,\"max_tokens\":150000,\"prompt\":\"<very long priming text>\"}'",
+  "request_payload_sample": "{\n  \"model\": \"redwood-open-6B-quant\",\n  \"stream\": true,\n  \"max_tokens\": 150000,\n  \"prompt\": \"<~180k tokens of customer docs>\"\n}",
+  "observed_behavior": "HTTP/1.1 504 Gateway Timeout or connection reset by peer. When a partial stream is returned, the final bytes are delayed then cut off. On successful-but-slow runs the finalizer queue length climbs and worker handoff latency spikes, then the connection is closed without finalization. No increased 5xx rate for other customers in the same cluster during most occurrences.",
+  "expected_behavior": "Streamed chunks continue until generation completes and finalizer emits final chunk; no client-visible 504 for requests that fit within resource quotas for Dedicated customers. If system must reject, return a clear 429 with a recommended fallback model/shorter max_tokens guidance.",
+  "logs": "Relevant logs for request_id=req_0a1b2c3d4e: \n[2026-03-12T03:18:57Z] api-gateway: accept request req_0a1b2c3d4e client_ip=54.210.12.34\n[2026-03-12T03:19:00Z] scheduler: queued job job_99877 priority=normal queue_pos=17\n[2026-03-12T03:19:12Z] scheduler: dispatch job job_99877 -> worker pool dedicated-eu? (chosen us-east)\n[2026-03-12T03:19:48Z] serving-runtime: pool-alloc-delay=36s kernel-swap=true req=req_0a1b2c3d4e model=redwood-open-6B-quant sequence_len_est=180000\n[2026-03-12T03:20:30Z] kv-cache: hit_ratio=0.18 resident=22% attempting-evict=true evict_rate=78%\n[2026-03-12T03:20:50Z] finalizer: queue_length=12 headroom_tokens=0 backlog_ms=13450\n[2026-03-12T03:21:57Z] finalizer: emit_chunk seq=last error=deadline_exceeded connection_closed=client_reset\n[2026-03-12T03:21:57Z] api-gateway: 504 Gateway Timeout req=req_0a1b2c3d4e\nAdditional metrics: grafana panel: https://metrics.redwood.com/d/abc123/cluster-finalizer?var=cluster=prod-us-east",
+  "investigation_notes": "Initial hypothesis: finalizer queueing + pool allocation delay caused by resource headroom exhaustion under spike of hyperlength jobs. Data points: sustained high kv-cache eviction and large pool-alloc-delay for this job; finalizer queue length correlates with 504 events in the cluster. Further checking: autoscaler logs show burst_capacity_remaining=0 at time of request; node-provisioning latency of ~28s causing delay in new worker attach. No immediate OOMs on worker; CPU on router pods spiked but not saturated. We saw several concurrent jobs with similar token budgets from the same customer window (backfill). The serving runtime stalls around kernel-swap for very long sequences \u2014 older kernel path selection causes higher mem copies leading to slower throughput; this cluster is using an older runtime image (runtime v2.14) not yet updated to the optimized kernel selection introduced in v2.18.",
+  "root_cause": "Combination of (a) cluster exhausted burst headroom due to multiple hyperlength jobs from the same customer, (b) scheduler allocation delay + autoscaler cooldown preventing timely worker provisioning, and (c) older serving runtime kernel path that increases CPU-bound handoff latency for very long-sequence workloads, which created a finalizer backlog and ultimately triggered gateway-level 504s.",
+  "mitigation_steps_taken": "1) Temporarily scoped rate-limit: applied per-customer concurrency cap for Podscribe to 2 concurrent hyperlength jobs to prevent further backlog. 2) Manually increased cluster burst_capacity for prod-us-east and forced a scale-up (nodes added, new workers attached). 3) Enabled fallback policy on the customer's routes to route to redwood-open-6B-quant-smaller (token-window-limited) when headroom < 5%. 4) Restarted a subset of router pods to clear TCP stale connections. These actions reduced immediate 504s and allowed most queued jobs to finish within 90s after scale-up.",
+  "workaround": "Recommend customers split monolithic priming into smaller chunks and use incremental generation + rerank instead of single hyperlength generation. For now we advised Podscribe to reduce max_tokens to <= 50k or switch to a dedicated private deployment with reserved capacity for their nightly backfills. Support provided a script to chunk prompts and stitch outputs client-side.",
+  "long_term_fix_plan": "1) Backport kernel-selection and memory-copy optimizations from runtime v2.18 to v2.14 and roll to affected Dedicated clusters. 2) Improve autoscaler heuristics to detect hyperlength job spikes and pre-warm workers when queue length and estimated sequence length exceed thresholds. 3) Add explicit API-level guardrail: return 429 with explanatory body when estimated token+context cost exceeds dynamic headroom threshold rather than letting requests queue to finalizer. 4) Update docs + quickstart with best practices for large priming workloads. Timeline: hotfix (kernel backport) targeted within 2 weeks; autoscaler heuristics in 6 weeks.",
+  "resolution": "Work in progress. Immediate mitigation reduced customer impact and suggested workaround accepted by customer. Engineering is tracking kernel backport PR and autoscaler changes. Customer asked to keep ticket open until backport is deployed to their dedicated cluster and they validate nightly success for one week.",
+  "comments": [
+    "2026-03-12 04:05 UTC - Support (Ava Martinez): Collected request_id=req_0a1b2c3d4e and sample prompt from customer, asked for exact timing and whether they had concurrent jobs. Customer confirmed 3 parallel backfills at time of failure.",
+    "2026-03-12 07:30 UTC - SRE (Liam Chen): Scaled cluster manually and observed worker attach completed at 2026-03-12T07:47Z; finalizer queue drained. Created temporary per-customer concurrency cap. Investigating autoscaler cooldown behavior.",
+    "2026-03-13 12:15 UTC - Eng (Priya Nair): Found that runtime v2.18 kernel selection reduces memcopy for long sequences by ~35% in benchmarks. Opening backport PR: https://github.com/redwood-inference/runtime/pull/2145",
+    "2026-03-14 09:10 UTC - Customer (Samir Dogra, Podscribe): Confirmed that after temporary concurrency cap and reducing max_tokens to 40k their nightly runs completed successfully. They will trial the chunking script and report results next week."
+  ],
+  "next_steps": "1) Merge and deploy backport PR to prod-us-east dedicated clusters for Podscribe (owner: Priya). 2) Implement autoscaler heuristic change and test on staging with synthetic hyperlength workload (owner: SRE team). 3) Keep ticket open; validate one week of successful nightly backfills from Podscribe; schedule a check-in on 2026-03-21.",
+  "notes_for_postmortem": "If backport resolves tail latency, root cause confirmed. Postmortem should include recommendation to add per-route estimated_token_cost pre-checks and document customer-facing limits for hyperlength jobs. Track any billing implications for partially emitted streams.",
+  "customer_communication_summary": "We acknowledged the 504s, applied an emergency concurrency cap, scaled the cluster, and provided a short-term workaround (split prompts or reduce max_tokens). Customer verified reduced failures and will validate chunked workflow. Promised follow-up after backport deployment.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "logs",
+    "investigation_notes",
+    "root_cause",
+    "mitigation_steps_taken",
+    "workaround",
+    "long_term_fix_plan",
+    "resolution",
+    "comments",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_e5687e8000ba45adb0b43c9d0b40911a"
+}

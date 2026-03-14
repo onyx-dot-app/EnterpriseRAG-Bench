@@ -1,0 +1,51 @@
+{
+  "key": "ENG-20450",
+  "team": "engineering",
+  "title": "Improve CUDA graph capture/replay stability for multi-stream decode with deterministic kernel selection and prefill gating",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-15",
+  "updated_at": "2026-03-01",
+  "creator": "Aisha Khan",
+  "assignee": "Miguel Ortega",
+  "project": "Serving Runtime: Graph & Decode Stability",
+  "cycle": "2026-W09",
+  "estimate": 8,
+  "labels": [
+    "runtime",
+    "cudagraph",
+    "multi-stream",
+    "prefill",
+    "p0"
+  ],
+  "dependencies": [
+    "ENG-17908",
+    "ENG-16821"
+  ],
+  "release": "runtime-1.22",
+  "customer_impact": "high",
+  "security_review_required": false,
+  "description": "Summary:\nWe are observing intermittent replay correctness issues and sporadic hangs when using CUDA Graph capture across concurrent multi-stream decode paths (prefill + decode streams). The failures manifest as: mismatch in token logits after replay, occasional kernel launch errors in production, and increased tail latency due to recapture storms. This ticket scopes a solution that: 1) makes kernel selection deterministic during capture, 2) enforces a prefill->capture quiesce and gating policy to prevent interleaved state changes, and 3) adds replay verification and deterministic test harnesses so we can prevent regressions.\n\nBackground and motivation:\n- Root cause appears to be non-deterministic kernel selection combined with inter-stream resource races during graph capture. The serving runtime dynamically chooses kernels (different matmul/cuBLAS heuristics and fused-attention kernels) based on workspace availability and input shapes. If capture happens while other streams are concurrently allocating/freeing or biasing the allocator (stream-local workspaces), the capture records a kernel variant that is incompatible when replayed later on a different stream/hardware situation.\n- Multi-stream decode uses at least two streams: prefill (longer sequence KV prefill) and decode (token generation). We capture graphs at end of prefill to accelerate subsequent decode. When capture interleaves allocations from the background cache manager or from concurrent requests, the captured graph can include pointers to temporary workspaces or assume kernels that subsequently choose different codepaths on replay.\n\nGoals:\n- Eliminate observed logit mismatches and launch errors attributed to cudagraph replay correctness in multi-stream scenarios.\n- Reduce frequency of full graph recaptures and avoid recapture storms that increase tail latency.\n- Ensure deterministic kernel selection during capture and provide safe fallbacks when capture invariants are not met.\n\nProposed design (high level):\n1) Deterministic kernel selection during capture:\n   - Freeze kernel-choice heuristics while performing a capture: force deterministic kernel IDs based on model architecture + length + batch shape. Introduce a capture flag that forces the kernel selector into a deterministic mode (no workspace-dependent heuristics).\n   - Record the kernel ID/version into graph metadata (graph-version hash) and include a compact compatibility check at replay time. If a mismatch is detected, either replay via fallback path or trigger a safe recapture under stricter isolation.\n\n2) Prefill->capture quiesce and allocator isolation:\n   - Introduce a capture quiesce window: before starting capture, pause new request scheduling to the target device for X ms and drain pending stream tasks. \n   - Use stream synchronization primitives (cudaEvent with streamWaitEvent) to ensure the prefill stream reaches a consistent state, and temporarily pin the allocator to avoid cross-stream transient allocations during capture.\n   - For small batch sizes or high concurrency where quiesce would be too expensive, fall back to single-stream capture strategy (capture everything on the dedicated capture stream) or skip graph capture and use optimized kernel path for that request class.\n\n3) Shadow-graph recapture and verification:\n   - When creating a new graph, concurrently build a shadow replay in a background low-priority job that runs the same inputs through the captured graph and the eager path (or a reference small-batch path) and compares outputs (logits/hash) deterministically. Only mark the graph as \"trusted\" after the shadow verification passes. This prevents bad graphs from being used at scale.\n\n4) Finer-grained graph-versioning and compatibility rules:\n   - Embed a graph header with kernel selection fingerprint, device compute capability, cuBLAS/cuDNN versions, and allocator mode. On replay, validate header; if any incompatibility is detected, the runtime will either: 1) replay on the eager path, 2) perform a guarded recapture with elevated isolation, or 3) route to a compatible model variant.\n\n5) Tests and telemetry:\n   - Add deterministic harness tests that run across multiple seeds, stream schedules, and simulated allocator noise to reproduce the bug in CI.\n   - Add production histograms: graph_replay_failures, graph_recapture_count, capture_quiesce_time, shadow_verification_pass_rate, and per-model graph_version_mismatch_rate.\n\nTrade-offs considered:\n- Quiesce window increases latency for the first request that triggers capture; mitigated via: short quiesce (5-20ms), background shadow verification, and selective fallback for small/latency-sensitive workloads.\n- Deterministic kernel choice removes some opportunistic performance wins from dynamic heuristics; we will benchmark the deterministic kernels vs. heuristic-chosen kernels and keep heuristics enabled for non-capture paths.\n\nAcceptance criteria:\n- Deterministic test harness reproduces previous failure locally within 3 tries for the current repro case (before fix) and shows no mismatches after the fix.\n- Shadow verification blocks bad graphs from being promoted in >= 95% of previously failing traces.\n- Production canary (1% traffic on dedicated pool) shows <= 0.1% graph_replay_failures and no increase in p99 latency beyond noise baseline.\n- Metric dashboards and alerts created for graph_replay_failures and graph_recapture_count.\n\nImplementation plan and milestone tasks:\n- M1 (Spike, 2d): Build minimal deterministic kernel selector mode and a local repro that fails deterministically. Record experiment notes. (Owner: Miguel)\n- M2 (5d): Implement capture quiesce + allocator pinning primitives; add metadata header to graphs. (Owner: Miguel)\n- M3 (4d): Shadow verification job and gating logic. Add CI deterministic tests. (Owner: Aisha)\n- M4 (3d): Rollout plan + canary automation + dashboards. (Owner: Platform team)\n\nRollout plan:\n- Internal feature flag guarded behind runtime.config.cudagraph_stability. Start with local tests, then internal canary (infra team), then 1% public canary on dedicated pool for 48h, inspect metrics, expand to 10% then 100% if green.\n\nObservability / dashboards:\n- Create dashboard: infra/graphs/capture-stability with panels: graph_replay_failures (by model), shadow_verification_pass_rate, graph_recapture_count, capture_quiesce_latency, graph_fallback_rate.\n- Alert: graph_replay_failures > 0.5% sustained for 15m in any model => page on-call runtime eng.\n\nLinks and artifacts:\n- Design doc (confluence): https://redwood.atlassian.net/wiki/spaces/INF/pages/5873421/CUDA+Graph+Capture+Stability+Design\n- Spike notes & perf results: https://docs.google.com/document/d/1X9-spike-notes\n- GitHub PRs: https://github.com/redwood-inference/runtime/pull/4321 (deterministic kernel selector), https://github.com/redwood-inference/runtime/pull/4340 (capture quiesce + metadata header), https://github.com/redwood-inference/runtime/pull/4358 (shadow verification harness)",
+  "comments": [
+    "2026-02-15 - Aisha Khan: Ticket created after observing several post-deploy incidents where cudagraph replay produced different logits vs. eager path. Collected five sample traces from prod (trace ids: tr-22a, tr-22b, tr-22c). Assigning to Miguel for spike.",
+    "2026-02-17 - Miguel Ortega: Spike complete. Reproducer built that toggles allocator noise and concurrent streams; reproduces mismatch with ~40% probability over 100 runs. Root cause looks like workload-dependent kernel selection combined with temporary allocator pointers being baked into graph capture ops. Drafted deterministic selector PR (WIP).",
+    "2026-02-20 - Miguel Ortega: Implemented deterministic kernel selector and added kernel_id to graph header. Local CI shows reduced mismatch but we still have sporadic launches failing when another concurrent job forces workspace resize during capture. Next: try capture quiesce + pin allocator.",
+    "2026-02-24 - Aisha Khan: Design review with infra and allocator owners. Agreed on quiesce + allocator pin; flagged performance trade-offs. Need to ensure we do not regress latency for small sequences. Added shadow graph verification to avoid silent bad graphs.",
+    "2026-02-26 - Miguel Ortega: Initial implementation of capture quiesce landed in PR #4340. Running internal canary on staging dedicated pool. Observed 12% reduction in graph_replay_failures on staging but increased capture latency by ~9ms for 2048-token prefill cases. Tuning quiesce window to 8ms improved result.",
+    "2026-03-01 - Aisha Khan: Added CI deterministic test harness (PR #4358) and a flaky-test guard. CI run reproduces prior failure before fix; after changes, 500 CI runs show 0 mismatches. Preparing rollout plan for canary next week.",
+    "2026-03-01 - Miguel Ortega: Blockers: need allocator API to expose temporary pinning for only the capture duration. Filed follow-up ENG-20463 for allocator API change."
+  ],
+  "acceptance_criteria": [
+    "Deterministic CI harness shows 0/500 mismatches for the current repro case",
+    "Shadow verification prevents promotion of any graph that produces >1e-6 relative difference in logits vs reference path",
+    "1% public canary shows graph_replay_failures <= 0.1% and no p99 latency regression",
+    "Dashboard and alerts created and tested"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "acceptance_criteria"
+  ],
+  "dataset_doc_uuid": "dsid_0dfb69934de54b00ab8a1f0fbd2ae9b1"
+}

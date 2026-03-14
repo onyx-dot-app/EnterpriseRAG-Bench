@@ -1,0 +1,95 @@
+{
+  "key": "SUP-721246",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "API-GW retry spin causes upstream GPU memory fragmentation and elevated 5xx rate",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-13",
+  "reporter": "Aisha Kapoor",
+  "assignee": "Ben Liang",
+  "customer_company": "ClarionAI",
+  "customer_tier": "enterprise",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "keepalive-proxy",
+    "autoscaler"
+  ],
+  "labels": [
+    "elevated-5xx",
+    "hedged-retry",
+    "gpu-fragmentation",
+    "prod"
+  ],
+  "environment": "prod/us-east",
+  "affected_models": [
+    "redwood-rlhf-13b",
+    "redwood-embed-2"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-12",
+  "first_response_due_at": "2026-03-12",
+  "linked_issues": [
+    "SUP-314159",
+    "SUP-531289"
+  ],
+  "related_github_prs": [
+    "github.com/redwood/inference/pull/1128"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood/pages/INC-hedged-retry-runbook"
+  ],
+  "description": "Issue summary: ClarionAI observed a sudden elevation in 5xx errors (502/503) for inference and embedding routes starting 2026-03-12 09:10 UTC. Impact: customer experiencing ~30% error rate increase for calls to redwood-rlhf-13b and batch embedding workflows; requests spike at p95 latency and many inflight hedged retries are visible. Environment: production (us-east-1) serving cluster using dedicated capacity. Observed behavior suggests API-GW retry/hedged-retry loop amplified traffic to runtimes, exhausting keepalive slots and contributing to GPU memory fragmentation and eventual runtime OOMs/crash-restarts.",
+  "steps_to_reproduce": [
+    "1) Use ClarionAI test tenant with parallelism=40 and hedgedRetries enabled in client (window=50ms).",
+    "2) Send mixed workload: 60% short chat/generation (max_tokens=256) + 40% batched embeddings (batch size 128) over 2 minutes.",
+    "3) Observe apigw 50x concurrency spikes, hedged retry counters incrementing and upstream 502/503 responses within 30-90s.",
+    "4) Reproduce observed GPU OOMs by running multi-tenant embed burst against dedicated pool (requires staging config mirroring prod keepalive limits)."
+  ],
+  "logs": [
+    "2026-03-12T09:11:02Z apigw[proxy-123] WARN hedged_retry: concurrent_backoff=0.02 in_flight=512 target=10",
+    "2026-03-12T09:11:05Z runtime[u-srv-07] ERROR nvml: GPU memory alloc failed: out of memory (fragmented). pid=11234 model=redwood-rlhf-13b",
+    "2026-03-12T09:11:07Z apigw[proxy-123] ERROR upstream: got 502 from u-srv-07 (keepalive_pool_exhausted)",
+    "2026-03-12T09:11:12Z autoscaler INFO prewarm: triggered 2 extra ephemerals due to queue_length>200",
+    "2026-03-12T09:11:18Z runtime[u-srv-07] FATAL watchdog: runtime exiting after repeated nvml errors; restart scheduled"
+  ],
+  "investigation_notes": [
+    "Initial triage: p95 latency for apigw route rose from 120ms to 1.2s coincident with error spike; apigw hedged-retry hit rates increased 7x compared to baseline.",
+    "Correlation found between hedged retry attempts and keepalive pool exhaustion: apigw connection reuse dropped to <20% and keepalive_fd in use reached configured limit.",
+    "Runtime logs show repeated small allocation failures rather than single large allocation\u2014consistent with memory fragmentation (frequent small model loads and model_variant swaps).",
+    "Autoscaler warmed additional ephemerals but warmup latency and accept-queue growth meant they did not absorb initial burst; increased retry traffic amplified upstream load before nodes stabilized.",
+    "Network and disk metrics normal; NVML traces show fragmentation followed by OOMs then driver-level reset on affected GPUs."
+  ],
+  "comments": [
+    "Aisha Kapoor (Support) 2026-03-12: Customer reported escalation of 5xx on embedding upload job; supplied request ids and times. Asking SRE to take a look and confirm if we throttled or applied any tenant-level caps.",
+    "Ben Liang (SRE) 2026-03-12: Investigating. Early signals point to hedged retry amplification + keepalive exhaustion. I have disabled hedged retries for the tenant as an immediate mitigation and put a soft concurrency cap on ClarionAI route.",
+    "ClarionAI (Customer) 2026-03-12: Confirmed temporary reduction in errors after your change; however throughput is degraded. Can you advise why runtimes restarted? We saw several job failures with \"GPU alloc failed\".",
+    "Ben Liang (SRE) 2026-03-12: Runtimes logged repeated small allocation failures consistent with fragmentation; driver resets triggered restarts. We are collecting NVML dumps and flamegraphs and will onboard runtime-engineering.",
+    "Sven M\u00fcller (Runtime Eng) 2026-03-13: Collected heap allocation traces; a recent model-prefetch heuristic change increased small allocation churn (prefetch-of-variants on embed load). Rolling back candidate heuristics to reduce fragmentation. Also increasing keepalive_pool temporarly in affected prod pool."
+  ],
+  "mitigation": "Applied temporary mitigations: disabled hedged retries for affected customer, applied per-tenant concurrency cap (parallelism limit), increased keepalive pool size for impacted GKE nodepool, and rolled back a model-prefetch heuristic that increased small-allocation churn.",
+  "resolution": "Root cause: interaction between aggressive client-side hedged retries + apigw hedged-retry behavior and a recent runtime prefetch change causing frequent small allocations; this combination produced GPU memory fragmentation that led to OOMs and runtime restarts, amplifying 5xx rates. Remediations deployed: (1) rollback runtime prefetch heuristic (deployed canary 2026-03-13 02:40 UTC, global 03:10 UTC), (2) apigw change to add exponential backoff for hedged retries and a short jitter window (PR merged github.com/redwood/inference/pull/1128), (3) add early per-tenant concurrency caps and a stateless circuit breaker to short-circuit hammering requests. Post-deploy: customer error rate returned to baseline (~1.2% 5xx) and runtimes stopped restarting. Follow-up: runbook entry created and a postmortem scheduled.",
+  "follow_up_actions": [
+    "Create postmortem doc and notify customers via status page (owner: Aisha Kapoor, due 2026-03-15).",
+    "Add automated alert for hedged-retry amplification combining apigw hedgedRetryRate and runtime keepalive_free < 10% (owner: Ben Liang).",
+    "Investigate long-term fixes: smarter runtime allocator for small allocations and per-model prefetch backoff (owner: Sven M\u00fcller).",
+    "Ship canary for apigw hedged-retry backoff to other regions in two weeks (owner: api-gateway team)."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "mitigation",
+    "resolution",
+    "follow_up_actions"
+  ],
+  "dataset_doc_uuid": "dsid_14e704e08e2c4e38af6c54dea0434d77"
+}

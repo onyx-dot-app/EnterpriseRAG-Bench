@@ -1,0 +1,33 @@
+{
+  "title": "Cobweb load scribble \u2014 elastic prefetch and jitter runs",
+  "owner": "Carmen Wu",
+  "drive_area": "users",
+  "path": "users/cobweb-load-scribble-carmen",
+  "doc_type": "doc",
+  "created_at": "2025-02-14",
+  "last_modified": "2025-02-18",
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "throughput",
+    "slo-investigation",
+    "kv-cache",
+    "burst-mitigation",
+    "heterogeneous-fleet"
+  ],
+  "collaborators": [
+    "Lena Ortiz",
+    "Samir Khatri"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/runtime/pull/2345",
+    "INF-6789",
+    "https://docs.internal.redwood.ai/confluence/x/Cobweb-Playbook"
+  ],
+  "content": "Purpose:\nQuick scratchpad of the last week of runs: trying an \"elastic prefetch\" (client-side micro-delay that coalesces very short back-to-back requests) + server KV-cache warmness tuning on a small, heterogeneous dev fleet. Goal: reduce p99 tail amplification during mixed-size arrivals while keeping p50 stable and not inflating cost by adding idle batching.\n\nSetup summary (dev cluster):\n- 8-node dev fleet: 3xA100-80GB, 3xA10, 2xT4 (intended to emulate mixed prod).\n- Runtime build: local branch elastic-prefetch-v3 (see PR above).\n- Model: open-gpt-2-medium-quant (tokenization ~ 1.1 tokens/byte), sequence length sampled from empirical distribution from the last 7d prod trace (median 64, heavy tail to 1024).\n- Client generator: hybrid driver (poisson baseline lambda + periodic microbursts every 45s, duration 3-9s, amplitude 1.5\u20133x).\n- Workload split: 70% short (<=64), 20% mid (65\u2013256), 10% long (>256).\n- KV-cache: baseline TTL=3s (old); tuned to 6s and 12s for experiments; cache is per-model, per-tenant variant.\n- Batch policy: continuous batching enabled, max batch size = 64 tokens, batch timeout = 20ms default unless overwritten by policy.\n\nExperiment matrix (high-level):\n1) baseline (no prefetch, TTL=3s)\n2) TTL=6s\n3) TTL=12s\n4) client elastic-prefetch enabled (micro-delay 8\u201312ms distribution) + TTL=6s\n5) elastic-prefetch + TTL=12s + slightly raised batch timeout (30ms)\n\nMetrics collected: p50/p90/p95/p99 latencies (in ms), end-to-end (client observed), server queue wait, GPU utilization, KV-cache hit rate, token cost estimate (tokens x cost factor). Sample window length: 20 minutes per run, repeated 3x per config at different random seeds.\n\nRepresentative results (median over repeats):\n- Baseline (TTL3): p50=42ms, p90=110ms, p95=210ms, p99=980ms, kv-hit=18%, gpu-util avg=72%\n- TTL6: p50=44ms, p90=108ms, p95=190ms, p99=860ms, kv-hit=27%, gpu-util avg=75%\n- TTL12: p50=45ms, p90=105ms, p95=180ms, p99=700ms, kv-hit=34%, gpu-util avg=76%\n- Prefetch+TTL6: p50=48ms, p90=95ms, p95=140ms, p99=260ms, kv-hit=39%, gpu-util avg=78%\n- Prefetch+TTL12+30ms: p50=50ms, p90=92ms, p95=130ms, p99=210ms, kv-hit=44%, gpu-util avg=79%\n\nInterpretation / quick notes:\n- Increasing KV TTL progressively reduces p99 but has diminishing returns beyond 12s on this dev fleet. The effect is more pronounced for heavy-tail (>256) requests because they benefit from cached prefixes.\n- Client-side elastic-prefetch dramatically reduces p99 (980->260ms) while modestly shifting p50 (42->48ms). That tradeoff is promising: small, controlled delays allow natural coalescing without adding large batching timeouts.\n- Raising the batch timeout to 30ms only added ~2\u20133ms to p50 compared to prefetch alone yet trimmed p99 further (260->210ms) \u2014 likely because longer micro-window captured extra short inter-arrivals.\n- GPU utilization increased slightly (72->79%) when combining prefetch+cache, which aligns with more effective token packing and lower per-token overheads. This implies lower per-token cost even if wall-time per-request increases a touch for short requests.\n\nObserved pathological cases:\n- During periodic microbursts, nodes with slower GPU (T4) showed transient queue buildup; p99 there spiked to ~900ms in baseline. With TTL12+prefetch the spike was limited to ~280ms.\n- A misconfigured client seed (one run) set micro-delay to 40ms accidentally and produced worse p50/p90 (p50 up to 120ms); this confirms sensitivity to the delay parameter. Keep default 8\u201312ms range.\n- Long sequence requests (>512) still dominate tail beyond p99. Prefetch helps by improving prefix cache for reused contexts, but cannot avoid raw compute time for long sequences. Consider explicit long-request routing to dedicated capacity for strict SLOs.\n\nProfiler snapshots (annotated):\n- When p99 climbs above 600ms, server-side breakdown shows: 60% queue wait, 30% GPU compute, 10% serialization/transfer. With prefetch+TTL12, queue wait reduces to 15% of end-to-end.\n\nQuick checklist for next actions:\n- [ ] Run same matrix on stable dedicated pool (no T4s) to confirm that heterogeneity is the main amplifier for tails.\n- [ ] Add a control that routes long (>512) to a dedicated lane and measure end-to-end SLO improvement and cost delta.\n- [ ] Instrument finer-grained client-side telemetry to confirm that prefetch actually groups requests from same client vs different clients (I suspect both).\n- [ ] Validate behavior with production-like token distributions (higher long-request fraction).\n- [ ] Add small A/B in-host test comparing prefetch distribution 6\u201310ms vs 12\u201318ms to confirm optimum.\n\nImplementation notes / gotchas to remember:\n- Prefetch/micro-delay must be randomized per request to avoid sync alignment across clients. Use triangular distribution center=10ms, min=5ms, max=15ms for production experiments.\n- When increasing TTL, ensure memory pressure on KV store is monitored; 12s on dev was safe but scale could push memory bounds. Add eviction logging.\n- Ensure cache keys are normalized by model-variant and tenant; accidental mismatch found in one run (lowered hit rate).\n\nShort-term conclusion:\nElastic client prefetch + modestly longer KV TTLs looks like a low-risk, high-reward knob to reduce p99 tail amplification on mixed-size workloads. It trades a couple ms at p50 for dramatic p99 improvements and better GPU packing. Next step: verify on a more production-like fleet and add long-request routing experiment.\n\nNotes to self: leave runtime flag gated and default off for customers, opt-in via feature flag for early testers. Add telemetry for \"prefetch_coalesced\" boolean on traces.\n\nRaw experiment IDs (for traceability):\n- run-20250214-cwb-01\n- run-20250216-cwb-03\n- run-20250217-cwb-07\n\nEnd of scribble.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_324daf23b86345249f462441029dc7b3"
+}

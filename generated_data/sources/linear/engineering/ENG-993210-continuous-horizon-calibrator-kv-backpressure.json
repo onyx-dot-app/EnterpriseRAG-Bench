@@ -1,0 +1,53 @@
+{
+  "key": "ENG-993210",
+  "team": "engineering",
+  "title": "Continuous batching horizon calibrator with KV backpressure controls for mixed prompt/response workloads",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-02-28",
+  "creator": "Aisha Khan",
+  "assignee": "Marco Alvarez",
+  "project": "Serving Runtime - Continuous Batcher",
+  "cycle": "2026-W08",
+  "estimate": "8",
+  "due_date": "2026-03-18",
+  "labels": [
+    "batching",
+    "kv-cache",
+    "gpu-memory",
+    "latency-slo",
+    "rollout"
+  ],
+  "parent_issue": [
+    "ENG-941000"
+  ],
+  "dependencies": [
+    "ENG-914321",
+    "ENG-842100"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Problem statement:\\n\\nOur continuous batching scheduler under mixed prompt/response workloads shows unstable tail latency and suboptimal GPU memory utilization. Short prompts followed by long decodes create uneven slot residency and cause KV cache churn: frequent small sessions pin and evict KV pages needed for longer decodes, increasing CPU/GPU memcpy and degrading p95/p99. Existing heuristics (fixed tenure, static watermarking) are brittle across tenants with different prompt/response distributions.\\n\\nGoal:\\n\\nDesign and implement a Horizon Calibrator layer in the continuous batcher that: 1) dynamically adjusts coalescing horizons (how long a slot waits to be coalesced into a batch) per-length stratum, 2) applies KV backpressure and soft-reservations to prevent short-lived traffic from evicting warm KV entries needed by long decodes, and 3) coordinates with GPU slab allocator to reduce fragmentation during mixed-length workloads.\\n\\nNon-goals:\\n\\n- Changing model kernels/quantization strategies (handled by separate teams).\\n- Large infra changes to allocator APIs beyond exposing a small advise()/pin() surface.\\n\\nDesign overview:\\n\\n1) Length strata and micro-horizons\\n- Classify requests into length strata at enqueue time: short (<=64 tokens), medium (65-512), long (>512). Buckets are tunable and sampled per tenant.\\n- Maintain an exponentially-weighted moving average (EWMA) of observed decode times per stratum and a per-stratum horizon H_s = alpha * median_decode + beta * median_enqueue_gap. H_s is clamped to [min_horizon, max_horizon].\\n\\n2) Horizon-driven coalescing\\n- Batcher defers slot sealing for up to H_s (per-slot) to allow more compatible tokens to join. Short-stratum slots get smaller H_s; long-stratum slots get larger H_s to maximize KV residency reuse during multi-token decodes.\\n\\n3) KV backpressure and soft-reservations\\n- Introduce per-GPU KV reservation scoreboard: a quota of KV pages reserved for active long decodes (configurable percent of total KV capacity). When reservations approach threshold, allow the batcher to apply backpressure for short-stratum requests (prefer tail-latency-shedding or route to a lower-cost model variant).\\n- Provide an allocator hint API: advise_reserve(gpu_id, pages) and release_reserve(...). Long-decode leaders call advise_reserve at start-of-decode; reservation is released on decode completion or graceful fallback.\\n\\n4) GPU slab alignment and compaction hints\\n- Coordinate with GPU slab allocator to prefer slab-aligned KV objects for long-lived entries. Periodic off-peak compaction API can be invoked to defragment KV memory when utilization crosses a fragmentation threshold.\\n\\n5) Telemetry and adaptive control loop\\n- Telemetry signals: per-stratum enqueue rate, slot coalescing ratio, per-stratum decode latency EWMA, KV hit/miss rates, KV eviction churn, slab fragmentation percent, GPU memcpy/sec, and token-per-second throughput.\\n- A control loop evaluates these signals every evaluation window (default 15s) and adjusts H_s, reservation percent, and backpressure thresholds using hill-climbing with safety clamps.\\n\\nSuccess metrics (measured against a representative mixed-traffic benchmark):\\n- p95 latency for decode phase <= baseline p95 + 10ms (goal: reduce p99 by 20%).\\n- KV eviction churn reduced by >= 35%.\\n- GPU memcpy volume reduced by >= 25% during mixed workloads.\\n- End-to-end throughput (tokens/sec) >= baseline or improved by >5% in long-decode heavy mixes.\\n- No >2x increase in short-request p50 latency; any short-request degradation must be controlled via customer-tier policies.\\n\\nCompatibility & rollout policy:\\n\\n- Feature gated behind runtime flag: continuous.horizon_calibrator (defaults off).\\n- Canary rollout: 0.5% -> 2% -> 10% -> 50% -> 100% over 2 weeks with automatic rollback on SLO breach.\\n- Per-tenant opt-out and soft-reservation tuning exposed in Dedicated/Private configs.\\n\\nTesting plan:\\n\\n1) Unit tests for horizon math, EWMA, and clamp logic.\\n2) Integration tests in CI: synthetic traffic generator with controlled mixes (short-only, long-only, mixed 70/30 & 30/70) verifying telemetry and control adjustments.\\n3) Staging: traffic-replay tests with customer traces that historically caused KV churn. Compare baseline vs calibrator behavior with trace replay.\\n4) Performance bench: run GPU microbench with slab instrumentation to measure memcpy/sec and fragmentation before/after.\\n\\nInstrumentation and dashboards:\\n\\n- New metrics: horizon_ms_by_stratum, kv_reserved_pages, kv_evictions_by_cause, slab_fragmentation_pct, slot_seal_delay_ms, coalesce_ratio_by_stratum.\\n- Dashboards: Continuous Batcher -> Horizon Calibrator (per-gpu, per-tenant filters).\\n- Alerts: sustained kv_evictions_by_cause > threshold for 60s, slab_fragmentation_pct > 70% for 5m, or p99 decode latency drift > 25% vs baseline.\\n\\nRollout steps and fallback:\\n\\n- Step 0: Merge feature as disabled. Add comprehensive unit/integration tests.\\n- Step 1: Internal QA with synthetic mixes and bench runs.\\n- Step 2: Canary 0.5% on low-risk tenants. Monitor tuned metrics for 24h.\\n- Step 3: If KV eviction decreases and p99 improves, expand to 10% and then to 50%. If regressions occur, automatically revert the flag and capture heap profile + KV metrics.\\n- Emergency fallback: disable continuous.horizon_calibrator and optionally set reservation percent to 0 to restore prior behavior.\\n\\nOpen questions / trade-offs:\\n\\n- How aggressive should soft-reservations be for multi-tenant GPUs? Too aggressive risks starving short interactive traffic; too conservative yields little benefit. Proposed default: reserve 18% pages for long decodes, tunable by tenant.\\n- Reservation accounting: should reservations be token-count based or page-count based? Page-count is simpler with current allocator metrics; token-based would need mapping of KV size per token distribution.\\n- Do we allow cross-GPU spill reservations for dedicated customers? (later PR if requested).\\n\\nDependencies and follow-ups:\\n\\n- Allocator API: expose advise_reserve/release_reserve (ENG-914321).\\n- Runtime telemetry: slab fragmentation instrumentation (ENG-842100).\\n- Policy UI: expose per-tenant reservation tuning in Console (PM follow-up).\\n\\nAcceptance criteria:\\n\\n- Implementation merged behind feature flag with tests.\\n- Bench results demonstrate >= 25% reduction in GPU memcpy/sec and >= 30% reduction in KV eviction churn for mixed workloads in staging.\\n- Canary run shows no SLO regression for short-request p95 beyond agreed thresholds and p99 decode improvements for long requests.\\n- Documentation and dashboard tiles published in Console release notes.",
+  "comments": [
+    "2026-02-11 - Marco: Initial spike completed. Built a prototype that computes per-stratum EWMA and clamps H_s. Observed decent coalesce gains for long-heavy mixes in the simulator. Next: wire reservation hints to allocator shim.",
+    "2026-02-13 - Priya Reddy (PM): Thanks \u2014 please include tenant opt-out and a conservative default reservation. PMs want a way to scope to Dedicated vs Hosted. Add 'customer_impact' high as this affects tail latency for many customers.",
+    "2026-02-18 - Design review (Liam O'Connor): Approved the horizon math and control loop conceptually. Raise a flag to keep reservation accounting simple (page-based). Also requested safety clamps and hard rollback triggers in the rollout plan.",
+    "2026-02-21 - Marco: Hooked advise_reserve/release_reserve to allocator shim (local dev build). Microbench shows ~18% less memcpy on medium+long mixes when reservation percent set to 20%. Filing perf PR next.",
+    "2026-02-27 - QA: Staging traffic replay shows KV evictions down 42% for trace A (mixed dialogs), p99 decode improved from 780ms -> 610ms. Short-request p50 degraded by ~6ms; within acceptable config default for free tier. Preparing canary plan.",
+    "2026-02-28 - Marco: PR opened: github.com/redwood-inference/runtime/pull/1286 (WIP). Need approval from infra and telemetry owners. Planning canary next week.",
+    "Action items:\\n- Marco to finish PR and add allocator unit tests.\\n- Telemetry owner (Jia Chen) to add horizon_ms_by_stratum metric.\\n- PM to add Console control for per-tenant reservation (follow-up ticket)."
+  ],
+  "attachments": [
+    "https://confluence.redwood.ai/display/RUNTIME/Horizon+Calibrator+Design+Spec",
+    "https://github.com/redwood-inference/runtime/pull/1286",
+    "https://grafana.redwood.ai/d/continuous-batcher/horizon-calibrator?orgId=1"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_f82b21786bb54638b5f60d07a7f18469"
+}

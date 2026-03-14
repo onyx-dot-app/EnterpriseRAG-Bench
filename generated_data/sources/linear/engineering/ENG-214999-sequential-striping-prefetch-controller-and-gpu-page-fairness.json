@@ -1,0 +1,82 @@
+{
+  "key": "ENG-214999",
+  "team": "engineering",
+  "title": "Sequential striping prefetch controller and GPU page fairness",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-10",
+  "creator": "Ava Kim",
+  "assignee": "Liam Patel",
+  "project": "KV-Serving-Runtime",
+  "cycle": "2026-W09",
+  "estimate": "8",
+  "labels": [
+    "kv-cache",
+    "gpu-prefetch",
+    "continuous-batching",
+    "eviction",
+    "observability"
+  ],
+  "description": "Context: As we run more diverse serving workloads with continuous batching, GPU residency for KV cache pages becomes the limiting factor for tail latency and throughput. Existing slab allocators and bulk prefetch approaches cause unfairness between concurrent requests and introduce fragmentation that spikes OOMs under bursty traffic. This ticket specifies an implementation for a sequential striping prefetch controller paired with a page-fairness residency policy to improve average token cost and reduce 99p latency regressions during high-concurrency, oversubscription scenarios.\n\nGoals:\n- Reduce 99th percentile token latency for bursty chat workloads by 20% relative to the current host-staged bulk prefetch baseline.\n- Improve GPU occupancy stability across concurrent lanes to avoid single-tenant or single-session hoarding of KV pages.\n- Keep steady-state increase in host->GPU memory transfer bandwidth under 1.5x baseline via adaptive throttling.\n- Provide observability to correlate prefetch events with latency, eviction churn, and thermal signals.\n\nDesign summary:\nWe introduce a prefetch controller that issues host->GPU transfers in a sequential stripe order across a small set of adjacent KV block ranges (\"stripes\") at the time a batch is dispatched. Instead of prefetching whole logical segments or sweeping large slab ranges, we fetch narrow stripes aligned to the runtime's page granularity (default 2MB) and stagger them across active worker lanes in a round-robin fashion. This achieves three things: (1) reduces instantaneous bandwidth demand by spreading transfers over the batch lifetime, (2) increases effective concurrency of useful resident pages for overlapping batches, and (3) reduces fragmentation compared to greedy whole-segment fetch.\n\nKey data structures and invariants:\n- StripeDescriptor (flat): identifies model_id, block_start_page, stripe_length_pages, stripe_epoch. Stored in lock-free MPSC queue shared between scheduler and prefetch worker. (Serialized as compact record; see notes for memory layout.)\n- ResidencyBudget per lane (int64): soft budget of pages allowed to be resident for that lane. Sum of budgets equals GPU resident cap minus a reserved eviction headroom. Budgets adjusted by controller based on recent hit-rate and latency signals.\n- ActiveStripeSet: ring buffer of pending stripes ordered by dispatch time. Controller ensures a stripe is only in-flight once per GPU to avoid duplicate transfers.\n\nController algorithm (high level):\n1) On batch commit, generate candidate stripe list by sampling token affinities and KV block hotspots from the batch's prefix histories. Prioritize exact-token affinities, then LRU-hotset sampled pages.\n2) Assign candidate stripes to lanes maintaining per-lane ResidencyBudget constraints. If assigning would exceed GPU cap, mark stripe as deferred and register it for backpressure-triggered prefetching.\n3) Issue transfers for assigned stripes in sequential order with small inter-transfer gaps proportional to the lane's batch duration. Use pinned host-staged buffers and CUDA async memcpy where available.\n4) On transfer completion, update residency maps and increment per-stripe epoch. If eviction required, invoke eviction planner (see Eviction strategy).\n\nEviction strategy and fairness:\n- Primary policy is a hybrid Hotness-LRU with weighted fairness: pages accrue a heat score from recent hits (exponential decay window). Eviction candidates are sampled from low-heat pages but chosen to maintain per-lane ResidencyBudget targets.\n- To enforce fairness, we track per-lane victim quotas; if a given lane has been assigned > 2x its fair share recently we trigger a fairness rebalancing that temporarily lowers its ResidencyBudget and accelerates demotion of its cold pages.\n- Eviction operates in small micro-batches (page multiples of stripe size) to avoid large instantaneous DMA traffic spikes and to enable overlap with ongoing kernel execution.\n\nContinuous batching interactions and backpressure:\n- The scheduler emits prefetch hints as soon as a batch is accepted; for streaming/continuous workloads, hints are updated incrementally as tokens are appended. The controller supports incremental stripe augmentation: new stripes can be appended to the end of an existing stripe transfer sequence for a lane, not preempting current transfers.\n- When the prefetch controller detects sustained high transfer queue depth or thermal/PCIe contention, it will throttle low-priority stripes and prefer immediate runtime-critical pages (e.g., attention KV for active tokens). Throttling uses a token-bucket per-GPU bandwidth controller with dynamic refill tied to observed 95th latency.\n\nConcurrency and correctness considerations:\n- Transfers can race with eviction; we use atomic residency flags per page (uint32) that transition through states: NOT_RESIDENT -> PREFETCHING -> RESIDENT -> DEMOTING. State transitions are CAS-based to avoid heavy locks.\n- To ensure correctness if a request touches a PREFETCHING page, the runtime will either wait on the prefetch completion future or trigger a synchronous fallback fetch (configurable by route SLA).\n\nImplementation plan and milestones:\n- Phase 1 (Prototype): implement stripe descriptor producer and single-GPU prefetch worker using existing host-staged code paths. Integrate with existing residency map. Add basic metrics. Target: bench harness microbench with synthetic chat workload. (ETA 2 weeks).\n- Phase 2 (Policy): implement ResidencyBudget controller, fairness rebalancer, and eviction micro-batching. Run integration tests with continuous batching harness. (ETA 3 weeks).\n- Phase 3 (Harden): add PCIe/thermal-aware throttling, concurrency stress tests, and integrate with rollout config and runtime flags. Add dashboard panels and SLO alerts. (ETA 2 weeks).\n\nPerformance testing strategy:\n- Use the autoscaling cluster testbed with multi-tenant simulation: 50 concurrent lanes with mix of short and long chats. Measure p50/p95/p99 token latency, host->GPU bandwidth, and eviction churn.\n- Synthetic worst-case: random access pattern that maximizes fragmentation to test eviction correctness and defrag heuristics.\n\nBackwards compatibility and rollouts:\n- Default off for existing deployments. Enable behind runtime feature flag and route-level config. Canary rollout on internal dedicated cluster with gradual percentage ramp and canary health checks comparing 99p latency against control.\n\nObservability and debugging hooks:\n- Emit prefetch events with fields: stripe_id, model_id, lane_id, pages_requested, pages_transferred, transfer_duration_ms, transfer_bandwidth_bytes_per_s.\n- Residency churn metric: pages_evicted_per_minute and eviction_bytes_per_minute.\n- Heatmap dashboard: page residency vs lane_id to observe hoarding and fairness.\n\nImplementation notes and trade-offs:\n- Page size: 2MB chosen as default to align with current CUDA pinned transfer optimal sizes; smaller pages increase metadata overhead and CPU scheduling jitter; larger pages worsen fragmentation. We'll expose as tuning parameter.\n- Sequential striping adds some extra RTT for earliest tokens in a batch compared to greedy full-segment prefetch, but overall amortized latency and tail behavior improves for overlapping batches.\n- Complexity increase in allocator and controller code is mitigated by keeping stripe structures compact and using lock-free queues between scheduler and prefetch workers.\n\nDeliverables:\n- Code: prefetch controller, eviction micro-batcher, residency budgeting, unit and integration tests.\n- Docs: design spec page (Confluence), operator runbook for knobs and fallback behavior.\n- Dashboards: prefetch and eviction panels + SLO alerts.\n",
+  "acceptance_criteria": [
+    "99th percentile token latency reduced by >=20% in the multi-lane synthetic chat benchmark compared to baseline",
+    "Eviction churn (pages evicted/min) does not increase >1.3x steady-state for normal conversational workloads",
+    "No regressions in median latency or throughput for non-oversubscribed stable workloads",
+    "Feature flag rollout path validated with canary check comparing control vs candidate 99p latency",
+    "Prefetch events and residency metrics visualized in console with per-lane breakdown"
+  ],
+  "tasks": [
+    "Prototype stripe descriptor producer and single-GPU prefetch worker (Ava)",
+    "Implement ResidencyBudget controller and fairness rebalancer (Liam)",
+    "Add atomic residency flags and CAS transition tests (Engineering)",
+    "Integration tests with continuous batching harness and synthetic workloads (QA)",
+    "Add observability events and dashboard panels (Observability)",
+    "Prepare operator runbook and rollout checklist (SRE)"
+  ],
+  "risks": [
+    "Increased host->GPU bandwidth may impact co-located tenants if throttling mis-tuned",
+    "Incorrect fairness parameters could starve heavy-hitter sessions and increase tail latency for high-value customers",
+    "CAS-based residency transitions require careful testing on multi-GPU NUMA topologies",
+    "Complexity may interact poorly with existing slab rotator leading to unexpected fragmentation"
+  ],
+  "observability": [
+    "prefetch.stripe.requested",
+    "prefetch.stripe.completed",
+    "residency.pages.resident_by_lane",
+    "eviction.pages.evicted_per_min",
+    "transfer.pcie.bandwidth_utilization",
+    "prefetch.throttle.rate"
+  ],
+  "links": [
+    "https://confluence.redwood.ai/display/RUNTIME/Sequential+Striping+Prefetch+Design",
+    "https://github.com/redwood-inference/runtime/pull/6789 (WIP)",
+    "https://docs.redwood.ai/ops/runbooks/prefetch-controller"
+  ],
+  "prs": [
+    "github.com/redwood-inference/runtime/pull/6789",
+    "github.com/redwood-inference/runtime/pull/6792"
+  ],
+  "comments": [
+    "2026-03-02 - Ace reviewer (Sophia Martinez): suggested adding backpressure token-bucket and explicit thermal signal integration. Agreed; token-bucket added to design.",
+    "2026-03-04 - Performance note (Liam Patel): prototype reduced p99 by ~18% but increased bandwidth by 1.4x; tuning ResidencyBudget expected to reach goal.",
+    "2026-03-07 - Design decision (Ava Kim): keep default page size at 2MB and expose runtime knob for operators. Documented in Confluence.",
+    "2026-03-09 - QA (Noah Rivera): integration harness discovered a race when reassigning stripes during evictions; added CAS guard and unit test (see PR comments)."
+  ],
+  "release": "runtime-1.23",
+  "customer_impact": "high",
+  "security_review_required": "false",
+  "dependencies": [
+    "ENG-62183",
+    "ENG-84621"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "tasks",
+    "risks",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_91c98a0d631845ada1c1fa0cb534f0c5"
+}

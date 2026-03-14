@@ -1,0 +1,98 @@
+{
+  "key": "SUP-15672",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Rerank returns inconsistent top-k order and occasional NaN scores after model fallback; latency spike observed",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Priya Shah",
+  "assignee": "Ethan Cole",
+  "customer_company": "LogiSearch Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "embeddings-service",
+    "reranker",
+    "serving-runtime",
+    "api-gateway",
+    "scheduler"
+  ],
+  "labels": [
+    "rerank",
+    "embeddings",
+    "latency-spike",
+    "fallback",
+    "investigation"
+  ],
+  "environment": "prod (us-east)",
+  "affected_models": [
+    "redwood-open-embed-1.3q",
+    "rdrk-rerank-v2-cpu-quant"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-11T14:00:00Z",
+  "first_response_due_at": "2026-03-10T20:00:00Z",
+  "linked_issues": [
+    "INT-4302",
+    "SUP-12849"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/reranker/pull/7456"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.internal/KB/rerank-fallbacks"
+  ],
+  "description": "Issue summary:\nLogiSearch (dedicated) reports that their /rerank endpoint started returning inconsistent top-k ordering for identical requests after a backend capacity event. In several requests the top scores are valid but the downstream returned ordering changes between retries; in ~7% of sampled calls we see NaN similarity scores and in others we see many ties (same score) that previously were distinct.\n\nImpact:\n- Customer-facing search quality regression: users see inconsistent ordering for the same query.\n- Intermittent NaN scores cause downstream dedup/thresholding code to drop results.\n- Latency for rerank calls spiked from typical 200-400ms to 2-5s during the incident window.\n- Affects production traffic in us-east; approximate affected sessions ~0.6% of requests in last 12h.\n\nEnvironment:\n- Dedicated deployment for LogiSearch in us-east region.\n- Primary embeddings model: redwood-open-embed-1.3q (GPU).\n- Fallback reranker variant observed: rdrk-rerank-v2-cpu-quant (CPU quantized).\n\nSteps to reproduce (customer-provided):\n1) Send rerank request with payload: top_candidates=500, queries=single short text, embeddings requested with model redwood-open-embed-1.3q.\n2) Force a capacity event by draining a pool (customer reproduced during a scheduled maintenance window).\n3) Observe rerank response ordering change across 3 quick retries and occasional NaN in the scores array.\n\nObserved logs (snippets):\n- \"2026-03-10T09:32:14Z ERR reranker: score computation resulted in NaN for candidate_id=3742 (module: dot_product)\"\n- \"2026-03-10T09:32:14Z WARN serving-runtime: falling back to rdrk-rerank-v2-cpu-quant due to no GPU slot\"\n- \"2026-03-10T09:32:15Z INFO api-gateway: request_id=abc123 latency=3421ms route=/rerank\"\n\nAdditional notes about payload shapes:\n- Customer payload embeddings are 1024-d by contract. The GPU model produces 1024-d float32 vectors. The CPU quantized reranker expects 1024-d int8-symmetric packed tensors after dequantization path, but our fallback path performs a normalization step that may assume float inputs.\n\nRequested outcome:\n- Root cause analysis and fix to prevent NaN/tie scores when fallback occurs, or a recommended customer-side mitigation until fix is live.\n",
+  "steps_to_reproduce": "1) Use customer dedicated stack in us-east with same API key and send a rerank request with top_candidates=500. 2) Simulate capacity event (drain pool) so requests route to fallback model. 3) Retry same payload 3-5 times and compare top-k ordering and score arrays. 4) Inspect logs for NaN and fallback warnings.",
+  "logs": [
+    "2026-03-10T09:32:14Z ERR reranker: score computation resulted in NaN for candidate_id=3742 (module: dot_product)",
+    "2026-03-10T09:32:14Z WARN serving-runtime: falling back to rdrk-rerank-v2-cpu-quant due to no GPU slot",
+    "2026-03-10T09:32:15Z INFO api-gateway: request_id=abc123 latency=3421ms route=/rerank"
+  ],
+  "investigation_notes": [
+    "03/10 10:00 - Support triage: confirmed customer reproduces issue when fallback to CPU quantized reranker occurs.",
+    "03/10 12:30 - SRE captured CPU-side logs: several dot_product ops return NaN immediately after dequant path for inputs with all zeros in one candidate (edge case).",
+    "03/11 09:15 - Eng hypothesis: normalization order mismatch \u2014 quantized path may be applying quantize->dot->normalize vs expected normalize->dot in GPU path, producing numerical instability for near-zero vectors.",
+    "03/11 15:40 - Reproduced locally by forcing reranker to use rdrk-rerank-v2-cpu-quant on a short synthetic query set; saw same NaNs when candidate vectors contain zero-padding after tokenization/embedding mismatch.",
+    "03/12 08:20 - Identified a missing float-clamp step in the CPU dequant routine that allows tiny denormals to propagate and produce NaNs in the dot product in rare cases.",
+    "Next steps: patch dequant clamp and add explicit L2-normalize-before-dot for CPU reranker; run canary for LogiSearch pool."
+  ],
+  "comments": [
+    "2026-03-10 11:02 - Joanna (Support): Received report from LogiSearch CS. Assigned to ENG for deeper triage.",
+    "2026-03-10 13:05 - Ethan Cole (Eng): I can reproduce locally when forcing fallback. Dumped raw dequant tensors; several entries are all zeros after unpacking \u2014 suspect packing/unpacking mismatch.",
+    "2026-03-11 10:00 - Priya Shah (Support): Customer confirmed issue started right after an autoscaler event at ~09:30 UTC; provided request_id=abc123 for trace.",
+    "2026-03-11 16:00 - SRE (Alex Ramos): Placed temporary policy to prefer GPU pool unless latency > 3s; reduces customer exposure while we work on fix."
+  ],
+  "workaround": "Temporary mitigation: 1) Customer can pin reranker to a non-quantized variant (rdrk-rerank-v2) via the model pinning API to avoid fallback path until fix is deployed. 2) We deployed a serving policy change to prefer GPU pools for LogiSearch (will increase cost but reduce errors).",
+  "resolution_notes": "Patch for dequant clamp and explicit L2-normalize-before-dot prepared (PR https://github.com/redwood-inference/reranker/pull/7456). Will run unit tests for edge-case zeros and a canary rollout to LogiSearch pool in us-east. Targeting full rollout after validation on 2026-03-13.",
+  "attachments": [
+    "support_trace_abc123.log",
+    "sample_payload_abc123.json"
+  ],
+  "related_slack_threads": [
+    "#support-logisearch: https://slack.redwood.internal/archives/C02ABC#p165711"
+  ],
+  "estimated_impact": "~0.6% of rerank traffic for LogiSearch in last 12h; customer reported user-facing ordering inconsistencies and some dropped results due to NaNs.",
+  "next_steps": [
+    "Merge dequant clamp PR after review",
+    "Run canary in us-east for LogiSearch dedicated pool",
+    "Monitor token-level and rerank-score histograms for NaN/inf occurrences",
+    "Postmortem draft if canary shows reduction to <0.01% NaN rate"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "workaround",
+    "resolution_notes",
+    "comments",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_e5ee71c17544424cac36c16d1c069ae1"
+}

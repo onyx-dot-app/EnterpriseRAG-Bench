@@ -1,0 +1,74 @@
+{
+  "key": "SUP-451852",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Tenant concurrency shed-policy interaction causing sustained 5xx wave for high-volume tenant",
+  "status": "In Progress",
+  "priority": "P0",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Aisha Kapoor",
+  "assignee": "Diego Martinez",
+  "customer_company": "SkylineDocs",
+  "customer_tier": "dedicated",
+  "environment": "prod (us-east-1)",
+  "components": [
+    "api-gateway",
+    "scheduler",
+    "serving-runtime",
+    "ingress-rate-controller"
+  ],
+  "labels": [
+    "5xx",
+    "customer-impact",
+    "concurrency",
+    "hotpath"
+  ],
+  "affected_models": [
+    "open-chat-medium-v2",
+    "redwood-internal-quant-1"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-12T16:30:00Z",
+  "first_response_due_at": "2026-03-12T13:45:00Z",
+  "linked_issues": [
+    "SUP-314159-nightly-batch-scheduler-backpressure-502s",
+    "SUP-472901-connection-thrashing-causing-intermittent-bridge-502s-and-runtime-failovers"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/3125"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/INGRESS+Thermostat+Runbook"
+  ],
+  "description": "Issue summary:\nA major customer (SkylineDocs, dedicated tier) observed sustained 5xx responses across chat and embedding routes beginning 2026-03-12 12:42 UTC. Error-rate remained elevated for ~90 minutes with periodic recoveries. Impacted flows used the tenant's pinned model variants and high-concurrency streaming sessions.\n\nImpact:\n- Customer reported ~40% request failure rate during the window, user-facing timeouts and degraded UX for real-time document Q&A.\n- Billing/usage spikes due to hedged retries from client SDKs.\n- A few downstream retries triggered CPU/GPU thrash on runtimes, causing additional failures.\n\nTimeline (high level):\n- 12:42 UTC: first error spike detected by SkylineDocs alerts (5xx > 15%).\n- 12:44 UTC: platform automated alert (apigw 5xx increase) routed to #support and SRE-oncall.\n- 12:50\u201313:10 UTC: intermittent partial recovery correlated with temporary ingress-shed adjustments.\n- 13:11 UTC: second spike; overall 5xx floor increased.\n- 13:30 UTC: mitigation (route weight shift + tenant cap bump) reduced error rate to <5%.\n\nEnvironment and scope:\n- Region: us-east-1 (single-region Dedicated pool serving SkylineDocs).\n- Affected customers: SkylineDocs only (single-tenant observed), but we saw increased backpressure on shared apigw proxies.\n- Services: REST generation + streaming chat endpoints, small-batch embedding uploads.\n\nSteps to reproduce (dev notes):\n1) Simulate SkylineDocs typical mix: 40% streaming chat (concurrency per-connection 2), 60% short sync generation.\n2) Apply tenant concurrency cap = 80 and ingress-thermostat target utilization tuned to 0.85.\n3) Ramp traffic to 250 RPS sustained over 5 minutes.\n4) Observe apigw 5xx increase and runtime evictions after ~90s when preemptions kick in.\n\nObserved logs / snippets (selected):\n- [apigw] 2026-03-12T12:43:01Z ERROR upstream: 502 gateway: conn_reset_by_peer tenant=skyline-docs path=/v1/chat/stream\n- [scheduler] 2026-03-12T12:43:05Z WARN preempt: evicting-inflight job job_id=abcd123 reason=tenant_cap_reclaim\n- [runtime] 2026-03-12T12:43:07Z ERROR runtime-gpu: preempted due to host-shed (EVIC_TOT) pid=4532 model=open-chat-medium-v2\n- [ingress-rate-controller] 2026-03-12T12:43:10Z INFO shed: enqueued 94 requests tenant=skyline-docs policy=thermostat\n\nMetrics observed (links):\n- Grafana: apigw/5xx-rate (us-east-1) spike: https://grafana.redwood.internal/d/ingress/5xx?from=2026-03-12T12:30\n- Logs: splunk query id: splunk://query/62a7-skyline-5xx-wave\n\nInvestigation notes (SRE):\n- Initial hypothesis: standard apigw overload or NVMe iowait (already ruled out by node-level metrics).\n- Key finding: when the ingress-thermostat began requeuing because of instantaneous token-bucket depletion, queue depths at the apigw grew and many requests became hedged-retries from the client SDK (SkylineDocs SDK default retries). Hedged retries increased concurrency seen by the scheduler.\n- Scheduler responded by reclaiming tenant capacity (tenant concurrency cap enforcement) which triggered inflight preemptions on serving runtimes. Preemptions caused upstream connections to reset and runtimes to emit OOM/preempt errors -> 502/503.\n- The interaction path is: influx of hedged retries -> apigw queueing -> ingress-thermostat requeue -> scheduler reclaim -> runtime preempt -> upstream resets -> client retries -> amplification loop.\n\nTemporary mitigations applied:\n- 13:30 UTC: increased SkylineDocs tenant concurrency cap from 80 -> 160 (immediate reduction in preemptions).\n- 13:32 UTC: adjusted ingress-thermostat to be less aggressive for dedicated-tenants (reduced aggressive requeue threshold).\n- 13:35 UTC: shifted a portion of SkylineDocs traffic to a separate warm pool (route weight change).\n- Customer applied a short client-side retry-window adjustment per our recommendation.\n\nRoot cause hypothesis:\n- Primary: Ingress-thermostat requeue behavior interacts poorly with per-tenant concurrency reclamation logic; the system's feedback loop did not account for client hedged-retries and temporarily over-reclaimed capacity leading to preemptive evictions on running GPU workloads.\n- Secondary: SkylineDocs client SDK aggressive retry/hedging by default amplified the transient queueing.\n\nResolution / current status:\n- Status: Partial mitigation in place; error-rate returned to acceptable (<5%) but we consider this incident Sev1 until fix deployed.\n- Short term: leave tenant cap increased and monitor for 24h. Keep ingress-thermostat relax setting for dedicated pools.\n- Long term: scheduled tasks (see Action items) to change reclaim policy and add hedged-retry-awareness to ingress controller.\n\nAction items / follow-ups:\n- ENGINEERING-3125: Update scheduler reclaim to prefer draining new capacity before preempting in-flight GPU jobs (owner: Diego Martinez, ETA: 2026-03-19).\n- INFRA-2981: Add hedged-retry metric into ingress-thermostat decision loop; avoid requeue when hedged-retry rate > X% (owner: Priya Shah, ETA: 2026-03-18).\n- SDK-745: Outreach to SkylineDocs recommending default retry decrease; create opt-in flag for hedging with dedicated customers (owner: DevEx team, ETA: 2026-04-01).\n- Postmortem scheduled: 2026-03-16 16:00 UTC in #postmortems; draft report to be published to Confluence.\n\nAttachments and references:\n- Slack thread: https://slack.redwood.com/archives/C024SUPPORT/p1678684200000000\n- Related PR (fix-in-progress): https://github.com/redwood-inference/runtime/pull/3125\n- Runbook page: https://redwood.atlassian.net/wiki/spaces/OPS/pages/INGRESS+Thermostat+Runbook\n",
+  "comments": [
+    "2026-03-12 12:46 - Support: Received customer report; confirmed elevated 5xx in SkylineDocs dashboard; escalated to SRE-oncall.",
+    "2026-03-12 12:55 - SRE (Diego): Initial triage - apigw queues spiking, checking runtime health and scheduler logs.",
+    "2026-03-12 13:12 - Eng (Priya): Observed preempt logs on serving nodes matching reclaim timestamps. Hypothesis: reclaim policy too eager under ingress requeue pressure.",
+    "2026-03-12 13:30 - Mitigation applied: tenant cap increased and route weight shifted. Customer confirmed immediate improvement.",
+    "2026-03-13 09:10 - Customer (SkylineDocs - TechLead): Appreciated quick mitigation; asked for permanent guardrails to avoid recurrence during large document ingestion windows.",
+    "2026-03-14 10:02 - Diego: Working on ENGINEERING-3125 design doc; will include test harness to simulate hedged-retry amplification.",
+    "2026-03-14 12:20 - Priya: Adding hedged-retry instrumentation to ingress; small PR created for metrics export. (see related_github_prs)",
+    "2026-03-14 14:30 - Support: Leaving ticket open until engine fix and ingress metric changes are deployed; monitoring in progress."
+  ],
+  "resolution": "Mitigated with tenant-concurrency increase and ingress-thermostat tuning. Permanent fix pending scheduler reclaim policy change and ingress hedged-retry awareness.",
+  "notes": "Keep customer updated daily until patch is released. If error-rate exceeds 10% again, reopen escalation and consider rolling back ingress thermostat global setting.",
+  "estimated_impact_cost_notes": "Billing impact: some inflight hedged retries likely increased billable tokens for SkylineDocs during the window; finance escalation possible if customer disputes. Tracking: billing-audit-queue id=bill-audit-2026-03-12-451852",
+  "follow_up_meeting": "2026-03-16T16:00:00Z #postmortems",
+  "internal_priority_rationale": "Dedicated customer with production SLA disrupted and a feedback-loop risk that could affect other tenants if left unaddressed.",
+  "customer_notification_template": "Hi <Customer>, we experienced an elevated error rate affecting your requests between 12:42\u201313:35 UTC on 2026-03-12 caused by a feedback loop between tenant concurrency reclamation and ingress requeue behavior. Immediate mitigations have been applied. We are deploying a permanent fix; ETA 2026-03-19. We will follow up with a postmortem. - Redwood Support",
+  "visibility": "internal",
+  "priority_owner_note": "Diego (SRE) owns short-term fix; Priya (Infra) owns ingress changes; DevEx to coordinate SDK guidance.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "resolution",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_e6f56ae0c6c34986a32ec424770acc81"
+}

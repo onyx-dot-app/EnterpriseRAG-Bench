@@ -1,0 +1,113 @@
+{
+  "key": "ENG-782413",
+  "team": "engineering",
+  "title": "Cross-shard lease skew yields ephemeral per-credential allowance spike",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-15",
+  "updated_at": "2026-03-02",
+  "creator": "Asha Raman",
+  "assignee": "Priya Khatri",
+  "project": "policy-engine-stability",
+  "cycle": "Cycle 56",
+  "estimate": "5",
+  "due_date": "2026-03-10",
+  "labels": [
+    "billing",
+    "rate-limiting",
+    "quota",
+    "investigation",
+    "slo-regression"
+  ],
+  "parent_issue": [
+    "ENG-61122"
+  ],
+  "dependencies": [
+    "ENG-27458",
+    "ENG-99901"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Summary: During a region failover / shard lease rotation we observed short-lived bursts of unthrottled traffic for a small set of API keys. The spike lasts on the order of 100-500ms but can allow 10-50x the expected per-key token consumption in that window, causing downstream billing and SLO violations for affected customers. This ticket captures investigation, repro steps, mitigation, and proposed permanent fixes for the policy engine enforcement path.",
+  "steps_to_reproduce": [
+    "1) Deploy test org with 3 ephemeral edge nodes and a policy-sharded rate engine (config: per-key burst=100 tokens/min, steady=20/min).",
+    "2) Start a steady synthetic stream from key-A at near-threshold rate on node-1.",
+    "3) Force a shard lease rotation by restarting the policy shard owner (or trigger scheduled reconcile) while concurrently sending a sudden burst from key-A routed via node-2.",
+    "4) Observe that both node-1 and node-2 apply burst allowance in close succession, resulting in aggregated allowance exceeding bucket capacity for ~200ms.",
+    "5) Collect enforcement logs from both edge nodes and the shard leader during the window."
+  ],
+  "observed": "Two enforcement agents applied a positive burst delta for the same credential within a single epoch boundary; reconciler later trimmed state but transient allowance permitted ~40k tokens of extra consumption for a single tenant. Billing and console dashboards show immediate spike; SLO alert fired (rate-engine-latency > 100ms due to reconciliation work).",
+  "expected": "Policy engine should ensure strict monotonic application of burst credits per credential across shard ownership transitions such that the sum applied across nodes in a logical time window never exceeds configured allowance.",
+  "investigation_notes": [
+    "2026-02-16 09:12 - root-cause hypothesis: lease skew + non-idempotent credit-apply path allows duplicate application when both previous owner and new owner process inflight requests without a sequence check.",
+    "2026-02-17 14:03 - observed race in codepath 'applyBurstAllowance' where local cache accepts request if lastSeenEpoch != currentEpoch, but epoch progression is updated only after async persist => window where both nodes think they can grant burst.",
+    "2026-02-18 11:47 - KV cache trace shows duplicate 'grant' events separated by 120ms; reconciler backfill later overwrote one entry (reported by reconciliation job), but tokens were already consumed upstream.",
+    "2026-02-19 16:30 - tested a quick patch: add an optimistic sequence compare (leaseEpoch + sequenceId) before applying grant; reduced duplicate grants in stress tests but caused additional latency on hot keys due to contended CAS failures.",
+    "2026-02-21 10:05 - note from infra: network partition windows (AZ-leader switch) correlate with higher incidence; this is not limited to a single region but amplified under higher concurrency.",
+    "2026-02-25 17:22 - customer impact triage: identified 3 customers with billing anomalies during incident window; alerts triggered in billing-ops."
+  ],
+  "logs": [
+    "[edge-node-1] 2026-02-15T21:03:12.123Z INFO applyBurstAllowance key=cli_ABC epoch=42 granted=80 lastPersist=42 seq=1123",
+    "[edge-node-2] 2026-02-15T21:03:12.245Z INFO applyBurstAllowance key=cli_ABC epoch=43 granted=100 lastPersist=42 seq=1",
+    "[reconciler] 2026-02-15T21:03:13.011Z WARN reconcile key=cli_ABC epoch=43 observed-dup=true mergedGrant=100 persisted=43"
+  ],
+  "mitigation": [
+    "Hotfix v1: temporarily disable best-effort local-grants during lease transitions (shadow-grant only) \u2014 rolled to prod 2026-02-20 02:00UTC. Reduced occurrences to near-zero at cost of slightly higher tail latency for keys routed to new owner.",
+    "Hotfix v2: increase lease handoff grace window by 500ms to allow in-flight persists \u2014 deploy scheduled 2026-03-03 if v1 introduces too many elevated latencies.",
+    "Billing remediation: issue credit adjustments to affected customers for the incident window and mark as manual review for any invoices that span 2026-02-15 21:00-21:10.",
+    "Monitoring: added synthetic test that performs forced lease rotations under traffic to detect duplicate grants within 1s windows (dashboard alarm 'policy-dup-grant-rate' created)."
+  ],
+  "design_decision": "Permanent fix should avoid serialization bottlenecks while guaranteeing idempotent grant application across ownership transitions. Proposal: introduce a compact per-credential commitment token (leaseEpoch + grantSequence) persisted atomically with the grant. Owners must succeed a CAS on that token before the grant is considered applied. For performance, use sharded CAS keyspace and bounded retry with backoff; add local negative cache for recently seen sequences to avoid reapplying on retries.",
+  "tradeoffs": [
+    "Stronger correctness (CAS persistence) increases write amplification and can raise tail latency for hot keys. We'll mitigate with sharded CAS keys and batching of low-risk grants.",
+    "Longer grace windows reduce incidents but increase the time a stale owner may serve traffic; this can delay recovery in failover scenarios.",
+    "Optimistic sequence checks reduce duplicate grants but may surface more CAS retries which need careful instrumentation to avoid CPU storms.",
+    "A pure shadow-grant approach avoids correctness risk but can increase perceived throttling for customers during rotations; acceptable as temporary mitigation but not permanent solution."
+  ],
+  "pr_links": [
+    "https://github.com/redwood-inference/policy-engine/pull/4821 (hotfix-disable-local-grants)",
+    "https://github.com/redwood-inference/policy-engine/pull/4857 (add-grant-sequence-cas)"
+  ],
+  "confluence_links": [
+    "https://redwood.atlassian.net/wiki/spaces/INF/pages/987654321/ENG-782413+Cross-shard+lease+skew+investigation"
+  ],
+  "dashboards": [
+    "https://grafana.redwood.company/d/pgRaTE/policy-engine-overview?orgId=1&view=dup-grants",
+    "https://grafana.redwood.company/d/ops/billing-spikes?orgId=1"
+  ],
+  "qa_plan": [
+    "Unit tests: add deterministic lease-transition unit tests that mock persistent store failures and verify idempotent grant semantics.",
+    "Integration: run multi-node soak with scheduled shard rotations and synthetic high-concurrency bursts for 72 hours.",
+    "Chaos: introduce network partitions between candidate owners during integration tests to validate no duplicate grants.",
+    "Performance: benchmark hotkey CAS latency with 95/99/99.9th percentiles; ensure tail latency stays within SLO after sharding optimizations."
+  ],
+  "rollout_plan": [
+    "1) Merge PR4857 behind a feature flag (sequence-cas-enabled=false) and run canary in two non-prod clusters.",
+    "2) Enable feature flag in staging with full traffic simulation for 48h, monitor 'policy-dup-grant-rate' and grant-latency metrics.",
+    "3) Gradual production rollout to <10% of orgs (select low-risk orgs) for 24h; if metrics stable, increase to 50% then 100%.",
+    "4) If elevated latencies observed, fallback to v1 hotfix and iterate on CAS sharding."
+  ],
+  "next_steps": [
+    "Assign backend engineer to PR4857 review: @Liam O'Connor (requested) \u2014 code review requested by 2026-03-04.",
+    "Finalize CAS key sharding scheme and add back-pressure counters to avoid thundering herd on hot keys.",
+    "Coordinate with billing-ops to finalize customer credits by 2026-03-08.",
+    "Schedule follow-up postmortem and writeup for incident channel; include reproducible test harness and timeline."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed",
+    "expected",
+    "investigation_notes",
+    "logs",
+    "mitigation",
+    "design_decision",
+    "tradeoffs",
+    "qa_plan",
+    "rollout_plan",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_d3819b18d78c4455bf5350ab1745a5a1"
+}

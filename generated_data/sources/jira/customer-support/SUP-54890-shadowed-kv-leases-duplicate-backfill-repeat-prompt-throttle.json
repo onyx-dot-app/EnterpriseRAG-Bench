@@ -1,0 +1,97 @@
+{
+  "key": "SUP-54890",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Shadowed KV leases causing duplicate backfill and repeat-prompt throttling",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Patel",
+  "assignee": "Marco Nguyen",
+  "customer_company": "StoryFlow Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "kv-store",
+    "prefetcher",
+    "routing"
+  ],
+  "labels": [
+    "repeat-prompt",
+    "kv-lease",
+    "backfill",
+    "p99-latency"
+  ],
+  "environment": "prod us-east-1",
+  "affected_models": [
+    "redwood-rlhf-v1",
+    "open-instruct-1.0"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "INT-4128",
+    "SUP-34121"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/serving-runtime/pull/2145"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SRE/KV+Lease+Design"
+  ],
+  "description": "Issue summary:\nCustomers on Dedicated pools (StoryFlow Inc.) reported repeated identical prompts that historically return sub-100ms p50 but now see p99 spikes up to 5\u201310s and occasional 504s. Root cause appears tied to new lease shadowing optimization in the KV coordinator combined with the incremental backfill path.\n\nImpact:\n- Several customer endpoints experienced elevated tail latency for identical repeated prompts.\n- Increased token cost due to duplicate prefetch/backfill work.\n- Observed downstream throttling (429s) on the prefetcher and temporary capacity exhaustion on a subset of GPU nodes.\n\nEnvironment:\n- Dedicated cluster (customer: StoryFlow Inc.) in us-east-1.\n- Serving runtime release: 2026.02.18-hotfix (includes KV coordinator v0.9.3).\n- KV store: managed-redis-cluster-5.\n\nSteps to reproduce (observed):\n1) Use same prompt payload to Redwood API (streaming disabled) in tight loop from a single client.\n2) After 200\u2013500 identical requests, p99 latency jumps; traces show repeated KV backfill work.\n3) Throttling from prefetcher observed, then occasional 504s returned to client.\n\nObserved logs/traces (high level):\n- Trace IDs: trace-20260310-1a2b3c, trace-20260310-4d5e6f.\n- Serving-runtime logs show \"lease_shadow_create\" followed by two backfill tasks for same prefix (~300ms apart).\n- Prefetcher emits repeated \"backfill:start\" for same key with different lease ids.\n- Redis slowlog entries correlate with duplicate GET/SET bursts during the latency spike.\n\nExpected behavior:\n- Lease shadowing should avoid redundant backfill work. Identical prompts should hit prefix cache or one single backfill task should satisfy concurrent requests.\n\nWorkaround in place:\n- Support temporarily disabled the new lease-shadowing flag for StoryFlow's dedicated pool, which reduced p99s back toward baseline. Full mitigation requires a runtime fix.\n",
+  "steps_to_reproduce": [
+    "Run a client that posts the same prompt to /v1/generate with 200\u2013500 concurrent sequential requests from one connection",
+    "Observe p99 increase after ~200 requests in us-east dedicated pool",
+    "Check serving-runtime traces for duplicate backfill tasks and differing lease ids"
+  ],
+  "logs": [
+    "[2026-03-10T14:03:12Z] serving-runtime INFO lease_shadow_create prefix=usr:session:abc lease_id=abcd1234",
+    "[2026-03-10T14:03:12Z] prefetcher WARN backfill:start key=usr:session:abc lease_id=abcd1234",
+    "[2026-03-10T14:03:12Z] prefetcher WARN backfill:start key=usr:session:abc lease_id=efgh5678",
+    "[2026-03-10T14:03:13Z] redis slowlog: cmd=get usr:session:abc duration=2.1s"
+  ],
+  "comments": [
+    "2026-03-10 14:35 - Marco Nguyen (Support): Acknowledged with customer. Reproduced locally on a scaled-down dedicated emulation. Opening INT for engineering deep-dive.",
+    "2026-03-10 16:10 - Priya Shah (SRE): Observed two simultaneous backfill jobs for same prefix on the coordinator. Hypothesis: lease shadowing path is creating a new ephemeral lease instead of reusing active lease metadata under high concurrency.",
+    "2026-03-11 09:22 - Aisha Patel (Support): Applied temporary flag disable for lease-shadowing on StoryFlow pool; customer reports reduced p99 but still sees occasional 1.5s spikes.",
+    "2026-03-11 11:40 - Marco Nguyen (Support): Hotfix PR created to add lease id canonicalization and de-duplication in prefetcher (PR: github.com/redwood-inference/serving-runtime/pull/2145). Deployed to canary cluster for validation.",
+    "2026-03-12 08:05 - Priya Shah (SRE): Canary shows 90% reduction in duplicate backfills. Running extended soak test before promoting to customer pools."
+  ],
+  "investigation_notes": [
+    "Coordinator added 'lease-shadowing' to reduce lock contention but the implementation created transient leases with unique ids rather than referencing the single authoritative lease record.",
+    "Under bursty identical requests, multiple ephemeral lease creations raced and each triggered a backfill job, duplicating work and saturating prefetcher I/O.",
+    "Redis slowlog and prefetcher metrics align \u2014 duplicate GETs/SETs correlate with p99 spikes observed by customer.",
+    "Reproduced with load generator: single-client sequential identical prompt at 350rps for 60s reproduces p99 of ~4.2s. Disabling lease-shadowing returns p99 to ~130ms.",
+    "Related prior ticket SUP-34121 discussed prefix cache warmup timing; this is a different root cause (lease id duplication vs. warmup ordering) but linked for context."
+  ],
+  "resolution_notes": [
+    "Mitigation: temporarily disabled lease-shadowing flag for affected dedicated pools (applied to StoryFlow). This reduced duplicate backfills and lowered p99 latency.",
+    "Fix: canonicalize lease identity in coordinator and add atomic 'lease-get-or-ref' API to ensure a single authoritative lease id is used for prefetch/backfill coordination.",
+    "Hotfix deployed to canary (serving-runtime PR #2145). Canary metrics showed 90% fewer duplicate backfills and stable p99. Scheduled rollout to remaining dedicated pools after 24h soak.",
+    "Follow-ups: add a unit/integration test that simulates high-concurrency identical prompt bursts to prevent regression; add an observability alert that triggers when >1 backfill task is created for same prefix within 500ms.",
+    "Customer communication: notified StoryFlow support contact and SRE contact about temporary flag and planned rollout. Offered credits for excess token cost during the incident window.",
+    "Postmortem: draft assigned to INT-4128; ETA for postmortem publication: 2026-03-20."
+  ],
+  "follow_up_tasks": [
+    "INT-4128: Postmortem and corrective action tracking",
+    "Add integration test for lease canonicalization in CI",
+    "Create alert rule 'duplicate_backfill_rate' targeting serving-runtime ops dashboard"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution_notes",
+    "follow_up_tasks"
+  ],
+  "dataset_doc_uuid": "dsid_be095375b6ed41de8f988060b75bbed4"
+}

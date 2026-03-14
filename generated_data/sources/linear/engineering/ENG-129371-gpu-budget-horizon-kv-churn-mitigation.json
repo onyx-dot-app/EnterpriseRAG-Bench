@@ -1,0 +1,54 @@
+{
+  "key": "ENG-129371",
+  "team": "engineering",
+  "title": "GPU budget horizon & KV churn mitigation for continuous batching",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-11",
+  "creator": "Aisha Khan",
+  "assignee": "Riley Chen",
+  "project": "Serving Runtime Memory",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-25",
+  "labels": [
+    "memory-budgeting",
+    "kv-cache",
+    "continuous-batching",
+    "telemetry",
+    "experiment"
+  ],
+  "parent_issue": [
+    "ENG-314159"
+  ],
+  "dependencies": [
+    "ENG-220017",
+    "ENG-462019"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Summary:\nWe need a runtime-level policy that maintains a short-to-medium term GPU memory budget horizon to prevent memory cliff events during continuous batching while reducing KV cache churn when model contexts or tenant footprints change. Current aggressive KV prefetching and static reserve policies cause frequent eviction storms and headroom collapses under mixed priority and bursty traffic.\n\nGoals:\n- Define a sliding 'budget horizon' that reserves flexible headroom over a rolling time window (seconds-to-minutes) instead of static per-request margins.\n- Reduce KV cache churn by differentiating between ephemeral and sticky KV entries and using probabilistic keep-alives for sticky entries under pressure.\n- Introduce adaptive prefetch windows that shrink for high-churn tenants and expand for stable long-context sessions.\n- Provide telemetry and guardrails (SLOs, alerts) to detect and rollback when horizon adjustments increase tail latency or token OOMs.\n\nProblem statement / context:\n- Continuous batching substantially improves throughput but magnifies GPU memory contention when mixed workloads spike. Static safety margins (X% headroom per tenant) either waste memory at low load or fail during microbursts.\n- KV cache churn is aggravated by model switches (different KV sizes), prompt-length variance, and tenant churn; evictions of KV for long-context sessions cause repeated re-warm and latency spikes.\n- Existing approaches in our backlog focus on per-tenant slicing and static slab allocations; these don't adapt well to time-varying burstiness or cross-tenant behavioral correlations.\n\nProposal (high-level):\n1) Sliding Budget Horizon: maintain a time-windowed budget H(t) computed from recent allocation rate, eviction rate, and forecasted microburst probability. H(t) will be represented as two values: target_reserve (soft headroom to satisfy SLOs) and emergency_reserve (strict minimum to avoid OOM). The horizon width is configurable (default 60s).\n\n2) KV Churn Mitigation: tag KV entries with churn_score derived from access recency/frequency and tenant stability signals. When memory pressure increases, prefer evicting low churn_score entries and probabilistically issue keep-alive decisions for high churn_score entries rather than immediate eviction. This reduces re-warm traffic for sticky sessions.\n\n3) Adaptive Prefetch Window: at the batch router, compute per-request prefetch window size (number of future KV pages to load) using a stability score. For requests in high-churn tenants, prefetch aggressively only the immediate working set; for stable sessions (long chats), prefetch a larger prefix to reduce downstream KV misses.\n\n4) Safety Controls and Rollout: start with a conservative horizon multiplier (0.7 of analytical optimum), enable on a small % of serving pods using feature-flag rollout, and monitor key metrics for 48h before broad rollout. Provide an automatic rollback if token OOMs or 95th token latency regressions exceed thresholds.\n\nDesign details and algorithms:\n- Horizon estimator: exponential weighted moving average (EWMA) of recent allocation delta + burst variance term. Add a short-term forecast from lightweight Poisson burst detector for incoming request rate.\n- Emergency reserve calculation: max(quantile(mem_usage_by_tenant, 99.9) + safety_margin, min_absolute_reserve).\n- Churn score: churn_score = alpha * recency_score + beta * freq_score + gamma * tenant_stability_score. Tune (alpha,beta,gamma) per workload class.\n- Probabilistic keep-alive: when eviction would remove a sticky entry, flip a weighted coin p_keep derived from churn_score and recent eviction success rate to decide whether to keep (at cost of higher memory) or evict.\n\nTradeoffs and rationale:\n- Tunable horizon allows us to trade memory efficiency for tail-risk reduction. Choosing window too small becomes reactive and oscillatory; too large wastes memory.\n- Probabilistic keep-alive reduces re-warm but increases memory pressure; mitigated by coupling with horizon and emergency reserve.\n- Prefetch windows reduce KV misses but can increase eviction pressure. We mitigate by making prefetched pages optional and evictable under emergency reserve conditions.\n\nImplementation plan (tasks):\n- Spike (2d): simulate sliding horizon with existing telemetry (allocation/eviction streams) to pick default parameters and horizon window. (Riley)\n- Engine change (5d): implement horizon estimator and reserve enforcement in sched/mem allocator; expose flags. (Riley, Priya)\n- KV tagging (3d): add churn_score computation to KV cache insertion path and scoring store. (Jordan)\n- Prefetch adaptation (3d): modify batch router to compute prefetch window per request. (Marta)\n- Telemetry and alerts (2d): dashboards for H(t), eviction_rate, KV_miss_rate_by_tenant, token_OOM_count, tail_latency. Add auto-rollback alert rule. (SRE)\n- Canaries and rollout (2d): enable on 5% pods -> 20% -> 100% with 48h observation gates. (Riley)\n\nAcceptance criteria / success metrics:\n- Reduce KV re-warm miss rate for long-chat tenants by >= 25% in canary traffic.\n- Maintain 95th token latency within +5% of baseline in canary traffic.\n- Reduce overall memory waste (measured as reserved-but-unused fraction) by >= 15% at steady-state across mixed workloads.\n- No increase in token OOM incidents in canary (zero regression).\n\nTelemetry and monitoring plan:\n- New metrics: budget_horizon_target, budget_horizon_emergency, churn_score_histogram, kv_eviction_policy_decision_counts (evict|keep|probabilistic_keep), kv_rewarm_rate, reserved_memory_utilization.\n- Dashboards: per-region and per-cluster views + tenant scatter of churn vs latency.\n- Alerts: auto-rollback if token_OOM_count > 0 in 5m or if 95th latency regresses by >10% relative to baseline for longer than 10m.\n\nRollout and migration considerations:\n- Start with workload classes: long-conversation enterprise tenants and stable low-latency tenants. Exclude extremely bursty untrusted tenants initially.\n- For Dedicated/Private deployments, expose horizon window as a configurable policy and default to conservative values; document expected behavior.\n\nDesign docs and experiments:\n- Initial simulation notebook: drive.google.com/drive/fake-sim-notebook (internal) - contains simulated mixed workloads and parameter sweep.\n- Design doc draft: confluence.redwood.ai/pages/KB/budget-horizon-kv-churn (internal).\n- Example PRs: github.com/redwood/repo/pull/7123 (spike), /pull/7324 (allocator), /pull/7331 (kv-score)\n\nRisks and open questions:\n- Calibration: selecting EWMA half-life and burst detector thresholds will require workload-specific tuning.\n- Interaction with quantization and offload: reduced memory pressure from offload may change optimal horizon; need to detect and adapt.\n- Multi-tenant fairness: horizon could favor predictable tenants; we must ensure fairness SLOs or tenant-weighted reserves.\n\nNext steps (short term):\n- Run spike simulation and push parameter recommendations by 2026-03-05.\n- Implement horizon estimator prototype behind feature flag and run on 5% canary by 2026-03-12.\n",
+  "comments": [
+    "2026-03-01 - Aisha Khan: Created ticket. Outline and goals posted. Blocking: need historical eviction/alloc telemetry to simulate; asked SRE for dataset.",
+    "2026-03-03 - Riley Chen: Ran initial spike simulation with two mixed workload traces. Found that a 60s horizon reduces eviction storms by ~18% at baseline parameters. Attached sim notebook link.",
+    "2026-03-05 - Jordan Patel: Implemented churn_score prototype in a local KV shim; initial results show long-chat sticky entries have churn_score > 0.8 consistently.",
+    "2026-03-07 - Priya Nair: Started allocator changes; identified a race condition between eviction loop and allocate path when emergency_reserve is hit. Scheduling follow-up refactor task.",
+    "2026-03-10 - Marta Lopez: Prefetch adaptation merged to staging router behind flag. Observed slight increase in memory pressure on one host; lowered default prefetch multiplier.",
+    "2026-03-11 - Riley Chen: Canary planned for 2026-03-12 at 5%. SRE to create dashboards and auto-rollback alert rules today."
+  ],
+  "attachments": [
+    "https://confluence.redwood.ai/pages/KB/budget-horizon-kv-churn",
+    "https://drive.google.com/drive/fake-sim-notebook",
+    "https://github.com/redwood/repo/pull/7324",
+    "https://github.com/redwood/repo/pull/7331",
+    "https://grafana.redwood.ai/d/alloc/kv-eviction-dashboard"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_4c511470acb347e29c14174c7a8d9690"
+}

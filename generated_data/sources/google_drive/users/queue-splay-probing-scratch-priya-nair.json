@@ -1,0 +1,33 @@
+{
+  "title": "Queue splay probing scratch",
+  "owner": "Priya Nair",
+  "drive_area": "users",
+  "path": "users/queue-splay-probing-scratch-priya-nair.json",
+  "doc_type": "doc",
+  "created_at": "2024-10-03",
+  "last_modified": "2024-10-08",
+  "collaborators": [
+    "Evan Morris",
+    "Kai Zhang"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "throughput",
+    "p99",
+    "queue-splay",
+    "experiment",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/421",
+    "SERVE-1187",
+    "confluence:queue-splay-experiment-notes-2024"
+  ],
+  "content": "Objective:\nShort experiments to understand whether adding a small randomized splay window when dispatching requests into the batching/queueing layer reduces extreme tail (p99/p999) under mixed-priority client traffic without materially hurting steady-state throughput.\n\nWhy this feels worth trying:\n- In prior field traces we see tightly synchronized arrival groups (client-side fan-in + retries) producing micro-synchrony in the batcher that inflates p99.\n- A small randomized offset on request enqueue reduces instantaneous clustering, potentially smoothing batch sizes and lowering tail.\n\nHypothesis:\nA 5\u201330ms randomized splay (uniform) applied to request enqueue times will: (a) reduce p99 latency by breaking micro-clumps, (b) keep p50/p95 within 10% of baseline, and (c) not reduce aggregate tokens/sec by more than 5% for typical payload distributions.\n\nTestbed / Setup:\n- Cluster: 4 x A100-40G equivalent nodes in staging (mixed partition), 8 vCPUs control-plane runner capturing traces.\n- Runtime: serving-runtime v0.23.1 (local build with splay flag).\n- Model: open-llama-7B quantized (4-bit), seq_len=512 typical, avg_tokens_out=80.\n- Workload generator: synthetic mix from real trace sampler (mix of small chat messages and long completions): 70% short (<=40 tokens), 30% long (80\u2013256 tokens).\n- Arrival patterns: two lanes: high-priority (HP) and best-effort (BE). HP = 20% of requests but tight bursts (10\u201330 reqs over 50ms windows every 2s). BE = Poisson baseline 200 qps.\n- Key runtime knobs under test: splay-window-ms (0/5/20/100), max-inflight-per-worker (8), preemption (off/on), batching_timeout_ms=12, batch_max_tokens=4096.\n- Metrics collected: qps, tokens/sec, p50/p95/p99/p999 latency (enqueue->response), batch size distribution, batch wait time, KV cache hit rate, CPU/GPU utilization.\n\nRun summary (aggregated over 10m steady windows):\nCONFIG | qps | tokens/s | p50 (ms) | p95 (ms) | p99 (ms) | p999 (ms) | mean batch size\n0 ms splay | 245 | 57,100 | 9.8 | 42.3 | 320.6 | 610.4 | 6.3\n5 ms splay | 244 | 56,800 | 10.1 | 41.9 | 235.2 | 410.7 | 5.9\n20 ms splay | 239 | 55,600 | 11.4 | 43.6 | 230.1 | 398.9 | 5.1\n100 ms splay | 221 | 51,800 | 15.9 | 54.2 | 480.7 | 1150.3 | 3.0\n\nKey takeaways from the numbers above:\n- Small splay windows (5\u201320ms) materially reduced p99 (approx 27%\u201328% reduction from baseline at 0 ms). p999 also improved significantly.\n- p50 stayed stable (within ~15%); small increase is expected because randomizing enqueue adds tiny wait.\n- Large splay (100ms) harms throughput and massively increases tail due to batching inefficiency and larger waiting windows causing resource underutilization and more context switches.\n\nBatching behavior notes:\n- With 0ms splay we saw more frequent instantaneous batch size spikes (10\u201320 reqs) that correlate with p99 spikes.\n- 5\u201320ms splay reduces variance of batch size; mean batch size decreases slightly but batch utilization remained >80% for CPU/GPU kernels.\n- 100ms splay causes many small batches (mean 3) and higher overhead per-token.\n\nInteraction with preemption:\n- Enabling preemption + 20ms splay improved HP p99 by additional ~15% vs splay-only, at the cost of a small BE throughput drop (~3%).\n- Preemption strategy used: interrupt BE in-progress batches when HP arrival threshold exceeded; we used conservative preemption (drain after token boundary).\n\nOddities / anomalies observed:\n- Periodic tail spikes (~every 30s) persisted across splay settings. Correlated with minor Python GC pauses on the control-plane sampler process (10\u201330ms), but those alone don't fully explain the 200\u2013400ms tail jumps. Need to correlate with node-level Nvlink/PCIe interrupts and container CPU throttling events (observed on one node at ~95% GPU util).\n- KV cache hit rate stayed flat (~78%) across splay values. Hypothesis: splay randomized enqueue doesn't alter cache affinity because requests are identical enough to be coalesced in time window from model's perspective.\n\nMicro-observations from traces (single interesting window):\n- 2024-10-03T14:12:22Z: HP burst of 24 requests arrives; with 0ms splay produced immediate batch of 18 + 6 in next tick -> p99 spike 480ms.\n- With 20ms splay same burst distributed -> three smaller batches over 60ms window -> p99 for HP reduced to 235ms.\n\nConclusions (quick):\n- Add a small randomized splay (5\u201320ms) in the enqueue path is a cheap, effective mitigation for micro-clustered arrivals that drive the tail. It trades a tiny increase in median for a significant tail win.\n- Large splay windows (>50ms) start to hurt throughput and worsen tail due to under-filled batches and queuing amplification.\n- Combining splay + conservative preemption is promising for mixed-priority traffic.\n\nNext steps (prioritized):\n1) Run \u00b1scale tests on a larger cluster (8\u201316 nodes) to validate that small-splay improvements persist at higher qps and with multi-tenant noise.\n2) Add an adaptive splay: use short-term ingress variance (sliding 1s window) to tune splay-window (0\u201330ms) dynamically instead of static config.\n3) Correlate the periodic 30s tail spikes with node-level telemetry (dmesg, pci counters) and GC traces; add pprof sampling for the control-plane to rule out lock contention.\n4) Test with different model seq lengths (short chat vs long completion) and with smaller GPU sizes (T4) to see dependency on kernel startup/overhead.\n5) Draft an internal playbook with recommended defaults: splay=10ms, batching_timeout=12ms, preemption=on (conservative) for HP-sensitive tenants.\n\nNotes / TODO (scratch):\n- Save full raw traces to S3: s3://rwd-staging/queue-splay/2024-10-03-runA/ (already uploaded).\n- Try uniform vs gaussian splay distribution in next run.\n- Instrument per-tenant queue depth histogram (missing).\n- File correlate script: tools/trace-annotate/annotate_splay.py (WIP)\n\n--- end of scratch ---\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_cb2357cd3d684fe6b791358a38b205d7"
+}

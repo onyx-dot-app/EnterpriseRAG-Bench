@@ -1,0 +1,114 @@
+{
+  "key": "ENG-314159",
+  "team": "engineering",
+  "title": "Allocated-byte leak hunt and rollback path for KV slab accounting drift",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-03-10",
+  "creator": "Maya Chen",
+  "assignee": "Rafael Ortiz",
+  "project": "kvcache-integrity-2026",
+  "cycle": "2026-W08",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "postmortem",
+    "memory-leak",
+    "kv-cache",
+    "safety-patch",
+    "observability"
+  ],
+  "description": "During a multi-day capacity event in production we observed steady growth in resident memory on a subset of inference nodes running the prefix/KV cache. Heap and slab usage metrics diverged from expected live entry counts: allocated_bytes increased while live_entry_count remained stable. This ticket tracks the investigation (root cause hypothesis), temporary mitigations, and a safe rollback/patch rollout path to remediate the accounting drift and prevent recurrence.",
+  "impact_summary": "Gradual memory growth on dedicated runtime nodes caused autoscaler thrashing and a handful of node restarts. User-facing latency spikes were intermittent; no model outputs were corrupted. Estimated affected capacity: ~2% of Dedicated fleet for 48 hours, causing a capacity shortfall for high-throughput tenants and increased cost due to autoscaling overprovisioning.",
+  "timeline": [
+    "2026-02-18 02:12 UTC: Pager triggered for node OOM risk due to rising resident memory (oncall: SRE-2)",
+    "2026-02-18 02:25 UTC: Oncall quarantined three nodes and kicked rolling restart; memory dropped but returned over 24 hours",
+    "2026-02-19 11:40 UTC: Engineering triage: observed allocated_bytes_gauge growing while live_entry_count stable",
+    "2026-02-19 13:05 UTC: Temporary mitigation: reduced prefetch concurrency (config flag) and raised eviction aggressiveness for affected shard groups",
+    "2026-02-20 09:00 UTC: Began scoped heap/heap-profiler captures and enabled high-resolution slab metrics in canary pool",
+    "2026-02-21 16:30 UTC: Root-cause hypothesis formulated (see root_cause_summary)",
+    "2026-02-22 to 2026-03-05: Iterative patches and chaos tests run in staging; initial patch introduced to canary with kill switch",
+    "2026-03-10: Decision to ship conservative accounting fix + sweeper and prioritise backfill alerts"
+  ],
+  "root_cause_summary": "A narrow race in slab compaction + reservation accounting left orphaned allocation records when compaction encountered a concurrent eviction path. Specifically, a compaction fast-path reused slab slots and advanced the per-shard allocation epoch without atomically reconciling reservation counters. The result was an allocated_bytes counter that counted freed-but-not-reconciled bytes, causing monotonic growth of the metric and retention of internal metadata until a restart or explicit sweep freed the orphaned bookkeeping entries.",
+  "technical_details": [
+    "Compaction flow reused 'slot_id' from a reclaimed bucket while a concurrent eviction worker was promoting tombstones; due to a missing memory_barrier and non-atomic decrement of reservation_counter an orphaned metadata node remained referenced from the allocation_index but not in the live_entry_set",
+    "Per-tenant reservation soft caps allowed allocation to exceed pressure thresholds when prefetch bursts occurred; the allocator compensated by deferring reconciliation which amplified the accounting drift",
+    "Observed failure mode reproducible in a high-concurrency stress harness using prefetch=24, eviction_backoff=0ms, and compaction_concurrency=4",
+    "Heap profiler showed thin stacks holding onto small descriptor objects (~48\u2013256 bytes each) that were never reachable from canonical entry maps but still accounted in allocated_bytes metric"
+  ],
+  "mitigation_work_done": [
+    "Reduced prefetch concurrency from 24 -> 8 across affected pools (config flag: kv.prefetch.max_concurrency)",
+    "Increased eviction aggressiveness: eviction_score_decay shortened and eviction_scan_window widened for a temporary period",
+    "Deployed targeted restart+drain of 32 suspect nodes to reclaim orphaned metadata",
+    "Added a staging-only sweeper that scanned slab allocation_index for zero-ref metadata and reclaimed entries; used to validate fixed behavior before production sweep",
+    "Instrumented new metrics: slab_orphan_count, allocation_epoch_lag, reservation_overcommit_ratio, compaction_retries_total"
+  ],
+  "remaining_action_items": [
+    "(A1) Ship allocator atomicity fix: ensure reservation_counter updates and epoch advances are performed under the allocator lock or via CAS with a retry loop (owner: Rafael Ortiz, estimate 5)",
+    "(A2) Implement background progressive sweeper in runtime with exponential backoff to heal orphaned descriptors without impacting tail latency (owner: Priya Nair, estimate 3)",
+    "(A3) Add automatic rollback guard: cluster-toggle 'kv.allocated_bytes_threshold_kill' to disable prefetch and force synchronous eviction if allocated_bytes grows > X% in 10m (owner: Infra Ops, estimate 2)",
+    "(A4) Add unit + fuzz tests around compaction + eviction interleaving; include deterministic scheduler scenarios (owner: QA Eng, estimate 5)",
+    "(A5) Update runbook and postmortem doc with 'how to identify' via new metrics and escalation steps (owner: Maya Chen, estimate 2)",
+    "(A6) Long-term: evaluate per-tenant memory ceilings and allocation quotas to avoid cross-tenant amplification (owner: Product - Khurram Iqbal, estimate 3)",
+    "(A7) Release: include migration tool to run an offline sweep for older clusters that didn't receive the fix before March 2026 (owner: Rafael Ortiz, estimate 4)",
+    "(A8) Backfill dashboards and create composite alert 'kv-slab-accounting-drift' tied to allocation_epoch_lag and slab_orphan_count (owner: Observability, estimate 2)",
+    "(A9) Run a canary rollout plan and schedule a 24-hour watch after 10% rollout (owner: Release Eng, estimate 1)",
+    "(A10) Customer outreach: notify top 10 high-throughput tenants about potential disruptions and provide remediation checklist (owner: CSM, estimate 1)",
+    "(A11) Security review: confirm sweeper and allocator changes have no data-exfil risk (security_review_required)",
+    "(A12) Post-release chaos test: inject compaction/ejection races in pre-prod via chaos harness for 3 weeks"
+  ],
+  "rollout_plan": [
+    "Phase 0 (Canary): apply allocator atomicity patch + sweeper disabled to 1% of Dedicated nodes (canary pool) for 48h; monitor slab_orphan_count and allocation_epoch_lag",
+    "Phase 1 (Conservative): enable background sweeper at low rate and deploy to 10% of Dedicated fleet; keep prefetch concurrency at reduced settings; 24h watch with SRE",
+    "Phase 2 (Gradual): full rollout to Dedicated, then Hosted API nodes over 72h with rolling drains and restart where needed",
+    "Rollback: flip 'kv.alloc-accounting-fix-enabled' to false and enable kill-switch 'kv.allocated_bytes_threshold_kill' to trigger aggressive eviction and synchronous reconciliation. Run emergency sweep script if rollback triggered.",
+    "Post: schedule a follow-up retrospective 2 weeks after full rollout"
+  ],
+  "monitoring_and_alerting": [
+    "Create alert 'kv-alloc-drift-warning' when allocation_epoch_lag > 1 for > 10m in >= 5 nodes",
+    "Create critical alert 'kv-slab-orphan-spike' when slab_orphan_count grows by 100% within 30m in any shard group",
+    "Dashboard: add 'Slab integrity' dashboard with time-series: allocated_bytes_gauge, live_entry_count, slab_orphan_count, allocation_epoch_lag, reservation_overcommit_ratio",
+    "Add runbook entries describing thresholds and immediate mitigations (reduce prefetch, increase eviction aggressiveness, node drain)"
+  ],
+  "testing_and_validation": [
+    "Unit tests for allocator CAS loop and epoch advance edge cases",
+    "Deterministic scheduler integration test: compaction vs eviction interleavings simulated with concurrency=8",
+    "Staging ramp: run 48h soak tests on staging with prefetch=24 and compaction_concurrency=4 to ensure no drift",
+    "Fuzz harness to inject delayed frees and validate sweeper reclaims within expected time window"
+  ],
+  "links": [
+    "Confluence: https://confluence.redwood.ai/display/KV/Allocated+Byte+Leak+Postmortem",
+    "Github PR (canary patch): https://github.com/redwood-inference/serving-runtime/pull/1529",
+    "Grafana dashboard: https://grafana.redwood.ai/d/kv/slab-integrity",
+    "Incident channel: #incidents-kv-slab",
+    "SRE runbook draft: https://confluence.redwood.ai/display/SRE/KV+Slab+Runbook"
+  ],
+  "comments": [
+    "2026-02-20 Maya Chen: Initial ticket created after triage; tagged SRE and Observability. Assigned to Rafael for allocator fix.",
+    "2026-02-21 Rafael Ortiz: Reproduced locally with stress-harness; confirmed race conditions under compaction+prefetch. Working on atomicity patch and CAS loop.",
+    "2026-02-24 Priya Nair: Implemented staging sweeper; validated recovery on 5-node canary without user-visible latency increase.",
+    "2026-03-01 Observability: Added slab_orphan_count and allocation_epoch_lag metrics to staging dashboards; alerted for small canary spikes.",
+    "2026-03-05 QA Eng: Added deterministic test case and started long-running fuzz job; found one additional edge case where compaction_retries_total increments without reconciliation\u2014added to A1 scope.",
+    "2026-03-10 Rafael Ortiz: Presenting conservative rollout plan to Exec; requesting approval for canary deploy next Tuesday. Moving ticket to In Progress with high priority."
+  ],
+  "customer_impact": "low",
+  "release": "runtime-2026.03.1",
+  "security_review_required": "true",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "impact_summary",
+    "timeline",
+    "root_cause_summary",
+    "technical_details",
+    "mitigation_work_done",
+    "remaining_action_items",
+    "rollout_plan",
+    "monitoring_and_alerting",
+    "testing_and_validation",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_6d185689b5d84167a4522422dfe4cf43"
+}

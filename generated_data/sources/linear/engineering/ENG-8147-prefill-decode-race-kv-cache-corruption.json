@@ -1,0 +1,80 @@
+{
+  "key": "ENG-8147",
+  "team": "engineering",
+  "title": "Investigate and fix prefill/decode scheduling race causing KV-cache corruption and numerical drift",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-02-28",
+  "updated_at": "2025-03-11",
+  "creator": "Rina Patel",
+  "assignee": "Mateo Cruz",
+  "project": "serving-runtime-performance",
+  "cycle": "2025-W09",
+  "estimate": "13",
+  "labels": [
+    "kernel-selection",
+    "attention-optimizations",
+    "bug",
+    "kv-cache",
+    "concurrency",
+    "perf-regression"
+  ],
+  "description": "Summary: After merging a change that widened kernel selection heuristics and introduced a combined prefill/decode scheduling path, we started seeing intermittent correctness regressions in production: wrong completions, token corruption, and subtle numerical drift in logits for certain requests. Impact is customer-facing for some live workloads (high sequence lengths and mixed-precision models).\n\nObserved symptoms:\n- Sporadic wrong token outputs observed in ~0.05% of requests for a specific model family under sustained burst traffic.\n- Repro on internal stress clusters when prefill tasks are cancelled mid-flight and decode begins concurrently on a worker previously executing fused attention kernels.\n- Deterministic small differences in logits between control and optimized kernels when executing identical input sequences in FP16 vs BF16 mixes (numerical drift).\n- KV-cache corruption patterns: header bytes in cache page get zeroed or contain shifted values after prefill cancellation + fast reuse.\n\nHypothesis: Two coupled issues introduced together during perf work:\n1) Kernel selection change allows mixed precision kernel variants (FP16 fused attention) to be used for sequences with atypical padding/stride patterns. Those fused kernels assume contiguous KV layout and perform in-place updates that are non-atomic when interleaved with prefill cancellation.\n2) Prefill/decode scheduler change removed a brief synchronization barrier to reduce latency. When a prefill task is aborted, its partially-written KV pages are not fully invalidated and a subsequent decode reuses the corrupted pages, causing cache corruption and wrong outputs. The numerical drift is caused by reduction order changes and different accumulation kernels between fused and reference kernels, exacerbated by FP16 rounding differences.\n\nWhy this is urgent: Corrupted completions can leak context across requests in worst case (observed in internal repros), and numerical drift causes evaluation regressions flagged by QA. We must fix correctness before further rolling out kernel selection heuristics or scheduler optimizations.",
+  "steps_to_reproduce": "1) Deploy runtime build with the new kernel-selection and scheduler flags to a repro cluster.\n2) Run the attached stress harness (link below) configured for a 2048-sequence model, mixed-precision, batch size 1 with high concurrency (200 concurrent connections).\n3) Issue workload that starts prefill requests and cancels about 15-30% after 100-300ms, then immediately issues decode requests reusing same worker.\n4) Observe token mismatches vs baseline or assert KV checksums fail.\nCommands: ./stress_harness --model redwood-xl-2048 --mixed-precision bf16_fp16 --cancel_prob 0.2 --concurrency 200 --duration 30m\n",
+  "attachments": [
+    "docs/repros/prefill_cancel_stress.py",
+    "dashboards/runtime/kvcache-integrity-ops",
+    "logs/production/2025-02-26-kv-corruption-sample.log"
+  ],
+  "investigation_notes": [
+    "2025-03-01: Reproduced locally on k8s repro cluster. CRC mismatch seen in KV page header after prefill cancel + reuse.",
+    "2025-03-02: Instrumented KV store to add per-page generation counters. Observed generation increment not happening when prefill abort path is taken.",
+    "2025-03-04: Confirmed fused attention kernels perform in-place accumulation that assumes exclusive access to the page; concurrent abort can leave partial writes.",
+    "2025-03-05: Experimented with acquiring a lightweight mutex per KV page; eliminates corruption in repro but adds measurable tail latency under high concurrency.",
+    "2025-03-06: Measured numerical drift between fused kernel and reference kernel: mean L2 difference of logits ~2e-3 for tail tokens in FP16 mode; drift disappears when forcing deterministic accumulation order (slower path).",
+    "2025-03-07: Scoped minimal fix attempts: 1) reclaim/zero KV page on abort, 2) atomic replace of cache pointer after full fill. Reclaim reduces corruption but increases GC churn.",
+    "2025-03-09: Developed low-overhead atomic-swap patch that writes into a pre-allocated staging page and does an atomic pointer swap on completion; added fence semantics. Initial perf impact ~+1.5% p99 latency in stress tests.",
+    "2025-03-10: Added kernel-selection guard: do not choose in-place fused FP16 kernels if request concurrency > 64 or if model sequence length > 1024 until cache syncs complete. This prevents triggering the race for most production workloads.",
+    "2025-03-11: Running longer 24h stress with atomic-swap + guard; no KV corruption observed so far. Still seeing tiny numerical drift but within acceptable tolerance for now; will add regression tests."
+  ],
+  "fix_plan": "Short term (hotfix): ship atomic-swap staging for KV page writes and reinstate a minimal synchronization barrier on prefill aborts. Feature-flag new kernel-selection heuristics and enable guardrails for mixed-precision fused kernels.\n\nMedium term: refactor KV cache to use sharded page ownership with epoch-based reclamation to avoid global locks, implement per-page checksums and automatic invalidation on abort, and add deterministic accumulation paths for fused kernels when requested by evals.\n\nTests: add concurrency stress test to CI that runs the repro harness for 1 hour, unit tests for atomic-swap semantics, deterministic kernel output tests (golden logits) for mixed-precision, and fuzzing of prefill cancellation edge cases.\n\nRollout: rollout hotfix to staging, run 24h stress and internal canary, then progressive rollout to 10% prod -> 50% -> 100% with monitoring gates. Target release runtime-1.18.1.",
+  "related_prs": [
+    "https://github.com/redwood-inference/runtime/pull/2892",
+    "https://github.com/redwood-inference/runtime/pull/2910"
+  ],
+  "monitoring_playbook": "Dashboards: dashboards/runtime/kvcache-integrity-ops, dashboards/runtime/prefill-decode-latency, dashboards/runtime/model-output-apparent-mismatch.\nAlerts: create alert 'kvcache.corruption.rate > 0.01 for 5m' -> page oncall infra.\nRollback: toggle feature flag kernel-selection/guard to OFF to force old kernel selection.\nRunbooks: run kvcache-integrity-check.sh against node to detect bad pages and restart worker if invalidation fails.",
+  "postmortem_actions": [
+    "Add KV page generation counters and per-page checksums permanently (ENG-8215)",
+    "Add deterministic mixed-precision regression tests to eval harness (PM-412)",
+    "Add scheduler invariant tests for prefill/cancel ordering (ENG-8221)",
+    "Re-evaluate kernel-selection heuristics and require canary windows for any fused in-place kernel addition"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.18.1",
+  "security_review_required": "false",
+  "parent_issue": [
+    "ENG-7500"
+  ],
+  "dependencies": [
+    "ENG-8102",
+    "ENG-8120"
+  ],
+  "comments": [
+    "2025-03-01 Mateo Cruz: Initial repro confirmed. Added repro harness to repos/docs. Leaving node-level logs in artifacts.",
+    "2025-03-02 Rina Patel: Instrumentation added to KV store; found missing generation bump on abort path. Assigning to Mateo for hotfix implementation.",
+    "2025-03-05 Elena Kim (QA): Found one failing integration test in evals when forcing fused kernel even without cancellations. Added to test matrix.",
+    "2025-03-06 Mateo Cruz: Implemented atomic-swap staging approach in branch eng/ENG-8147-atomic-swap; bench shows +1.5% p99 under heavy concurrency. Preparing PR.",
+    "2025-03-09 Priya Nair (SRE): Added temporary alert for kvcache.corruption.rate > 0.001 for canary cluster. Noticing anomaly spikes during nightly load tests.",
+    "2025-03-11 Mateo Cruz: PR #2892 opened for atomic-swap and guard flag. Running 24h stress. Requesting review from Rina and Jeremy for kernel selection guard semantics."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "investigation_notes",
+    "fix_plan",
+    "monitoring_playbook",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_08a63edd1e104b3b8a160c6e2f7a5aa0"
+}

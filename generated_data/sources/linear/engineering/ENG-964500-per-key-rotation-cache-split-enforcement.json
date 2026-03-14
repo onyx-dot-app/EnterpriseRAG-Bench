@@ -1,0 +1,102 @@
+{
+  "key": "ENG-964500",
+  "team": "engineering",
+  "title": "Per-key rotation leaves edge shard enforcing stale policy leading to transient over-allow and meter undercount",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-25",
+  "updated_at": "2026-03-03",
+  "creator": "Maya Chen",
+  "assignee": "Soren Patel",
+  "project": "RateEngine Reliability",
+  "cycle": "2026-W09",
+  "estimate": "8",
+  "due_date": "2026-03-15",
+  "labels": [
+    "rate-limiting",
+    "billing",
+    "cache",
+    "incident",
+    "edge-routing"
+  ],
+  "dependencies": [
+    "ENG-712908",
+    "ENG-842719"
+  ],
+  "parent_issue": [],
+  "customer_impact": "high",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Summary: After an API key rotation flow for a high-traffic customer, several edge shards continued enforcing the previous tenant policy (legacy per-key quotas) for up to 45 minutes while control-plane records were already updated. This created a window where the serving edge would allow requests under the old, higher burst credit profile and simultaneously fail to increment central meters correctly, causing a combination of transient over-allow and undercounted usage in billing.\n\nWhy this matters: Customers saw apparent \u2018free\u2019 requests during the window and subsequent billing reconciliations showed missing tokens. This undermines trust in metering accuracy and can lead to financial loss or contested invoices. The behavior also complicates SLOs for rate limiting and quota safety for overloaded downstream services.",
+  "reproduction_steps": [
+    "Create test tenant with a custom per-key burst profile (burst=500, refill=50/min) and enable route aliasing.",
+    "Simulate steady traffic from key-A hitting edge shard S1 for 10k reqs/min.",
+    "Rotate API key (key-A -> key-A.v2) using the normal rotation API which updates control-plane policy records and issues new credentials.",
+    "Immediately switch client to key-A.v2 and continue traffic. Observe edge shard S1 logs and central metering aggregator.",
+    "Expect enforcement to reflect new, tighter per-key limits within control-plane propagation window; observe that S1 continues to use stale policy and does not emit meter increments for requests that were allowed under stale path."
+  ],
+  "observed_behavior": "Edge shard S1 continued to enforce the old policy for ~28-45 minutes after rotation. During that interval: (1) requests allowed by stale local cache did not always send meter increments to the aggregator due to a code-path that optimizes out redundant meter events for keys recognized as unchanged locally, and (2) when the shard switched back to control-plane evaluation it discovered a gap and backfilled inconsistent counts, but the reconciliation missed some tokens. Result: higher-than-expected request throughput and underreported usage in billing snapshots.",
+  "expected_behavior": "After API key rotation, all edge shards should either: (a) immediately invalidate local per-key policy cache and defer to control-plane for enforcement until fresh policy is fetched, or (b) atomically switch enforcement to the new policy and ensure every allowed request increments central meter with the correct key mapping. There should be no window where allowed requests are omitted from billing events.",
+  "logs": [
+    "[2026-02-25T15:12:03Z] S1 enforcement: key=key-A policy_version=2026-02-25T15:09:00Z allowed bpm=500\n",
+    "[2026-02-25T15:12:03Z] S1 meter-emitter: suppressed duplicate-meter for key=node:key-A local_tag=legacy\n",
+    "[2026-02-25T15:40:21Z] control-plane: policy-update key=key-A.v2 version=2026-02-25T15:11:22Z pushed to shards list=[S2,S3,S4] status=ok\n",
+    "[2026-02-25T16:00:17Z] S1 policy-fetch: fetch_failed=false applied_version=2026-02-25T15:11:22Z latency=1.2s\n",
+    "[2026-02-25T16:00:18Z] S1 reconcile: missing_meter_events_detected=1203 backfill_attempted=false reason=emit-path-optimized-out"
+  ],
+  "root_cause_analysis": "Preliminary RCA: two issues interacted. First, the per-key local policy cache on edge shards had a TTL-based invalidation that did not get triggered by key rotation events targeted at other regions (control-plane pushes used a best-effort fanout; S1 missed the push). Second, the meter emission path contains an optimization that avoids sending meter increments for keys flagged as unchanged since last sync. That optimization used the local policy_version tag to decide whether to emit; because S1 still believed the key mapping was unchanged it suppressed emission. When the shard later refreshed and discovered the rotation it applied a reconciliation path that does not reliably backfill suppressed meter-events, so counts were lost.",
+  "proposed_fixes": [
+    "Short term: disable 'suppress-duplicate-meter' optimization for per-key paths until safe invalidation is implemented. Toggle via runtime flag 'edge.suppress_duplicate_meter=false'.",
+    "Medium term: introduce a control-plane guaranteed-notification for key-rotation events with retry and ack (push+ack model) so shards cannot miss critical rotation messages; include a monotonic rotation_id in push payloads.",
+    "Long term: change local policy cache to support tombstone/epoch markers for key identities. When rotation occurs, shards should atomically switch to a transitional enforcement mode that either defers to control-plane or forces emission of all meter events for a bounded window to avoid undercounting.",
+    "Add a periodic reconciliation job on the aggregator that cross-checks request traces from edge logs for keys that had recent rotations and attempts targeted backfill with best-effort credit attribution."
+  ],
+  "rollout_plan": [
+    "1) Deploy runtime flag change to disable suppression in a canary subset of edge shards (shard-group B) and monitor metering delta for one hour.",
+    "2) If canary looks good (no surge in duplicate events, latency impact <2ms), roll flag globally over 2 hours.",
+    "3) Implement control-plane push+ack prototype behind a feature flag; enable for a single customer with high rotation frequency and observe behaviour.",
+    "4) Ship full cache epoch/tombstone change in runtime-1.20: requires forward-compatible policy payload and aggregator reconciliation support.",
+    "Rollback: re-enable suppression optimization immediately via runtime flag if event volume increases > 10x or latency regressions exceed 10ms p95."
+  ],
+  "qa_plan": [
+    "Unit tests for meter-emitter to assert it never drops events when local policy_version mismatches rotation_id.",
+    "Integration test that simulates round-robin rotation pushes with randomized shard misses and asserts aggregator total equals ground-truth event count.",
+    "Load test on staging: rotate keys continuously while driving 5k rps for a lane and ensure no >1% discrepancy between edge logs and aggregator counts.",
+    "Backward-compatibility test for older shards that may not understand tombstone markers (simulate and ensure safe fallback)."
+  ],
+  "owner_notes": [
+    "Assigned Soren to lead the patch; pairing with infra (Rajiv) on push+ack design.",
+    "Priority elevated due to high-impact customer reported issue; billing team looped in to prepare reconciliation and customer comms.",
+    "Estimate includes time for tests, canary, and quick rollback automation (8 points)."
+  ],
+  "comments": [
+    "2026-02-25 Maya Chen: Reported by finance after customer reported anomalous free requests. Initial triage points to edge-cache miss during rotation.",
+    "2026-02-26 Soren Patel: Reproduced in staging. Confirmed meter-emitter suppression is the immediate cause. Working on a feature-flag patch to disable suppression in per-key path.",
+    "2026-02-27 Rajiv Singh (infra): Meet scheduled 2026-02-28 to design push+ack. Suggested adding rotation_id and per-shard ack with exponential retry.",
+    "2026-03-01 Soren Patel: Canary ran on shard-group B for 30m. Meter delta reduced to expected levels. Observed 0.8ms median latency increase on emit path. Preparing global rollout tomorrow.",
+    "2026-03-02 Finance (Anya Lopez): Begin draft customer-facing reconciliation and credit memo for affected window. Holding until global rollout confirms fix.",
+    "2026-03-03 Maya Chen: Updated ticket with rollout notes and assigned follow-ups for aggregator reconciliation job. Marked In Progress.",
+    "Related PR: https://github.com/redwood-inference/rate-engine/pull/4121",
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/ENG/pages/Rate+Engine+Rotation+RCA"
+  ],
+  "attachments": [
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/Rate+Engine+Rotation+RCA",
+    "https://github.com/redwood-inference/rate-engine/pull/4121",
+    "logs/s1-rotation-window-2026-02-25.tar.gz"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "reproduction_steps",
+    "observed_behavior",
+    "expected_behavior",
+    "logs",
+    "root_cause_analysis",
+    "proposed_fixes",
+    "rollout_plan",
+    "qa_plan",
+    "owner_notes",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_124cb27614ed4d7ca69574a4cf530ae0"
+}

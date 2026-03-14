@@ -1,0 +1,108 @@
+{
+  "key": "SUP-741852",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Long-lived low-CPU / high-GPU streams holding slots and causing reserved-pool throughput erosion",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-13",
+  "updated_at": "2026-03-14",
+  "reporter": "Aisha Kumar",
+  "assignee": "Benjamin Ortiz",
+  "customer_company": "Nimbus Analytics",
+  "customer_tier": "dedicated",
+  "environment": "prod | us-east",
+  "components": [
+    "serving-runtime",
+    "scheduler",
+    "autoscaler",
+    "dedicated-pool",
+    "kv-cache"
+  ],
+  "labels": [
+    "noisy-neighbor",
+    "slot-lock",
+    "autoscale-lag",
+    "throughput-degradation"
+  ],
+  "affected_models": [
+    "rwkv-13b-quant",
+    "gpt-4o-mini"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "linked_issues": [
+    "SUP-271903",
+    "SUP-903210"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/2145"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SRE/Dedicated+Pool+Slot+Lock+Runbook"
+  ],
+  "sla_due_at": "2026-03-14",
+  "first_response_due_at": "2026-03-13",
+  "description": "Issue summary:\n- Since ~2026-03-13T07:30UTC several reserved GPU pools serving Nimbus Analytics have shown a gradual p99/p95 throughput degradation over a 2\u20133 hour window. The symptom set is a slowly rising request queue, batch slot allocation increases despite constant request rate, and a corresponding step-up in tail latency.\n\nImpact:\n- Nimbus (dedicated tenant) reports degraded batch throughput and higher p99 latency; customer reports timeouts for multi-token streams and intermittent throttling. Business affected: nightly ingestion pipelines and interactive inference endpoints.\n\nEnvironment:\n- Dedicated pool: us-east reserved cluster (pool-id: rp-us-east-12).\n- Runtime version: serving-runtime v3.12.7.\n- Scheduler: gang-scheduler v1.4.\n\nSteps to reproduce (observed pattern):\n1. Reproduce workload shape: many long-lived streaming requests (60\u2013120s) that do heavy decode and minimal CPU preprocessing.\n2. Start 200 concurrent small-batch streams (1\u20134 tokens per iteration) pinned to rwkv-13b-quant.\n3. Observe scheduler's slot accounting and batcher metrics over 30\u201390 minutes.\n\nObserved behavior:\n- Certain streams keep GPU slot assignments for entire stream lifetime; slot release doesn't correlate to actual GPU utilization.\n- Autoscaler does not trigger additional capacity because slot occupancy appears steady (but effective usable throughput is lower).\n- KV-cache entries for these streams grow and cause collisions with small short-lived requests, increasing serialization in the batcher.\n\nExpected behavior:\n- Long-lived streams should let batching multiplex other requests without holding slots in a way that blocks normal batching. Autoscaler should detect real utilization drop/pressure and scale accordingly.\n\nTemporary workaround applied:\n- Support configured an eviction soft-threshold (5m) for long-held soft-locked slots for this pool and applied a conservative slot reclaim policy. This immediately recovered ~30% of throughput for the customer's critical route.\n",
+  "steps_to_reproduce": [
+    "Start 200 concurrent streaming requests: 60\u2013120s lifetime, minimal cpu per-step work, model rwkv-13b-quant",
+    "Monitor batcher slot-occupancy and scheduler assigned_slots metrics for rp-us-east-12 over 60 minutes",
+    "Compare kv-cache size and eviction_rate against a normal short-stream workload"
+  ],
+  "logs": [
+    "2026-03-13T07:29:12Z rp-us-east-12 batcher: slot_acquire id=0x7a3f hold_time=00:01:03",
+    "2026-03-13T08:10:03Z serving-runtime: kv_cache:items=48k collisions=622 growth_rate=0.18/s",
+    "2026-03-13T08:15:22Z scheduler: assigned_slots=312 target_slots=240 pending_queue=184"
+  ],
+  "comments": [
+    "2026-03-13T08:40Z - Aisha Kumar (Support): Customer opened with alerting showing p99 increase on two interactive routes. Initial triage shows pool rp-us-east-12. Marking as P1 due to ingestion SLAs.",
+    "2026-03-13T09:05Z - Benjamin Ortiz (SRE): Confirmed slow drift in throughput. Not seeing obvious GPU saturation; per-GPU util at 45\u201360% while queue grows. Suspect slot lock behavior from long-lived streams.",
+    "2026-03-13T10:12Z - Nimbus Analytics (Customer - Rachel Li): We started a new streaming job yesterday evening that keeps an open connection while polling for outputs. This roughly matches when the degradation began.",
+    "2026-03-13T11:00Z - Benjamin Ortiz (SRE): Applied temporary slot-reclaim soft-threshold (5m). Early effect: pending_queue reduced ~27% and p99 for customer's critical route improved from 2.4s -> 1.1s. Continuing investigation into root cause and autoscaler signals.",
+    "2026-03-14T09:20Z - Margo Chen (Infra): Found that scheduler heartbeat coalescing and slot bookkeeping path does not decrement 'logical_hold' when stream-only activity enters a steady-state decode loop. Raising a runtime bug: GH-2145."
+  ],
+  "investigation_notes": [
+    "Hypothesis 1: Long-lived streams set a logical slot hold that doesn't get decremented unless explicit release path runs; decode-only steps don't trigger slot-update callbacks.",
+    "Hypothesis 2: KV-cache growth causes increased serialization inside batcher; small streams wait behind large held slots leading to effective throughput drop despite available GPU cycles.",
+    "Metric evidence: per-GPU util at <70% while assigned_slots >> active_batching_slots. This indicates slots are 'owned' but not enabling multiplexing.",
+    "Correlated config: rwkv-13b-quant runtime path uses a different kernel lifecycle and may bypass the usual slot-heartbeat. Reproducer confirms kernel path correlates to the issue.",
+    "Related prior tickets: linked SUP-271903 shows similar pocket of slot-lock but with ephemeral streams causing starvation; this incident differs because streams are long-lived and low-CPU.",
+    "Next investigative steps: instrument slot-heartbeat delta, add metric for 'logical_hold_duration' per stream, and run ablation with kernel path disabled for same workload.",
+    "Action items: SRE to add canary patch to reclaim logic; Runtime team to patch heartbeat callback (PR https://github.com/redwood-inference/serving-runtime/pull/2145) and add unit test for decode-only step path."
+  ],
+  "resolution": "Mitigation in place: soft eviction/reclaim applied to rp-us-east-12; observed ~30% throughput recovery on customer routes. A runtime patch (PR 2145) submitted to fix heartbeat decrement on decode-only steps. Longer-term patches: (1) make autoscaler use effective_throughput metric (not just assigned_slots), (2) add kv-cache eviction tuning for long-lived streams. Plan: schedule controlled rollout of runtime fix in canary pools on 2026-03-17 then full pool rollout 2026-03-20.",
+  "follow_up_tasks": [
+    "QA: Create automated test for long-lived decode-only stream slot release",
+    "Product: Expose 'long-lived stream' warning in Console for Dedicated pools",
+    "SRE: Monitor effective_throughput metric and create alert if assigned_slots > active_batching_slots by 25% for >15m"
+  ],
+  "workaround_notes": "Applied eviction soft-threshold (5m) to the pool which reclaims idle logical holds earlier than default. This is a stop-gap; it may impact very long-running customer sessions that intentionally hold slots (we coordinated with Nimbus).",
+  "customer_communication": "2026-03-13T12:15Z - Sent interim update to Nimbus support contact (Rachel Li) describing mitigation and next steps. Promised follow-up timeline for runtime patch and canary rollout. Customer acknowledged and requested notification on canary success before full rollout.",
+  "postmortem_link": "",
+  "estimated_root_cause": "Scheduler + runtime slot bookkeeping mismatch: decode-only long-lived streams were not decrementing logical_hold counters, so slots appeared occupied preventing batch multiplexing and confusing autoscaler signals.",
+  "notes_for_engineering": "Runtime heartbeat callback needs a unit test covering decode-only step paths. Autoscaler should incorporate a derived throughput metric to avoid decisioning purely on assigned_slots. Consider kv-cache per-tenant caps for dedicated pools to avoid cross-tenant collision.",
+  "attachments": [
+    "/var/logs/rp-us-east-12/2026-03-13-batcher.log",
+    "/var/metrics/dumps/rp-us-east-12-slot-snapshot-2026-03-13.json"
+  ],
+  "related_slack_threads": [
+    "#support - thread: SUP-741852 slot-lock investigation (https://slack.redwood.ai/archives/C01234ABC)"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution",
+    "follow_up_tasks",
+    "workaround_notes",
+    "customer_communication",
+    "estimated_root_cause",
+    "notes_for_engineering",
+    "steps_to_reproduce",
+    "logs"
+  ],
+  "dataset_doc_uuid": "dsid_6bc8db5e11de411ea464b05eb99afd40"
+}

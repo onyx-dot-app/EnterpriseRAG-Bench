@@ -1,0 +1,38 @@
+{
+  "key": "ENG-44902",
+  "team": "engineering",
+  "title": "stale org->project mapping cache causes billing bleed after project rename",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Raman",
+  "assignee": "Marco Delgado",
+  "project": "billing-platform",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "billing",
+    "metering",
+    "rate-limiter",
+    "high-impact",
+    "investigation"
+  ],
+  "dependencies": [
+    "ENG-37645",
+    "ENG-31228"
+  ],
+  "parent_issue": [
+    "ENG-41107"
+  ],
+  "customer_impact": "high",
+  "release": "billing-2.3",
+  "security_review_required": "false",
+  "body": "Summary:\\n\\nAn intermittent bug in the org->project attribution cache causes ingress events to be billed to the parent org (or to the wrong project) after a project rename or idempotent key rebind. The root cause appears to be a stale in-memory mapper used by the metering proxy fallback path; when a project name/alias update races with token exchange, requests are processed with an outdated mapping and end up recorded against the wrong billing entity.\\n\\nImpact:\\n- Multiple customers reported sudden billing spikes and incorrect per-project usage in the last 48 hours.\\n- Affected requests show correct API key but wrong project_id in aggregated metering records.\\n- Severity: P0 \u2014 actively misbilling production traffic and causing invoices to be incorrect.\\n\\nReproduction (observed in staging and in one customer repro):\\n1) Create project P-A and issue API key K.\\n2) Start heavy streaming workload (10\u201350 RPS) using K.\\n3) Rename project to P-B (rename operation updates catalog and fires rewrite event).\\n4) Concurrently rotate API key (token aliasing flow) or rebind key to a subproject.\\n5) Metering proxy receives requests and consults in-memory org->project cache; race leaves cache stale for ~30s.\\n6) Metering writes usage rows labeled with the pre-rename project id (or default org) instead of the current project id.\\n\\nNotable logs/traces (anonymized):\\n- metering-proxy: mapper_cache_miss=false cache_version=42 serving_project=proj_old\\n- catalog-watcher: published_version=43 project_rename=proj_old->proj_new\\n- usage-writer: write_success=true user_key_alias=abc123 recorded_project=proj_old\\n\\nInitial triage findings:\\n- The cache is an in-process LRU with manual invalidation triggered only on catalog webhook success. Catalog updates occasionally arrive out-of-order vs the key rotation message queue (kafka partitioning mismatch).\\n- Fallback code path used during short catalog latencies bypasses the canonical resolver and reads the stale LRU.\\n- There is no defensive invariant in the ingestion pipeline to assert that the recorded_project matches the active mapping for the API key at write-time.\\n\\nProposed plan of action (multi-step):\\n1) Hotfix (1\u20132 day):\\n   - Add conservative server-side mitigation: if catalog_version != mapper_cache_version then reject non-idempotent writes with 409 and return a header X-Metering-Mapper-Stale: 1 so callers can retry. Implement as feature-flagged change behind ff/metering-mapper-strict.\\n   - Deploy to canary region and run synthetic repro load for 24h.\\n   - PR: https://github.com/redwood-inference/metering/pull/892 (WIP)\\n\\n2) Root fix (2\u20133 sprints):\\n   - Replace process-local LRU with a strongly-consistent resolver backed by a read-through cache using the catalog's versioned key-value store (etcd) and a version token on each API key.\\n   - Ensure the mapper update path is idempotent and ordered by catalog event offsets; add event-sequencing in catalog-watcher so we never apply older versions after newer ones.\\n   - Add a short-lived immutable mapping token on API key creation/rotation so metering can validate recorded_project token at write-time.\\n\\n3) Data repair and monitoring:\\n   - Backfill job to scan recent usage rows with recorded_project not matching canonical mapping and re-emit corrected usage events (will carry a correction_flag to avoid double billing). See migration script: https://github.com/redwood-inference/ops-scripts/blob/main/fix-mapping-backfill.py\\n   - Add metric meter.attribution.orphaned_count and a Grafana dashboard: https://grafana.redwood-internal/d/usage/attribution-health\\n\\n4) Tests and validation:\\n   - Unit tests for mapper ordering and catalog-watcher event application.\\n   - Integration test that performs rename+rotate under load and asserts 100% correct attribution.\\n\\nRollout plan:\\n- Step 0: Merge hotfix behind ff/metering-mapper-strict and enable on internal-only cluster. Run synthetic workload for 24h.\\n- Step 1: Canary rollout to US-west (10% of traffic) \u2014 monitor orphaned_count and invoice_delta.\\n- Step 2: Gradual rollout to production regional clusters over 48h if metrics stable.\\n\\nMetrics to watch (alert thresholds):\\n- meter.attribution.orphaned_rate > 0.1% sustained for 15m -> Pager/SEV2\\n- invoice_delta anomalous increase > 5% for a single org -> Pager/SEV1\\n- catalog_watcher_lag > 5s -> Alert (ops)\\n\\nOpen questions / blockers:\\n- Does the billing pipeline idempotency allow us to safely re-emit corrected usage rows without double billing? (Finance/Revenue needs sign-off)\\n- Which catalog event ordering guarantees exist across clusters? Ops to confirm kafka partitioning by org key.\\n- Do we want to tolerate brief rejections (409) during catalog sync as opposed to best-effort attribution?\\n\\nImmediate next steps (today):\\n- Marco: finish the hotfix PR and add header instrumentation (ETA: 2026-03-12) \u2014 in progress.\\n- Aisha: run synthetic repro and capture traces (ETA: 2026-03-12).\\n- Finance: schedule emergency review for the backfill semantics (requested).\\n\\nRelated artifacts and links:\\n- Repro harness: https://ci.redwood-internal/repro/ENG-44902/run/13\\n- Draft playbook for mitigation: https://confluence.redwood-internal/display/BILLING/ENG-44902+playbook\\n- Initial customer reports: drive link (internal) https://drive.redwood-internal/alerts/44902\\n\\nIf anyone with deeper catalog-watcher context (Kenji, Priya) can chime in on the ordering guarantees and whether we can atomically attach a version token to every key during rotation, that will unblock the root fix design.\\n\\nStatus updates: \\n- 2026-03-11 09:47 (Aisha): Confirmed repro in staging with project rename + rotation. Captured traces and uploaded to repro job.\\n- 2026-03-11 16:20 (Marco): Pushed hotfix branch w/ header instrumentation and a basic catalog_version check; tests added for 409 path. PR opened (WIP).\\n- 2026-03-12 08:15 (Aisha): Canary enabled on internal cluster \u2014 no orphaned writes observed in first 6h.\\n\\nNotes for follow-up: prioritize the root fix in the next billing-platform sprint; planning session scheduled for 2026-03-14 to scope the etcd-backed resolver and migration strategy.\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_df04c9a85b6b428e84edf5357cf5002c"
+}

@@ -1,0 +1,87 @@
+{
+  "key": "SUP-961022",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "SSE stream fails to resume after transient proxy backoff causing mid-generation stall and final chunk loss",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-08",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Patel",
+  "assignee": "Lena Zhao",
+  "customer_company": "ClipQuick",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "streaming"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "timeout",
+    "proxy",
+    "resume"
+  ],
+  "environment": "prod - us-west",
+  "affected_models": [
+    "redwood/gpt-infer-3b-v1"
+  ],
+  "affected_regions": [
+    "us-west"
+  ],
+  "sla_due_at": "2026-03-09",
+  "first_response_due_at": "2026-03-08",
+  "linked_issues": [
+    "SUP-832917",
+    "SUP-257001"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/1248"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SRE/Streaming+Resilience+Runbook"
+  ],
+  "related_incident_id": "INC-2026-03-08-07",
+  "description": "Issue summary:\nCustomer ClipQuick reports repeated cases where SSE chat sessions stall mid-generation after an upstream proxy transient (502/502->connection-close) and then client reconnects. The stream does not resume and the final chunk is never delivered.\n\nImpact:\n- Multiple production customers experienced silent stalls during long responses (1.5k+ token outputs).\n- For ClipQuick (dedicated), affected ~12% of long-stream requests over a 6-hour window, causing user-facing timeouts and degraded UX.\n\nEnvironment:\n- Prod (us-west) on Dedicated capacity; API requests routed through managed edge proxy cluster (edge-proxy-usw).\n- Model: redwood/gpt-infer-3b-v1 with streaming enabled, chunk interval ~200ms.\n\nObserved behavior:\n- Client receives SSE events for 60-90% of response, then a transient upstream 502 -> client reconnects with same request-id.\n- New connection receives initial keepalive chunks but no continuation of the previous generation; server logs show worker completed tokens but final chunk not flushed to the resumed session.\n\nExpected behavior:\n- When client reconnects within session window, server should resume sending remaining tokens from active KV cache / continuation stream, or include a clear error; at minimum deliver final completion chunk.\n\nNotes:\n- This is different from simple keepalive timeouts: here the upstream proxy closes the TCP connection (FIN) during an in-flight response and responds with 502 to some concurrent requests. The platform should either allow seamless streaming resume or fail-open with a clear error to clients.",
+  "steps_to_reproduce": [
+    "1) Start a streaming chat generation request for a long response (>1200 tokens) against redwood/gpt-infer-3b-v1 via the public SSE endpoint with chunked streaming enabled.",
+    "2) Introduce a transient upstream proxy failure (simulate a 502 + TCP close) between client and edge-proxy while tokens are being streamed (approx 30-60 seconds into generation).",
+    "3) Immediately reconnect with identical request-id/headers (client auto-retry policy with short backoff).",
+    "4) Observe that the resumed connection receives keepalives but does not receive the worker's final token flush; status remains silent until backend finishes, then nothing delivered to client."
+  ],
+  "logs": [
+    "2026-03-08T10:21:12Z edge-proxy-usw: upstream returned 502 -> connection closed (FIN) to client 10.14.2.9",
+    "2026-03-08T10:21:12Z sse-handler: client reconnect request-id=clipq-req-71dc, session-token=abc123 (reconnect attempt 1)",
+    "2026-03-08T10:21:13Z serving-runtime[worker-7]: generation complete for req=clipq-req-71dc, emitted_tokens=1423, final_flush=scheduled",
+    "2026-03-08T10:21:14Z sse-handler: resume lookup for session=clipq-req-71dc -> worker-7 found but websocket_session_id mismatch",
+    "2026-03-08T10:21:14Z sse-handler: unable to attach stream to new connection: session-affinity-mismatch, dropping flush"
+  ],
+  "comments": [
+    "2026-03-08 | Aisha Patel (Support): Customer reports UI shows partial text then spinner; retrying does not get the remainder. Provided request-id and timestamp. Asked for logs and sample request headers.",
+    "2026-03-08 | Lena Zhao (SRE): Reproduced locally by simulating upstream FIN during chunked transfer. Observed worker emits tokens to internal IPC but sse-handler fails to reattach because connection_uuid changed and resume-token not persisted to session store.",
+    "2026-03-09 | Miguel Ortega (Runtime Eng): Hypothesis: resume token saved in in-memory worker state only; when proxy disconnects and client reconnects to a different edge instance, we miss the mapping. Suggested persist resume-token to shared session store (redis) and extend session TTL for in-flight streams.",
+    "2026-03-10 | Clara Jensen (Support): Provided ClipQuick with temporary workaround: set client retry_backoff to linear 200ms and enable polling fallback (non-stream) for long responses. Customer accepted workaround; still requests fix.",
+    "2026-03-11 | Lena Zhao (SRE): Deployed patch to persist resume metadata and attach-on-reconnect logic to sse-handler on canary edge-proxy-usw-2 (PR #1248). Monitoring for errors."
+  ],
+  "investigation_notes": "Summary of root cause: resume-token and session affinity were only kept in local worker memory and tied to the original connection_uuid. When upstream proxy returned FIN and the client reconnected, the new connection->edge mapping often landed on a different edge instance. Because resume metadata wasn't persisted, sse-handler could not reattach the worker's output stream to the new connection, causing final token flush to be dropped. Additional contributing factor: short TTL for session entries and aggressive proxy connection reuse causing unexpected FINs. Metric evidence: spike in sse_handler.attach_failures correlated with edge proxy 502 events (10:15-12:30).",
+  "resolution_notes": "Temporary workarounds shared with customer: enable polling fallback for very long responses and reduce client retry backoff. Deployed fixes: (1) Persist resume metadata (resume_token, worker_id, offset) to Redis with TTL tied to expected generation duration. (2) sse-handler now attempts worker rebind across edges by querying coordinator and matching worker_id; if rebind succeeds, remaining tokens are streamed on reconnect. (3) Increased session TTL for in-flight streams. Changes merged in PR https://github.com/redwood-inference/serving-runtime/pull/1248 and rolled to canary (edge-proxy-usw-2) on 2026-03-11, then to prod on 2026-03-12. Post-deploy: attach_failures down 92% in canary traffic; ClipQuick monitored and verified final chunk delivery in subsequent long-response requests. Follow-ups: add more robust client-facing errors when rebind fails and add a dashboard for sse reattach rates.",
+  "action_items": [
+    "A) Platform: add automated test simulating FIN during streaming to CI gating (owner: Miguel Ortega, due: 2026-03-19)",
+    "B) SRE: instrument edge-proxy to alert on consecutive FIN events (owner: Lena Zhao, due: 2026-03-15)",
+    "C) DX/SDK: document recommended retry_backoff and polling-fallback patterns for long-stream clients (owner: Clara Jensen, due: 2026-03-18)",
+    "D) Product: evaluate option to surface resume/fallback state in Console for in-flight streams (owner: Ravi Shah, due: 2026-04-01)"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution_notes",
+    "action_items"
+  ],
+  "dataset_doc_uuid": "dsid_efafb146cd814b37969e820c1c38b64f"
+}

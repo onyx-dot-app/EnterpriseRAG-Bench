@@ -1,0 +1,49 @@
+{
+  "key": "ENG-72502",
+  "team": "engineering",
+  "title": "Speculative kernel merge exposes stale-cache window and precision divergence during interleaved prefill-decode",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-02-12",
+  "updated_at": "2025-02-25",
+  "creator": "Liam Chen",
+  "assignee": "Priya Kapoor",
+  "project": "runtime-kernel-selection",
+  "cycle": "2025-W07",
+  "estimate": "5",
+  "due_date": "2025-03-05",
+  "labels": [
+    "kernel-selection",
+    "prefill-decode",
+    "regression",
+    "stability",
+    "kv-cache"
+  ],
+  "dependencies": [
+    "ENG-52711",
+    "ENG-61177"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.21",
+  "security_review_required": "false",
+  "description": "Summary:\nWe observed rare correctness regressions after enabling speculative kernel merging (a perf optimization that coalesces adjacent kernels to reduce launch overhead). Failures present as: (1) token shifts from stale KV entries during long prefill + interleaved decode workloads, and (2) small numerical divergences (mixed-precision rounding) that amplify in downstream logits and cause sampling differences.\n\nHow it manifests:\n- Probabilistic sample drift (not deterministic) on long-context generation with interleaved user requests.\n- Reproducible with stressed interleaving (concurrent prefill on one stream while the scheduler merges kernels from a different workqueue).\n- KV cache slot tags occasionally refer to an older slab window after a speculative merge completes during a prefill pipeline flush.\n\nReproduction steps (minimal harness):\n1) Start runtime with kernel-merging enabled and kernel-scheduler: speculative-merge policy.\n2) Feed a long prefill (2k tokens) on task A. During prefill flush, trigger many short decode requests on task B (1-4 tokens) to force scheduler interleave.\n3) Use the attached reproducer script (link below) under AVX2 GPU emulation; failure observed ~1 in 600 runs on our CI stress runner.\n\nImpact and urgency:\n- High: affects correctness of serving outputs for some production workloads with interleaved multi-tenant patterns.\n- Regression introduced by a perf optimization; must either fix correctness or gate the optimization behind safe heuristics.\n\nInvestigation notes so far (timeline):\n- 2025-02-12: Initial alert from canary -> PR triage. Priority escalated due to customer-facing divergence for a mid-market customer using long-context chat.\n- 2025-02-14: Triage run: captured traces showing kernel merge event overlapped with prefill KV flush. Observed stale-cache reads with sequence-number mismatch.\n- 2025-02-16: Added deterministic instrumentation: per-slot sequence counters + merge-event logs. Confirmed that speculative merge can complete and reassign buffers before prefill flush completes, leaving transient stale views.\n- 2025-02-20: Hypothesis validated: race between speculative-merge finalization (which reclaims/repurposes slab segments) and prefill write-back leads to stale reads that get interpreted as valid KV entries.\n\nRoot cause hypothesis:\n- The speculative merge path reuses slab segments without properly synchronizing with outstanding prefill state machines. Because merge reduces the number of kernel invocations and coalesces writes, one side-effect is tighter timing windows on slab reuse. The prefill state machine can observe slot metadata that appears valid (non-zero length) but whose backing buffer was recycled and partially overwritten by the merged kernel path.\n- Mixed-precision reorderings inside the merged kernel also alter accumulation order, producing subtle fp rounding differences that amplify across attention and cause downstream token probability drift.\n\nProposed mitigations and tradeoffs:\nOption A (short-term, safe):\n- Disable speculative kernel merging when prefill sequences are active or when multi-stream interleaving exceeds a threshold.\n- Cost: measurable perf regression under the specific mode (approx +4-7% median latencies on 1-token bursts in our synthetic benchmark).\n\nOption B (medium-term, correct):\n- Introduce sequence-numbered KV-slot fencing: every slot write increments a fence counter; readers validate fence after memory barrier. Ensure merge finalization waits for in-flight prefill fences.\n- Add explicit memory barriers and a merge finalization handshake to avoid reuse until all prefill state machines ack.\n- Cost: complexity increase; some perf overhead but can be tuned (estimated +1-2% latency).\n\nOption C (long-term, performant):\n- Rework speculative merging logic to keep per-stream slot ownership metadata rather than blind slab reuse, enabling zero-cost correctness checks at read time.\n- Cost: larger engineering effort but keeps most perf wins.\n\nImmediate plan (agreed by on-call + runtime owners):\n1) Ship short-term safeguard (Option A) behind a config flag and enable automatically for canary/production for affected customers. Branch: PR #9876.\n2) Implement medium-term fence-based fix (Option B) and add unit+stress tests. Target runtime-1.21.\n3) Instrument canary and dashboards with merge-event, fence misses, and KV-validate metrics.\n4) Run extended perf regression and correctness stress for 72h across regions.\n\nAcceptance criteria:\n- No stale-cache read reproductions on CI reproducer after patch for 1M stress iterations.\n- Canary with production traffic (selected customer) shows no divergence for 48h.\n- Automated tests added to kernel-scheduler unit tests and end-to-end prefill-decode stress harness.\n- PR passes design/eng review and is rolled with a toggle.\n\nLinks and artifacts:\n- Reproducer harness: https://github.com/redwood-inference/runtime-tests/tree/main/repro/speculative-merge-stress\n- PR (short-term safeguard): https://github.com/redwood-inference/runtime/pull/9876\n- Kernel scheduler design notes: https://docs.redwood.ai/confluence/kernel-scheduler/speculative-merge\n- Canary dashboard: https://grafana.redwood.ai/d/merge-events/merge-canary\n\nNotes on telemetry to add:\n- metric.runtime.merge.finalize_latency_ms (histogram)\n- metric.runtime.kv.read_validation_failures (counter, tags: stream_id, slot_id)\n- trace span: kernel.merge.finalize -> includes slab_id, seq_before, seq_after\n\nRisks and roll-back plan:\n- Rolling out short-term disable increases request median latency slightly; rollback by re-enabling speculative merge if perf/regression unacceptable for a customer (but then we will re-schedule for tracked customers only).\n- If fence-based fix affects throughput, we will canary with limited capacity and revert under controlled window.\n",
+  "comments": [
+    "2025-02-12 09:14 - Liam Chen: Initial alert from canary. Captured traces attached. Assigning to Priya for deeper investigation.",
+    "2025-02-13 16:02 - Priya Kapoor: Added reproducer harness and two test scenarios. Reproducer hits divergence ~0.15% on CI; ramps to ~0.2% under stress. See CI run: https://ci.redwood.ai/runs/4231",
+    "2025-02-16 11:47 - Ben Morales: Instrumentation added to kernel runtime to emit merge events. Observed merge finalization timestamps that overlap with prefill flush windows. Hypothesis: race on slab reuse.",
+    "2025-02-18 14:25 - Priya Kapoor: Validated sequence-number mismatch on slot read. Drafted short-term patch to gate speculative merge when prefill_active=true. PR: https://github.com/redwood-inference/runtime/pull/9876",
+    "2025-02-22 10:33 - QA (Marisol Vega): Running 72h stress with short-term gate enabled. No reproductions seen in first 24h. Perf impact measured: median latency +5% on 1-token bursts, tail unchanged.",
+    "2025-02-25 09:08 - Priya Kapoor: Preparing medium-term fence-based fix. Adding unit tests for slot-fence and merge-handshake. Scheduling review with runtime leads on 2025-02-26.",
+    "2025-02-25 13:11 - Liam Chen: Added this ticket to runtime-1.21 milestone. Please add any further findings here and attach test logs."
+  ],
+  "attachments": [
+    "https://storage.redwood.ai/artifacts/ENG-72502/traces.zip",
+    "https://storage.redwood.ai/artifacts/ENG-72502/stress-logs.tar.gz"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_620d0ed5bb094db4875fff8aaac74cd1"
+}

@@ -1,0 +1,82 @@
+{
+  "key": "ENG-14421",
+  "team": "engineering",
+  "title": "Fix inconsistent enforcement of hierarchical burst quotas across cache replicas",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-02-14",
+  "updated_at": "2025-03-05",
+  "creator": "Priya Desai",
+  "assignee": "Liam O'Connor",
+  "project": "billing-and-rate-policy-v2",
+  "cycle": "2025-W09",
+  "estimate": "8",
+  "due_date": "2025-03-12",
+  "labels": [
+    "quota",
+    "rate-limiter",
+    "billing",
+    "p0-hotfix",
+    "observability"
+  ],
+  "parent_issue": [
+    "ENG-13600"
+  ],
+  "dependencies": [
+    "ENG-14110",
+    "ENG-14022"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.25",
+  "security_review_required": "false",
+  "body": "Summary:\nThe hierarchical quota enforcement path (per-key -> per-org -> per-route) that allows short-term burst tokens is sometimes permitting requests that should be rejected, leading to billing mismatches and downstream capacity pressure. The bug appears when multiple cache replicas (regional L1 caches) concurrently grant burst tokens while the central accounting store (Redis/LeveledCounter) experiences transient time skew or delayed reconciliation.\n\nObserved behavior:\n- Customers observe higher-than-expected usage and corresponding invoices that include requests that were supposed to be rate-limited.\n- In some cases, downstream workers report 429s while upstream logs show the request was allowed by a cache replica (the replica returned an ABORT=false grant).\n- A reconciliation job shows frequent small positive deltas where granted burst tokens were not atomically decremented in the global counter.\n\nWhy this matters:\n- Billing/usage correctness is fundamental to trust and our contracts (especially Dedicated).\n- Over-granting can cause customers on reserved pools to see noisy neighbors and potentially breach SLAs.\n\nScope:\n- Affects hosted API and Dedicated edge L1 caching configuration (regions using read-through caches and local token grants).\n- Triggered under high concurrent request bursts and when replica clocks diverge or when network partitions cause delayed writes to the central store.\n\nInitial hypothesis: race condition between local grant paths and central counter reconciliation. Local replicas use an optimistic local token lease to reduce round-trips; they then asynchronously decrement the global counter. If the async decrement fails or is delayed and another replica simultaneously grants, the global state can be oversubscribed.\n\nKey findings from telemetry: see telemetry_signatures below for searched metrics and log patterns.\n",
+  "repro_steps": [
+    "1) Configure two L1 cache replicas (region-us-east, region-us-west) with local-burst=true and lease_timeout=150ms.",
+    "2) Create an org-level quota of 100 req/min with per-key burst=20 and per-route burst=10.",
+    "3) From two simulated clients (one hitting each replica), send 40 concurrent requests each against the same API key and route. Use a small jitter but keep the burst window within 100ms.",
+    "4) Observe that both replicas grant local burst tokens and return HTTP 200 for ~60-80 requests total in the first second while central accounting only registers ~20 decrements immediately, followed by delayed reconciliations.\n    Expected: global accounting should ensure total granted tokens <= configured burst budget."
+  ],
+  "telemetry_signatures": [
+    "metric:quota.grants.local_ratio{route,org,key} spikes to ~2 when bursts occur",
+    "log:rate-limiter:INFO grant_local key=<redacted> replica=us-east grant=10 central_decrement_failed=true",
+    "log:reconciler:WARN reconcile_delta key=<redacted> delta=+18 timestamp_mismatch=25ms",
+    "metric:requests.4xx.rate{org} increases after reconciliation window",
+    "dashboard:billing/usage-discrepancy: saw 7% mismatch week-over-week correlated with burst windows"
+  ],
+  "comments": [
+    "2025-02-15 - Priya Desai: Added initial reproducible harness and synthetic load scripts in GH gist (link below). Observed deterministic overshoot when lease_timeout < 200ms.",
+    "2025-02-18 - Liam O'Connor: Confirmed reproduction in staging. Captured packet traces showing delayed HSET to Redis during transient saturation. Replicas still return success due to optimistic lease. Added more detailed logs to rate-limiter grant path (PR in review).",
+    "2025-02-22 - R&D (Nora Chen): Investigated algorithmic options: (A) move to central compare-and-set (CAS) for burst grants, (B) change to short-lived centralized token buckets, (C) adopt lease with two-phase commit. CAS reduces latency invariants but increases central contention; two-phase commit impacts tail latencies.",
+    "2025-02-26 - SRE (Omar Khatri): Instrumented reconcile job to emit per-key reconciliation frequency. Found reconciler delay often correlates with GC pauses on redis-proxy pod. Working on proxy tuning.",
+    "2025-03-01 - PM (Jules Martin): Flagged high customer impact for a handful of enterprise customers on Dedicated; requested P0 fix and mitigation plan including temporary config change to disable local-burst for affected customers.",
+    "2025-03-04 - Liam O'Connor: Implemented candidate fix: atomic central CAS at grant time with optimistic local fast-path fallback. Running load tests against staging; initial results show no overshoot but 8-12ms median increase in grant latency."
+  ],
+  "proposed_fix": "Primary: implement an atomic central CAS increment for burst grants in the global accounting store to guarantee total grants <= budget even with multiple replicas. Secondary: keep local lease fast-path but only for non-burst (steady-state) traffic; require CAS for burst-mode grants. Add a bounded retry/backoff and fallback to 'deny' when central store is unavailable. Also harden the reconciler to be idempotent and add per-key throttles to avoid large reconciliation spikes.",
+  "test_plan": "- Unit tests for new CAS path including simulated concurrent grant attempts.\n- Deterministic integration test in CI that spawns N parallel granters against two replicas; assert final central counter <= quota.\n- End-to-end load test in staging with representative traffic patterns (bursty and steady).\n- Add chaos test: inject 100-300ms delay into central store writes and ensure no overshoot.\n- Update billing reconciliation acceptance tests to assert no invoice delta > 0.5% during noisy windows.",
+  "rollout_plan": "1) Feature-flag the CAS burst-enforcement change under runtime-1.25 gate.\n2) Deploy to staging and run the full test_plan.\n3) Canary deploy to 10% of production nodes with tight observability (quota.grants.local_ratio, reconcile_delta).\n4) If stable for 48h, expand to 50% then 100%.\n5) For Dedicated customers with high sensitivity, flip flag manually after validation.\n6) If CAS path causes unacceptable latencies, revert and apply emergency config: global disable local-burst and reduce burst window to 50ms as temporary mitigation.",
+  "acceptance_criteria": [
+    "No observable overshoot in staging under the reproducible harness (final central counter <= configured budget in 100/100 runs)",
+    "E2E latency impact for grant API median < +15ms and p99 < +100ms in production canary",
+    "Monitoring: reconcile_delta metric mean reduced to < 2 tokens per reconciliation run across keys",
+    "Billing discrepancy dashboard shows delta <= 0.5% in two subsequent billing cycles for canaried customers"
+  ],
+  "links": [
+    "confluence:Billing / Rate Policy - burst enforcement design - https://confluence.redwood.ai/billing/burst-enforcement",
+    "github_pr:ENG-14421-cas-burst-enforcement - https://github.com/redwood-inference/platform/pull/8124",
+    "gist:repro-harness - https://gist.github.com/priyadesai/6b4c9f2b7c",
+    "dashboard:quota/burst-reconciliations - https://grafana.redwood.ai/d/quotas/burst-reconciliations",
+    "incident:INC-2025-02-burst-mismatch - https://redwood.atlassian.net/browse/INC-2025-02"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "repro_steps",
+    "telemetry_signatures",
+    "comments",
+    "proposed_fix",
+    "test_plan",
+    "rollout_plan",
+    "acceptance_criteria"
+  ],
+  "dataset_doc_uuid": "dsid_612de109cabf411ba1c7e7b92cedf098"
+}

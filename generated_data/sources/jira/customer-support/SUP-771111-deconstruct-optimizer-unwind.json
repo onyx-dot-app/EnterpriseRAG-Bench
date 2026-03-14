@@ -1,0 +1,90 @@
+{
+  "key": "SUP-771111",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Unwind assistance: deconstruct mixed batching + kv-cache + 8-bit quant profile causing higher tail latency and inference variance",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Maya Chen",
+  "assignee": "Liam O'Connor",
+  "customer_company": "NovaHealth",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "optimizer",
+    "scheduler"
+  ],
+  "labels": [
+    "rollback-guidance",
+    "batching",
+    "kv-cache",
+    "8bit-quant",
+    "latency",
+    "accuracy-drift"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "redwood-open-7b",
+    "redwood-instruct-7b-8bit"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-47211",
+    "SUP-90477"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/8921",
+    "https://github.com/redwood-inference/optimizer/pull/330"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SUPPORT/Unwind+Optimizer+Playbook",
+    "https://confluence.redwood.ai/display/SRE/Live+Snapshot+Restore"
+  ],
+  "description": "Issue summary:\nCustomer reported a pronounced increase in 95th/99th percentile latency and occasional semantic drift in outputs after enabling a combined optimizer profile: async batching (aggressive), KV prefix caching, and an 8-bit quantization profile pinned to their blue release. The change was applied via the tenant optimizer endpoint at 2026-03-09T14:03Z.\n\nImpact:\n- Affected ~7 routes used by NovaHealth conversational triage (avg traffic 2.1k rps).\n- 95p latency increased from ~120ms to 420ms for long-session workloads; 99p spikes >900ms observed.\n- Small but reproducible hallucination-like deviations on medical triage prompts (customer flagged 0.8% of cases).\n\nEnvironment:\n- prod-us-east, Dedicated cluster redwood-ded-nyc-03\n- Model variants: redwood-open-7b (fp16) fallback, redwood-instruct-7b-8bit (quant) active\n- Optimizer profile: tenant-nova-v3 (batching: async aggressive, kv_cache: enabled, quant_profile: 8bit-fast)\n\nSteps to reproduce:\n1) Use customer route nova-triage-v1 with long conversation (>512 tokens cumulative).\n2) Send 1:1 simulated traffic at 80% of normal (1.6k rps) with a mix of short and long sequences.\n3) Observe latency distribution and sampled outputs.\n\nObserved behavior:\n- Elevated tail latency on long-session requests; CPU/GPU utilization patterns show increased scheduling jitter and queueing.\n- KV cache hit rates dropped intermittently for a subset of sessions (suspected cache fragmentation).\n- Quantized path returns slightly different logits for specific tokens leading to variance in deterministic prompts.\n\nExpected behavior:\n- Minimal change to 95/99p latency after conservative optimizer enablement and no semantic regressions beyond expected quantization noise.\n",
+  "logs": "[2026-03-09T14:03:12Z] OPTIMIZER: apply tenant-nova-v3 to tenant:novahealth routes: [nova-triage-v1]\n[2026-03-09T14:04:01Z] SERVING: route nova-triage-v1 batcher: async-aggr workers: 16\n[2026-03-10T09:22:43Z] SCHEDULER: queue-depth spike detected on host gpu-45 (queue=310 -> 762)\n[2026-03-10T09:22:44Z] RUNTIME: kvcache: eviction-rate 0.12/s host=gpu-45 prefix-misses=87\n[2026-03-10T09:22:44Z] RUNTIME: quant-path fallback=0.4% for sequence-length>1024\n[2026-03-10T09:25:10Z] ALERT: 99p latency nova-triage-v1 exceeded threshold (900ms)\n",
+  "investigation_notes": "Initial hypothesis: aggressive async batching increased inter-request scheduling that, combined with uneven prefix cache distribution and 8-bit quantized execution, caused hot-host skew and queueing leading to tail latency. Secondary hypothesis: the quantization microkernel for long sequences introduces small token probability perturbations that, combined with caching mismatches, expose semantic variance.\n\nWhat we checked:\n- Verified optimizer assignment timestamp and tenant-level gating (confirmed).\n- Correlated host-level queue depth with optimizer enable time; three hosts show persistent queue amplification.\n- KV cache telemetry: session affinity lost intermittently for long-lived websocket sessions (likely due to batching coalescing across connectors).\n- Compared logits across fp16 and 8bit for sampled prompts: token-by-token diffs concentrated in punctuation and domain-specific terms (medical).\n\nEvidence links:\n- Grafana dashboard: https://grafana.redwood.ai/d/serve/novahealth-tail-latency?orgId=1\n- KV cache telemetry: https://internal.telemetry/nova/kvcache/tenant-nova-v3\n",
+  "actions_taken": "1) Placed temporary traffic gate to limit async batch size per-worker to 8 for nova-triage-v1 at 2026-03-10T10:00Z (partial mitigation).\n2) Manually rebalanced traffic away from hosts gpu-45/gpu-46 to reduce hot-host queueing (drain + reassign).\n3) Ran a local re-run comparing fp16 vs 8bit for 200 sampled prompts; captured token-level diffs.\n4) Prepared a stepwise unwind plan (see recommended rollback below) and requested SRE approval for live snapshot restore if needed.\n",
+  "recommended_unwind_plan": "(safe, staged, per-route)\n- Step 0: Create snapshot of current optimizer state and tenant config (done at 2026-03-10T10:05Z).\n- Step 1: Reduce async batch max_size to 4 for nova-triage-v1 and monitor 95p/99p (30m).\n- Step 2: If 95p not reduced, disable async batching (switch to sync batching with small max latency) for nova-triage-v1 and maintain kv_cache enabled (30m).\n- Step 3: If variance persists, toggle kv_cache to read-only (no new entries) to check if eviction/access pattern is root cause (30m).\n- Step 4: If accuracy drift remains correlated only with quant path, roll back quant_profile to fp16 for nova-triage-v1 (cold rollback of model variant to redwood-open-7b) and route a small shadow traffic split (5%) for validation before full cutover.\n- Safety notes: perform changes one route at a time and wait 30m after each step before proceeding. Keep snapshot rollback path ready.\n",
+  "comments": [
+    "Maya Chen (2026-03-10): Customer reports regression after enabling tenant-nova-v3. Asked for traffic windows and agreed to keep changes within low-peak hours.",
+    "Diego Alvarez, NovaHealth (2026-03-10): Confirmed: we saw more user escalations in the morning. Can you prioritize a safe rollback? We have a scheduled clinical sync on 2026-03-12.",
+    "Liam O'Connor (SRE) (2026-03-10): I've applied a temporary per-worker max batch size limit (8). Monitoring host queue depths and tail latency; initial 20% improvement on 95p. Preparing staged unwind playbook.",
+    "Maya Chen (2026-03-11): Ran fp16 vs 8bit token diffs and uploaded sample set to the case attachments. Noted domain tokens affected: 'anticoagulant', 'triage', punctuation around numeric lab values.",
+    "Liam O'Connor (2026-03-11): Recommend proceeding to Step 1 (reduce max_size to 4) during the next maintenance window (2026-03-12 02:00-04:00 UTC). Need customer approval for Step 4 if required.",
+    "Diego Alvarez, NovaHealth (2026-03-11): Approve Step 1 now, and Step 4 only if data quality tests fail. We'll hold Step 4 for the clinical sync debrief.",
+    "Maya Chen (2026-03-12): Executed Step 1 during window. 95p latency improved to ~180ms; 99p remained ~420ms. Proceeding to Step 2 tonight if 99p doesn't drop further."
+  ],
+  "resolution": "Work in progress. Short-term mitigation: batch size limit reduced and host rebalancing restored most of the 95p performance. Next steps agreed: disable aggressive async batching per-route and evaluate kv_cache read-only toggles before changing quant_profile. If quant path remains implicated, follow the staged model rollback to fp16 with a 5% shadow validation prior to full cutover. Customer (NovaHealth) has approved Step 1 and deferred Step 4 until after clinical sync. Follow-up ticket will capture final rollback and any post-change validation artifacts.",
+  "next_steps": "1) Execute Step 2 (disable async batching) for nova-triage-v1 in the next low-traffic window and capture 95/99p plus sampled outputs.\n2) If 99p still elevated, toggle kv_cache to read-only to measure eviction impact.\n3) If accuracy drift persists and metrics correlate with quant path, schedule Step 4 rollback to fp16 with 5% shadow traffic and run customer QA suite (pass threshold: no more than 0.2% semantic deviation on clinical prompts).\n4) Document final changes and attach snapshot IDs and Grafana/telemetry links into the ticket before closing.",
+  "attachments": [
+    "s3://support-attachments/sup-771111/snapshot-2026-03-10T10-05Z.json",
+    "s3://support-attachments/sup-771111/fp16-vs-8bit-diffs.csv"
+  ],
+  "customer_communication": "We informed NovaHealth about staged unwind and got approval for conservative steps. Asked to postpone any full quant rollback until after their clinical review on 2026-03-12. Committed to hourly updates during any active rollback window.",
+  "internal_notes": "Consider adding a safety guard in optimizer rollout UI to limit simultaneous enabling of: (1) aggressive async batching, (2) kv cache writes, and (3) 8bit quant profiles for tenants with long-session conversational workloads. File a follow-up internal support task to propose guard UX: INT-204912.",
+  "tags": [
+    "customer:novah",
+    "tenant:tenant-nova",
+    "urgent"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "actions_taken",
+    "recommended_unwind_plan",
+    "comments",
+    "resolution",
+    "next_steps",
+    "customer_communication",
+    "internal_notes"
+  ],
+  "dataset_doc_uuid": "dsid_a959b5fcfa14486282145b8cde138f2c"
+}

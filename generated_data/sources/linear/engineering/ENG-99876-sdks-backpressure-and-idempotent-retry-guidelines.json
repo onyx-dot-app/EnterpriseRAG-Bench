@@ -1,0 +1,61 @@
+{
+  "key": "ENG-99876",
+  "team": "engineering",
+  "title": "SDK backpressure, idempotency, and retry ergonomics for streaming clients",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-02-10",
+  "updated_at": "2025-03-01",
+  "creator": "Aisha Khatri",
+  "assignee": "Mark Rivera",
+  "project": "sdk-ergonomics",
+  "cycle": "2025-W06",
+  "estimate": "5",
+  "due_date": "2025-03-14",
+  "labels": [
+    "sdk",
+    "retry",
+    "streaming",
+    "backpressure",
+    "cross-language"
+  ],
+  "release": "sdk-2025.04",
+  "security_review_required": "false",
+  "customer_impact": "high",
+  "description": "Summary: Define and implement a cross-language convention for handling server-side backpressure and idempotent retries in streaming SDKs (Python/TypeScript/Go). The goal is to give app developers predictable semantics when a stream is interrupted, when the server signals load/backpressure (429/503 + Retry-After or custom header), and how to safely retry or resume without duplicating side effects.\n\nWhy this matters: Many large customers are running production streaming workloads (chat + embeddings streaming + token-level responses). Currently each SDK handles interruptions differently: some expose raw HTTP 503s, some silently reconnect losing partial output, and some force clients to re-generate from scratch. That leads to inconsistent developer experience and customer complaints about incorrect duplicate events, unknown retry windows, and poor recommendations in our docs.\n\nScope: This ticket contains the RFC + small implementation changes and examples. Workstreams: 1) define server-side signals and canonical error codes; 2) design SDK exception types and retry/resume API surface; 3) implement client-side backoff + idempotency token helpers; 4) create cross-language example snippets and test harnesses.\n\nProposed server signals (for runtime + API):\n- Header: X-RI-Backpressure: value=soft|hard (soft: polite rate reduction recommended; hard: reject currently)\n- HTTP status mapping: 429 -> short-term backpressure, include Retry-After when available; 503 -> temporary service unavailability, prefer Retry-After; 499 -> client-cancelled (when applicable)\n- Structured body: {\"code\":\"RI_BACKPRESSURE\",\"retry_after_secs\":10,\"resume_token\":\"<opaque>\"} for streams where we can offer a resume token.\n\nCanonical SDK exceptions (cross-language names):\n- BackpressureError: raised when server signals load (429/RI_BACKPRESSURE or X-RI-Backpressure: hard). Includes attributes retry_after_secs and suggested_backoff_ms.\n- StreamInterruptedError: raised when a streaming connection was terminated unexpectedly. Includes optional resume_token when server returned one.\n- IdempotencyRequiredError: raised when server refuses non-idempotent retry and asks client to provide an idempotency key.\n- PermanentError: non-retriable errors (4xx other than the above).\n- TransientError: retriable errors where simple exponential backoff is sufficient (e.g., transient network failures).\n\nSDK surface decisions and ergonomics:\n1) Retry vs Resume: For streaming RPCs that support resume, prefer returning a resume_token to the SDK user inside StreamInterruptedError. SDKs should provide helper methods to attach a resume_token to the next request. Automatic resume should be opt-in (default: false) to avoid surprising apps that have side effects.\n2) Idempotency tokens: For any non-read idempotent operation associated with a stream (e.g., webhook ack, DB write triggered by token), recommend an explicit idempotency_key param on high-level SDK methods. SDKs should include utilities to generate UUIDv4 idempotency keys and to persist them across retries when requested.\n3) Backoff policy: Provide a shared policy: initial_backoff_ms=500, multiplier=1.8, max_backoff_ms=60000. Honor Retry-After header if present by setting backoff to max(current_backoff, retry_after_secs*1000). Expose policy knobs in each SDK.\n4) Streaming buffer and backpressure: Provide dual-mode buffering: (a) push mode (default) where SDK emits tokens/events to user via callback/async iterator and applies built-in small buffering to smooth bursts; (b) pull mode where user reads from a queue and controls consumption. If server signals X-RI-Backpressure: soft, SDK should reduce request rate (if using client-side batching) and apply a short pause to token emission.\n\nSmall example snippets (to be copied into language-specific docs):\n- Python (async resume pattern):\n\"\"\"python\nfrom redwood import StreamingClient, BackpressureError, StreamInterruptedError\n\nclient = StreamingClient(api_key=..., resume_enabled=True)\nasync def chat_loop():\n    idempotency = make_uuid()\n    try:\n        async for chunk in client.stream_chat(prompt, idempotency_key=idempotency):\n            print(chunk.text, end='')\n    except StreamInterruptedError as e:\n        if e.resume_token and user_wants_auto_resume():\n            # attach resume token to subsequent call\n            async for chunk in client.stream_chat(prompt, resume_token=e.resume_token, idempotency_key=idempotency):\n                print(chunk.text, end='')\n        else:\n            raise\n    except BackpressureError as bp:\n        await asyncio.sleep(bp.retry_after_secs or 1)\n        # retry logic...\n\"\"\"\n\n- TypeScript (auto-backoff example):\n\"\"\"ts\nimport { StreamingClient, BackpressureError } from '@redwood/inference';\nconst client = new StreamingClient({apiKey: process.env.RI_KEY});\nasync function run() {\n  const idempotency = generateIdempotency();\n  try {\n    for await (const chunk of client.streamChat({prompt, idempotencyKey: idempotency})) {\n      process.stdout.write(chunk.text);\n    }\n  } catch (e) {\n    if (e instanceof BackpressureError) {\n      const wait = Math.max(e.retryAfterMs || 0, 500);\n      await new Promise(r => setTimeout(r, wait));\n      // consumer may choose to retry or surface error\n    }\n  }\n}\nrun();\n\"\"\"\n\n- Go (resume token usage):\n\"\"\"go\nclient := redwood.NewClient(\"TOKEN\")\nctx := context.Background()\nvar resume string\nfor attempt := 0; attempt < 3; attempt++ {\n    stream, err := client.StreamChat(ctx, &redwood.ChatRequest{Prompt: prompt, ResumeToken: resume})\n    if err != nil {\n        if ri.IsStreamInterrupted(err) {\n            resume = ri.ResumeTokenFromErr(err)\n            continue\n        }\n        return err\n    }\n    // read from stream...\n    break\n}\n\"\"\"\n\nTesting and compatibility:\n- Unit tests: parse headers, raise expected exception types, honor Retry-After, preserve idempotency_key across retries when provided.\n- Integration tests: simulate server-side X-RI-Backpressure, simulate 503 with resume_token, and verify SDKs expose resume token and recommended backoff.\n- Backwards compatibility: fall back to current behavior if server doesn't return structured body (i.e., treat 429/503 as BackpressureError w/o resume_token).\n\nRollout plan: 1) RFC and API contract with backend (2 weeks); 2) implement exception types + helpers in Python/TS/Go and small docs (2 sprints); 3) integration tests + QA; 4) enable opt-in automatic resume for Trusted partners in next release; 5) make default safer behavior (no auto-resume) in subsequent release after telemetry.\n\nMetrics to track after release: rate of StreamInterruptedError, percent of interrupts with resume_token returned, fraction of auto-resume successes, customer tickets related to duplicate events.\n",
+  "acceptance_criteria": [
+    "RFC accepted by runtime and API teams and merged into design-docs",
+    "Exception classes implemented in Python, TypeScript, and Go SDKs with matching names and documented fields",
+    "SDK unit tests validate header parsing and Retry-After propagation",
+    "Integration tests exercising resume_token flows pass in CI",
+    "Sample snippets added to SDK docs and a quickstart demonstrating safe resume and idempotency"
+  ],
+  "notes": [
+    "Design tradeoff: automatic resume is opt-in because auto-resume can duplicate side-effects in downstream systems; we prefer to give developers control.",
+    "We chose X-RI-Backpressure header over enumerating many 429 variants to keep server surface small and make client parsing deterministic.",
+    "Idempotency key generation helper should be intentionally simple (UUID) and documented as best-effort; persistence of keys is left to application layer where necessary.",
+    "Consider later adding a durable resume store in Console for long-lived sessions (future work)."
+  ],
+  "comments": [
+    "2025-02-11 - Aisha Khatri: Initial ticket created. Punted deep API negotiation to runtime and API teams \u2014 need agreement on resume_token format.",
+    "2025-02-13 - Mark Rivera: Proposed initial exception class names and backoff policy. PR link: https://github.com/redwood-inference/sdk/pull/421 (draft).",
+    "2025-02-20 - Priya Desai (runtime): Reviewed RFC; backend can emit resume_token as opaque base64 token. Suggested including trace_id in the structured body for correlation.",
+    "2025-02-24 - Security review (note): security_review_required=false for now; resume_token treated as bearer token with short TTL. Consider HMACing token for verification later.",
+    "2025-02-26 - QA: Added integration test plan to simulate 429 with Retry-After and 503 with resume_token. Test harness branch: https://github.com/redwood-inference/test-harness/tree/stream-resume",
+    "2025-03-01 - Mark Rivera: Implementation underway for Python and TypeScript. Go PR opened: https://github.com/redwood-inference/go-sdk/pull/88. Need docs copy for quickstart."
+  ],
+  "attachments": [
+    "https://docs.redwood.ai/confluence/display/INF/streaming-retry-and-backpressure-rfc",
+    "https://github.com/redwood-inference/sdk/pull/421",
+    "https://github.com/redwood-inference/go-sdk/pull/88",
+    "https://github.com/redwood-inference/test-harness/tree/stream-resume"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "notes",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_a5ef5a7b69a440a4a43653223ce94dde"
+}

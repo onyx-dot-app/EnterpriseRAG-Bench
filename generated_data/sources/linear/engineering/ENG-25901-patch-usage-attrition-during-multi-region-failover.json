@@ -1,0 +1,119 @@
+{
+  "key": "ENG-25901",
+  "team": "engineering",
+  "title": "patch-usage-attrition-during-multi-region-failover",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-01-22",
+  "updated_at": "2025-02-02",
+  "creator": "Samantha Ortiz",
+  "assignee": "Daniel Kim",
+  "project": "billing-reliability",
+  "cycle": "2025-W04",
+  "estimate": "8",
+  "due_date": "2025-02-10",
+  "labels": [
+    "metering",
+    "incident-response",
+    "dedicated",
+    "private",
+    "postmortem-required"
+  ],
+  "parent_issue": [
+    "ENG-25788"
+  ],
+  "dependencies": [
+    "ENG-24350",
+    "INFRA-3312"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.21",
+  "security_review_required": "false",
+  "description": "Several Dedicated and Private customers reported persistent drops in reported token usage following a multi-region failover + hot redeploy on 2025-01-20. Downstream billing showed lower-than-expected usage (under-billing), causing accounting mismatches and customer confusion. This ticket tracks investigation, immediate mitigations, and a targeted patch to prevent future undercount events.",
+  "steps_to_reproduce": [
+    "Simulate Redis cluster leader failover in region A during sustained traffic (10k req/min) to trigger request routing to region B",
+    "Trigger hot-redeploy of the gateway service in region B while failover is in-progress",
+    "Send mixed streaming and non-streaming generation requests with close-timestamped session_ids",
+    "Observe metering events emitted to the ingestion pipeline and compare to gateway request logs"
+  ],
+  "observed_behavior": "A subset (~0.7%) of requests during the failover window had no matching usage event persisted to the billing store. Gateway logs show requests accepted and tokens emitted to the runtime, but the metering producer did not emit final 'usage.complete' events for those request_ids.",
+  "expected_behavior": "Every accepted request that consumes model tokens should produce an immutable usage event chain (start, progress, complete) such that final token counts are recorded in the billing pipeline.",
+  "investigation_summary": [
+    "Jan 20: initial customer reports received (Acct A, Acct C). On-call LT triaged and confirmed discrepancy with customer audits.",
+    "Jan 21: replicated in staging by recreating Redis failover + hot-redeploy sequence. Repro incident rate ~0.5-1% under heavy churn.",
+    "Log analysis: gateway emitted 'usage.progress' fragments but not 'usage.complete'. The metering producer encountered a race where the local in-memory dedupe cache evicted a request_id before the final flush after reconnecting to Redis.",
+    "Telemetry: queue lag spiked on the producer side for ~90s during leader election. Producer retry logic attempted to dedupe emits and, due to a TTL miscalculation after reconnect, suppressed the final completion event.",
+    "Related: background compacting job (metering-compact) was scheduled concurrently and ran a reclamation sweep which removed soft-state the producer relied on for finalization."
+  ],
+  "root_cause": "A race between Redis-based request dedupe state and a local in-memory TTL in the metering producer. During multi-region failover + hot-redeploy the producer reconnect logic rehydrated without current Redis keys, relied on local TTL values, and then a concurrent compaction/reclamation sweep removed the residual state before the final 'usage.complete' was emitted. The consumer therefore never saw the completion event and the billing store missed final token counts.",
+  "immediate_mitigation": [
+    "Backfilled missing usage for impacted customers via replay: run logs -> reconstruct token counts for window 2025-01-20 03:12 - 03:25 UTC and ingest into billing (script run: infra/scripts/backfill_metering_20250120.py)",
+    "Emergency config change: increase dedupe local TTL to 5 minutes (from 30s) and pause metering-compact sweep for 10 minutes during leader election windows",
+    "Notified affected customers with reconciliation report and issued temporary invoice hold for two customers pending verification"
+  ],
+  "long_term_fix": [
+    "PR: decouple finalization state from ephemeral local TTLs; make 'usage.complete' idempotent and authoritative regardless of local cache (see PR #4821)",
+    "Introduce a persistent tombstone state in Redis (durable key) with explicit commit semantics so reconnects can verify completion status",
+    "Improve producer reconnect logic to re-fetch active request_ids from Redis on reconnect and queue pending completions rather than relying solely on memory",
+    "Add end-to-end test that simulates leader failover + hot-redeploy and validates completed usage events are persisted"
+  ],
+  "testing_plan": [
+    "Unit tests for idempotent 'usage.complete' handling",
+    "Integration test in staging with fault-injection: Redis leader drop + gateway restart on load",
+    "Canary rollout against 10% of gateway traffic for 48h with synthetic load and end-to-end verification of usage counts",
+    "Post-deploy billing dry-run comparing emitted usage events to token-metering-consumer for two days"
+  ],
+  "rollout_plan": [
+    "Merge PR #4821 into main after code review (owners: @daniel-kim, @leila-gonzales)",
+    "Deploy to staging and run fault-injection suite",
+    "Canary deploy to prod in region B (10% traffic) for 48 hours",
+    "If stable, ramp to 50% for 24 hours then full rollout",
+    "Monitor for regressions; if any failure, roll back immediately to previous image and resume emergency mitigation"
+  ],
+  "monitoring_and_alerting": [
+    "New alert: billing-mismatch-rate > 0.1% over 15m -> page on-call SRE",
+    "Dashboard: metering-producer-lag, dedupe-cache-hit/miss, usage.complete-rate (https://stats.redwood/dashboards/metering-attrition)",
+    "Add log sampling of 'usage.complete' missing cases and attach request_id for automated backfill"
+  ],
+  "follow_up_tickets": [
+    "ENG-26012 - add e2e fault injection harness to CI",
+    "ENG-26100 - billing reconciliation automation for partial-windows",
+    "ENG-26345 - increase retention on metering event logs to 14 days"
+  ],
+  "links": [
+    "https://github.com/redwood-inference/infra/pull/4821",
+    "https://github.com/redwood-inference/infra/commit/9c2a7b4",
+    "https://confluence.redwood/incident/2025-01-20-metering-attrition",
+    "https://github.com/redwood-inference/infra/issues/3312",
+    "https://stats.redwood/dashboards/metering-attrition"
+  ],
+  "attachments": [
+    "logs/2025-01-20/gateway_regionB_03-14-12.log",
+    "backfill_reports/AcctA_20250120_reconciliation.csv"
+  ],
+  "notes": [
+    "Customer comms draft prepared by @leila-gonzales; legal reviewed billing hold language",
+    "We chose idempotent 'complete' semantics to simplify consumer guarantees across Hosted/Dedicated/Private since a single reconciliation path is easier to verify",
+    "Estimated customer cost delta: low aggregate immediate under-billing (~$12k across 3 customers) but reputational risk is medium-high",
+    "Coordinate with finance to issue corrected invoices after verification from backfill run"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "investigation_summary",
+    "root_cause",
+    "immediate_mitigation",
+    "long_term_fix",
+    "testing_plan",
+    "rollout_plan",
+    "monitoring_and_alerting",
+    "follow_up_tickets",
+    "links",
+    "attachments",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_d320c0c27edd44e4b681bf1628aa9093"
+}

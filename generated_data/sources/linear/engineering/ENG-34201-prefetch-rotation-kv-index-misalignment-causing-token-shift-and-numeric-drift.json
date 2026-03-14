@@ -1,0 +1,81 @@
+{
+  "key": "ENG-34201",
+  "team": "engineering",
+  "title": "prefetch-rotation-kv-index-misalignment-causing-token-shift-and-numeric-drift",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-09-02",
+  "updated_at": "2025-09-10",
+  "creator": "Aisha Patel",
+  "assignee": "Liam Chen",
+  "project": "Serving Runtime Stability",
+  "cycle": "2025-W36",
+  "estimate": "8",
+  "labels": [
+    "bug",
+    "prefill-decode",
+    "kv-cache",
+    "kernel-selector",
+    "regression",
+    "high-priority"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Summary: After a recent performance change that introduced speculative prefetching during kernel selection for tiled attention, we are seeing sporadic token misalignment and small numerical drift in model outputs. Root cause appears to be a race between prefetch/rotation of per-shard KV buffers and the decoder's read path: a kernel instance may read a stale KV offset while another thread has rotated the buffer index, producing shifted KV lookups and subtle softmax downstream differences. This manifests as occasional token shifts in generations and non-deterministic numeric differences between otherwise identical requests.\n\nWhy this is urgent: Affects deterministic tests and customers relying on exact-output comparisons (evals/regression detection). The failure rate is low (~0.2% of requests on high-concurrency workloads) but correlated with specific tiling/stride configurations and batching settings introduced in the perf rollout.\n\nHypothesis: The kernel selector's speculative prefetch path updates a per-shard rotation counter outside of the main prefill/decode ordering lock. Under high concurrency the decode worker can start using the old offset while prefetch completes and rotates to a new backing slice. Combined with delayed KV invalidation this produces a read-from-previous-slice scenario. Numerical drift is amplified by mixed-precision kernels that apply small per-token scaling differences, which diverge when KV pointers are shifted by a token index.\n\nReproducibility: Not trivially reproducible in unit tests; reliable under synthetic load using the attached repro harness (see links). Reproduces locally when running the tiling+prefetch config with 48 concurrent decoders and a short sequence length (S=64) that forces frequent rotation.\n\nObserved symptoms:\n- Tokens off-by-1 in ~10% of the anomalous traces, other traces show subtle probability mass shifts.\n- Non-deterministic between runs with same seed and config.\n- Correlated with kernel-selector path that chooses speculative prefetch + tiled-attn.\n\nImpact analysis:\n- Unit/regression tests fail flakily, undermining CI trust.\n- Customers doing automated evals see spurious quality regressions and may roll back.\n- May underreport as a perf bug because throughput/latency appears improved for the offending requests; correctness regressions are hidden unless deterministic evals are run.\n",
+  "steps_to_reproduce": [
+    "Checkout branch runtime-1.22-perf-tiling (local repro harness in infra/tests/kv_rotate_repro)",
+    "Build runtime with tiled-attn and speculative prefetch enabled via RUNTIME_FLAGS=tiling_prefetch=true",
+    "Run repro_harness --concurrency 48 --seq_len 64 --models=small-open --iters 2000",
+    "Collect traces with debug KV_INDEX and kernel_selector logs enabled (level=debug)",
+    "Inspect generation outputs and compare across runs with same seed; look for off-by-1 token alignments and probability drift"
+  ],
+  "logs_and_traces": [
+    "s3://redwood-debug/runtime-1.22/ENG-34201/traces/2025-09-02.tar.gz",
+    "log://cluster-alpha/runtime/kernel_selector/debug/2025-09-03/kv-rotation.log"
+  ],
+  "links": [
+    "https://github.com/redwood-inference/runtime/pull/2789",
+    "https://confluence.redwood.ai/pages/Runtime/tiling-prefetch-design",
+    "https://drive.redwood.ai/serving/repro/ENG-34201-repro-harness.tar.gz"
+  ],
+  "analysis_summary": "Initial triage done on 2025-09-03 by @Liam. Confirmed race between rotation counter update and decoder read window. Reproduction under cluster load consistent with race. Numeric drift tied to mixed-precision execution and small-order token misalignment. Unit tests added for single-threaded rotation do not fail; bug appears only under concurrent prefetch + rotate path. We compared against a baseline that disables speculative prefetching and observed determinism restored. Prioritizing a correctness-first mitigation while designing minimal perf impact fix.",
+  "mitigation_applied": "Hotfix deployed: disabled speculative prefetch by default on tiled-attn kernels on 2025-09-04 for all hosted clusters (config flag tiling_prefetch=false). Rollback prevented further regressions; customer affect reduced immediately. Hotfix PR: runtime#2791",
+  "decision": "Short-term: keep speculative prefetch disabled until we can guarantee atomicity of rotation updates or move rotation into same lock as decoder read path. Long-term: implement per-shard sequence-stamped offsets and an ABA-safe rotation protocol (see design doc) to allow safe prefetching without full global lock. Trade-offs: small latency regression for some workloads while prefetch is disabled vs correctness guarantees. Agreed by SRE and Runtime leads 2025-09-05.",
+  "next_steps": [
+    "Implement sequence-stamped offset (nonce) for per-shard rotations and change decoder read to validate stamp before using KV slice (owner: Liam) - estimate 5 pts",
+    "Add stress test that runs 100k concurrent decode operations in CI with various batch/tiling combos (owner: Sofia Martinez) - estimate 3 pts",
+    "Add deterministic comparators for mixed-precision kernels to detect early numeric divergence in nightly runs (owner: Rahul Rao) - estimate 3 pts",
+    "Re-enable speculative prefetch behind a rollout flag and run canary in staging with telemetry for KV-mismatch rate (owner: SRE)"
+  ],
+  "comments": [
+    "2025-09-03 - Liam Chen: Initial repro and triage. Found interleaving of rotate() and read_kv() without atomic ordering. Added diagnostic logs and repro harness.",
+    "2025-09-04 - Sofia Martinez (SRE): Hotfix applied disabling tiling_prefetch across hosted clusters. Post-hotfix sample of customer traffic showed anomaly rate dropped to ~0.003%.",
+    "2025-09-05 - Aisha Patel (PM): Notifying customers on cohort list and flagging for roadmap reprioritization. We should aim to have sequence-stamp fix in runtime-1.22.1.",
+    "2025-09-06 - Rahul Rao: Working on mixed-precision regression detector. Early results show softmax tail divergence grows exponentially once misaligned strip is read.",
+    "2025-09-10 - Engineering lead review (Diane Xu): Agreed on sequence-stamp approach. Approving 8pt engineering ticket and CI stress enhancements. Requesting detailed perf regression numbers post-change before re-enabling prefetch."
+  ],
+  "dependencies": [
+    "ENG-31822",
+    "ENG-27653"
+  ],
+  "attachments": [
+    "/attachments/ENG-34201/kv_rotation_harness.py",
+    "/attachments/ENG-34201/analysis-postmortem-2025-09-07.md"
+  ],
+  "notes": "This ticket focuses on correctness/regression caused by a perf optimization. Any production rollout of re-enabled speculative prefetch must be gated by the new CI stress test and a canary that monitors KV-index mismatch rate. Keep PM and SRE teams in the loop for customer comms.",
+  "observability_changes": "Add KV_INDEX mismatch metric (counter) and a per-request rotation_stamp (varchar) to traces. Expose new alert when mismatch rate > 0.01% over 5min window. (owner: Observability team)",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "analysis_summary",
+    "mitigation_applied",
+    "decision",
+    "next_steps",
+    "comments",
+    "notes",
+    "observability_changes"
+  ],
+  "dataset_doc_uuid": "dsid_c3084399fd0443e8bc6aa0e5fcb1fb1e"
+}

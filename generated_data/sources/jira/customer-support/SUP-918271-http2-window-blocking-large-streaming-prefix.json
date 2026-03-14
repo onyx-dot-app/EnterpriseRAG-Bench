@@ -1,0 +1,84 @@
+{
+  "key": "SUP-918271",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "HTTP/2 stream flow-control blocks during very long streaming generation leading to client timeouts",
+  "status": "Resolved",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Riley Chen",
+  "assignee": "Maya Patel",
+  "customer_company": "NovaDocs",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "streaming",
+    "load-balancer",
+    "kv-cache"
+  ],
+  "labels": [
+    "http2",
+    "streaming",
+    "long-context",
+    "customer-impact",
+    "regression"
+  ],
+  "environment": "prod | us-west-2",
+  "affected_models": [
+    "llama-3-13b-v1",
+    "redwood-instruct-7b"
+  ],
+  "affected_regions": [
+    "us-west-2",
+    "eu-west-1"
+  ],
+  "sla_due_at": "2026-03-10",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "INT-4142"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/serving/pull/1428"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/Streaming+FlowControl+Runbook"
+  ],
+  "description": "Issue summary:\nCustomer NovaDocs reported repeat client 504s and aborted streaming responses when requesting very long generations (large prefix + max_tokens) over HTTP/2. The requests enter streaming mode but stall after an extended period (typically ~60-100s) with no chunks sent; the client eventually times out. This appears after a recent routing/runtime change rolled out on 2026-03-08.\n\nImpact:\n- Multiple NovaDocs sessions failed to receive final tokens (customer-facing error).\n- Affected some dedicated instances in us-west-2 and sporadically in eu-west-1.\n- Customer reported production outage for a subset of users performing long-document summarization workflows.\n\nEnvironment:\n- Dedicated cluster for NovaDocs in prod us-west-2.\n- Streaming over HTTP/2 via API gateway + NGINX proxy + serving runtime.\n- Typical request: system + 15 documents priming (~45k tokens) then max_tokens=120000 in generate call.\n",
+  "steps_to_reproduce": "1) Using HTTP/2 client (httpx or curl --http2), send a streaming /v1/generate request with a very large prefix and max_tokens >= 100k.\n2) Observe that initial streaming chunks may arrive, then the stream pauses for ~60-100s with no chunks.\n3) Client sees stalled connection; after client timeout or proxy idle timeout, the request fails with 504 or connection reset.\nExample curl reproduction:\ncurl --http2 -N -v -H 'Authorization: Bearer <token>' -H 'Accept: text/event-stream' \\\n  -d '{\"model\":\"llama-3-13b-v1\",\"prompt\":\"<very long priming>\",\"max_tokens\":120000,\"stream\":true}' \\\n  https://api.redwood.example/v1/generate\n",
+  "logs": "Support logs and snippets:\n- gateway request id: gw-20260310-7f5a3b (NovaDocs request)\n- upstream logs: nginx: upstream prematurely closed connection while reading response header from upstream, client: 10.2.12.45, server: api.redwood.example, request: \"POST /v1/generate HTTP/2.0\"\n- serving-runtime: request_id=gw-20260310-7f5a3b state=STREAMING last_chunk_sent=2026-03-10T17:11:03Z stall_detected=2026-03-10T17:11:59Z kernel_thread_block=KV_SERIALIZE\n- netstat trace: HTTP2 stream WINDOW_UPDATE not issued for ~75s on stream 3\n- nginx proxy_read_timeout: 90s (default)\n",
+  "investigation_notes": "Initial hypotheses considered: KV cache eviction stalls, priority-queue starvation, load-balancer idle timeout.\nFindings:\n- HTTP/2 specific: trace shows stream-level flow-control window became zero and no WINDOW_UPDATE frames were sent back for ~70s while runtime was busy performing a blocking KV serialization step. This stopped the server from sending further DATA frames even though the runtime had tokens ready immediately after serialization completed.\n- NGINX proxy has proxy_read_timeout=90s which plus client-side HTTP/2 flow-control pause resulted in connection termination.\n- GPU utilization graphs during incidents showed low GPU activity while request was stalled, indicating the stall happened outside token generation on the critical path (I/O / serialization).\n- Reproducible with a synthetic test that simulates heavy KV serialization by priming a large context and invoking max_tokens=120k; behavior only reproduced when using HTTP/2 streaming.\n- Regression introduced after changeet rserve/rt-2026-03-08 that deferred some WINDOW_UPDATE handling into the same thread as KV serialization (reduced contention overall but introduced blocking race on long serializations).\n\nTemporary mitigations tested:\n- Forcing HTTP/1.1 streaming bypasses HTTP/2 flow control and avoided the stall (customer workaround).\n- Reducing nginx proxy_read_timeout prevented premature disconnects but does not fix root cause.\n",
+  "comments": [
+    "Riley Chen (Support): Customer reported first occurrence 2026-03-10 16:45 UTC. Provided request IDs and sample payloads.",
+    "Maya Patel (SRE): Reproduced locally with httpx and synthetic payload. Observed HTTP/2 WINDOW_UPDATE missing while runtime performing KV serialize. Filed internal follow-up INT-4142.",
+    "Eliot Grant (Backend Eng): Identified regression in rserve/rt-2026-03-08 that moved flow-control bookkeeping into the serialization thread. Preparing patch to send periodic WINDOW_UPDATE or offload serialization. Will test on staging.",
+    "Customer (NovaDocs): Verified workaround by switching to HTTP/1.1; request completed successfully (customer confirmed workaround acceptable short term)."
+  ],
+  "resolution": "Mitigation and fix applied:\n1) Hotfix deployed 2026-03-11: serving runtime v1.2.3 - offloads WINDOW_UPDATE bookkeeping to IO thread and adds a keep-alive WINDOW_UPDATE heartbeat during long blocking ops.\n2) NGINX proxy config adjusted for streaming endpoints: proxy_read_timeout increased to 180s as a safety buffer while patch rolled out.\n3) Added server-side guard: if stream idle > 30s due to blocking work, emit a small DATA chunk (flush) or explicit WINDOW_UPDATE to keep HTTP/2 window alive.\n4) Customer advised to use HTTP/1.1 streaming as a fallback if they see stalls.\nPost-deployment verification:\n- NovaDocs test cases completed successfully in us-west-2 and eu-west-1 on 2026-03-11 after v1.2.3 rollout. No further incidents reported by customer.\nFollow-ups:\n- INT-4142 assigned to infra to instrument serialization latency and add alerts for long blocking operations (>10s).\n- Engineering to consider asynchronous KV serialization and non-blocking kernels to avoid similar regressions.\n",
+  "resolution_summary": "Served primary fix in runtime to avoid HTTP/2 flow-control starvation during long KV serialization; proxy timeout increased temporarily. Customer validated and ticket closed.",
+  "follow_up_actions": [
+    "INT-4142 - instrument KV serialize times and add alerting",
+    "ENG-RT-2026 - evaluate async serialization for long-context workloads",
+    "Update streaming runbook with HTTP/2 fallback guidance"
+  ],
+  "customer_communication": "2026-03-10: Acknowledged receipt and requested logs.\n2026-03-11: Provided workaround (switch to HTTP/1.1) and ETA for hotfix.\n2026-03-12: Confirmed fix deployment and asked customer to validate; customer confirmed success and closed the incident.",
+  "related_links": [
+    "https://slack.redwood.com/support/channels/#support",
+    "https://grafana.redwood.example/d/streaming/streaming-latency?var-cluster=novaDocs"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution",
+    "resolution_summary",
+    "follow_up_actions",
+    "customer_communication"
+  ],
+  "dataset_doc_uuid": "dsid_6720884545b74027950101581bad2862"
+}

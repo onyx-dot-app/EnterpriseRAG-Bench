@@ -1,0 +1,87 @@
+{
+  "key": "SUP-724810",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "gRPC streaming: per-request idempotency header ends up in HTTP trailers and is dropped on reconnect causing duplicate tool/function invocations",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-13",
+  "reporter": "Arielle Chen",
+  "assignee": "Marco Ruiz",
+  "customer_company": "SlateMaps Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "api-gateway",
+    "edge-proxy",
+    "go-sdk",
+    "ts-sdk",
+    "python-sdk"
+  ],
+  "labels": [
+    "idempotency",
+    "grpc",
+    "trailers",
+    "streaming",
+    "dedupe"
+  ],
+  "environment": "prod | us-east",
+  "affected_models": [
+    "redwood-3f-large"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-11",
+  "linked_issues": [
+    "SUP-889900",
+    "SUP-956321"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/runtime/pull/8421"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/GRPC+Streaming+Idempotency+Guide"
+  ],
+  "description": "Issue summary: Customer reports intermittent duplicated function/tool invocations when using long-lived gRPC streams through our edge stack. Duplicates occur after transient connection loss and reconnect. Initial triage shows idempotency header (X-Idempotency-Key / x-redwood-idempotency) is present from client, but server processing path only sometimes observes it on replays.\n\nImpact: SlateMaps sees duplicate downstream webhooks and doubled billing for about ~0.6% of streamed tool calls during heavy workload. Customer is on Dedicated capacity and uses our Go SDK in production. They have also reproduced locally with TS/Python clients.\n\nObserved behavior: When the client sends per-message idempotency metadata for funcalls on a streamed session, an intermediate Envoy filter (custom header rewrite configured for legacy analytics) occasionally moves headers into HTTP/2/3 trailers (end_stream event). On reconnect + replay, the serving-runtime's replay path only checks initial request metadata for idempotency tokens \u2014 it does not look for trailer metadata, so some replays are treated as new requests and trigger duplicate tool invocations.",
+  "steps_to_reproduce": [
+    "(Go) Start a streaming session with the Go SDK (grpc-go v1.56.0) against the customer's edge: set per-funcall metadata header 'x-redwood-idempotency' with unique UUID per tool invocation.",
+    "Simulate an edge-level transient connection drop (e.g., curl -X POST to our /simulate-failure endpoint or kill TCP connection on client), then let client reconnect and replay pending frames.",
+    "Observe server logs: sometimes the incoming request metadata on replay does not include 'x-redwood-idempotency' in initial headers, but it is present in HTTP/2 trailers (seen in pcap / envoy logs).",
+    "Repro with TS and Python SDKs by adding per-request idempotency metadata in the streamed message envelope rather than initial metadata; same duplicates observed when edge moves header to trailers."
+  ],
+  "logs": [
+    "client (Go) send: metadata: :authority=stream.redwood.example, x-redwood-idempotency=0f7b2c1a-... , content-type=application/grpc+json",
+    "envoy (edge) trace: on StreamEnd header rewrite: move x-redwood-idempotency from header->trailer (filter: legacy-analytics-v1)",
+    "server (runtime) replay path: INFO replaying request id=abc123 initial-metadata={} (no x-redwood-idempotency)",
+    "server (runtime) exec: calling tool webhook idempotency-key=UNKNOWN -> POST /hooks/run (duplicate)"
+  ],
+  "comments": [
+    "2026-03-10 09:12 - Arielle Chen (Support): Customer reported duplicates after a recent edge rewrite deployment. Assigned to Marco for runtime investigation.",
+    "2026-03-10 11:03 - Marco Ruiz (SRE): Captured tcpdump; confirmed idempotency header present on client frames but arriving to runtime as HTTP trailer in ~12/50 repro attempts when envoy filter triggers. Suspect middleware moving headers on end_stream.",
+    "2026-03-11 14:20 - Devon Patel (Runtime Eng): Added a quick local patch to runtime replay path to fall back to trailers when header missing; reproduced dedupe fix locally. Preparing PR for review. Will coordinate canary deploy to staging.",
+    "2026-03-12 08:45 - SlateMaps (Customer): Confirmed repro with TS client in staging; duplicates stopped when they set idempotency key in initial-stream-metadata instead of per-message header. Asked for recommended SDK guidance and whether server can accept trailers permanently.",
+    "2026-03-13 10:30 - Marco Ruiz (SRE): PR merged for runtime to accept idempotency header from trailers for replays (github.com/redwood-inference/runtime/pull/8421). Drafting advisory to SDKs to add best-practice checks.",
+    "2026-03-13 11:05 - Support: Notifying customer of canary rollout schedule and recommended client mitigation (set idempotency at initial call metadata)."
+  ],
+  "investigation_notes": [
+    "Hypothesis 1: Edge filter rewrites analytic headers and moves them into trailers at end_stream; runtime only inspects initial metadata on replay. Evidence: envoy logs show header->trailer rewrite event coincident with duplicates.",
+    "Hypothesis 2: Some SDKs set per-message headers vs initial call metadata depending on helper utility patterns (Go/TS wrappers have historically allowed either). Customer code uses helper that attaches metadata per message. Repro across languages confirms this is client-agnostic; root cause is missing trailer handling in replay path.",
+    "Test: Added runtime fallback to inspect HTT P/2 trailers on replay. In staging this eliminated the dupes for the captured repro cases. Edge-case: trailers are only available on stream end; ensure fallback doesn't break streaming partial acks.",
+    "Telemetry: Instrumented counts for 'replay_without_initial_idempotency' and 'replay_with_trailer_idempotency' to measure incidence. Current rate ~0.6% in prod for this customer traffic shape.",
+    "Risk assessment: Accepting idempotency tokens from trailers is safe for replay (tokens are client-supplied). Need to ensure we normalize header casing and length; avoid accepting tokens from untrusted proxy modifications without auth checks."
+  ],
+  "resolution": "Mitigation steps: (1) Runtime patch merged to accept idempotency token from HTTP/2/3 trailers on replay path (PR #8421). (2) SDK guidance published: prefer setting per-call idempotency in initial stream metadata rather than per-message header; Go/TS/Python SDKs will include helper validation in next minor release to detect 'per-message header' usage and warn. (3) Customer advised to upgrade to runtime build with patch and to deploy SDK minor when available; temporary workaround: set idempotency token in initial metadata on connect.\n\nRollout notes: Canary deployed to staging 2026-03-12, canary to subset of us-east Dedicated on 2026-03-13 09:00, full prod rollout scheduled 2026-03-14 pending telemetry.\n\nFollow-ups: (a) Add unit tests for trailer-handling in replay path. (b) Create an Envoy rule/guidance to avoid moving idempotency headers to trailers; coordinate with edge infra. (c) Add metrics alert if trailer-based idempotency hits >0.2% on customer traffic.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_9edf8c39ead04e1694347b2494583ee9"
+}

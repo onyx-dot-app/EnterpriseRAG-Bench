@@ -1,0 +1,97 @@
+{
+  "key": "ENG-879444",
+  "team": "engineering",
+  "title": "Leaky capacitor: graceful shutdown meter flush delay causing short-lived soft-limit bypass",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-03-10",
+  "creator": "Ethan Park",
+  "assignee": "Maya Thompson",
+  "project": "billing-reliability",
+  "cycle": "2026-W08",
+  "estimate": "5",
+  "due_date": "2026-03-18",
+  "labels": [
+    "metering",
+    "rate-limiter",
+    "shutdown",
+    "bug",
+    "slo-impact",
+    "per-org"
+  ],
+  "description": "Summary: During rolling upgrades and graceful pod shutdowns, we observed short (1\u20133s) windows where per-org soft quotas were not enforced \u2014 requests that should have been throttled were allowed. The pattern correlates with high-concurrency traffic and shard compaction/eviction on the per-key local in-memory capacitor used to aggregate debits before async commit to the durable meter. Impact: customers may see unexpected overage requests succeed, causing billing drift and temporary SLO breach for quota enforcement. This ticket tracks investigation, mitigation, and a fix for the graceful-shutdown/meter-flush interaction.",
+  "reproduction_steps": [
+    "Deploy a small cluster with 3 replicas of edge-metering service using canary configuration",
+    "Seed a per-org soft quota at 100k tokens/min and generate steady traffic to approach 90% utilization",
+    "Trigger a rolling restart of one replica with SIGTERM and configured graceful shutdown timeout (15s)",
+    "While the shutting-down replica drains, generate a spike of short-lived concurrent requests routed to that pod (1000 concurrent), and observe enforcement decisions",
+    "Compare allowance decisions before and after the pod gracefully exits and the shard handoff completes"
+  ],
+  "observed_logs": [
+    "2026-03-02T14:03:21Z [metering] INFO flush_slab shard=shard-17 pending_debits=12345 grace_remaining=13s",
+    "2026-03-02T14:03:22Z [enforcer] WARN allow_check org=acme-corp route=/v1/generate reason=local_counter_not_committed",
+    "2026-03-02T14:03:23Z [rpc] ERROR shard-reassign: fast-fail during handoff, fallback-routing=true",
+    "2026-03-02T14:03:24Z [billing] INFO commit_async shard=shard-17 tx=0x9f3c ack=delayed"
+  ],
+  "hypothesis": [
+    "The local in-memory capacitor that batches debits uses a short-lived commit path to the durable aggregator; on SIGTERM we attempt to flush but the flush becomes best-effort and we rely on a handoff which can momentarily return stale 'zero' local occupancy, allowing additional requests to be allowed until the downstream durable aggregator reconciles.",
+    "During high concurrency the flush path is backpressured and we switch to a non-blocking fast-exit mode that drops pending delta updates rather than blocking shutdown \u2014 this creates an undercount window.",
+    "Route alias remapping and shard compaction accelerate the period where requests are routed to a node while its local counters are stale because metadata update precedes delta commit.",
+    "Edge proxies prefer low-latency routing and do not wait for flush ACKs resulting in requests being evaluated against underreported local state."
+  ],
+  "root_cause": "Graceful shutdown flush is configured as best-effort and can be short-circuited under backpressure; the enforcement path reads local in-memory counters that are zeroed on handoff before durable commit completes, so a small time window exists where per-org counters underreport usage and enforcement allows requests that should be throttled.",
+  "severity": "high",
+  "customer_impact": "high",
+  "mitigation": [
+    "Temporarily lower per-node routing preference during rolling restarts by setting edge-proxy weight to 0 for draining replicas (short-term, operational) \u2014 runbook created in ops-docs and applied for next maintenance window",
+    "Increase flush timeout on graceful shutdown to 30s to give more time for commit_ack under normal load (stop-gap; risk of longer drain times)",
+    "Shadow-sample: enable sampling on durable aggregator to detect uncommitted deltas and surface alerts to oncall dashboards"
+  ],
+  "fix_description": "Make shutdown flush blocking for pending debits above a safety threshold and implement a two-phase handoff: 1) mark shard as draining and stop accepting new requests (edge routing update), 2) synchronously flush pending deltas to durable aggregator with backoff and bounded retry, 3) only after ack mark local counter zero and handoff metadata. Also add a transient enforcement guard in the enforcer that treats 'recently-drained' shards as potentially stale and refuses new allow decisions until durable reconciliation has confirmed state or a conservative local delta is applied.",
+  "rollout_plan": [
+    "Step 1: Deploy canary change to meter-shard manager to expose 'draining' annotation and require edge-proxy to stop routing to draining pods (canary 10% traffic)",
+    "Step 2: Deploy synchronous flush logic behind a feature flag with increased monitoring for queueing/backpressure metrics (canary 1 replica)",
+    "Step 3: Gradual ramp to 50% and monitor latency and flush success rate for 48 hours",
+    "Step 4: Enable conservative enforcement guard globally and remove feature flag after 2 weeks of stable metrics",
+    "Step 5: Revert temporary operational weight changes once all pods run patched logic"
+  ],
+  "test_plan": [
+    "Unit tests for drain-and-flush path including simulated backpressure and retry behavior",
+    "Integration test that simulates rolling restart with concurrent spike and asserts no allowed requests beyond quota when drain is active",
+    "Chaos test in staging: random SIGTERM on metering pods during heavy load with route alias remap enabled",
+    "Load test to validate flush latency distribution and ensure tail latencies do not break SLOs after change"
+  ],
+  "dependencies": [
+    "ENG-771333",
+    "ENG-482900",
+    "PR-https://github.com/redwood-inference/metering/pull/182"
+  ],
+  "attachments": [
+    "dashboard: https://grafana.redwood.internal/d/abcd/meter-flush",
+    "incident: https://confluence.redwood.internal/display/OPS/2026-03-02-metering-drain-incident"
+  ],
+  "comments": [
+    "2026-02-21 Maya Thompson: Started a local repro loop and reproduced under constrained ephemeral CPU. Added more logs in flush path (PR-180) for visibility.",
+    "2026-02-24 Ethan Park: Verified that setting edge proxy weight to 0 prevents the window in staging, but is operationally heavy for frequent deploys.",
+    "2026-03-01 Priya Nair (SRE): Ran a scheduled canary where we bumped graceful timeout to 30s; saw reduced incidents but higher median drain time \u2014 ops wants a programmatic fix.",
+    "2026-03-05 Design review: Decided to add conservative enforcement guard; need UX trace-visible flag to track 'stale-shard' decisions in Console.",
+    "2026-03-09 Maya Thompson: Implemented synchronous flush prototype behind feature flag and added metric meter.flush.ack_latency_ms. Running 1-replica canary now. Observed 98th pct flush ack at 240ms under moderate load."
+  ],
+  "release": "runtime-1.30",
+  "security_review_required": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "reproduction_steps",
+    "observed_logs",
+    "hypothesis",
+    "root_cause",
+    "mitigation",
+    "fix_description",
+    "rollout_plan",
+    "test_plan",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_1bbcec119f5440ab8437bba34fc724cf"
+}

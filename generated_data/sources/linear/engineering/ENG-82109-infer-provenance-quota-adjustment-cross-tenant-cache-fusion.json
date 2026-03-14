@@ -1,0 +1,99 @@
+{
+  "key": "ENG-82109",
+  "team": "engineering",
+  "title": "Infer request provenance and adjust quotas for cross-tenant cache fusion",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-14",
+  "creator": "Ava Martinez",
+  "assignee": "Ravi Kapoor",
+  "project": "Metering Accuracy Initiative",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-31",
+  "labels": [
+    "billing",
+    "metering",
+    "cache",
+    "multitenancy",
+    "rate-limits"
+  ],
+  "dependencies": [
+    "ENG-70200",
+    "ENG-61234"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.23",
+  "security_review_required": "false",
+  "description": "Problem: When multiple tenants' requests are fused into a single inference microbatch and some tokens are served from prefix/KV cache, our current billing pipeline attributes token costs inconsistently. In practice we either (A) bill the entire microbatch to a single owner or (B) prorate based on post-hoc token expansion heuristics. Both approaches lead to incorrect quota debits and confusing rate-limit enforcement (e.g., a tenant sees quota depletion even though most tokens were answered from cached state).\n\nGoal: Introduce a lightweight provenance tagging model at ingress and an aggregation rule for billing that ensures each tenant is charged only for their effective non-cached token compute and is subject to fair rate-limits. This should work across: hosted API multi-tenant microbatches, Dedicated tenant-colocated batching, and future Private multiplexed pools.\n\nScope: Add request_provenance metadata, emit a cache_hit_vector on response, change billing job to compute effective_token_charge per request owner before applying quota/rate limit and emitting usage events. Backfill not required for historical reporting; new metrics are forward-looking.",
+  "acceptance_criteria": [
+    "Ingress service attaches a stable request_provenance id and owner tag to every request before batching.",
+    "Serving runtime emits cache_hit_vector (binary per-token/segment) and a condensed cache_summary (prefetch_hit_count, kv_hit_count) per request.",
+    "Billing pipeline consumes provenance + cache hints and produces an effective_token_charge for each original request owner.",
+    "Quotas and rate limiter apply charges derived from effective_token_charge and reject requests correctly under the same time-window semantics as today.",
+    "End-to-end test harness demonstrates correct billing for 5 canonical scenarios (all-cached, none-cached, mixed-interleaved, speculative-prefetch, cross-tenant-fusion).",
+    "Performance: additional metadata adds <3% p99 tail to ingress path and billing job latency remains within SLA with a 10% CPU headroom margin."
+  ],
+  "tasks": [
+    "Design: finalize provenance schema and minimal cache hint format (Ava)",
+    "Ingress: attach provenance id + owner fields to requests (Ravi)",
+    "Runtime: emit per-request cache_summary and optional token-level cache_hit_vector (opt-in flag) (SRE/Runtime)",
+    "Billing: update aggregation logic to compute per-owner effective_token_charge from batch and cache hints (Billing team)",
+    "Rate limiter: consume effective_token_charge and ensure same-window enforcement semantics (Throttling team)",
+    "E2E tests: add simulated microbatch fusion tests and monte-carlo billing checks (QA)",
+    "Bench: measure metadata overhead on p95/p99 tail, iterate (Perf)",
+    "Docs: update Metering docs and Console cost breakdown to surface effective_token_charge (Docs)",
+    "Launch: staged rollout on a subset of production traffic + monitoring dashboards (Ops)"
+  ],
+  "implementation_notes": [
+    "Provenance model: use 128-bit UUID (request_provenance) + owner_id (account_id) + request_shard_index to map microbatch subrequests post-fusion.",
+    "Cache hints: keep cache_summary compact (3 ints: prefix_hits, kv_hits, served_from_cache_flag) and only enable token-level cache_hit_vector behind a debug flag to limit bandwidth.",
+    "Billing change: compute effective_token_charge = max(0, nominal_token_count - cached_token_equivalent). nominal_token_count comes from tokenization at ingress; cached_token_equivalent estimated from cache_summary using deterministic rules to avoid reprocessing token streams.",
+    "Rate-limiting: apply quota debit at the moment of computed charge emission. Keep existing sliding-window semantics; treat cached tokens as zero-cost but still account for request frequency for DDOS detection (separate throttle metric).",
+    "Telemetry: emit metrics: billing.effective_token_charge, billing.cache_fraction_by_owner, rate_limit.declines_by_owner, ingress.provenance_attach_failures.",
+    "Backwards compatibility: for components that do not yet produce cache hints, fall back to conservative per-request nominal charging but mark usage with meter.inferred=true for later reconciliation.",
+    "Storage: store per-request effective_token_charge in usage_events stream for downstream billing and Console dashboards."
+  ],
+  "rollout_plan": [
+    "Week 1: feature-flagged deploy of ingress provenance tagging to 10% of nodes + unit tests",
+    "Week 2: runtime emits cache_summary to 10% traffic; billing job reads summary but still uses legacy path (dry-run) and emits diagnostics",
+    "Week 3: enable billing path to apply computed effective_token_charge behind feature flag for 5% customer traffic; monitor deltas against legacy accounting",
+    "Week 4: expand to 50% if deltas within threshold (<0.5% variance for non-cache-heavy customers), otherwise iterate",
+    "Week 5: global rollout and documentation update; remove dry-run; run reconciliation job for the first 7 days to detect anomalies"
+  ],
+  "metrics": [
+    "delta_percent_between_legacy_and_effective_charge (goal <1% for non-cache heavy workloads)",
+    "billing.effective_token_charge.sum by tenant",
+    "ingress.provenance_attach_rate (goal 100%)",
+    "rate_limit.false_positive_declines_due_to_cache (goal 0%)",
+    "p99_ingress_metadata_latency increase (goal <3%)"
+  ],
+  "links": [
+    "https://confluence.redwood.ai/display/METER/Provenance+and+Cache+Hints+PRD",
+    "https://docs.redwood.ai/architecture/microbatching#provenance",
+    "https://github.com/redwood-inference/runtime/pull/4231",
+    "https://github.com/redwood-inference/billing/pull/1289",
+    "https://dashboards.redwood.ai/d/abcd1234/metering-provenance-qa"
+  ],
+  "comments": [
+    "2026-03-02 - Ava Martinez: Spike completed. Verified that prefix cache hits are the largest source of ambiguity because they shrink token sequences without clear owner boundaries. Prototype attached in the PR link above.",
+    "2026-03-04 - Ravi Kapoor: Implemented ingress tagging. Bench shows +0.8% p95 latency on tagging path. Lowered metadata size by compressing owner_id to 8 bytes.",
+    "2026-03-06 - SRE (Jin Park): Runtime change emitted cache_summary for debug traffic. Observed that speculative-prefetch flows report overlapping prefix hits across owners; will need deterministic tie-break rule in billing.",
+    "2026-03-08 - Billings (Mar\u00eda Gomez): Proposed deterministic attribution rule: attribute shared prefix cache saves proportionally to nominal token counts unless owner requests mark shared segments as private. Pending PM sign-off.",
+    "2026-03-10 - PM (Noah Li): Approved deterministic attribution as interim rule with a follow-up to add request-level signals for private/shared cache semantics.",
+    "2026-03-12 - Ravi Kapoor: Billing dry-run comparison on 1M requests: median effective charge delta 0.4% vs legacy, tail differences concentrated in 2 customers (investigating).",
+    "2026-03-14 - Ava Martinez: Decision: enable partial rollout week 3 behind feature flag. Action items: add reconciliation alert for any tenant with >5% negative delta post-cutover."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "tasks",
+    "implementation_notes",
+    "rollout_plan",
+    "metrics",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_e409852d498d46899ee4476486c423ce"
+}

@@ -1,0 +1,84 @@
+{
+  "key": "SUP-262626",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "SSE resume state mismatch on rapid reconnects causes incomplete/ellipsed final output and repeating prefixes",
+  "status": "Resolved",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Khan",
+  "assignee": "Diego Martinez",
+  "customer_company": "FinSight Analytics",
+  "customer_tier": "enterprise",
+  "environment": "prod | us-west-2",
+  "components": [
+    "serving-runtime",
+    "api-gateway",
+    "edge-proxy"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "reconnect",
+    "resume-state",
+    "regression"
+  ],
+  "affected_models": [
+    "redwood-3.2",
+    "redwood-3.2-quant"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-10",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "INT-4021"
+  ],
+  "related_slack_thread": "https://slack.redwood.com/archives/C01SUPPORT/p1673490000000123",
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/564"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.com/display/SUP/Streaming+Resume+Runbook"
+  ],
+  "description": "Issue summary:\nCustomer reports repeated partial streaming responses from SSE endpoint: final sentence is truncated/ellipsed (\"...\"), terminal metadata (end event) missing on resume, and a short reconnect loop duplicates the opening tokens/prefix on each reconnect. Impacted customer observed occasional data loss in critical financial summaries.\n\nImpact:\n- Ongoing for ~3 hours for several FinSight sessions; some summaries missing final recommendation sentence.\n- Client experiences reconnect retry loop (3-6 reconnects) and receives repeated leading tokens on each resumed stream.\n- Application-level consequence: downstream processors see incomplete JSON/markdown and fail ingestion for ~15% of affected requests.\n\nEnvironment:\n- Production (us-west-2).\n- Customer app behind corporate NAT with aggressive TCP rebinds and short keepalives.\n- Model: redwood-3.2 and redwood-3.2-quant.\n- Deployment: hosted API; requests routed through edge-proxy -> api-gateway -> serving-runtime.\n\nSteps to reproduce (customer-provided + internal replay):\n1) Start long-form generation via SSE: POST /v1/generate with stream: true, conversation state pinned.\n2) Force a rapid disconnect from client (tcp CLOSE followed by immediate reconnect within 200-700ms).\n3) During reconnect client attempts resume with Last-Event-ID and fresh auth token (token rotated by client).\n4) Server accepts resume but omits the terminal \"end_of_stream\" metadata and emits a repeated prefix choice (same first 8-12 tokens) before continuing.\n5) If reconnects happen again quickly, the prefix repeats and the final terminal marker never arrives (client stops consuming).\n\nObserved behavior:\n- Repeated prefix tokens on each resume (e.g., \"As a result, the model recommends...\").\n- Final sentence ends with an ellipsis \"...\" instead of a complete sentence or final event.\n- No terminal control event (end event with metadata: {status: done}) in the resumed session.\n- Logs show resume handshake accepted but serving-runtime emits no EndStream call on the resumed path.\n\nExpected behavior:\n- Resume should reconnect the client and faithfully continue where it left off without duplicating prefix tokens.\n- Terminal metadata / end event should be emitted exactly once when generation completes.\n\nLogs (excerpt):\n- edge-proxy: \"conn-id=abc123 -> keepalive expired, migrating client (rebind)\"\n- api-gateway: \"resume request received; last_event_id=evt-98765; auth_ok; routing to runtime-node-22\"\n- serving-runtime: \"resume accepted session=ses-42; kvcache primed; generation resumed\"\n- serving-runtime (later): \"generation complete -> wrote 0 end_event (race?)\"\n- client debug: \"received tokens: 'As a result, the model recommends' | reconnect #2 -> received duplicate: 'As a result, the model recommends' | final: '...'\";\n\nWorkarounds tried:\n- Customer increased client reconnect backoff to 1s; observed reduced duplication but not full elimination.\n- Temporary tenant-level fallback to non-resume (full restart) eliminated the duplication at cost of extra tokens.\n\nAdditional notes:\n- No clear correlation with model quantization; both float and quantized variants showed the behavior.\n- Similar reconnection patterns from other customers but with lower frequency; FinSight's corporate network produced higher rate of subsecond reconnects.\n",
+  "comments": [
+    "2026-03-10 09:12 - Aisha Khan (Support): Acknowledged with customer, gathered logs and asked for sample request headers and Last-Event-ID. SLA first response met.",
+    "2026-03-10 10:05 - Diego Martinez (SRE): Replayed customer steps in staging; saw duplicate prefix on rapid reconnects. Attaching runtime node logs and timeline. Flagged to runtime team.",
+    "2026-03-10 12:30 - Priya Raman (Runtime Eng): Noted resume state machine increments resume_count but a token-rotation path clears terminal flag in ResumeHandler.java. Preparing quick diagnostic patch. Assigned INT-4021 for deeper state-machine test coverage.",
+    "2026-03-11 02:07 - Diego Martinez (SRE): Deployed canary hotfix to us-west-2 (serving-runtime v1.14.3-hotfix). Observed resolved end_event emission in canary traces. Customer confirmed reduced failures on canary route.",
+    "2026-03-12 11:45 - Aisha Khan (Support): Customer confirmed recovery; closing their incident and documenting recommended client backoff in integration guide."
+  ],
+  "investigation_notes": [
+    "Hypothesis: rapid reconnect + token rotation triggers ResumeHandler to reinitialize session state but not emit terminal event when generation completes in the pre-rotation window.",
+    "Reproduction confirmed in staging when client reconnect < 800ms and supplies new Authorization header during resume; resume acceptance flow uses 'isNewAuth' branch.",
+    "Log correlation shows generation finished prior to final ResumeAck being processed by runtime; missing EndStream call on resumed path. There is a race between token rotation cleanup and end-of-generation callback.",
+    "Edge-proxy sometimes issues connection migration events that produce multiple overlapping resume attempts; api-gateway accepts both and routes to same runtime node, causing duplicate prefix emission from replayed partial output buffer.",
+    "No evidence of upstream truncation or HTTP/2 push-related corruption; root appears in resume state machine and resume acceptance path."
+  ],
+  "resolution_notes": [
+    "Root cause: resume path's 'new auth' branch resets the terminal-emitted flag prematurely when a token-rotation occurs concurrently with end-of-generation. The runtime resumed path therefore did not emit the end_of_stream control for that resumed session.",
+    "Fix: guarded the terminal flag with an atomic check-and-set and ensured EndStream is enqueued regardless of auth-rotation path. Patch: serving-runtime PR #564. Unit tests added to cover subsecond reconnect+token-rotation race.",
+    "Deployment: hotfix rolled to canary in us-west-2 on 2026-03-11 02:00, validated via synthetic replay harness, then promoted to prod in us-west-2 on 2026-03-11 06:30. Global rollout scheduled and completed for hosted on 2026-03-11 22:00.",
+    "Customer impact: FinSight observed failure rate drop from ~12% to <0.5% for the reported flows after canary (they moved to 1s backoff as complementary mitigation). No billing adjustments requested.",
+    "Follow-up: add metric for 'missing end_event on resume' and dashboard in Console, add integration doc recommending >=500ms reconnect backoff for unstable networks."
+  ],
+  "postmortem_followup": [
+    "ENG: Create deterministic integration tests for resume/token-rotation race (owner: Priya Raman). Due 2026-03-24.",
+    "SRE: Add alert and Console dashboard tile for 'resume without end_event' occurrences. Due 2026-03-20.",
+    "DX: Update SDK docs with recommended reconnect backoff and explicit guidance on Last-Event-ID usage. Due 2026-03-18.",
+    "Support: Communicate fix and recommended client settings to affected customers (owner: Aisha Khan). Completed 2026-03-12."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes",
+    "postmortem_followup"
+  ],
+  "dataset_doc_uuid": "dsid_c8a4367928d447d0bc86535046bd2a04"
+}

@@ -1,0 +1,87 @@
+{
+  "key": "ENG-20412",
+  "team": "engineering",
+  "title": "Interleaved kernel arbitration causes stale KV-index reads and subtle fp drift",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-01-27",
+  "updated_at": "2025-02-07",
+  "creator": "Sofia Patel",
+  "assignee": "Marcus Chen",
+  "project": "runtime-stability",
+  "cycle": "2025-W06",
+  "estimate": "5",
+  "due_date": "2025-02-14",
+  "labels": [
+    "kv-cache",
+    "kernel-scheduler",
+    "prefill",
+    "race-condition",
+    "numerical-drift",
+    "investigation"
+  ],
+  "dependencies": [
+    "ENG-17921",
+    "ENG-18675"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Summary: A recent change to the kernel arbitration path (priority-based dispatcher to reduce tail latency) permits prefill and decode work items from the same session to interleave on a single worker thread. Under specific timing this exposes a use-after-release of a KV-cache index pointer: decode path reads a stale kv-index while prefill is still updating metadata, leading to occasional token misalignment and small but reproducible floating-point accumulation drift in output logits when fallback kernels are used. Impact is correctness (token mismatch) on ~0.3% of requests for large-batch, long-sequence workloads in Dedicated clusters with aggressive kernel-priority enabled.\n\nObserved behavior:\n- Reproducible on stress harness with session concurrency > 24 and mix of short decode + long prefill.\n- Symptoms: token duplication or shifted tokens halfway through generation (~1-4 tokens), and ~1e-6 to 1e-4 relative differences in softmax logits vs baseline.\n- No GPU OOMs; worker process stays alive; issue sometimes triggers cascade of subsequent KV-miss events and increased latency for affected sessions.\n\nWhy this is critical: correctness regressions introduced by perf scheduling are high-severity: they can silently alter outputs or evaluation metrics. This ticket captures the investigation, repro, mitigation, and permanent fix for the scheduler/kv-index interaction.",
+  "reproduction_steps": [
+    "1) Deploy runtime-1.20 branch with kernel-priority-scheduler enabled (config: scheduler.mode=priority, scheduler.max_interleave=2).",
+    "2) Run harness: session_concurrency=32, batch_size=8, seq_prefill=1024, seq_decode=256, mix: 60% short-decode sessions, 40% long-prefill sessions, run for 30 minutes.",
+    "3) Collect failing traces using request-id and worker-id; compare generated tokens and logits against golden run with scheduler.mode=round-robin.",
+    "4) Observe token shift/duplication in ~0.2-0.5% of sessions and deterministic fp-diff when replaying same rng seed with fallback kernel lineage enabled."
+  ],
+  "investigation_notes": [
+    "2025-01-28 Marcus Chen: Initial bisect points to commit e3f9a4a (kernel arbitration rewrite). Reproducer attached to repro harness 'kv-stress-2025-01-28'.",
+    "2025-01-29 Sofia Patel: Heap and GPU pointer logs show kv_index pointer reused while prefill metadata write + decode read interleaved; suspect missing acquire/release around kv-index refcount in scheduler path.",
+    "2025-01-30 Keiko Tanaka: Added additional instrumentation: kv-index create/update/delete events with monotonically increasing epoch IDs. Observed decode read epoch N while prefill completed update to epoch N+1 but did not publish epoch before releasing write lock.",
+    "2025-02-02 Allan Ruiz: Floating point drift correlates with fallback kernels that use approximate softmax implementation; when stale kv-index leads to a wrong cache hit, token logits diverge slightly vs baseline and accumulate across timesteps.",
+    "2025-02-04 Marcus Chen: Stress runs with serialized arbitration (scheduler.max_interleave=0) show no failures; confirms interleaving window is the catalyst."
+  ],
+  "workaround": "Disable priority-based arbitration (set scheduler.mode=round-robin or scheduler.max_interleave=0) on affected Dedicated pools; alternatively, set kv-cache.guard_epoch=true to force epoch checks (adds ~3-7% p99 latency).",
+  "temporary_mitigation_applied": "2025-02-05 Marcus Chen: Rolled out scheduler.mode=round-robin to 3 affected Dedicated clusters and increased kv-cache debug sampling to 1%. Customer-facing incidents mitigated; no new correctness reports post-rollout.",
+  "root_cause_hypothesis": "Scheduler allowed interleaving of prefill update and decode read without ensuring kv-index epoch publication; combined with non-atomic pointer/epoch update this permitted a decode to read a freed or stale index when fallback kernel path was selected, exposing fp differences.",
+  "proposed_fix": [
+    "1) Make kv-index updates atomic: publish new epoch after metadata update and fence before release; add a reader-side epoch check to detect concurrent update.",
+    "2) Harden scheduler: prevent prefill and decode for same session from interleaving on same worker (session-level in-flight barrier) or ensure serialized index-update critical section.",
+    "3) Add end-to-end regression harness in CI that runs mixed prefill/decode workload with kernel-priority enabled and asserts token parity against baseline for common seeds.",
+    "4) Add unit test for epoch-based kv-index and fuzz tests for scheduler interleaving windows.",
+    "5) Optional: revert approximate softmax fallback for kernels that rely on strict KV correctness until fix is validated."
+  ],
+  "next_steps": [
+    "2025-02-06: Implement atomic epoch publish in kv-cache (Marcus) - PR draft opened.",
+    "2025-02-07: Scheduler change review to add session-level barrier (Allan) - design doc link added.",
+    "2025-02-09: Add CI regression job and increase stress harness sampling to reproduce at scale (Keiko).",
+    "2025-02-12: Deploy fix to canary Dedicated pool and run 72-hour stress run (if green, rollout to remaining clusters)."
+  ],
+  "comments": [
+    "2025-01-28 Marcus Chen: Attached repro harness and initial flamegraphs. Kernel arbitration commit e3f9a4a is suspicious; starting bisect.",
+    "2025-01-30 Keiko Tanaka: Added epoch logging; repro becomes deterministic when forcing interleave=1. Epoch mismatch observed in 18/100 failing runs.",
+    "2025-02-01 Dan O'Neill (QA): Confirmed token shifts reproduce on dedicated-sim environment with the provided harness; capturing full coredump and GPU trace for offline analysis.",
+    "2025-02-05 Marcus Chen: Rolled back arbitration in prod pools and notified SRE + customers; monitoring shows no further regressions. GDPR-redacted incident notes stored in Confluence.",
+    "2025-02-07 Sofia Patel: Finalizing PR and adding CI job. Scheduling postmortem on 2025-02-18 to capture lessons and gating criteria for future perf work."
+  ],
+  "links": [
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/RUNTIME/pages/kv-index-scheduler-investigation-2025",
+    "Repro harness: gs://redwood-artifacts/kv-stress-2025-01-28.tar.gz",
+    "PR draft: https://github.com/redwood-inference/runtime/pull/3214",
+    "Internal issue references: ENG-17921, ENG-18675 (related kernel fallback and concurrency incidents)",
+    "Support ticket (redacted): SUP-3981"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "reproduction_steps",
+    "investigation_notes",
+    "workaround",
+    "temporary_mitigation_applied",
+    "root_cause_hypothesis",
+    "proposed_fix",
+    "next_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_8d73e540e0fb4370aafe173ef15cabc5"
+}

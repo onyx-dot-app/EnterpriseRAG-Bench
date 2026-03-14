@@ -1,0 +1,49 @@
+{
+  "key": "ENG-61432",
+  "team": "engineering",
+  "title": "Normalize tenant quota and rate-limit attribution after subproject merges and API key rebinds",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-02-10",
+  "updated_at": "2025-03-04",
+  "creator": "Emily Chen",
+  "assignee": "Raj Patel",
+  "project": "Billing & Quotas",
+  "cycle": "2025-W06",
+  "estimate": "5",
+  "due_date": "2025-03-14",
+  "labels": [
+    "billing",
+    "quota",
+    "rate-limiting",
+    "multi-tenant",
+    "investigation",
+    "migration"
+  ],
+  "dependencies": [
+    "ENG-31228",
+    "ENG-41107",
+    "ENG-50321"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Summary:\nWe are seeing intermittent misattribution of token/usage and rate-limit buckets after project/subproject merges and API key rebinds. Some requests (particularly those proxied through the edge gateway during a key rebind window) are being counted against the old project identifier or orphaned at the organization level. This affects both per-project quota accounting and enforcement of per-project rate limit buckets, causing customers to see unexpected quota exhaustion or incorrect billing spikes.\n\nObserved behavior:\n- After merging subprojects or rebinding a project-level API key to a new project_id, some tokens are attributed to the previous project_id or to an \"unbound\" tenant placeholder.\n- Rate limiter uses a cached mapping (api_key -> tenant_bucket) in the edge layer; a race during key update leads to two active mappings until cache invalidation completes.\n- The async usage-aggregator consumes events that may lack the canonical project_id when the token->project mapping was ambiguous, resulting in historical misattribution in the usage database.\n- Customers report: sudden quota drops for the \"new\" project, and unexpected billed usage under the old project or organization root.\n\nImpact:\n- Billing discrepancies and erroneous quota enforcement for affected tenants (customer-facing outages for quota-limited features).\n- High-severity support cases for enterprise customers using Dedicated/Private where key rotation is common.\n- Potential revenue loss and trust impact.\n\nRoot cause hypothesis:\n- The gateway cache and token metadata service perform eventual consistency updates when API keys are rebound. During the window, the edge may accept requests and stamp them with a transient tenant identifier. The aggregation pipeline uses the stamped identifier rather than querying the canonical mapping at ingestion.\n- Additionally, a small subset of workflows (project merges) triggers a batch metadata update that temporarily sets project_id -> parent_project mapping; aggregator logic doesn't handle parent lineage properly.\n\nProposed solution (multi-part):\n1) Hotfix: change the aggregator to perform a fallback resolution at ingestion: if the event's project_id is missing or marked as \"unbound\", resolve api_key -> canonical_project_id synchronously against the metadata service (with read-through cache and short circuit to avoid extreme latency). This will reduce new misattribution while we roll out the full fix.\n2) Core fix: make token attribution canonical by using the authoritative project_id from the metadata service (stable id), and propagate that stable id into the edge stamping path as an immutable header (x-redwood-tenant-id) that survives rebind transitions. Update cache invalidation to use versioned mappings to avoid windowed ambiguity.\n3) Aggregator migration/backfill: implement a reconciliation job that identifies events in the usage window (configurable, default last 30 days) with non-canonical attribution and reattributes them to the canonical project_id. Produce a dry-run mode and a reversible patch to the billing ledger so we can audit before applying.\n4) Tests and observability: add end-to-end test scenarios for key rotation and project merges, expand the per-tenant reconciliation dashboard (usage-delta, reattributed-count, errors), and add alerts when the flow sees >0.1% unbound at ingestion.\n5) Rollout plan: canary the aggregator fallback in us-east-1; after 48h stabilization, enable core fix behind feature-flag and canary the stamp header. Run reconciliation dry-run for 7 days, review diffs, then apply patch for customers with confirmed mismatches.\n\nTradeoffs and constraints:\n- Synchronous resolution in the aggregator increases tail latency for a small fraction of events; to mitigate we will use a bounded retry + fast-read-through cache with memcache + short TTL.\n- Full backfill will be I/O heavy against the usage store; schedule during off-peak windows and throttle.\n- For Dedicated/Private deployments, must provide a self-contained migration script that operators can run (no cloud-only dependencies).\n\nAcceptance criteria:\n- New events during a key rebind window are attributed to the canonical project_id (verified via test harness).\n- Rate-limit enforcement uses canonical tenant buckets immediately after key rebind (no more than 0.1% misattributed requests observed in canary).\n- Reconciliation dry-run produces a clear diff and is reviewed by billing and support; after approval, backfill run reduces mismatch counts to zero for test tenants.\n- Production rollout docs and a runbook for customer remediation are published in Confluence and linked in this ticket.\n\nRunbook / Short mitigation for support teams:\n- If a customer reports unexpected quota exhaustion after a merge/rotation, run the \"lookup-tenant-by-token\" tool to confirm canonical mapping and trigger a targeted fast-reconcile for affected date ranges.\n\nLinks and artifacts:\n- Dashboard (tenant-usage-delta): https://grafana.redwood.internal/d/usage/tenant-usage-delta\n- Initial aggregator PR (WIP): https://github.com/redwood-inference/platform/pull/2387\n- Reconcile job design doc: https://confluence.redwood.ai/display/INFR/Token+Attribution+Reconcile+Design",
+  "comments": [
+    "2025-02-11 \u2014 Emily Chen: Initial triage completed. Reproduced with local e2e: merge two subprojects then rebind key; observed events stamped with parent project id during a 3\u20135s window. Attached logs and trace IDs.",
+    "2025-02-13 \u2014 Raj Patel: Confirmed aggregator consumed events with 'tenant_id=null' when the metadata service was returning 202 (in-progress). Found that the ingestion pipeline trusts the stamped header from the edge without verification. Opened spike to measure how often this occurs in prod (querying last 7 days).",
+    "2025-02-17 \u2014 Lina Guzman (SRE): Prod query shows ~0.6% of ingestion events in last 7d had non-canonical tenant tags; concentrated around our key-rotation cron windows. SRE recommends adding a short-lived synchronous resolution in the aggregator as a hotfix.",
+    "2025-02-20 \u2014 Raj Patel: Implemented aggregator fallback (local branch: feat/aggregator-tenant-fallback). Added metrics: aggregator.fallback_resolutions and aggregator.fallback_latency. Opening PR for initial review. PR: https://github.com/redwood-inference/platform/pull/2387",
+    "2025-02-24 \u2014 PR review (Design): Marcus Reed: Major comment \u2014 need to ensure the fallback path is idempotent and doesn't create duplicate ledger writes. Suggested adding a \"resolution_token\" and checking the dedupe table before write. Adjusted implementation accordingly.",
+    "2025-02-27 \u2014 QA (Aisha Torres): Added e2e test scenarios for key rotation and subproject merge; found a race in cache invalidation code in the edge that could reintroduce a window on rollback flows. Recording as follow-up task.",
+    "2025-03-01 \u2014 Raj Patel: Deployed aggregator fallback in canary (us-east-1). Observed fallback rate drop from 0.6% -> 0.05% in canary traffic. Latency P95 increased by ~8ms for fallback-resolved events. No customer-facing errors reported so far.",
+    "2025-03-03 \u2014 Emily Chen: Started work on canonical stamping in the edge. Need to coordinate with dedicated/private release owners for a migration script. Added ENG-61433 as a follow-up to track operator migration packaging.",
+    "2025-03-04 \u2014 Raj Patel: Added reconciliation dry-run job. Running dry-run for last 30 days for a small set of affected tenants; preparing diff for billing and support review next week."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_5ed2cfbe2cfa4e17bea30104b78cea38"
+}

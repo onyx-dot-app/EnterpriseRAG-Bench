@@ -1,0 +1,103 @@
+{
+  "key": "ENG-553219",
+  "team": "engineering",
+  "title": "Epochal Rotor Preemptor: SLO-aware rotation and soft-preemption for continuous batching",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-01-10",
+  "updated_at": "2025-02-05",
+  "creator": "Aisha Kaur",
+  "assignee": "Marco Nguyen",
+  "project": "batching-scheduler",
+  "cycle": "2025-W06",
+  "estimate": "8",
+  "due_date": "2025-03-01",
+  "labels": [
+    "slo",
+    "kv-cache",
+    "gpu-mem",
+    "preemption",
+    "fairness"
+  ],
+  "description": "Problem: Continuous-batching workloads with mixed tenant priorities and diverse sequence lengths cause KV cache thrash and GPU memory pressure. Existing tranche/preemptors either kill requests abruptly (causing user-visible errors) or follow simple priority-queue schemes that starve low-volume tenants. We need an SLO-aware preemption policy that preserves tail latency SLOs for high-tier tenants, prevents KV cold-spike regressions, and minimizes unnecessary KV evictions that regen warmup cost.\n\nProposal: Implement an 'Epochal Rotor Preemptor' that cycles through tenant epochs (time-sliced fairness windows) and uses per-epoch credits + soft-preemption grace tokens to pause/resume microbatches. Core components: epoch rotation (round-robin with weighted slots by SLA tier), credit buckets per-tenant seeded by negotiated SLOs, soft-preempt handshake that signals worker to checkpoint KV/decoder state and yield micro-slices, and a compacting eviction covenant that favors preserving hot KV prefixes for a small preservation window after soft-resume. The preemptor coordinates with GPU memory headroom accounting and an admission controller that shrinks batch width proactively under KV-pressure.\n\nWhy different from past approaches: Instead of strict proportional-share or token-bucket eviction, rotor provides cyclical fairness guarantees that are robust to workload burstiness and long-running generative sessions. Soft-preemption reduces user visible regeneration while allowing rapid reclamation of GPU memory for higher-priority epochs. The compact eviction covenant mitigates cold-KV thrash by pinning recently used prefix blocks for a short epoch-window rather than evicting LRU immediately under pressure.",
+  "acceptance_criteria": [
+    "p99 latency SLO for P0 tenants remains within target under 95th percentile mixed workload runs (target: <= 1.5x baseline)",
+    "KV hit rate degradation <= 5% versus baseline when mixed with bursty long-sequence jobs",
+    "Tail preemptions (requests that required full restart) reduced by >= 70% compared to hard-kill preemptor in stress tests",
+    "No GPU OOMs in 48h continuous soak with synthetic mixed-tenancy traces",
+    "Canary rollout on dedicated pool with automated rollback if p99 SLO violations observed for 3 consecutive 5-minute windows"
+  ],
+  "design_notes": [
+    "Epoch length: configurable; baseline 250ms window (empirically chosen from p50/p95 sequence length distribution in logs). Tunable via runtime flag 'rotor.epoch_ms'.",
+    "Priority weighting: each tenant assigned weight w_i derived from SLA tier and recent token consumption rate. Rotor allocates epoch-slots proportional to w_i with min-slot floor to prevent starvation.",
+    "Credit model: two-layer credits: CPU-side admission credits (microbatch admission) and GPU-side residency credits (KV residency budget). Credits decay linearly each epoch; burst replenishment allowed up to a configurable cap.",
+    "Soft-preempt flow: preemptor signals worker with 'yield_request' containing grace_tokens=N; worker flushes current microbatch, checkpoints KV deltas and decoder state to ephemeral slot, releases GPU token and KV slack, then signals 'yield_ack'. Another epoch can then use the freed memory. If worker cannot yield within grace window, preemptor escalates to priority-backed hard reclaim (last resort).",
+    "KV preservation covenant: when a tenant is soft-resumed, the last K prefix blocks (configurable, default 8) are pinned for a preservation window (default 10s) to avoid cold restart penalties; eviction policy respects pinned blocks unless OOM imminent.",
+    "Admission shrinker: admission controller monitors KV occupancy ratio and slices batch width (max microbatch size) using an MLP-derived curve (trained offline) to maintain headroom target (e.g., 12% free GPU memory).",
+    "Telemetry: expose per-epoch metrics: epoch_utilization, yield_count, average_yield_latency, kv_pin_count, kv_hit_rate_by_epoch, preempt_escalations. Add tenant-level counters for credits, starving_time, and last_resume_ts.",
+    "State persistence: ephemeral checkpointing kept in-memory on host; long stalls tracked centrally so resumption attempts prioritize preserving tenant order."
+  ],
+  "decisions": [
+    "Use soft-preemption with checkpoint/resume rather than immediate kill to preserve UX and reduce rerun compute cost.",
+    "Adopt epochal rotation (rotor) vs strict proportional fair-share because rotation reduces starvation during bursts and simplifies eviction heuristics.",
+    "Pin a small number of KV prefix blocks on resume to reduce cold-starts; cap pinned total to avoid uncontrolled memory growth.",
+    "Escalation to hard reclaim allowed but gated behind a configurable threshold ('rotor.escalation_threshold') and operator-visible alarms.",
+    "No immediate persistent storage of full KV on preempt; rely on short-term host memory and fast recompute to minimize I/O complexity.",
+    "Admission shrinker uses heuristic curve initially; plan to replace with online-learned policy after two iterations of A/B feedback."
+  ],
+  "risks": [
+    "Incorrect epoch length tuning could increase perceived jitter for interactive requests \u2014 mitigate with auto-tuning and canary gradients.",
+    "Pinned KV blocks may lead to memory fragmentation over long runs \u2014 mitigation: periodic compaction and pin decay with aging policy.",
+    "Checkpoint/resume failure modes could increase tail if state reconstruction is delayed \u2014 add watchdog timers and fallback to graceful restart path.",
+    "Weight calculation can be gamed by tenants sending low-cost heartbeats; we will throttle heartbeat influence and validate with usage anomaly detectors.",
+    "Complexity increases operator burden for debugging \u2014 include detailed trace hooks and a dedicated console view for rotor epochs."
+  ],
+  "testing_plan": [
+    "Unit tests for rotor scheduler state transitions and credit accounting.",
+    "Property tests that simulate extreme burst patterns to assert no starvation and bounded preemption escalations.",
+    "Integration tests in staging: attach synthetic multi-tenant trace (internal dataset /contrib/bench/mixed-tenancy-2025) and assert acceptance criteria across 24h run.",
+    "Chaos tests: random worker delay, delayed yield_ack, and KV eviction race to validate escalation correctness.",
+    "Performance microbench: measure checkpoint/resume overhead (target < 30ms median to resume small microbatches), and batch shrinker latency impact.",
+    "Load test with customer-like traces (redwood-corp/tenant-mix-2024) to ensure p99 stability.",
+    "Automated observability smoke: custom Grafana dashboard with rotor-specific panels and alert rules for p99 regressions."
+  ],
+  "rollout_plan": [
+    "Phase 0 (internal dogfood): enable rotor on dev clusters with synthetic workloads, validate no functional regressions (2 weeks).",
+    "Phase 1 (canary): route 1% of traffic on dedicated pools to rotor-enabled runtime; monitor p99, kv_hit_rate, and yield_escalations for 48h.",
+    "Phase 2 (small-scale): increase to 10% on dedicated pools and run 7-day soak. If >2 SLO alerts in 24h, rollback and collect traces.",
+    "Phase 3 (roll-forward): 50% then full rollout with staged activation per region. Add runtime flag 'rotor.enable' for quick rollback.",
+    "Fallback: agent-side hard-kill policy is retained as last-resort; rollback document and postmortem playbook prepared."
+  ],
+  "links": [
+    "https://github.com/redwood-inference/runtime/pull/13822",
+    "https://confluence.redwood.ai/display/INF/Epochal+Rotor+Design",
+    "drive:/designs/batching/epochal-rotor-preemptor-v1.pdf",
+    "internal-dashboard:/dashboards/rotor-epochs-overview"
+  ],
+  "related_issues": [
+    "ENG-7421",
+    "ENG-17283",
+    "ENG-21011",
+    "ENG-821000"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "notes": [
+    "Owner: Marco Nguyen (runtime team). Contact on Slack #runtime-ops.",
+    "Follow-ups: 1) online learning loop for admission shrinker (ENG-560140), 2) integrate rotor metrics into Console rollouts (PM-443).",
+    "PR checklist: knobs for epoch_ms, preservation_window_s, pin_block_count, escalation_threshold."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "design_notes",
+    "decisions",
+    "risks",
+    "testing_plan",
+    "rollout_plan",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_a9aa90b46a07480285c1364288ae500d"
+}

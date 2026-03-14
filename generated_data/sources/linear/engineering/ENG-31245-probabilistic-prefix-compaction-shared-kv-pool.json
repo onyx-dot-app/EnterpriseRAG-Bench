@@ -1,0 +1,49 @@
+{
+  "key": "ENG-31245",
+  "team": "engineering",
+  "title": "Probabilistic prefix compaction and shared KV pool for GPU memory optimization",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-15",
+  "updated_at": "2026-03-12",
+  "creator": "Lena Zhang",
+  "assignee": "Marco Santos",
+  "project": "runtime-memory-optimizations",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-04-02",
+  "labels": [
+    "kv-cache",
+    "gpu-memory",
+    "continuous-batching",
+    "probabilistic-dedupe",
+    "rollout-canary"
+  ],
+  "dependencies": [
+    "ENG-25714",
+    "ENG-26821"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Goal: Reduce peak GPU memory pressure from per-request prefix KV residency by introducing a compact, probabilistic deduplication layer and a shared on-device KV pool that allows safe reuse of identical or near-identical prefix KV fragments across concurrent requests and models.\n\nContext: Prefix/prompt caching reduces compute by reusing previously-computed KV cache fragments, but naively storing full token-aligned KV shards per-request leads to high GPU memory usage at scale. Current efforts (fragment indexing, canonicalization) improve dedupe but retain deterministic metadata that is bulky. This ticket explores a complementary approach: fast content-derived compaction + probabilistic membership tests (Bloom/Golomb sketches) to cheaply identify candidate duplicate fragments, plus a shared KV pool with compact headers to enable cross-request sharing while preserving per-request isolation and correctness.\n\nKey design goals:\n- Substantially lower average GPU memory used for KV residency (target 20-35% reduction on mixed workload traces).\n- Keep extra CPU overhead and latency minimal (probabilistic checks should be O(1) and amortized).\n- Maintain deterministic decoding for model correctness: false positives must be handled via a safe verification path and not affect outputs.\n- Support continuous batching and hot-path common-case (no verification required when confident).\n- Interoperate with existing prefix canonicalization and fragment indexing (non-destructive).\n\nProposal summary:\n1) Content fingerprinting (compact): compute a 64-bit rolling content hash per prefix fragment on CPU during request ingestion. Also compute a small sketch (Bloom filter with 3 hashes, 128-bit bitset) for token-level distribution summary for longer fragments.\n2) Probabilistic index: maintain an in-memory per-GPU probabilistic index (shared across worker threads) mapping 64-bit fingerprints to compact pool handles. The index is optimized for insert/lookup and accepts a low false positive rate (~1e-4).\n3) Shared KV pool layout (on-GPU): each pool entry stores compact header (64-bit fingerprint, 16-bit length bucket id, 16-bit refcount, 32-bit verification checksum pointer) + contiguous KV payload compressed with per-layer delta or 8-bit quantization. Payload alignment optimized for CUDA memory coalescing.\n4) Verification path: on a probabilistic match, the worker performs a short verification: compare a 128-bit checksum (CRC64+xxhash) computed lazily on GPU or precomputed on CPU. If checksum matches, accept reuse. If not, fall back to per-request copy and consider inserting new pool entry. Verification is allowed to run asynchronously when used in batch mode; for single-request low-latency routes we run verification synchronously.\n4b) False positives handling: never mutate model state based solely on a probabilistic match prior to verification. If verification fails, metrics increment and the request continues with local allocation.\n5) Eviction & compaction: pool entries are organized by length buckets and LRU + size-aware eviction for long fragments. Periodic compaction merges pool entries that are byte-identical and removes stale entries (refcount 0 for > grace window).\n6) Integration with continuous batching: when building a batch, the scheduler checks pool handles for each prefix; batch builder groups requests that share handles to enable KV pointer-sharing across the batch and avoid redundant copies. This reduces host<->device transfer bandwidth during batch assembly.\n\nAcceptance criteria:\n- Integration tests showing safe reuse across concurrent requests (no cross-request leakage).\n- End-to-end benchmark: 25% median GPU KV memory reduction on our multi-tenant trace (>=15% on tail-heavy workloads) without measurable correctness regressions on downstream generation tests.\n- Latency overhead of probabilistic lookup + verification should be <0.2ms p50 on hot-path; <1ms p99 for batch verification deferred paths.\n- Automated stress test demonstrating bounded memory under sustained mixed workloads and safe eviction semantics.\n\nImplementation plan (phased):\nPhase 1 (spike, 2w): implement CPU-side fingerprinting + probabilistic index prototype, add instrumentation hooks, run offline trace replay to estimate dedupe effectiveness and false positive behavior. Deliverable: perf report + tuning parameters (hashers, bloom size).\nPhase 2 (core impl, 4w): implement on-GPU pool layout and upload/download paths, verification checksum compute (GPU offload), thread-safe refcounting. Add integration with the batch assembler to use pool handles. Deliverable: feature behind runtime flag, unit & integration tests.\nPhase 3 (canary, 2w): enable for dedicated canary customers and internal prod-like workloads with telemetry. Observe memory, latency, correctness metrics.\nPhase 4 (rollout, 2w): expand canary to more clusters, implement adaptive eviction tuning, optimize sketch sizes, finalize dashboards and runbooks.\n\nTelemetry & observability:\n- Metrics: pool hit/miss rate, verification pass/fail, false-positive estimate, avg fragment size, refcount distribution, eviction rate, memory saved per-minute.\n- Traces: attach fingerprint and verification result to request-level traces.\n- Dashboards: per-cluster and per-model breakdowns showing memory savings and any verification failures correlated with model quality changes.\n\nRisks & mitigations:\n- Risk: Bloom/hash collision causing frequent verification failures -> tune sketch parameters from spike data and make sketch size configurable per workload.\n- Risk: CPU overhead for fingerprinting at high ingress rates -> offload hashing to a lightweight SIMD path or optional in-batch cooperative hashing.\n- Risk: Memory fragmentation on GPU pool -> use length-bucketed slab allocator and periodic compaction.\n\nBackward compatibility and config knobs:\n- Feature gated behind runtime flag default-off for Hosted; opt-in for Dedicated.\n- Configurable knobs: sketch size, fingerprint algorithm, verification mode (sync/async), length-bucket thresholds, pool size caps per-GPU.\n\nNotes / links:\n- Trace replay used for spike: s3://redwood-traces/prefix-reuse-2026-01 (internal).\n- Design doc draft: https://confluence.redwood.ai/display/RUNTIME/Probabilistic+Prefix+Compaction (internal).\n- Prototype PR: https://github.com/redwood-inference/runtime/pull/11234 (WIP).\n\nWork items (high level):\n- CPU fingerprinting + sketch library (SIMD-optimized)\n- Probabilistic index implementation (lock-free hashmap)\n- On-GPU pool allocator & headers\n- GPU checksum compute kernel + verification glue\n- Batch assembler integration & pointer-sharing path\n- Eviction, compaction and refcount lifecycle management\n- Telemetry + dashboards + runbook updates\n\nEdge cases:\n- Very short prefixes (<=2 tokens): skip probabilistic path and use dedicated small-slot caching to avoid sketch overhead.\n- Model parameter changes altering KV layout: attach model-version to pool entries and include in fingerprint namespace to avoid invalid reuse.\n\nEstimated resource needs:\n- 2 SDEs (runtime) + 1 infra SRE for rollout support + 0.5 PM for coordination during canary phase.\n\nIf approved, we will start the spike in 2026-W10 and aim for a canary rollout in runtime-1.22 canary clusters by the end of April.",
+  "comments": [
+    "2026-02-16 \u2014 Spike kickoff: ran initial trace replay, dedupe candidate rate ~18% with 64-bit fingerprint alone. Bloom sketch adds discriminative power for long fragments.",
+    "2026-02-22 \u2014 Design review notes (from Maya R.): require deterministic model-version namespace on pool handles to avoid accidental reuse across model upgrades.",
+    "2026-03-01 \u2014 Marco S. implemented a lock-free hashmap prototype; microbenchmarks show 0.05ms avg lookup on CPU core-local hot cache.",
+    "2026-03-07 \u2014 Integration test added: ensures verification failure never causes output divergence; test passed on x64 but found a dangling refcount bug on GPU allocator (fixed).",
+    "2026-03-12 \u2014 Canary gating proposal: default-off for hosted, opt-in flag for Dedicated controlled by org ID. Added telemetry for false-positive rate and verification latency."
+  ],
+  "attachments": [
+    "https://confluence.redwood.ai/display/RUNTIME/Probabilistic+Prefix+Compaction",
+    "https://github.com/redwood-inference/runtime/pull/11234",
+    "s3://redwood-traces/prefix-reuse-2026-01"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "attachments"
+  ],
+  "dataset_doc_uuid": "dsid_0a298fd6534f47b7ad6fcd6d0d6856b3"
+}

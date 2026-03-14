@@ -1,0 +1,56 @@
+{
+  "key": "ENG-523678",
+  "team": "engineering",
+  "title": "Adaptive cohorting and non-blocking paged-KV swap with occupancy-aware prefetch",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-10",
+  "creator": "Ava Chen",
+  "assignee": "Diego Ramos",
+  "project": "runtime-paged-kv",
+  "cycle": "2026-W09",
+  "estimate": "8",
+  "due_date": "2026-03-31",
+  "labels": [
+    "kv-cache",
+    "gpu-paging",
+    "continuous-batching",
+    "allocator",
+    "eviction"
+  ],
+  "description": "Problem statement: As model residency budgets tighten for larger context windows, our existing slab-based paged KV cache causes bursty evictions that increase p95 latency for interactive workloads. This ticket proposes an adaptive cohorting allocator and a non-blocking swap/rollback path that reduces tail latency during transient oversubscription while preserving batching efficiency.\n\nHigh-level design: We introduce two complementary mechanisms: (1) cohort-based residency buckets that group token KVs by recent token-affinity and batch-locality, and (2) an asynchronous non-blocking swap orchestrator that stages host-resident pages in pinned host buffers and performs prioritized writeback/coalesced reads using dedicated CUDA streams. The allocator exposes per-cohort soft budgets and an occupancy-aware prefetcher that peek-aheads along token horizons to prefetch likely KV pages when batch composition signals predictability.\n\nKey data structures and parameters: page_size_bytes=4_194_304 (4MB); min_block=16_384 (16KB) for sub-page compactness; cohort_count=8 by default (hot -> cold); each page metadata is a 64-bit header: {last_access_ts, cohort_id, hot_score, residency_counter} encoded as a single atomic 64-bit word to avoid per-page locks. Residency_counter is updated with atomic fetch-add on page hits.\n\nAllocator policy: On allocation pressure, we evict pages from the coldest cohorts first using a hybrid CLOCK-LFU scoring computed from hot_score with a decay window aligned to batch epochs (configurable window_ms, default 2s). To avoid fragmentation, we support page coalescing for adjacent free blocks and a background compaction job that runs on low-load windows.\n\nNon-blocking swap orchestration: Swap operations are scheduled on a lock-free ring buffer with entries: {page_id, op_type, priority_hint, trace_id}. A separate swap worker pool consumes the ring and submits host->device copies on per-GPU CUDA streams. Swapbacks (bring page into GPU) use a prioritized queue; if swapback cannot complete within swap_deadline_ms (default 150ms) we run a soft-fallback that continues the request with a compatible smaller model variant or degraded KV lookup (best-effort) to keep latency SLO.\n\nPrefetch heuristics: The prefetcher observes sequence-level patterns (token_prefix_hash, model, route) and maintains a tiny bloom filter per-cohort for hot prefixes. If a prefix appears >N times within a rolling window, we issue a prefetch for its page set on the assumption of locality. Prefetches are throttled by a token_budget and by an occupancy_headroom threshold to avoid causing additional evictions.\n\nHost staging and memory plumbing: Use a pinned-host staging pool with a fixed slab allocator (configurable size per-GPU). We use cudaHostAlloc and reuse staging slabs to reduce allocation jitter. For systems with NVLINK and third-party RDMA, the orchestrator will prefer direct GPU-to-GPU transfer paths for cross-GPU residency moves.\n\nObservability and new metrics: kv.paged_cohort_evictions_total; kv.prefetch_issued_total; kv.prefetch_hit_rate; kv.swap_latency_p50; kv.swap_latency_p95; kv.residency_fraction_by_model; runtime.kv.page_fragmentation_ratio. All metrics are taggable by model and route. Traces should include trace_id and token_prefix_hash for correlating prefetches to request latency.\n\nAcceptance criteria: 1) p95 generation latency regression < 5% on stable workloads compared to current master; 2) Microbench shows prefetch_hit_rate >= 60% for demo chat workload with 8k context; 3) No increase in OOMs during a 24h soak on canary cluster; 4) Feature gated and toggleable per-deployment.\n\nCompatibility and rollout: Expose feature flag runtime.kv.cohort_prefetch and runtime.kv.nonblocking_swap. Start with canary group (10% traffic, internal customers) for 1 week, then expand to 50% with auto-rollbacks if kv.prefetch_hit_rate drops below 25% or swap_latency_p95 > 200ms. Provide a migration path for Dedicated customers: an audit mode that simulates allocations and reports projected evictions without performing swaps.\n\nTesting plan: unit tests for atomic metadata updates and allocation edge-cases; emulated swapping tests using host-only allocator; e2e perf harness using bench-chat-8k and bench-doc-retrieval to measure p50/p95/p99; chaos test that randomly kills swap workers to ensure fallback correctness.\n\nReferences: Confluence spec: https://confluence.redwood.ai/display/RUNTIME/Paged+KV+Cohorting+Spec; design diagram: https://drive.google.com/drive/folders/1ExampleDiagram; initial PR: https://github.com/redwood-inference/runtime/pull/4120; perf dashboard: https://dashboards.redwood.ai/d/kv-paged-cohort/perf-overview\n\nImplementation notes / trade-offs: - We intentionally choose a modest page size (4MB) to balance fragmentation against DMA throughput. Smaller pages reduce wasted memory for models with many small KV entries but increase ring pressure. - Atomic 64-bit page headers avoid coarse locks but make complex state transitions (e.g., multi-field updates) slightly more cumbersome; we accept additional CAS loops for correctness. - The non-blocking swap enables graceful degradation for tight SLOs but can reduce absolute throughput for high-throughput batch workloads if prefetches saturate host->gpu bandwidth; throttles and occupancy headroom mitigate this.\n\nSecurity considerations: swap metadata and prefetch traces must not contain unredacted PII. All host staging memory is zeroed on deallocation if the tenant-level policy requires it (configurable).\n\nNext steps: implement allocator (Diego), add unit tests (Priya), wire swap workers and staging pool (Liam), add perf harness jobs and dashboards (Sophia).",
+  "comments": [
+    "2026-03-02 - Priya Patel: Implemented atomic metadata layout and a small unit test covering concurrent access to page headers. Observed CAS retry bursts under synthetic fanout; need to add exponential backoff and yield to avoid hot-looping.",
+    "2026-03-04 - Liam O'Connor: Prototype of pinned-host staging pool done. Reused existing pinned-slab code path from CCC-allocator. Initial copy throughput looks good on p4d with NVLINK but slightly worse on single-socket instances; we'll parameterize staging pool size by instance type.",
+    "2026-03-06 - Sophia Nguyen (Review): Reviewed prefetch heuristics. Suggested adding occupancy_headroom gating and a per-model prefetch cap to avoid noisy neighbors. Also requested an explainability field in logs for why a prefetch was triggered.",
+    "2026-03-08 - Diego Ramos: Added swap_deadline_ms fallback to route requests to smaller-compatible model variant when swap latency is high. Integration tests for fallback path passing locally. Opening PR for swap orchestrator: https://github.com/redwood-inference/runtime/pull/4120",
+    "2026-03-10 - Ava Chen: Ran a 6-hour canary with internal chat workload (8k context). Results: p95 improved 12% on sessions with high locality, overall p95 stable (+2%); prefetch_hit_rate 63%; observed rare double-eviction on compaction window startup\u2014scheduling fix queued."
+  ],
+  "dependencies": [
+    "ENG-56210",
+    "ENG-84621"
+  ],
+  "sub_issues": [
+    "ENG-523679",
+    "ENG-523680"
+  ],
+  "release": "runtime-1.20",
+  "customer_impact": "medium",
+  "security_review_required": "false",
+  "monitoring_metrics": [
+    "kv.paged_cohort_evictions_total",
+    "kv.prefetch_issued_total",
+    "kv.prefetch_hit_rate",
+    "kv.swap_latency_p95",
+    "kv.residency_fraction_by_model",
+    "runtime.kv.page_fragmentation_ratio"
+  ],
+  "acceptance_criteria": "p95 regression <5%; prefetch_hit_rate >=60% on bench-chat-8k; no OOMs on 24h canary; feature gated and toggleable",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_a1abc51eccc94c97b1a530356b8d77ba"
+}

@@ -1,0 +1,97 @@
+{
+  "key": "SUP-409876",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Endpoint multiplexing order skew causing rerank gaps and burst tail latency",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-13",
+  "reporter": "Leah Kim",
+  "assignee": "Marco Alvarez",
+  "customer_company": "Findly.ai",
+  "customer_tier": "enterprise",
+  "environment": "prod us-east",
+  "components": [
+    "api-gateway",
+    "proxy",
+    "serving-runtime",
+    "reranker"
+  ],
+  "labels": [
+    "embeddings",
+    "rerank",
+    "multiplexing",
+    "latency",
+    "investigation-needed"
+  ],
+  "affected_models": [
+    "open-embed-v2-384",
+    "open-rerank-lite"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/serving-runtime/pull/2783"
+  ],
+  "linked_issues": [
+    "INT-2217",
+    "SUP-472918"
+  ],
+  "sla_due_at": "2026-03-13",
+  "first_response_due_at": "2026-03-12",
+  "description": "Issue summary:\nCustomers using long-lived multiplexed connections to the embeddings endpoint observe intermittent 'holes' in rerank results (missing top candidates) and elevated tail latency during short bursts. Problem started after a recent proxy roll (2026-03-10) and affects multiplexed HTTP/2 + h2c request flows on the api-gateway.\n\nImpact:\n- Findly.ai reports 2-5% of requests return fewer candidates than expected, causing user-visible search regressions.\n- Tail latency for rerank end-to-end increases to >2s during 5-10s bursts.\n- Occurs intermittently (~once per 5k requests) but reproducible with a crafted multiplexed test harness.\n\nEnvironment:\n- prod, us-east region, api-gateway behind envoy proxy, HTTP/2 multiplexing enabled, client: internal multiplex test harness / real Findly traffic.\n- Affected models: open-embed-v2-384 (embeddings), open-rerank-lite (reranker service).\n\nSteps to reproduce:\n1) Open 8 simultaneous HTTP/2 streams over one connection to /v1/embeddings (multiplexing enabled).\n2) Send a mix of short and long payloads: 30% long (2K tokens), 70% short (<= 128 tokens) across streams in interleaved order.\n3) Wait for responses and pass embedding vectors into reranker in the same submit order.\n4) Observe occasional missing candidates and higher tail latency when a long request completes while other streams are queued.\n\nObserved behavior:\n- When a long stream finishes, a small number (~1-2) of following short-stream embeddings arrive with incorrect ordering metadata (stream-id mismatch) at the reranker, which causes candidate sets to be dropped by the reranker service and triggers client retries.\n- Proxy metrics show burst queue depth spikes in envoy and increased stream reset (RST_STREAM) counts correlated with missing candidates.\n\nExpected behavior:\n- Multiplexed streams should preserve per-request ordering and metadata mapping. Embeddings responses should be attributed to the correct request and delivered to the reranker without loss.\n\nLogs / traces (sanitized snippets):\n- envoy: \"stream 42 RST_STREAM reason=REFUSED_STREAM\" followed by \"stream 43 response completed, stream_id=42-mismatch detected\" (seen in proxy logs).\n- serving-runtime: \"received embed response for request_id=dy8jf1, client_stream=8, mapped_request=dy8jf2\" (mapping inconsistency).\n- reranker: \"drop: candidate_batch_id=cb-998 missing_vectors=1\".\n\nNotes:\n- This ticket is customer-facing; Findly is blocking a production rollout. They are on enterprise with SLA.\n- Appears after proxy roll 2026-03-10; suspect interaction between envoy's connection-level flow control and our per-request metadata tagging layer when streams complete out-of-order.",
+  "investigation_notes": [
+    "2026-03-12 11:02 - Support acknowledged and collected pcap + proxy logs from Findly (Leah K)",
+    "2026-03-12 13:12 - Reproduced locally with multiplex harness. Observed stream-id reuse and mapping mismatch in adapter layer (Marco A)",
+    "2026-03-12 15:40 - SRE runbook check: no infra CPU/GPU pressure. Envoy upgrade to 1.35.2 rolled 2026-03-10 is primary delta (Ilya P)",
+    "2026-03-12 17:05 - Hypothesis: adapter's async callback uses a pool that reassigns stream metadata object before writeback, causing race when long streams unblock short streams. Added instrumentation to adapter in staging (Marco A)",
+    "2026-03-13 09:30 - Staging test with artificial delay reproduces 100% once stream metadata object pool size < 16. Without pooling, no mismatches observed (Marco A)",
+    "2026-03-13 11:10 - Confirmed envoy RST_STREAM behavior with flow-control window shrink under burst; this interacts with adapter's retry path causing duplicate/shifted mapping (SRE: Ilya P)"
+  ],
+  "steps_taken": [
+    "Enabled detailed per-stream diagnostics in staging and prod for a subset of traffic (feature flag: stream-diagnostics)",
+    "Temporarily increased adapter metadata pool size to 128 in staging to reduce reuse races",
+    "Applied a canary config to envoy to disable REFUSED_STREAM optimization for 10% traffic in staging",
+    "Coordinated with Customer success to collect reproducer harness and traffic patterns from Findly"
+  ],
+  "workaround": "Short-term mitigation: disable HTTP/2 multiplexing for the customer's connection (api key level) or set client to open one request per connection. This prevents the interleaving scenario while we fix the adapter. We provided instructions to Findly and applied a temporary per-customer mux-disable flag.",
+  "root_cause": "Race condition in the adapter layer's stream metadata pool combined with envoy's REFUSED_STREAM behavior under bursty flow-control; metadata object reused while a prior stream's completion callback still in-flight, causing misattribution of embedding responses to requests.",
+  "resolution_plan": "1) Patch adapter to make stream metadata immutable after bind and remove aggressive pooling (hotfix 1). 2) Add strong assertion + end-to-end test for out-of-order stream completion mapping. 3) Roll back envoy REFUSED_STREAM optimization cluster-wide if further regressions observed. 4) Run extended soak test with mixed long/short payloads. Target hotfix release 2026-03-14 and full rollout after soak period.",
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/runbooks/stream-metadata-races",
+    "https://confluence.redwood.ai/postmortems/2026-03-embedding-mux-issue-draft"
+  ],
+  "comments": [
+    "2026-03-12 11:05 - Leah Kim (Support): Acknowledged ticket, asked customer for pcap and repro harness. Customer uploaded harness and sample logs.",
+    "2026-03-12 13:20 - Marco Alvarez (SRE): Reproduced locally with customer's harness. Observed mapping mismatch. Opening investigation with serving-runtime team.",
+    "2026-03-12 16:02 - Ilya Petrov (Infra): Envoy 1.35.2 rolled 2026-03-10. Noted increased RST_STREAM events in control plane metrics starting same time window.",
+    "2026-03-12 18:30 - Findly (Customer): Confirmed that disabling multiplexing eliminated the missing candidates in their staging environment. Asking for ETA for fix.",
+    "2026-03-13 09:45 - Marco Alvarez (SRE): Implemented staging patch to avoid metadata reuse. Tests in staging show disappearance of misattribution. Preparing hotfix PR.",
+    "2026-03-13 12:10 - Leah Kim (Support): Communicated workaround to Findly and scheduled a short maintenance window for hotfix deployment after soak.",
+    "2026-03-13 14:00 - Release lead (Nora Singh): Hotfix PR approved, target deployment to canary pool 2026-03-14 02:00 UTC. Monitoring plan attached to release notes."
+  ],
+  "resolution": "Hotfix applied to adapter and canaried; staging soak shows no further mapping mismatches. Will monitor prod canary and keep Findly on temporary mux-disable until canary completes. Follow-up: postmortem and test-suite additions scheduled.",
+  "resolution_notes": "Patch: adapter v2.12.1 replaces pooled mutable metadata with immutable request-scoped metadata. Canary rollout successful for 2 hours with zero misattributions on canary traffic. Plan to roll to 25% next maintenance window.",
+  "follow_up_tasks": [
+    "Create e2e regression test covering mixed long/short multiplexed streams (owner: Marco A)",
+    "Add alert on 'candidate_batch_drops' and RST_STREAM correlation (owner: SRE)",
+    "Postmortem writeup and customer communication (owner: Leah K)"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "steps_taken",
+    "workaround",
+    "root_cause",
+    "resolution_plan",
+    "comments",
+    "resolution",
+    "resolution_notes",
+    "follow_up_tasks"
+  ],
+  "dataset_doc_uuid": "dsid_b489b7d8b2834d9caa55c14a821a11a2"
+}

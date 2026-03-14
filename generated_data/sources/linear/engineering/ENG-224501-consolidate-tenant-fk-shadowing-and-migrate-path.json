@@ -1,0 +1,121 @@
+{
+  "key": "ENG-224501",
+  "team": "engineering",
+  "title": "Consolidate tenant FK shadowing and safe migration path for control-plane joins",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-15",
+  "updated_at": "2026-03-10",
+  "creator": "Asha Kulkarni",
+  "assignee": "Miguel Ramirez",
+  "project": "controlplane-db-cleanup",
+  "cycle": "Cycle 56",
+  "estimate": "8",
+  "due_date": "2026-03-31",
+  "labels": [
+    "db-migration",
+    "indexing",
+    "tech-debt",
+    "shadow-reads"
+  ],
+  "parent_issue": [
+    "ENG-175321",
+    "ENG-132457"
+  ],
+  "dependencies": [
+    "ENG-24601",
+    "ENG-28901"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Control plane tables currently duplicate tenant identifiers across many wide tables (project_refs, tenant_id, tenant_uuid) with slight variations in type and nullability. This causes large join fanout, inconsistent FK semantics, and heavy index churn when tenants are soft-deleted or renamed. This ticket designs and executes a low-risk, shadowed migration to consolidate tenant foreign keys into a single canonical reference and remove redundant tenant columns over time.",
+  "problem_statement": "Multiple tables carry tenant identifiers with different types (text/uuid/biginteger) and duplicated FK constraints. Queries frequently join on these columns or use IS NOT NULL filters, creating hot indexes and poor planner choices. Ad-hoc backfills and emergency patches have added conditional logic in query predicates. We need a consistent, compact reference pattern that reduces join width, simplifies indexes, and provides a safe migration path without large downtime.",
+  "background": "Past migrations (ENG-24601, ENG-28901) partially normalized tenant ids but left shadow columns and online backfills. Observability shows elevated p95 query latency on control-plane read paths for tenant-scoped dashboards and an increase in index bloat after several backfills. The service team has requested a migration that supports smooth rollback, real-time verification, and light write amplification during cutover.",
+  "goal": "Introduce a canonical tenant_ref (surrogate) and mapping table, route reads to shadow references while backfilling, perform a tapered cutover with canary queries, drop redundant columns, and add compact covering indexes to reduce IO for common join patterns.",
+  "migration_plan": [
+    "Step 1 \u2014 Create canonical table: tenant_ref(id BIGSERIAL PRIMARY KEY, tenant_uuid UUID UNIQUE, created_at timestamptz)",
+    "Step 2 \u2014 Add shadow column: add column tenant_ref_id BIGINT NULL to tables: projects, environments, audit_events, usage_quotas (batch-safe, no default)",
+    "Step 3 \u2014 Backfill in rolling batches: backfill tenant_ref_id via join on tenant_uuid using windowed jobs limited to 5k rows per transaction and per-table rate limit",
+    "Step 4 \u2014 Read routing: introduce read-side shadow preference in control-plane query layer (prefers tenant_ref_id when present; fallback to legacy tenant_uuid) behind feature flag",
+    "Step 5 \u2014 Canary & verify: run comparison checks for 48h on sampled traffic; escalate on mismatch > 0.1%",
+    "Step 6 \u2014 Swap enforcement: on success, add NOT NULL + FK constraint and small maintenance window to add FK index concurrently",
+    "Step 7 \u2014 Deprecate legacy columns: schedule column drops in a later maintenance window after 30 days of stable metrics"
+  ],
+  "backfill_strategy": [
+    "Batch size: 5000 rows per job; target table lock-free updates via primary key range; use background worker with jitter",
+    "Idempotency: jobs skip rows with tenant_ref_id already set",
+    "Throttling: scale based on replica lag and WLM; disable during peak deploys",
+    "Verification pass: run hash comparisons (sha256 of concatenated id columns) before and after per-batch to detect mismatch"
+  ],
+  "index_proposals": [
+    "projects: CREATE INDEX CONCURRENTLY idx_projects_tenant_ref_id_created_at ON projects (tenant_ref_id, created_at) WHERE deleted_at IS NULL",
+    "audit_events: CREATE INDEX CONCURRENTLY idx_audit_tenant_ref_event_ts ON audit_events (tenant_ref_id, event_ts)",
+    "environments: CREATE INDEX CONCURRENTLY idx_env_tenant_ref_name ON environments (tenant_ref_id, lower(name))",
+    "migration-aid: CREATE INDEX CONCURRENTLY idx_tenant_uuid_to_ref ON tenant_ref (tenant_uuid)"
+  ],
+  "queries_affected": [
+    "SELECT p.* FROM projects p JOIN tenant_ref t ON p.tenant_ref_id = t.id WHERE t.tenant_uuid = $1",
+    "SELECT count(*) FROM audit_events WHERE tenant_ref_id = $1 AND event_ts > now() - interval '7 days'",
+    "Legacy path: SELECT * FROM projects WHERE tenant_uuid = $1 -- will continue to be supported during shadow period"
+  ],
+  "acceptance_criteria": [
+    "Shadow reads enabled and returning identical results to legacy reads for sampled 99.9% of rows over a 48h window",
+    "Backfill job completes for projects/environments/audit_events with <0.5% manual corrections required",
+    "No increase in p99 write latency > 15% during backfill windows",
+    "New compact indexes reduce median read I/O on tenant-scoped dashboards by at least 20% in lab runs",
+    "Rollback path validated: feature flag flip restores legacy reads without data loss"
+  ],
+  "testing_plan": [
+    "Unit tests for query layer preference logic (tenant_ref_id preferred, fallback to tenant_uuid)",
+    "Integration test: deploy in staging with production-sized fixture and run full backfill",
+    "Chaos test: simulate replica lag and network partition during backfill to validate throttling and job retry",
+    "Canary traffic: route 1% of production queries to shadow path and compare results via comparison harness"
+  ],
+  "rollback_plan": "If mismatches exceed thresholds or errors surface, flip feature flag to stop reading tenant_ref_id and resume legacy tenant_uuid reads; pause backfill jobs; delete newly created tenant_ref rows if dead-letter auditing shows integrity issues; re-assess and run corrective reconcile job.",
+  "monitoring_kpis": [
+    "backfill_progress.percent_complete",
+    "controlplane.read.latency.p95 (tenant-scoped)",
+    "index_bloat.bytes (projects, audit_events)",
+    "shadow_mismatch.rate (per 100k reads)",
+    "replica_lag.seconds during backfill"
+  ],
+  "linked_prs": [
+    "github.com/redwood-inference/control-plane/pull/7854",
+    "github.com/redwood-inference/control-plane/pull/7899"
+  ],
+  "links": [
+    "https://confluence.redwood.ai/display/DB/tenant-ref-design",
+    "https://dashboard.redwood.ai/d/controlplane/tenant-reads?from=now-7d&to=now"
+  ],
+  "comments": [
+    "2026-02-16 \u2014 Asha Kulkarni: Initial scoping and risk analysis done. Identified candidate tables and rough backfill cost estimate (approx 14m rows total).",
+    "2026-02-20 \u2014 Miguel Ramirez: Implemented tenant_ref table DDL in a feature branch; added migration skeleton. Request review from DB-ops before running on staging.",
+    "2026-02-27 \u2014 DB-Ops (S. Lee): Suggested adding per-table rate limits and explicit replica-lag thresholds; recommended hashing verification step.",
+    "2026-03-04 \u2014 PM (Jordan Patel): Approved the planned canary window and customer communication template for potential read blips.",
+    "2026-03-08 \u2014 Migration runner: Started backfills for projects (phase 1). Observed 0.02% mismatch due to historical tenant_uuid casing differences; added normalization step.",
+    "2026-03-10 \u2014 Miguel Ramirez: Enabled shadow reads behind feature flag for 1% canary traffic; no mismatches beyond normalized cases; proceeding to expand backfill to environments"
+  ],
+  "owner_contacts": [
+    "Asha Kulkarni <asha@redwood.ai>",
+    "Miguel Ramirez <miguel@redwood.ai>",
+    "S. Lee (DB-Ops) <slee@redwood.ai>"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "problem_statement",
+    "background",
+    "goal",
+    "migration_plan",
+    "backfill_strategy",
+    "index_proposals",
+    "queries_affected",
+    "acceptance_criteria",
+    "testing_plan",
+    "rollback_plan",
+    "monitoring_kpis",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_c9ca01be82544cbb907db4aa06b2b15a"
+}

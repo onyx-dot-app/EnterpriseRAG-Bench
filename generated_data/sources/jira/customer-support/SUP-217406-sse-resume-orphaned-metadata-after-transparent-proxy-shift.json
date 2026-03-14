@@ -1,0 +1,82 @@
+{
+  "key": "SUP-217406",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "SSE resume leaves orphaned metadata envelope and trims final tokens after transparent proxy path change",
+  "status": "Resolved",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Priya Nair",
+  "assignee": "Diego Martinez",
+  "customer_company": "SlateDocs Inc.",
+  "customer_tier": "enterprise",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "edge-proxy"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "proxy",
+    "reconnect",
+    "partial-output"
+  ],
+  "environment": "prod us-west-2",
+  "affected_models": [
+    "redwood-chat-3b-v1"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-10",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "INT-8121"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/edge-proxy/pull/1423",
+    "https://github.com/redwood-inference/serving-runtime/pull/391"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SRE/SSE+resume+edge+proxy+runbook"
+  ],
+  "description": "Issue summary: Customer reports that when their users hit a corporate transparent HTTP proxy that rebinds connections mid-session, resumed SSE streams frequently have an orphaned metadata envelope and the final few tokens of the assistant response are dropped. Impact: customer-facing chat UI ends up missing the last sentence or closing JSON metadata, causing UI to show 'incomplete' and to retry the prompt. This blocks a critical workflow for SlateDocs' editor-collaboration feature. Environment: prod, us-west-2 cluster, model redwood-chat-3b-v1, path goes through our edge-proxy fleet and then through the customer's transparent proxy (observed via packet captures and headers).",
+  "steps_to_reproduce": "1) Start SSE streaming request to /v1/chat/stream with a long completion (~800 tokens) behind a transparent corp-proxy that performs connection rebinds/short-lived idle teardown. 2) Simulate a midstream path change: induce an intermediate NAT rebind or send TCP FIN from the intermediate proxy to force client to reconnect and resume. 3) Allow client to resume using session resume headers (session-id + resume-offset). 4) Observe final payload: metadata envelope is present but contains an empty or truncated closing field and final text tokens are missing. 5) Capture server and proxy logs and the raw SSE bytes for analysis.",
+  "expected_behavior": "On resume, the SSE stream should re-emit any necessary metadata and the final assistant tokens / closing metadata envelope should be delivered atomically so the client can assemble a complete response.",
+  "actual_behavior": "After proxy-induced path changes, the stream often ends with a metadata envelope that is not properly terminated (orphaned), and the last 10-30 tokens of the generated response are never received by the client. The customer UI marks the response incomplete and triggers a duplicate retry.",
+  "logs": "[2026-03-09T18:22:12Z] edge-proxy-01 INFO incoming SSE session resume (session=abc123, offset=781)\\n[2026-03-09T18:22:12Z] serving-runtime-07 INFO resumed KV priming for session=abc123 up to offset=781\\n[2026-03-09T18:22:13Z] edge-proxy-01 WARN upstream connection rebind detected (src-ip changed)\\n[2026-03-09T18:22:13Z] edge-proxy-01 DEBUG flush-chunk final-size=0 suppressed-by-proxy\\n[2026-03-09T18:22:13Z] serving-runtime-07 ERROR trailing metadata envelope not closed before EOF (session=abc123)\\n[2026-03-09T18:22:13Z] client-capture: SSE chunk: 'data: {\"type\":\"meta\",\"trace\":\"t-9f1\",\"closing\":'   <-- stream truncated\\n",
+  "investigation_notes": "Initial hypothesis: customer transparent proxy performs aggressive chunk coalescing and sometimes strips the zero-length final chunk or rewrites chunk boundaries during path migration. That behavior can cause our HTTP chunked-encoding sentinel (implicit in SSE connection closure) to be swallowed, and the runtime assumes connection close will drive final 'closing' metadata emission. Net effect: server emits a metadata frame but the final bytes (closing flag or trailing JSON bracket) do not make it to the client. Evidence: tcpdump from the edge node shows a FIN/ACK from proxy followed by a new connection; the raw SSE stream captured at the edge contains an unterminated metadata envelope. We reproduced locally by inserting an HTTP/1.1 transparent proxy that rewrites chunk boundaries and observed identical truncation. Engineering hypothesis tracked as two issues: 1) edge-proxy path-change drop of zero-length chunk, 2) serving-runtime relying on implicit connection close to emit final metadata.",
+  "comments": [
+    "2026-03-10 09:05 - Priya Nair (Support): Customer reports ~7% of streams truncated after mid-session reconnects. Attaching sample SSE capture and markup. Asked for correlation ids and timestamps.",
+    "2026-03-10 10:12 - Diego Martinez (SRE): Confirmed edge-proxy observed connection rebind at approx the same time as truncated capture. Marked high priority and requested packet captures from customer for the same timeframe.",
+    "2026-03-10 14:40 - Eng (Liam O'Connor): Reproduced with local transparent-proxy harness. Found that proxy removed trailing zero-length chunk when it performed early connection close, leading runtime to not flush final event. Proposed fix: runtime should send an explicit 'stream_end' event before relying on connection close and edge-proxy should preserve zero-length terminal chunk on path migration.",
+    "2026-03-11 08:22 - Diego Martinez: Deployed edge-proxy patch (preserve-final-chunk) to canary in us-west-2 and serving-runtime change to emit explicit stream_end event by default. Canary run metrics look good; no truncations in 12h window for the reproducer harness.",
+    "2026-03-12 10:01 - Priya Nair (Support): Customer validated fix in their environment with corp-proxy in-path. Confirmed the last sentence and closing metadata now arrive consistently. Customer will monitor for 48h before final signoff.",
+    "2026-03-12 15:30 - Diego Martinez (SRE): Post-deploy: rolled the runtime change to all us-west-2 serving-runtime nodes and the edge-proxy preserve-final-chunk flag to all edge nodes in the same region. Added regression test and runbook note.",
+    "2026-03-12 17:12 - Customer (SlateDocs): 'Looks stable so far, thanks \u2014 will re-open if we see any regressions.'"
+  ],
+  "resolution": "Applied twofold fix: 1) Serving runtime now emits an explicit 'event: stream_end' metadata message with a deterministic JSON footer prior to relying on connection close. 2) Edge-proxy change to preserve and forward zero-length terminal chunk on connection migration was deployed to prod us-west-2. Added a targeted regression test (integration harness injecting transparent-proxy behaviors) and updated SSE resume runbook with mitigation steps for customers behind aggressive proxies.",
+  "postmortem_followup": "- Runbook updated: 'If customer uses transparent HTTP proxy that performs mid-session rebinds, recommend enabling passthrough mode or ensure proxy preserves chunk boundaries.'\\n- Add telemetry to count orphaned metadata envelopes and provide alerting if >0.1% of resumed streams show truncated final token in any region.\\n- Follow-up ENG ticket INT-8121 to add a configurable stream_end sentinel for older runtimes.",
+  "attachments": [
+    "sse_capture_2026-03-09_18-22-13.txt",
+    "edge-proxy-pcap-2026-03-09.pcap"
+  ],
+  "notes_for_support": "If a customer reports similar symptoms, ask for: raw SSE capture, the session-id in question, client-side resume headers, and (if possible) tcpdump from the edge node. Offer a temporary workaround: reduce chance of midstream rebind by configuring shorter idle timeouts on intermediate proxies or enabling proxy passthrough for the chat endpoint. If customer cannot change proxy, recommend enabling the explicit 'stream_end' sentinel via an admin flag (back-ported for older runtimes by INT-8121).",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "expected_behavior",
+    "actual_behavior",
+    "investigation_notes",
+    "logs",
+    "comments",
+    "resolution",
+    "postmortem_followup",
+    "notes_for_support"
+  ],
+  "dataset_doc_uuid": "dsid_bac24735baf84e7390d2aac1c58e798c"
+}

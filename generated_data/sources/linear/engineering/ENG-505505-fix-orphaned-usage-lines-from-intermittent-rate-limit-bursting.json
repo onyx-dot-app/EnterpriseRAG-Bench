@@ -1,0 +1,56 @@
+{
+  "key": "ENG-505505",
+  "team": "engineering",
+  "title": "Fix orphaned usage lines caused by intermittent rate-limit bursting",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-03-10",
+  "creator": "Miguel Ortega",
+  "assignee": "Aisha Kapoor",
+  "project": "billing-stability",
+  "cycle": "2026-W09",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "billing",
+    "rate-limits",
+    "reconciliation",
+    "high-priority"
+  ],
+  "dependencies": [
+    "ENG-531200"
+  ],
+  "customer_impact": "medium",
+  "release": "billing-2026.03",
+  "security_review_required": "false",
+  "description": "Summary:\nIntermittent bursts from the token-bucket rate limiter are producing ephemeral request retries that create 'orphaned' usage lines in the internal usage ledger. These lines do not map to a stable request_id or webhook signature and therefore are dropped or misattributed during the Stripe/NetSuite export, resulting in invoice skews and later corrective credits.\n\nObserved behavior:\n- Customers see small unexpected credits (rate-limit refunds) or missing usage on invoices for high-throughput burst windows.\n- The billing export logs show usage_events with empty request_id or with request_id that was de-duplicated upstream by a retry gate, but the usage row persisted.\n- The reconciler cannot match these rows to invoice lines and some are left unexported (or exported under a generic 'retry' bucket) causing mid-cycle corrections.\n\nScope & impact:\n- Affects accounts that do heavy bursty traffic (tooling tests, synchronous SDKs with small backoffs).\n- Estimated ~0.4% of late-usage adjustments in Feb 2026 are attributable to these orphaned lines (query below).\n\nRoot cause hypothesis:\n- Retry amplification + request dedup path: when a request is rate-limited mid-request, the SDK/client retries with a slightly different idempotency key. The front-end gateway dedupes some retries but the metering hook records a usage row before dedupe reconciliation completes. That usage row lacks the stable export metadata (export_key/request_id_hash) and winds up \"orphaned.\"\n\nDetection query (used in prod->billing-runbook):\nSELECT u.account_id, COUNT(*) as orphan_count\nFROM usage_events u\nLEFT JOIN requests r ON u.request_id = r.id\nWHERE r.id IS NULL AND u.created_at >= '2026-01-01'\nGROUP BY u.account_id\nORDER BY orphan_count DESC\n\nRepro steps (dev env):\n1) Run a script with concurrent requests that intentionally triggers 429s from gateway (script in repo: tools/test-burst-retry).\n2) Observe usage_events created without request_id or with request_id that later disappears after gateway dedupe.\n3) Run the export reconciler locally; observe those rows flagged as unmapped and ending in the backfill queue.\n\nCurrent mitigation:\n- Short-term: reconciler now ignores rows with transient flags older than 3h to reduce premature credits (deployed 2026-02-28). This reduced noisy credits but left orphaned rows accumulating.\n\nProposal (full fix):\n1) Add stable linking field to usage_events: rate_limit_bucket_fingerprint (varchar(64), nullable) and export_origin_token (varchar(128)). This lets metering attach the bucket-level fingerprint to rows created during bursts so we can later group them deterministically.\n2) Update metering hook: emit export_origin_token when request passes through the retry-deduper; if deduper has not finalized, include bucket_fingerprint to the row.\n3) Reconciler change: enhance fuzzy-matcher to perform multi-key joins: by (request_id) OR (account_id, bucket_window, rate_limit_bucket_fingerprint). Add confidence score and a reconciliation action plan for low-confidence matches.\n4) Backfill job: billing.backfill.orphaned_usage to re-evaluate orphaned rows for the last 90 days, attaching matched request_ids where confidence > 0.85 and creating offset-commented invoice lines for anything older than invoice close window.\n5) Export behavior: for historical invoices that would change, create netting offset lines instead of mutating original invoice rows; add audit notes linking to the backfill run and reconciler candidate matches.\n\nImplementation details / migration steps:\n- DB migration (safe, online): add columns with null default, backfill in small batches. Name: 2026_03_add_usage_fingerprint.sql\n- Metering change: small patch in gateway (pkg/metering) to emit fingerprint; feature-flagged (flag: emit_bucket_fingerprint).\n- Reconciler: new matcher module billing.reconciler.fuzzy_matcher with unit tests.\n- Backfill: a one-off k8s job with streaming window and checkpointing to avoid double-work.\n\nSQL snippets used in backfill matching (example):\nUPDATE usage_events u\nSET matched_request_id = m.id, reconciler_confidence = m.score\nFROM (\n  SELECT u.id as id, r.id as id, 0.92 as score\n  FROM usage_events u\n  JOIN requests r ON r.account_id = u.account_id\n  WHERE u.rate_limit_bucket_fingerprint = r.bucket_fp\n  AND abs(date_part('epoch', u.created_at - r.created_at)) < 120\n  LIMIT 1000\n) m\nWHERE u.id = m.id;\n\nRisk & rollbacks:\n- Schema add is low risk.\n- Metering patch behind flag. If we see increased orphaning, flip flag off.\n- Backfill produces offset lines rather than editing invoices to minimize accounting risk. Backfill can be aborted and partial runs rolled back via the billing.backfill.audit table which tracks created offset line IDs.\n\nMonitoring & success metrics:\n- Dashboard: billing/exports/orphaned_usage (new) shows orphan count, backfill progress, reconciler confidence distribution.\n- Success criteria: reduce rate of orphaned usage events leading to late credits by 90% within two weeks of completing backfill and reconciler deploy.\n- Alert: orphaned_usage > 100/hr for > 30m -> P1 pager.\n",
+  "implementation_notes": "Planned code owners: @aisha (metering), @liam (reconciler), @sofia (backfill). Feature flag: emit_bucket_fingerprint. DB migration will be deployed with 0 downtime (add nullable columns), backfill run gated by 'billing-backfill-approval' runbook. Backfill will checkpoint to s3 prefix s3://redwood-billing/backfill/orphaned-usage/2026-03. Ensure rate-limit metrics preserved in telemetry.\n\nPRs and branches: \n- github.com/redwood-inference/metering PR: feature/emit-bucket-fp (TBD)\n- github.com/redwood-inference/billing PR: feat/fuzzy-reconciler (TBD)\n\nRunbooks to update: billing/README -> add section on orphaned usage, ops runbook: billing/backfill-orphaned-usage.md\n",
+  "tests": [
+    "Unit tests for fuzzy_matcher covering exact, bucket_fp, temporal-window joins",
+    "Integration test: run reconciler against synthetic burst dataset (tools/test-burst-retry) and assert >95% of orphaned rows get matched or offset lines created",
+    "Staging e2e: run backfill on 7-day window and verify exported invoice diffs are offset lines (no invoice mutation)",
+    "Load test: ensure reconciler fuzzy matching at production volume completes within SLA (90th percentile within 10m for 1M events)"
+  ],
+  "acceptance_criteria": [
+    "Schema columns added and migrations pass in staging",
+    "Metering emits bucket fingerprint behind flag and flag toggled on in staging without regressions",
+    "Reconciler fuzzy matcher successfully matches >85% of previously orphaned rows in staging backfill run",
+    "Backfill run produces offset lines for historical invoices older than invoice-close window and writes audit trail",
+    "Production dashboard shows orphaned_usage rate drop >= 90% and no spike in invoice diffs after rollout"
+  ],
+  "related_links": [
+    "https://confluence.redwood.ai/display/BILL/Orphaned+usage+investigation",
+    "https://github.com/redwood-inference/metering/pull/XXXX",
+    "https://github.com/redwood-inference/billing/pull/YYYY",
+    "https://grafana.redwood.ai/d/billing/exports?view=orphaned_usage"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "implementation_notes",
+    "tests",
+    "acceptance_criteria"
+  ],
+  "dataset_doc_uuid": "dsid_158bd7207d424149934acb99534da72d"
+}

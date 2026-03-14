@@ -1,0 +1,35 @@
+{
+  "title": "Microcadence survey: latency vs cost for stitch strategies (draft)",
+  "owner": "Ethan Morris",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/observability/microcadence-survey-latency-cost-stitch-draft",
+  "doc_type": "doc",
+  "created_at": "2026-04-11",
+  "last_modified": "2026-04-13",
+  "collaborators": [
+    "Priya Desai",
+    "Luca Moretti",
+    "Samira Kaur"
+  ],
+  "team": "engineering-observability",
+  "status": "draft",
+  "tags": [
+    "microcadence",
+    "stitching",
+    "latency",
+    "cost",
+    "sessionization",
+    "batching"
+  ],
+  "linked_artifacts": [
+    "JIRA-OPS-849",
+    "https://confluence.redwood.ai/display/OPS/Microcadence+Survey",
+    "https://github.com/redwood-inference/runner/pull/462"
+  ],
+  "body": "PURPOSE:\nQuick exploratory writeup of how \"microcadence\" (many tiny conversational turns with short idle gaps) trades latency for cost depending on stitch/prefetch strategies. This is a messy working doc \u2014 experimental notes + ascii charts + quick ops recommendations.\n\nBACKGROUND / MOTIVATION:\n- We see a growing workload pattern from a couple of customers: lots of short user messages (5\u201340 tokens) separated by 0.5\u20135s idle. Traditional session-oriented packing underuses slots; pure per-request serving pays high per-token overhead.\n- Idea: stitch multiple micro-turns either on the client (bundle before send) or on the server (speculative prefetch + soft-stitch) to amortize fixed per-request token overhead. Need baseline metrics for latency impact vs unit cost.\n\nEXPERIMENT SETUP (quick):\n- Model: open-llm-13b-ish (quantized profile used in Dedicated pool).\n- HW: A100-equivalent, 1 GPU per shard, session-slot model (typical Redwood Dedicated config).\n- Workloads simulated:\n  * micro-turn: 10 tokens prompt, 12 token generation, inter-turn gap 1s\n  * burst micro: 3 turns in 3s (tight), sparse micro: 3 turns across 12s (looser cadence)\n- Strategies compared:\n  A) naive (each turn -> independent request)\n  B) client-bundle (client collects turns up to 3 or 2s then sends as a single request)\n  C) server-stitch (server receives first turn, speculatively warm / prefetch KV and holds slot for 500ms waiting for come-one-more; attempts to stitch subsequent turns into same execution if they arrive)\n  D) partial-prefetch (server starts KV cache only, returns very-low-latency stub if no additional turns)\n- Metrics: p50/p95/p99 latency per-turn (end-to-end), cost per 1k turns (amortized GPU-seconds -> $), slot occupancy %, tail amplification factor (p99/p50).\n\nRAW OBSERVATIONS (coarse numbers \u2014 bench harness output):\n- naive:\n  p50: 120ms, p95: 420ms, p99: 980ms, cost per 1k turns: $3.40\n  slot occupancy: 12% (lots of idle between small requests)\n- client-bundle (optimal bundling when available):\n  p50: 180ms (per turn, because combined request adds marginal decode), p95: 520ms, p99: 1.1s, cost per 1k turns: $1.95\n  slot occupancy: 38%\n- server-stitch (500ms hold):\n  p50: 140ms (for stitched turns that arrive within hold), p95: 610ms (tails include waits), p99: 1.5s, cost per 1k turns: $2.10\n  slot occupancy: 29%\n- partial-prefetch:\n  p50: 125ms, p95: 465ms, p99: 1.05s, cost per 1k turns: $2.70\n  slot occupancy: 18%\n\nASCII CHART: (per-turn latency CDF sketch; x-axis ms, markers p50/p95/p99)\n- naive:  [ p50=120 | p95=420 | p99=980 ]\n- client-bundle: [ p50=180 | p95=520 | p99=1100 ]\n- server-stitch: [ p50=140 | p95=610 | p99=1500 ]\n- partial-prefetch: [ p50=125 | p95=465 | p99=1050 ]\n\nCOST VS LATENCY TRADEOFFS (interpretation notes):\n- Client-bundle gives the most cost savings at expense of predictable per-turn latency increase (since turns are explicitly batched). If the client can accept ~60ms extra p50, it's the cheapest.\n- Server-stitch reduces cost (vs naive) without client changes, but introduces variable added latency for stitched-turns and a longer tail due to the hold-window. It also increases slot occupancy which can hurt multi-tenant fairness.\n- Partial-prefetch looks like a sweet spot: small cost savings, minimal p50 increase, moderate tail. Works well when we can prefetch KV cheaply.\n\nSIMPLE VISUAL (cost per 1k turns vs p95 latency):\n- naive:   $3.40 @ p95 420ms\n- client-bundle: $1.95 @ p95 520ms\n- server-stitch: $2.10 @ p95 610ms\n- partial-prefetch: $2.70 @ p95 465ms\n\nNOTES / QUALIFIERS:\n- numbers above are synthetic from local bench harness. Absolute dollars depend on GPU config, preemption, etc.\n- Tail behavior for server-stitch is sensitive to hold-window and session churn. 500ms was chosen as midpoint; 200ms reduces tail but also reduces stitch-hit rate (and thus less cost benefit).\n- Client-bundle depends on product UX; long holds on client to aggregate degrade interactivity. For messaging apps where users type multi-turn quickly it's fine; not for voice agents.\n\nSAMPLE STITCH HIT RATES (from trace-replay):\n- burst micro (tight cadence): stitch hit-rate ~72% at 500ms\n- sparse micro (loose cadence): stitch hit-rate ~18% at 500ms\n- hit-rate -> directly maps to cost reduction roughly linearly (approx)\n\nOPERATIONAL CONCERNS / SAFETY:\n- Holding slots increases exposure to noisy tenants. Need per-tenant stitch caps or a slot-reservation budget.\n- Billing clarity: if turns are stitched on-server, how do we attribute tokens to customer invoices (we do, but need clear docs).\n- SLAs: customers expecting strict p95 guarantees may need opt-out from server-stitch.\n\nQUICK RECS (draft):\n- Offer server-side partial-prefetch as default: low disruption, small cost wins, low tail risk.\n- Add an opt-in client-bundle API for high-volume micro-cadence customers (docs + SDK helper).\n- For server-stitch, run a limited pilot with 2 customers, instrument stitch-hit and tail amplification (JIRA-OPS-849).\n- Add a console flag per-tenant to set stitch-window (0/200/500/1000ms) and show estimated cost delta in UI.\n\nNEXT STEPS / TODO:\n- (Ethan) run 2000-user trace replay across more model sizes (7b, 13b, 34b) \u2014 capture p50/p95/p99 + cost/time breakdown. target: Apr 20\n- (Priya) prototype console tickbox + cost estimate UI mock (link to mock in design PR)\n- (Luca) make a small bench PR that exposes stitch-hit rate metric to observability pipeline (prometheus label: stitch_window_ms)\n\nOPEN QUESTIONS:\n- Should stitch be tenant-configurable or product-level? Default-off for hosted API and default-on for Dedicated?\n- How do we present cost vs latency tradeoff to PMs and customers in plain language? Need 1-pager.\n- Are there legal/billing implications if server combines multiple physical requests into one billing event? need finance signoff.\n\nNOTES TO SELF:\n- save raw bench csvs under /bench/microcadence/apr11 and attach to JIRA-OPS-849\n- ping #serving-runtime with summary when pilot ready\n\nEND.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_5a4a5aa6d1c147b6b68332e4d30a612e"
+}

@@ -1,0 +1,78 @@
+{
+  "key": "SUP-921407",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Bursty client rollover causes resume gap and orphaned final-frame on streaming endpoints",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-14",
+  "updated_at": "2026-03-14",
+  "reporter": "Aisha Patel",
+  "assignee": "Marco Liu",
+  "customer_company": "BrightLexa Inc",
+  "customer_tier": "dedicated",
+  "environment": "prod | us-east",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "connection-manager"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "reconnect",
+    "priority-customer"
+  ],
+  "affected_models": [
+    "gpt-redwood-3b",
+    "gpt-redwood-2b-q4"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-14",
+  "linked_issues": [
+    "SUP-314159",
+    "SUP-4721"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/runtime/pull/8842"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/runbooks/streaming-reconnects"
+  ],
+  "description": "Issue summary:\nBrightLexa reports recurring incomplete final events and short resume gaps when their clients rapidly rotate websocket/SSE client IDs during heavy fan-out. Impact: users observe missing closing choice/token and occasionally two partial final fragments (one live, one after resume) which cannot be stitched. This breaks downstream transcript consumers and causes duplicate billing events.\n\nImpact:\n- ~20% of large streaming responses for this customer have a missing terminal choice or produce an orphaned trailing fragment after resume.\n- Affects production us-east serving for dedicated cluster.\n- Customer workflows that rely on exactly-one final event fail validation.\n\nEnvironment:\n- Dedicated capacity cluster: redwood-dedicated-us-east-1\n- API: streaming SSE + websocket fallbacks for clients behind CDNs\n- Client behavior: aggressive client-id rotation on reconnect (30\u201390s TTL), many short-lived connections in <1s bursts from edge fleet behind a custom proxy.\n\nSteps to reproduce (customer-provided):\n1. Create a streaming chat request pinned to gpt-redwood-3b on dedicated region us-east.\n2. Simulate 150 concurrent clients that each open a stream for 45\u2013120s and then rotate client-id and reconnect immediately (bursty rollover).\n3. Introduce a proxy-level short TCP FIN/RESET during one reconnect window (can be reproduced using a flaky proxy).\n4. Observe some sessions where the client receives a final token chunk but the server later emits a resume fragment that contains overlapping/truncated metadata and no explicit end-event.\n\nObserved behavior:\n- Client receives an apparently-complete final fragment (content tokens + metadata end flag) then on reconnect receives another fragment containing the last 20\u201350 tokens (partial overlap) without end-event.\n- In some traces, the original final-event is accepted by API gateway but connection tombstone is not removed promptly; subsequent route to a different serving node replays cached tail fragment.\n- Logs show HTTP/2 RST_STREAM or short-lived h2 stream resets correlated with these customer reconnect bursts.\n\nExpected behavior:\n- When a client reconnects and resumes, the system should either deliver a single canonical terminal fragment or clearly emit a resume boundary and the end-event exactly once. No duplicate or orphaned final fragments.\n\nLogs / snippets (redacted):\n[proxy] 2026-03-14T15:02:12Z client-id=cli-42 FIN recv; upstream h2 RST 0x1c\n[api-gateway] 2026-03-14T15:02:12Z session=ses-8ac accept final-choice seq=184 end=true\n[serving-runtime] 2026-03-14T15:02:13Z session=ses-8ac tombstone=true node=node-7 cached-tail-seq=184\n[router] 2026-03-14T15:02:13Z session=ses-8ac route->node-3 resume request id=res-1\n[serving-runtime] 2026-03-14T15:02:13Z session=ses-8ac emit tail seq=168 partial=true end=false\n\nTemporary workaround provided to customer:\n- Increase client-id TTL so reconnects are less bursty (client-side change).\n- Enable shorter cache eviction on dedicated cluster nodes (ops knob) to avoid stale tombstones while we investigate.\n\nAdditional notes: customer provided packet captures and proxy logs; we have permission to reproduce on a staging clone of their traffic pattern.",
+  "steps_to_reproduce": [
+    "Simulate 150 concurrent streaming clients with client-id rotation TTL 30-90s behind a proxy that injects short TCP resets",
+    "Pin requests to gpt-redwood-3b on dedicated us-east cluster",
+    "Introduce a short h2 RST during reconnect window and observe duplicate/orphaned final fragments"
+  ],
+  "comments": [
+    "2026-03-14 16:10 UTC - Aisha Patel (Support): Opened ticket after initial customer report; attached pcap and proxy logs. Escalating to infra due to possible h2 reset race.",
+    "2026-03-14 16:45 UTC - Marco Liu (SRE): Assigned. Initial hypothesis: tombstone eviction race combined with proxy-level h2 RST causing the router to re-deliver cached trailing queue to a different node.",
+    "2026-03-14 17:05 UTC - Eng (runtime): Reproduced on a dedicated staging cluster with a proxy fault injector. Observed cached-tail emission from node if tombstone removal delayed >300ms. Created instrumented trace PR to add tombstone TTL metrics: github.com/redwood-inference/runtime/pull/8842.",
+    "2026-03-14 18:22 UTC - Support (Aisha): Shared temporary workaround with customer; they validated that increasing client-id TTL reduced incidence from ~20% to ~2%.",
+    "2026-03-14 19:00 UTC - Marco Liu: Rolling a small change to lower default tombstone TTL in dedicated clusters to 200ms as an experiment (ops change id: OPS-3321). Monitoring for regressions.",
+    "2026-03-14 20:12 UTC - Eng: Deployed tracing patch to staging; captured a deterministic replay showing race between gateway ACK and tombstone GC causing a second fragment emission when route changed nodes."
+  ],
+  "investigation_notes": [
+    "Hypothesis 1: Tombstone GC window too long allowing router to consider session active on another node and re-send cached tail when a new handshake arrives",
+    "Hypothesis 2: HTTP/2 RST on the upstream path sometimes leaves gateway in 'accepted final' state while runtime still has cached partial result; resume flow lacks strong idempotency checks for terminal fragments",
+    "Found: tombstone removal currently runs on a soft timer (500ms) and is not immediately observable by router; router relies on session metadata staleness check that uses last-seen timestamp only",
+    "Found: some proxies in customer path inject FIN before ACK which generates a short race and h2 RST observable in logs"
+  ],
+  "resolution_notes": "Work in progress. Immediate mitigation: customer-side TTL increase and ops knob to lower tombstone TTL rolled to experiment. Engineering changes planned: (1) add explicit terminal-fragment idempotency token and server-side dedupe on resume flow, (2) instrument tombstone lifecycle with high-cardinality traces and metrics, (3) add fast-path tombstone invalidation on gateway when it sees an accepted final event. Target: deploy dedupe fix and gateway invalidation in next sprint; follow-up rollback plan in case of regressions.",
+  "fix_version": "TBD",
+  "postmortem_link": "",
+  "resolution": "Unresolved - fix in development",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_a7a8f7cd70d44aa2b76b56b39b8475af"
+}

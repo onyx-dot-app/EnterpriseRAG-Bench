@@ -1,0 +1,111 @@
+{
+  "key": "ENG-35412",
+  "team": "engineering",
+  "title": "Timezone boundary + out-of-order ingestion causing transient double-counts in per-model usage charts",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-12",
+  "creator": "Marco Li",
+  "assignee": "Asha Patel",
+  "project": "Console - Usage Analytics",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "billing",
+    "metering",
+    "backfill",
+    "timezone",
+    "rate-limits",
+    "observability"
+  ],
+  "customer_impact": "medium",
+  "release": "console-2026.03",
+  "description": "Summary: Several customers reported brief, unexplained increases in per-model token and embedding counts around midnight UTC and during DST transitions. Investigation shows a sequence of contributing issues: (1) some ingestion sources emit events with local timezone timestamps (without normalized UTC), (2) our late-event/backfill ingestion path accepts events with timestamps in the future of the aggregation window, and (3) rate-limit retry behavior re-emits identical request events with new event_ids, leading to duplicate counting when backfills and retries overlap. The combined effect produces transient double-counts and small negative deltas after reconciliation. This ticket defines the diagnosis, fixes in the ingestion and aggregation pipelines, and a safe rollout + reconciliation strategy.",
+  "steps_to_reproduce": [
+    "1) Simulate client sending generation events with local timestamps set to 'YYYY-MM-DDT23:58:xx+01:00' (no UTC normalization).",
+    "2) Trigger a simulated rate-limit retry that re-submits the same generation with a new event_id and slightly later timestamp (e.g., +00:02).",
+    "3) Run the backfill consumer which accepts late events and inserts them into the raw-timeseries table without deduplication or watermark checks.",
+    "4) Observe the console per-model hourly chart: a spike at the late-event hour and a small negative correction when reconciliation runs next day."
+  ],
+  "investigation_logs": [
+    "2026-03-02: Triage \u2014 received user report from Customer Success (acct: acme-ml) showing +18% spike at 00:00 UTC on 2026-02-28.",
+    "2026-03-03: Correlated spike with ingestion logs \u2014 found events with timezone offsets in payloads (e.g., +01:00) and no normalization to UTC at edge.",
+    "2026-03-04: Found ~12% of affected events originated from SDK versions < 1.9 that did not set 'timestamp_utc' header. Also saw retry patterns from gateway with new event_ids when rate-limit 429 responses occurred.",
+    "2026-03-05: Aggregation team confirmed backfill consumer inserts late events into aggregation table with only a dedup key of (customer, model, hour) which is insufficient when identical calls are retried with new ids.",
+    "2026-03-09: Reproduced locally using synthetic stream; observed transient double-counts and small negative corrections after reconciliation run."
+  ],
+  "root_cause_analysis": [
+    "Missing UTC normalization at ingestion \u2014 several upstream SDKs and partners emit local-timestamp fields that are not converted to a canonical UTC timestamp before downstream processing.",
+    "Backfill consumer accepts 'future' timestamps relative to aggregation watermark and inserts them into hourly buckets without enforcing watermark/late-window limits.",
+    "Retry duplicate events are given new event_ids by the gateway; our current dedupe uses event_id only, so retried requests bypass dedupe and get counted twice.",
+    "Aggregation logic allows insertion of late events into past buckets which creates spikes; reconciliation later subtracts what it thinks is duplicate, causing negative corrections in chart deltas.",
+    "UI smoothing highlights these transient artifacts, which confuses customers and triggers support tickets."
+  ],
+  "decision": [
+    "Normalize timestamps at the ingestion edge to a canonical 'received_utc' before any downstream processing; prefer server-received UTC over client-supplied local timestamps when present.",
+    "Introduce a watermarking policy per-customer: only accept backfill events with timestamp <= now + 5m and >= now - 7d. Events outside the window go to a quarantine topic for manual review/reconciliation.",
+    "Improve deduplication to use (canonicalized_event_signature, customer, model, request_hash) where canonicalized_event_signature derived from call payload + client_request_id if present. This ensures retry-with-new-event-id does not double-count.",
+    "Add idempotency hooks to the gateway so retries reuse original event_signature when possible.",
+    "Enhance aggregation to compute token counts using monotonic counters when available and ignore tiny negative corrections in UI smoothing; surface a 'backfill' badge on chart points that were modified by reconciliation."
+  ],
+  "implementation_plan": [
+    "A. Ingestion edge (edge-service): add middleware to parse timezone offsets and set 'ingest_received_utc' header. If client timestamp present, compute canonical UTC and store both client_ts and canonical_ts.",
+    "B. Gateway: extend request metadata to include client_request_id and original_event_signature; on retry, maintain original_event_signature when payload identical.",
+    "C. Backfill consumer: enforce watermark window; route out-of-window events to quarantine topic and add extra dedupe layer using request_hash in addition to event_id.",
+    "D. Aggregation service: change dedupe key to include request_hash/canonical_signature and add idempotent upsert path. Add metric: 'duplicate_events_rejected'.",
+    "E. Console UI: ignore negative delta adjustments less than 0.5% of hourly bucket when smoothing; add a small indicator on affected points with a tooltip explaining backfill reconciliation.",
+    "F. Data migration: run a reconciliation job for the last 14 days for tenants with spikes to dedupe duplicates based on newly computed request_hashes and re-compute per-model hourly aggregates.",
+    "G. Rollout via feature flag: enable ingestion changes in canary region (us-west-2) for 48 hours, then expand to 10% of tenants before full rollout."
+  ],
+  "testing_and_qa_criteria": [
+    "Unit tests: timezone parsing and canonicalization for a variety of offsets and DST transitions.",
+    "Integration tests: retry scenarios where gateway resubmits requests with new event_id but identical payload \u2014 ensure dedupe prevents double-counting.",
+    "Load test: ingestion path with 10k events/s including 2% out-of-order events \u2014 aggregation correctness should hold and latency SLOs met.",
+    "Backfill acceptance tests: events outside watermark should land in quarantine topic and not affect hourly aggregates.",
+    "UI test: chart smoothing does not show negative blips > 0.5% and backfill badge appears on modified points.",
+    "Manual verification: run reconciliation for a seeded tenant and confirm chart aligns to expected single-count totals."
+  ],
+  "rollback_plan": [
+    "If duplicates increase after rollout, toggle feature flag to revert new dedupe behavior on gateway and ingestion (can revert within 15 minutes).",
+    "If reconciliation job produces unexpected drops, pause and revert to snapshot-backed restore of the affected aggregation partitions and investigate logs.",
+    "Quarantine topic will contain any out-of-window events so rollback will not lose data \u2014 manual reingest path available."
+  ],
+  "monitoring_and_alerting": [
+    "New metric: duplicate_events_rejected (per-customer) \u2014 alert if > 0.5% of total events for 5m.",
+    "New dashboard: ingestion-timestamp-origin (client_ts vs ingest_received_utc) and fraction of events with missing client_request_id.",
+    "Alert: sudden >10% hour-over-hour change in per-model token counts for a tenant with tag 'sensitive' \u2014 route to on-call telemetry pager.",
+    "Post-rollout check: compare canary tenants' hourly aggregates before/after rollout and ensure < 0.2% variance for steady workloads."
+  ],
+  "links": [
+    "https://confluence.redwood.ai/pages/UsageAnalytics/Timezone-and-Backfill-Ingest",
+    "https://github.com/redwood-inference/edge-service/pull/4823",
+    "https://github.com/redwood-inference/gateway/pull/2149",
+    "https://grafana.redwood.ai/d/usage/per-model-hourly?orgId=1&from=now-14d&to=now",
+    "https://drive.redwood.ai/Shared/ingest-watermark-design.md"
+  ],
+  "comments": [
+    "2026-03-03 Marco Li: Initial triage \u2014 looks like a combination of timezone-unaware SDKs + retries. Assigned to Asha for ownership.",
+    "2026-03-04 Asha Patel: Reproduced locally. I'll get a prototype dedupe using payload hashing in the backfill consumer tomorrow.",
+    "2026-03-05 Riley Chen (aggregation): We need to be careful updating aggregation upserts \u2014 will coordinate migration window to avoid write conflicts.",
+    "2026-03-06 Dana Ortiz (console): UX agrees with backfill badge and negative-delta hiding; will supply exact tooltip text and mockups by 2026-03-08.",
+    "2026-03-09 Marco Li: Canary plan approved. Data-migration job queued as job-id: dm-2026-0310-42.",
+    "2026-03-11 Asha Patel: Gateway PR merged with idempotency hook. Edge-service PR in review (edge-service#4823).",
+    "2026-03-12 Marco Li: Enabled canary for 5 tenants in us-west-2; monitoring dashboard shows duplicate_events_rejected ~0.12% \u2014 within expected range."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "investigation_logs",
+    "root_cause_analysis",
+    "decision",
+    "implementation_plan",
+    "testing_and_qa_criteria",
+    "rollback_plan",
+    "monitoring_and_alerting",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_b2a85703f402498696d2649013052fae"
+}

@@ -1,0 +1,79 @@
+{
+  "key": "SUP-547203",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "SSE prefetch race during client rebind omits final quotation and trailing sentence on long-streams",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-13",
+  "updated_at": "2026-03-14",
+  "reporter": "Aisha Kaur",
+  "assignee": "Miguel Santos",
+  "customer_company": "NimbleRetail Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "api-gateway",
+    "edge-proxy",
+    "console"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "reconnect",
+    "prefetch",
+    "investigation"
+  ],
+  "environment": "prod | us-west",
+  "affected_models": [
+    "redwood-chat-v1-large"
+  ],
+  "affected_regions": [
+    "us-west"
+  ],
+  "sla_due_at": "2026-03-14",
+  "first_response_due_at": "2026-03-13",
+  "linked_issues": [
+    "SUP-314159",
+    "SUP-420420"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/1489"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SRE/SSE+Streaming+Handoff+Runbook"
+  ],
+  "description": "Issue summary:\nCustomer on Dedicated capacity observes that long SSE streams frequently finish with the final closing quotation mark and the last sentence missing when the client's connection is re-bound (client IP/port change) during the last 2\u20135s of streaming. The output in the UI and delivered events show a truncated last token and no terminal metadata event.\n\nImpact:\n- NimbleRetail reports ~6% of long streaming completions (>8k tokens) are missing the closing quote and trailing sentence, causing downstream parsers to fail.\n- Customer uses streaming for generating product descriptions; truncated output is causing UI errors and data loss.\n\nEnvironment:\n- Dedicated pool: dp-03 (GPU32) in us-west.\n- Client: browser + corporate sidecar that performs cookie refresh and socket rebinds on auth refresh.\n- Request pattern: SSE streaming with prefetched KV priming and keepalive heartbeats enabled. Model pinned to redwood-chat-v1-large.\n\nSteps to reproduce (observed by customer):\n1) Start a long streaming generation (approx 10\u201312k tokens) over the SSE endpoint with multiplexing enabled.\n2) Trigger an auth cookie refresh (customer sidecar) so the browser reconnects/rebinds socket within the last 3\u20136 seconds of the stream.\n3) Observe final SSE messages: trailing tokens omitted, final QUOTE (\\\") and last sentence missing; no explicit terminal 'done' metadata event is delivered.\n\nObserved vs Expected:\n- Observed: truncated final payload, missing terminal metadata event, client receives a short keepalive and then a new resumed session with duplicated prefix but without the final fragment.\n- Expected: resume should deliver the missing terminal tokens and terminal metadata or fall back to a compatible model variant and emit a 'fallback' metadata event.\n\nRelevant logs & traces (sanitized):\n- edge-proxy request id: ep-20260313-77a2\n- serving-runtime trace: trace-77a2-0b9c\n- last SSE lines captured by customer sidecar: \"...and the final recommendation is to choose the Eco series for durability\n\n--KEEPALIVE--\"\n- server-side tail from worker: \"choice_end: token_idx=9860; last_emitted_token=\\\"lack\" (note: trailing quote not emitted)\n\nWorkaround (customer):\n- Short-term: increase client keepalive window to avoid rebind in the final 10s, disable aggressive sidecar socket rebind, or reduce request chunk size (shorter streams).\n\nNotes:\n- Customer provided packet captures showing IP/port rebind and immediate new connection to edge with replayed prefix but missing final fragment.\n- No billing impact reported.\n",
+  "comments": [
+    "2026-03-13 09:42 \u2014 Aisha Kaur: Customer reported via support portal. Attached sample transcript and pcap. Logs reference ep-20260313-77a2.",
+    "2026-03-13 10:05 \u2014 Miguel Santos: Acknowledged. Assigned to SRE to reproduce internally. Requesting exact request payload and SSE headers (Authorization, X-Client-Id).",
+    "2026-03-13 12:18 \u2014 NimbleRetail (customer): Sent sanitized SSE request headers and sample pcap. Noted their sidecar does quick auth refresh every ~180s and rebinds sockets on token rotation.",
+    "2026-03-13 14:33 \u2014 Miguel Santos (SRE): Reproduced with local sidecar simulation. Observed race between prefetch/kv-priming and session handoff; worker emitted final token but edge proxy closed stream before terminal metadata could be flushed.",
+    "2026-03-14 08:12 \u2014 Eng (runtime): Looking at commit history in serving runtime; suspect a windowing change in streaming flush introduced in v1.12.5. Opening PR to ensure flush is tried before connection close on handoff. See PR linked.",
+    "2026-03-14 11:00 \u2014 Miguel Santos: Proposed mitigation at edge: hold close for 250ms when an in-flight terminal event is pending. Requesting deploy to staging for validation."
+  ],
+  "investigation_notes": [
+    "Initial reproduction: simulated client sidecar rebind while stream was in finalization phase produced truncated output consistently in 7/10 runs.",
+    "Hypothesis: race between edge-proxy connection swap and serving-runtime flush of terminal buffer. Edge currently uses aggressive half-close to speed connection handoff; terminal metadata flush path is being preempted.",
+    "Telemetry: worker trace shows final token emitted but with emit_time ~= close_time - 25ms. Edge logs show connection close initiated immediately on new bind acknowledgement, without waiting for full flush acknowledgment.",
+    "Related to change in http/1.1 chunked flush heuristics introduced in edge-proxy v2.8.0 (rollback candidate).",
+    "Observed duplicated prefix on resume: resume-path replays prefix from checkpoint which masks missing tail tokens for short time but does not trigger final meta event emission.",
+    "Customer sidecar behavior: rebind occurs with 0\u201350ms gap between old socket teardown and new socket establish; during this gap, keepalive was interpreted by edge as session end and triggered upstream cleanup."
+  ],
+  "resolution_notes": [
+    "Mitigation applied: edge-proxy change to hold half-close for 300ms when finalization tokens are detected in trace header 'x-stream-finalizing'. Deployed to staging (ep-2 staging cluster) for verification.",
+    "Immediate customer workaround documented: increase sidecar rebind quiet window to >500ms during streaming or disable automatic socket rebind while stream active.",
+    "Follow-ups: (1) Roll PR to serving-runtime to add explicit terminal-flush-ack path so worker waits for edge confirmation before freeing terminal buffer. PR: https://github.com/redwood-inference/serving-runtime/pull/1489. (2) Add a console alert when resumed sessions replay prefix more than 2x within 10s (to detect masking of missing tails).",
+    "Postmortem action: add an SLO test for long-stream handoff scenarios in our chaos harness; create runbook entry to triage future occurrences.",
+    "Status: patch under review; staging validation shows missing-quote rate dropped to 0/20 reproductions. Planning controlled deploy to prod edge canaries tomorrow morning US window."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_17349ff53a1c42a2becee5da7c7ea9a7"
+}

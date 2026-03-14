@@ -1,0 +1,51 @@
+{
+  "key": "ENG-208443",
+  "team": "engineering",
+  "title": "Evicted KV cache causing misattributed tool outputs and JSON parse failures under proxy retry",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-22",
+  "updated_at": "2026-03-13",
+  "creator": "Aisha Raman",
+  "assignee": "Devon Park",
+  "project": "runtime-parser-hardening",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "customer-escalation",
+    "kv-cache",
+    "toolcall",
+    "parser",
+    "hotfix"
+  ],
+  "dependencies": [
+    "ENG-31209",
+    "ENG-143210"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-2.4.1",
+  "security_review_required": "false",
+  "description": "Summary: Production customer (AcmeAI, Dedicated) reported intermittent corrupted tool/function call outputs and downstream JSON parse errors. Errors appear during sustained high throughput with streaming toolcall responses and proxy retries: multiple customers (Hosted, Dedicated, and some Private customers running older runtime packages) observed structured JSON envelopes that were either truncated, duplicated, or contained interleaved fragments from different invocations, causing downstream parsers to throw and customer jobs to fail.\n\nObserved impact:\n- Customer-facing failures (service errors and data loss) for 3 large customers during peak windows (lasting ~30-90s per incident).\n- Elevated error rate in streaming/function-call telemetry and >10% increase in structured-output JSON parse exceptions for impacted tenants.\n\nRoot cause hypothesis (confirmed by logs & heap dumps):\n- Under memory pressure and high concurrency, the local KV cache used to hold partial toolcall fragments evicted entries aggressively. Eviction logic reused short-lived session tags / correlation tokens too quickly.\n- When the edge/proxy retried a connection (network blips / customer proxy retries), fragments belonging to a previous invocation (with a recently recycled tag) were accepted and merged into the new invocation stream.\n- The stream reassembly code assumed per-session monotonically increasing fragment sequence IDs but did not protect against tag reuse. When interleaved fragments from two different invocations merged, the structured output serializer emitted malformed JSON (partial escape sequences, duplicate keys, and multibyte UTF-8 codepoint splits across fragments) which our parser surface-level detection failed to recover from.\n- This path is exercised by streaming tool outputs with function/toolcall envelopes + proxy retries + KV cache eviction race. Hosted is protected partially by longer tag TTLs, but Dedicated tenants with tight memory constraints were exposed. Private installs with older runtime images lacked the reassembly guards.\n\nEnvironments affected: Hosted API (edge/proxy path), Dedicated (tenant-level KV eviction under heavy load), Private (older runtime images without reassembly guards).\n\nRepro steps (internal harness):\n1) Start runtime with small KV cache limit and enable streaming toolcall test harness.\n2) Issue N concurrent toolcall streams that produce multi-fragment structured outputs (simulated nested tool responses, including multibyte UTF-8 characters and function output with JSON inside strings).\n3) Induce eviction by ramping concurrent requests to exceed KV cache capacity and trigger proxy connection retries (simulate transient 502/timeout).\n4) Observe merged fragments and JSON parse failures in logs.\n\nQuick mitigation (customer-facing):\n- For Dedicated customers: increase KV cache capacity (config knob) and temporarily disable proxy automatic retry for streaming endpoints. We rolled this out to AcmeAI during the incident window and error rate dropped to baseline.\n- For Hosted: extended tag TTL from 60s to 300s for high-risk tenants while patch is prepared.\n- For Private: instruct customers to upgrade to runtime-2.4.1-rc with the guard patch once released.\n\nProposed permanent fix (implementation summary):\n1) Add sequence-protected session IDs: attach a monotonically incremented incarnation counter to session tags so tags cannot be recycled into active sequences for X minutes.\n2) Harden the reassembly logic: validate fragment ownership by (session-tag, incarnation, fragment-seq) tuple; drop or quarantine fragments with mismatched incarnation. Log with high-cardinality reason codes for easier post-incident grouping.\n3) Add atomic eviction hook: when KV eviction removes a partial invocation, increment the incarnation for that session tag to avoid future reuse race.\n4) Tighten UTF-8 boundary handling: reassembly code now buffers partial codepoints across fragments and validates decoder boundaries before JSON emission.\n5) Add idempotency checks and deduplication for fragments arriving after proxy retries.\n6) Add end-to-end integration tests that simulate eviction + retry + streaming fragments (harness added to runtime test-suite).\n\nCode/PRs and artifacts:\n- Runtime PR with patch + unit tests: https://github.com/redwood-inference/runtime/pull/1279\n- Integration harness for reproduction: https://github.com/redwood-inference/replay-harness/commit/5b9c4b2\n- Confluence postmortem & mitigation playbook: https://redwood.atlassian.net/wiki/spaces/ENG/pages/908271234/ENG-208443+KvCache+Eviction+Misattribution+Postmortem\n- Customer incident dashboard (internal Grafana): https://grafana.redwood.ai/d/streams/toolcall-parser-errors\n\nTesting & QA notes:\n- New unit tests added for fragment sequence validation and UTF-8 boundary buffering.\n- Integration test simulating eviction/retry reproduces pre-fix failure and passes post-fix.\n- Load test performed on dedicated staging cluster (mirror of AcmeAI config) for 48h with sustained concurrency; no regressions observed in latency or throughput beyond small additional byte-level checks.\n\nRollout plan:\n- Merge to runtime/main and ship runtime-2.4.1-rc to Dedicated staging lane (canary 5% of Dedicated hosts) for 48h.\n- If stable, expand canary to 30% of Dedicated and selected Hosted tenants (low-risk) for 72h.\n- Full rollout to Hosted and Dedicated within 7 days if no regressions.\n- Publish patch notes and targeted notification to Private customers with upgrade instructions.\n\nAcceptance criteria:\n- No new occurrences of misattributed fragments in canary logs for 72h.\n- Integration harness shows 100% success on 2000 simulated eviction+retry cycles.\n- Customer (AcmeAI) confirms no recurrence after Dedicated patch is applied.\n\nOpen follow-ups / technical debt:\n- Add analytics to trace fragment assembly hits/misses per tenant to proactively detect tag-reuse risk.\n- Consider stronger isolation for tenant KV caches (configurable hard limits per-tenant).\n\nBusiness/CS follow-up:\n- Solutions Eng to send final incident summary to AcmeAI with remediation steps and credits for downtime.\n- PM to schedule a customer briefing and provide patch ETA.\n\nNotes for reviewers:\n- This touches core runtime reassembly; please focus review on the incarnation token semantics and eviction atomicity. Avoid introducing additional shared mutable state without locks.\n- Watch for performance regressions in the hot path: added checks are minimal and optimized in C++ path used by the runtime.\n",
+  "comments": [
+    "2026-02-22: Initial report from AcmeAI support \u2014 structured outputs occasionally corrupted during peak. Escalated to ENG on call. (Aisha)",
+    "2026-02-23: Triage call with infra and runtime teams; reproduced locally with small-kv limit. (Devon)",
+    "2026-02-25: Confirmed fragment interleaving + tag reuse in heap traces. Began design for incarnation counter approach. (Devon)",
+    "2026-03-01: Hotfix mitigation applied for AcmeAI (increased kv cache limit + disabled streaming proxy retry). Error rate dropped. (SRE)",
+    "2026-03-05: PR opened with core fixes + unit tests. Requested additional review from parser owners. (Devon) https://github.com/redwood-inference/runtime/pull/1279",
+    "2026-03-10: Integration tests added to CI and passing in staging. Running dedicated canary. (QA)",
+    "2026-03-13: Preparing rollout plan; notify PM/CS for customer communications. (Aisha)"
+  ],
+  "attachments": [
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/908271234/ENG-208443+KvCache+Eviction+Misattribution+Postmortem",
+    "https://github.com/redwood-inference/runtime/pull/1279",
+    "https://github.com/redwood-inference/replay-harness/commit/5b9c4b2",
+    "https://grafana.redwood.ai/d/streams/toolcall-parser-errors"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_f33e57523313441a90f09098ccab4464"
+}

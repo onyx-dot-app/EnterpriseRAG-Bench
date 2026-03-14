@@ -1,0 +1,52 @@
+{
+  "key": "ENG-99502",
+  "team": "engineering",
+  "title": "compact-tenant-payload-and-sparse-indexing-strategy",
+  "status": "Planned",
+  "priority": "P1",
+  "created_at": "2026-02-25",
+  "updated_at": "2026-03-14",
+  "creator": "Asha Patel",
+  "assignee": "Miguel Herrera",
+  "project": "Control Plane DB Tech Debt",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "due_date": "2026-04-10",
+  "labels": [
+    "db-migration",
+    "schema-refactor",
+    "performance",
+    "tech-debt"
+  ],
+  "dependencies": [
+    "ENG-28901",
+    "ENG-34177"
+  ],
+  "description": "Problem: multiple control-plane hot reads (tenant queries, list endpoints) scan wide rows containing large JSONB blobs and denormalized metadata. This increases IO, bloats indexes, and drives CPU spikes on small fleet sizes. We've observed repeated contention on the tenant manifest read path during onboarding bursts and high WAL generation on writes that include full payloads.\n\nThis ticket proposes a low-risk refactor: move large, infrequently-read JSON payloads out of the hot tenant table into a compact tenant_payloads table and introduce targeted sparse/partial indexes on the hot read columns. The goal is to reduce average row width, shrink working set size, and improve p95 read latency while keeping a zero-downtime migration path.\n\nKey trade-offs:\n- Pro: smaller primary table \u2192 faster index scans, lower memory pressure, cheaper backups.\n- Pro: easier online partial index strategy (indexes no longer include JSONB).\n- Con: additional join/lookup when payload is needed (optimizable via caching and prefetching).\n- Con: adds a second table to maintain in writes/backfills and increases write path complexity when creating/updating payloads.\n\nWhy now: recent incidents (see incident runbook links below) and SLO regressions indicate this hot-row problem is the most cost-effective debt to pay down before scaling Dedicated capacity further.\n\nReferences:\n- Incident summary: https://go.redwood/incident/controlplane-2026-02 (internal)\n- Design doc: https://confluence.redwood.ai/display/ENG/Compact+Tenant+Projections+Design\n",
+  "acceptance_criteria": "1) Primary control_plane.tenants table median row width reduced by >=40% measured on a representative snapshot.\n2) P95 read latency for tenant list endpoints improves by >=25% in staging under replayed traffic.\n3) No visible write path regressions: write latency p99 delta < +10% and no increase in error rate.\n4) Online migration completes without >1min of sustained elevated DB locks or any >1min write errors.\n5) Rollback path exercised in staging and documented.\n6) Migration has associated dashboard panels and alerting for backfill progress and WAL growth.",
+  "plan_steps": "1) Schema: Add table control_plane.tenant_payloads(payload_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id UUID NOT NULL, payload JSONB NOT NULL, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, CONSTRAINT fk_tenant FOREIGN KEY (tenant_id) REFERENCES control_plane.tenants(id) ON DELETE CASCADE).\n2) Add control_plane.tenants.payload_id UUID NULL.\n3) Backfill: write an idempotent background worker that scans tenants in batches (LIMIT/OFFSET or cursor) and inserts payloads, then updates payload_id in the tenant row in a single transaction per batch. Use small batches (500\u20132k) and sleep between batches to avoid saturation.\n4) Add partial indexes on tenants for the most-common read predicates (e.g., WHERE active = true AND last_seen > now() - interval '90 days'), and expression indexes for lower(name) where used for case-insensitive search.\n5) Shadow reads: deploy application change to read from tenant_payloads when payload_id is present, but avoid deleting payload column yet (shadow+compare). Collect metrics to confirm parity.\n6) Cutover: once shadow reads are validated, stop writing payload to tenant JSONB and write to tenant_payloads instead (single transaction: insert/update payloads then set payload_id).\n7) Cleanup: after a 2-week observation window and full telemetry validation, drop JSONB column and related indexes, and run VACUUM/ANALYZE and a compaction job for the table.\n8) Post-migration: update runbooks, dashboards, and add a lightweight cache for payload reads (LRU TTL) in the control plane service to reduce join costs for hot tenants.",
+  "migration_steps": "- Pre-migration: add new schema objects (tenant_payloads table and payload_id column) during a normal deploy. Add intended indexes concurrently where supported (CREATE INDEX CONCURRENTLY).\n- Backfill: run backfill worker with guarded rate limits; run in staging first with production-sized dataset replay to validate time and WAL.\n- Cutover: flip reads in canary (5% traffic) then 25%, 100% once metrics stable.\n- Post-cutover: run a final consistency sweep comparing hash(payload) between old column and payload table for random sample of rows.\n- Cleanup: ALTER TABLE ... DROP COLUMN payload using online-safe statements; rebuild indexes; run VACUUM FULL during low traffic window if required.",
+  "rollback_plan": "- If backfill errors: stop worker, revert worker code, mark migration as paused, and escalate. The tenants table retains original payload until cleanup, so rollback is to pause and resume after fix.\n- If cutover causes read regressions: rollback app reads to original column by switching feature flag; keep newly written payloads in payloads table (will be reconciled by re-run backfill).\n- If DROP COLUMN accidentally issued prematurely: restore from PITR snapshot to a pre-cleanup timestamp (document RTO/RPO expectations and coordinate with DBA).",
+  "rollout_notes": "- Use feature flag gating for reading from tenant_payloads.\n- Canary on a small set of internal tenants first (team-owned test tenants) to validate end-to-end behavior.\n- Inform downstream teams (billing, onboarding) about potential increased latency for payload-heavy operations during migration.\n- Schedule heavy compaction and VACUUM jobs in low-traffic windows (weekend nights regionally).",
+  "telemetry_and_kpis": "- Dashboard panels to add: backfill progress (rows processed / total), migration worker lag, DB CPU, p95/p99 read latency for /v1/tenants endpoints, WAL generation rate, index bloat estimate.\n- KPIs: tenant read p95 down by >=25%, average DB RSS memory down by >=15%, index size of tenants main index down by >=30%.\n- Alerts: backfill stuck > 30m, WAL growth > 2x baseline for 15m, p95 tenant read latency > baseline + 50%.",
+  "comments": [
+    "2026-02-27 \u2014 Asha Patel: Initial spike analysis attached; observed worst-case rows ~12KB with payloads. Suggested moving JSON blobs out and introducing targeted partial indexes.",
+    "2026-03-03 \u2014 Miguel Herrera: Reviewed initial design. Concern: write path complexity for transactional guarantees. Proposal: keep single transaction per logical write: insert/update tenant_payloads THEN update tenants.payload_id in same tx. I'll prototype in a branch.",
+    "2026-03-07 \u2014 Emily Zhao (DBA): Suggested using CREATE INDEX CONCURRENTLY to avoid locks and recommended max batch size 1000 for backfills to bound WAL. Also recommended pre-creating the UUIDs in batches to speed inserts.",
+    "2026-03-10 \u2014 Security Review: Payloads contain some PII fields (contact_email) \u2014 add column-level encryption requirement or ensure payload is written encrypted at rest. Marked security_review_required: true.",
+    "2026-03-12 \u2014 Miguel Herrera: Prototype PR created https://github.com/redwood-inference/control-plane/pull/12345 \u2014 includes backfill worker and feature flag. Integration tests pass in CI with synthetic dataset.",
+    "2026-03-14 \u2014 Asha Patel: Merged a docs annex in Confluence and scheduled staging run during 2026-03-20 maintenance window. Added to cycle 2026-W11."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "plan_steps",
+    "migration_steps",
+    "rollback_plan",
+    "rollout_notes",
+    "telemetry_and_kpis",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_588c28e3b69f4687ba40bbacea116517"
+}

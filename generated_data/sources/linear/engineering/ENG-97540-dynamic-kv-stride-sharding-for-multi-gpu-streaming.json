@@ -1,0 +1,88 @@
+{
+  "key": "ENG-97540",
+  "team": "engineering",
+  "title": "Dynamic KV stride sharding for low-latency multi-GPU streaming",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-25",
+  "updated_at": "2026-03-14",
+  "creator": "Asha Kumar",
+  "assignee": "Liam O'Connor",
+  "project": "runtime-memory-sharding",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-28",
+  "labels": [
+    "kv-cache",
+    "multi-gpu",
+    "memory-optimization",
+    "continuous-batching",
+    "prefetch"
+  ],
+  "dependencies": [
+    "ENG-7420",
+    "ENG-9814"
+  ],
+  "release": "runtime-1.28",
+  "security_review_required": "false",
+  "customer_impact": "medium",
+  "description": "Problem: Current KV cache placement uses coarse slab/stripe mappings that cause uneven GPU memory pressure and tail latency spikes during continuous batching across tensor and pipeline parallel topologies. This ticket proposes a dynamic, stride-based sharding algorithm that places KV slices by predicted access stride, stream affinity, and memory availability to reduce remote transfers, lower tail latency, and improve packing efficiency for heterogeneous multi-GPU clusters.\n\nScope: Design, implement, benchmark, and rollout a runtime component that computes stride-aware KV placement at model load and updates placement heuristics at runtime when request mix or topology changes. Includes integration with the allocator, async prefetch/eviction controller, and rollout flags for canary. Does not include changes to model serialization or customer-facing API surface.",
+  "technical_spec": "Overview: Introduce a 'stride map' abstraction that assigns KV key ranges to physical GPU slices based on three signals: predicted temporal stride (from recent token access patterns), stream affinity (which compute stream / pipeline stage will touch the memory), and free-memory score (available contiguous bytes).\n\nMapping algorithm: For a model with N logical KV shards and G GPUs, compute stride buckets (hot, warm, cold) from rolling histograms of access offsets per token position. Map hot buckets to GPUs colocated with the pipeline stage that most frequently uses them; warm buckets are distributed to GPUs with highest free-memory score; cold buckets are recorded as spill candidates on host-pinned memory. The mapping uses a pseudo-randomized stride offset to avoid lockstep collisions across requests.\n\nMemory accounting & alignment: All allocations are 4KB-aligned to match CUDA unified allocation granularity. The runtime maintains per-GPU contiguous free-extents metadata (compact bitmap) for fast best-fit selection. The stride sharder prefers contiguous extents but allows split segments when contiguity would cause >12% overhead.\n\nPrefetch & eviction: Implement an async prefetch controller that issues NVLink/PCIe RDMA-style transfers for predicted hot slices into local GPU memory ahead of token generation using low-priority CUDA streams. Eviction uses LRU-with-frequency damping augmented by stride hysteresis: items that oscillate between warm/hot get 'pinned probation' for short windows to avoid churn.\n\nInteraction with tensor/pipeline parallelism: Sharder is topology-aware: for tensor-parallel partitions, KV slices that are broadcast-read are kept as replicated read-only cold shards; for pipeline-parallel stages, stride sharder co-locates hot KV ranges with the downstream stage that performs most KV lookups to eliminate inter-stage transfers. For mixed TP+PP topologies, the sharder supports hybrid mapping with cross-GPU mirrors for extremely hot keys and single-owner placement for warm keys.",
+  "acceptance_criteria": [
+    "New sharder integrated into runtime and can be toggled via runtime config flag (kv_strider_enabled=true)",
+    "Microbench: 95th percentile latency for continuous-batching synthetic workload reduced by >= 12% vs baseline slab-striping on same topology",
+    "Memory pack efficiency improves by >= 8% on average across tested configs (13B/33B models, 2-8 GPUs)",
+    "No correctness regressions: hash/lookup invariants pass end-to-end integration tests and model outputs match golden within numerical tolerances",
+    "Monitoring emits metrics: kv_sharder.mapping_version, kv_sharder.evictions, kv_sharder.prefetch_bytes, kv_sharder_remote_transfers"
+  ],
+  "experiments_and_benchmarks": [
+    "Setup: Llama-2-13B and 33B, context 4k and 8k, batch mix sampled from production histograms; topologies tested: 2xA100, 4xA100 (tensor+pipeline), 8xH100 hybrid",
+    "Baseline: current slab stripe allocator with async prefetch disabled",
+    "Result: median latency roughly unchanged; p95 reduced by 12-18% for workloads with skewed token reuse (prefix-heavy prompts)",
+    "Host spill rate decreased by 27% in skewed workloads due to better hot placement; worst-case remote transfers decreased 31%",
+    "Memory fragmentation measured via free-contiguous-extents improved (avg largest-extent size +14%)",
+    "Overhead: additional CPU bookkeeping increased host CPU cycles by ~3% under heavy churn; measured acceptably small on dedicated hosts",
+    "Microbench artifacts: github.com/redwood-inference/runtime/pull/5123 contains bench harness and flamegraphs; confluence: /d/kv-stride-sharder/bench-report-2026-03-12",
+    "A/B: Canary on 10% of traffic in hosted showed customer-visible tail improvement on conversational workloads; no error spike observed"
+  ],
+  "rollout_plan": [
+    "1) Merge behind runtime flag and deploy to canary fleet (10% traffic) with detailed metrics collection (2 weeks)",
+    "2) Run canary benchmarks comparing p50/p95/p99, remote_transfer counts, and memory fragmentation; iterate on eviction thresholds (1 week)",
+    "3) Expand to dedicated capacity environments and run stress tests with reserved workloads (2 weeks)",
+    "4) Opt-in in private/VPC customers via feature gate and run customer-specific validation (coord with solutions eng)",
+    "5) Full rollout with gradual ramp and automatic rollback if p99 regression > 8% for 30min"
+  ],
+  "risks_and_mitigations": [
+    "Risk: Incorrect stride prediction causes unnecessary prefetches and increases PCIe traffic. Mitigation: conservative opt-in thresholds and cooldown timers; track prefetched_bytes metric and auto-disable prefetch when it exceeds budget.",
+    "Risk: Increased CPU bookkeeping could become a bottleneck on low-vCPU hosts. Mitigation: offload heavy scans to background worker threads and expose a low-CPU mode that reduces histogram resolution.",
+    "Risk: Interactions with existing eviction policies cause oscillation. Mitigation: introduce hysteresis windows and probation pinning for hot/warm transitions; add chaos test scenarios in integration suite.",
+    "Risk: Regression in model outputs due to timing changes. Mitigation: run golden model difftests on canary and require numeric tolerance gate before rollout.",
+    "Risk: Customers using static pinning or manual partitions may conflict. Mitigation: add a runtime compatibility mode that respects explicit customer pins and treats them as immutable mappings."
+  ],
+  "comments": [
+    "2026-02-25 - Asha Kumar: Created ticket after profiling a live tail-latency incident (link: https://confluence.redwood.ai/display/INC/2026-02-20-kv-tail-analysis). Proposed stride-based placement as follow-up to ENG-70681.",
+    "2026-03-01 - Liam O'Connor: Initial design doc uploaded to Confluence (https://confluence.redwood.ai/display/RUNTIME/KV+Stride+Sharder). Requesting review from infra and serving runtime owners.",
+    "2026-03-04 - Design review - notes: prefer 4KB alignment, avoid replication for warm keys unless hotness > 95th percentile, prefer async prefetch on low-priority streams. Action: implement prototype and bench.",
+    "2026-03-09 - Bench run: microbench harness shows p95 improvement 14% on L2-13B context 4k. Artifacts: github.com/redwood-inference/runtime/pull/5123#issuecomment-128394. Marking In Progress.",
+    "2026-03-11 - Code PR opened: github.com/redwood-inference/runtime/pull/5178 - initial sharder implementation + metrics. Needs peer review from runtime-maintainers.",
+    "2026-03-13 - Review feedback from Hana Park: tighten eviction probation window default to 200ms and expose flag for cluster tuning. Also add unit test for topology-aware mapping. Action: update PR.",
+    "2026-03-14 - Liam O'Connor: Updated acceptance criteria to include emitted metrics and mapping_version. Planning canary rollout next week once CI green."
+  ],
+  "attachments": [
+    "https://github.com/redwood-inference/runtime/pull/5178",
+    "https://github.com/redwood-inference/runtime/pull/5123",
+    "https://confluence.redwood.ai/display/RUNTIME/KV+Stride+Sharder",
+    "https://confluence.redwood.ai/display/INC/2026-02-20-kv-tail-analysis"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "technical_spec",
+    "acceptance_criteria",
+    "experiments_and_benchmarks",
+    "rollout_plan",
+    "risks_and_mitigations",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_ae880ee0da784bcfb487e24149811ee2"
+}

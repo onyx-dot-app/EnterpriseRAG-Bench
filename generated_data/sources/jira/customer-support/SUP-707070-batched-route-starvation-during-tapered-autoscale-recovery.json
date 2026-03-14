@@ -1,0 +1,95 @@
+{
+  "key": "SUP-707070",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Batched route starvation during tapered autoscaler recovery causing sustained p99 throughput regression",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Priya Nair",
+  "assignee": "Luis Ortega",
+  "customer_company": "VectorMaps Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "dedicated-scheduler",
+    "serving-runtime",
+    "autoscaler",
+    "prefetcher",
+    "api-gateway"
+  ],
+  "labels": [
+    "throughput",
+    "autoscale-cooldown",
+    "noisy-neighbor",
+    "hotfix-consideration"
+  ],
+  "environment": "prod-us-west",
+  "affected_models": [
+    "opt-13b",
+    "gpt-j-6b"
+  ],
+  "affected_regions": [
+    "us-west"
+  ],
+  "sla_due_at": "2026-03-11",
+  "description": "Issue summary:\nCustomer (VectorMaps Inc.) observed a sustained p99 throughput regression on their dedicated reserved pool starting 2026-03-10 14:30 UTC. The degradation aligns with an autoscaler shrink followed by a tapered recovery window where short-lived high-concurrency streams repeatedly acquired and held GPU slots during warmup, preventing normal batched routes from filling and causing long tail queuing. Impact:\n- Customer reported 3x increase in request latency p95->p99 and 40-60% drop in throughput for batched text-generation routes.\n- Affects production traffic for multiple routes; some traffic fell back to hosted fallback model variants causing higher cost and inconsistent outputs.\nEnvironment:\n- Dedicated pool: reserved-capacity-vecmaps-usw (8x A10g equiv GPUs)\n- Region: us-west\n- Time window: 2026-03-10 14:30 UTC onwards\n- Routes: /v1/generate-batched, /v1/stream-chat (batched backends), customer uses pinned model opt-13b for priority routes\n",
+  "steps_to_reproduce": [
+    "1) Send a mix of long-lived batched generation requests and a burst of short 1-2 token short-stream connections at high concurrency (50-100 concurrent short streams).",
+    "2) Ensure autoscaler min_replicas at low baseline (2 GPUs) and cooldown window set to default 300s so autoscaler aggressively shrinks after observed drop in average load.",
+    "3) During the autoscaler recovery window, observe GPU attach logs and batcher fill rates for batched routes.",
+    "4) Measure p95/p99 for batched route and correlated slot allocation timelines from allocator telemetry."
+  ],
+  "logs": [
+    "2026-03-10T14:29:52Z allocator: shrink_to=2 triggered by 60s low load metric",
+    "2026-03-10T14:30:15Z serving-runtime: attach_request id=txn-8f1d short_stream=true duration=0.8s hold_slots=1",
+    "2026-03-10T14:30:16Z prefetcher: lease_acquired id=pref-342 type=short_warmup lease_ttl=120s",
+    "2026-03-10T14:31:03Z batcher: insufficient_fill route=/v1/generate-batched observed_fill=30% target=80%",
+    "2026-03-10T14:31:05Z autoscaler: recovery_in_progress cooldown_remaining=230s",
+    "2026-03-10T14:31:45Z allocator: slot_wait_queue length=42 p99_wait=1.8s",
+    "2026-03-10T14:32:10Z serving-runtime: eviction_attempt id=txn-ff2a cause=slot_blocked_by_prefetch",
+    "2026-03-10T14:33:00Z metrics: route=/v1/generate-batched p95=320ms p99=2.4s throughput=45req/s baseline=120req/s"
+  ],
+  "comments": [
+    "Priya Nair (Support): Initial triage - customer seeing repeated short streams during autoscaler recovery. Asking SRE to pull allocator traces and prefetch lease state for pool reserved-capacity-vecmaps-usw.",
+    "Luis Ortega (SRE): Assigned - gathering allocator, batcher and prefetcher traces. Hypothesis: short warmup streams are obtaining prefetch leases that persist for lease_ttl, blocking slot reuse and starving batchers while autoscaler is in cooldown.",
+    "Customer (VectorMaps Eng - Jamie): We started a new feature at 14:25 that spins many short model-check requests. Rolling that back reduced error rate briefly but p99 stayed elevated until autoscaler spun back up.",
+    "Luis Ortega (SRE): Correlated with autoscaler shrink at 14:29. We see lease_ttl defaults of 120s; short streams are sequentially reusing same pattern, keeping slots occupied and preventing batch fill. Recommending temporary change: increase autoscaler min_replicas to 4 or disable prefetch for short routes as workaround.",
+    "Priya Nair (Support): Noted workaround suggested to customer; requested approval to patch customer's routing policy to reduce prefetch aggressiveness while we investigate.",
+    "Luis Ortega (SRE): Added linked investigation to allocator heartbeat (INT-330?) and noted potential follow-up PR for prefetch lease eviction logic."
+  ],
+  "investigation_notes": [
+    "01 - Correlation: Autoscaler shrink at 14:29 reduced active GPUs. Immediately following, short warmup streams (mean duration 0.7s) repeatedly acquired prefetch leases (TTL 120s) and occupied slot objects, preventing batched requests from filling target batch sizes.",
+    "02 - Batcher telemetry shows sustained low fill-rate (30-40%) for batched routes while short streams maintained steady attach churn; combined with fewer GPUs caused throughput to fall ~55%.",
+    "03 - Allocator traces show slot objects moved to 'pinned' state tied to prefetch lease; lease release did not occur promptly on short stream completion when autoscaler was in recovery (race between prefetcher and allocator release path).",
+    "04 - Hypothesis: Prefetch lease release path depends on heartbeat from warmup sidecar; during autoscaler recovery sidecar restart sequence introduced a window where leases weren't reclaimed promptly. Also TTL expiry was long enough to allow multiple short streams to hold onto slots sequentially.",
+    "05 - Secondary factor: default autoscaler cooldown prevented new GPUs from being added until recovery window elapsed (300s), so even when workload ramped the platform was slow to re-provision capacity.",
+    "06 - No signs of driver-level GPU errors; this appears scheduling/allocator-level resource contention rather than hardware faults.",
+    "07 - Related tickets: SUP-712909 (deferred-warmup-causing-spotty-gpu-assignments), SUP-371400 (allocator-heartbeat-skew) - useful traces and prior mitigation notes."
+  ],
+  "resolution": "Workaround applied (customer consented):\n- Increased pool min_replicas from 2 -> 4 for reserved-capacity-vecmaps-usw to reduce chance of slot starvation during recovery window.\n- Temporarily disabled aggressive prefetching for short-stream route (/v1/stream-chat) for the customer via routing override.\n- Customer rolled back the short-model-check feature burst.\nPost-mitigation observations: latency/p99 recovered to baseline within ~6 minutes of changes and autoscaler stabilized.\nNext steps (tracking):\n- Engineering task created to add lease-release-on-shortstream-termination and to reduce default prefetch TTL for short streams (PR referenced below).\n- Consider autoscaler cooldown tuning: expose per-pool cooldown or quick-provision path when significant queueing is detected.\n",
+  "linked_issues": [
+    "SUP-712909",
+    "SUP-61234",
+    "SUP-271400"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/allocator/pull/2487",
+    "github.com/redwood-inference/prefetcher/pull/1021"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.com/display/OPS/Autoscaler+Cooldown+Guidance",
+    "https://confluence.redwood.com/display/ENG/Prefetch+Lease+Design+Notes"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_bc3598ffcaab4862b3751d51c831e5b9"
+}

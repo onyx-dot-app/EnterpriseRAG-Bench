@@ -1,0 +1,73 @@
+{
+  "key": "SUP-88223",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Identical follow-up turn experiences p99 latency and 504s after initial prompt \u2014 KV/prefix cache warmup degeneration",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-14",
+  "reporter": "Priya Shah",
+  "assignee": "Marcus Nguyen",
+  "customer_company": "Acme Analytics",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "kvcache",
+    "routing",
+    "console"
+  ],
+  "labels": [
+    "latency-regression",
+    "kv-ttl",
+    "cache-warmup",
+    "followup-turns"
+  ],
+  "environment": "prod us-east-1",
+  "affected_models": [
+    "redwood-open-13B",
+    "rw-vicuna-7b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "linked_issues": [
+    "SUP-34121",
+    "SUP-61748"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/4123"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/KV+Cache+Runbook"
+  ],
+  "description": "Issue summary: Customer reports large P99 latency increase and intermittent 504s on second conversational turns that are text-identical to the first turn. Behavior started after a canary deploy on 2026-03-09 and is reproducible for a subset of sessions in Acme Analytics' dedicated pool. Impact: Increased user-visible latency and occasional stream disconnects for conversational flows that reuse exact prompt prefixes. This affects Acme's core conversational product and is blocking an in-flight demo.\n\nImpact: ~20% of identical follow-up turns show >2s p50 -> p99 skew, with a p99 rising from 620ms to ~3.8s for affected requests. 504s observed at ~0.6% of identical-turn requests in the last 72h window.\n\nPriority & next steps: Sev1 customer-impacting. SRE assigned to investigate cache warmup and prefix lookup path; engineering will prepare a patch after reproducer validated in staging.",
+  "steps_to_reproduce": "1) Customer sends conversational turn A (prompt length ~60 tokens) to model redwood-open-13B in prod us-east-1.\n2) Immediately send an identical follow-up turn A' (same exact tokens, new request id).\n3) Observe response times and stream behavior for the second request.\n4) Repeat with ~200 parallel sessions to reproduce sampling of failures.\n\nNote: Acme provided request IDs and sample payloads in attached logs.",
+  "observed_behavior": "Second (identical) turn shows elevated p95/p99 latency and occasional 504s. Metrics from customer telemetry: p50 640ms -> p50 850ms, p95 1.2s -> 2.7s, p99 0.62s -> 3.8s for identical-followups; 504s spike to 0.6% (baseline 0.02%). Server logs show kvcache miss->fallback + repeated prefix backfills in the serving node's logs immediately before 504s.",
+  "expected_behavior": "Identical follow-up turns should hit KV/prefix cache hot path and return at near-identical latency to the initial prompt (modulo tokenization differences). No increase in 5xx rate is expected for warm cache scenarios.",
+  "logs": "[2026-03-09T18:02:12.423Z] INFO serving-runtime request=req-4fA prefix_lookup=hit kv_shard=12 latency_ms=34\n[2026-03-09T18:02:13.512Z] WARN serving-runtime request=req-4fB prefix_lookup=miss kv_prefetch=started shard=12 backfill=true\n[2026-03-09T18:02:14.009Z] ERROR serving-runtime request=req-4fB response=504 reason=kv_backfill_timeout\n[2026-03-09T18:02:14.011Z] DEBUG kvcache reinsert=failed key=prefix:sha256:... reason=lease-expired\n[2026-03-10T02:14:01.001Z] METRIC kvcache.miss_rate 0.21 host=node-7\n[2026-03-12T09:30:00.000Z] METRIC serving.latency.p99 3800 host=node-7\n",
+  "investigation_notes": "Timeline: Issue surfaced 2026-03-09 after a canary that changed the kvcache lease refresh behavior (decreased aggressive background refresh).\n\nFindings so far:\n- Spike in kvcache miss_rate on shard 12 concurrent with p99 spikes.\n- Backfills for identical prefixes showed duplicated inflight backfill requests across multiple threads on the same node, leading to serialized KV reads and occasional timeouts.\n- The new canary reduced the TTL refresh frequency for prefetched prefixes; combined with a new suffix-key hashing change introduced a stale mapping window where a warm prefix could be evicted and then immediately re-requested by identical follow-ups.\n- Heap snapshots on node-7 show transient memory pressure around the same time, triggering an eviction job that removed recently-warmed prefixes.\n\nHypothesis: A race between reduced TTL refresh, shard-level eviction, and duplicated backfill in-flight requests causes identical follow-up turns to miss the cache and then block on serialized backfill logic. Serialization amplifies latency and increases chance of backfill timeout (manifesting as 504).\n\nExperiments run:\n- Reproduced locally by lowering kvcache.refresh_interval and inducing artificial memory pressure; observed identical p99 pattern.\n- Increased kvcache.prefetch_dedupe window in staging; p99 dropped ~40% in synthetic test.\n\nNext investigative tasks:\n- Capture per-request backfill concurrency counts for all affected nodes.\n- Add detailed tracing for lease refresh events and eviction triggers.\n- Validate patch that reintroduces a small refresh buffer and dedupes concurrent backfills.",
+  "workaround": "For Acme (dedicated pool) applied temporary mitigations on 2026-03-11: 1) Increased kvcache.refresh_interval back to pre-canary value for Acme's pool. 2) Enabled backfill_dedupe=true (experimental flag) to collapse concurrent backfills. 3) Recommended customer to route high-variance sessions to a pinned model-variant to avoid cross-variant evictions.\nThese reduced error rate to ~0.05% and lowered observed p99 by ~35% for a 24h window.",
+  "resolution": "Patch proposal: 1) Revert the aggressive decrease of kvcache TTL refresh in canary and add a controlled refresh jitter to prevent synchronized eviction. 2) Add server-side dedupe for in-flight prefix backfills with a small concurrency cap per-shard. 3) Add a soft-cache-protect window after warmup to prevent eviction for N seconds.\nDeployment plan: apply change to staging (done 2026-03-13), run canary on 5% of prod (scheduled 2026-03-15), then 25% rollout if no regressions, full rollout 2026-03-17.\nFollow-ups: update runbook, add automated synthetic tests that exercise identical-turn warm-cache scenarios, and create telemetry alert for concurrent backfill counts exceeding threshold.\nStatus: Patch is in review (PR linked) and staging validation passed for synthetic traffic.",
+  "comments": [
+    "Priya Shah (Support): Customer reported issue after deploy; provided sample request IDs and timeline. Asked SRE to triage ASAP.",
+    "Marcus Nguyen (SRE): Confirmed reproduction in staging with lowered refresh interval; hypothesizing eviction + serialized backfill. Investigating per-shard counters. Added staging flag to enable prefetch dedupe.",
+    "Emma Johnson (Acme Analytics): Confirmed temporary mitigations reduced impact for demo traffic; asking for ETA on permanent fix and whether rollback possible.",
+    "Marcus Nguyen (SRE): Suggested non-invasive rollback to previous kvcache defaults for Acme's pool while patch reviewed. Engineering prepping PR for backfill dedupe and refresh jitter."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "logs",
+    "investigation_notes",
+    "workaround",
+    "resolution",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_2118cf5be50c4924b0d414deb4a285db"
+}

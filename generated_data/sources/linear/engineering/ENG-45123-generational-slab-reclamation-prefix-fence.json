@@ -1,0 +1,51 @@
+{
+  "key": "ENG-45123",
+  "team": "engineering",
+  "title": "Generational slab reclamation with prefix fencing for GPU KV cache",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-14",
+  "creator": "Marisol Chen",
+  "assignee": "Arjun Patel",
+  "project": "runtime-1.20",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-28",
+  "labels": [
+    "kv-cache",
+    "eviction",
+    "gpu-memory",
+    "prefix-awareness",
+    "reliability"
+  ],
+  "dependencies": [
+    "ENG-33421",
+    "ENG-30642"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "body": "Summary:\nWe need a new eviction/reclamation mechanism for the GPU-side KV cache that reduces fragmentation and uncontrolled OOMs while preserving prefix-scoped correctness guarantees used by continuous batching. The proposal is a generational slab allocator + checkpointed reclamation with a lightweight prefix fencing protocol so that in-flight batches referencing prefixes cannot observe partially reclaimed state.\n\nBackground and motivation:\n- Current LRU/TTL and hybrid approaches work well for capacity trimming but create two problems on GPU: per-slab fragmentation (wasted GPU memory) and races between reclamation and concurrent batch KV lookups that can result in stale or missing prefix entries when cache metadata is compacted.\n- Continuous batching increases concurrency: many requests share KV prefixes and KV cache reads happen from multiple worker threads/processors. We need atomicity at prefix granularity so a batch that begins with a prefix sees a coherent snapshot until it completes.\n- Existing solutions (global eviction pause, coarse locks) hurt latency and throughput. We want a low-latency protocol that provides correctness guarantees with minimal blocking.\n\nGoals and acceptance criteria:\n1) Implement a generational slab allocator on the GPU that groups KV entries into short-lived generations. Slabs can be compacted/merged when all entries in a generation are safe to reclaim.\n2) Provide a prefix-fence protocol: callers can acquire a cheap read-fence for a prefix (or prefix set) which ensures the underlying slab generation(s) referenced will not be reclaimed until the fence is released. Fences must be wait-free for the common path (no global stop-the-world).\n3) Maintain existing external invariants: no request should observe a partially-evicted prefix (either full prefix present or logically absent), and KV lookup latency impact should be <5% p99 compared to baseline without fences.\n4) Improve effective usable GPU memory by >=10% for production workloads with moderate churn (measured in internal perf harness).\n\nDesign overview:\n- Generational slabs: allocate entries into current generation slab per shard. When a slab reaches a configured fullness or time window, new allocations move to a next generation. Each generation has a small header with an epoch id and a live-reference counter kept in host-managed pinned memory (fast atomic updates).\n- Prefix metadata maps prefix -> list of (shard, generation id, offset, length, checksum). Lookups consult the map and then read from the slab.\n- Prefix fence: a thread acquiring a prefix fence atomically increments the live-reference counter(s) for the generation(s) that the prefix maps to. This is a per-generation atomic counter update in CPU-visible pinned memory; no GPU kernel needed on the hot path. When a batch is done, it decrements the counters.\n- Reclamation: background compactor scans generations with zero references and performs GPU-side compaction into new slabs or frees slabs. Compaction creates new slab placements and then atomically updates prefix metadata to point to the new locations; the switch is single atomic metadata update per prefix (using compare-and-swap on metadata version).\n- Safety: the fence + compaction ordering ensures a reader either sees the pre-compaction data or the post-compaction data, not a mixture. The atomic CAS on metadata provides the commit point. Generations with non-zero counters will not be reclaimed.\n\nImplementation plan (high level):\n1) Prototype generation headers and per-generation counters in host pinned memory (week 1).\n2) Extend prefix metadata to include generation ids and a small version integer (week 2).\n3) Implement cheap fence acquire/release APIs used by continuous-batching read path; add microbench for read latency (week 2).\n4) Implement background compactor that only touches zero-referenced generations (week 3).\n5) Integrate atomic prefix metadata swap (CAS) and validate invariants with model checker + unit tests (week 4).\n6) Run canary in a dedicated cluster with synthetic churn + production trace replay, gather telemetry and OOM/fragmentation metrics (week 5).\n\nPerformance and microbench expectations:\n- Fence acquire/release should be 50-200ns on host (atomic inc/dec on pinned memory).\n- Lookup fast path should avoid touching fences unless a caller explicitly requests prefix-fenced semantics. Default behavior remains best-effort LRU/TTL unless caller opts in.\n- Background compaction bandwidth should be tunable; default rate = 1GB/s per compactor thread to avoid saturating PCIe.\n\nTesting and correctness validation:\n- Unit tests for fence semantics (acquire-count prevents reclamation).\n- Fuzz tests: concurrent threads performing lookups, inserts, fence acquire/release, and compaction; assert no prefix returns partially-updated payloads and checksums validate.\n- Model-checker run that verifies linearizability of prefix metadata CAS under concurrent fence operations.\n- Integration test using continuous-batching harness with production traffic replay: verify <5% p99 latency regressions and improved usable memory.\n\nMigration and rollout:\n- Feature flag at shard-level to enable generational reclamation. Start in internal dedicated clusters (non-customer) then limited customer canaries (Dedicated tenants) for 2 weeks.\n- Telemetry: track per-shard generation counts, average fence hold time, compaction throughput, p99 lookup latency, and fragmentation percent.\n- Rollback plan: revert flag and drain compaction queue; compactor must be idempotent.\n\nRisks and open questions:\n- Atomicity guarantees depend on reliable CAS on metadata. We need to ensure metadata writes are durable and visible across processes in private deployments.\n- Fences introduce additional host CPU memory traffic under extremely high concurrency; need to validate CPU overhead and potential contention hotspots. Potential mitigation: sharded counters per CPU core and periodic aggregation.\n- Interop with existing TTL eviction and LRU fast-paths needs careful ordering: we must ensure that TTL expiry marks entries as \"candidate\" but does not free the generation until counters are zero.\n\nAcceptance checklist:\n- [ ] Prototype counters and fence API merged behind feature flag.\n- [ ] Compactor implementation with generation scan and safe free.\n- [ ] Comprehensive unit + fuzz + model-check tests passing.\n- [ ] Canary run shows memory improvement >=10% and p99 lookup regression <5%.\n- [ ] Design doc and runbook published.\n\nRunbook snippets (for incidents):\n- If compactor accidentally frees active generation (should not happen): immediately toggle feature flag off, restart compactor, run a consistency rescan to reconcile prefix metadata against slab manifest. Notify infra oncall.\n- If fence counters show abnormal growth: inspect actor hold traces, collect stack samples from holding threads, and consider lowering default fence TTL for long-lived batches.\n\nReferences and related work:\n- Prior eviction designs: ENG-33421 (formalize-eviction-invariants-prefix-aware-hybrid)\n- Compaction/shard reclamation: ENG-30642 (epoch-hybrid-kv-eviction)\n\nNotes: This ticket focuses on correctness-first implementation; later optimizations (per-core counters, aggregated fencing, GPU-accelerated compaction kernels) will be separate follow-ups.",
+  "comments": [
+    "2026-03-02 - Marisol Chen: Initial write-up after whiteboard session with Runtime and Batch teams. Added acceptance criteria and rough perf targets. Putting behind runtime-1.20 feature flag.",
+    "2026-03-04 - Arjun Patel: Spike results: host pinned counters are cheap (~120ns inc/dec). Microbench attached. Will push prototype PR for generation headers. Blocker: need consensus on metadata CAS representation across private deployments.",
+    "2026-03-06 - Priya Kumar (PM): Reviewed acceptance criteria. Request to add telemetry for fence hold-time percentiles and to ensure alerting if compactor backlog > 2x baseline.",
+    "2026-03-09 - SRE, Tomasz Nowak: Raised concern about compactor IO on PCIe during peak. Suggested limiting compaction to off-peak or use rate-limiter token bucket. Added to implementation plan.",
+    "2026-03-11 - Design review (Lina Rodriguez): UX note: need an exposed console metric and a toggle per-deployment. Also requested a clear description for operators in runbook. Done.",
+    "2026-03-13 - Arjun Patel: PR #4321 opened with generation header prototype and fence API (internal). Added unit tests for simple acquire/release semantics. CI: 97% passing; failing flaky test in compactor mock. Marking as In Progress.",
+    "2026-03-14 - Marisol Chen: Updated ticket with compaction cadence tuning and explicit model-check tasks. Scheduling canary for 2026-03-20 in dedicated-stage cluster."
+  ],
+  "attachments": [
+    "confluence: https://redwood-internal.atlassian.net/wiki/spaces/RUNTIME/pages/GEN-Slabs+Design",
+    "github: https://github.com/redwood-inference/runtime/pull/4321",
+    "perf-dashboard: https://internal-dashboard.redwood.ai/d/perf/kv-compaction-2026",
+    "spec-sheet: https://drive.google.com/file/d/1a2b3cGEN-Slabs-Design/view"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_2625b32605ed434291ff0860b8dfe7a2"
+}

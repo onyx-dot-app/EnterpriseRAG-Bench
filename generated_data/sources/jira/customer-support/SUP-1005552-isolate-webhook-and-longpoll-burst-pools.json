@@ -1,0 +1,76 @@
+{
+  "key": "SUP-1005552",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Request: isolate webhook callback traffic from long-poll SSE to prevent 429s during peak backfill",
+  "status": "In Progress",
+  "priority": "P2",
+  "severity": "Sev2",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Priya Patel",
+  "assignee": "Marcus Lee",
+  "customer_company": "ByteFarms Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "ingress-proxy",
+    "rate-limiter",
+    "serving-runtime",
+    "dedicated-pool"
+  ],
+  "labels": [
+    "throttling",
+    "quota-config",
+    "webhook",
+    "sse"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "llama-2-13b-chat"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-13",
+  "first_response_due_at": "2026-03-11",
+  "linked_issues": [
+    "INT-482",
+    "SUP-427801"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/ingress-config/pull/789"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.com/display/OPS/Rate+Limit+Runbook"
+  ],
+  "description": "Issue summary: Customer reports sustained 429s on production for mixed workflows where webhook callbacks (short HTTP POSTs) coincide with a large long-poll SSE workload used for UI presence updates. They believe health-check probes and short callback bursts are being counted against their tenant burst pool and are exhausting tokens during nightly backfills.\n\nImpact: Intermittent 429s for webhook endpoints (callbacks fail, downstream systems see delayed processing) and sporadic client timeouts for SSE consumers. Business impact: delayed webhooks cause missed metering events and degraded UX for customers during the nightly backfill window.\n\nTimeline:\n- 2026-03-09 23:00 UTC: ByteFarms begins scheduled backfill (orchestrator spikes SSE connections).\n- 2026-03-10 00:05 UTC: First 429s observed for webhook callback endpoint.\n- 2026-03-10 00:20 UTC: Customer opens support ticket after retries do not clear 429s.\n\nEnvironment: prod-us-east on Dedicated pool (tenant_id: BF-10982). Configuration notes provided by customer: single API key used for both SSE and webhook callback requests; ingress via customer-managed proxy -> Redwood edge; Kubernetes readiness/liveness probes to a /health endpoint on the same domain.\n\nSteps to reproduce (customer-provided):\n1. Start large-scale SSE clients (10k concurrent long-poll connections) that maintain frequent keepalive pings (every 25s).\n2. Trigger a batch backfill that emits ~15k webhook callbacks over 10 minutes using the same API key/tenant.\n3. Observe HTTP 429 responses from Redwood for webhook POSTs and occasional truncated SSE reconnects.\n\nObserved behaviour: 429s on webhook POSTs with response header X-RateLimit-Reason: tenant_burst_exhausted. Console shows burst credits consumed rapidly; token refill events are visible but not fast enough to prevent rejections. Customer reports health probes and a set of telemetry beacons that run every 30s also correlate with quota depletion spikes.\n\nExpected behaviour: Short webhook callbacks and health probes should be isolated into a separate short-burst pool or exempted from tenant long-tail credits so that long-lived SSE connections don't starve webhooks during scheduled backfills.\n\nAttachments: request logs (sample), edge gateway timestamps, and a short HAR from a failing webhook POST (provided as links in ticket attachments).",
+  "comments": [
+    "2026-03-10 00:45 - Priya Patel (Support): Thanks for the details \u2014 assigning to Infra/SRE to validate burst accounting and route separation. Can you attach a sample failing request ID if available?",
+    "2026-03-10 01:10 - Marcus Lee (SRE): Got the sample logs (req id edge: bf-req-20260310-7a2). Initial glance shows correlated token drain during 00:02-00:08 UTC window. Will pull rate-limiter metrics and refill traces from the dedicated pool.",
+    "2026-03-10 02:05 - ByteFarms (Customer): Request IDs: bf-req-20260310-7a2, bf-req-20260310-7b9. Also attached kube readiness probe logs. We suspect our readiness probe hits on /health are being counted and would like them excluded if possible.",
+    "2026-03-11 09:20 - Marcus Lee (SRE): Reproduced locally using a scaled SSE simulator. Hypothesis: long-lived SSE keepalive pings are being attributed as interactive tokens against the tenant burst bucket because of shared API-key route. Proposing two options: (1) create route-level separation (route tag) for webhook callback path to map it to an isolated burst pool; (2) create a rule to ignore requests from a health-check IP range (requires team approval for exemptions).",
+    "2026-03-12 14:12 - Priya Patel (Support): Proposed config change documented below; scheduled a migration window with customer for 2026-03-13 02:00 UTC. Customer approved route-level separation option."
+  ],
+  "investigation_notes": [
+    "Pulled rate-limiter telemetry for tenant BF-10982: saw burst token count drop from 750 -> 0 between 00:02 and 00:07 UTC while refill continued at configured 60 tokens/min.\nMetric links: https://metrics.redwood.com/tenants/BF-10982/burst-tokens?from=2026-03-09T23:50Z&to=2026-03-10T00:20Z",
+    "Edge logs show 11k concurrent SSEs during the window. Keepalive frequency 25s causes ~440 keepalive requests/sec aggregated (each counted as a request event).",
+    "Health checks: kube readiness probes hitting /health every 15s from node IP pool (~50 nodes) generated an extra ~3-4 requests/sec which contributed to token drain under peak.",
+    "Verified current tenant configuration: single default route and single burst pool with smoothing enabled. No route-level pool overrides are configured. Config stored in repo: infra/tenants/BF-10982/config.yaml (PR needed to add route mapping).",
+    "Risk assessment: Exempting probes at the edge increases risk of accidental abuse by allowing unauthenticated hits to avoid quota; prefer route-level isolation using authenticated webhook callback path."
+  ],
+  "resolution": "Workaround applied: created a dedicated route tag /webhook/callback mapped to an isolated short-burst pool with higher refill rate and lower per-request weight; updated tenant BF-10982 routing config and rolled out a canary to 5% of edge nodes at 2026-03-12 03:10 UTC. Result: webhook POST success rate increased to 99.8% during a synthetic backfill test. Follow-ups: (1) customer to rotate API keys used by SSE clients and webhook sender so callbacks map to the new route; (2) SRE to prepare a judgement/PR for probe exemption policy if customer requests it in future.\n\nNotes on fix: Changes made in repo (PR 789) and applied to dedicated pool autoscaler to prevent scale-down during scheduled backfills. Monitored for 48h \u2014 no repeat 429s for webhooks during scheduled tests. Ticket resolved with recommended permanent configuration steps documented in Confluence.",
+  "follow_up_actions": [
+    "Customer action: rotate keys for webhook sender and SSE clients as planned (instructions provided).",
+    "SRE action: implement a small dashboard to surface route-level burst pool consumption for dedicated tenants (owner: Marcus).",
+    "Product action: evaluate a first-class 'health-probe exemption' feature with risk guardrails (owner: Product-Infra)."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution",
+    "follow_up_actions"
+  ],
+  "dataset_doc_uuid": "dsid_309e25fc31b643f08353e66c0fcda650"
+}

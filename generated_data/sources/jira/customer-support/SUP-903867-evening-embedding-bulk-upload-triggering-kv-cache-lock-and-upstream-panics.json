@@ -1,0 +1,111 @@
+{
+  "key": "SUP-903867",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Evening bulk-embedding upload triggers KV-cache lock contention and upstream panics, causing elevated 5xx floor",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Priya Nandi",
+  "assignee": "Ethan Morales",
+  "customer_company": "ClarionMaps Inc",
+  "customer_tier": "enterprise",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "kv-cache",
+    "scheduler"
+  ],
+  "labels": [
+    "5xx",
+    "kvcache-lock",
+    "embeddings",
+    "noisy-tenant"
+  ],
+  "environment": "prod | us-west",
+  "affected_models": [
+    "open-embedding-large-v2"
+  ],
+  "affected_regions": [
+    "us-west"
+  ],
+  "sla_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-824206",
+    "SUP-214890"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/runtime/pull/4218"
+  ],
+  "related_confluence_pages": [
+    "/confluence/runbooks/kv-cache-locks",
+    "/confluence/incidents/2026-03-bulk-embed-wave-postmortem"
+  ],
+  "description": "Issue summary: Beginning 2026-03-10 18:05 UTC ClarionMaps reported a sustained increase in 5xx responses for embedding endpoints. Error rate rose from baseline ~0.2% to ~6% during a 45m window, with a persistent elevated error-floor (~1.2%) for several hours after the initial burst. Impact: customer embeddings API degraded causing failed batch imports and client-side retries. Environment: prod, us-west region, traffic routed via api-gateway cluster agw-usw-2 to serving-runtime pool srw-usw-3.",
+  "steps_to_reproduce": [
+    "1) Submit a single large embeddings bulk upload (10k items, many short texts) to /v1/embeddings with concurrency ~80 and request body size ~120MB",
+    "2) Observe a rapid increase in concurrent kernel allocations on serving runtime nodes pinned to open-embedding-large-v2",
+    "3) Watch KV-cache lock acquisition times spike and API responses begin returning 500/503/502",
+    "4) Retries from client cause amplified connection churn and a persistent error-floor even after load subsides"
+  ],
+  "observed_behavior": [
+    "API gateway returned 502/503/500 at the apigw layer with upstream 'connection reset' and 'upstream unhealthy' messages",
+    "Serving runtime processes logged repeated panic and watchdog restarts (SIGABRT) correlating with GPU preemption and CL context eviction on a subset of nodes",
+    "KV-cache (prefix index) reported long lock hold times and frequent lock contention metrics (kv.lock.wait_ms median increased from 2ms to 180ms)",
+    "Autoscaler reacted by spinning new nodes but warmup time and prefetch caused additional thrashing"
+  ],
+  "logs_and_error_snippets": [
+    "2026-03-10T18:12:03Z srw-usw-3 node-17 runtime[pid:22411]: panic: unexpected nil pointer during kv cache fetch",
+    "2026-03-10T18:12:04Z srw-usw-3 node-17 runtime[pid:22411]: runtime stack trace ...\\n  goroutine 321: ...\\n  kv/cache.go:412 acquireLock(0x7f3b...)",
+    "2026-03-10T18:12:05Z apigw-usw-2 proxy: upstream reset while reading response headers from upstream\\n  upstream: 10.4.78.22:8080",
+    "Metric snapshot (18:10-18:20 UTC): 5xx_rate=6.1%, kv.lock.wait_ms_p95=420, runtime-restarts=8, gpu-preemptions=3"
+  ],
+  "investigation_notes": [
+    "18:15 UTC: Support (Priya) alerted SRE on #support and opened this ticket after initial ClarionMaps report.",
+    "18:18 UTC: SRE (Ethan) confirmed elevated apigw 502s, traced to routing to srw-usw-3 pool nodes showing runtime restarts.",
+    "18:25 UTC: Correlation found between ClarionMaps bulk-job bursts and sudden KV-cache hot-locks on a subset of partitions (partition id range 1024-1280).",
+    "18:33 UTC: Observed retries from client increased connection churn; autoscaler added 4 nodes but prefetch + model initialization increased load and cold-start memory pressure.",
+    "18:45 UTC: Applied temporary rate-limit rule for ClarionMaps tenant at edge (conn/concurrency cap = 40) which reduced immediate 5xx spike; error floor persisted at ~1% for 30m after due to cache thrash and pipeline recovery.",
+    "19:30 UTC: Eng runtime team confirmed a bug in KV-cache lock path under heavy concurrent prefix invalidation that can cause lock inversion and long hold times (internal issue created: github.com/redwood-inference/runtime/issues/9876).",
+    "20:10 UTC: Deployed emergency mitigation (kv-cache backoff tuning and lock timeout enforcement) to a canary subset of runtime pool; saw p95 lock wait drop from 420ms to 12ms on canary nodes and 5xx rate drop to ~0.6% for that slice.",
+    "21:00 UTC: Gradual rollout of mitigation across us-west serving pool completed; customer notified and asked to retry imports. Monitoring shows stabilization but a small residual error-floor remains while background prefetch eviction completes."
+  ],
+  "hypothesis": [
+    "Primary: Large concurrent embedding bulk uploads triggered concentrated hot-key access patterns in KV-cache partitions, causing lock contention that blocked request handling goroutines and cascaded into runtime panics under memory pressure.",
+    "Secondary: Client retry amplification and autoscaler cold-starts amplified resource pressure, leading to intermittent GPU preemption and runtime process restarts, producing upstream 502/503 responses at the gateway."
+  ],
+  "temporary_workaround": "Applied tenant-level connection/concurrency cap (conn cap 40) at edge for ClarionMaps and increased kv-cache lock timeouts plus backoff on lock acquisition. Recommended customers stagger large bulk-upload jobs and use smaller batches (<=1k items) until fix is rolled out.",
+  "resolution": "Mitigation rolled to canary then full us-west pool: updated kv-cache lock backoff and introduced lock acquisition timeout with graceful fallback to a soft-cache-miss path. Runtime crash target fixed by guard against nil pointer during cache fetch (runtime PR merged: github.com/redwood-inference/runtime/pull/4221). Monitoring shows 5xx back to baseline by 2026-03-11 02:15 UTC for us-west.",
+  "postmortem_followup": [
+    "Create a throttling guidance doc for large embedding bulk imports and add to public docs and quickstart (owner: Devex, due 2026-03-20)",
+    "Implement tenant-level adaptive batching to detect hot-key patterns and automatically shard KV-cache keys to reduce single-partition contention (owner: Serving Runtime team, epi: INT-4021)",
+    "Add pre-deploy chaos test that simulates large concurrent embedding uploads to catch regressions in lock paths (owner: QA, due 2026-04-05)",
+    "Add an alert rule for kv.lock.wait_ms_p95 > 200ms in any region (owner: Observability)",
+    "Customer CS follow-up: ClarionMaps to receive incident summary and recommended import best practices; offer 2 weeks of Dedicated throughput credit for remediation impact (owner: CS)"
+  ],
+  "comments": [
+    "Priya Nandi (2026-03-10T18:20): Customer-reported: 'We saw lots of 500s during a large backfill. Some items completed but many were retried and failed.' Clarified they were using our SDK with default 3 retries and batch size 10k split into single API call.",
+    "Ethan Morales (2026-03-10T18:27): SRE investigating - routing traces show majority of failures originated from srw-usw-3 nodes. Pulling runtime logs and kv-cache metrics now.",
+    "Lina Chen (runtime engineer) (2026-03-10T18:41): Found repeated 'acquireLock' stack traces and a nil deref path when lock wait exceeded threshold. Opening PR for guard and backoff changes.",
+    "SRE Pager (2026-03-10T19:05): Applied tenant-level rate cap at edge; initial drop in 5xx spike observed. Monitoring for error-floor recovery.",
+    "ClarionMaps - Chris Hale (2026-03-10T19:22): Confirmed they can pause the import and will split into smaller batches if recommended. Asking for ETA on full fix.",
+    "Ethan Morales (2026-03-11T02:30): Full rollback mitigation deployed; runtime patch merged and rolled. Asking CS to coordinate communication and confirm customer retries succeeded.",
+    "Maya Singh (CS Manager) (2026-03-11T03:05): Communicated to ClarionMaps with guidance. Customer accepted credit offer and will follow up after re-run."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "logs_and_error_snippets",
+    "investigation_notes",
+    "hypothesis",
+    "temporary_workaround",
+    "resolution",
+    "postmortem_followup",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_381e5d51710c4e979e3cc78fadea56f1"
+}

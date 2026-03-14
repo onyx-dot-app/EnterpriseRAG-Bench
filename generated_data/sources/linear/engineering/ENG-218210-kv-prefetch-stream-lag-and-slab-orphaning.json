@@ -1,0 +1,96 @@
+{
+  "key": "ENG-218210",
+  "team": "engineering",
+  "title": "KV prefetch stream-lag causing slab orphaning and slow resident growth",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-12",
+  "creator": "Ava Chen",
+  "assignee": "Marcus Patel",
+  "project": "runtime-memory-safety",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "cudaMallocAsync",
+    "kv-cache",
+    "fragmentation",
+    "continuous-batching",
+    "memory-leak"
+  ],
+  "parent_issue": [
+    "ENG-21388"
+  ],
+  "dependencies": [
+    "ENG-33109",
+    "ENG-142309"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Summary: Under sustained continuous-batching workloads with aggressive KV prefetching, we observe slow, persistent GPU resident-memory growth that does not plateau. Growth appears as small, scattered allocations that never get coalesced back into arena free lists (we're calling this 'slab orphaning'). Hypothesis: KV prefetch tasks allocate pinned/staging buffers and small device buffers across many streams; due to stream-lag on frees (deferred-free until stream completion) plus cudaMallocAsync pooling behavior we keep creating micro-slab fragments that the pool never reclaims. This is distinct from a single large leak \u2014 it's a slow slope caused by accumulation of tiny allocations that escape compaction heuristics.",
+  "reproduction_steps": [
+    "1) Deploy runtime-1.20 nightly to a 4xA100 pool with default cudaMallocAsync pool enabled",
+    "2) Run kv-prefetch-heavy benchmark (tooling: internal loadgen kv-prefetch v2) at 500-700 rps with batch sizes 1-4 for 6+ hours",
+    "3) Monitor nvidia-smi and /proc/driver/nvidia/gpus/*/memory; collect per-process resident and tracked pool stats every minute",
+    "4) Capture nvprof/nvtx traces for 30s slices during growth window and record stream_event latency histograms",
+    "5) Repeat with cudaMallocAsync disabled (fallback to cudaMalloc) as control and with a single-stream prefetch path as additional control."
+  ],
+  "investigation_notes": [
+    "Observed slope: resident +3.9 MB/hour on baseline runs; after a quick heap warmup resident plateaus only when load drops. Under steady load the slope persists.",
+    "nvtx traces show many small allocations on distinct streams with free calls returning quickly but cudaMemPool calls not merging because stream completion fences are delayed ~200-400ms for certain prefetch tasks.",
+    "Pool metrics: high small-allocation churn (4-32KB allocations) with >60% of them in 'staging/pinned' bucket. Pool fragmentation metric shows many <64KB free chunks that are isolated by stream affinity.",
+    "Kernel timeline: KV prefetch does async host->device memcpy on per-request streams; request completion triggers eviction path which queues cudaFree on same stream but we observed a race where stream is reused before pool can reuse freed segments leading to transient resident bumps.",
+    "Control run (cudaMallocAsync disabled) reduced slope to +0.5 MB/hour but increased per-allocation latency by ~15%. Indicates pooling behavior is implicated in the leak pattern.",
+    "Reproducer: small internal harness that repeatedly prefetches random KV slices recreated the slope within 90 minutes on a local dev A100; enabling a forced cudaStreamSynchronize() before free eliminated slope in harness, confirming deferred-free latency interaction."
+  ],
+  "proposed_changes": [
+    "A) Short-term mitigation: add a 'prefetch stream affinity' flag that runs KV prefetches on a bounded set of dedicated streams so freed staging memory is more likely to be coalesced before stream reuse. Experimented in branch ENG/218210/affinity - reduced slope to +0.9 MB/hour.",
+    "B) Medium-term: implement a deferred-free coalescer thread that batch-processes pending frees from multiple streams and issues coalescing hints to cudaMemPool (or issues synchronous fences in safe windows). Adds a configurable budget to avoid tail-latency regressions.",
+    "C) Heuristic eviction: when small-chunk fragmentation grows beyond threshold, trigger background arena compaction that migrates hot KV slices into reserved contiguous arenas and releases orphaned slabs to the OS/pool.",
+    "D) Disable small-pool fast-path for allocations < 64KB when they are coming from KV prefetch path (configurable); forces them into a separate pool that has more aggressive compaction policies.",
+    "E) Add observability: track per-stream allocate/free histograms and expose 'orphaned slab' gauge to Console. Create alert when slope > 1 MB/hour for 3h on dedicated instances."
+  ],
+  "experiments": [
+    "affinity-flag run (24h): slope reduced from +3.9 to +0.9 MB/hr; CPU overhead +1%",
+    "forced-sync patch (dev only): slope -> 0 MB/hr but tail p95 latency regressed 12% \u2014 unacceptable for PLG tier",
+    "separate-pool-for-small-allocs prototype: slope -> +0.4 MB/hr; increases fragmentation metric but allows background compaction to reclaim chunks more effectively",
+    "deferred-free-coalescer simulation: expected to reduce slope to near-zero with <2% p99 latency impact when tuned; further validation required on mixed workloads"
+  ],
+  "decision": [
+    "Landing plan: ship affinity-flag as opt-in in runtime-1.20 to mitigate customer impact while we stabilize deferred-free-coalescer in runtime-1.21. Metric gates required before turning on by default.",
+    "Follow-ups: implement Console charts and alerting, schedule load tests across Dedicated fleet in Cycle 42, and open RFC for allocator compaction primitives."
+  ],
+  "next_steps": [
+    "1) Marcus to land affinity-flag PR and enable opt-in for internal cluster (owner: Marcus) - target 2026-03-15",
+    "2) Ava to prototype a lightweight deferred-free coalescer and share microbench results (owner: Ava) - target 2026-03-19",
+    "3) Infrastructure to add per-stream allocation histograms to the telemetry pipeline (owner: Lee Robinson) - target 2026-03-22",
+    "4) PM to draft customer communication plan if we enable affinity-flag by default (owner: Priya Nair) - target 2026-03-18"
+  ],
+  "comments": [
+    "2026-03-02 | Marcus Patel: Initial repro runs look convincing. Uploaded nvtx traces and pool histograms to the attached dashboard. I can reproduce locally with the harness. Going to try affinity flag next.",
+    "2026-03-04 | Ava Chen: Affinity-flag patch reduced slope significantly in short runs. Recording that forced-sync removes slope but regresses p99; that guides us to a background coalescer rather than adding syncs to request path.",
+    "2026-03-08 | Lee Robinson: Telemetry team started a pipeline to collect per-stream allocation histograms; added a temporary 'kv-orphaned-slab' gauge. Will stub Console charts this week.",
+    "2026-03-10 | Marcus Patel: Landed draft PR for affinity flag: github.com/redwood-inference/runtime/pull/5421. Running fleet soak on internal cluster with opt-in enabled.",
+    "2026-03-12 | Priya Nair: Noted two ongoing enterprise customers with Dedicated pods showing similar slope. Marked for medium customer impact and requested weekly status updates."
+  ],
+  "related_links": [
+    "https://github.com/redwood-inference/runtime/pull/5421",
+    "https://confluence.redwood/inference/runtime/memory/kvs-prefetch-slab-orphaning",
+    "https://internal-dashboards.redwood.net/d/kv-memory/kvs-prefetch-fragmentation?orgId=1",
+    "https://github.com/redwood-inference/runtime/issues/21388"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "reproduction_steps",
+    "investigation_notes",
+    "proposed_changes",
+    "experiments",
+    "decision",
+    "next_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_f590febdc94a400384d4f36bb664ee22"
+}

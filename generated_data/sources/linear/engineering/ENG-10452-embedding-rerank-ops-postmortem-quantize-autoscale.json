@@ -1,0 +1,44 @@
+{
+  "key": "ENG-10452",
+  "team": "engineering",
+  "title": "Postmortem: Rerank/Embedding outage from autoscaler misfire + quantized model normalization bug",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2026-02-15",
+  "updated_at": "2026-02-28",
+  "creator": "Maya Chen",
+  "assignee": "Luis Ortega",
+  "project": "embedding-infra",
+  "cycle": "2026-W07",
+  "estimate": "13",
+  "due_date": "2026-03-15",
+  "labels": [
+    "postmortem",
+    "rerank",
+    "embeddings",
+    "incident",
+    "high-impact"
+  ],
+  "parent_issue": [
+    "ENG-10337"
+  ],
+  "dependencies": [
+    "ENG-10380",
+    "ENG-10401"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.23",
+  "security_review_required": "false",
+  "description": "Summary:\nOn 2026-02-15 08:12 UTC we observed a simultaneous capacity drop and quality regression for the embeddings + reranking endpoints used by hosted API tenants. The incident lasted ~2.5 hours at peak and affected latency and correctness of rerank responses for a subset (~7%) of production traffic. Root causes were twofold and coincidentally correlated: (1) an autoscaler policy mis-evaluated a custom metric and aggressively downscaled GPU pools serving the embeddings model, and (2) a newly-deployed quantized embedding variant introduced a normalization bug that inverted similarity ordering for certain input distributions.\n\nImpact:\n- Increased 95th percentile latency for rerank requests from 220ms -> 1.8s for affected nodes during scale-down windows.\n- Incorrect ranking order for ~7% of evaluated rerank queries (MRR and nDCG drops detected in post-incident evaluation).\n- Several customers filed support tickets citing noisy/incorrect search results and timeouts; automatic retries increased load on fallback routes.\n\nDetection and detection timeline:\n- 2026-02-15 08:12 UTC: First alert from runtime autoscaler that replica count dropped below expected.\n- 2026-02-15 08:14 UTC: Internal SLO dashboard shows latency spike on /v1/rerank; alert triggered.\n- 2026-02-15 08:17 UTC: Pager duty to on-call infra engineer (Luis).\n- 2026-02-15 08:22 UTC: NLU team notices unusual drop in similarity metrics from evaluation probes.\n- 2026-02-15 08:28 UTC: Correlation observed between nodes scaled down and traffic routing to newly-deployed quantized embedding model (embed-v2-q).\n- 2026-02-15 09:05 UTC: Emergency mitigation started (traffic steering off embed-v2-q; scale-up override applied).\n- 2026-02-15 10:45 UTC: Full rollback of embed-v2-q and autoscaler policy patch deployed.\n- 2026-02-15 11:00 UTC: Monitoring shows latency and quality metrics returning to baseline.\n\nRoot causes (detailed):\n1) Autoscaler misconfiguration and metric selection (primary contributor to capacity drop)\n- The autoscaler policy for embedding GPUs relied on a composite metric 'kv_cache_hit_ratio' (derived) which under certain traffic patterns returned NaN (division by zero) from a downstream telemetry pipeline. The autoscaler treats NaN as 0 and fired a downscale action.\n- The policy did not include a minimum-replica safeguard for the embedding pool; as a result the pool briefly shrank to a single replica for several shards, causing queueing and latency amplification.\n\n2) Quantized embedding model release (embed-v2-q) introduced normalization bug (primary contributor to quality regression)\n- During quantization we switched from float32 L2 normalization to a lower-precision fused normalization kernel. A rounding edge-case caused negative values to be slightly biased, which for some vectors flipped cosine similarity ordering for near-equal vectors.\n- The model passed unit tests and local evaluation but failed a production-sensitive canary that relies on rank-consistency tests (those tests were not executed because the canary flag was accidentally disabled in the rollout config).\n\nWhy they coincided:\n- embed-v2-q rollout was scheduled the same day and expanded to 30% of traffic via the rollout orchestrator. When the autoscaler misfired we saw higher pressure on the remaining replica(s) and an increased proportion of traffic hit embed-v2-q, amplifying the end-user quality impact.\n\nMitigations (immediate):\n- 2026-02-15 09:05 UTC: Temporarily rerouted 100% of rerank requests to embed-v1 (stable) via routing policy.\n- 2026-02-15 09:12 UTC: Forced scale-up to restore GPU pool to safe minimum of 4 replicas per shard.\n- 2026-02-15 09:25 UTC: Applied emergency patch to autoscaler to treat NaN as 'ignore' instead of 0.\n- 2026-02-15 10:45 UTC: Rolled back embed-v2-q to previous model version and disabled automated rollout.\n\nLonger-term fixes and action items (owners and target dates):\n- Autoscaler hardening (ENG-10510) - add minimum replica guard, NaN-safe metric handling, and canary-safe mode. Owner: Luis Ortega. Target: 2026-03-10.\n- Model rollout policy change (ENG-10541) - require rank-consistency canary to be enabled and pass before >10% rollout; add explicit disable fallback blocking. Owner: Priya Nair (NLU). Target: 2026-03-05.\n- Embedding quantization test suite (ENG-10582) - add bit-level and rank-stability tests, include representative production vector distributions in CI. Owner: Jordan Patel. Target: 2026-03-12.\n- Add production rerank quality alerts (ENG-10600) - surface daily MRR/nDCG deltas vs. baseline and create high-priority alerts for >2% regression. Owner: Analytics team. Target: 2026-03-01.\n- Improve rollout visibility in Console (PM-482) - show per-model canary results and blocked rollout reasons. Owner: Console PM. Target: 2026-04-01.\n- Post-incident customer outreach: Support to send incident summary to affected customers and include recommended actions. Owner: Customer Success. Target: 2026-02-20.\n\nFollow-ups already completed:\n- Emergency change set for autoscaler NaN handling merged and hotfixed (PR: https://github.com/redwood-inference/runtime/pull/1824).\n- Embed-v2-q rollback PR merged (https://github.com/redwood-inference/models/pull/391).\n- Incident Slack channel archive and initial postmortem discussion completed 2026-02-18.\n\nLessons learned / retrospective notes:\n- Canary gating must be enforced by the rollout orchestrator, not left to team-level flags. We will move gating logic into a central service to avoid accidental disablement.\n- Metric selection for autoscalers must consider telemetry edge cases (NaN, outliers). Test harnesses for autoscaler policies will be added to infra CI.\n- Quantization pipelines need production-distribution sampling to detect edge-case rounding effects.\n- We should add a lightweight, fast 'rank-stability' probe that runs on every model canary run with synthetic and sampled production queries.\n\nCommunications and artifacts:\n- Incident runbook: https://confluence.redwood.ai/incidents/rerank-2026-02-15\n- Support tickets: #CS-1479, #CS-1482, #CS-1491\n- Dashboards: https://grafana.redwood.ai/d/rerank/embedding-pools\n- Postmortem review scheduled: 2026-03-02 16:00 UTC (owner: Maya Chen).\n\nConclusion:\nThe outage was caused by an unfortunate overlap of an autoscaler policy edge-case and an immature quantized model rollout. Immediate mitigations restored service and quality, and we have an actionable list of fixes with owners and deadlines. The priority is to prevent recurrence by hardening autoscaling rules, enforcing canary gates for model rollouts, and expanding quantization validation in CI.\n\nRelated tickets and references:\nENG-10380, ENG-10401, ENG-10510, ENG-10541, ENG-10582, ENG-10600\n\nAttachments and evidence:\n- timeline_logs_2026-02-15.txt (attached in ticket)\n- sampled_failed_queries.csv\n- grafana-screenshots.zip\n",
+  "reviewers": [
+    "Priya Nair",
+    "Jordan Patel",
+    "Amir Hassan"
+  ],
+  "postmortem_review_date": "2026-03-02",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description"
+  ],
+  "dataset_doc_uuid": "dsid_202660ad6a794aac8deb662d0bfd7b41"
+}

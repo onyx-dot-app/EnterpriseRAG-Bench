@@ -1,0 +1,80 @@
+{
+  "key": "SUP-722119",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Concurrent keepalive pool collapse causing intermittent 5xx server errors and upstream runtime GPU thrashing",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Priya Kapoor",
+  "assignee": "Ethan Ross",
+  "customer_company": "StreamlineAI",
+  "customer_tier": "dedicated",
+  "environment": "prod | us-east",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "keepalive-pool",
+    "scheduler"
+  ],
+  "labels": [
+    "5xx",
+    "keepalive",
+    "gpu-thrash",
+    "urgent"
+  ],
+  "affected_models": [
+    "gptx-4-onnx-quant"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-14",
+  "linked_issues": [
+    "SUP-214890",
+    "SUP-462019"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/1632"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/Keepalive+Collapse+Runbook"
+  ],
+  "description": "Issue summary:\nSupport received multiple reports from StreamlineAI (Dedicated) about a sudden rise in server errors during peak morning traffic window (09:00-10:30 UTC). Error rate rose from ~0.2% to ~12% for the tenant's routes. Customers observed intermittent HTTP 502/503/504 returned by the API and streaming sessions disconnecting.\n\nImpact:\n- StreamlineAI saw increased request failures and stream disconnects affecting production availability for a 15-minute window.\n- Elevated token retry and hedged-retry activity from SDK clients.\n- Latency for successful requests increased by ~120ms median and p95 by ~450ms.\n\nEnvironment:\n- Redwood Dedicated pool (tenant pinned).\n- Region: us-east.\n- Models serving: gptx-4-onnx-quant pinned.\n- Autoscaler: enabled, burst policy set to allow ephemeral warmup.\n\nSteps to reproduce (observed pattern):\n1) Tenant sees a steady small-payload burst from many short-lived connections (keepalive churn).\n2) API gateway keepalive pool begins recycling sockets aggressively when ephemeral worker count spikes.\n3) Accept queue depth grows; proxy begins returning 502s for new connections.\n4) Upstream runtimes experience high prefetch and KV cache thrashing, GPU utilization oscillates and triggers watchdog resets for a subset of workers.\n\nLogs / snippets:\n- apigw: \"ERROR tcp_accept: accept queue backlog exceeded: backlog=512 -> dropping\"\n- proxy: \"WARN upstream_health: stale-keepalive detected, closing 42 sockets\"\n- runtime: \"GPU_WATCHDOG: worker 128 killed - NVML reset observed; oom=false; kernel_swap=true\"\n- metrics snapshot (09:12 UTC): request_error_rate=12.1%, accept_queue=490, ephemeral_workers=240 -> baseline ephemeral_workers ~40\n\nInitial customer report excerpt:\n> \"We saw a sudden wave of failures around 09:10 \u2014 streaming sessions disconnect and simple chat completions returning 502. No change on our side. Our traffic is short-lived connections (mobile SDK).\"\n",
+  "comments": [
+    "2026-03-12 Priya Kapoor (Support): Logged after customer alert. Collected traces and asked for client SDK versions and approximate concurrency. Assigned to SRE on-call.",
+    "2026-03-12 Lucas Martin (SRE): Acknowledged. Spun up targeted dashboards (accept queue depth, ephemeral worker count, NVML resets). Noted accept queue spike coincident with increased ephemeral workers. Linked temporary slack thread: #support-streamlineai-722119.",
+    "2026-03-13 Ethan Ross (Servicing): Observed a pattern: many short-lived connections cause keepalive pool churn which forces socket tear-downs; proxy then re-establishes with a flood causing upstream runtime prefetch storms. Hypothesis: keepalive pool sizing + aggressive worker prewarm combined with hedged retry from client SDK amplifies effect.",
+    "2026-03-13 Support (Priya): Customer confirms mobile SDK v2.1.3 with hedged retry enabled; telemetry shows backoff disabled in their config. Requested they temporarily disable hedged retry; customer agreed and applied a config change at 09:40 UTC.",
+    "2026-03-13 StreamlineAI (Customer): After disabling hedged retries we saw immediate drop in error rate to ~0.8% and streaming disconnects reduced. However sporadic 502s remain.",
+    "2026-03-14 SRE (Lucas): Deployed a soft fix: increased keepalive pool headroom and adjusted accept queue tuning for the affected host group. Patch rolled to us-east canary (host-group-egress-09) 09:00-09:15 and then broader roll 09:30. Monitoring shows accept_queue reduced from 490->40 and error rate dropped to 0.5%.",
+    "2026-03-14 Ethan (Servicing): Noted a code PR to add guardrails in runtime for prefetch spikes: https://github.com/redwood-inference/runtime/pull/1632. Scheduling follow-up to add a runtime-side circuit to limit prefetch concurrency per-tenant during high keepalive churn.",
+    "2026-03-14 Priya (Support): Informed customer of mitigation and requested confirmation of stability for 72 hours. Opened ticket for follow-up closure after monitoring window.",
+    "2026-03-14 StreamlineAI (Customer): Confirmed that errors returned to normal levels after both client-side hedged retry disable and server-side keepalive headroom increase. Asked whether Redwood can recommend SDK config defaults to avoid this class of problem.\n"
+  ],
+  "investigation_notes": [
+    "Timeline correlation: accept queue and ephemeral_workers spike co-occurred with API error spike (09:08-09:22).",
+    "Root correlation: short-lived mobile connections with hedged retry created repeated connection churn, causing keepalive pool to recycle sockets at high rate.",
+    "Proxy behavior: closing stale keepalive sockets en masse increases downstream cold-connects; cold connects hit runtime prefetch path which triggers KV cache invalidations and GPU kernel swaps.",
+    "NVML resets: subset of runtime workers experienced NVML soft-resets likely due to driver-level kernel swaps under high context-switch pressure (observed on 5 out of 60 workers in host-group).",
+    "Mitigations validated: disabling hedged retries on client reduced amplification immediately; server-side keepalive headroom prevented accept queue exhaustion and reduced cold-connection rate.",
+    "Risk: Without runtime prefetch guards, similar tenant traffic patterns could cause repeated GPU thrashing and intermittent worker restarts during other tenant bursts."
+  ],
+  "root_cause": "A feedback amplification loop between aggressive client hedged retries (short-lived connections), proxy keepalive recycling, and runtime prefetch/kv-cache activity which caused accept-queue exhaustion and triggered NVML soft-resets on a subset of GPU workers.",
+  "resolution": "Short-term: Coordinated mitigation with customer (disable hedged retry) + server-side increase in keepalive pool headroom and accept-queue tunables in us-east. Medium-term: merged PR to add runtime-side prefetch concurrency limits and a proxy change to stagger keepalive socket closures (PR linked).",
+  "next_steps": "1) Ship runtime prefetch guard (PR 1632) to canary across all regions in next maintenance window. 2) Update dedicated runbook and add automatic tenant-level prefetch throttling during accept-queue pressure. 3) Update SDK recommended defaults to have hedged retries off for mobile scenarios in the docs and publish guidance to customers. 4) Monitor StreamlineAI for 72h and then move ticket to Resolved if stable.",
+  "closure_criteria": "Error rate stable below 1% for 72 hours for StreamlineAI and no NVML resets in affected host group. Follow-up runbook updates merged into ops-runbooks.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "root_cause",
+    "resolution",
+    "next_steps",
+    "closure_criteria"
+  ],
+  "dataset_doc_uuid": "dsid_a2a329140e1c40e895245a118313f44e"
+}

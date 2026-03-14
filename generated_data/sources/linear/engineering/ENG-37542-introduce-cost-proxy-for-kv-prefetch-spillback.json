@@ -1,0 +1,97 @@
+{
+  "key": "ENG-37542",
+  "team": "engineering",
+  "title": "Introduce cost-proxy attribution for KV prefetch spillback in interleaved batch flows",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-14",
+  "creator": "Aisha Raman",
+  "assignee": "Marco Silva",
+  "project": "metering-rewrite-2026",
+  "cycle": "2026-W11",
+  "estimate": "5",
+  "due_date": "2026-03-28",
+  "labels": [
+    "metering",
+    "kv-cache",
+    "billing",
+    "rate-limiting",
+    "high-impact"
+  ],
+  "parent_issue": [
+    "ENG-35711"
+  ],
+  "dependencies": [
+    "ENG-33190",
+    "ENG-29740"
+  ],
+  "customer_impact": "high",
+  "release": "billing-2.4",
+  "security_review_required": "false",
+  "description": "Define and implement a deterministic \u2018cost-proxy\u2019 attribution mechanism that assigns metering/quota consumption for requests affected by KV prefetch spillback and interleaved/coalesced batches. This ticket covers accounting rules, rate-limiter interactions, and implementation guardrails to avoid double-charging or lost tokens when prefix/KV cache hits trigger partial or full fallthroughs to live model execution within fused batches.",
+  "background": "We observed multiple production incidents where mixed cache-hit/miss batches caused misattribution of token charges: some customers were billed for tokens executed on behalf of other tenants, and quota enforcement applied incorrectly after spillback. Current metering tags are attached at request start and are not updated when requests are merged, split, or when a prefetcher causes spillback. This ticket aims to make attribution explicit and auditable.",
+  "acceptance_criteria": [
+    "Metering records include a cost-proxy field for any request that participated in an interleaved batch where KV prefetch changed execution path",
+    "Quota deductions are charged to the original request owner when spillback executes tokens on their behalf; no tenant is charged twice for the same token",
+    "Rate limiter windows and token buckets behave consistently when partial-prefetch hits convert to model execution (benchmarked under 10k RPS mixed hit/miss workload)",
+    "Unit and integration tests cover: fully cached batch, fully miss batch, mixed batch with partial KV hits, and spillback that triggers additional model steps",
+    "Monitoring dashboards show per-route reconciliation between billed tokens and actual GPU token counts with <1% drift under test workloads"
+  ],
+  "implementation_notes": [
+    "Introduce a cost_proxy tag (string) on the metering envelope that can carry: 'origin-request-id', 'proxy-mode:proportional', and an optional 'split-map' encoded as CSV (originId:tokenCount) for auditability",
+    "When a fused batch contains requests A,B,C and A had a KV prefetch that later spills back to model execution, we will: 1) mark the execution tokens with cost_proxy=origin:A, 2) allocate cost to A by default, and 3) if model execution interleaves tokens from B/C, apply proportional split if 'proxy-mode:proportional' is set",
+    "Preferred split algorithm: by active decoding token counts (not by original input length) because decoding drives GPU time. Example: if execution produced 120 tokens where A triggered 80 of them and B triggered 40, allocate 80/120 of billing to A and 40/120 to B",
+    "For partial KV hits (prefix present but tail misses) we attach two records: a cached token record (zero-cost but contributes to cache-metrics) and a model-token record (billed) with cost_proxy pointing to the owner of the request that caused the miss",
+    "Rate limiter harmonization: apply quota deduction at the moment of final token issuance (post-aggregation) but tag usage with original request owner. This requires the rate-limiter to accept 'owner' metadata on bucket consumption calls",
+    "To avoid double-billing, any prefetch-related bookkeeping that previously charged a prefetched token must be idempotent: mark prefetch attempts as 'metered=false' until final execution confirms charge target",
+    "We will add a reconciliation job that compares GPU-side emitted token counts (via runtime telemetry) to metering records grouped by cost_proxy; anomalies >1% will create PagerDuty alerts for billing team",
+    "Edge-case: multi-tenant dedicated pools where requests from different customers are served by same GPU. For these, default is strict owner-charging. Only allow proportional charge if customer config (tenant policy) permits share-billing; otherwise route to sequential execution to keep accounting simple",
+    "Instrumentation: expose cost_proxy in streaming event logs (kafka topic: runtime-metrics) and in the billing pipeline consumer so that downstream billing can apply proration rules"
+  ],
+  "examples_and_formulas": [
+    "Scenario: Batch of 3 requests (A,B,C). Prefetch indicates A has prefix hit for 10 tokens; during execution A hits a KV miss at token 11 causing spillback that triggers 90 model tokens that are emitted in an interleaved fashion: A emits 60, B emits 20, C emits 10. Billing: allocate 60/90 of those billed tokens to A, 20/90 to B, 10/90 to C",
+    "Formula: billed_tokens(owner) = sum_over_executions(token_count * allocation_fraction(owner,execution))",
+    "Allocation fraction (proportional): allocation_fraction(owner,execution) = owner_decoded_tokens_in_execution / total_decoded_tokens_in_execution",
+    "Prefetch-only tokens should be tagged as cached_tokens and have cost = 0. If downstream audit shows a cached token was later re-executed due to eviction, the reconciliation job will surface and trigger corrective billing with 'correction_reason: cache-eviction-spillback'",
+    "Rate-limiter interaction: when final_billed_tokens(owner) > remaining_quota(owner), block further requests according to normal quota enforcement paths and emit a 'quota-overdraft' event tied to origin request id"
+  ],
+  "tests_to_add": [
+    "Synthetic integration load: 10k/s mixed pattern (60% cached prefix, 40% miss) validate metering attribution and rate-limiter behavior",
+    "Unit tests for cost_proxy envelope serialization/deserialization and idempotency of prefetch metering flags",
+    "Chaos test: force KV prefetch eviction mid-batch to validate corrective reconciliation path",
+    "E2E billing test: replay batch traces through billing consumer comparing expected proration with actual billing outputs"
+  ],
+  "work_log": [
+    "2026-03-10 - Aisha Raman: Ticket created after postmortem for incident 'mixed-batch-billing-2026-03-05'. Collected telemetry and examples from live traces.",
+    "2026-03-11 - Marco Silva: Investigated runtime event stream; confirmed that current metering tag is immutable after batch-coalescing. Drafted cost-proxy design and shared with billing and runtime teams.",
+    "2026-03-12 - Design review: billing, runtime, and infra reviewed approach. Decision: use proportional allocation by decoded tokens; require tenant opt-in for share-billing. Action items: add reconciliation job and add envelope field cost_proxy.",
+    "2026-03-13 - PR opened: github.com/redwood-inference/runtime/pull/1289 implementing cost_proxy tagging in batch fusion path. Benchmarks show <1% overhead on p99 latency for 512-token workloads.",
+    "2026-03-14 - Marco Silva: Integration tests failing in multi-tenant dedicated pool scenario where owner metadata was stripped by an older router. Blocking: infra rollout needed to preserve owner metadata across hop. Added dependency ENG-39702 to track router fix.",
+    "2026-03-14 - Aisha Raman: Created temporary dashboard 'billing/cost-proxy-debug' to surface mismatched aggregates and linked to PR. TODO: add alerting thresholds and oncall playbook."
+  ],
+  "risks_and_mitigation": [
+    "Risk: Complexity of proportional proration could make billing explanations hard for customers. Mitigation: include detailed audit logs and a readonly billing-reconciliation API endpoint customers can query",
+    "Risk: Additional metadata increases event size on the runtime-kafka topic. Mitigation: cost_proxy is compact (owner id + small CSV) and will be gzipped; monitor throughput and consider sampling for low-value routes",
+    "Risk: Race between rate-limiter deduction and final token issuance could allow small overdrafts. Mitigation: perform a best-effort pre-reservation (soft-hold) for expected billed tokens and finalize at issuance time; overdrafts will be corrected by reconciliation job and communicated via billing corrections",
+    "Risk: Unauthorized charge attribution if owner metadata is spoofed. Mitigation: validate owner signatures at the ingress boundary and preserve signed owner id through the path; if signature missing, fall back to strict per-request execution (no interleaving)"
+  ],
+  "links": [
+    "https://github.com/redwood-inference/runtime/pull/1289",
+    "https://confluence.redwood.ai/display/METER/Cost-Proxy-Design-Doc",
+    "https://grafana.redwood.ai/d/billing/billing-cost-proxy-debug",
+    "https://incident.redwood.ai/2026-03-05-mixed-batch-billing-postmortem"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "background",
+    "acceptance_criteria",
+    "implementation_notes",
+    "examples_and_formulas",
+    "tests_to_add",
+    "risks_and_mitigation",
+    "work_log"
+  ],
+  "dataset_doc_uuid": "dsid_77e46abe477f4dddb9b1dd78aa17c84c"
+}

@@ -1,0 +1,106 @@
+{
+  "key": "ENG-743820",
+  "team": "engineering",
+  "title": "Shard resequencing causes model identity smear on Console charts",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-04",
+  "updated_at": "2026-03-10",
+  "creator": "Ava Martinez",
+  "assignee": "Ravi Patel",
+  "project": "console-usage-fidelity",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-18",
+  "labels": [
+    "metering",
+    "backfill",
+    "console",
+    "high-impact"
+  ],
+  "description": "Symptom: Customer-facing Console charts (top model breakdown, model heatmap, and per-model sparklines) intermittently show 'smearing' where token/usage mass appears briefly under incorrect model aliases after an internal shard resequencing event. This spike is visible for 1-3 buckets and then reconciles after a backfill, causing confusion among customers and triggering support tickets. The effect is most prominent for orgs that use multi-model routing and custom aliases.",
+  "reproduction_steps": [
+    "Run synthetic traffic replay using multi-model routing (models A/B, aliasing enabled) against a sharded ingest pipeline with simulated shard resequencing (out-of-order shard stream + delayed watermark).",
+    "Observe per-model aggregate by hour and 5-minute charts. Look for transient re-attribution where tokens attributed to model A briefly show up under model B alias 'unknown-123', then disappear after ingest reconcile job runs.",
+    "Enable rate-limit retry fan-in to increase chance of duplicate events and observe smear intensity."
+  ],
+  "impact": "high",
+  "customer_impact": "high",
+  "root_cause_summary": "The aggregation pipeline uses a two-stage keying approach: fast ingesters assign ephemeral shard-local model identity tokens which are later reconciled during sharded merge. When shard resequencing occurs (e.g., due to consumer rebalance or network hiccup), downstream downsamplers apply time-based windowed smoothing using the ephemeral keys. The smoothing/downsampling logic doesn't wait for final model_id reconciliation, so intermediate aggregates are emitted to the Console with the transient, wrong model key. Backfills correct the model_id, but by then charts already showed the smear and customers saw inconsistent snapshots.",
+  "detailed_technical_notes": [
+    "Ingest path: frontend -> shard writer -> per-shard pre-aggregator -> Kafka topic -> sharded combiner -> downsampler -> materialized timeseries store.",
+    "Pre-aggregator emits provisional rows with 'shard_identity' and 'alias_hint' fields. The sharded combiner reconciles to canonical model_id later, but downsampler currently consumes provisional rows and uses smoothing windows of 2-3 buckets for jitter reduction.",
+    "Downsampler smoothing algorithm spreads counts across adjacent buckets by shard_identity; it lacks a reconciliation hook to replace provisional key material when the combiner emits the resolved mapping.",
+    "Rate-limit retry fan-in duplicates increase frequency of provisional rows with conflicting alias_hint, exacerbating smear."
+  ],
+  "proposed_fix": [
+    "Short-term mitigation: Stop emitting to Console from the downsampler for model-identity sensitive metrics until reconciliation completes. Instead, surface a staleness indicator on affected charts (e.g., 'Data may be provisional for the last 15 minutes').",
+    "Medium-term: Add reconciliation barrier in the downsampler: buffer provisional rows keyed by shard_identity for a short, configurable watermark (default 60s) and apply reconciliation mappings from the combiner before smoothing/downsampling. This reduces visible provisional attribution while keeping latency targets for most workloads.",
+    "Long-term: Move to idempotent event model where each token event carries a canonical model_id assigned at the earliest stable point (frontend or model router). Also consider versioned per-model canonicalization tables persisted to the timeseries store to permit fast retroactive corrections without emitting provisional aggregates to Console.",
+    "Implement alerting for sudden per-alias bursts coincident with shard-rebalance traces to allow ops to triage quicker."
+  ],
+  "acceptance_criteria": [
+    "Synthetic replay tests show 90% reduction in transient mis-attribution events on Console charts under simulated resequencing scenarios.",
+    "Console shows a clear staleness indicator for provisional windows and customers no longer receive spike notifications for transient smears.",
+    "Metrics: downstream 5m chart latency increase <= 15s compared to baseline after changes, and no increase in 95p tail latency for chart rendering calls.",
+    "E2E tests added to replay harness and integrated into CI to prevent regression."
+  ],
+  "rollback_plan": "If customer-visible regressions appear after deployment (increased chart latency or missing real usage), revert the buffer/reconciliation change in the downsampler and re-enable the previous path while toggling a kill-switch feature flag. Notify support and create a postmortem timeline.",
+  "rollout_plan": [
+    "Feature-flag the reconciliation buffer in the downsampler.",
+    "Deploy to staging and run the synthetic resequencing replay harness. Verify acceptance criteria.",
+    "Canary to 10% of traffic (low-traffic region) for 24h and monitor per-model attribution correctness, chart latency, and alert volume.",
+    "Gradual ramp to 100% over 72h with monitoring thresholds for automatic rollback."
+  ],
+  "tests": [
+    "Unit tests for buffer and reconciliation logic (edge cases: missing mapping, mapping updates, duplicate events).",
+    "Integration replay tests in the synthetic harness simulating: normal operation, shard resequence, consumer rebalance, and retry spikes.",
+    "Load test to verify default 60s buffer does not cause unacceptable memory pressure at 10k orgs concurrently.",
+    "Manual QA: Validate Console charts for several tenant-sized datasets including multi-model routing with alias churn."
+  ],
+  "dependencies": [
+    "ENG-412987",
+    "ENG-21432"
+  ],
+  "related_issues": [
+    "ENG-357914",
+    "ENG-95321"
+  ],
+  "related_links": [
+    "confluence:docs/console/ingest-aggregation-architecture",
+    "github:repo/ingest/downsampler#issue-flag-reconciliation",
+    "dashboard:observability/per-model-attribution-anomalies"
+  ],
+  "notes_and_decisions": [
+    "2026-03-05: Initial triage by SRE and Platform team. Reproducible in synthetic harness. Decided to prioritize a buffering reconciliation over removing smoothing entirely to balance latency and correctness.",
+    "2026-03-07: PM (Liam Chen) approved user-facing staleness indicator and customer comms plan.",
+    "2026-03-09: Design review: added opt-out config for orgs with ultra-low-latency needs. UX to display provisional badge on sparkline tooltip."
+  ],
+  "customer_communication": "Draft support KB created explaining transient attribution artifacts and how backfills correct them. Customer success to proactively reach out to top-10 affected tenants once fix is rolled out.",
+  "security_review_required": "false",
+  "owner_on_call": "Ravi Patel",
+  "comments": [
+    "Ava Martinez (2026-03-04): Filing ticket after reproducing smear in replay harness for tenant demo-data. Logged heap usage of buffer during replay: 12MB per 1k shards.",
+    "Ravi Patel (2026-03-05): Confirmed root cause tracing from shard_identity mismatch. Proposing 60s buffer as default; will test memory implications.",
+    "SRE - Priya Kapoor (2026-03-06): We need alerting on 'provisional_to_canonical_mismatch_rate' so ops can detect large incidents.",
+    "Liam Chen PM (2026-03-07): Add a customer-visible tooltip explaining provisional data and timeline for correction. We'll also prepare a one-pager for CSMs.",
+    "Design - Marco Ruiz (2026-03-08): Prototype for provisional badge on sparklines uploaded to Drive: /drive/prototypes/console-provisional-badge.png",
+    "Ravi Patel (2026-03-10): Started work on downsampler buffering PR; aiming for staging deploy 2026-03-12."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "reproduction_steps",
+    "root_cause_summary",
+    "detailed_technical_notes",
+    "proposed_fix",
+    "acceptance_criteria",
+    "rollback_plan",
+    "rollout_plan",
+    "tests",
+    "notes_and_decisions",
+    "customer_communication",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_8424f2d104364e8980ce28b3ce4ee1cb"
+}

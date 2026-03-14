@@ -1,0 +1,51 @@
+{
+  "key": "ENG-847210",
+  "team": "engineering",
+  "title": "Tenant shielding: ingest flow control + trace handoff for on-prem collectors",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Patel",
+  "assignee": "Marco Ruiz",
+  "project": "Private-Observability",
+  "cycle": "Cycle 53",
+  "estimate": "8",
+  "release": "obs-2026.03",
+  "security_review_required": "true",
+  "labels": [
+    "onprem",
+    "vpc",
+    "multi-tenant",
+    "observability",
+    "tracing",
+    "ingest",
+    "isolation"
+  ],
+  "dependencies": [
+    "ENG-4721",
+    "ENG-64209",
+    "ENG-50432"
+  ],
+  "description": "Background:\nRedwood private and VPC deployments need stronger tenant-level ingress controls at the observability boundary to avoid noisy tenants taking down collector capacity, and to ensure trace continuity when we perform tenant isolation or replay. Current sidecar/collector behavior can lead to head-of-line latency and opaque trace gaps when ephemeral tenants exceed expected burst capacity.\n\nGoal:\n1) Implement a tenant shielding layer in on-prem/VPC collectors that enforces per-tenant ingest flow-control (burst, steady-state qps, backpressure policy) and graceful trace handoff semantics (preserve trace continuity, mark/annotate partial traces, and emit replay checkpoints).\n2) Surface SLO-aligned latency/error dashboards and per-tenant health signals in the Console so platform teams can detect noisy tenants early and remediate.\n\nOut of scope:\n- Global multi-region routing changes (follow-up).\n- Long-term archival replay pipeline (separate initiative).\n\nDesign summary and trade-offs:\n- Flow-control model: token-bucket per-tenant with two burst tiers (soft, hard). Soft-tier throttles by delaying ack to the source (sidecar backpressure), hard-tier rejects with 429 + opaque tenant traceback when buffer saturation hits critical levels.\n  Trade-off: token-bucket keeps steady throughput and is simple to reason about; however rare bursty ML workloads could see increased rejections \u2014 mitigated by a configurable burst window per tenant and temporary burst leases.\n\n- Trace handoff: when a tenant's connection is paused or rejected, the collector will emit a trace-handoff span with metadata: tenant_id (hashed), handoff_reason, local_buffer_watermark, and an idempotency checkpoint token. Consumers (central relays / replay orchestrator) can use the checkpoint token to resume or reconstruct partial traces; traces missing spans are flagged for regression monitoring.\n  Trade-off: adding handoff spans increases telemetry volume marginally but is necessary to preserve trace continuity and make missing-span detection deterministic. Handoff tokens are short-lived and rotated to avoid information leakage.\n\n- Isolation boundaries: collectors will create per-tenant bounded queues and memory pools. When total collector memory pressure > threshold, eviction prefers tenants without burst-lease or with lowest SLA tier.\n  Trade-off: this introduces complexity in allocator and eviction policy; we will instrument metrics heavily and keep the initial algorithm conservative (LRU-ish with SLA weight).\n\nAcceptance criteria:\n- Collector accepts per-tenant token-bucket config via CRD/console and enforces it under load for synthetic tenants (see test harness).\n- When a tenant exceeds soft limit, source sidecar sees sustained increased request latency but no lost spans; when hard limit is reached, collector returns structured 429 and emits trace-handoff span.\n- Console shows per-tenant ingest qps, head-of-line latency, buffer utilization, and count of trace-handoffs. Alerts firing for sustained head-of-line latency > 500ms and buffer utilization > 85%.\n- Replay harness can resume a partial trace using the checkpoint token emitted in the handoff span and reconstruct trace parent-child relationships in 95% of test cases (synthetic trace replays).\n\nImplementation plan (high level):\n1) Schema & API: define handoff-span schema and checkpoint token format (short-lived opaque base64) \u2014 PR: github.com/redwood/collector/pull/3124 (WIP).\n2) Collector runtime: per-tenant bounded queues + token-bucket enforcement; memory accounting hooks. Implement in C++ collector runtime with a Rust shim for the eviction policy so we can iterate safely.\n3) Sidecar protocol: augment sidecar -> collector HTTP/gRPC with backpressure semantics and structured 429 bodies. Backwards-compatible: if old sidecar connects, collector will default to rejecting when hard limit triggers (graceful degradation).\n4) Console: add tenant-level ingest panel, trace-handoff count, and dashboard alerts. Console-side will map hashed tenant ids to customer display names for authorized viewers only.\n5) E2E tests: load generator harness with tenant mix, fault injection for network partitions, and replay/resume validation.\n6) Rollout: start in internal Dedicated environment -> pilot select private customers with feature flag -> ramp to GA.\n\nTesting & QA:\n- Unit tests for token-bucket logic, eviction ordering, and handoff token lifecycle.\n- Integration tests between sidecar and collector (simulate backpressure).\n- Chaos test: inject sudden 5x traffic spike from one tenant and assert other tenants maintain latency SLOs.\n- Replay test: intentionally drop a subset of spans and validate handoff-checkpoint resumes correctly.\n\nMonitoring & Dashboards:\n- New collector metrics (prometheus names): redwood_collector_tenant_queue_size, redwood_collector_tenant_tokens, redwood_collector_tenant_handoff_count, redwood_collector_heap_by_tenant_hash.\n- Console dashboards: tenant ingest overview, tenant-heatmap for head-of-line latency, top-causers (by handoff count).\n- Alerts: tenant_head_of_line_latency > 500ms for 2m (warning), > 2m (critical); collector_total_buffer_utilization > 90% (critical).\n\nRollout and migration notes:\n- The new handoff-span schema must be backwards compatible with existing trace storage. We'll add a converter in the ingestion path to translate handoff spans into an internal annotation.\n- For private/on-prem customers, the agent upgrade will be opt-in initially (feature flag). Ops playbook will include a rollback that clears per-tenant leases and drains buffers.\n\nRisks and mitigations:\n- Risk: Incorrect eviction policy could starve low-volume critical tenants. Mitigation: SLA-weighted eviction and safeguard to protect tenants with active canary tokens.\n- Risk: Handoff tokens leak tenant identity if not carefully rotated. Mitigation: store only hashed tenant_id in emitted spans; token is opaque and bound to collector ID + TTL.\n- Risk: Increased CPU/memory overhead on collector. Mitigation: benchmark targets and circuit-breaker to disable per-tenant queuing if host memory pressure is high.\n\nOpen questions / decisions needed:\n- How long should handoff tokens be valid for replay (30s, 5m, 1h)? Proposal: 5 minutes to balance replay speed vs token surface area.\n- SLA tiers mapping to eviction weight: need PM input on default weights and recommended burst windows.\n\nLinks & artifacts:\n- Design doc (Confluence): https://redwood.atlassian.net/wiki/spaces/INF/pages/847210/tenant-shielding-design (draft)\n- Collector PR (WIP): https://github.com/redwood/collector/pull/3124\n- Sidecar protocol sketch: https://docs.google.com/document/d/sidecar-backpressure-sketch\n- Console dashboard mockups: https://drive.redwood.com/drive/folders/obs-tenant-shielding\n\nNext steps this cycle:\n- Finalize handoff-span schema and submit PR for API review (assigned to Marco).\n- Implement basic token-bucket enforcement in collector runtime (ETA: +5 days).\n- Build a minimal Console panel prototype to validate backend metrics ingestion (ETA: +7 days).\n\n",
+  "acceptance_criteria": [
+    "Per-tenant token-bucket config enforced under synthetic load",
+    "Handoff span emitted with opaque checkpoint token on hard-limit reject",
+    "Console shows per-tenant ingest and handoff metrics and alerts",
+    "Replay harness can reconstruct partial traces using checkpoint token in >=95% tests"
+  ],
+  "comments": [
+    "2026-03-10 Aisha Patel: initial ticket created and design doc linked. Marked security review required because of tenant identifiers in spans.",
+    "2026-03-11 Marco Ruiz: started prototyping token-bucket in collector runtime. Found that current allocator exposes only global memory counters \u2014 adding per-tenant accounting. Draft PR opened: https://github.com/redwood/collector/pull/3124",
+    "2026-03-11 Lina Hsu (PM): provided suggested SLA weight mapping and recommended default burst window = 20s for P1 customers; added label 'slo-impact'.",
+    "2026-03-12 Marco Ruiz: pushed a small change to use hashed tenant ids in handoff spans to avoid PII. Running perf microbenchmarks: ~6% CPU overhead at 10k qps per collector node (nominal).",
+    "2026-03-12 Security (Samir): quick sync \u2014 agreed to require HSM-signed rotation of replay tokens for Private customers. Added dependency on ENG-50432 for private deploy tap scrub pipeline."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_05218c532cf74ef19e52852ebc4125e6"
+}

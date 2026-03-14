@@ -1,0 +1,110 @@
+{
+  "key": "SUP-629301",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Evening 5xx surge caused by ephemeral-init throttling and KV-IO latency during mixed embed+stream workload",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-13",
+  "updated_at": "2026-03-14",
+  "reporter": "Priya Shah",
+  "assignee": "Liam O'Connor",
+  "customer_company": "NimbleChat Inc",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "kvcache",
+    "ephemeral-proxy"
+  ],
+  "labels": [
+    "5xx",
+    "evening-surge",
+    "investigating",
+    "embeddings",
+    "streaming"
+  ],
+  "environment": "prod us-east",
+  "affected_models": [
+    "redwood-v2-medium",
+    "open-llama-13b"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-14",
+  "first_response_due_at": "2026-03-13",
+  "linked_issues": [
+    "SUP-472901",
+    "SUP-842314"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/2439"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/Runbook+-+Evening+5xx+Surge"
+  ],
+  "description": "Issue summary: Starting ~2026-03-13 20:10 UTC we observed a sustained elevation in 5xx responses on several customer-facing streaming and embeddings routes for tenant NimbleChat (dedicated). Impact: customer reported degraded UX (stream disconnects and failed embedding uploads), increased error rate ~8% for API surface, and multiple customer calls. Initial triage shows apigw returning 502/503, upstream serving runtimes reporting worker exits and GPU eviction events.\n\nImpact: Multiple sessions for NimbleChat experienced aborts, some calls retried by client and hit rate-limiting; billing-impacting errors and potential SLA breach if persistent.\n\nEnvironment: prod us-east, dedicated pool for NimbleChat, autoscaler configured with reserved capacity + ephemeral burst pool. Mixed workload: many small embedding uploads (N=100k small batches) concurrently with low-latency streaming chat sessions.\n\nObserved at: 2026-03-13 20:10 UTC \u2014 21:05 UTC (first detection) and ongoing.",
+  "steps_to_reproduce": [
+    "1) Send a sustained mix of small-embedding uploads (~50-200 items per second) and concurrent streaming chat starts from a single tenant to prod us-east;",
+    "2) Configure client SDK to keep connections long-lived (keepalive enabled) and hedged retries with low backoff;",
+    "3) Observe accept-queue growth at api-gateway and increased latency to serving runtime prewarm endpoints;",
+    "4) Monitor kvcache disk/iostats on the serving nodes for bursts of reads/writes and NVMe iowait;",
+    "5) Watch runtime logs for worker init throttling, OOM eviction traces, and nvml GPU eviction events."
+  ],
+  "logs": [
+    "apigw: 2026-03-13T20:12:02Z ERROR handler.go:412 upstream returned 502: upstream read timeout (accept queue=452 backlog=310)",
+    "runtime: 2026-03-13T20:12:05Z WARN runtime/worker.go:128 initThrottle: delaying new worker start for tenant NimbleChat due to burst=high prewarm_capacity=2",
+    "runtime: 2026-03-13T20:12:07Z ERROR runtime/gpu_manager.go:54 eviction: nvml: memory pressured -> evicting model redwood-v2-medium (pid=2719)",
+    "kvcache: 2026-03-13T20:12:10Z WARN kvcache/io.go:87 nvme_iowait=245ms writes_inflight=64 read_latency_p50=18ms read_latency_p99=420ms",
+    "apigw: 2026-03-13T20:13:01Z ERROR proxy.go:201 connection reset while streaming -> returning 503 to client"
+  ],
+  "investigation_notes": [
+    "20:15 UTC - Initial hypothesis: combined high-rate embedding writes plus long-lived streams caused accept-queue growth on apigw and triggered runtime worker init throttling (initThrottle) to avoid overcommitting GPU memory; this introduced head-of-line blocking and retries from clients amplified error rate.",
+    "20:25 UTC - Observed NVMe iowait spikes correlating with kvcache write bursts \u2014 kvcache background compaction likely contending with prefetch writes, increasing worker init latency and causing proxies to time out.",
+    "20:35 UTC - SRE reproduced local load pattern in staging: when small-embed batch size <8 and many concurrent small batches, kvcache writes spike and accept-queue at apigw increases by 3-4x. Adding client-side jitter reduces peak but runtime still evicts hot models under high churn.",
+    "20:50 UTC - Noted hedged retry behavior from some SDK versions caused duplicate fanout to runtime at connection time; recommended immediate client guidance to disable aggressive hedging during ongoing mitigation.",
+    "Hypothesis: two interacting failure modes \u2014 kvcache IO saturation delaying prewarm/worker initialization + initThrottle protection that serializes worker starts \u2014 together cause apigw accept-queue collapse and 502/503 propagation."
+  ],
+  "comments": [
+    "Customer (NimbleChat): 2026-03-13T20:18 UTC - 'Users are seeing a lot of disconnects. This is impacting conversations in our app. Can you investigate priority please?'",
+    "Support (Priya): 2026-03-13T20:22 UTC - Acknowledged, escalating to SRE. Please avoid redeploying any SDK changes for the next 30m and share any relevant request IDs if you see failures.",
+    "SRE (Marta Ruiz): 2026-03-13T20:30 UTC - Reproduced load in staging. Confirmed NVMe iowait and initThrottle delays. Spinning up additional prewarm capacity and temporarily increasing ephemeral burst pool for NimbleChat to reduce immediate errors.",
+    "SRE (Liam O'Connor): 2026-03-13T20:40 UTC - Applied temporary rate-limiter at apigw for tenant NimbleChat to smooth admit rate (token-bucket lowered from 1000r/s -> 400r/s) and disabled prefetch for tenant. Observed 5xx rate drop from ~8% -> ~1.6% in 4 minutes.",
+    "Support (Priya): 2026-03-13T20:50 UTC - Notified customer of temporary mitigations and asked them to confirm client-side retry/backoff settings. Opened ticket to track permanent fixes.",
+    "Customer (NimbleChat): 2026-03-13T21:00 UTC - 'Thanks \u2014 error rate dropped and our UX recovered. We'll apply backoff changes on our side and monitor.'"
+  ],
+  "root_cause_summary": "Interaction between kvcache NVMe IO saturation from high-rate small-embedding writes and serving-runtime worker init throttling (initThrottle) which serialized worker starts. Apigw accept-queue grew, causing upstream timeouts and 502/503 responses. Client hedged retries amplified the load during the window.",
+  "mitigation_actions": [
+    "Applied tenant-scoped admission smoothing at apigw (token-bucket reduction) to reduce peak arrivals;",
+    "Increased ephemeral burst capacity for NimbleChat in the dedicated pool to reduce init contention;",
+    "Disabled kvcache prefetch for the tenant to lower background compaction pressure;",
+    "Advised customer to reduce hedged retry aggressiveness and add jitter on retries;",
+    "Monitored error rate and NVMe metrics for 1 hour post-mitigation."
+  ],
+  "resolution": "Temporary mitigations placed at 2026-03-13 20:40 UTC restored service to acceptable error rates for NimbleChat. Customer confirmed degraded UX resolved. Long-term fixes identified and assigned: runtime team to adjust initThrottle backoff and add leaky-bucket admit smoothing in runtime prewarm path (owner: @MartaRuiz, PR planned), kvcache team to tune compaction schedule under mixed embed+stream traffic, and platform team to add tenant-level burst shaping in apigw config.\n\nFollow-up: Postmortem scheduled (Owner: Liam O'Connor) and timeline for permanent fixes: patch proposal by 2026-03-17, staging validation 2026-03-19, prod rollout week of 2026-03-23.",
+  "next_steps": [
+    "1) Runtime: implement less-aggressive initThrottle backoff and add parallel prewarm worker windows (tracker: GH PR #2439);",
+    "2) KVCACHE: add IO-smoothing heuristics when compaction overlaps with high write bursts;",
+    "3) APIGW: implement tenant burst shaping policy so dedicated tenants can be given smoother admission control;",
+    "4) Customer: deploy client SDK with reduced hedged retry and added jitter (support provided);",
+    "5) Ops: schedule postmortem and circulate findings to product and support teams."
+  ],
+  "postmortem_link": "https://confluence.redwood.ai/display/POSTMORTEMS/SUP-629301+-+Evening+5xx+surge",
+  "owner_notes": "Keep ticket open until runtime/kvcache patches are merged and validated in staging. Coordinate communication with NimbleChat through CS. Priority: ensure no regressions for other dedicated tenants during burst-smoothing rollout.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "root_cause_summary",
+    "mitigation_actions",
+    "resolution",
+    "next_steps",
+    "owner_notes"
+  ],
+  "dataset_doc_uuid": "dsid_e085adb625dd43ee9b3d7462ea303eb0"
+}

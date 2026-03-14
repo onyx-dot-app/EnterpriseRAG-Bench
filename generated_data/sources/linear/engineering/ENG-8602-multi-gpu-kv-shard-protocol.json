@@ -1,0 +1,58 @@
+{
+  "key": "ENG-8602",
+  "team": "engineering",
+  "title": "KV-cache memory sharding protocol across tensor & pipeline parallel ranks",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-28",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Malik",
+  "assignee": "Jonah Reyes",
+  "project": "Serving Runtime: Memory Optimization",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-04-01",
+  "labels": [
+    "kv-cache",
+    "multi-gpu",
+    "sharding",
+    "pipeline-parallel",
+    "perf",
+    "cost-optimization"
+  ],
+  "release": "runtime-2.2",
+  "customer_impact": "high",
+  "security_review_required": "false",
+  "dependencies": [
+    "ENG-7420",
+    "ENG-8123",
+    "ENG-8341"
+  ],
+  "description": "Summary:\nDesign and implement a memory-efficient, low-latency protocol for sharding KV cache across multi-GPU inference setups that mix tensor parallel (TP) and pipeline parallel (PP). Goal is to reduce peak GPU memory usage for KV cache on long-context workloads while preserving/ improving latency for streaming continuous-batching use-cases.\n\nBackground and motivation:\n- Long-context streaming customers are the largest driver of KV cache memory growth. Current single-GPU KV replication limits maximum context length and forces expensive model quantization or smaller batch sizes.\n- Past experiment ENG-7420 explored KV sharding strategies but left open the runtime protocol when TP and PP are both in use (tensor shards inside a pipeline stage). We need a general protocol that composes with our kernel selection, continuous batching, and our smart routing fallback model variants.\n\nDesign goals (ranked):\n1) Bounded per-GPU memory for KV cache (deterministic upper bound given config).\n2) Minimal extra cross-GPU bandwidth in the common case (streaming single-request, many small tokens).\n3) Latency-friendly for tail P95/P99 of token generation under continuous batching.\n4) Compatibility with existing TP/PP placement (no mandatory topology re-mapping).\n5) Graceful fallbacks to CPU-hosted KV and transparent eviction/rehydration.\n\nKey constraints and trade-offs considered:\n- If we shard KV by head ranges (attention-head sharding), we reduce memory per GPU but require reduce-scatter + all-gather of attention outputs per token step which increases interconnect bandwidth and latency for small token sizes.\n- If we shard KV by token-sequence slices (time sharding), streaming generation requires fetching remote time slices for new tokens and may induce many small point-to-point transfers when prefix tokens are cached on different GPUs.\n- Hybrid: a two-level mapping (token-blocks x head-blocks) to balance bandwidth across NCCL links; increases complexity in index mapping and eviction.\n\nSelected approach (protocol overview):\n1) Topology-aware block-sharding: split KV into contiguous token-blocks (configurable block_size_tokens, default 256) and attention-head blocks (head_block_size, default equal split across TP ranks). Each GPU is assigned a set of (token_block_idx, head_block_idx) tuples based on physical placement and intra-node NVLink topology.\n2) Local fast-path: For generation steps that only need KV local blocks (common when prefix fits in local blocks), runtime proceeds with no inter-GPU comms. Cache hits are checked via a lightweight Bloom filter per remote block to avoid unnecessary requests.\n3) Async prefetch + pipelined reduction: When non-local blocks are required, issue asynchronous NCCL point-to-point (cudaMemcpyAsync+cudaIpc for intra-node) pulls for full KV tensors for the block into pinned staging buffers, then overlap decode+kernel execution with remainder I/O. For attention outputs that need reduction across head shards we use NCCL reduce-scatter followed by local attention apply and an all-gather only when downstream pipeline stage requires full hidden states.\n4) Degraded mode: if interconnect bandwidth or latency SLOs are violated (configurable thresholds), automatically switch to CPU-hosted shared KV: remote GPUs push compact compressed blocks (FP16+quantized keys) to a pinned CPU cache and rehydrate on demand; this trades latency for predictable memory usage.\n5) Eviction and compaction: background compaction tasks run per node, consolidating small blocks and optionally recompressing to lower precision. Eviction policy is LRU at block granularity with heuristics to keep the most recent N token-blocks local to the GPU serving the active stream.\n\nImplementation details and API changes:\n- New runtime module: kv_shard_manager (C++/CUDA) that exposes: configure_sharding(topology_hint, token_block_size, head_block_size), query_block_location(block_id), request_block_async(block_id, callback_token), and evict_block(block_id).\n- Add Bloom filters and block metadata to the per-model manifest; expose diagnostics via Console (per-route KV hit-rate, bytes pulled, pending requests).\n- Scheduler change: continuous-batcher will prefer co-locating requests with similar prefix-blocks onto GPUs that host those blocks; add a route-aware affinity hint to smart routing.\n- NCCL group composition: create intra-stage NCCL groups optimized for head reductions and inter-stage groups for token-block transfers; fall back to host staging when cross-node links are oversubscribed.\n\nBenchmarks and acceptance criteria (initial targets):\n- 2x reduction in peak KV memory per GPU for 32k-context models on a 4xA100 node with TP=2, PP=2 (measured with streaming 1k token prefixes across 200 concurrent streams).\n- P95 token latency increase <= 10% in steady state when using local fast-path; P99 increase <= 20% relative to baseline replication for workloads with >75% local block hit rate.\n- Continuous-batcher throughput should not degrade by more than 5% for high-concurrency steady workloads.\n\nTesting plan and rollout:\n- Synthetic unit tests for mapping, Bloom false-positive rates, eviction and compaction correctness.\n- Integration test harness that runs model generation across TP/PP topologies (TP:1..4, PP:1..4) with deterministic prefixes and measures memory, NCCL traffic, latency.\n- Canary rollout in dedicated infra: enable kv_shard_manager with token_block_size=256 for a small set of internal routes and compare metrics in Console.\n- Gradual enable via rollout policy: start with read-only (monitor-only) mode -> optimistic prefetch -> active sharding.\n\nOpen questions and decisions to be made:\n- Optimal default token_block_size across model families (GPT-like vs Dense Transfomer). Plan: run sweep in next perf cycle.\n- Bloom filter sizing trade-offs vs false positive overhead. Default currently set to 1% FPR; revisit after benchmarks.\n- CPU-hosted degraded mode compression format (INT8 vs product quantization).\n\nLinks and artifacts:\n- Design doc (internal): https://company-confluence/redwood/kv-shard-protocol (draft)\n- Related experiment ENG-7420 notes: https://git.internal/experiments/ENG-7420\n- Proposal PR: https://github.com/redwood-inference/runtime/pull/1123 (WIP)",
+  "comments": [
+    "2026-03-01 Jonah Reyes: Initial prototyping shows token_block_size=256 reduces peak by ~1.8x on 4xA100 when head_block_size=32. Need to measure NCCL bandwidth at scale.",
+    "2026-03-03 Priya Nair (PM): Agree on goals; add dashboard tile for per-route KV pull bytes and block hit-rate. Also flag customer_impact high for customers using 16k+ contexts.",
+    "2026-03-05 Miguel Soto (Infra): Noted that intra-node cudaIpc handles pinned buffer reuse well; we should reserve a small pool of staging buffers per GPU to avoid repeated allocations.",
+    "2026-03-08 Design review (Aisha Malik): Reviewed data path; design needs a clear UX story for Console to explain degraded vs normal modes. Added TODO to Console tickets.",
+    "2026-03-10 Jonah Reyes: Implemented bloom filter prototype and async prefetch; unit tests green. Next: integrate with continuous-batcher affinity hints.",
+    "2026-03-12 Code review note (ENG-8123): Suggested renaming request_block_async callback_token -> request_token to align with batching API; will update PR.",
+    "2026-03-12 Jonah Reyes: Updated description with reduce-scatter decision after meeting with Kernel team. Scheduling next perf sweep for 2026-03-18."
+  ],
+  "attachments": [
+    "https://drive.redwood/attachments/kv-shard-arch.pdf",
+    "https://perf-dash.redwood/internal/kv-shard/benchmark-2026-03-11.csv"
+  ],
+  "parent_issue": [
+    "ENG-7150"
+  ],
+  "sub_issues": [
+    "ENG-8630",
+    "ENG-8641"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_e81bb4d746ec4367b54d7e40ee5043ed"
+}

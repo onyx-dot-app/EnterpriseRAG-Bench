@@ -1,0 +1,92 @@
+{
+  "key": "SUP-98123",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Resume race after HA proxy failover produces truncated final choice and duplicated trailing fragments in SSE streams",
+  "status": "Triage",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Martinez",
+  "assignee": "Liam O'Connor",
+  "customer_company": "BrightAssist Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "api-gateway",
+    "sse-streaming",
+    "network-proxy"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "reconnect",
+    "proxy",
+    "dedicated-customer"
+  ],
+  "environment": "prod/us-east-1",
+  "affected_models": [
+    "redwood/chat-deployment-v2",
+    "redwood/gptj-13b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-4721",
+    "SUP-21045"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/runtime/pull/483"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/streaming-reconnects"
+  ],
+  "description": "Issue summary:\nCustomer BrightAssist reports that after an HA proxy failover in their environment, SSE streams used for chat completions resume but the final choice is truncated and the client receives duplicated trailing fragments. This causes the customer application to fail JSON parsing for structured responses and to show incomplete assistant messages.\n\nImpact:\n- Multiple production requests (15-30/min for a single customer pod) end with malformed final choices leading to downstream app exceptions.\n- Customer reports increased error rate and user-visible truncations during a recent network maintenance window.\n\nEnvironment:\n- Dedicated customer deployment, hosted in us-east-1 on Redwood Dedicated.\n- Fronted by customer's HAProxy cluster (two-tier: edge -> internal LB -> customer nodes).\n- SDK: JS browser client using EventSource (SSE) with Last-Event-ID resume logic.\n- Models: redwood/chat-deployment-v2.\n\nSteps to reproduce (customer-provided):\n1. Start a long-running chat generate request which streams 200-400 tokens.\n2. Force a HAProxy edge failover (reload/restart) during token stream generation.\n3. Client reconnects and passes Last-Event-ID to resume.\n4. Observe final fragments: duplicate trailing fragments interleaved and the end event missing or the choice body truncated.\n\nObserved behavior:\n- Client receives duplicate chunks that contain trailing token fragments (e.g., \",\\\"metadata\\\":{...}\" appears twice).\n- A terminal 'event: end' is sometimes missing after resume, or arrives but with sequence offsets that cause the client to drop the final token batch.\n- Some resumed streams contain a short garbled fragment appended to the previous choice, producing invalid JSON in structured outputs.\n\nExpected behavior:\n- After reconnect/resume the stream should continue without duplication or truncation; the final 'end' event should be delivered exactly once and the choice body should be intact.\n\nRelevant logs (customer excerpts):\n- \"edge: connection reset by peer; replaying Last-Event-ID=6734\"\n- \"internal-lb: 502 during upstream shutdown, resume requested with id=6734\"\n- A sample fragment sequence the customer saved (sanitized) shows duplicated trailing suffix lines with identical token offsets.\n\nWorkarounds tried by customer:\n- Forcing full restart instead of resume avoids duplicated fragments but increases latency.\n- Using long-polling instead of SSE avoids the issue but is not acceptable for UX.\n\nNotes:\n- Customer is on a paid dedicated contract and is impacted for multiple production users.\n",
+  "investigation_notes": [
+    "Support reproduced a variant of the issue in staging by simulating TCP connection close during SSE stream and replaying Last-Event-ID; observed truncated final chunk intermittently.",
+    "Hypothesis 1: HAProxy or intermediary is buffering and splitting SSE event boundaries; on failover re-inserted fragments cause the server/runtime to re-emit overlapping token ranges leading to duplicate trailing fragments.",
+    "Hypothesis 2: Last-Event-ID resume logic expects monotonic offset acknowledgement from client; proxy-induced reordering of small TCP fragments causes the resume offset to point to a byte boundary inside a multi-byte token, producing truncated JSON on reassembly.",
+    "Hypothesis 3: The serving-runtime may commit and stream a final 'end' event before all socket buffers are flushed; a mid-flight failover can cause a partial 'end' event emission that the resume path doesn't canonicalize (idempotency gap).",
+    "Collected traces: request IDs and event offsets from customer; shared a trace dump via secure link with SRE team (internal ticket attached).",
+    "Reproduced in our lab using HAProxy 2.6 config with 'option http-server-close' toggled; duplication frequency increased when proxy had response-buffering enabled.",
+    "SRE note: Node-level TCP FIN+RST timing correlates with missing 'end' events; suggests race between socket teardown and application flush path."
+  ],
+  "comments": [
+    "2026-03-10 11:23 UTC - Aisha Martinez (Support): Opened ticket after customer escalation; requested full sample of raw SSE payloads and proxy logs.",
+    "2026-03-10 14:02 UTC - BrightAssist (Customer): Uploaded sanitized SSE capture and HAProxy logs (link provided). They confirm the issue occurs after planned network maintenance window when the edge proxy is reloaded.",
+    "2026-03-11 09:15 UTC - Liam O'Connor (SRE): Reproduced locally with proxy reload test. Observed duplicate trailing fragments when 'response-buffering' is on. Creating runtime experiment to add defensive trimming logic.",
+    "2026-03-11 13:40 UTC - Dev (Serving Runtime): Noted that resume path uses event offsets based on token indices; edge-case when a final event boundary splits across TCP segments, resume can replay overlapping token index ranges. Proposing idempotent write on resume to dedupe overlapping offsets.",
+    "2026-03-12 07:50 UTC - Aisha Martinez (Support): Shared temporary mitigation with customer: set HAProxy option 'http-buffer-request' to off and enable 'tcp-smart-connect' workaround; customer to test and confirm.",
+    "2026-03-12 16:30 UTC - BrightAssist (Customer): Confirmed that disabling response buffering reduced occurrences dramatically; still observed 1/200 streams failing. Asked for ETA on permanent fix.",
+    "2026-03-12 18:05 UTC - Liam O'Connor (SRE): Marked investigation finding and assigned runtime fix to eng team (see PR reference). Planned patch: runtime v1.12.2 with resume idempotency and stronger end-event flush semantics."
+  ],
+  "root_cause": "Race between proxy-induced buffer/reordering during HAProxy reload and the runtime's resume logic which relied on strict event/offset boundaries. A partial final event emitted at socket teardown could be replayed or dropped when resume uses a byte/offset that lands mid-event.",
+  "resolution": "Temporary mitigation provided (disable response buffering on HAProxy). Engineering implemented idempotent resume logic and final-event flush improvements in runtime. Patch scheduled for rollout to dedicated clusters: v1.12.2.",
+  "resolution_notes": [
+    "Customer applied workaround and reported large reduction in failures (from ~3% to <0.5%).",
+    "Runtime fix implements token-offset deduplication on resume and ensures the final 'end' event is only acked after successful flush to socket buffers.",
+    "Patch PR: github.com/redwood-inference/runtime/pull/483 contains unit tests and integration test that simulates proxy failover and validates no duplicate trailing fragments.",
+    "Rollout plan: staged deploy to Dedicated in us-east-1 during maintenance window 2026-03-18; monitor error rate and customer reports for 48 hours."
+  ],
+  "follow_up_actions": [
+    "Eng: Merge and release runtime v1.12.2 with idempotent resume and flush semantics. Target date 2026-03-17.",
+    "SRE: Coordinate staged rollout to BrightAssist pod and monitor SSE stream error rates for 72h post-deploy.",
+    "Support: Update KB article on SSE resume best practices and HAProxy tuning recommendations.",
+    "Product: Consider adding a streaming resume validation test in the Dedicated on-boarding checklist."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "comments",
+    "root_cause",
+    "resolution",
+    "resolution_notes",
+    "follow_up_actions"
+  ],
+  "dataset_doc_uuid": "dsid_c141b4c5a3f14a22861eea688d36b83b"
+}

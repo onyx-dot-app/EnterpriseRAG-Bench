@@ -1,0 +1,101 @@
+{
+  "key": "SUP-61899",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Staggered KV warmup causing intermittent p99 latency spikes for repeat prompts",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-13",
+  "reporter": "Aisha Khan",
+  "assignee": "Diego Ramirez",
+  "customer_company": "NovelDocs Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "kv-cache",
+    "scheduler",
+    "routing"
+  ],
+  "labels": [
+    "latency",
+    "kv-prefetch",
+    "repeat-prompts",
+    "dedicated-customer"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "redwood-compat-7b",
+    "rw-7b-q4"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "description": "Issue summary: Customer reports that repeated conversational prompts (short turns repeated 3-6x) are experiencing intermittent p99 latency spikes and occasional request timeouts. Impact: Production degradation for several API routes; some user sessions see 1-2s baseline latency jump to >6s p99 and a small number of 504/timeout errors. Environment: Dedicated pool for NovelDocs in us-east, pinned to redwood-compat-7b model, steady qps ~60. Observed at 2026-03-10 15:20 UTC and recurring during next hours. This appears tied to how the KV/prefix cache warmup and shard prefetch are scheduled under client burst patterns, causing staggered cache population and head-of-line waits for repeat-context requests.",
+  "steps_to_reproduce": [
+    "1) Use NovelDocs prod-mimic workload: repeat a short 30-token prompt 4x with 100ms inter-turn gap",
+    "2) Target the dedicated pool us-east pinned to redwood-compat-7b",
+    "3) Observe latency distribution across sequential turns; watch p50/p90/p99 and any 504s",
+    "4) Repeat with concurrency of 3 clients to simulate real traffic bursts"
+  ],
+  "logs": [
+    "2026-03-10T15:24:03Z serving-runtime: request id 7bfa2a - prefix lookup miss -> kv-prefetch scheduled (shard 12)",
+    "2026-03-10T15:24:03Z scheduler: prefetch worker queued (worker=3) for shard 12, expected start delay 120ms",
+    "2026-03-10T15:24:04Z serving-runtime: request id 7bfa2b - blocked waiting for KV fill for same prefix, observed wait 630ms",
+    "2026-03-10T15:24:05Z api-gateway: proxied request 504 to client after backend timeout 5000ms",
+    "Grafana link: https://grafana.redwood.internal/d/kv-prefetch/pool-noveldocs-us-east (internal)",
+    "Trace link: https://tracing.redwood.internal/trace/7bfa2a (internal)"
+  ],
+  "investigation_notes": [
+    "Initial hypothesis: KV cache cold fills are being serialized per-shard and prefetch tasks are intentionally staggered to avoid thundering herd; this interacts poorly with repeat short-turn conversational traffic, creating head-of-line waits for subsequent turns that hit the same prefix.",
+    "Observed pattern: p99 spikes coincide with interleaved prefetch scheduling where worker concurrency is limited (prefetch_worker_limit=3) and shard prioritization uses FIFO across shards; when multiple simultaneous short-turn sessions touch same shard, one request triggers a prefetch while others queue awaiting the cache fill.",
+    "Heap/profile: No memory OOMs. Prefetch worker pool shows saturation with backlog during the spike windows. CPU/GPU utilization normal. Disk/IO latencies nominal.",
+    "Reproduced in staging by lowering prefetch_worker_limit to 2 and creating 3 concurrent clients doing repeated short prompts; p99 spikes reproduced reliably.",
+    "Compared to baseline: previous routing allowed speculative concurrent prefetches for the same prefix (race-y) which reduced latency but caused slight extra KV load; the recent change to serialize per-prefix prefetch removed duplicate fills but exposed blocking for repeat prompts.",
+    "Check related config change: Deploy abc1234 (scheduler) rolled out 2026-03-08 changed prefetch serialization logic and introduced per-shard FIFO prioritization. Related PR: https://github.com/redwood-inference/runtime/pull/4821"
+  ],
+  "comments": [
+    "Aisha Khan (Support) 2026-03-10: Customer reported p99 jumps and occasional 504s. Attached sample request IDs and approximate timestamps. Asked for SLO escalation.",
+    "Diego Ramirez (SRE) 2026-03-10: Investigating. Early traces point to KV fill waits. Opening metric dashboards and checking worker pool. Linked PR 4821 looks suspect.",
+    "Lina Patel (Serving Eng) 2026-03-11: Confirmed reproduced in staging. Prefetch worker pool is the hot path. Suggest temporary toggle to revert to speculative concurrent fills for same prefix for this dedicated pool as a mitigation.",
+    "Customer (Mike Chen, NovelDocs) 2026-03-11: Impacting user conversions. Please advise an ETA for mitigation. Agrees to testing a toggle in canary for 30 minutes.",
+    "Diego Ramirez (SRE) 2026-03-12: Enabled customer-scoped feature flag 'kv_allow_speculative_fills' for NovelDocs pool at 2026-03-12T04:10 UTC. Observed p99 fall back to baseline in next 30 minutes. No increase in KV backend errors.",
+    "Lina Patel (Serving Eng) 2026-03-12: Preparing patch that retains dedupe semantics but changes scheduling to prioritize in-flight prefixes and allow bounded speculative fills when latency-sensitive route detected. PR opened: https://github.com/redwood-inference/runtime/pull/4838",
+    "Diego Ramirez (SRE) 2026-03-13: Running canary deployment of PR 4838 to 10% of dedicated pools in us-east. Monitoring results show p99 reduction and stable backend load. Planning full rollout pending 24h observation.",
+    "Aisha Khan (Support) 2026-03-13: Updated customer with mitigation timeline and asked to keep reporting if regressions seen post-rollout. Closing loop when full rollout complete."
+  ],
+  "root_cause": "Prefetch scheduling change (per-shard FIFO + strict per-prefix serialization) created head-of-line blocking for repeat short-turn prompts in dedicated pools. The serialization prevented bounded speculative concurrent fills for the same prefix, so subsequent repeat turns waited for a single fill to complete, causing p99 latency spikes and occasional timeouts.",
+  "resolution": "Temporary mitigation: Enabled customer-scoped feature flag 'kv_allow_speculative_fills' for NovelDocs (2026-03-12) which allowed bounded concurrent fills for identical prefixes and restored latency to baseline. Long-term fix: Deploy PR 4838 which adjusts scheduler to prioritize in-flight prefix prefetches and allow controlled speculative fills when route marked latency-sensitive. Full rollout scheduled 2026-03-14 after 24h canary.",
+  "resolution_notes": [
+    "Mitigation applied at 2026-03-12 04:10 UTC for NovelDocs dedicated pool; validated by p99 drop on Grafana dashboard",
+    "PR 4838 implements prioritized prefetch ordering + bounded speculative fills; includes unit tests and an integration test simulating repeat short-turn sessions",
+    "Follow-up: Add a per-route QoS flag to detect conversational short-turn patterns and auto-enable speculative fills when safe",
+    "Follow-up: Postmortem to be published on Confluence after full rollout and 72h stability window"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/4821",
+    "https://github.com/redwood-inference/runtime/pull/4838"
+  ],
+  "linked_issues": [
+    "SUP-61748",
+    "SUP-34121"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.internal/display/INF/KV+Prefetch+Scheduling+Runbook"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "investigation_notes",
+    "logs",
+    "comments",
+    "root_cause",
+    "resolution",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_27b0eedfb21f446e84e094a141dd5006"
+}

@@ -1,0 +1,105 @@
+{
+  "key": "SUP-821305",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Serialized FP16 padding/truncation causing rerank suppression and burst 429s",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Jordan Patel",
+  "assignee": "Maya Chen",
+  "customer_company": "ClaritySearch Inc.",
+  "customer_tier": "enterprise",
+  "components": [
+    "embeddings-service",
+    "reranker",
+    "api-gateway",
+    "ingest-proxy"
+  ],
+  "labels": [
+    "fp16",
+    "serialization",
+    "rerank",
+    "latency",
+    "proxy"
+  ],
+  "environment": "prod:us-west",
+  "affected_models": [
+    "open-bert-large-v2",
+    "redwood-rerank-v1"
+  ],
+  "affected_regions": [
+    "us-west"
+  ],
+  "sla_due_at": "2026-03-13",
+  "linked_issues": [
+    "SUP-331210",
+    "INT-1142"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/embeddings-ingest/pull/678",
+    "https://github.com/redwood-inference/reranker/pull/221"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/Embedding+Ingest+Formats",
+    "https://confluence.redwood.ai/display/RELIABILITY/FP16+Validation+Runbook"
+  ],
+  "description": "Issue summary:\nCustomer ClaritySearch reports large numbers of suppressed rerank results (missing hits) and sudden tail latency increases during bulk ingestion windows. They also see a correlated burst of 429 responses from our public API gateway during re-rank requests originating from the same tenant.\n\nImpact:\n- Search relevance drops for ~10% of queries using rerank pipeline (customer reported large missing top-k items).\n- Tail latency for rerank requests increases from median ~70ms to 800ms+ during impacted windows.\n- Customers received transient 429s (rate-limit/gateway) for ~12 minutes during the first event window.\n\nInitial hypothesis: serialized fp16 vectors from the customer's client are being misinterpreted by the ingest proxy (expects float32), leading to incorrect vector length checks. This causes a fallback path during rerank that routes to CPU-based scoring which reduces throughput and triggers downstream throttling (429s).\n\nReported by customer: ClaritySearch infra (Luis Ortega) via support@claritysearch.com on 2026-03-12 09:20 PST.\n",
+  "steps_to_reproduce": [
+    "1) Customer used client SDK v2.4.1 with an experimental `serialize_fp16=True` toggle to upload batched embeddings (batch size 512).",
+    "2) Payloads were base64-encoded raw bytes of float16 little-endian arrays (no explicit schema header).",
+    "3) Send to /v1/embeddings/batch with model=open-bert-large-v2 and then call /v1/rerank with those embedding IDs in the same tenant context.",
+    "4) Observe rerank responses: many top-k positions return uniformly low scores and some requests time out; gateway returns 429 for subsequent rerank calls after a short burst.",
+    "5) Reproduction inside our staging: reproduced by toggling SDK to send float16 raw bytes; server accepted payload but stored shorter vectors (truncated), causing low similarity scores."
+  ],
+  "logs_excerpt": [
+    "2026-03-12T16:21:42Z ingest-proxy ERROR tenant=clarity id=abcd123 vlen=192 expected=384 payload-truncated=true",
+    "2026-03-12T16:21:57Z embeddings-service WARN tenant=clarity stored_vector_len=192 model_dim=384 warn=length-mismatch-accepted",
+    "2026-03-12T16:22:05Z reranker INFO tenant=clarity route=cpu_fallback triggered_by=vector_len_mismatch queue_time_ms=4200",
+    "2026-03-12T16:22:12Z api-gateway ERROR 429 tenant=clarity route=/v1/rerank burst-protection=tripped concurrent_backlog=78"
+  ],
+  "customer_observed_behavior": "ClaritySearch reported that their nightly ingestion job (small bursts every 2 minutes) suddenly produced poor rerank quality and intermittent 429s. They temporarily reverted the SDK toggle to float32 and reported immediate improvement.",
+  "support_summary": "Support confirmed customer-side SDK toggle to fp16 was enabled. We reproduced behavior in staging by sending fp16 byte arrays without schema headers \u2014 vectors were accepted but truncated, reranker fell back to CPU, and API gateway experienced backlog leading to 429s.",
+  "comments": [
+    "Eliot Gomez (Support) 2026-03-12: Received initial report from customer. Asked for example payload and timestamp. Noted SDK version 2.4.1 and experimental serialize_fp16 flag.",
+    "Luis Ortega (Customer) 2026-03-12: Provided payload sample and curl command. Reverted client to float32 and quality returned \u2014 believes new fp16 packing introduced in their internal fork caused the issue.",
+    "Priya Rao (SRE) 2026-03-13: Reproduced in staging. Confirmed ingest proxy currently accepts variable-length payloads and logs a warning rather than rejecting. Opened quick mitigation to rate-limit large CPU fallbacks.",
+    "Samir Vyas (SDK Eng) 2026-03-13: Investigating SDK v2.4.1 experimental flag; found missing schema header in our FP16 helper. Preparing patch to make the SDK emit a small header with dtype+length when serialize_fp16=True.",
+    "Maya Chen (Assignee) 2026-03-14: Principal action items outlined below. Prioritizing server-side validation first to avoid silent truncation in prod."
+  ],
+  "investigation_notes": [
+    "2026-03-13: Reproduced by sending float16 raw bytes; server read bytes as float32 stream, which halved element count (expected 384 floats, got 192) \u2014 stored truncated vector without failing ingestion pipeline.",
+    "2026-03-13: Reranker code path checks stored vector length against model_dim; on mismatch we fall back to CPU scoring (graceful but expensive). In the burst scenario CPU fallback saturated available workers leading to backlog and gateway 429s.",
+    "2026-03-13: Found no alerting rule for 'high-rate cpu_fallback for reranker' \u2014 added temporary CloudWatch/Prometheus alert for >20 CPU fallbacks/minute per tenant.",
+    "2026-03-13: SDK team confirmed that the experimental fp16 serialization intentionally omits explicit schema header; this is a known risk but not previously surfaced at scale.",
+    "2026-03-14: Benchmarked fix: rejecting mismatched-length embeddings at ingest reduces silent-quality issues and prevents downstream CPU fallback surge (throughput preserved)."
+  ],
+  "root_cause": "Client-side FP16 serialization produced base64-encoded raw float16 byte arrays without a schema header. The ingest proxy accepted the bytes and our storage layer treated them as float32, resulting in halved vector lengths. The reranker conditionally fell back to CPU scoring on mismatch, which during bursts caused throughput collapse and gateway 429s.",
+  "workaround": "Customer reverted to sending float32 vectors (disabled serialize_fp16) \u2014 immediate restoration of quality and latency. Recommended temporary mitigation for other customers: do not enable experimental fp16 serialization until SDK header patch is rolled out.",
+  "resolution_plan": [
+    "Short-term (hotfix): Add strict vector length validation in ingest-proxy (reject with 400 + clear error message when length != model_dim). Deploy hotfix to prod in us-west (rolling).",
+    "Mid-term: SDK patch (PR #678) to emit a 8-byte header for serialized embeddings indicating dtype and element count. SDK release v2.4.2 will include this and documentation updates.",
+    "Long-term: Add automated ingestion schema validation tests to CI, add alerting for high CPU fallback rates, and update runbook to automatically reduce CPU fallback capacity per-tenant when abnormal patterns are detected.",
+    "Customer communication: notify ClaritySearch of planned timeline and provide guidance to test SDK v2.4.2 in staging before re-enabling fp16."
+  ],
+  "resolution": "In Progress - hotfix for strict validation prepared and on schedule. SDK patch merged to main and in candidate release. Customer accepted workaround and is holding re-enablement until validation is live.",
+  "resolution_notes": "2026-03-14: Hotfix branch for ingest-proxy created (https://github.com/redwood-inference/embeddings-ingest/pull/678). Hotfix deployment scheduled for 2026-03-15 02:00 UTC (rolling to us-west). SDK release v2.4.2 candidate published to npm/pypi; Samir to coordinate customer test window. Follow-up: create RCA doc and add to postmortem if post-deployment verification shows improvement.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs_excerpt",
+    "customer_observed_behavior",
+    "support_summary",
+    "investigation_notes",
+    "root_cause",
+    "workaround",
+    "resolution_plan",
+    "resolution",
+    "resolution_notes",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_73f300ac202246ee8f7a3692169a7826"
+}

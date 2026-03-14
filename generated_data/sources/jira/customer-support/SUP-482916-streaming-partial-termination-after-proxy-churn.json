@@ -1,0 +1,68 @@
+{
+  "key": "SUP-482916",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Partial stream termination following upstream proxy churn during SSE resume",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-13",
+  "updated_at": "2026-03-14",
+  "reporter": "Maya Chen",
+  "assignee": "Carlos Ortega",
+  "customer_company": "Hermes Analytics",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "edge-proxy"
+  ],
+  "labels": [
+    "sse",
+    "stream-resume",
+    "proxy-churn",
+    "final-event-loss",
+    "urgent"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "gpt-l1-32k"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-14",
+  "first_response_due_at": "2026-03-13",
+  "linked_issues": [
+    "SUP-100999"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/1284"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SUPPORT/SSE+Resume+Runbook"
+  ],
+  "related_incident_id": "INC-2026-03-13-07",
+  "description": "Issue summary:\nCustomer Hermes Analytics (dedicated) reports chat sessions intermittently missing the final 'end' SSE event after a short upstream proxy churn. Client observes streaming continues with periodic heartbeat frames but the terminal payload (closing JSON event with `done: true`) never arrives even though server logs show generation completed.\n\nImpact:\n- Several long-running chat completions (10k-20k tokens) appear truncated on the client; transcripts end mid-sentence without final metadata.\n- Affects ~8% of sessions from the customer's us-east region over the last 3 hours.\n- Causes downstream ingestion pipeline at Hermes to mark sessions as failed and retry, inflating token/billing counts.\n\nEnvironment:\n- Redwood prod cluster serving dedicated pool for Hermes (dedicated-id: DED-07).\n- Edge: internal edge-proxy fleet behind customer-configured transparent proxy and an extra corporate proxy in Hermes network.\n- Models: gpt-l1-32k pinned on the dedicated pool.\n\nSteps to reproduce (as provided by customer):\n1) Start a long chat generation (~10k tokens) via SSE to the hosted endpoint using their client behind corporate proxy.\n2) At ~80% completion, Hermes network triggers a short flow table update (proxy churn) causing a TCP 7-12s transient tear.\n3) Client reconnects and resends resume session token.\n4) Client receives further heartbeat events but never sees final `data: {\"done\": true}` event; stream appears to hang until client-side timeout.\n\nLogs/Observations from Hermes:\n- Client-side logs show WebSocket->SSE upgrade not used; pure SSE.\n- Reconnect attempts are immediate; resume token present in `?resume_id=` param.\n\nTemporary workaround (customer):\n- Hermes increased client-side finalization timeout and added heuristic to request a short re-generation when final event missing. This mitigates customer-visible failures but increases costs.\n\nRequested outcome:\n- Root cause and fix so final terminal event reliably reaches clients after short proxy churns without requiring expensive customer workarounds.",
+  "investigation_notes": "Initial triage (Carlos Ortega):\n- Replicated high-level pattern in lab by simulating HTTP/2 GOAWAY + upstream proxy connection rotation. Observed a class of races where the edge-proxy completes send of final SSE chunk but an intermediate transparent proxy aggressively closes/buffers the connection producing a torn final TCP segment. Kernel-level retransmit causes final chunk to be delivered to the client but the SSE parser in our edge ingress reorders keepalive frames and final chunk, causing the `event: done` boundary to be dropped during resume stitching.\n\nDetailed traces collected:\n- Edge ingress access logs: final POST streaming request shows status 200 then GOAWAY from upstream 1s after last token served.\n- Serving-runtime logs: generation completed and final `end` marker emitted at 2026-03-13T21:12:17.123Z.\n- Packet capture (edge->proxy) shows final chunk split across two TCP segments; intermediate proxy returned RST after ACK but before client ACK of final segment.\n\nHypothesis:\n- The resume assembly logic relies on contiguous chunk sequence numbers from the edge-proxy. When an intermediate proxy performs connection churn, the final segment boundary may be lost or arrive out-of-order relative to keepalive 'heartbeat' events used to align resume offsets. The resume merger treats the heartbeat as the last seen offset and discards a trailing fragment as late or duplicate, dropping the terminal `done` event.\n\nRepro status:\n- Reproducible in lab with proxy churn + split final TCP segment. Not reproduced with clean network.\n\nNext immediate action:\n- Instrument resume assembler to log fragment offsets and boundary decisions for affected sessions (non-prod first) to collect more data.\n- Add temporary server-side heuristic to treat final small JSON chunks (<=512B) as high-priority and attempt retransmit on resume.\n- Engage networking infra to review edge-proxy keepalive ordering and consider flushing vs. buffering semantics on upstream close.\n\nLinked artifacts:\n- Packet captures uploaded to internal S3: s3://redwood-support/sup-482916/pcap.tar.gz\n- Traces: https://tracing.redwood.ai/trace/482916-20260313\n",
+  "comments": [
+    "2026-03-13 \u2014 Maya Chen (Support): Customer reported 8% of long-form SSE sessions missing terminal event after short corporate proxy churn. Provided initial logs and a short packet capture.",
+    "2026-03-13 \u2014 Carlos Ortega (SRE): Reproduced locally with simulated proxy churn. Observed split final TCP segment and resume reassembly drop. Marked as P1 Sev1 and initiated deeper trace collection.",
+    "2026-03-14 \u2014 Priya Nair (Runtime eng): Noted similar historical bug in resume stitching but previously only for websockets. Will review resume assembler patch (PR referenced).",
+    "2026-03-14 \u2014 Carlos Ortega: Deployed instrumentation to staging and collected 42 failing resumes; posted aggregated offsets and sample payloads to ticket attachments.",
+    "2026-03-14 \u2014 Support (Maya): Informed Hermes about temporary timeout/heuristic workaround and asked for permission to coordinate maintenance window if needed. Customer accepted temporary workaround pending fix."
+  ],
+  "resolution_notes": "Workaround applied: enabled 'prefer-final-chunk-retransmit' heuristic on the Hermes dedicated pool (server-side) to attempt resending final small chunks during resume. This reduced customer-reported failures from 8% -> 0.7% in the 6h following rollout.\n\nPermanent fix plan:\n1) Patch the resume assembler to be ordering-tolerant for 'final' chunk boundaries: treat recent keepalive frames as non-terminal if a final chunk arrives within N ms of the keepalive (PR: runtime#1284).\n2) Harden edge-proxy to avoid RST-on-close in churn scenarios where buffered outbound data exists; require graceful drain or send FIN with retries.\n3) Add regression tests simulating split-final-segment and proxy churn to the streaming test harness.\n\nFollow-ups assigned:\n- Runtime eng (Priya Nair): implement assembler change, target rollout to staging 2026-03-20.\n- Edge team (Lars Voss): evaluate proxy close semantics, target mitigation 2026-03-25.\n- Support (Maya Chen): schedule 1:1 with Hermes to validate after fixes.",
+  "attachments": [
+    "s3://redwood-support/sup-482916/pcap.tar.gz",
+    "https://tracing.redwood.ai/trace/482916-20260313"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "comments",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_ed3a42bec24d45ada20aaca02bf0f066"
+}

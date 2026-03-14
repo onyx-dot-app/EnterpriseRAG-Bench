@@ -1,0 +1,78 @@
+{
+  "key": "ENG-6137",
+  "team": "engineering",
+  "title": "Align billing with prefix/KV cache and batching semantics (token attribution rules)",
+  "status": "In Review",
+  "priority": "P0",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-14",
+  "creator": "Aisha Patel",
+  "assignee": "Marcus Lee",
+  "project": "billing-and-metering",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-21",
+  "labels": [
+    "billing",
+    "metering",
+    "runtime",
+    "kv-cache",
+    "batching",
+    "customer-impact"
+  ],
+  "description": "Problem statement:\n\nCurrently our billing and rate-limiting layers attribute token usage naively as 'tokens touched by runtime' which causes two classes of correctness problems when caches and batching are involved: (1) prefix and KV cache hits sometimes cause zero model work but still get counted (or counted inconsistently across deployments), and (2) batched generation aggregates compute which makes per-request token attribution ambiguous and can lead to overcharging or double-counting on retries / fallbacks.\n\nThis ticket defines deterministic, auditable token-attribution rules and an implementation plan so that: billing, quotas, and rate limits reflect the actual model work performed (excluding prefix/KV cache reads that avoided compute), behavior is consistent across hosted/dedicated/private, and we can roll out with telemetry and rollback safety.\n\nScope of changes: runtime token accounting hooks, router/billing adapter changes, edge-case handling for retries/fallbacks, dashboards/alerts, and docs for supported semantics. Not in scope: wholesale redesign of pricing model or per-API pricing changes.\n\nWhy this matters:\n- Customers with aggressive prefix caching (e.g., system prompt caches) expect lower bills; inconsistent meter behavior causes billing disputes.\n- Batching improvements that reduce cost for the infra team must translate into customer metering benefits; otherwise value is lost.\n- Rate limit enforcement must not be bypassed by cache hits in a way that causes abuse or accidental throttling mismatches.\n\nHigh-level proposal (see proposed_solution for specifics):\n1) Define three token types for billing: cached_prefix_tokens, cached_kv_tokens, generated_tokens. Bill only generated_tokens.\n2) For batched runs, compute generated_tokens for the whole batch and deterministically attribute tokens to originating requests using generation-order attribution (first-emitted token -> request that triggered it).\n3) Ensure idempotency/dedup keys are used to prevent double billing on immediate retries/fallbacks.\n4) Expose per-request breakdown in usage logs and Console for auditability.",
+  "proposed_solution": "Implementation summary:\n\nRuntime hooks:\n- Add a compact event stream emitted by the serving runtime for each request/batch containing: request_id, batch_id, prefix_cache_hit_length (tokens), kv_cache_hit_length (tokens), and a generation_event sequence for the batch indicating order of new tokens and which request slot they were generated for. This must be a flat, compact JSON line logged to the billing adapter.\n\nBilling adapter rules (deterministic algorithm):\n1) For each request in a batch, billed_tokens = number of generated tokens attributed to that request according to generation_event sequence.\n2) Do NOT bill prefix_cache_hit_length or kv_cache_hit_length. These are for observability only.\n3) If a request is fully served from prefix cache (generated_tokens == 0), it will be billed 0 tokens but still count against per-minute request quotas (configurable policy).\n4) On retries/fallbacks: use idempotency-key + original_batch_id to detect duplicate generation events within a 2-minute window; drop duplicate generated_tokens to avoid double billing.\n5) For streaming responses, emit attribution events in real time; billing records are updated incrementally.\n\nEdge cases and decisions made:\n- Partial KV cache hits: treat KV-retrieved tokens as cached_kv_tokens and exclude from billing; only new decoder steps produce billed tokens.\n- Non-deterministic sampling or stochastic decoders: still attribute per emitted token to a request slot using the runtime's generation_event stream (the runtime already coordinates decoding order for batches).\n- Fallback to smaller model: if runtime falls back and replays the same request, use idempotency detection and attribute billed tokens to the original request only once; if different model emits additional tokens because of behavioral changes, attribute the delta but surface a reconciliation record to Billing team.\n\nBackward compatibility:\n- Old logs will still be ingestible; move to hybrid processing for 30 days to reconcile historical variance.\n\nRollout safety:\n- Start behind feature flag; mirror billing-adapter outputs to a side datastore and compare (mirror-mode) for 2 weeks before switching live billing.\n\nSecurity and privacy:\n- Events emit only token counts and request identifiers (no token text). All payloads follow existing telemetry PII rules.",
+  "acceptance_criteria": [
+    "Runtime emits generation_event streams for batched runs and includes prefix_kv counters",
+    "Billing adapter computes per-request billed_tokens per algorithm and stores them in usage ledger",
+    "Mirror mode shows <0.5% divergence between old-metering and new-metering on baseline workloads after 1 week",
+    "No customer sees >5% increase in billed tokens after rollout (goal: decrease for cache-heavy workloads)",
+    "Rate-limiter continues to enforce request-based quotas and provides configurable policy to count cache-only requests"
+  ],
+  "rollout_plan": [
+    "Phase 0: implement runtime hooks + telemetry tests in staging (feature-flagged)",
+    "Phase 1: enable billing-adapter mirror-mode for all traffic; collect mismatch metrics (2 weeks)",
+    "Phase 2: enable live billing for non-critical accounts and monitor invoice parity (1 week)",
+    "Phase 3: 100% rollout with alerting and 72-hour rollback window if >5% unexpected bill changes observed",
+    "Post-rollout: create migration report and update public docs/FAQ"
+  ],
+  "metrics": [
+    "mirror_mismatch_rate: percent of requests where new billed_tokens != old_billed_tokens",
+    "customer_cache_billing_delta: per-customer percent change in billed tokens vs baseline",
+    "duplicate_billing_events: count of idempotency-key collisions leading to duplicate charges",
+    "latency_overhead: additional p99 latency introduced by emitting generation_event stream (goal <1ms)",
+    "rate_limit_violation_delta: change in number of rejected requests after applying cache-counting policy"
+  ],
+  "related_links": [
+    "https://redwood-internal.atlassian.net/l/c/RFC-cache-billing-2026",
+    "https://github.com/redwood-inference/runtime/pull/1290",
+    "https://github.com/redwood-inference/billing/pull/487",
+    "https://confluence.redwood.ai/billing/prefix-kv-cache-metering",
+    "https://grafana.internal.redwood/d/usage/billing-mirroring-dashboard"
+  ],
+  "comments": [
+    "2026-03-02 - Marcus Lee: Initial implementation complete for runtime hooks; generating compact per-batch event stream. Setting up integration tests.",
+    "2026-03-04 - Priya Nair (PM): Need clarifications on quota policy for cache-only requests \u2014 recommend they count against request quotas to avoid abuse (agreed in design review).",
+    "2026-03-06 - Elena Gomez (SRE): Concern: idempotency window of 2 minutes might be too short for long retries in mobile networks; propose 5 minutes or use dedup via persistent ledger. Will follow up.",
+    "2026-03-10 - Marcus Lee: Adjusted idempotency logic to persist lightweight generation_event checksum for 10 minutes in Redis; PR updated (see related_links).",
+    "2026-03-12 - Finance (FYI): Please add a reconciliation report format so Billing ops can audit before first live invoices. Added acceptance criteria to include reconciliation report."
+  ],
+  "customer_impact": "medium",
+  "release": "billing-2026.03",
+  "security_review_required": "false",
+  "parent_issue": "ENG-5910",
+  "dependencies": [
+    "ENG-6102",
+    "ENG-6088"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "proposed_solution",
+    "acceptance_criteria",
+    "rollout_plan",
+    "metrics",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_c71fdbff5b05425ca18f7158fbf30565"
+}

@@ -1,0 +1,75 @@
+{
+  "key": "SUP-365530",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Stream termination mismatch after auth-proxy rewrite causes partial SSE payload and reconnect loop",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-13",
+  "reporter": "Aisha Patel",
+  "assignee": "Liam O'Reilly",
+  "customer_company": "FinEdge Analytics",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "edge-proxy",
+    "auth"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "auth-proxy",
+    "regression",
+    "investigating"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "redwood-v1.4",
+    "open-llama-13b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-13",
+  "first_response_due_at": "2026-03-12",
+  "linked_issues": [
+    "SUP-202634",
+    "SUP-314158"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/edge-proxy/pull/891"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/runbooks/stream-reconnect"
+  ],
+  "description": "Issue summary:\nCustomer reports intermittent truncated SSE sessions where the final JSON array bracket and final metadata fields are missing. Sessions then immediately reconnect and replay the prefix, resulting in duplicated leading tokens and missing trailing text. This appears after the customer's requests transit through a corporate auth proxy (WAF) that rewrites headers.\n\nImpact:\n- Several FinEdge endpoints experience incomplete model responses in production (user-facing feature: assistant reply bodies get cutoff).\n- Client apps (web and mobile) observe reconnect loops and duplicate partial outputs, causing confusing UI flicker and occasionally malformed JSON on the client.\n\nEnvironment:\n- Prod (us-east-1), customer on Dedicated plan using a pinned model route (redwood-v1.4) via our hosted API through edge-proxy + auth middleware.\n\nSteps to reproduce (observed by customer):\n1. Client opens SSE connection to /v1/stream with authorization cookie set by corporate SSO proxy.\n2. After ~40-120s the stream emits a small keepalive and then a truncated final chunk (missing closing \"]\" and last metadata block).\n3. Client reconnects using resume token; server responds with a re-send of the prefix but the terminal marker is never delivered.\n4. Several reconnects later the client gives up and surfaces an incomplete reply.\n\nObserved behaviour:\n- Truncated final chunk where last 6\u201340 bytes of payload are missing (common pattern: final close-bracket \"]\" or trailing metadata object).\n- Immediate client reconnects that replay prefix tokens, causing duplicates.\n- At least one recorded case where duplicated prefix + missing suffix produced invalid JSON array and crashed client JSON parser.\n\nExpected behaviour:\n- Final chunk arrives intact with closing metadata and terminator; resume should stitch cleanly without token duplication or missing suffix.\n\nInitial hypothesis:\n- Auth proxy in front of customer is rewriting/chunking responses and inserting or removing a header that triggers our edge-proxy to prematurely close the transfer-encoding chunk stream (we saw evidence of CHUNKED-to-identity rewrite in tcpdump). The edge-proxy then emits a half-closed SSE final event and the client interprets it as connection loss and performs a resume.\n\nRelevant logs & traces:\n- Packet capture from customer (pcap) shows proxy injecting an X-Auth-Trace header and collapsing small keepalive frames into a single TCP packet; server-side proxy logs show a 200 followed by a short FIN that carries a partial chunk.\n- Serving runtime logs (trace ids): trace-9f2a5b7e shows final write of 512 bytes then immediate socket close from edge-proxy; downstream worker shows no error.\n- Edge-proxy access logs: edge-01: 2026-03-12T21:13:42Z GET /v1/stream status=200 bytes_sent=487 connection_status=half-closed\n\nRepro steps for engineering:\n- curl -N -H 'Accept: text/event-stream' -H 'Cookie: auth=...' 'https://api.redwood.example/v1/stream?model=redwood-v1.4' (observed by customer to reproduce intermittently)\n- python sseclient + tcpdump to inspect boundaries; when auth proxy rewrite occurs, final chunk size is reduced and trailing bytes are missing.\n\nNotes on scope:\n- Related but distinct from previously tracked pure-proxy truncations: in this case auth-cookie rotation coincides with proxy rewrite and results in half-close behavior that our resume machinery does not currently tolerate without duplicate prefix suppression.\n",
+  "comments": [
+    "2026-03-12 22:05 - Support (Aisha): Acknowledged with first response. Collected pcaps and asked for SSO proxy vendor and sample request IDs.",
+    "2026-03-12 22:34 - Customer (FinEdge): Provided pcap + proxy vendor = 'SecureGate WAF v3', noted they see an 'X-Auth-Trace' insert around the time of the cutoff.",
+    "2026-03-12 23:10 - Eng (Liam): Confirmed trace-9f2a5b7e shows final write then FIN from edge-proxy; assigned to me for deeper investigation. Linked to PR for edge-proxy parsing tests. See slack #support link: https://slack.redwood.ai/archives/C01SUPP/3190",
+    "2026-03-13 01:15 - Eng (Liam): Ran targeted reproducer behind a SecureGate test instance \u2014 observed identical half-closed behavior when WAF response-size limiter kicks in. Filed temporary mitigation in edge-proxy to avoid aggressive coalescing (PR: https://github.com/redwood-inference/edge-proxy/pull/891)."
+  ],
+  "investigation_notes": [
+    "Confirmed that SecureGate WAF rewrites small keepalive frames and may drop trailing CRLF on chunk boundaries when activating its response-size limiter.",
+    "Edge-proxy currently treats a FIN immediately after a write as 'normal termination' and emits SSE end-event without validating terminator presence in the JSON envelope.",
+    "Resume logic assumes last acknowledged byte offset is authoritative; when proxy strips trailing bytes, resume replays from earlier offset and duplicates prefix tokens; downstream parser expects a closing bracket which never arrives.",
+    "Reproducible locally by placing SecureGate testbed with response-size ceiling set to 512 bytes and sending a 540-byte final payload \u2014 observed truncation and immediate FIN from WAF."
+  ],
+  "resolution_notes": [
+    "Workaround (customer): Routed streaming traffic for affected routes through a bypass ACL on SecureGate to avoid response-size limiter \u2014 customer confirmed immediate reduction in truncation events.",
+    "Temporary platform mitigation: edge-proxy PR #891 adds a small delay/wait for final terminator bytes on half-close and avoids emitting SSE end-event if terminator not seen; deployed to canary on us-east and reduced incidents in canary traffic by 92%.",
+    "Long-term fix: edge-proxy to validate chunk terminator and hold socket for up to 500ms for trailing bytes in case of mid-air rewrite. Also adding a resume de-duplication pass that rejects replay of already-emitted tokens based on token-offset signatures.",
+    "Follow-up actions: 1) Add new test harness simulating SecureGate behavior to CI (assigned INT-4221). 2) Update runbook with steps to instruct customers to bypass WAF for streaming or configure 'stream passthrough' mode. 3) Outreach to SecureGate to understand rewrite policy."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_673ff6462c9b4685bc7263e93ce6004f"
+}

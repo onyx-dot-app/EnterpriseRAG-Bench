@@ -1,0 +1,105 @@
+{
+  "key": "SUP-995431",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Sustained request timeouts for multi-turn chat with deep conversation history and very high max_tokens",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Banerjee",
+  "assignee": "Marco Liu",
+  "customer_company": "NovaHealth",
+  "customer_tier": "enterprise",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "kv-cache",
+    "scheduler",
+    "streaming"
+  ],
+  "labels": [
+    "long-context",
+    "timeout",
+    "kv-eviction",
+    "priority-customer",
+    "investigation"
+  ],
+  "environment": "prod - us-west-2",
+  "affected_models": [
+    "redwood-v2-large",
+    "llama-2-13b-instruct"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-10",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-29541",
+    "SUP-60735"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/3412"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/98765-Long+Context+Timeouts+Runbook"
+  ],
+  "related_incident_id": "INC-20260310-04",
+  "description": "Issue summary: Customer reports repeated request timeouts (HTTP 504 / streaming disconnect) when sending multi-turn conversations with very deep history (>= 25 messages) combined with max_tokens set above 12,000.\nImpact: NovaHealth saw 15% of production inference requests fail for a subset of chat flows over a 3-hour window, causing degraded UX for clinicians and elevated support contacts.\nEnvironment: Production (us-west-2), dedicated tenant on Redwood Dedicated (reserved GPU pool), model pinned to redwood-v2-large.\nObserved behavior: Requests initially stream tokens but often stall after ~60-120s and then terminate with 504 or client-side socket reset. Failures are most frequent when KV cache size grows large due to long conversation history and when customers set high max_tokens for final answer generation.\nFrequency: Intermittent but reproducible for sessions with deep history and high max_tokens.\nCustomer impact note: Customer is on an enterprise contract with SLAs; business critical workflows (clinical summarization) were interrupted.",
+  "steps_to_reproduce": [
+    "Create a long multi-turn chat session with ~30 prior messages (system + user + assistant).",
+    "Set generation parameters: model=redwood-v2-large, max_tokens=12500, temperature=0.2, streaming=true.",
+    "Issue the request to the /v1/chat/completions endpoint with the full history included as messages[].",
+    "Observe that streaming returns initial chunks, then stalls between 60-120s, and request either times out with 504 or the client connection resets.",
+    "Repeat with reduced history (<=10 messages) or reduced max_tokens (<=2048) and note the request completes successfully."
+  ],
+  "logs_snippets": [
+    "2026-03-10T14:23:42Z INF request_id=8f3a... accepted size=2.1MB messages=31 max_tokens=12500\n",
+    "2026-03-10T14:24:45Z ERR request_id=8f3a... finalizer_timeout after 78s waiting for tokenization/kernels\n",
+    "2026-03-10T14:24:45Z ERR serving-runtime: downstream write error: write tcp 10.0.3.12:443->...: write: connection reset by peer\n",
+    "2026-03-10T14:24:46Z WARN scheduler: priority-queue backlog=72 batchers=4 kv_cache_size=3.9GB evictions=7/min\n",
+    "Trace: grafana/dashboard/request_latency?var-region=us-west-2&var-model=redwood-v2-large peak p50=0.9s p95=14.2s p99=62.7s during window"
+  ],
+  "comments": [
+    "[2026-03-10 15:05 UTC] Support (Aisha): Contacted customer, confirming impact and requested sample payloads and full request_id headers.",
+    "[2026-03-10 15:20 UTC] Customer (NovaHealth - product): Sent three failing request_ids and a sample session export (30 messages + system prompt + docs). Reports failures only when max_tokens above 10k.",
+    "[2026-03-10 16:00 UTC] SRE (Marco): Correlated request_ids in prod cluster; saw sustained finalizer queue growth and KV cache evictions during the window. Opened runtime investigation and increased observability sampling.",
+    "[2026-03-10 18:40 UTC] Runtime eng (Priya): Reproduced backlog locally when KV cache exceeded ~3.5GB. Hypothesis: large KV entries cause serialization/deserialization stalls under current kernel swap logic.",
+    "[2026-03-11 09:15 UTC] Support (Aisha): Provided customer with temporary mitigation steps (trim conversation history, reduce max_tokens to <4k, set prefer_fast_path=true). Customer applied mitigation and confirms requests complete.",
+    "[2026-03-12 12:30 UTC] Eng (Marco): Rolled out limited-rate patch to finalizer that prioritizes token emission for streaming and avoids large blocking serialization on critical path. Monitoring for regressions."
+  ],
+  "investigation_notes": [
+    "Initial hypothesis: network flakiness or API gateway idle timeouts \u2014 ruled out: other customers in same AZ not affected and gateway logs show healthy upstream connectivity.",
+    "Observed pattern: failures co-occur with high kv_cache_size and increased eviction rates; finalizer component shows GC/serialization pauses correlated with stalled streaming.",
+    "Repro locally: synthetic workload with 35 messages and max_tokens=12k reproduces ~60-90s stall on redwood-v2-large when using default kernel swap path.",
+    "Profiling: blocking syscall in kv-serialization routine while writing >2.5MB KV frames to temp storage; scheduler backlog increases and timeouts follow.",
+    "Grafana panels: contended finalizer threads (thread_cpu>85%), scheduler queue depth spike, p99 latency for token emission increases sharply.",
+    "Temporary mitigation verified: trimming history to reduce KV size avoids the stall; switching to model variant with smaller key/value footprint also avoids issue.",
+    "Related to recent runtime change: PR #3412 introduced a lazy-serialization optimization but has a path that falls back to blocking serialization for large KV blobs \u2014 likely trigger for these workloads.",
+    "Customer-specific: NovaHealth uses long structured system prompts + document snippets which inflate tokenized history size beyond typical chat loads."
+  ],
+  "root_cause": "Blocking KV serialization path that performs synchronous writes for large KV blobs (triggered by very deep conversation history and high max_tokens), causing finalizer threads to stall and scheduler backlog to grow, resulting in request timeouts and streaming disconnects.",
+  "resolution": "Implemented a hotfix that avoids blocking serialization on the streaming emission path: large KV blobs are now asynchronously checkpointed and finalizer is prioritized for active streaming requests. Hotfix rolled to affected us-west-2 Dedicated pool at 2026-03-12 03:20 UTC. Monitoring shows error rate dropped to baseline.",
+  "workaround": "1) Trim conversation history (remove older assistant turns) or summarize earlier context before sending.\n2) Reduce max_tokens to <= 4096 for large-history sessions.\n3) Temporarily pin to a model variant with smaller KV footprint.\n4) Set prefer_fast_path=true to favor low-latency execution if available.",
+  "next_steps": [
+    "Postmortem write-up and root-cause doc scheduled for 2026-03-15 (owner: Marco).",
+    "Backport async-serialization fix to stable branch and release to Dedicated clusters next week (owner: runtime team).",
+    "Add telemetry alert for kv_cache_size > 3GB + finalizer_queue_depth > 50 to catch regressions early.",
+    "Customer follow-up: schedule a sync with NovaHealth to review long-term guidance for handling deep-history workflows and offer migration assistance."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs_snippets",
+    "comments",
+    "investigation_notes",
+    "root_cause",
+    "resolution",
+    "workaround",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_46c3939f0e48481f832fb44db7eece58"
+}

@@ -1,0 +1,60 @@
+{
+  "key": "ENG-48123",
+  "team": "engineering",
+  "title": "Slotted-retirement policy for GPU KV cache: bounded-staleness with prefix integrity",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-14",
+  "creator": "Priya Nair",
+  "assignee": "Mateo Alvarez",
+  "project": "runtime-cache-consistency",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-28",
+  "labels": [
+    "kv-cache",
+    "gpu-memory",
+    "continuous-batching",
+    "consistency",
+    "runtime-1.29"
+  ],
+  "release": "runtime-1.29",
+  "security_review_required": "false",
+  "customer_impact": "medium",
+  "dependencies": [
+    "ENG-24167",
+    "ENG-30642"
+  ],
+  "description": "Problem:\nWhen we mix TTL-driven expiration, LRU pressure and prefix-affine allocations on the GPU, loose eviction (per-key) leads to two classes of production correctness issues: 1) prefix-splitting where a prefix's KV history is partially evicted causing reranked completions to return inconsistent context, and 2) in-flight batch regressions where a request references a KV slot that is reclaimed mid-batch. Both are exacerbated by continuous batching (variable-length micro-batches) and GPU memory compaction strategies.\n\nGoal:\nDesign and implement a low-latency, low-cost GPU KV reclamation policy that: (a) bounds staleness deterministically (an upper bound on how old a referenced KV may be), (b) preserves prefix-level integrity (no partial prefix retirements visible to inference), (c) cooperates with continuous batching to avoid mid-batch invalidation, and (d) enables efficient bulk reclamation/compaction to reduce fragmentation and GPU OOM risk.\n\nProposed approach (Slotted-retirement):\n- Partition KV allocation space into contiguous time-slots (configurable slot duration, e.g., 30s). New entries are written into the current active slot.\n- Each in-flight request pins the slot(s) it touches; slot pins are reference-counted at the runtime layer.\n- Retirement happens at slot granularity: a slot becomes eligible when its TTL window (or LRU watermarks) expire AND there are no active pins for that slot. We then atomically mark the slot retired and make it available for compaction/eviction in one operation.\n- Prefix integrity: allocations belonging to a prefix are placed in the same slot whenever possible via short-lived prefix-anchoring heuristics so that we never retire only a subset of a prefix's cached KV history without moving the rest. For long-lived prefixes that cross slots we maintain a small prefix-index that records sequence boundaries so we can perform coordinated retire/merge operations.\n- Continuous batching cooperation: before initiating a batch, the scheduler snapshots the list of candidate slots for the full batch window and holds lightweight pins on them for the expected batch duration. This prevents mid-batch evictions without adding significant latency.\n- Compaction and GPU memory optimization: retired slots are compacted in background worker threads; compaction uses a reclamation plan that prefers whole-slot releases and only does intra-slot shuffles when fragmentation exceeds a high threshold. This allows large contiguous frees for the allocator to reduce fragmentation and avoid repeated small frees that are expensive on GPU drivers.\n- Fallbacks: if memory pressure becomes critical, runtime may trigger emergency per-key reclaim within a slot using conservative sequence checks and promoted fallback models for degraded quality. Emergency paths are logged and surfaced as high-severity alerts.\n\nCorrectness guarantees sketch:\n- Atomic slot retirement ensures that any inference either sees the slot fully present or fully absent \u2014 no partial visibility.\n- Pinning model guarantees that if an inference references a KV entry, the slot containing it cannot be retired until the inference completes. This gives a bounded staleness: max(slot duration + max scheduling delay).\n- Prefix anchoring heuristics decrease the probability of prefix-splitting; coordinated retire/merge provides a deterministic path for prefixes that cross slots (merge is serialized with retire operations for those slots).\n\nTrade-offs and rationale:\n- Coarser granularity (slots vs per-key) increases potential memory retention, but dramatically simplifies correctness and enables contiguous GPU frees that reduce fragmentation and allocator overhead \u2014 a net win for tail-latency and OOM avoidance.\n- Slot duration is a tunable knob: shorter slots reduce staleness but increase background compaction frequency. We will default to 30s and expose slot-duration per-customer tier.\n- Continuous batching pinning adds minimal overhead (O(slot-count) refs) compared to the cost of mid-batch retries and model quality regressions.\n\nImplementation plan:\n1) Runtime data structures: slot table, refcounts, prefix-index (lightweight), slot-state machine.\n2) Scheduler changes: batch pre-snapshot + pin acquisition API.\n3) Background compactor worker and emergency reclaim path.\n4) Instrumentation: metrics for slot-pinning duration, retire latency, compaction throughput, emergency-reclaim counts.\n5) Tests: unit tests for slot-state transitions, integration tests with simulated continuous batching, and fault injection that forces compaction race conditions.\n6) Canary rollout: start with dev clusters, then dedicated capacity customers on low-traffic pools, then wider rollout.\n\nMetrics to observe:\n- Average and 99.9th percentile pin hold time.\n- Number of emergency per-key reclaims per hour.\n- GPU memory fragmentation score (before/after compaction).\n- Inference error rates and retry counts correlated with retire events.\n\nRollout safety and rollback:\n- Feature gate behind a runtime flag. Default off for hosted until canary validated.\n- If emergency reclaims exceed threshold or inference errors rise, gate off and fall back to existing LRU/TTL per-key policy (with a compaction-only helper).\n\nOpen questions:\n- Exact slot sizing heuristics per workload (batch-heavy vs low-QPS interactive) \u2014 plan A is adaptive slot-duration tuned from observed access patterns.\n- Whether prefix-index adds unacceptable memory overhead for extremely high cardinality prefixes; plan: sample prefixes and evict index entries LRUs.\n- Interaction with model quantization memory layouts during compaction \u2014 need closer integration with allocator team.\n\nDeliverables:\n- RFC and design doc (link below)\n- Implementation PRs for slot table + scheduler pins + compactor\n- Load tests and canary report\n",
+  "acceptance_criteria": [
+    "Unit tests covering slot lifecycle and pin refcounts",
+    "Integration test where continuous batching of mixed sequence lengths never observes mid-batch slot retire (fault-inject and assert)",
+    "Canary showing <1 emergency per-key reclaim/hour on test workload and no regression in tail latency",
+    "Monitoring dashboards for slot metrics available in Console",
+    "Gradual rollout plan documented and feature-flagged"
+  ],
+  "comments": [
+    "2026-03-02 - Priya Nair: Drafted RFC, added initial correctness sketch and trade-offs. Put together initial test matrix.",
+    "2026-03-04 - Mateo Alvarez: Reviewed. Concern: prefix-index memory overhead. Action: add sampling strategy and LRU for prefix-index entries (see action below).",
+    "2026-03-05 - Aria Chen: From allocator team: compaction must avoid long GPU kernels; prefer staged compaction with small copy windows. We'll coordinate thresholds with allocator.",
+    "2026-03-07 - Priya Nair: Updated RFC to include staged compaction and prefix-index sampling. Added emergency reclaim alert thresholds.",
+    "2026-03-10 - Mateo Alvarez: Implemented slot table skeleton and pin APIs in branch: https://github.com/redwood-inference/runtime/pull/3887",
+    "2026-03-12 - QA (Liam O'Connor): Running integration harness with continuous-batching simulator. Observed one mid-batch stale reference in 1e6 requests when slot-duration=5s \u2014 likely race in pre-snapshot. Increasing pre-snapshot window eliminated the regression."
+  ],
+  "related_links": [
+    "Design RFC: https://docs.redwood.ai/rfcs/2026/kv-slotted-retirement.md",
+    "Implementation PR: https://github.com/redwood-inference/runtime/pull/3887",
+    "Perf dashboard (canary cluster): https://console.redwood.ai/dashboards/kv-slots-canary",
+    "Allocator notes: https://docs.redwood.ai/allocators/compaction-guidelines.md",
+    "Incident learning (re: mid-batch evictions): https://playbooks.redwood.ai/incidents/2025-11-mid-batch-evict"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "comments",
+    "related_links"
+  ],
+  "dataset_doc_uuid": "dsid_ef904fbc7fd24d278d75cc498edbdd2a"
+}

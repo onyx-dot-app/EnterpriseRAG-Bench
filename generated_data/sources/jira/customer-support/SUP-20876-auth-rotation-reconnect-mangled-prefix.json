@@ -1,0 +1,104 @@
+{
+  "key": "SUP-20876",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Auth token rotation race causes truncated prefix on SSE resume leading to partial/garbled first tokens",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Kumar",
+  "assignee": "Evan Park",
+  "customer_company": "NovusRetail",
+  "customer_tier": "dedicated",
+  "environment": "prod-us-east",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "auth"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "reconnect",
+    "auth-rotation",
+    "customer-impact"
+  ],
+  "affected_models": [
+    "redwood-v1-large"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "linked_issues": [
+    "SUP-721406",
+    "SUP-4721"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/4123"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/ENG/Streaming+Resume+Runbook"
+  ],
+  "description": "Issue summary:\nCustomer reports that when their client reconnects to an in-progress SSE stream after a short network blip, the first emitted tokens are truncated or garbled. The remainder of the stream resumes normally, but the partial/gibberish prefix corrupts downstream parsers in their product. This is intermittent (~1-2% of reconnects) and correlates with our auth token rotation window in the prod-us-east serving fleet.\n\nImpact:\n- NovusRetail reports failed order-summary displays in their storefront for ~2% of streaming requests after reconnects.\n- Client-side parsers report JSON parse errors when the stream's initial tokens are corrupted.\n- Business impact: some users see blank widgets; revenue impact estimated small but customer wants SLA-level mitigation.\n\nEnvironment:\n- Customer on Dedicated cluster in us-east (dedicated pool id: dr-prod-7).\n- Client uses SSE via the public Redwood API with short-lived bearer tokens (rotation TTL 30s at their integration).\n\nWhy this is different from other streaming reconnect cases:\n- Not a pure proxy fragmentation or keepalive issue \u2014 traces show a valid SSE chunk arrives but first few characters are mangled, not missing.\n- Occurs only when the client's reconnect happens within ~2-5s of our auth token rotation point.\n- Neither client nor edge shows TLS/TCP resets at time of corruption.",
+  "steps_to_reproduce": [
+    "1) Customer has an active SSE session from the Redwood hosted API producing a long running generative response.",
+    "2) Induce a short network blip (client-initiated disconnect) and immediately reconnect the SSE stream within 2-5 seconds.",
+    "3) Observe that the resumed SSE stream emits a first data event where the first 2-8 characters of the tokenized text are replaced with non-UTF8 or garbled bytes, causing client JSON parsing to fail.",
+    "4) Repeat ~50-100 times to reproduce the ~1-2% occurrence window; easiest to reproduce when client performs token refresh right around server-side rotation window."
+  ],
+  "logs": [
+    "Client-side captured fragment (base64): H4sIAAAAAAAA/ytJLS4BAAx+f9gEAAAA (corrupt leading bytes) followed by valid UTF-8 tokens.",
+    "Edge proxy (nginx) access log at 2026-03-09T14:22:08Z: 200 GET /v1/streams?id=abc123 - - 0.083 - upstream_response_time:0.080",
+    "Serving runtime trace (2026-03-09T14:22:08.042Z): conn=dr-prod-7/slot-12 auth_check ok (token_id: rtk-245) rotated at 14:22:06.867Z; resume_stream resumed_kv_cache=true; emitted first_chunk size=128 bytes",
+    "Auth service audit (2026-03-09T14:22:06.860Z): rotated token rtk-246 issued; old token rtk-245 moved to grace state expires_in=30s",
+    "Hex dump of received SSE chunk: 7b 22 74 6f 6b 65 6e 22 3a 22 e2 28 9f 20 2f ... (notice e2 28 9f inserted at offset 12)",
+    "No TCP retransmit events in connection logs; no TLS renegotiate entries."
+  ],
+  "investigation_notes": [
+    "Initial hypothesis: proxy chunk coalescing or MTU split \u2014 discarded after confirming chunk size variance and presence of non-UTF8 bytes that match neither nginx nor customer client encodings.",
+    "Observed tight correlation with auth token rotation operations on the serving node (rotation grace period and immediate reauth paths).",
+    "Repro attempt with synthetic client toggling token refresh window reproduced corrupted prefix in ~3/120 trials \u2014 not deterministic but statistically significant versus baseline 0/120 when token refresh disabled.",
+    "Trace-level capture shows a goroutine in the serving-runtime that swaps auth context during resume; swapping code path copies the buffer into a reusable slab while simultaneously appending the prefix from the KV cache \u2014 race suspected between buffer zeroing and write path leading to leftover bytes in front of new data.",
+    "Memory-debugging with sanitizers on a dev replica reproduces out-of-order memory copy when auth rotation coincides with resume flow (local heap reuse observed).",
+    "Edge-level mitigation (disable immediate token rotation while resumes in-flight) removed occurrences in a small canary (dr-canary-2) for 48 hours."
+  ],
+  "customer_communication": [
+    "2026-03-10 09:12 UTC - Support (Aisha): Thanks for the report \u2014 we are investigating. Could you share approximate timestamps of affected sessions?",
+    "2026-03-10 09:25 UTC - Customer (NovusRetail): Sent three timestamps, sample IDs, and client SDK version 1.4.2. Confirmed this started after we switched token TTL to 30s last week.",
+    "2026-03-11 15:02 UTC - Support (Evan): We have a suspected race in our resume/auth code path. We're running a canary fix disabling token rotation during resume and will update in 24h with results.",
+    "2026-03-12 11:47 UTC - Customer: Noticed reduced failures after canary. Asked for ETA on permanent fix and whether there is a customer-side workaround.",
+    "2026-03-12 16:00 UTC - Support: Provided temporary client workaround (increase token TTL to >90s or refresh tokens only when not actively reconnecting) and timeline for code fix."
+  ],
+  "root_cause": "A race condition in the serving-runtime resume path where an auth rotation path reuses/re-initializes a write buffer concurrently with resume write. The concurrent memory copy left stale bytes at the buffer head which are emitted as the first bytes of the resumed SSE data, producing garbled/truncated prefixes on the client.",
+  "workaround": "Customer can increase bearer token TTL to >90s or defer token refresh until after stream finalization. Temporary server-side mitigation deployed to canary: hold token rotation for 10s after any resume event on that slot.",
+  "resolution_summary": "Patch merged to fix buffer reuse race (runtime PR #4123). Hotfix rolled to canary (dr-canary-*) observed zero reproductions in 72h. Rollout plan: staged deploy to Dedicated clusters in us-east over 48 hours with telemetry threshold checks. Post-deploy, recommend customer revert token TTL change or leave as-is; confirmed with NovusRetail that they will keep token TTL at 90s until full rollout completes.",
+  "next_steps": [
+    "1) Merge and monitor runtime fix across dedicated pools (owner: serving-runtime team).",
+    "2) Post-deploy metrics: track percentage of reconnects with non-UTF8 prefix payloads; target <0.01% over 24h windows.",
+    "3) Add a defensive unit test and fuzzing harness for resume+auth rotation interleavings (owner: runtime QA).",
+    "4) Follow up with NovusRetail after full rollout and confirm SLA closure; schedule a short postmortem with SRE and runtime engineers."
+  ],
+  "comments": [
+    "Evan Park (2026-03-10): Added initial trace logs and linked suspected PR for buffer pool changes.",
+    "Maya Singh (SRE, 2026-03-11): Canary deployed hold-rotation patch to dr-canary-2; observing no incidents in last 24h.",
+    "Julien Moreau (Auth, 2026-03-12): Will add a metric for token-grace-events and instrumentation to the rotation path to detect future close-timing resumes.",
+    "Aisha Kumar (Support, 2026-03-12): Sent customer-facing note summarizing workaround and upcoming rollout schedule."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "root_cause",
+    "workaround",
+    "resolution_summary",
+    "next_steps",
+    "customer_communication",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_21e470a7f82549c387b855e70571a1f0"
+}

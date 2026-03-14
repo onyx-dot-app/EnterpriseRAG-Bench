@@ -1,0 +1,32 @@
+{
+  "title": "Temporal gating warmup fieldnotes",
+  "owner": "Sofia Ramirez",
+  "drive_area": "users",
+  "path": "users/temporal-gating-warmup-fieldnotes-sofia.json",
+  "doc_type": "doc",
+  "created_at": "2026-02-20",
+  "last_modified": "2026-02-22",
+  "collaborators": [
+    "Marta Lee",
+    "Ibrahim Noor"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "warmup",
+    "latency",
+    "microburst",
+    "batching",
+    "experiment"
+  ],
+  "linked_artifacts": [
+    "https://linear.app/RED-312/warmup-gating-investigation",
+    "https://github.com/redwood-inference/benchmarks/pull/87"
+  ],
+  "content": "Purpose:\nQuick scratchpad for experiments exploring \"temporal gating\" during warmup. Observed recurring p99 spikes after rolling restarts; hypothesis is that scheduler gating during early warmup + small burst arrivals amplifies tail. This doc contains test plan, run notes, raw sample numbers, quick plots (ASCII), and immediate next actions.\n\nBackground / hypothesis:\n- We bias warmup to gradually open concurrency via a gating window (e.g., allow 2->4->8 concurrent requests across the first N seconds) to avoid cache thrash and OOM spikes.\n- If the gating steps align with incoming microbursts, the effective instantaneous concurrency jumps cause transient scheduling contention (kernel wakes, allocator churn) that inflates p95/p99.\n- Goal: characterize whether gating timing or step-size is dominant, and whether adding small randomized jitter in gate-open time reduces the tail.\n\nTest environment:\n- Model: open-weights-13b (kv-cache warmup sensitive)\n- Runtime build: serving-runtime v0.52.1 (profiling-enabled)\n- Hardware: single A100-80GB (shared ci bench node), CUDA 12.1\n- Container: rwinference/bench:2026-02-15\n- Traffic generator: go-bench-proxy v0.9 (Poisson and custom-arrival modes)\n- Metric collection: Prometheus scrape @5s, traces via jaeger lite\n\nWarmup gating configs tested:\nA) linear-small: gate steps [2,4,8] at T = [0s, 6s, 18s]\nB) linear-big: gate steps [4,8,16] at T = [0s, 8s, 24s]\nC) jittered: linear-small + uniform jitter +/-20% applied to each step time\nD) instant-open: no gating (control)\n\nWorkload patterns:\n- baseline-poisson: Poisson arrivals, mean QPS 20, T=5s warmup window (steady-ish)\n- microburst-train: repeated tiny bursts: 200ms bursts at 80rps for 3s every 30s (to simulate frontend batching)\n- long-tail-staccato: random spikes 0.5\u20132s long at up to 150% of baseline\n\nProcedure (per run):\n1) cold start process, ensure no prior kv cache (restart runtime)\n2) apply gating config and start traffic generator\n3) run for 10 minutes, collect percentiles (p50/p90/p95/p99/p999), request counts, and OOM/eviction logs\n4) snapshot kernel wake traces for first 30s of every minute (if p95>threshold)\n\nRepresentative results (excerpt):\n- Run: microburst-train under linear-small\n  - p50 = 32ms, p90 = 72ms, p95 = 110ms, p99 = 420ms, p999 = 980ms\n  - Observed ~3 spikes >1s coincident with gate steps (6s and 18s) and arrival bursts aligning within +/-200ms window.\n\n- Run: microburst-train under jittered\n  - p50 = 34ms, p90 = 75ms, p95 = 115ms, p99 = 180ms, p999 = 340ms\n  - Spikes reduced by ~57% at p99 compared to linear-small. No >1s outliers recorded.\n\n- Run: microburst-train under instant-open (control)\n  - p50 = 30ms, p90 = 70ms, p95 = 105ms, p99 = 160ms, p999 = 310ms\n  - Baseline tail similar to jittered for this workload; suggests gating introduced extra coupling with arrival pattern.\n\nNotes from traces / profiler:\n- Kernel wake patterns: at gate-open times we saw dense wakeup events from allocator threads and CV notify flood; context-switch spikes aligned to the p99 windows.\n- Memory allocator: short-lived bump in device-side allocator calls (dev-malloc) around gating steps. Eviction logs show small KV cache churn at step boundaries.\n- GC pause: python-side GC noise small; not primary driver.\n\nQuick ascii latency timeline (microburst-train, linear-small):\nTime(s) | 0      5      10     15     20     25\np99(ms) | 40 ---- 120 --- 420 --- 90 ---- 480 --- 70\n             ^gate@6s    ^gate@18s     ^burst every 30s\n\nInterpretation / tentative conclusions:\n- Temporal gating can interact badly with periodic microbursts. If a burst coincides with a gate-open event, resources (allocators, kernel threads, IO scheduling) spike causing long tails.\n- Randomizing gate timings (jittered) mostly mitigates the worst tails while keeping warmup behavior similar.\n- For realistic production traffic which is not perfectly Poisson, the cost of gating (in tail risk) may outweigh the benefits unless we incorporate randomness or per-instance phase offsets.\n\nImmediate action items:\n- Short-term (next week): add <50% jitter to gating config in canary cluster; instrument kernel wake counts and eviction rates per gate event. Link PR: https://github.com/redwood-inference/runtime/pull/242 (draft).\n- Mid-term: prototype per-instance phase offset seeding (hash of instance id) to avoid fleet-wide synchronized gates. Run A/B vs jitter.\n- Long-term: investigate allocator backpressure mechanisms (batched dev-alloc/freelist thawing) to avoid mass alloc wakes at gate times.\n\nOpen questions / TODOs:\n- How sensitive is this to model size/kv footprint? Need a run on 70B distill (if we can access heavy nodes).\n- Does changing gate step cardinality (smaller increments e.g., 2->3->4) meaningfully lower p99 vs adding jitter? Quick experiment idea: micro-steps + jitter.\n- Might also test spreading warmup over longer wall time (flatten) vs gating steps \u2014 tradeoff vs cold latency exposure.\n\nLogs attached (short excerpts pasted):\n- eviction_log snippet: \"2026-02-20T12:06:05Z eviction: kv: 12 entries removed, peak_latency=587ms\"\n- trace snippet: \"kernel_wakeup: 118 events at t=6005..6030ms coincident with batch_dispatch spike\"\n\nPersonal notes:\n- This is a messy scratchpad. If results look promising, I'll formalize into a bench brief and a small PR to add jitter support to our gating config. For now, tag as exploratory and keep the canary conservative.\n\nNext run plan (short):\n- Run micro-steps (2->3->4->6) with 30% jitter, microburst-train, 4 repeats; capture p99 and kernel_wakeup counts. Compare against instant-open control.\n- Owner for next run: @Marta Lee (I'll share bench node creds).\n\nEnd of notes.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_7f0bb8e1a803445bbed97518ee12cecf"
+}

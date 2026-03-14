@@ -1,0 +1,44 @@
+{
+  "key": "ENG-29876",
+  "team": "engineering",
+  "title": "Resilient billing-safe ingest using opaque replay tokens",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-01-15",
+  "updated_at": "2026-03-10",
+  "creator": "Aisha Raman",
+  "assignee": "Marco Diaz",
+  "project": "consumption-metering",
+  "cycle": "2026-W06",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "billing",
+    "idempotency",
+    "ingestion",
+    "rate-limiting",
+    "quota-safety"
+  ],
+  "dependencies": [
+    "ENG-27318",
+    "ENG-15432"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.22",
+  "security_review_required": "true",
+  "description": "Problem: We continue to see edge-case billing duplicates when clients retry requests across network blips or when ingestion clients perform at-least-once delivery. Existing idempotency keys are often user-controlled, long-lived, or reused across distinct logical operations, which leads to both under- and over-charging. The rate limiter and quota enforcer currently operate with per-request token accounting that assumes a single delivery per client attempt, and lacks a robust cross-service commitment/lease model for in-flight consumption accounting.\n\nGoal: Implement an opaque server-issued replay token (ORT) and short-lived consumption lease protocol to guarantee single billing for logically identical ingestions while preserving client-side retry semantics and accurate quota/rate calculations. The solution must:\n- Prevent duplicate billing when the same upstream request is processed multiple times (retries/timeouts/at-least-once ingestion).\n- Integrate with existing rate limiter/quotas so transient retries don't push customers over quotas unfairly.\n- Be backward-compatible: SDKs should fall back to current idempotency key behavior when ORT unavailable.\n- Support cross-region failover and durable commitment logs for audit.\n\nDesign overview:\n1) Opaque Replay Token (ORT): server returns a short (128-bit) ORT in response headers when a request is first accepted for processing (2xx provisional acceptance). ORT encodes minimal server metadata (shard, epoch) and a signed HMAC; the server never trusts client-supplied ORTs unless validated against the commitment ledger. Clients include ORT on retries. ORT lifetime defaults to 60s with configurable TTL per tenant.\n\n2) Consumption Lease & Commitment Ledger: when a request is accepted, the allocation path creates a consumption lease entry in a commit log (append-only, per-tenant partition) reserving the billed tokens for a bounded lease window (e.g., 60s). On successful processing, the entry is committed/resolved to a final consumed amount. If the lease expires without commit, a reconciliation pass frees reserved tokens and applies risk-based adjustments. The ledger exposes idempotency resolution APIs: Resolve(ORT, final_units) and Query(ORT).\n\n3) Rate limiter and Quota changes: the quota enforcer will deduct from available quota only when a lease is created (not on replays). Replays that present a valid ORT will land on the same ledger entry: they query the ledger and either return cached response or await final commit (with a tie-break on first committer). For retries without ORT, the request will either be given a new ORT (new lease) or rejected when duplicate heuristics detect same payload/headers within a small window.\n\n4) Deterministic tie-breaking: the first successful processor to commit final_units wins; subsequent processors detecting a resolved ledger entry will return the cached result and will NOT create additional billing entries. To handle concurrent commit races, ledger uses compare-and-append with per-ORT sequence and commit nonce.\n\n5) Backward compatibility and SDKs: SDK releases will add helpers that call an initial \"preflight\" accept endpoint to obtain ORT before sending payload (optional to reduce latency). If SDK does not use ORT, server will fall back to legacy idempotency heuristics (payload fingerprinting + time window) but with lower guarantees.\n\nTrade-offs and notes:\n- Latency vs correctness: add a fast-path where small requests (<128 tokens) can be synchronous accept+commit to avoid extra roundtrips. Larger requests use lease+commit to protect billing correctness.\n- Storage: the commitment ledger is append-only; retention for audit will be 90 days plus compressed cold storage. We need to estimate throughput to shard ledger by tenant hash.\n- Complexity: introduces cross-service calls (frontend -> ledger -> quota service). We'll add local caches for ORT validation at edge nodes to avoid hot paths.\n\nTelemetry & Metrics:\n- metric: billing.duplicate_attempts.rate (count of replayed ORTs observed)\n- metric: billing.duplicate_billed.rate (cases where duplicates resulted in double-billing) -> target 0 after rollout\n- metric: ledger.commit_latency.p95\n- metric: quota.reservations.released_on_expiry\n- dashboards: per-tenant duplicate-safety and reconciliation failures\n\nRollout plan:\n1) Implement ledger prototype behind feature flag for internal-only tenants.\n2) Integrate ORT issuance and validation at edge; SDK opt-in alpha for internal clients.\n3) Shadow-mode enforcement for 2 weeks: create leases and ledger entries but continue billing via legacy path; compare outcomes and measure divergence.\n4) Canary rollout to 5% of production tenants with auto-rollback if billing.duplicate_billed.rate > 0.01%\n5) Full rollout after 4 weeks of stable telemetry and ops runbook.\n\nTesting plan:\n- Unit tests for ORT generation/validation HMAC and TTL edge cases.\n- Integration tests simulating concurrent commit races across shards.\n- Chaos tests with delayed commit and network partitions to ensure no double-commit.\n- End-to-end billing verification against synthetic tenants and usage patterns (retries, simultaneous reconnects).\n\nOperational runbook items:\n- If ledger becomes a hot-spot, increase shard count and scale append servers; fallback to conservative dedupe heuristics if ledger unavailable.\n- Reconciliation job will run hourly to detect leases expired > TTL and reconcile reserved tokens.\n- Manual unclaim flow for customer disputes: customer support can query Query(ORT) and see committed resolution, or trigger an audit.\n\nOpen questions / TODOs:\n- TTL tuning per workload class (low-latency chat vs batch embeddings).\n- Exact data retention and encryption-at-rest policy for ledger entries (coordinate with security).\n- Whether ORT should be returned for rejected/over-quota requests as a ticket for customer retry (probably not).\n- UX for customers who need guaranteed exactly-once semantics across multiple distinct calls that form a single logical operation (parent-level ORT?).\n\nReferences and artifacts:\n- Prototype PR: https://github.com/redwood-inference/platform/pull/5123\n- Ledger design doc (Confluence): https://confluence.redwood.ai/display/BILL/ORT+Commit+Ledger+Design\n- SDK changes (internal RFC): https://drive.google.com/drive/folders/1d-example-sdk-rfc\n- Telemetry dashboard (Grafana): https://grafana.redwood.ai/d/consumption/duplicate-safety\n\nExpected impact: reduced double-billing incidents for retry-heavy clients by >99%, clearer audit trail for disputes, and more predictable quota accounting during transient failures.",
+  "comments": [
+    "2026-01-20 - Marco: Prototype of ledger append API merged into feature branch. Initial perf looks good; commit latency p95 ~45ms on low load. Created PR: https://github.com/redwood-inference/platform/pull/5123",
+    "2026-01-28 - Aisha: Design review notes from PM (Lena): prefer configurable ORT TTL per-tenant. Added to open questions. Lena recommended adding a customer-visible header when a request is billed in shadow-mode.",
+    "2026-02-08 - Sohail (SRE): Shadow-mode load test simulated 10k TPS; leader election for per-tenant shard stable but we saw increased GC on append servers. Action: add memory tuning and monitor commit_latency.p99.",
+    "2026-02-24 - Marco: Began edge caching implementation for ORT validation (local LRU cache with 5s TTL). Draft PR: https://github.com/redwood-inference/platform/pull/5289",
+    "2026-03-02 - Compliance (Marta): Ledger entries must be tagged with tenant_id_hash and encrypted with KMS; security review flagged retention policy. Assigned follow-up to ENG-30112.",
+    "2026-03-10 - Aisha: Moving ticket to 'In Progress'. Begin canary config for 5% tenant rollout next week. Monitoring playbook and rollback thresholds are documented in Confluence."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_9c6cf5306021452fb6b5cec4ad266c25"
+}

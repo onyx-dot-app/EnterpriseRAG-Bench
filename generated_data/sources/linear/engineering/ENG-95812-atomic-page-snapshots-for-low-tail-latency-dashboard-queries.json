@@ -1,0 +1,101 @@
+{
+  "key": "ENG-95812",
+  "team": "engineering",
+  "title": "Atomic page snapshots for low tail latency dashboard queries",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-03-13",
+  "creator": "Asha Patel",
+  "assignee": "Ethan Brooks",
+  "project": "console-query-performance",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "dashboard",
+    "pagination",
+    "indexing",
+    "cache",
+    "slo",
+    "analytics-pipeline"
+  ],
+  "parent_issue": [
+    "ENG-73421"
+  ],
+  "dependencies": [
+    "ENG-62188",
+    "ENG-34912"
+  ],
+  "customer_impact": "high",
+  "release": "console-2026.03",
+  "security_review_required": "false",
+  "description": "Problem: Some dashboard query patterns (long time-window aggregations with multi-page result sets) are experiencing high p99 tail latency and read amplification under load. Observed behavior: intermittent p99 spikes to 3\u20135s for paginated list endpoints when underlying index shard compactions, GC, or tenant rebalances occur. This disproportionately affects customers with wide time windows and many matching rows causing repeated seeks across hot partitions.\n\nGoal: Reduce p99 for paginated dashboard queries by at least 40% while lowering backend read amplification by ~25%, without changing client API surface. Keep p50 < 200ms, p95 < 600ms, p99 < 1500ms for typical tenant-sized queries.\n\nProposed solution (summary): Implement \"atomic page snapshots\" \u2014 a lightweight read-consistent snapshot created at query start which binds the query to a point-in-time view of materialized per-tenant index checkpoints for the duration of the cursor-based pagination flow. Combine this with \"pagefold index coalescing\": a temporary compaction of contiguous key ranges used only for the snapshot to reduce seeking across small segments. Add a per-tenant hot-page bloom filter + short-TTL LRU cache to avoid re-reading cold pages across sequential pages. To remain API-compatible, issue cursors will be encoded tokens containing (snapshot_id, page_token). Snapshot lifecycle is ephemeral (default TTL 5 minutes).\n\nWhy this is different from previous work: existing efforts focused on cursor stability (segmented cursors) and materialized cursors; this approach trades a small, transient storage and compute cost (creating snapshot checkpoints) for deterministic read patterns and significantly reduced seek amplification. It also allows the system to route read traffic to a snapshot-optimized read path without requiring upfront full materialization of results.\n\nTrade-offs considered:\n- Strict consistency vs performance: snapshot introduces bounded staleness (configurable; default 30s). Chosen to prioritize latency while keeping staleness acceptable for most dashboards.\n- Storage overhead: snapshots require temporary metadata (checkpoint pointers) and optional compacted segment copies. We limit scope to index metadata + short-lived coalesced segments to keep disk overhead minimal.\n- Complexity: introduces snapshot lifecycle management and GC; requires careful failure handling so cursors produced before snapshot creation fallback gracefully.\n\nNon-goals: full transaction-level consistency across unrelated writes; cross-tenant snapshotting; replacing long-running offline materializations for very large analytic exports.\n\nSuccess criteria:\n- p99 for paginated dashboard queries reduced 40% on synthetic and production-shadow workloads.\n- Backend read IOPS reduced by >=25% for target tenants.\n- No increase in 5xx errors; error rate change < 0.1%.\n\n",
+  "acceptance_criteria": [
+    "API compatibility: existing cursor-based pagination works with new snapshot tokens (test clients exercise both new and old cursors).",
+    "Performance: p50 < 200ms, p95 < 600ms, p99 < 1500ms on benchmark harness for representative tenant workloads.",
+    "Resource: average read IOPS reduction >=25% on shadowed 24h run.",
+    "Operational: snapshot GC runs and reclaims >99% of ephemeral state within TTL without manual intervention.",
+    "Fallback: if snapshot creation fails, API gracefully falls back to stable cursor mode and logs telemetry for investigation."
+  ],
+  "implementation_plan": [
+    "Design RFC: define snapshot token format, snapshot metadata schema, compaction heuristics (PRD: https://confluence.redwood.ai/console/snapshots-rfc).",
+    "Index layer: add transient checkpoint writer that records segment boundaries and hot-page hints at query start.",
+    "Coalescing worker: implement short-lived compactor that merges small adjacent segments for the snapshot read path (configurable thresholds).",
+    "Caching: add per-tenant bloom filter + LRU hot-page cache with TTL tuned from load tests.",
+    "API compatibility: encode snapshot id into existing cursor token (backwards compatible decoder).",
+    "GC & lifecycle: implement snapshot TTL, reference counting, and background GC; expose snapshot metrics and debug endpoint.",
+    "Testing: unit tests, integration tests (local), and large-scale benchmark (k6 + internal harness), shadowing against production for 48 hours before rollout).",
+    "Migration: no schema migration required for primary store; add lightweight metadata table for snapshot pointers (sharded by tenant id).",
+    "Documentation: update Console docs and SDK notes about stable cursors and snapshot behavior."
+  ],
+  "rollout_plan": [
+    "Phase 0 (canary): internal-only rollout to us-east-1 for low-traffic tenants; enable snapshotting behind feature flag. Monitor dashboards for errors and latency (72h).",
+    "Phase 1 (shadow): enable snapshot path in shadow for 48h across representative tenants; collect p50/p95/p99 and read IOPS. Stop if error rate >0.2% or latency regressions occur.",
+    "Phase 2 (gradual enable): enable for 5% of production reads (traffic-sampled by tenant); ramp to 50% over 7 days if metrics meet thresholds.",
+    "Phase 3 (full): enable by default with ability to opt-out per-tenant for sensitive use-cases."
+  ],
+  "monitoring_and_alerts": [
+    "New metrics: snapshot_create_latency_ms, snapshot_success_rate, snapshot_gc_count, snapshot_active_count.",
+    "Read path metrics: snapshot_read_seeks_per_query, snapshot_cache_hit_rate, backend_read_iops_by_tenant.",
+    "Alerts: p99_paginated_queries > 1500ms for 10m -> P1 alert; snapshot_success_rate < 98% -> P2.",
+    "Dashboards: add per-tenant heatmap for read amplification and snapshot effectiveness."
+  ],
+  "notes": [
+    "Implementation should avoid blocking hot write paths; snapshot creation will be opportunistic and rate-limited.",
+    "We should reuse existing compaction primitives where possible; coalescing worker only operates on in-memory segment descriptors for speed.",
+    "Consider future work: pre-warming snapshots for scheduled long-running reports and integrating with Optimize cost suggestions.",
+    "Discussed with Platform infra: snapshot metadata table will be sharded on tenant_id and use TTL indexing for GC.",
+    "PM asks for an opt-out flag at tenant config level for customers that require zero staleness."
+  ],
+  "comments": [
+    "2026-02-10 Asha Patel: Triage notes \u2014 reproducer harness attached. Reproduced p99 spikes in us-east-1 after compaction events. Filed initial benchmark. (see link below).",
+    "2026-02-18 Ethan Brooks: Spiked a prototype for snapshot token format; verified token encoding works with existing cursor decoder. Prototype PR: https://github.com/redwood-inference/console/pull/1129",
+    "2026-02-25 Sofia Nguyen (PM): Reviewed trade-offs and agreed to bounded staleness default 30s. PM requests telemetry to show staleness vs latency trade-off in rollout.",
+    "2026-03-01 Marco Diaz (Backend): Implemented basic coalescing worker; local perf tests show 30% fewer seeks for target workloads. Link to bench results: https://bench.redwood.ai/results/ENG-95812/2026-03-01",
+    "2026-03-06 Security review (internal): Confirmed snapshot metadata does not include customer PII; no KMS changes required. Security note: ensure snapshot debug endpoint is RBAC-protected.",
+    "2026-03-09 QA: Ran 24h shadow run against a representative tenant set. p99 improved by 38% on average; however, 3 tenants saw increased write latencies due to GC contention \u2014 tuning GC window in progress.",
+    "2026-03-12 Ethan Brooks: Addressed GC contention by staggered GC and lowering compaction concurrency; updated rollout plan to include a GC sandbox phase. New PR for GC: https://github.com/redwood-inference/console/pull/1187",
+    "2026-03-13 Asha Patel: Moving to In Progress \u2014 target for code complete by 2026-03-18. Added additional logs for snapshot allocation failures."
+  ],
+  "links": [
+    "RFC (design): https://confluence.redwood.ai/console/snapshots-rfc",
+    "Prototype PR: https://github.com/redwood-inference/console/pull/1129",
+    "GC PR: https://github.com/redwood-inference/console/pull/1187",
+    "Benchmark dashboard: https://grafana.redwood.ai/d/bench/eng-95812-snapshot-bench",
+    "Shadow run results: https://bench.redwood.ai/eng-95812/shadow-2026-03-09",
+    "Related internal issue: ENG-73421 (probabilistic shard sampling microindex summary)",
+    "Related infra work: ENG-62188 (unified-time-window-index)"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "implementation_plan",
+    "rollout_plan",
+    "monitoring_and_alerts",
+    "notes",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_7df903a96222486fba9e2517d3a091f4"
+}

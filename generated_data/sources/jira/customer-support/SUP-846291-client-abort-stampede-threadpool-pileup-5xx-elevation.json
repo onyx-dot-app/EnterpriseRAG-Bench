@@ -1,0 +1,90 @@
+{
+  "key": "SUP-846291",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Client-abort storm causes runtime cleanup pile-up \u2192 threadpool saturation and API 5xx elevation",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Patel",
+  "assignee": "Diego Morales",
+  "customer_company": "BrightForms Inc.",
+  "customer_tier": "dedicated",
+  "environment": "prod | us-east",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "threadpool",
+    "streaming"
+  ],
+  "labels": [
+    "5xx",
+    "investigation",
+    "priority-shed"
+  ],
+  "affected_models": [
+    "redwood-gpt-medium-v1"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "related_incident_id": "INC-2026-0310-01",
+  "linked_issues": [
+    "SUP-312579",
+    "SUP-472901"
+  ],
+  "related_github_prs": [
+    "github.com/redwood/realtime-runtime/pull/412",
+    "github.com/redwood/api-gateway/pull/88"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwoodinc/KB/client-abort-cleanup-playbook"
+  ],
+  "description": "Issue summary:\nWe observed a sustained elevation in 5xx responses at the API gateway beginning ~2026-03-10 09:40 UTC for an affected dedicated tenant (BrightForms Inc.). Errors correlate with a large number of client-side stream cancellations/aborts (long-polling webhook flows).\n\nImpact:\n- ~12% 5xx error rate on tenant's streaming route over a 35m window, impacting live inference features for BrightForms (multiple customers report failures).\n- Latency tail increased (p95\u2192p99) and token throughput reduced for the tenant's dedicated pool.\n\nTimeline (high level):\n- 2026-03-10 09:30 UTC: Traffic spike starts from BrightForms long-poll clients (sustained connection churn and frequent client-initiated ABORTs).\n- 09:40 UTC: API gateway begins returning 502/503s for streaming routes.\n- 09:45 UTC: Alert fired (5xx rate > threshold).\n- 09:50\u201310:10 UTC: Support engaged, routed to SRE and runtime team.\n\nEnvironment:\n- Prod, us-east dedicated pool for BrightForms.\n- Serving runtime: release 1.18.2 (event-loop + blocking threadpool for model IO).\n- API gateway: envoy proxy mesh with HTTP/2 streaming.\n\nSteps to reproduce (observed pattern):\n1) Client establishes long-lived HTTP/2 streaming session and issues prompt.\n2) Client rapidly sends aborts/finishes (CANCEL frames) in tight loops (multiple concurrent sockets per client).\n3) Runtime receives cancellations and schedules cleanup tasks that perform KV-cache unlocks, GIL-adjacent teardown, and metrics flushes on a shared blocking threadpool.\n4) Threadpool becomes saturated; new request handoff to blocking workers is queued and stalls the runtime event loop, causing request timeouts and upstream 5xx to API gateway.\n\nObserved behavior:\n- High number of CANCEL frames recorded per second for the tenant.\n- Worker thread pool depth near capacity; queue length grows.\n- Runtime logs show extended cleanup task durations (10\u201320s) under the abort pattern.\n- API gateway surfaces 502/503 to callers when upstream runtimes are slow or unresponsive.\n\nExpected behavior:\n- Graceful and fast cancellation handling without blocking the main request path; cancellations should be processed with bounded CPU and not occupy blocking threads for long periods.\n\nAdditional notes:\n- This looks distinct from prior NVMe/gpu OOM/customer-prefetch issues; root cause appears tied to cancellation handling and cleanup semantics under high abort frequency.\n",
+  "logs": [
+    "[2026-03-10T09:41:12Z] envoy: upstream reset before response (client: 10.240.3.18, path: /v1/stream)",
+    "[2026-03-10T09:41:13Z] runtime[tid=1402]: received CANCEL frame for session=bf-usr-224, scheduling cleanup on blocking-pool (task id=67341)",
+    "[2026-03-10T09:41:14Z] blocking-pool: task 67341 started (kv-unlock, metric-flush); estimated duration 14.3s",
+    "[2026-03-10T09:41:26Z] runtime[warning]: blocking-pool queue length=98, active=32, max=32",
+    "[2026-03-10T09:42:00Z] api-gateway: returning 502 upstream_timeout for tenant=brightforms route=/v1/stream"
+  ],
+  "comments": [
+    "Support (Aisha Patel) 2026-03-10 09:48 UTC: Customer reports intermittent failures on live preview \u2014 errors start coinciding with a client rollout at 09:30. Asking for traffic window and sample client user-agent headers.",
+    "Customer (BrightForms) 2026-03-10 09:51 UTC: Sending logs and client patterns \u2014 new mobile SDK pushes a reconnect loop that cancels previous requests aggressively. Will provide SDK version and repro rate.",
+    "SRE (Diego Morales) 2026-03-10 10:01 UTC: Observed threadpool saturation for tenant. Hypothesis: cancellation handler performs heavy synchronous work on blocking threadpool. Recommending immediate mitigation: enable temporary rate-limit on concurrent streaming sessions for tenant and increase threadpool size to relieve backlog.",
+    "Runtime Eng (Maya Chen) 2026-03-10 10:12 UTC: Confirmed cleanup tasks include disk-backed metric flush and KV unlock which are blocking. Propose patch to offload metric flush to async queue and convert KV unlock to lock-free path. Will open a PR for safe rollout.",
+    "SRE (Diego Morales) 2026-03-11 03:00 UTC: Mitigation applied: tenant concurrent streaming cap reduced to 60 connections; threadpool temporary scaled +50%. 5xx rate reduced to baseline within 20 minutes."
+  ],
+  "investigation_notes": [
+    "Correlation observed between client abort rate and blocking-pool queue length (Pearson r=0.82 over 30m window).",
+    "Heap and GPU stats show no memory fragmentation or driver resets; NVIDIA metrics within normal bounds for pool. Not a GPU OOM issue.",
+    "Tracing shows synchronous calls in cancellation path that touch disk (metric flush) and lock global kv-shard. These operations previously assumed low-frequency cancel events.",
+    "Prioritized repro harness created using a simulated SDK abort loop (100 clients, each issuing cancel 2\u20135s after request start). Reproduces blocking-pool queueing and upstream 502s within ~3 minutes.",
+    "Lock profiling indicates kv-shard lock hold time spikes to 12\u201318ms in the cancel path, multiplied by cancel rate causing pile-up."
+  ],
+  "workaround": "Applied per-tenant concurrent streaming cap (60) and increased blocking threadpool capacity temporarily. Recommended customer to roll back mobile SDK aggressive reconnect until runtime patch is deployed.",
+  "resolution_plan": "Short-term: merge PR to make metric flush asynchronous and relax KV lock scope (github.com/redwood/realtime-runtime/pull/412). Patch scheduled for canary 2026-03-12 02:00 UTC. Long-term: implement cancellable cleanup tokenization to bound work per cancellation and add server-side abort-rate circuit that sheds excessive aborting clients.",
+  "resolution_notes": "Canary rollout started 2026-03-12 02:15 UTC; monitored tenant had 5xx drop from 12% \u2192 1.8% within 10 minutes. No regressions observed in other tenants during canary. Full rollout planned 2026-03-12 08:00 UTC after 4h successful canary.",
+  "follow_up_tasks": [
+    "ENG-1692: implement cancellation backpressure circuit (owner: Maya Chen)",
+    "OPS-881: add exporter metric for cancel-frame-rate per-tenant and alert on sustained >100 cancel/s (owner: Diego Morales)",
+    "DOCS-43: guidance for customers on safe reconnect/abort patterns in mobile SDK (owner: Developer Experience)",
+    "SEC-22: review that async metric flush does not expose PII in transit (owner: Security)",
+    "SRE-504: evaluate default threadpool sizing heuristic for dedicated pools under high abort-rate workloads"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "workaround",
+    "resolution_plan",
+    "resolution_notes",
+    "follow_up_tasks"
+  ],
+  "dataset_doc_uuid": "dsid_9b30607c13034e94b92c078e219636eb"
+}

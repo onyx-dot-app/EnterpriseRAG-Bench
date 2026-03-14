@@ -1,0 +1,106 @@
+{
+  "key": "ENG-878441",
+  "team": "engineering",
+  "title": "Prefill -> Decode kernel migration exposes non-atomic attention-state snapshot causing stale embedding reads",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-15",
+  "updated_at": "2026-03-13",
+  "creator": "Aisha Patel",
+  "assignee": "Jonah Kim",
+  "project": "runtime-integrity",
+  "cycle": "Cycle 52",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "kernel-selection",
+    "prefill-decode",
+    "kv-cache",
+    "numerical-drift",
+    "race-condition",
+    "high-priority"
+  ],
+  "release": "runtime-1.23",
+  "customer_impact": "high",
+  "description": "After introducing opportunistic kernel migration to a faster fused-attention implementation, we observed sporadic token duplication and small probability numerical drift in logits for long-context prefill flows. This ticket captures the investigation and remediation plan for a correctness issue where attention state snapshots become inconsistent across a kernel switch during in-flight prefill->decode transitions.",
+  "symptoms": [
+    "Intermittent duplicated tokens in outputs for multi-chunk prefill scenarios (1 in ~50k requests in canary)",
+    "Small but reproducible L2-norm drift in final logits compared to baseline for identical inputs when kernel migration triggers mid-prefill",
+    "Mismatch in KV slot epoch tags observed in debug traces after a kernel handoff",
+    "Increased tail latency for affected requests due to downstream retry logic in some callers"
+  ],
+  "steps_to_reproduce": [
+    "Deploy runtime-1.23 with kernel-migration enabled (opportunistic_fused_attn=true)",
+    "Run a prefill of ~2048 tokens split into 8 chunks with concurrent decode enabled (batching factor 4)",
+    "Force kernel migration by enabling 'candidate_score_boost' and reduce cooldown so handoff is likely during chunk boundary",
+    "Capture debug KV traces (KV_EPOCH and KV_SLOT checksums) and full logits for each token position",
+    "Compare outputs to a baseline run without kernel migration and note any token duplication or per-step logit divergence"
+  ],
+  "logs": [
+    "2026-02-20T12:03:14Z WARN kernel_migrator: handoff initiated for shard-3 while prefill chunk 5 inflight",
+    "2026-02-20T12:03:14Z DEBUG kv_manager: swap_kv_ptrs(shard=3) started seq=1258",
+    "2026-02-20T12:03:14Z DEBUG kernel_fused_attn: read_kv_slot(slot=42, epoch=17, checksum=0x7a5c)",
+    "2026-02-20T12:03:14Z ERROR decoder: token_duplication detected at output_pos=631 request_id=rx-94b2",
+    "2026-02-20T12:03:14Z DEBUG kv_manager: post_swap_validate(slot=42) expected_epoch=18 observed_epoch=17"
+  ],
+  "investigation_summary": "Initial triage shows the migrator performs a host-side swap of the shard's KV base pointer and immediately schedules the new kernel without ensuring all in-flight decoders have observed a consistent snapshot. On some GPUs this exposes a memory ordering gap: the kernel reads a KV slot before the host pointer update is fully visible or before the migrating kernel has completed zeroing/initialization of new cache metadata. The result is a stale epoch read followed by writes that produce token duplication and slight logit drift. Reproduced locally with debug builds and a synthetic harness that interleaves prefill chunk boundaries with an explicit 'migrate' signal.",
+  "root_cause": "Non-atomic handoff path in the kernel migrator: host-side pointer swap + immediate kernel launch lacks a strict synchronization/fence guaranteeing visibility of initialized KV metadata to the newly launched kernel. Additionally, the KV metadata lacked a monotonically-incrementing slot epoch tag that would let kernels detect stale reads and self-heal.",
+  "proposed_mitigation": [
+    "Short-term: add a conservative quiesce step where the migrator waits for in-flight prefill decoders to reach a safe boundary before switching pointers (configurable via 'migrator_quiesce_ms', default 2ms)",
+    "Medium-term: make the pointer swap atomic from the kernel's perspective by using CUDA atomic compare-and-swap on a single migration descriptor and issuing CUDAStream.synchronize or cudaDeviceFlushGPUDirect (platform-specific) to enforce visibility",
+    "Long-term: embed per-slot monotonically-incrementing epoch tags and checksum validation; new kernels must verify slot epoch >= expected and fall back to reinitialization on mismatch",
+    "Add a runtime flag 'disable_optimistic_migration' for controlled rollbacks in canary"
+  ],
+  "mitigation_risks": "Quiesce increases latency slightly for migration cases and could reduce throughput under heavy churn. Atomic CUDA operations add overhead for each migration but are rare; epoch tags increase KV metadata size by 8 bytes per slot.",
+  "tests_added": [
+    "Microbenchmark harness that fuzzes migration timing against prefill chunk boundaries and asserts no token duplication across 1M synthetic traces",
+    "Unit test for kv_manager that simulates concurrent read/write with epoch tags and verifies detection and recovery paths",
+    "Integration canary that enables migration on 1% of traffic with enhanced logging and automatic rollback on error rate > 0.1%"
+  ],
+  "acceptance_criteria": [
+    "No token duplication observed under the microbenchmark across 1M runs",
+    "Canary traffic (1%) shows error rate <= baseline + 0.05% for 72h",
+    "KV post-swap validation logs no epoch mismatches in production canary",
+    "Performance regression < 0.5% p50 and < 2% p99 compared to pre-change baseline when migration is idle"
+  ],
+  "next_steps": [
+    "ENG: implement epoch tags + validation in kv_manager (Jonah)",
+    "ENG: add atomic migration descriptor + platform-specific visibility fence (Gideon)",
+    "QA: build microbenchmark harness and run 1M fuzzed migrations (Marta)",
+    "PM: schedule canary rollout with monitoring and rollback playbook (Ravi)",
+    "Docs: update runbooks to describe migration flags and safe configurations (Aisha)"
+  ],
+  "links": [
+    "https://github.com/redwood-inference/runtime/pull/4892 (WIP: kv-epoch-and-migration-descriptor)",
+    "https://console.redwood.ai/dashboards/request-duplication?range=72h (internal canary dashboard)",
+    "https://docs.redwood.ai/runbooks/kernel-migration.md",
+    "https://drive.redwood.ai/attention-migration/investigation-2026-02-20.pdf"
+  ],
+  "dependencies": [
+    "ENG-878112",
+    "ENG-872900"
+  ],
+  "comments": [
+    "2026-02-16 Jonah Kim: Reproduced locally with debug logging. Confirmed epoch mismatch pattern. Planning to add epoch tags first to detect stale reads.",
+    "2026-02-22 Marta Rodriguez: Microbenchmark harness prototype ready. Observed duplication rate ~1 in 40k without quiesce; drops to zero after inserting 3ms quiesce in harness.",
+    "2026-03-01 Gideon Lee: Prototype of atomic migration descriptor implemented. Need to measure perf impact on non-migrating workloads.",
+    "2026-03-12 Ravi Singh (PM): Canary scheduled for 2026-03-15 on low-latency region us-west-2 at 1% traffic. Rollback criteria defined.",
+    "2026-03-13 Aisha Patel: Updated ticket with acceptance criteria and added runtime flag for quick rollback. Assigning follow-ups."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "symptoms",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_summary",
+    "root_cause",
+    "proposed_mitigation",
+    "mitigation_risks",
+    "tests_added",
+    "acceptance_criteria",
+    "next_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_8e2debd7bbff4df082485db641368032"
+}

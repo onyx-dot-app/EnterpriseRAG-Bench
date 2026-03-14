@@ -1,0 +1,49 @@
+{
+  "key": "ENG-512919",
+  "team": "engineering",
+  "title": "Casefolding normalization mismatch causes per-route metering bypass for mixed-casing client route aliases",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-08",
+  "updated_at": "2026-03-13",
+  "creator": "Avery Chen",
+  "assignee": "Jordan Patel",
+  "project": "metering-integrity",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-22",
+  "labels": [
+    "billing",
+    "metering",
+    "rate-limiter",
+    "investigation",
+    "unicode"
+  ],
+  "dependencies": [
+    "ENG-246579",
+    "ENG-33384"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.19",
+  "security_review_required": "false",
+  "description": "Summary:\nWe observed per-route quota bypasses for certain customers where traffic was being accounted under multiple distinct aggregation keys even though the logical route alias (what customers think of as the same route) was identical except for casing and Unicode normalization differences. This causes effective per-route quotas to be larger than intended and leads to billing/usage discrepancies and potential SLO violation for throttling behavior.\n\nObserved behavior / symptoms:\n- Customer reported that a single route was able to exceed its configured per-route QPS burst window without hitting throttles.\n- Traces show requests routed to the same backend model but attributed to two different meter keys by the aggregator (hashes differ by explicit route alias key).\n- On inspection, the route alias values differ only by casing (e.g., \"/GenerateText/UserFlow\" vs \"/generatetext/userflow\") and a handful of non-ASCII normalization variants (e.g., composed vs decomposed forms).\n- Affected customers are primarily using client libraries that canonicalize route aliases in the client or pass human-entered metadata with inconsistent normalization.\n\nRepro steps (minimal):\n1) Send request A with header: X-Route-Alias: /GenerateText/UserFlow (NFC form)\n   curl -H \"X-Route-Alias: /GenerateText/UserFlow\" -H \"Authorization: Bearer $TOKEN\" https://api.redwood.ai/generate\n2) Send request B with header: X-Route-Alias: /generatetext/userflow (lowercased, may be NFD form if client uses different unicode normalization)\n3) Observe metrics: two separate meter keys created by the edge -> aggregator pipeline, both consuming from the same per-route quota pool in policy configuration but counted separately.\n4) Confirm by looking at aggregator logs: meter_key_hash=0xabc123 key_string=\"/GenerateText/UserFlow\" vs meter_key_hash=0xdef456 key_string=\"/generatetext/userflow\"\n\nRoot cause hypothesis:\n- The ingress path and early fastpath normalizers perform different transformations depending on request path: the edge (fast path) currently lowercases ASCII bytes only and does not apply Unicode casefold or normalization. The aggregator service performs a different normalization which applied Unicode NFC in some code paths and not in others. As a result, the canonicalization of route alias used for meter key generation is inconsistent across the hop boundaries.\n- Additionally, legacy route alias canonicalization in the policy engine used simple string lowercase using ASCII operations which does not correctly unify non-ASCII inputs.\n\nImpact:\n- Per-route quotas are effectively split across multiple meter keys for the same logical route, allowing quota bypass and inconsistent throttling behavior for affected customers.\n- Billing/usage aggregation reports show duplicated entries leading to over/under-reporting depending on downstream aggregation.\n- Potential for abuse if clients purposely vary Unicode case to obtain extra capacity.\n\nEvidence / logs (examples sanitized):\n- aggregator-01 logs: \"meter_key=\\\"/GenerateText/UserFlow\\\" hash=0x7f2a3b count=1234 source=edge-A\"\n- aggregator-02 logs: \"meter_key=\\\"/generatetext/userflow\\\" hash=0x1c9d5f count=1100 source=edge-B\"\n- Trace sample: both requests route to the same backend shard id=33 and model=redwood/text-neo-1 but have different meter keys.\n\nShort-term mitigation options:\n- Deploy a config change to the ingress fastpath to reject route aliases containing non-ASCII characters or mixed-casing in orgs that have strict quotas (quick but user-impacting).\n- Add a transparent middleware (edge) that performs aggressive canonicalization (Unicode casefold + NFC normalization + trim) before meter key generation; deploy as a canary for orgs with incidents.\n- Temporarily enforce single canonicalization at the aggregator side by folding incoming keys into a canonical bucket during aggregation (best-effort dedupe) while a longer-term fix is rolled out. This may lose true historical fidelity but reduces bypass risk.\n\nProposed long-term fix (design):\n1) Define a single canonicalization spec for route alias and meter keys: apply Unicode casefold (UAX #21 case folding), normalize to NFC, collapse repeated whitespace, and enforce a max codepoint length. Document this in the platform spec.\n2) Implement canonicalizer as a small deterministic library used by all components that generate/compare meter keys (edge fastpath, policy-eval, aggregator, billing pipeline). Publish in internal pkg/strings/canonicalizer and bump all services to use it.\n3) Add idempotent migration handling in aggregator: when a key is observed that canonicalizes to an existing bucket, merge counts in the aggregator hot-path and emit a metric for migrated events for auditing.\n4) Add unit and fuzz tests for ASCII, Latin-1 extended, and composed/decomposed Unicode forms, plus clients that mix-case intentionally.\n5) Update SDKs and client docs to advise best practices, and surface a linter in SDKs that warns about non-canonical aliases.\n\nRollout plan:\n- Phase 1 (canary): Deploy canonicalizer library to ingress edge with a traffic-fraction flag for 5% of requests and non-blocking logging (emit canonical_key tag). Monitor collision_count, canonicalization_delta metric, and errors for 48h.\n- Phase 2 (aggregate dedupe): Deploy aggregator best-effort merge for keys observed to canonicalize to the same bucket. Emit audit logs for merged events. Roll for 72h.\n- Phase 3 (enforce): After 1 week of stable telemetry (drop in duplicate keys), flip config to canonicalize everywhere and stop accepting non-normalized keys for quota decisions.\n- Phase 4 (cleanup): Backfill historical reports by collapsing old keys in billing pipelines for affected orgs if requested; keep a retention mapping for 30 days to allow reconciliation.\n\nTests & validation:\n- Unit tests for canonicalizer across representative languages and edge cases (Turkish dotted/dotless I, Greek sigma, composed/decomposed accents).\n- Integration test injecting pairs of differently-normalized headers; assert single meter key emitted.\n- Load test to ensure canonicalizer CPU cost is acceptable on path.\n- Backwards compat test: ensure existing aggregator hashes still map and merging does not create double-counting during the migration window.\n\nStakeholders / CC:\n- Billing: Priya Rao (for billing reconciliation)\n- SRE: Miguel Alvarez (monitoring/rollout)\n- SDK: Lina Park (client guidance and SDK lint)\n- Product: Sara Nguyen (customer communication)\n\nAcceptance criteria:\n- All requests canonicalize to a single meter key per logical route for >99.99% of traffic after phase 3 ramp.\n- No increase in 5xxs attributable to canonicalizer CPU overhead under p99 load for ingress (monitor latency).\n- Billing reports for impacted orgs reconciled to within 0.1% after backfill if requested.\n\nOpen questions / risks:\n- Do we include character folding for visually similar characters from different scripts? (Security/abuse risk vs. correctness tradeoff.)\n- Migration may temporarily alter per-route billing numbers; need coordinated comm with customers.\n- Extra CPU per-request; might require micro-optimizations (precompiled table for ASCII fast path).\n\nNext steps (today):\n- [Avery] implement canonicalizer prototype + unit tests (ETA 2 days).\n- [Jordan] add aggregator best-effort merge hook (ETA 3 days).\n- Schedule canary with SRE and configure dashboards (Miguel).\n",
+  "comments": [
+    "2026-03-09 Avery Chen: Initial investigation complete; confirmed keys differ only by case and Unicode normalization. Added sample logs and repro steps.",
+    "2026-03-10 Jordan Patel: Implemented a local prototype canonicalizer (ASCII fast path + fallback to ICU casefold+NFC). Observed ~1.8% CPU uplift in microbench; acceptable for canary. Pushed branch: github.com/redwood/ingress/pull/1142",
+    "2026-03-11 Miguel Alvarez: Prepared canary config on edge cluster eu-west-1; will start at 2% traffic tomorrow morning. Added dashboard panels for collision_count and canonicalization_latency.",
+    "2026-03-12 Priya Rao: Billing team flagged 3 customers with repro-traffic; will coordinate reconciliation if backfill is needed. Marking high customer_impact.",
+    "2026-03-13 Jordan Patel: Aggregator merge hook PR opened: github.com/redwood/aggregator/pull/899 (tests included). Ready for review."
+  ],
+  "links": [
+    "https://github.com/redwood/ingress/pull/1142",
+    "https://github.com/redwood/aggregator/pull/899",
+    "https://confluence.redwood.ai/display/METER/Route+alias+canonicalization+spec",
+    "https://grafana.redwood.ai/d/abc123/metering-integrity?orgId=1"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_cabe65ec71b84d5aafab0c2522005e3e"
+}

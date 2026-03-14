@@ -1,0 +1,95 @@
+{
+  "key": "SUP-765431",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Asynchronous webhook ACK race causes duplicated chained function/tool executions on retry",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Khan",
+  "assignee": "Ben Cho",
+  "customer_company": "DocuLend",
+  "customer_tier": "dedicated",
+  "components": [
+    "sdk-python",
+    "sdk-js",
+    "serving-runtime",
+    "webhooks"
+  ],
+  "labels": [
+    "idempotency",
+    "function-calling",
+    "streaming",
+    "webhook",
+    "race-condition"
+  ],
+  "environment": "prod us-east",
+  "affected_models": [
+    "redwood/gptx-3b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-12903"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/platform/pull/4821"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.local/display/SRE/Function+Call+Idempotency+Patterns"
+  ],
+  "description": "Issue summary:\nCustomer (DocuLend, dedicated) reports duplicate downstream side-effects when using chained function/tool-calls with asynchronous webhook callbacks. The customer uses the Python SDK to request a function call that triggers their webhook; the webhook returns a 202 Accepted (async processing). When the client or SDK retried due to a streaming disconnect, the same function call was executed twice by the customer backend.\n\nImpact:\n- Duplicate downstream jobs (billing and document-signing) processed twice for several high-value requests; customer reported financial and user-experience impact.\n- Occurred intermittently under moderate load during a spike; reproducible on demand in our environment.\n\nEnvironment:\n- Redwood Hosted API, prod us-east region, customer on Dedicated pool.\n- SDKs used: python-redwood 2.3.1 and js-redwood 1.8.0 in different integrations.\n- Models: redwood/gptx-3b \n\nSteps to reproduce (minimal):\n1) Customer config: chained function flow where model triggers a function call: {\"name\": \"start_job\", \"arguments\": {...}}.\n2) Their webhook handler immediately responds 202 Accepted and processes the job asynchronously (job created, queued, processed later).\n3) Client opens a streaming generation connection (Python streaming chunking) and receives a partial response. Mid-stream the connection is closed (network blip).\n4) Client SDK retries the request using automatic retry policy (idempotency not explicitly provided by customer).\n5) The model (or the server-side function router) issues the function call again; webhook receives a second invocation and creates a second job.\n\nExpected behavior:\n- Retries should not cause duplicate downstream side effects when the webhook accepted the callback and returned 202. Either: (a) SDK should surface a clear way to attach a per-action idempotency token to the function call; or (b) the serving/runtime should not re-emit an already-acknowledged function call when an acknowledgement was already proxied upstream.\n\nActual behavior:\n- The function call is sent twice during a retry scenario; DocuLend sees two queued jobs.\n\nLogs / example traces (customer-provided):\n- Customer webhook trace: \n  POST /callbacks/start_job 202 \n  X-Req-Id: dl-req-1142\n  payload.job_id: job-20260308-88\n\n  POST /callbacks/start_job 202 \n  X-Req-Id: dl-req-1143\n  payload.job_id: job-20260308-89\n\n- From SDK side: python client shows reconnect and retry logs: \n  INFO: redwood.sdk.stream: connection closed by server, attempting retry (attempt 1)\n  INFO: redwood.sdk.request: retrying request without idempotency key\n\nAttachments: sample recording and http traces provided by customer (S3 link), anonymized request/response dump included.",
+  "steps_to_reproduce": [
+    "Configure chained function call that posts to an async webhook returning 202",
+    "Open a streaming completion request from Python SDK and induce a mid-stream disconnect",
+    "Allow SDK to retry automatically (no manual idempotency header set)",
+    "Observe duplicate POSTs to customer's webhook and two downstream job entries"
+  ],
+  "observed_logs": [
+    "POST /callbacks/start_job 202 X-Req-Id: dl-req-1142 payload.job_id: job-20260308-88",
+    "POST /callbacks/start_job 202 X-Req-Id: dl-req-1143 payload.job_id: job-20260308-89",
+    "INFO: redwood.sdk.stream: connection closed by server, attempting retry (attempt 1)",
+    "INFO: redwood.sdk.request: retrying request without idempotency key"
+  ],
+  "comments": [
+    "Customer Support (Aisha): Thank you for the details \u2014 we can reproduce this in our staging cluster; assigning to Eng/SRE for deeper investigation.",
+    "SRE (Ben): Initial hypothesis: SDK retry logic replays the function call because we only consider final success when function execution completes. If callback returns 202 (accepted), we treat that as success upstream but the streaming retry path may re-emit before the ACK is fully recorded in our request-state store.",
+    "Customer (DocuLend Engineer): We rely on 202 because jobs are enqueued for long-running processing. Our webhook cannot synchronously confirm completion. How should we deduplicate from our side?",
+    "Support (Aisha): Short-term workaround: include a client-generated idempotency token in function_call arguments yourself (e.g., job_client_id) and dedupe on webhook side. We'll follow up with engineering on server-side guards.",
+    "Eng (Ben): Creating follow-ups to evaluate persisting function-call ACKs earlier in the pipeline and to add a recommended SDK helper for attaching a per-function idempotency header. See linked PR that prototypes an option: https://github.com/redwood-inference/platform/pull/4821"
+  ],
+  "investigation_notes": [
+    "Reproduced in prod-like dedicated pool with synthetic load (test customer account).",
+    "Tracing shows two distinct server-side function-call events emitted with two different internal event ids; both were delivered to webhook because webhook ACK was 202 and we did not mark the call as 'durably recorded' until later in the pipeline.",
+    "Root cause hypothesis: race between streaming connection retry path and durable write of function-call metadata to the event-store. When reconnect/retry occurs before durable write completes, the request is replayed and results in a duplicate downstream invocation.",
+    "Confirmed that using an explicit idempotency key in the function_call arguments prevents duplicate jobs in our reproduction environment (customer-side dedupe)."
+  ],
+  "resolution": "Workarounds and fixes:\n1) Customer workaround (immediate): Add a stable client-generated idempotency token in the function call payload (e.g., job_client_id) and perform deduping in your webhook using that token. Ensure your webhook returns 200 for an already-seen token and 202 for a newly enqueued job to avoid semantic confusion.\n2) SDK guidance (short-term): Document recommended pattern for per-action idempotency (examples for Python/TS/Go) in docs.\n3) Platform fix (mid-term): Engineering to change function-call pipeline to mark an invocation as 'acknowledged' earlier (persist pre-delivery id) or to respect a function-call idempotency header when present. A patch PR is in review: https://github.com/redwood-inference/platform/pull/4821.\n4) Long-term: Add SDK-level option to attach auto-generated per-action idempotency keys and propagate them to webhooks and audit logs so downstreams can dedupe reliably.\n\nFollow-ups:\n- ENG-OPS task created to harden durable-write ordering and add a test covering async webhook 202 scenarios.\n- Notify customer onboarding/solutions team once SDK helper is released so they can update DocuLend integration.",
+  "postmortem_links": [
+    "https://confluence.redwood.local/display/PM/POSTMORTEM+SUP-765431"
+  ],
+  "resolution_status": "Mitigations provided to customer; engineering fix in progress, scheduled for next release window.",
+  "notes_for_cs": "Recommend customer implement client-side job_client_id idempotency token in short term. CS to follow up after platform patch is released. Provide sample code snippets for Python/TS/Go demonstrating pattern.",
+  "sample_snippets": [
+    "Python:\nfrom redwood import Client\nclient = Client()\nresp = client.generate(\n  model=\"redwood/gptx-3b\",\n  function_call={\"name\": \"start_job\", \"arguments\": {\"text\": \"...\", \"job_client_id\": \"dl-12345\"}}\n)",
+    "TypeScript:\nimport { Redwood } from 'redwood';\nconst client = new Redwood();\nclient.generate({\n  model: 'redwood/gptx-3b',\n  function_call: { name: 'start_job', arguments: { text: '...', job_client_id: 'dl-12345' } }\n});",
+    "Go:\nclient := redwood.NewClient(nil)\nresp, _ := client.Generate(redwood.GenerateParams{\n  Model: \"redwood/gptx-3b\",\n  FunctionCall: map[string]interface{}{\"name\": \"start_job\", \"arguments\": map[string]interface{}{\"text\": \"...\", \"job_client_id\": \"dl-12345\"}},\n})"
+  ],
+  "related_incident_id": "INC-20260310-84",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_logs",
+    "comments",
+    "investigation_notes",
+    "resolution",
+    "notes_for_cs"
+  ],
+  "dataset_doc_uuid": "dsid_ee11f063b1884b2180118439b7752470"
+}

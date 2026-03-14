@@ -1,0 +1,53 @@
+{
+  "key": "ENG-99456",
+  "team": "engineering",
+  "title": "Adaptive trip-score fallback policy for regional & tiered routing",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-01-28",
+  "updated_at": "2026-03-10",
+  "creator": "Asha Patel",
+  "assignee": "Marco Li",
+  "project": "SmartRoutingV2",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "routing",
+    "fallback",
+    "circuit-breaker",
+    "regional",
+    "tier-routing"
+  ],
+  "parent_issue": [
+    "ENG-7421"
+  ],
+  "dependencies": [
+    "ENG-31802",
+    "ENG-87211"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Summary:\nWe need an automated, low-latency fallback trigger that blends multiple operational signals (429s, timeouts, error rates, latency spikes, queue depth) into a single, interpretable \"trip-score\" per route+region+tier. The trip-score will drive three classes of actions: 1) soft fallbacks (route to a model variant or lower-cost tier), 2) regional cutovers (move traffic to alternative region), and 3) hard circuit trips (reject or throttle).\n\nBackground and motivation:\n- Current fallback triggers are siloed (separate thresholds for 429s, timeouts, or p95 latency) and produce noisy flips during transient spikes.\n- Product needs graceful degradation that respects customer SLOs, per-customer routing policies, and avoids cascading overload across regions.\n- We want a single control plane primitive (trip-score) that operators and product can reason about, with tunable weights and hysteresis.\n\nGoals and success metrics:\n- Reduce P95/P99 SLO violations caused by overloaded pools by 30% under surge test.\n- Keep false-positive fallback rate below 2% over a 24h window (false-positive = fallback when downstream capacity would have recovered without action).\n- No more than 5% additional cost from fallback to higher-latency model variants during steady traffic.\n- Provide per-route observability: trip-score timeseries, contributing signal breakdown, and action log.\n\nHigh-level design:\n1) Signals aggregated per (route, model_variant, region, tier) on two windows: short (1m) and medium (5m). Signals: 429_rate, timeout_rate, error_rate (5xx), p95_latency, queue_depth, active_requests.\n2) Normalize each signal to a 0..1 risk band using running baseline percentiles per-region and per-tier. Normalization reduces sensitivity to regional traffic patterns.\n3) Compute trip-score = sum_i (w_i * normalized_signal_i) where weights w_i are configurable per-route and default to {429:0.35, timeout:0.25, error:0.2, p95:0.15, queue:0.05}.\n4) Hysteresis and decay: require trip-score > trip_threshold (default 0.65) on medium window to trigger fallback; require trip-score < recover_threshold (default 0.45) on short window for re-allow. Implement exponential decay cooldown to avoid flip-flopping (cooldown_min=30s, cooldown_max=5m).\n5) Action matrix: depending on route policy and isolation level, map trip_score ranges to actions: 0.65-0.8 => model-variant fallback (quantized or smaller), 0.8-0.95 => regional reroute to same-tier in alternate region, >=0.95 => circuit trip and fail-fast with standardized 503 and troubleshooting guidance.\n6) Per-customer overrides: customers on Dedicated/Private can pin to \"no cross-region fallback\" and instead take only model-variant fallbacks. Enterprise customers can supply custom weight profiles and thresholds.\n\nOperational details and data model:\n- Stats collection: lightweight counters emitted every 5s from each router worker and aggregated to a per-route Redis key (sharded). Keys are time-bucketed and TTL'd to 6m to cap memory.\n- Scoring service: a stateless scorer reads aggregated counters, computes normalized signals, trip-score, and writes action decisions to a routing-config store (etcd) with revisioned timestamps.\n- Rollout mechanism: scorer runs behind a feature flag (per-cluster) and publishes decisions as non-authoritative until enabled via gradual rollout. Router consults scoring decisions and applies action only if decision is authoritative for that cluster.\n- Telemetry: new Grafana dashboards and Alerting rules for \"trip-score spikes\", \"fallback rate\", \"fallback-latency delta\", and \"false-positive fallbacks\". Logs include cause breakdown and resolution path.\n\nScoring formula (example):\n- normalized_signal = clamp((value - baseline_p50) / (baseline_p95 - baseline_p50), 0, 1)\n- trip_score = sum(weights * normalized_signal)\n- Example: route /v1/chat in us-west0: 429_rate norm=0.8, timeout norm=0.1, p95 norm=0.5 => trip_score = 0.35*0.8 + 0.25*0.1 + 0.15*0.5 + ... = 0.347 -> below threshold (no action).\n\nTrade-offs and discussion:\n- Benefit: single interpretable number for operators and easier tuning per-route.\n- Risk: score aggregation can obscure root cause (e.g., network vs model), mitigated by retaining signal breakdown in logs and dashboard.\n- Complexity: introduces scorer service and Redis aggregation; mitigated by lightweight buckets and TTLs, and reuse of existing metric pipelines.\n- Edge case: sustained low-volume but high-error customers may look noisy; add min-traffic floor before evaluation (min_active_requests=3).\n\nTesting and validation plan:\n- Unit tests for normalization, hysteresis and decay logic.\n- Load tests: synthetic surge (spike RPS) and induced 429s via upstream rate limits to validate fallback selection and false-positive rate.\n- Canary rollout: enable scorer as non-authoritative in canary region, compare decisions to baseline for 48h. If deviations within 1% of expected, promote to authoritative with 1% traffic, then 10%, then 50%.\n\nRollout and runbook:\n1) Feature-flagged deploy of scorer and router changes (read-only decisions).\n2) Canary run in ns-usw1 for 48h.\n3) Gradual increase of authoritative traffic; monitor false-positive & SLO metrics.\n4) If \"trip-score spike\" alerts > 5/min or false-positive > 2% for 1h, rollback scorer to non-authoritative.\n\nOpen questions & follow-ups:\n- Should token-level partial completions be treated as separate signal? (concern from SRE about partials causing client retries).\n- Evaluate cost impact of model-variant fallbacks under long tail traffic; add cost-budget guardrail to action matrix.\n- Investigate offloading aggregation to the metric pipeline (Prometheus/Thanos) instead of Redis for scale.\n\nLinks to artifacts:\n- Design doc: https://redwood.atlassian.net/wiki/spaces/ENG/pages/SmartRoutingV2/trip-score-design (internal)\n- Prototype PR: https://github.com/redwood-inference/platform/pull/2123\n- Initial bench results: https://drive.google.com/drive/folders/benchmark-2026-02\n- Dashboard (staging): https://grafana.redwood.internal/d/trip-score/staging\n\nNext milestones:\n- 2026-03-05: Complete unit tests + integration with router (DONE)\n- 2026-03-12: Run staged canary in ns-usw1 (IN PROGRESS)\n- 2026-03-20: Full rollout gating decision (BLOCKED until security review of cross-region signals)\n",
+  "comments": [
+    "2026-02-28 - Marco Li: Prototype scorer implemented and tested locally; pushed initial PR for review. Need guidance on per-tenant overrides format.",
+    "2026-03-02 - Priya Nair (SRE): Concerned about aggregation explosion if we persist per-route per-variant keys for all namespaces; suggested sharding by hash and strict TTLs.",
+    "2026-03-04 - Jonas Becker (PM): Please ensure canary includes a mix of high and low priority customers and that enterprise \"no cross-region\" contracts are not violated.",
+    "2026-03-06 - Marco Li: Added min_traffic floor and explicit enterprise flag to routing-config to prevent cross-region moves for pinned customers.",
+    "2026-03-09 - Security review stub: Awaiting confirmation that trip-score decisions do not exfiltrate customer identifiers. A follow-up review scheduled.",
+    "2026-03-10 - Asha Patel: Benchmarks look promising: under synthetic surge, P95 reduced by 28% and fallback false-positive measured at 1.6% over 2h window. Moving to canary in staging."
+  ],
+  "attachments": [
+    "https://github.com/redwood-inference/platform/pull/2123",
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/SmartRoutingV2/trip-score-design",
+    "https://grafana.redwood.internal/d/trip-score/staging",
+    "https://slack.redwood.internal/archives/C01234567/p1640000000"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_aecad6e771dc4570b97c0f0ef8117b8b"
+}

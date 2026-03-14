@@ -1,0 +1,66 @@
+{
+  "key": "ENG-162001",
+  "team": "engineering",
+  "title": "Proportional KV Reservation + Leaky-Bucket Smoothing for Dialogue-Length Skew",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-02-15",
+  "updated_at": "2025-03-04",
+  "creator": "Aisha Patel",
+  "assignee": "Jordan Kim",
+  "project": "continuous-batching-improvements",
+  "cycle": "2025-W07",
+  "estimate": "8",
+  "labels": [
+    "batching",
+    "kv-cache",
+    "gpu-memory",
+    "regression-testing",
+    "observability"
+  ],
+  "description": "Problem: Mixed prompt/response workloads (short prompts, long generated responses, or vice versa) cause pathological KV cache fragmentation and bursty memory pressure on GPUs. Current continuous-batcher admission is length-agnostic and we observe: increased p95 latency during skewed bursts, frequent KV evictions that regress token cost and accuracy (cache misses), and uneven GPU memory utilization across shards.\n\nGoal: Implement a proportional KV reservation and leaky-bucket smoothing layer in the continuous batching scheduler to reduce eviction churn, stabilize per-GPU memory usage, and maintain latency SLOs for mixed-length dialogues. The approach should be backwards-compatible (config knobs) and safe to rollout via canary.\n\nKey ideas (high-level):\n- Introduce length-classes (short/medium/long) by token-count percentiles per-customer and maintain a small proportional KV reservation per-class on each GPU shard. Reservations scale with expected residency (recent frequency * avg response length) rather than raw token count.\n- Apply a leaky-bucket admission smoothing layer that limits instantaneous batch entry rate per-length-class to soften bursts and avoid synchronized KV population across many requests (which causes eviction storms).\n- Add a compacting GC watermark window: when fragmentation ratio crosses threshold, trigger asynchronous KV compaction that prefers evicting low-scored entries (age + length-weighted importance).\n- Per-GPU soft memory quotas: avoid hard OOMs by throttling new long-response admissions and routing overflow to a lower-cost model variant or queue-with-backpressure depending on policy.\n- Observability changes: surface kv_eviction_score, kv_fragmentation_ratio, per-length-class admission_rate, class_reservation_utilization, batch_coalesce_efficiency, and slot_starve_time.\n\nWhy different from prior work: this ticket explicitly ties KV reservation to observed per-customer length distribution and separates reservation from static slab sizes; combines burst smoothing with compaction logic and introduces routing fallbacks rather than immediate eviction. Existing tickets focused on slotting, coalescing, or pure length-priority \u2014 this one targets coordinated reservation + smoothing + compaction as a single policy to reduce churn and tail latency under dialogue skew.",
+  "acceptance_criteria": [
+    "A. Scheduler can create length-classes automatically from 7-day token histogram for a tenant and set an initial reservation percentage per class (default 10/30/60 for short/medium/long).",
+    "B. Under synthetic skew tests the p95 generation latency decreases by >=15% vs baseline while kv_eviction_rate decreases by >=40% for the long-heavy workload (same throughput).",
+    "C. GPU memory fragmentation metric (kv_fragmentation_ratio) reduces by >=20% during the steady-state of mixed bursts vs baseline due to compaction and reservations."
+  ],
+  "implementation_notes": "Implementation will be a three-part change: 1) admission layer: add length-class identification and leaky-bucket token buckets per-class per-shard (configurable leak_rate and burst_capacity). 2) reservation manager: small resident KV slots reserved per-length-class with eviction scoring that mixes recency (LRU-ish) and length-weighted importance (long responses favored for residency if recent). 3) compaction worker: asynchronous background worker that monitors fragmentation ratio and compacts/shuffles KV entries to reduce slab waste.\n\nConfig knobs to add: length_class_boundaries (percentiles), reservation_pct_by_class, leak_rate_per_class, burst_capacity_per_class, compaction_threshold, eviction_score_weights, gpu_soft_quota_pct, fallback_policy (route|queue|downgrade_model).\n\nBackward compatibility: all knobs default to disabled or conservative defaults. Scheduler should expose a feature flag per-customer to enable reservations + smoothing.\n\nSecurity/ops: compaction worker runs in same trusted runtime; ensure compaction logs scrub prompt/response contents and only emit aggregate metrics.\n\nDev tasks (rough):\n- Add length histogram collector (ingest streaming token lengths) and expose API for percentile calculation (ENG-162002)\n- Implement admission leaky-bucket middleware (this ticket)\n- Implement reservation manager and eviction scorer\n- Implement compaction worker and GPU soft quota enforcement\n- Add observability metrics and dashboards\n- Synthetic workload generator and benchmark harness\n- PRs + integration tests + canary rollout plan",
+  "benchmark_plan": [
+    "1) Build synthetic workload generator that can emit mixed-dialogue patterns: short prompts/long responses, long prompts/short responses, and bimodal distributions. Use existing harness or extend ENG-151234 test runner.",
+    "2) Run baseline with current continuous-batcher at target throughput 500 req/s for N GPUs (match dedicated testbed) and record p50/p95/p99 latency, kv_eviction_rate, kv_fragmentation_ratio, and token cost per-100k.",
+    "3) Enable feature flag + conservative knobs and run same workloads; iterate on reservation_pct and leak_rate to hit targets in acceptance criteria.",
+    "4) Add stress test for worst-case synchronized bursts (simultaneous long-response starts) and verify fallback_policy: route->queue/downgrade models behave per config."
+  ],
+  "rollout_plan": [
+    "Canary stage: enable for 2 tenants (non-production) 5% traffic -> monitor error budget, latency, eviction metrics for 48h.",
+    "Stage 2: 20% of small-to-medium tenants for 72h, gather cost delta and user-visible regressions via eval prompts.",
+    "Stage 3: 50% across mixed tenants, enable compaction aggressiveness if stable.",
+    "Global: flip default to enabled for new customers after 2 weeks of stable telemetry and docs update."
+  ],
+  "dependencies": [
+    "ENG-162002",
+    "ENG-151234",
+    "ENG-116233"
+  ],
+  "links": [
+    "https://confluence.redwood.ai/display/INF/Proportional+KV+Reservation+Design",
+    "https://github.com/redwood-inference/runtimes/pull/7189",
+    "https://grafana.redwood.ai/d/kv-cache/kv-reservation-dashboard?orgId=1"
+  ],
+  "comments": [
+    "2025-02-16 - Aisha Patel: Initial writeup. Added conservative default percentages to reduce rollout risk.",
+    "2025-02-20 - Jordan Kim: Implementation approach looks good. Will prototype the leaky-bucket in the admission path this sprint. Need to coordinate with infra for additional counters.",
+    "2025-02-26 - Maya Rodriguez (SRE): Note: compaction worker needs throttling to avoid saturating PCIe during heavy reclaims. Suggested adding compaction_rate_limit per-node.",
+    "2025-03-03 - Jordan Kim: Prototype results: with reservation_pct [5/20/75] and leak_rate tuned to 250 tokens/s per-class, observed ~35% reduction in kv_eviction_rate on the long-heavy workload in lab. Moving to instrumentation PR next."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "implementation_notes",
+    "benchmark_plan",
+    "rollout_plan",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_98df4b9998ba4b648c85e5ea11e99efb"
+}

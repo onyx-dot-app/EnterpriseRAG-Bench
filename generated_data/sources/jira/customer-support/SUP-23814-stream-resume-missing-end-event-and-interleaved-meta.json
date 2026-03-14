@@ -1,0 +1,89 @@
+{
+  "key": "SUP-23814",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "SSE resume produces out-of-order metadata events and missing end-of-stream marker after connection failover",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Priya Menon",
+  "assignee": "Liam O'Connor",
+  "customer_company": "MuseAI",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "api-gateway",
+    "streaming-proxy"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "resume",
+    "metadata-order",
+    "customer-impact"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "redwood-llm-v1",
+    "gptj-2.7b"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-10T18:30:00Z",
+  "first_response_due_at": "2026-03-10T12:00:00Z",
+  "linked_issues": [
+    "SUP-4721",
+    "SUP-11420"
+  ],
+  "related_incident_id": "INC-20260310-01",
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/879"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/SSE+Streaming+Runbook"
+  ],
+  "description": "Issue summary:\nCustomer reports that after an SSE connection interruption and automatic resume, the stream sometimes arrives with metadata 'meta' events interleaved after the final completion marker (\"event: done\"). In other cases the final 'done' event is not received at all even though generated text chunks continue to arrive. This causes the customer's client SDK to treat the session as incomplete and retry, producing duplicate writes to their downstream processing pipeline.\n\nImpact:\n- A single enterprise customer (MuseAI, dedicated) is observing duplicated end-state processing and missing completion acknowledgements for a subset of resumed streams.\n- User-facing impact: downstream duplication, longer processing windows, occasional aborted jobs (customer reports ~0.8% of resumed streams impacted in the past 24h).\n\nEnvironment:\n- prod-us-east, dedicated capacity pool, serving-runtime v3.7.1 behind streaming-proxy v1.2.3\n- Affected model variants: redwood-llm-v1 (default), fallback gptj-2.7b for some requests\n\nSteps to reproduce (customer repro):\n1) Start a long-response generation request using SSE from the MuseAI app against the dedicated endpoint.\n2) After ~30s, simulate a transient TCP disconnect (client network flakiness or NAT timeout).\n3) Client reconnects and resumes the SSE stream using Last-Event-ID header.\n4) Observe that the client receives 'done' event followed by additional 'meta' events or, alternatively, receives streaming tokens without a terminating 'done' event.\n\nObserved behavior:\n- Out-of-order sequence: token -> token -> event: done -> event: meta(position: 512) -> token\n- Missing completion: tokens continue but event: done never arrives within expected timeout window.\n\nExpected behavior:\n- After resume, stream should preserve original chronological order of token events and any meta events should not appear after the final 'done' marker. Every completed generation should be terminated with a single 'done' event and no further tokens or metadata after that marker.\n\nInitial logs provided by customer (redacted):\n[2026-03-10T10:12:31.123Z] event: chunk id=147 seq=51 data={...}\n[2026-03-10T10:12:31.789Z] CONNECTION_RESET by NAT\n[2026-03-10T10:12:33.002Z] reconnected, Last-Event-ID: 147\n[2026-03-10T10:12:33.104Z] event: done id=147\n[2026-03-10T10:12:33.200Z] event: meta position=512 id=restored-metadata\n[2026-03-10T10:12:33.210Z] event: chunk id=148 seq=52 data={...}\n\nAttachments: client-side packet capture and server request IDs attached below.\n",
+  "steps_to_reproduce": [
+    "Open SSE stream to dedicated endpoint for a long generation",
+    "Induce short network interruption (client NAT/ISP)",
+    "Resume using Last-Event-ID header",
+    "Observe event ordering around the final events"
+  ],
+  "comments": [
+    "Priya Menon (Support): Received initial ticket from MuseAI. Assigned to streaming runtime on-call. Requesting server-side logs and trace IDs.",
+    "Liam O'Connor (SRE): Reproduced locally with an SSE replay harness. Observed meta events being replayed from the proxy after done is emitted. Suspect race between proxy buffering and backend completion signal.",
+    "Marcus Li (Runtime Eng): Looking at the runtime's commit/ack flow for KV-cache trimming during resume. If the runtime emits 'done' and then the proxy flushes buffered meta frames, ordering can flip.",
+    "MuseAI (Customer): We rely on 'done' to close our processing window; duplicates have caused a few double-charges in our billing flow. Appreciate a short-term workaround.",
+    "Liam O'Connor: Short-term mitigation suggested: client-side filter that ignores meta events after done OR enforce stronger ordering by requesting non-resumable streams for critical jobs until fixed.",
+    "Priya Menon: Noted. Customer will apply client filter as workaround; engineering to provide permanent patch."
+  ],
+  "investigation_notes": [
+    "Reproduced with internal SSE harness by inducing a replay from streaming-proxy v1.2.3. The proxy keeps a small circular buffer for last 2KB of frames and republishes on resume. If backend completes concurrently, the proxy may flush buffered meta frames after the backend's completion event.",
+    "Proxy code path 'flushBufferedFramesOnResume' observed calling publish() on buffered meta frames without checking completion flag from runtime. Added logging and hypothesis that ordering is non-deterministic under concurrent completion + resume.",
+    "No errors in serving-runtime logs indicating generation rollback; runtime reports completion and GC of KV cache at time T+0.2s relative to done emission.",
+    "We saw ~0.8% of resumed connections hit this ordering in the customer's traffic sample; occurrence increases when there is heavy proxy-side buffering (observed under 95th percentile latency spikiness)."
+  ],
+  "resolution_notes": [
+    "Workaround (customer): Client-side filter to drop 'meta' events after receiving the 'done' event implemented by MuseAI. They confirm reduced duplicate downstream processing.",
+    "Short-term engineering mitigation: add a proxy-side guard to drop any buffered frames with event types 'meta' or 'chunk' if a backend-supplied completion token has been received for that Last-Event-ID. Patch PR opened: https://github.com/redwood-inference/streaming-proxy/pull/162.",
+    "Long-term fix: revise resume semantics to include a resume-coordinator handshake so proxy guarantees ordering by waiting for backend 'done' confirmation before flushing buffered frames. Design doc link: https://confluence.redwood.ai/display/ENG/SSE+Resume+Ordering+Proposal (draft).",
+    "Post-deploy verification plan: replay customer traffic at 2x rate in staging with proxy v1.2.4 and runtime v3.7.2; validate no meta events after done in 100k resumed sessions."
+  ],
+  "attachments": [
+    "sse_client_capture_MuseAI_2026-03-10.pcap",
+    "server_trace_20260310_request_abc123.log",
+    "proxy_buffer_dump_20260310.txt"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_ef94dd75300e464394ce8d594f18ca0b"
+}

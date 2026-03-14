@@ -1,0 +1,74 @@
+{
+  "key": "ENG-547201",
+  "team": "engineering",
+  "title": "Stream session broker and fallback mediator for hosted edge API",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Patel",
+  "assignee": "Jonah Kim",
+  "project": "edge-resilience",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-04-02",
+  "labels": [
+    "sre",
+    "slo",
+    "multi-region",
+    "streaming",
+    "kv-cache",
+    "failover"
+  ],
+  "parent_issue": [
+    "ENG-812309"
+  ],
+  "dependencies": [
+    "ENG-314159",
+    "ENG-14257"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.20",
+  "security_review_required": "true",
+  "description": "Summary:\nDesign and ship a lightweight \"session broker\" and an accompanying \"fallback mediator\" at the edge gateway to enable graceful active-active failover for stateful streaming sessions and request-affine tokens. The broker mediates ephemeral session ownership, checkpoints minimal streaming state (KV checkpoint/tombstones), and orchestrates controlled traffic handoffs to a fallback path without dropping in-flight streams or losing token-level progress.\n\nBackground & motivation:\nHosted API customers increasingly use long-lived streaming calls (chat, tool-calls, embeddings with large prefix) that maintain server-side KV, key-value caches, and token progress in the gateway. During region or node-level failover we must avoid: token loss, duplicated completions, sudden EOFs for streams, or systemic SLO violations. Existing active-active routing either kills streams or forces heavyweight global state sync. This ticket proposes a mediator pattern that keeps handoff lightweight, observable, and bounded in latency/cost.\n\nGoals & non-goals:\nGoals:\n- Preserve user-visible token progress for >99.9% of in-flight streams during a regional drain or failover window.\n- Provide deterministic circuit-breaker thresholds that trigger staged fallback with minimal client-visible disruption.\n- Coordinate with existing KV-prefetch and prefix cache so rehydration of short-lived sessions is under 200ms median on failover.\n- Make fallback policy pluggable (drop-in to routing stack) and controllable by SLO headroom.\nNon-goals:\n- Do not attempt full strong consistency across regions (no synchronous cross-region write for every token).\n- Not solving heavy stateful replication for very long-running sessions (>24h); those should be surfaced as special-case enterprise flows.\n\nDesign proposal (high level):\n1) Session Broker: ephemeral, per-connection controller co-located in the gateway that tracks: session_id, last_ack_token_index, small checkpoint blob (KV pointers + checksum), preferred replica region, and soft-lease expiry. The broker exposes a lightweight handshake over the streaming protocol (new header X-RW-Session-Broker) to allow the backend runtime to accept a session takeover. Brokers store minimal state in a fast local store (in-memory + local SSD snapshot) and publish short-lived leases to the telemetry plane.\n\n2) Fallback Mediator: a separate, stateless control plane component that listens to telemetry (SLO headroom, latency percentiles, error budget burn) and decides staged fallback policies. When triggered, the mediator: (a) switches routing for new sessions, (b) instructs brokers to attempt a rendezvous checkpoint for active sessions matching filter sets, and (c) orchestrates per-session fallback behavior (rehydrate -> continue / replay -> abort-graceful).\n\n3) Handoff protocol (session rendezvous):\n- Step A: Mediator requests broker to snapshot minimal checkpoint and publish it to a local rendezvous store with a short TTL.\n- Step B: Mediator instructs egress gateway to divert a small fraction of traffic (canary % per-second) to target region while maintaining sticky routing for ongoing connections until negotiation completes.\n- Step C: Target region gateway fetches checkpoint (rendezvous) and attempts soft-attach by validating checksum and recovering prefix caches.\n- Step D: If attach succeeds within the per-session timeout, new traffic continues on the target and old connection is gracefully drained. If not, an automatic fallback policy applies: either extend soft-lease (retry), escalate to partial-hedge (duplicate a small amount of tokens to both regions for safety), or return a well-defined stream-abort with resume token.\n\nCircuit breakers and load-shedding integration:\n- We will tie mediator decisions to SLO-driven triggers: p99 latency > SLO*1.2 for N seconds, error-rate spike, or capacity headroom < X%.\n- Circuit breakers live at two levels: node-proxy (fast path) for per-process overload, and mediator-driven (global) for region-level decisions. Node-proxy breakers have fast-fail thresholds for new sessions; mediator breakers control staged diversion and per-session reattach timeouts.\n- Load-shedding policy favors stopping low-value, non-persistent requests first (inference-less health checks, high-cost rerank-only calls) and preserves streaming chats with recent activity. Policy is a ranked list with cost/benefit weights supplied by Optimize heuristics.\n\nObservability & SLO mapping:\n- New metrics: session_rendezvous_latency_ms, session_attach_success_rate, session_takeover_rate, token_preservation_rate, mediator_action_rate, per-region_fallback_incidents.\n- Alerts: token_preservation_rate < 99.5% over 5m, session_attach_success_rate < 95% for canary window.\n- Dashboards: per-route SLO headroom, broker state distribution (leases/refresh), time-to-recovery histogram for rehydrated sessions.\n\nEdge implementation details & trade-offs:\n- Checkpoint size capped to 4KB; anything larger results in an incremental checkpoint strategy (store pointer + small digest and rely on KV-cache prefetch). This reduces cross-region transfer costs.\n- Soft-lease length defaults to 45s, configurable by route. Shorter leases reduce stale ownership but increase handoff attempts.\n- Trade-off: strict consistency via synchronous replication would be safer but costs >2x latency and complicates autoscale. We accept eventual rehydration with resume tokens for rare long sessions.\n\nTesting & validation plan:\n- Unit + integration tests for handshake protocol and rendezvous TTL behavior.\n- End-to-end simulation using synthetic streams (varying prefix lengths, token rates) executed in CI against a multi-region staging cluster.\n- Chaos engineering run: region detach during 1% production traffic with controlled canary to measure token_preservation_rate and p99 latency impact.\n- Load tests to validate checkpoint throughput and rendezvous-store IOPS under burst.\n\nRollout plan (staged):\n- Phase 0 (lab): broker + mediator in staging, wire up telemetry signals, run smoke tests (2 weeks).\n- Phase 1 (canary): route 1% of traffic for low-risk routes with mediator controlling diversion; monitor attach_success and token_preservation (2 weeks).\n- Phase 2 (gradual): 1% -> 10% -> 50% for broader routes (automated gating on metrics).\n- Phase 3 (on-by-default): enable for all hosted API edge gateways with region policy opt-out for enterprise customers.\n\nAcceptance criteria:\n- token_preservation_rate >= 99.9% for canary routes during simulated failovers.\n- session_attach_success_rate >= 97% within 200ms median rehydration; 95th < 1s.\n- No more than 1% increase in median token latency for routed sessions in steady state.\n- Runbook documented and SLO alerts configured.\n\nOpen questions / risks:\n- Pricing impact: rendezvous transfers across regions increases egress; need BU decision on default retention policy.\n- Edge storage durability: local SSD snapshot vs. remote rendezvous store availability window.\n- Client compatibility: older SDKs may not support resume tokens or the new broker handshake. We need a compatibility shim and migration guidance.\n\nLinks & artifacts:\n- Design doc (Confluence): https://redwood.atlassian.net/wiki/spaces/ENG/pages/edge-session-broker\n- Prototype PR: https://github.com/redwood-inference/edge-proxy/pull/7821\n- Telemetry dashboard draft: https://grafana.redwood.com/d/edge-session-broker\n",
+  "updates": [
+    "2026-03-02: Initial spike and prototype wireframe completed; broker exposes header X-RW-Session-Broker and stores short checkpoint in local memstore.",
+    "2026-03-05: Prototype showed median rendezvous write 6ms, but observed tail at 450ms under I/O contention; investigating snapshot debounce and batching.",
+    "2026-03-08: Mediator stub integrated with telemetry; added SLO trigger hooks. PM review (Lena Ortiz) requested clearer fallbacks for long sessions.",
+    "2026-03-10: Design review with Security completed; agreed on checkpoint encryption-at-rest and short TTL. Assigned encryption implementation to ENG-314159.",
+    "2026-03-12: Canary gating plan accepted by SRE; scheduling canary windows and chaos run next sprint. Added compatibility shim for older SDKs to return resume token on abort."
+  ],
+  "reviewers": [
+    "Lena Ortiz",
+    "Marco Nguyen",
+    "Priya Desai"
+  ],
+  "links": [
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/edge-session-broker",
+    "https://github.com/redwood-inference/edge-proxy/pull/7821",
+    "https://grafana.redwood.com/d/edge-session-broker"
+  ],
+  "tests": [
+    "unit: handshake/ttl/edge-cases",
+    "integration: end-to-end rehydrate with synthetic streams",
+    "chaos: region-detach during canary (token_preservation measurement)",
+    "perf: rendezvous-store throughput and IOPS under 3x traffic"
+  ],
+  "blockers": [
+    "rendezvous-store durability SLA must be confirmed by infra",
+    "SDK resume-token support requires release coordination with client sdks team"
+  ],
+  "next_steps": [
+    "Complete encrypted checkpoint persistence (ENG-314159)",
+    "Implement mediator fallthrough policies and test vectors",
+    "Schedule first canary window with SRE and run chaos experiment"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "updates",
+    "next_steps",
+    "blockers"
+  ],
+  "dataset_doc_uuid": "dsid_4692f26f6e574042a971cca28dbe7331"
+}

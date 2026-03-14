@@ -1,0 +1,46 @@
+{
+  "key": "ENG-812479",
+  "team": "engineering",
+  "title": "Sliding-window affinity eviction with snapshot-fencing for KV shards",
+  "status": "In Review",
+  "priority": "P1",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-03-10",
+  "creator": "Lena Ortiz",
+  "assignee": "Marco Nguyen",
+  "project": "kv-cache-core",
+  "cycle": "2026-W09",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "kv-cache",
+    "eviction",
+    "gpu-memory",
+    "continuous-batching",
+    "safety",
+    "prefix-affinity"
+  ],
+  "parent_issue": [
+    "ENG-654321"
+  ],
+  "dependencies": [
+    "ENG-47205",
+    "ENG-721000"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.21",
+  "security_review_required": "true",
+  "body": "Background:\nWe operate a GPU-backed KV cache keyed by model prefix tokens to accelerate continuous batching and autoregressive generation. Existing eviction strategies (pure LRU, TTL, or simple prefix trimming) either starve long-running prompts, cause prefix-coherence violations under batching, or lead to frequent GPU OOMs under transient load spikes.\n\nGoal:\nDesign and implement a hybrid eviction policy that:\n- Maintains strong correctness guarantees (no stale prefix reads, safe in-flight reference semantics)\n- Preserves prefix affinity where beneficial for latency and KV reuse\n- Smooths memory usage during bursts and avoids catastrophic OOMs\n- Integrates with continuous batching without blocking tail-latency SLOs\n\nProposal summary (Sliding-window affinity + Snapshot Fencing):\n1) Sliding-window affinity score: each prefix shard maintains a time-decayed access score (leaky-window counter) that blends recency (LRU-like) and frequency (LFU-like) while exposing a TTL component. The decay half-life is configurable per workload profile.\n2) Soft/Hard watermarks per GPU slab: memory reclamation uses two thresholds. On crossing soft watermark, low-affinity slots are marked reclaimable; on hard watermark we aggressively evict according to a prioritized eviction queue.\n3) Snapshot-fencing for in-flight batches: when a request begins using a KV prefix, it obtains a transient fence token (epoch id + sequence). Fenced slots are immortal to eviction until the fence is released or a grace timeout elapses. This prevents prefix coherence regressions during continuous batching when multiple micro-batches may reference the same KV.\n4) Prefetch and pin hints: scheduler and batcher can pass affinity hints (next-token prefetch probability) to increase a prefix's score temporarily, reducing evictions for likely-reused contexts.\n5) Graceful demotion and compact-on-evict: evicted entries go through a demotion window where compressed or quantized representations can be stored in pinned host memory or on-device lower-precision slabs rather than being fully dropped, preserving partial reuse for heavy tails.\n\nCorrectness invariants and rationale:\n- Linearizability for GET/PUT/UNPIN: every GET/PUT must observe a consistent snapshot w.r.t fences. Fencing ensures that an in-progress generation cannot observe evicted KV slices mid-request.\n- Safe eviction never reclaims a slot with active fence tokens. A fence token is released deterministically on batch completion or forcibly after a bounded grace timeout (configurable).\n- No prefix split-read: when prefix re-chaining occurs due to eviction+reconstruction, callers see either the old contiguous KV or the fully rebuilt KV; there is no hybrid state. This is achieved via an atomic pointer-swap at reconstruct time guarded by fence epochs.\n\nDesign details and data structures:\n- Affinity counter: 64-bit float decay counter per prefix-shard. Updates are lock-free increments on access; periodic background decay applied per epoch.\n- Eviction queue: a priority heap of (affinity_score, last_access_ts, tenant_weight, size_bytes). Tie-breaks favor smaller slots to reduce fragmentation.\n- Fence table: compact per-GPU table mapping fence_token -> list of pinned slot ids and epoch. Fence entries are reference-counted.\n- Demotion store: compressed representation kept in host or lower-precision slabs with a fast rehydrate path when reclamation happens.\n\nTesting and validation plan:\n- Property-based fuzzing harness (kv-fuzz) that injects concurrent GET/PUT, forced fence timeouts, and artificial GPU OOM signals. Assert invariants: no stale reads, no double-free, and memory accounting correctness.\n- Simulation environment: extend the eviction-emulator to model sliding-window decay and fence latencies; run workload traces from production (chat-heavy and embedding-heavy) for 72h each to measure evictions and reconstructed KV rates.\n- Microbench: benchmark with continuous batching harness to measure P50/P95 latency and tokens/sec before/after. Target: P95 increase <5% under same throughput, reconstruction rate <0.5% of accesses.\n- Safety fuzz runs integrated in CI: daily smoke tests that force hard watermark and validate graceful degradation policies and rollback.\n\nImplementation status and progress updates:\n- 2026-02-18: RFC posted to team (link: https://confluence.redwood.ai/display/KV/Sliding-Window-Affinity-RFC).\n- 2026-02-24: Prototype of affinity counters and eviction queue implemented in rust/core-kv (PR: https://github.com/redwood-inference/core-kv/pull/912).\n- 2026-03-01: Snapshot-fencing API landed (internal PR: https://github.com/redwood-inference/runtime/pull/1043). Basic fence table implemented; unit tests added.\n- 2026-03-07: Demotion store completed and host-resident compressed format defined (doc: https://drive.redwood.ai/file/demotion-format-v1).\n- 2026-03-09: Simulation runs completed on prod traces. Key results: 32% fewer full reconstructs vs LRU baseline, 12% lower P50 latency under burst; worst-case P95 increase 4.2%. Attached simulation artifacts in artifacts/ENG-812479/sim-results-20260309.tar.gz.\n- 2026-03-10: PR open for integration tests and CI (https://github.com/redwood-inference/runtime/pull/1070) \u2014 currently awaiting review from infra and runtime owners.\n\nCode review feedback (high level):\n- Request to add stronger invariants in runtime panics when fence refcount mismatches detected (addressed in PR#1070).\n- Concern about fence grace-timeout interacting with distributed preemption \u2014 added a safety check to defer forced eviction until fence epoch advanced.\n\nRisks and open questions:\n- Long-lived fences under slow downstream clients can pin significant memory. Mitigation: add adaptive grace-timeout that drops with global memory pressure and informs caller via a deterministic error path.\n- Quantized demotion rehydrate latency might hurt tail latency for some workloads. We'll gate quantized demotion by per-tenant QoS tiers.\n- Cross-GPU reconstruction cost when sharded KV gets evicted on one GPU but partially present on another. Plan: prefer co-locating shard affinity and include heuristics to avoid cross-GPU fragmentation.\n\nRollout plan:\n1) Canary on internal non-prod cluster with hard watermark set conservative (lower eviction aggressiveness). Monitor reconstruct rate, latency, OOMs for 48h.\n2) Gradual ramp to production with per-tenant control: start with low-traffic tenants and Dedicated customers.\n3) Enable demotion store incrementally behind runtime flag.\n4) Full fleet rollout with monitoring alerts and automatic rollback on safety violations.\n\nNext steps (short-term):\n- Address Infra review comments and merge PR#1070 (owner: Marco).\n- Add adaptive grace-timeout heuristics and expose metric for pinned-by-fence bytes.\n- Add a small runtime migration job to compute initial affinity scores from historical traces for warm startups.\n\nArtifacts and references:\n- RFC: https://confluence.redwood.ai/display/KV/Sliding-Window-Affinity-RFC\n- Prototype PR: https://github.com/redwood-inference/core-kv/pull/912\n- Integration PR: https://github.com/redwood-inference/runtime/pull/1070\n- Simulation results: artifacts/ENG-812479/sim-results-20260309.tar.gz\n- Fuzz harness: https://github.com/redwood-inference/tools/kv-fuzz\n\nNotes and approvals:\n- Design reviewed by: Aisha Patel (SRE), Dr. Jonas Weber (Runtime), Maya Singh (ML infra).\n- Security review scheduled: 2026-03-12 (owners: security@redwood.ai).\n\nComments and status log (timeline):\n- 2026-02-18 (Lena Ortiz): Created ticket, linked RFC.",
+  "comments": [
+    "2026-02-25 Marco Nguyen: Prototype looks good; need to handle fence leak detection.",
+    "2026-03-02 Dr. Jonas Weber: Please add atomic pointer-swap invariant to avoid split-read; pushed patch.",
+    "2026-03-05 Aisha Patel: Observability: add metric pinned_by_fence_bytes and eviction_demotions_count.",
+    "2026-03-10 Marco Nguyen: PR#1070 opened; awaiting infra + security reviews."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_b6319b3889654cfeac29d1623e55d6c1"
+}

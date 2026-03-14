@@ -1,0 +1,59 @@
+{
+  "key": "SUP-42760",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "KV-prefetch + aggressive quant profile causing intermittent token errors and elevated tail latency; guidance for safe unwind",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-13",
+  "updated_at": "2026-03-14",
+  "reporter": "Aisha Khan",
+  "assignee": "Liam O'Connor",
+  "severity": "Sev1",
+  "customer_company": "NovaDocs Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "optimizer",
+    "kv-cache",
+    "quantization"
+  ],
+  "labels": [
+    "optimization-assist",
+    "kv-prefetch",
+    "quant-profile",
+    "rollback-playbook"
+  ],
+  "environment": "prod-us-west",
+  "affected_models": [
+    "redwood/llama-2-70b-rwkv-compat"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-14",
+  "linked_issues": [
+    "SUP-31421",
+    "SUP-22057"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/3872"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/runbooks/kv-prefetch-rollback"
+  ],
+  "description": "Issue summary:\nCustomer enabled two optimization changes in their Dedicated cluster: 1) kv_prefetch=true (prefix/KV warm-up across shards) and 2) quant_profile=aggressive_int4. They also increased preferred_batch_size to 256 in the route config. After deploy, NovaDocs observed intermittent token corruption (garbled tokens mid-stream), elevated P95/P99 token latency and a small number of 5xx stream terminations for long-context prompts (>= 8k).\n\nImpact:\n- Production inference degraded for ~3% of requests to the affected route; affects user-facing document generation workflows.\n- Elevated tail latency (P95 up from 120ms to 470ms) and sporadic 5xx stream drop.\n- Business impact: some time-sensitive document renders missing tokens; customer requested guidance and an emergency safe rollback.\n\nEnvironment:\n- Dedicated cluster (customer-managed reservation) in us-west-2\n- Model: redwood/llama-2-70b-rwkv-compat, seq_len typical 8192 for large prompts\n- Route config: preferred_batch_size: 256, kv_prefetch: true, quant_profile: aggressive_int4\n- Observability: Redwood Console + Kibana; customer forwarded example request IDs\n\nSteps to reproduce (observed by customer):\n1) Send multi-turn prompt with ~6k tokens and pinned system prompt.\n2) Stream generation with default chunk_size; after ~200 tokens, stream returns garbled tokens or sudden 5xx.\n3) Reproduce probability increases with concurrent load ~80 RPS.\n\nRelevant logs/snippets provided by customer:\n- Kibana trace: trace_id=trc-88d3; shows KV cache read time spikes at cache-miss bursts and CPU-bound worker queueing.\n- Runtime error sample: \"kv_cache_fetch: shard 3 timeout after 120ms\" followed by \"tokenize: unexpected codepoint sequence\"\n- Console metrics: request_inflight rose 40% and batching latency increased during peak.\n\nInvestigation notes (support/SRE):\n- Hypothesis 1: aggressive int4 quant profile reduces numeric headroom and with KV prefetch introduces alignment constraints causing subtle decoding differences under heavy batch packing.\n- Hypothesis 2: kv_prefetch pre-warms cross-shard KV which increases instantaneous memory pressure and evictions leading to cache-miss storms and queueing at the serving-runtime layer.\n- Hypothesis 3: very large preferred_batch_size combined with quantized kernels pushed some operators into slower fallback code paths under long-sequence workloads.\n\nActions taken so far:\n- Collected heap/disk metrics and GPU memory timelines for the timeframe provided. See PR https://github.com/redwood-inference/runtime/pull/3872 for a minor telemetry enhancement we applied to the customer's dedicated control plane to surface per-shard prefetch latencies.\n- Scoped the issue to routes with kv_prefetch=true + preferred_batch_size >= 200 + quant_profile=aggressive_int4. Routes without this combination have not shown corruption.\n- Applied a temporary traffic-split to route 10% of production to a variant with quant_profile=balanced_int8 to measure delta in a small canary. Canary showed no token corruption and P95 returned to ~140ms.\n\nImmediate recommended safe rollback (step-by-step):\n1) Set route-level preferred_batch_size to 64 (non-disruptive): API call example: PATCH /routes/{id} {\"preferred_batch_size\": 64}. Wait 5\u201310 minutes and monitor P95/P99.\n2) If corruption persists, disable kv_prefetch: PATCH /routes/{id} {\"kv_prefetch\": false}. This is safe and reversible; it will increase cold-start token latency slightly but eliminates prefetch-induced memory pressure.\n3) If corruption still observed, revert quant profile to a conservative profile: PATCH /models/{model_id}/config {\"quant_profile\": \"balanced_int8\"}. NOTE: quant_profile change may require warmup; perform for a canary first.\n4) If immediate rollback required and above steps not feasible, perform a route pin to a known-good model variant: POST /routes/{id}/pin {\"model_version\": \"rev-2026-02-18-stable\"}.\n\nValidation checklist after rollback (what to monitor):\n- Token correctness on previously affected request IDs (customer-provided samples).\n- P95 and P99 token latency trends return to baseline within 30 minutes.\n- No new 5xx stream terminations in logs for the route for 2h.\n- GPU memory/disk swap metrics stable; no sustained cache-miss storms.\n\nWorkarounds (if customer cannot change config immediately):\n- Decrease concurrent inflight requests via client-side rate limiting (e.g., limit to 50 RPS for the route).\n- Reduce requested sequence length or split long prompts into shorter passes where possible.\n\nFollow-up items and engineering recommendations:\n- Engineering will add a guard in the optimizer that disallows pairing kv_prefetch=true with preferred_batch_size >= 200 for aggressive_int4 quant profiles without an explicit opt-in flag.\n- Add a runtime check that logs and surfaces \"kv_prefetch contention\" and recommendations when memory pressure spikes are detected. See linked PR for telemetry.\n- Consider adding an automatic canary gate that refuses to rollout aggressive quant profiles to dedicated clusters with long-seq heavy workloads.\n\nResolution notes (partial):\n- We recommended the customer reduce preferred_batch_size to 64 and disable kv_prefetch in a controlled window. Customer applied step 1 and is monitoring. Canary to balanced_int8 was scheduled.\n- No customer-facing patch deployed by Redwood yet; must coordinate for quant_profile change.\n\nRequests from customer:\n- Clear, minimal rollback steps and expected customer-visible impact (provided above).\n- Confirmation that disabling kv_prefetch is safe for dedicated and reversible. (Confirmed by SRE: reversible and safe.)\n\nNext steps:\n- Support to wait for customer's confirmation after they apply step 1 (preferred_batch_size reduction).\n- If customer wants Redwood to perform the kv_prefetch toggle and quant_profile canary, schedule a maintenance window and coordinate with their on-call.\n\nAttachments: request IDs and log snippets provided by customer (attached to ticket).",
+  "comments": [
+    "2026-03-13 09:12 - Aisha Khan (Support): Initial intake and triage. Escalated to SRE for root cause hypotheses.",
+    "2026-03-13 11:45 - SRE (Liam O'Connor): Collected telemetry and confirmed correlation between kv_prefetch + preferred_batch_size >=200 + aggressive_int4. Recommended staged rollback plan; asked customer to reduce batch size as first step.",
+    "2026-03-13 13:02 - Customer (NovaDocs On-call, Maria Alvarez): Applied batch size change to 64. Monitoring now. Asked whether disabling kv_prefetch will impact throughput expectations.",
+    "2026-03-13 13:15 - Liam O'Connor (SRE): Replied that disabling kv_prefetch will slightly increase cold prefix latencies but should restore correctness. Provided commands and runbook link.",
+    "2026-03-14 08:30 - Support (Aisha Khan): Follow-up to ensure canary to balanced_int8 is scheduled. Created linked engineering ticket for optimizer guard (INT-4129)."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_9c7816c1c0da42118a957c54469fbda3"
+}

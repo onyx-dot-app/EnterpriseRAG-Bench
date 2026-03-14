@@ -1,0 +1,89 @@
+{
+  "key": "SUP-1000001",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Opaque 5xx elevation during mixed embedding uploads and short streaming chat; proxy FD throttle observed",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-13",
+  "updated_at": "2026-03-14",
+  "reporter": "Maya Singh",
+  "assignee": "Diego Ramos",
+  "customer_company": "Acme AI",
+  "customer_tier": "dedicated",
+  "environment": "prod | eu-west",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "ephemeral-proxy",
+    "kvcache"
+  ],
+  "labels": [
+    "5xx",
+    "high-priority",
+    "embedding",
+    "streaming",
+    "fd-throttle",
+    "investigation"
+  ],
+  "affected_models": [
+    "redwood/openchat-XL",
+    "text-embedding-1b-lite"
+  ],
+  "affected_regions": [
+    "eu-west"
+  ],
+  "sla_due_at": "2026-03-14",
+  "linked_issues": [
+    "SUP-531289",
+    "SUP-412987"
+  ],
+  "related_github_prs": [
+    "github.com/redwood/infra/pull/4821",
+    "github.com/redwood/runtime/pull/3910"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/runbooks/ephemeral-proxy-fd-throttle",
+    "https://confluence.redwood.ai/postmortems/2026-02-kvcache-refcount-incident"
+  ],
+  "description": "Issue summary:\\nCustomer (Acme AI) reported a sudden ~8-12 minute spike of 502/503 responses across a subset of eu-west host pools during a mixed workload: large embedding bulk uploads interleaved with many short-lived streaming chat sessions. The spike coincided with elevated proxy file-descriptor throttle metrics and a jump in runtime restart events.\\n\\nImpact:\\n- Multiple production endpoints returned 5xxs for ~8-12 minutes for the customer tenant; increased token failure rate ~18% for that window.\\n- Short-lived streams (chat) saw connection resets and aborted streaming frames.\\n- Embedded bulk uploads saw elevated first-byte timeouts and retries, causing backoff amplifications.\\n\\nEnvironment:\\n- Redwood hosted, customer assigned Dedicated pool in eu-west.\\n- Affected instances: ephemeral-proxy fleet nodes (eu-west-a/b), serving-runtime shards pinned to dedicated GPUs.\\n- Time window: 2026-03-13T18:02:00Z \u2014 2026-03-13T18:14:00Z.\\n\\nSteps to reproduce (observed pattern):\\n1) Customer starts a bulk embedding upload (multipart, ~3000 small items in parallel) to embedding route.\\n2) Simultaneously dozens of short streaming chat sessions are opened by web clients (many short-lived: connect -> prompt -> disconnect).\\n3) Proxy accept queue grows; ephemeral-proxy FD throttle metric increments; some proxy instances start returning 502 to api-gateway.\\n4) Serving runtime shows prefetch/kvcache worker stalls, and selective runtimes restart (OOM watchdog sometimes triggered after stall).\\n\\nObserved logs/metrics (snips):\\n- proxy-fd-throttle: surge from 0.02 -> 0.48 across nodes\\n- apigw.error_rate[eu-west]: 4.7% -> 22.1% during window\\n- runtime.restart_count: +7 in 12m on shard-57\\n\\nLogs (excerpt):\\n\"2026-03-13T18:04:21Z proxy[eu-west-a] WARN accept_queue_full fd_throttle=0.41 backlog=312\"\\n\"2026-03-13T18:05:03Z runtime[shard-57] ERROR kvcache_worker hung for 120s; stacktrace attached\"\\n\"2026-03-13T18:05:07Z apigw[eu-west] ERROR upstream_connect failed: connection_reset by peer\"\\n\\nInitial mitigation taken:\\n- Support applied a transient rate-limit on the customer's embedding upload route (reduced concurrent multipart parts to 8) and instructed client to retry with exponential backoff.\\n- Redirected a portion of tenant traffic to warm standby hosts in eu-west-b.\\n- Pager alerted SRE and on-call runtime engineer to trace kvcache thread hangs.\\n\\nNext steps (high level):\\n- SRE to capture full runtime core dump and profiling traces from shard-57.\\n- Infra to run ephemeral-proxy heap and FD diagnostics, and investigate accept queue drain behavior.\\n- Engineering to validate kvcache worker refcount and prefetch cancellation interaction under mixed embedding+stream load.\\n",
+  "comments": [
+    "2026-03-13 18:09 - Maya Singh (Support): Customer reported elevated 502s; triaged and escalated to SRE. Applied temporary embedding concurrency cap and suggested client-side rate limiting.",
+    "2026-03-13 18:21 - Diego Ramos (SRE): Observed FD throttle spike on 4 proxy nodes; started collecting netstat/lsof samples and epoll backlog metrics.",
+    "2026-03-13 18:33 - Claire Nguyen (Runtime Eng): Noted repeated kvcache_worker hang signatures; requested full runtime logs and core from shard-57. Hypothesis: prefetch cancellation races under high accept-queue pressure.",
+    "2026-03-13 19:02 - Acme AI (Customer): Confirmed embedding upload was triggered as part of daily sync and could stagger uploads; asked for guidance to avoid future outages.",
+    "2026-03-13 20:10 - Diego Ramos (SRE): Uploaded collected artifacts to S3: s3://redwood-incident-artifacts/SUP-1000001/ (profiles, lsof, netstat, runtime-cores). Linked PR created for temporary proxy throttle alert tuning."
+  ],
+  "investigation_notes": [
+    "Collected lsof snapshots show ephemeral-proxy retaining ~1200 sockets in CLOSE_WAIT on affected hosts during peak; garbage collect loop not reclaiming quickly enough.",
+    "netstat -an on proxy nodes shows large accept backlog (tcp_accept_queue ~300) coincident with apigw retries and hedged retry amplification.",
+    "Runtime core from shard-57 indicates kvcache worker thread blocked on prefetch cancellation wait; stack points to refcount path that increments when request is accepted and decremented on close \u2014 race with socket teardown observed.",
+    "No immediate evidence of GPU OOM; runtime restarts appear secondary to watchdog timeouts triggered by blocked kvcache threads and growing event loop latencies.",
+    "Hypothesis A: Mixed workload (many short streaming connects + large multipart embed) causes ephemeral-proxy to hit FD throttle; accept queue growth causes upstream backlog and increased hedged retries, which in turn triggers duplicate prefetch attempts causing kvcache worker lock contention and a hang -> watchdog kill -> runtime restart -> 5xx wave.",
+    "Hypothesis B: A latent issue in proxy's CLOSE_WAIT cleanup under heavy multipart uploads created FD pressure; the proxy's backpressure signal isn't being propagated quickly enough to apigw causing retry storms.",
+    "Dashboards checked: apigw/accept-queue, proxy/fd-usage, runtime/kvcache-hang-count, customer/tenant-concurrency. Correlation between proxy FD usage and kvcache hang count is strong (Pearson r ~0.78 for the event window)."
+  ],
+  "temporary_workarounds": [
+    "Reduced customer's embedding parallelism (server-side) to 8 concurrent parts \u2014 immediate error rate dropped to baseline within 90s.",
+    "Implemented a conservative apigw backoff override for embedding endpoints for the affected tenant to avoid hedged retry amplification.",
+    "Blackholed a subset of ephemeral-proxy nodes exhibiting heavy CLOSE_WAIT until kernel reclaim completed (careful rolling to avoid capacity loss)."
+  ],
+  "resolution_plan": "(in-progress) Engineering will: 1) patch kvcache prefetch cancellation to avoid refcount races under early socket teardown, 2) add a short-term proxy CLOSE_WAIT scavenger to reclaim FDs faster, and 3) tune apigw hedged retry thresholds for embedding multipart endpoints. Target for PRs and canary: 2026-03-18. SRE to monitor apigw error floor and proxy FD metrics post-deploy.",
+  "follow_up_actions": [
+    "Post-deploy smoke test with mixed embedding + short streaming workload to validate fix under controlled load.",
+    "Add an alert for sustained proxy CLOSE_WAIT ratio > 0.15 on any node in a pool, and a dashboard panel for kvcache prefetch hang rate per shard.",
+    "Customer-facing CC: provide recommended upload pattern (staggered multipart, lower concurrency) and incident summary when resolved.",
+    "Consider adding tenant-level admission control for embedding uploads when concurrent streaming sessions exceed a threshold."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "temporary_workarounds",
+    "resolution_plan",
+    "follow_up_actions"
+  ],
+  "dataset_doc_uuid": "dsid_7893bd6baed34d919e21e44a10c10287"
+}

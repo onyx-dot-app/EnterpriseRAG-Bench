@@ -1,0 +1,64 @@
+{
+  "key": "SUP-202603",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Live stream resume memory leak correlates with intermittent omission of final tokens on SSE/WS reconnect",
+  "status": "Triage",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-14",
+  "updated_at": "2026-03-14",
+  "reporter": "Maya Patel",
+  "assignee": "Jordan Kim",
+  "customer_company": "DocuFlow Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "api-gateway",
+    "scheduler"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "websocket",
+    "memory-leak",
+    "reconnect"
+  ],
+  "environment": "prod - us-west",
+  "affected_models": [
+    "rw-instruct-13b-v2"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-14",
+  "description": "Issue summary:\nCustomer reports that after a backend failover (worker restart/autoscale), their long-running SSE and websocket streams frequently reconnect but the final paragraph or trailing tokens are missing. The behavior is intermittent but reproducible for large payloads (>20k tokens produced) and roughly correlates with elevated heap usage on workers handling the session resume.\n\nImpact:\n- DocuFlow's editor integration loses the last paragraph or final footnotes in ~15% of resumed streams, causing user-visible truncation and data loss.\n- Affects production traffic on a Dedicated pool; high-visibility customer.\n\nEnvironment:\n- Customer uses Dedicated capacity (pool-id: df-prod-01).\n- Platform: prod, region us-west-2.\n- Client SDK: web-js v1.9.3 and internal server-side fan-in that upgrades to websockets for long responses.\n- Model pinned: rw-instruct-13b-v2, quantized profile: q4_k_mixed.\n\nSteps to reproduce (customer-provided):\n1) Open a long streaming generation (document summarization, ~1,200 tokens prompt leading to ~2\u20135k generated tokens).\n2) Trigger a controlled worker drain (scale-down or rolling restart via dedicated autoscaler).\n3) Allow client to perform automatic reconnect/resume (SSE Last-Event-ID or WS resume path).\n4) Observe that sometimes the final paragraph or trailing footnote is missing from the stitched stream; client logs show a successful resume handshake and an end-of-stream marker, but the last tokens are not present in the stitched payload.\n\nObserved logs & artifacts attached by customer:\n- Client-side event timeline and Last-Event-ID headers (attached as timeline_0314.log).\n- Excerpt of server-side worker logs showing repeated GC and heap growth prior to restart: worker-8723-gc.log.\n- Two sample transcripts (one complete, one truncated) provided for comparison.\n\nInitial hypothesis:\n- A memory leak in resume handling path (KV cache or per-session buffer) on worker processes causes the worker to drop trailing tokens when the streaming frame assembler is finalized during graceful shutdown or handoff.\n- Race between drain/finalize path and the streaming flush that writes the terminal event to the connection.\n\nPriority & next steps requested by customer:\n- Fast mitigation or workaround (customer requests a config toggle or suggested client-side pattern to avoid data loss).\n- Root cause analysis and timeline.\n\nAttachments: timeline_0314.log, worker-8723-gc.log, sample_complete.json, sample_truncated.json\n",
+  "comments": [
+    "2026-03-14 - Maya Patel (Support): Acknowledged with first response. Asked customer for exact autoscale event ID and to confirm whether both SSE and WS flows are affected. Requested that customer enable verbose client debug logs to capture Last-Event-ID headers.",
+    "2026-03-14 - DocuFlow (Customer): Confirmed both SSE and WS. Attached logs and two sample transcripts. Provided autoscaler event id autoscale-2026-03-14-17-22.",
+    "2026-03-14 - Jordan Kim (SRE): Noted correlation with worker GC spikes in attached logs. Requested heap histograms from the affected worker (worker-8723) and asked infra to hold similar pool nodes from rolling until we capture trace. Assigned to investigate resume code paths in serving-runtime.",
+    "2026-03-15 - Jordan Kim (SRE): Collected heap profile and reproduced similar behavior in staging with a synthetic 6k token stream and forced drain. Observed a retained buffer per-session that grows; final flush sometimes gets dropped during shutdown sequence. Created follow-up INT ticket to track fix PR. Linked INT-3306.",
+    "2026-03-16 - Support (Maya Patel): Shared an interim workaround with customer: set client reconnect backoff to 250ms and enable explicit close-then-resume flow (client performs a graceful EOF ACK before resuming) \u2014 reduced incidents in customer testing. Customer confirmed decreased frequency.",
+    "2026-03-18 - Engineering (Jordan Kim): Prepared patch proposal to ensure streaming assembler completes flush before shutdown and to adopt an atomic swap of per-session buffers to prevent mid-flush races. PR reference: github.com/redwood-inference/serving-runtime/pull/4127. Asked QA to validate on dedicated staging pool.",
+    "2026-03-23 - DocuFlow: Verified fix candidate on staging; reports no loss in 500 resume iterations. Requested ETA for prod rollout and whether any migration is required."
+  ],
+  "investigation_notes": "Summary of findings:\n- Reproduced in staging by simulating worker eviction mid-stream while a concurrent flush to the connection was ongoing.\n- Heap/GC analysis: per-session assembly buffer (sessionAssembler) retained references to previous frames when certain error paths executed (notably when cancelation + drain interleave), causing final flush callbacks to be dropped.\n- Root cause: a race in serving-runtime shutdown handler: when a worker receives SIGTERM, the session finalizer would schedule asynchronous buffer drain but would also reuse the sessionAssembler instance for a new resume token handshake in the compatibility layer. If the finalizer's callback executed after the assembler was recycled, the final write was dropped to a stale socket context.\n- Observed both SSE and WS variants because both reuse the same high-level assembler abstraction.\n\nEvidence:\n- Heap profile shows leaked sessionAssembler instances tied to session IDs in truncated samples.\n- Repro script attached to INT ticket reproduces failure 80% of the time under forced eviction.\n",
+  "resolution": "Mitigation applied: engineering merged a two-part fix. 1) Make sessionAssembler finalization synchronous during SIGTERM drain path to guarantee completion of terminal writes before connection context is released. 2) Introduced an atomic handoff: a new assembler instance is allocated for resume handshakes and the finalizer uses a rendezvous token that prevents recycling until flush success/failure is observed.\n\nRollout notes:\n- Patch deployed to staging (dedicated pool) 2026-03-18 and validated.\n- Gradual rollout to prod dedicated pools started 2026-03-25 with throttled rate (10% pool increment) and monitoring for error spikes.\n\nCustomer workaround (until fix fully rolled out):\n- Configure client reconnect strategy to perform explicit close-and-ack before attempting resume.\n- For high-criticality flows, use short-lived non-resumable streams and re-request remainder on reconnect, as a defensive approach.\n\nFollow-ups:\n- INT-3306 tracks the PR and unit tests for assembler finalization.\n- Add E2E test that forces worker eviction mid-stream to prevent regressions.\n- Add telemetry metric for 'final-flush-failure' per-session to detect recurrence.\n\nStatus: In Progress (rollout in prod, monitor).",
+  "linked_issues": [
+    "INT-3306"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/serving-runtime/pull/4127"
+  ],
+  "related_confluence_pages": [
+    "confluence.redwood.ai/pages/DEVOPS-STREAMING-DRain-Runbook"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_54f2b43bffe84f27af075a8ea2e08476"
+}

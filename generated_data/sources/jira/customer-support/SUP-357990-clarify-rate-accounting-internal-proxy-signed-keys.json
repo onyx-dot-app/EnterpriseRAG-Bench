@@ -1,0 +1,78 @@
+{
+  "key": "SUP-357990",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Clarify rate-limit accounting for internal proxy with per-user signed-keys triggering intermittent throttles",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev2",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-11",
+  "reporter": "Erin Walsh",
+  "assignee": "Jordan Kim",
+  "customer_company": "NimbleHealth Inc.",
+  "customer_tier": "enterprise",
+  "components": [
+    "api-gateway",
+    "rate-limiter",
+    "auth",
+    "edge-proxy",
+    "billing"
+  ],
+  "labels": [
+    "throttle-accounting",
+    "signed-urls",
+    "http2",
+    "proxy-affinity",
+    "billing-question"
+  ],
+  "environment": "prod:us-east",
+  "affected_regions": [
+    "us-east",
+    "eu-west"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "related_github_prs": [
+    "https://github.com/redwood-inference/edge-proxy/pull/789",
+    "https://github.com/redwood-inference/rate-limiter/pull/412"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/Proxy+Throttling+Design",
+    "https://redwood.atlassian.net/wiki/spaces/CS/pages/Throttle+Headers+Explainer"
+  ],
+  "description": "Issue summary: Customer reports intermittent 429 throttles originating after they introduced an internal forwarding proxy that reuses persistent HTTP/2 connections and issues per-user signed keys for downstream requests. Impact: Production traffic for NimbleHealth's inference feature sporadically receives 429 responses during normal load peaks, causing degraded user experience for some customers and automated ingestion backfill failures. Environment: prod:us-east (primary), eu-west (replicated). Affected endpoints: /v1/chat/stream, /v1/embeddings/batch.\n\nObserved behavior: NimbleHealth sees short bursts (tens of seconds) of 429 responses across many users, with throttle headers reporting a near-empty token bucket for the tenant. When the proxy is bypassed and clients call Redwood directly using same signed keys, the issue disappears. Customer believes token accounting should follow API key only and not be affected by connection multiplexing or signed key re-issuance frequency.\n\nCustomer-provided context: NimbleHealth uses an internal gateway that mints short-lived signed keys per end-user session (~60s TTL) and reuses persistent HTTP/2 connections to Redwood. They also reuse a small pool of upstream IPs (NAT-ed). Traffic patterns: many short-lived sessions with high fanout (hundreds of concurrent users per customer), frequent key refreshes, and occasional bulk backfills that run concurrently with live traffic.\n\nExpected behavior: Signed keys (short-lived) should consume tokens against the parent tenant quota but accounting should not double-count due to connection reuse or signed-key churn. They expect token refill and per-connection accounting to be smooth when using multiplexed HTTP/2 pooling behind a proxy.\n\nFiles attached: customer provided request traces, sample throttle headers, and a packet-level tcpdump showing HTTP/2 stream reuse (attached in ticket attachments).",
+  "steps_to_reproduce": "1) Set up an internal proxy that mints per-user signed keys with TTL=60s.\n2) Open a persistent HTTP/2 connection from proxy to Redwood and multiplex many signed-key requests over the same connection.\n3) Run concurrent short chat sessions (50\u2013200) while also kicking off a backlog embedding job.\n4) Observe 429 spikes and check X-RateLimit and X-Token-Bucket headers from Redwood responses.\n\nNotes: Customer asserts behavior is deterministic when key churn and connection reuse overlap; we have not yet reproduced this in staging with identical NAT/connection pool topology.",
+  "logs": "[2026-03-09T18:12:07Z] 200 OK user=alice signed_key_id=sk_live_abc conn_id=conn-12 stream=5 tokens_left=18\n[2026-03-09T18:12:28Z] 429 THROTTLE user=bob signed_key_id=sk_live_def conn_id=conn-12 stream=9 tokens_left=0 header: X-RateLimit-Remaining=0 X-RateLimit-Limit=600\n[2026-03-09T18:12:29Z] 200 OK user=carol signed_key_id=sk_live_ghi conn_id=conn-12 stream=10 tokens_left=2\n[2026-03-09T18:12:30Z] 429 THROTTLE user=dave signed_key_id=sk_live_jkl conn_id=conn-12 stream=11 tokens_left=0\n\nCustomer trace excerpt: connection-level keepalive pings every 15s; signed key refresh requests issued immediately after TTL expiry, causing brief stampede of new tokens but not reflected as refill in tenant accounting sample.\n",
+  "comments": [
+    "2026-03-10 09:12 - Erin Walsh (Support): Acknowledged receipt of logs and attachments. Requested request IDs and the exact timestamp range for one incident window. Asked for proxy config (pool size, NAT IPs).",
+    "2026-03-10 09:45 - NimbleHealth (Customer): Provided request IDs and proxy pool config: 4 upstream NAT IPs, persistent conn pool size 8, key TTL=60s, refresh jitter disabled. Attached tcpdump and request traces.",
+    "2026-03-10 11:20 - Jordan Kim (SRE): Reviewing token-bucket accounting and HTTP/2 muxing code path. Hypothesis: edge-proxy connection affinity metrics and refill attribution might be keyed both by API key and by connection fingerprint, resulting in transient misattribution when signed keys rotate rapidly on the same connection.",
+    "2026-03-10 13:05 - Support: Requested customer to enable jitter on signed key refresh and to increase pool size as workaround. Asked if they can reproduce by toggling refresh jitter.",
+    "2026-03-10 15:30 - NimbleHealth: Confirmed they enabled a basic jitter (random 0-20s) and observed a ~60% reduction in 429 spikes during next test window. Asked for a long-term fix and an explanation of accounting semantics.",
+    "2026-03-11 08:10 - Jordan Kim (SRE): Attached early investigation notes and a pointer to rate-limiter PR that improves per-connection attribution (#412). Noted that billing/accounting systems are separate and we need to confirm whether refill events are fully propagated to the tenant-level metrics in presence of short-lived keys."
+  ],
+  "investigation_notes": [
+    "Checked rate-limiter logs for customer tenant during spike window: observed burst drains with multiple signed_key_ids sharing same conn_id. Token consumption entries were logged against individual signed_key_ids but the refill loop occasionally emits a connection-scoped refill checkpoint that overwrote the signed-key-level state during concurrent refreshes.",
+    "Edge hypothesis: when signed-key rotation aligns with connection reuse and NAT IP reuse, the refill counter uses a connection fingerprint plus tenant id, which can produce temporary negative deltas in the tenant-visible bucket until the next refill reconciliation job runs (30s cadence).",
+    "Reproduced in internal staging by simulating: pool size 4, TTL=30s, no jitter, high fanout. Confirmed transient tenant-level token under-reporting followed by reconciliation. Root cause appears to be a race between per-key consumption logging and connection-scoped refill checkpoints in the edge aggregation layer.",
+    "Related code paths: edge-proxy/ingest/connection_aggregator.go and rate-limiter/refill_coordinator. See PRs: https://github.com/redwood-inference/edge-proxy/pull/789 and https://github.com/redwood-inference/rate-limiter/pull/412.",
+    "Potential billing impact: short-lived under-reporting could surface as 429s but does not cause long-term overbilling. Reconciliation restores true token counts within 30s window; still customer-visible spikes are unacceptable for low-latency product."
+  ],
+  "resolution": [
+    "Workaround (applied): Recommended customer enable jitter on signed-key refresh (0-20s) and increase upstream connection pool size to reduce refresh stampedes; customer confirmed reduction in spike frequency. Also advised disabling immediate retry storms on 429 by implementing exponential backoff on client side.",
+    "Short-term fix (deployed to staging): Apply edge-proxy sideguard to associate refill checkpoints to tenant+key when rotation frequency exceeds threshold (PR #789). This reduces overwrite races. Deployed to staging for validation 2026-03-11.",
+    "Planned long-term fix: Update refill_coordinator to perform atomic merge of per-key consumption and connection-level checkpoints, and shorten reconciliation cadence. Will coordinate a change in rate-limiter repo (tracked in PR #412). Estimated rollout to prod: two-week window pending QA and canary.",
+    "Follow-ups: (1) Schedule a post-deploy canary with NimbleHealth to validate production behavior during peak windows. (2) Document recommended proxy patterns in KB and update Confluence page. (3) Consider offering a managed signed-key jitter helper library in SDKs to reduce customer misconfigurations."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_461588786f8544a899f5e632f040bcd3"
+}

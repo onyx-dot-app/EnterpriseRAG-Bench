@@ -1,0 +1,41 @@
+{
+  "title": "carousel-slapback-congestion-lab-notes",
+  "owner": "Mira Alvarez",
+  "drive_area": "users",
+  "path": "users/carousel-slapback-congestion-lab-notes-mira.json",
+  "doc_type": "doc",
+  "created_at": "2026-02-25",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Juno Park",
+    "Samir Rao"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "burst",
+    "congestion",
+    "latency",
+    "loadgen",
+    "kv-cache"
+  ],
+  "linked_artifacts": [
+    "GH:github.com/redwood-inference/serving-runtime/pull/6421",
+    "JIRA:INF-1984",
+    "grafana:/d/priming/carousel-slapback-2026-02-25"
+  ],
+  "summary": "Scratchpad for a set of bench runs that try to reproduce and characterize an oscillatory congestion mode where bursts from multiple tenants align (\"slapback\"), causing repeated KV-cache thrash + prioritized-batching starvation.",
+  "quick_metrics": "baseline (steady poisson): p50=18ms p95=62ms p99=112ms qps=1200; slapback peak: p50=42ms p95=480ms p99=1.2s qps dip to 450",
+  "content": "Goal: reproduce the 'carousel' multi-tenant collision (my name: slapback) where temporally aligned bursts cause repeated cache evictions + batch starvation, producing long tails and throughput collapse. Want to capture traces + metrics to guide mitigation options (fractional backoff, staggered probing, aggressive KV retention for primed keys).\n\nHypothesis: when several small bursty clients (few tokens each) are scheduled in lockstep, the continuous batching layer will create a series of large batch windows that monopolize GPU cycles and evict hot KV entries. After eviction, following requests miss and require KV refill windows, which prolongs token latency; repeated cycles produce oscillations and throughput collapse.\n\nEnv / baseline config:\n- Model: open-llama-7b-8k (FP16, 4-bit quant profile for some runs)\n- Serving runtime: local dev rig (k80 emulation profile) + staging cluster (A10x2 pods)\n- Runtime build: experiment/kv-refactor branch (hash cd3a9f)\n- Batching policy: continuous, max_batch=128, max_delay_ms=12, immediate_flush_threshold=0.6\n- KV cache TTL: 45s (default), size cap per shard: 2GB\n- Loadgen: custom loadgen (loadgen/carousel.py) supporting arrival pattern 'carousel' (see args below)\n\nLoad generator (repro):\npython loadgen/carousel.py --clients 36 --qps 1200 --pattern carousel --burst-size 4 --burst-spacing 120ms --seq-len 64 --priming-context 32 --duration 900 --trace=true\nNotes: 'carousel' pattern: clients grouped into N rings; each ring emits a small synchronized burst every T ms, rings offset by T/N so waves slide but sometimes align depending on jitter param. In the 'slapback' variant jitter was reduced to 2\u20136ms to encourage alignment.\n\nImportant instrumentation captured:\n- Per-request trace id, timeline of queuing -> batch_start -> kernel_launch -> kernel_end -> kv-hit/miss flag\n- KV eviction events per shard (count + reason: size vs LRU TTL)\n- Batch sizes over time (histogram + temporal series)\n- GPU utilization (SM%, mem%), host CPU runq, network egress\n- Token generation throughput (tokens/s) and per-request token count\n\nRepresentative run (staging cluster, 36 clients, low jitter):\n- run id: slap-2026-02-25-01\n- target qps: 1200 sustained (intended), observed aggregate qps: 1180 until t=110s then collapsed in cycles\n- initial transient (0-90s): p50~22ms p95~80ms p99~140ms batch sizes 40-70 (healthy)\n- first collision (t=110s): 12 rings align -> single mega-window, batch spike to 128 (cap), kernel queue backlog builds -> p95 spikes to 420ms p99 900ms\n- KV evictions note: within 2s after collision eviction_count/shard rose from 12->67 (LRU churn)\n- post-eviction phase (t=112-140s): many small requests miss KV, cause additional micro-batches and CPU work; GPU util falls (SM% from 82% -> 34%) while host CPU spikes; observed qps dips to 450; p99 during dip 1.2s\n- recovery: KV refill + staggered requests slowly restore throughput (approx 25\u201345s to converge)\n- repeated after ~60s: another alignment -> same cycle repeats for the duration (period ~60\u201375s)\n\nASCII temporal snapshot (batch_size / p95 / qps)\n[0s  ]  50 / 78ms  / 1180\n[110s] 128 / 420ms / 820 (colliding window)\n[115s]  18 / 310ms / 460 (post-eviction misses)\n[170s]  60 / 95ms  / 1140 (recovered)\n\nControl variants tried:\n1) Increase KV TTL to 300s: reduced eviction_count by ~82% => p95 spikes reduced to 180ms but GPU memory pressure increased; not acceptable for multitenant without bigger memory commitments.\n2) Reduce max_batch to 64: batch spikes limited but increased kernel invocation overhead; steady-state p50 rose from 22ms -> 28ms but collapse severity reduced (p95 spike ~230ms).\n3) Introduce jitter (30-80ms) across clients: collisions rare; simulates client-side fix but not under control for platform operators.\n4) Fractional backoff (server): detect a batch-size spike > 110 and throttle a fraction of low-priority clients in the next window (20%): reduced repeat cycles, qps drop modest, p99 max reduced to 360ms.\n5) Aggressive priming: force keep-alive pins for top-100 hot contexts (LRU pin) at expense of memory: elimination of repeated miss cycles in this workload but requires dataset of hot contexts per tenant.\n\nQuick numbers (avg across 3 similar runs):\n- baseline (poisson): p50 18ms p95 62ms p99 112ms qps 1200 tokens/s 28k\n- slapback uncontrolled: p50 42ms p95 480ms p99 1150ms qps (avg) 780, dip to 450\n- TTL=300s variant: p50 26ms p95 180ms p99 320ms qps 1120\n- max_batch=64 variant: p50 28ms p95 230ms p99 420ms qps 980\n- fractional backoff: p50 31ms p95 180ms p99 360ms qps 950\n\nObservations / takeaways:\n- Lockstep alignment is a credible reproduction mode for field incidents where many clients have similar shimmed polling patterns.\n- KV eviction + refill is the dominant secondary effect that lengthens the tail and causes repeated cycles; batching spikes are the trigger but eviction amplifies the damage.\n- Client-side jitter helps but not reliable for multi-tenant public API. Server-side mitigations (fractional backoff, early detection of large spike and controlled shedding of low-priority requests, or KV pinning for hot contexts) appear promising.\n- Tradeoffs: TTL increase reduces oscillations but raises memory costs and cross-tenant stability risk (one tenant hoards cache). Reducing max_batch decreases peak efficiency (higher per-token cost). Fractional backoff is a middle ground.\n\nOpen questions / TODO:\n- Can we detect impending collision earlier? e.g., sliding-window batch-growth derivative > X within 30ms and preemptively throttle. Need microsecond-level batching telemetry (add guard in batch-accept path).\n- Better per-tenant KV quotas/pinning policy (fast eviction score) \u2014 prototype quota design and simulate fairness across 50 tenants.\n- Evaluate approach on larger model family (13B) and on real Dedicated cluster to validate memory costs.\n- Instrumentation: add kv-cache histograms (age at eviction) and per-key owner tag to confirm cross-tenant churn.\n\nNotes to self: attach traces to JIRA INF-1984, link PR for fractional-backoff patch, coordinate with SRE to run long 6h soak with synthetic mixed workloads. Slack thread: #serving-runtime -> tag Juno for follow-up on detection heuristic.\n\nLast-run attachments: grafana link above (linked_artifacts), tracelog: s3://redwood-staging/traces/slap-2026-02-25-01.trace.gz (put under INF-1984).\n\nEnd of scratchpad.",
+  "conclusion": "Short-term: enable fractional backoff prototype + small max_batch cap for handling sudden spike windows. Medium-term: explore KV pinning + smarter eviction heuristics with per-tenant quotas. Longer-term: surface a collision-detection metric in the console and recommend client jitter best-practices in SDKs.",
+  "notes_for_next_run": "1) Increase trace sampling to 100% for first 5 minutes; 2) run with quant profile toggles (4-bit vs 8-bit) to see memory-eviction tradeoffs; 3) try mixed workload with embeddings + chat to observe heterogeneity effects.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "quick_metrics",
+    "content",
+    "conclusion",
+    "notes_for_next_run"
+  ],
+  "dataset_doc_uuid": "dsid_ac9ed2dbb638489690e1c79c9bcc668a"
+}

@@ -1,0 +1,72 @@
+{
+  "key": "SUP-204842",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "WebSocket permessage-deflate corruption behind edge throttling results in garbled final tokens and missing finish_reason",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Emma Chen",
+  "assignee": "Raj Patel",
+  "customer_company": "NotePad AI",
+  "customer_tier": "dedicated",
+  "components": [
+    "websocket-proxy",
+    "api-gateway",
+    "serving-runtime",
+    "edge-rate-limiter"
+  ],
+  "labels": [
+    "streaming",
+    "websocket",
+    "compression",
+    "edge",
+    "rate-limiter",
+    "investigating"
+  ],
+  "environment": "prod - us-east-1",
+  "affected_models": [
+    "redwood-7b-v1"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-12",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "INT-412",
+    "SUP-314158"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/edge-proxy/pull/781"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/Edge+Streaming+Runbook"
+  ],
+  "description": "Issue summary:\nCustomer NotePad AI reports intermittent corrupted final output when using the WebSocket streaming endpoint with permessage-deflate enabled and high burst traffic. Symptoms: final tokens are garbled (non-UTF8 glyphs or stray control characters) and the SDK client never receives the closing metadata (finish_reason/stop sequence). This causes client-side JSON parsing failures and perceived truncated responses.\n\nImpact:\n- Affected customer: NotePad AI (dedicated capacity).\n- Intermittent but reproducible during high-concurrency bursts when edge rate-limiter or CDN returns 429s mid-stream.\n- Users see corrupted trailing text or incomplete JSON, downstream UIs show partial replies and retry loops.\n\nEnvironment:\n- prod - us-east-1, dedicated pool id: dp-46b3\n- Client: NotePad AI proprietary SDK v1.4 with permessage-deflate negotiated on WS handshake\n- Model: redwood-7b-v1, streaming mode, chunk_size ~512 tokens\n\nSteps to reproduce (observed by customer):\n1) Open WebSocket to wss://api.redwood.ai/v1/streams with Sec-WebSocket-Extensions: permessage-deflate; client_id header set.\n2) Start a long-running generation (30s+) that yields multiple frames across minutes.\n3) Simulate burst traffic (20 concurrent streams) from the same customer IP to trigger edge rate-limiter.\n4) When edge returns a 429 or injects a compressed short-circuit (observed in traces), the client receives a final compressed frame that appears truncated to the decompressor.\n\nObserved behavior:\n- Last message body contains high-bit garbage (e.g. \"\\u0000\\ufffd\\ufffd\\ufffd\") or stray bytes appended to valid tokens.\n- SDK logs show decompression error or silently emits replacement characters and then never receives the JSON finish object containing finish_reason and metadata.\n- Server-side traces show the model emitted the final choice and finish metadata, but those bytes do not successfully reach the client.\n\nExpected behavior:\n- Permessage-deflate should yield a well-formed final decompressed payload; finish_reason metadata should be delivered in a separate control/data event as documented.\n\nRecent logs / snippets (sanitized):\n- Edge trace (edge-rt-12487): 2026-03-10T18:04:22Z POST->WS burst -> rate-limit 429 injected mid-stream; downstream forwarded partial compressed frame, then RST_STREAM.\n- Proxy logs (proxy-2b): 2026-03-10T18:04:23Z upstream closed while inflating message: zlib: unexpected EOF\n- Serving runtime: 2026-03-10T18:04:23Z choice_complete id=ch_6a9ff finish_reason=stop metadata_sent=true\n- Client SDK (NotePad AI): 2026-03-10T18:04:23Z decompressor error: \"invalid stored block lengths\"; emitted replacement chars and failed JSON parse\n\nTemporary workaround applied:\n- Support instructed customer to disable permessage-deflate on their WS handshake (client-side) and route via the same IP with lower concurrency. After disabling compression the customer reported stable, untampered final payloads.\n\nNext steps (in-progress):\n- Reproduce in-house using the customer's workload simulator with permessage-deflate and an Edge test harness to inject 429 mid-frame.\n- Capture PCAP and ZLIB traces for a failing case.\n- Patch edge proxy to avoid returning HTTP 429 mid-compressed-fragment (ensure backpressure signals occur between messages rather than during compressed data blocks).\n\nNotes on risk and scope:\n- Root cause appears to be interaction between edge rate-limiter and streaming compressed frames: when the edge interrupts a compressed message the decompressor on the client sees corrupted suffix bytes. This is not strictly a zlib bug but a transport interruption scenario that the stack must handle (either flush/complete frames or close with a clear protocol-level error before truncating).\n- Affects customers using permessage-deflate over WebSocket. Not triggered on SSE or uncompressed WS frames.\n",
+  "comments": [
+    "2026-03-10 19:02 - Emma Chen: Opened after customer provided request traces and SDK logs. Customer reproduces reliably when their load generator ramps concurrently to 20+ streams. They reported disabling permessage-deflate temporarily fixed the issue.",
+    "2026-03-10 20:15 - Raj Patel: Confirmed we can reproduce a zlib EOF when we inject an upstream RST during an ongoing compressed frame. Created a minimal repro harness and filed INT-412 to track edge proxy change.",
+    "2026-03-11 09:32 - SRE (Marta Gomez): Collected pcap + zlib raw stream from repro run (s3://redwood-support/artifacts/SUP-204842/pcap.tar.gz). Observed the same truncated deflate block and decompressor error on client-side."
+  ],
+  "investigation_notes": [
+    "2026-03-11 - Hypothesis: Edge rate-limiter currently returns a 429 with a short response body while a compressed WS message is mid-stream; the proxy does not signal an application-level close, resulting in truncated compressed blocks reaching the client decompress path.",
+    "Edge proxy component (edge-proxy v2.4.1) uses streaming-chunk forwarding; on high load it attempts opportunistic early 429 and can close TCP connection mid-message. Need to ensure 429 responses are delivered only between compressed message boundaries or convert to a higher-level control frame.",
+    "Repro notes: Reproducer uses ws-client with permessage-deflate, sends 30s generation. Reproducer injection: close server->client socket after 70% of compressed frame bytes forwarded. Client zlib error matches customer logs."
+  ],
+  "resolution_notes": [
+    "2026-03-12 - Short-term: Edge and proxy teams applied a guard to avoid injecting 429 while a compressed message is in-flight; instead the edge now marks session for graceful throttling and sends a TCP FIN after the current message completes where possible.",
+    "2026-03-12 - Medium-term: Implement detection to disable permessage-deflate negotiation on customer-dedicated pools if edge-conditions cannot guarantee message boundary safety. Patch PR: https://github.com/redwood-inference/edge-proxy/pull/781 (in review).",
+    "Follow-up: Add automated integration test in CI to simulate mid-frame interruptions and assert that client receives explicit protocol close or intact frames (ticket INT-412)."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_5f399449435d4cfcbab87c1e0a5e2b91"
+}

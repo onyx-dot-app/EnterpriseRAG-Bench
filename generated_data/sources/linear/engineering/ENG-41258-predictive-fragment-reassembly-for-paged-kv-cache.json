@@ -1,0 +1,85 @@
+{
+  "key": "ENG-41258",
+  "team": "engineering",
+  "title": "Predictive fragment reassembly and adaptive slab routing for paged KV cache",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-02-21",
+  "updated_at": "2025-03-12",
+  "creator": "Maya Patel",
+  "assignee": "Ethan Liu",
+  "project": "runtime-prefill",
+  "cycle": "2025-W08",
+  "estimate": "8",
+  "due_date": "2025-03-25",
+  "labels": [
+    "prefill",
+    "kv-cache",
+    "performance",
+    "paged-attention",
+    "eviction"
+  ],
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Background: On paged attention workloads we observe tail latency variability caused by fragmented KV entries across slabs and non-localized prefill traffic. Fragmentation increases decode jitter when the runtime has to assemble many small fragments during prefill and decode, and the scheduler frequently switches kernels due to uneven memory access patterns. This ticket investigates a predictive reassembly layer combined with adaptive slab routing to reduce real-time reassembly work, improve kernel locality, and lower 95th/99th percentile decode latency without regressing throughput or memory overhead.\n\nProblem statement: Small, scattered KV fragments for multi-turn sessions cause frequent micro-IO and kernel context switches during prefill. The current eviction and allocation heuristics prioritize simple recency and often leave hot fragments spread across slabs, increasing page faults and GPU kernel churn. We need a low-risk runtime change that: (1) detects hot fragment groups early, (2) reassembles/co-locates them proactively into contiguous slab segments during idle cycles, and (3) routes new allocations to slabs that maximize kernel-friendly locality.\n\nGoals: Reduce 95th/99th percentile decode latency by >=15% on conversational workloads with long histories; reduce kernel handoff events during prefill by >=25%; keep memory overhead <5% relative to baseline. Maintain or improve aggregate throughput and not increase eviction storms for cold keys.\n\nScope: Implementation touches KV allocator, slab metadata, prefill scheduler, and the kernel routing policy. No API changes. Changes are confined to runtime components behind a feature flag (kv_predictive_reassembly).\n\nHigh-level approach:\n1) Hot-fragment detector: lightweight in-memory counter on KV touch patterns per session-window (exponential decay). Marks fragment groups with a hot score.\n2) Background reassembly job: opportunistic compaction pass that runs during predicted idle windows on a per-shard basis. It allocates contiguous runs in a target slab and copies fragments to create a co-located region. The original fragments are tombstoned and reclaimed by a delayed free to avoid races.\n3) Adaptive slab routing: allocation hints from hot-detector steer new prefill allocations into slabs with existing co-located groups or into slabs with low fragmentation. The slab router prefers slabs that historically produced fewer kernel switches for similar sequence-length distributions.\n4) Prefill scheduler integration: tighten prefill hysteresis to batch prefill copies when background reassembly is running and to apply soft backpressure to imbalanced shards.\n\nSuccess metrics and measurement plan:\n- Latency: measure 50/95/99 P50/P95/P99 decode latencies on benchmark conv-long and chat-synth workloads.\n- Kernel events: count kernel handoffs and context switches per 1k requests.\n- Memory overhead: track additional peak memory used by reassembly buffers.\n- Eviction impact: measure eviction rate and cold-key miss rate.\n- A/B rollout: start with internal perf cluster (canary), then small % of production traffic behind the feature flag, monitor for regressions for 72h before wider rollout.\n\nCompatibility and constraints: Some models (very short sequence models) will not benefit and should be excluded via per-model routing table. The background compactor must be interruptible and yield to higher-priority decode work. Reassembly should be bounded by per-shard budget to respect latency SLOs.",
+  "acceptance_criteria": [
+    "P95 decode latency reduced by >=15% on conv-long benchmark compared to baseline when kv_predictive_reassembly is enabled",
+    "Kernel handoff events reduced by >=25% in canary runs",
+    "Peak extra memory for reassembly buffers <=5% of baseline working set",
+    "No increase in overall request error rate or timed-out prefill operations during 72h canary",
+    "Feature gated behind runtime flag and configurable per-tenant and per-model"
+  ],
+  "technical_notes": [
+    "Hot detector uses fixed-size ring counter per session bucket with exponential decay alpha=0.125 to avoid unbounded state growth",
+    "Reassembly uses double-buffer copy: allocate contiguous target range, copy fragments on CPU pinned host memory then GPU memcpy; perform atomic pointer swap for shard index",
+    "Delayed free TTL of 2x max inflight sequence length to avoid invalidating active decodes",
+    "Slab router maintains a light-weight scoreboard: per-slab avg kernel-switch rate and avg sequence-length histogram (coarse buckets). Routing uses a weighted score combining fragmentation ratio and kernel-switch metric",
+    "Background compactor runs with QoS class low and max budget of 50ms per shard per minute to limit interference",
+    "Feature flag exposes knobs: reassembly_budget_ms, hot_threshold, slab_routing_weight, delayed_free_ttl"
+  ],
+  "tasks": [
+    "Design API surface for slab scoreboard and expose to kernel router (Ethan)",
+    "Implement hot-fragment detector and in-memory counters (Ruth)",
+    "Implement background reassembly job with safe pointer swap and delayed free (Ethan)",
+    "Add slab routing heuristic and configuration flags (Jamal)",
+    "Instrument kernel handoff and memory metrics for dashboards (SRE)",
+    "Write unit and integration tests for reassembly correctness and race conditions (Ruth, Ethan)",
+    "Run canary on internal perf cluster and collect A/B metrics (SRE)",
+    "Prepare rollout playbook and rollback threshold alerts (Support)",
+    "Benchmark end-to-end with conv-long and chat-synth; record baselines (Bench team)"
+  ],
+  "dependencies": [
+    "ENG-31807",
+    "ENG-40321"
+  ],
+  "risks_and_mitigation": [
+    "Risk: Reassembly copies could create transient memory spikes -> Mitigation: enforce reassembly_budget_ms and global buffer caps",
+    "Risk: Delayed free incorrectly held long-lived memory in pathological workloads -> Mitigation: add tunable TTL and emergency compaction path that forces reclamation under memory pressure",
+    "Risk: Incorrect pointer swap could cause stale reads -> Mitigation: use atomic compare-and-swap with schema versioning and unit tests to validate visibility",
+    "Risk: Feature interacts poorly with autoscaler burst policy -> Mitigation: add autoscaler-aware compactor suspend when burst capacity is active"
+  ],
+  "alternatives_considered": [
+    "Aggressive per-request coalescing (rejected): While simple, it increases tail latency for the triggering request and hurts P50 without addressing fragmentation trend",
+    "Global offline compaction (rejected): Too heavyweight and requires long pauses; not acceptable for latency SLOs",
+    "Model-specific prefill profiles (deferred): Might help for a small set of models but doesn't generalize across unknown user workloads"
+  ],
+  "comments": [
+    "2025-02-21 Maya Patel: Created ticket after investigating persistent P99 spikes on conv-long in cluster-a. Collected traces showing repeated tiny GPU memcpy and kernel switches for the same session.",
+    "2025-02-23 Ethan Liu: Prototype of hot detector implemented; memory overhead sub-1% in microbenchmarks. Need to validate false positives under bursty traffic.",
+    "2025-02-27 Ruth Gomez: Background reassembly algorithm sketches uploaded to Confluence: https://confluence.redwood.ai/display/RUNTIME/Fragment+Reassembly+Design. Includes sequence diagrams for pointer swap and delayed free.",
+    "2025-03-03 Jamal Khan: Added slab scoreboard structure to runtime telemetry; dashboard PR: https://github.com/redwood-inference/infra/pull/4821. Initial metrics look promising on internal traffic.",
+    "2025-03-08 SRE (CI): Canary run scheduled on perf-cluster-2 for 24h. Initial telemetry shows -12% P95 and -22% kernel handoffs. Still below target for P95; tuning reassembly_budget_ms next.",
+    "2025-03-12 Ethan Liu: Increased hot_threshold and reduced reassembly_budget_ms to reduce background interference. New canary run started; collecting 72h data. Added checkpoint to disable feature if request_error_rate > 0.1% or P99 regresses by >5%"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "technical_notes",
+    "tasks",
+    "risks_and_mitigation",
+    "alternatives_considered",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_0e01dd5ed66d4076bbf70488d0c606d1"
+}

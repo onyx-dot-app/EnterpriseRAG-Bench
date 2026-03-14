@@ -1,0 +1,117 @@
+{
+  "key": "ENG-6101",
+  "team": "engineering",
+  "title": "Adaptive kernel autotuner: architecture & seq-len aware kernel picking",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "creator": "Maya Chen",
+  "assignee": "Diego Ruiz",
+  "project": "serving-runtime-autotune",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "release": "runtime-1.20",
+  "labels": [
+    "runtime",
+    "kernel-selection",
+    "autotune",
+    "performance",
+    "telemetry"
+  ],
+  "description": "Add an online and offline autotuning subsystem that selects the optimal kernel variant for a model request based on detected hardware (arch), model architecture class, sequence length distribution, and batch size. The goal is to reduce per-token cost and tail latency by automatically choosing fused/low-memory kernels when appropriate and falling back to robust defaults when unstable.",
+  "background": "We ship multiple kernel variants for attention and matmul paths (fused attention, segmented attention, tiled matmul with different tile sizes, int8/FP16 paths). Right now kernel choice is static at model load-time and tuned by hand for a few canonical configs. With more model families, quantization profiles, and hardware generations, static picks cause suboptimal throughput or OOMs for uncommon seq-len/batch combos. This ticket designs and implements heuristics and an autotuner to pick kernels dynamically and cache decisions per model+variant+env.",
+  "goals": [
+    "Reduce P95 token latency by >=10% for long-prefill workloads (seq_len >= 1024) on Ampere A100 and H100-class nodes.",
+    "Reduce average token cost by >=8% across representative workloads via better kernel picks and quantization-aware choices.",
+    "Limit autotuner overhead to <1% of traffic and ensure safe automatic rollback on regressions.",
+    "Expose kernel decision telemetry and per-model decision history in Console for SRE/Customers."
+  ],
+  "non_goals": [
+    "Automated model architecture search or quantization tuning beyond kernel variant selection.",
+    "Replacing the per-model pinned kernel option; we still allow explicit overrides for enterprise customers."
+  ],
+  "proposed_solution": "Two-part system: (1) an offline microbenchmarking harness that runs candidate kernel variants against a matrix of (architecture, seq_len bucket, batch_size, model-type) to build an initial decision table; (2) an online lightweight probe/autotuner that validates and refines picks under production traffic and records results to a per-tenant decision cache. The runtime picks kernels at request scheduling time using the decision cache; if no match exists, it falls back to a conservative default and triggers a background probe job.",
+  "heuristics_overview": [
+    "Detect hardware microarch and memory topology (A100/H100/RTX/AMD) and use it as a primary axis for decision keys.",
+    "Bucket sequence lengths into {short: <=64, medium: 65-512, long: 513-2048, xl: >2048} with ability to tune buckets per-model family.",
+    "Use model-class hints (decoder-only, encoder-decoder, mixture of experts) provided in model metadata to prefer fused kernels when semantics align.",
+    "Consider batch size and KV cache reuse: small-batch low-latency should prefer kernels optimized for single-token decode while large-batch prefill should pick throughput-optimized tiled matmul.",
+    "Weigh memory footprint vs compute: prefer int8 kernels only when quantization-quality checks passed and when peak memory is near device limit.",
+    "Penalty term for kernel-switching cost: if switching kernel would flush/resize KV caches or require layout transforms, add switching overhead to decision score.",
+    "Safety rule: never pick kernels that have previous OOM or correctness regression telemetry for the same model+env.",
+    "Cooldown and exploration: after a stable pick, allow periodic low-traffic exploration (1-2% sampling) for 24-72 hours to detect improvements on updated drivers or new load patterns.",
+    "Persist decisions keyed by model_id:arch:seq_bucket:batch_bucket:quant_profile with TTL and manual overrides visible in Console.",
+    "Enable an opt-out label (customer opt-out or high-security customers) to pin kernels and disable online probing.",
+    "Expose a per-decision confidence metric derived from comparison of P50/P95 and mem headroom across candidate kernels.",
+    "Fallback policy: if probe shows regression >5% P95 or any correctness anomaly, revert to last known-good kernel and flag for manual review.",
+    "Telemetry-driven defaulting: new models start with offline-harness recommended kernel for model family and arch.",
+    "Integrate with rollout policies: canary the tuner across a subset of capacity (region or dedicated pool) before global enablement."
+  ],
+  "autotuner_architecture": "Compact description: a controller service (autotune-controller) collects microbench results and live probe telemetry, writes decisions to the decision cache (Redis-like fast store), and exposes an advisory API the serving runtime queries synchronously at route-prep time. Probe jobs run in isolated sandbox workers with configurable resource limits; results are scraped into telemetry with detailed metrics.",
+  "experiment_plan": [
+    "Phase 1 - Offline sweep: run microbench matrix across archived models (gpt-like, t5-like, long-context models) on A100/H100 nodes. Collect latency/throughput/mem for each kernel variant and build baseline decision table.",
+    "Phase 2 - Staging canary: enable online probing for non-prod traffic on a small fraction of lanes; validate probe stability and rollback triggers.",
+    "Phase 3 - Production limited rollout: enable on <10% of traffic for 48 hours, monitor P50/P95, OOMs, correctness signals, and cost metrics.",
+    "Phase 4 - Gradual ramp to 100% with automatic rollback if cumulative regression thresholds exceeded.",
+    "Measurement: collect per-token latency histograms, tokens/sec, GPU util, memory high-water, OOM counts, kernel-switch count, and customer-level impact.",
+    "Bench harness: extend existing perf-bench service to support custom seq_len traces and KV-cache warm/cold runs.",
+    "Success criteria: see goals above; additionally confirm autotuner accuracy by sampling decisions and validating predicted wins vs observed."
+  ],
+  "acceptance_criteria": [
+    "Autotune-controller and decision cache implemented and reachable from runtime; serving runtime reads decision within 1ms added median scheduling overhead.",
+    "Offline microbench outputs stored and used as initial decision table for at least three model families.",
+    "Online probe job runs without causing OOMs; probe overhead on production fleet <1% of GPU time.",
+    "Canary rollout completed with documented telemetry and no customer-facing regressions; roll forward to 100% toggled by SRE/PM.",
+    "Console surfaces per-model kernel decisions, confidence, and history; user can pin or override decisions.",
+    "End-to-end test: for a selected long-prefill workload, P95 improved by >=10% on A100/H100 in controlled run.",
+    "Documentation: runbook for debugging decision regressions, and an internal guide for adding new kernel variants to the harness."
+  ],
+  "risks_and_mitigations": [
+    "Risk: probes could trigger OOMs or slowdowns. Mitigation: run probes in isolated sandboxes and limit probe batch sizes and runtime budgets.",
+    "Risk: noisy measurements may cause flip-flopping. Mitigation: require statistically significant wins with hysteresis and cooldown windows before switching.",
+    "Risk: increased system complexity. Mitigation: keep decision logic small in the hot path; heavy heuristics and aggregation live in controller not in runtime.",
+    "Risk: customer compliance objections. Mitigation: opt-out/pinning per-tenant and audit logs for kernel choice changes.",
+    "Risk: hardware driver updates change kernel performance. Mitigation: continuous offline sweeps on driver upgrades and version-tag decision entries by driver kernel version.",
+    "Risk: telemetry volume. Mitigation: sample and aggregate at 1s buckets and store detailed traces only for failures.",
+    "Risk: correctness regressions for fused kernels. Mitigation: include numeric and output-diff tests in harness and block auto-enablement until tests pass.",
+    "Risk: increased rollout blast radius. Mitigation: stepwise ramping, automatic rollback thresholds, and canary isolation.",
+    "Risk: model metadata missing or inaccurate. Mitigation: fallback to architecture-agnostic rules and treat missing metadata as lowest-confidence decisions."
+  ],
+  "dependencies": [
+    "ENG-5890",
+    "ENG-6032",
+    "PM-424",
+    "DES-317"
+  ],
+  "notes_and_links": [
+    "Design doc: https://docs.redwood/inference/rt-autotune-design (internal)",
+    "Perf harness repo PR: https://github.com/redwood-inference/perf-bench/pull/124",
+    "Console UI mockups: https://drive.google.com/drive/folders/console-autotune-mockups",
+    "Related ticket - kernel packaging: ENG-5890",
+    "Field notes from SRE: summarized in /internal/sre/autotune-ops-notes.md"
+  ],
+  "comments": [
+    "2026-03-12 Maya Chen: Ticket created after spike with Ampere A100 showing a 17% gap between default kernel and best-of-breed fused attention for long-prefill traces.",
+    "2026-03-13 Diego Ruiz: Added heuristics list and probe safety rules; started perf harness changes in feature branch. Q for @SRE: what isolation resources can we use for probes?",
+    "2026-03-14 Anika Bose (SRE): Recommend using isolated NVML-limited sandboxes on staging cluster q3 and provide two dedicated H100 nodes for probe validation. Suggested probe CPU/GPU quotas in design doc.",
+    "2026-03-14 Diego Ruiz: Updated acceptance criteria to include Console visibility and decision TTL. Planning to open initial PR for controller this week."
+  ],
+  "security_review_required": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "background",
+    "goals",
+    "non_goals",
+    "proposed_solution",
+    "heuristics_overview",
+    "autotuner_architecture",
+    "experiment_plan",
+    "acceptance_criteria",
+    "risks_and_mitigations",
+    "notes_and_links",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_7d888f4c74d840a788e9ff00c2767ab7"
+}

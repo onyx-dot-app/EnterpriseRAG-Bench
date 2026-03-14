@@ -1,0 +1,104 @@
+{
+  "key": "ENG-24756",
+  "team": "engineering",
+  "title": "Offload batch sampling to background worker to prevent hot-path allocations",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-15",
+  "updated_at": "2026-02-28",
+  "creator": "Aisha Patel",
+  "assignee": "Marcus Chen",
+  "project": "observability-tracing",
+  "cycle": "2026-W08",
+  "estimate": "5",
+  "due_date": "2026-03-15",
+  "labels": [
+    "tracing",
+    "performance",
+    "sampling",
+    "allocations",
+    "observability"
+  ],
+  "dependencies": [
+    "ENG-23140"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Problem: At high QPS the tracer hot path is allocating per-request metadata and performing synchronous sampling decisions that require temporary allocations and occasional mutex contention. This manifests as elevated heap churn (allocs/sec), higher p99 service latency under load, and increased GC pressure in customer-facing services. Tail-based sampling and occasional diagnostic span enrichment amplify the cost because decisions sometimes require constructing span metadata to evaluate rules.\n\nGoal: Reduce hot-path allocation and CPU cost of sampling while preserving observability signal for errors and tail events. Achieve a low-overhead fast path that: (1) performs only pointer-sized operations and deterministic lightweight checks; (2) defers expensive work to a background worker when appropriate; (3) keeps tail-sampling coverage for error/latency spikes; (4) is feature-flagged and rollable per-service.\n\nProposed approach: Implement a minimal synchronous sampler on the hot path that only performs a compact deterministic hash check and tag check (no string copies, no map allocations). For spans that are not immediately sampled, enqueue a small sampling token (struct with span id pointer, timestamp, and 1-byte flags) onto a lock-free per-thread ring buffer. A background batching worker will consume tokens, assemble the lightweight metadata snapshot, run the richer sampling rules (tail rules, user-defined predicates), and either persist the span for export or drop it. For spans that might be sampled immediately (errors, http status >=500, long-running traces flagged by priority), the hot path will short-circuit to the existing full sampler.\n\nWe will also introduce: pooled arena for temporary metadata used by the background worker, preallocated token pools to avoid allocation on enqueue, and backpressure policy (drop oldest tokens when ring buffer is full) with metrics to track drop rates. The new path must be pluggable and controlled by a runtime feature flag with per-service rollout and sampling thresholds.\n\nWhy different from previous work: Rather than adapting sampling probabilities alone, this ticket focuses on moving work off the critical path and minimizing allocations at the call site. It complements adaptive sampling initiatives by making the fast path allocation-free and providing a high-throughput background pipeline for heavier sampling decisions.",
+  "design_decisions": [
+    "Hot-path must not allocate: only store pointer/ids and 1-byte flags in token",
+    "Use per-thread lock-free ring buffer to avoid global mutex contention",
+    "Background worker will batch tokens (configurable batch size, default 128) to amortize cost",
+    "Backpressure strategy: drop oldest token and increment metric 'tracing.sampling.dropped' when buffer is full",
+    "Provide a deterministic initial hashing (FNV-1a) for consistent sampling without RNG allocations",
+    "Expose feature flag 'sampling.background.enabled' and per-service tunables: ring_size, batch_size, error_thresholds"
+  ],
+  "implementation_notes": [
+    "Add new lightweight token struct to runtime tracer package; ensure 16-byte size to fit in cache lines where possible",
+    "Implement per-thread ring buffer using single-producer single-consumer pattern for minimal sync ops",
+    "Background worker runs on dedicated runtime thread; uses preallocated arena for metadata snapshot and returns arenas to pool after batch",
+    "Integrate with existing tail-sampling rules path: background worker will call existing evaluator but pass a read-only shallow snapshot",
+    "Add feature flag gating and config validation at startup to avoid partial configuration breakage",
+    "Avoid copying span name or attributes on hot path; background worker will collect those lazily from span store",
+    "Add telemetry: 'tracing.hotpath.allocs', 'tracing.enqueue.latency', 'tracing.sampling.dropped', 'tracing.background.batch.latency'"
+  ],
+  "acceptance_criteria": [
+    "Service p99 latency under a synthetic 10k rps load does not increase by >5% after enabling feature flag",
+    "Heap allocations/sec decreases by at least 40% for instrumented endpoint compared to baseline (no feature flag)",
+    "Trace coverage for error events (HTTP 5xx and explicit errors) remains >=98% compared to baseline",
+    "Background sampling drop rate remains <0.1% under normal load and is observable via metric",
+    "Feature flag can be toggled at runtime without requiring binary restart (if platform supports dynamic flags); otherwise safe server restart acceptance tests exist",
+    "Documentation updated: tracer migration guide and config reference present in Confluence"
+  ],
+  "tests": [
+    "Unit: ring buffer correctness under single-producer-single-consumer boundary conditions",
+    "Unit: token pool allocation/free invariants",
+    "Integration: end-to-end sampling pipeline with mock evaluator ensuring sampled spans are exported",
+    "Load test: compare allocations/sec and latency before/after with 10k rps synthetic workload (Github perf harness: /redwood/infra/perf/tracing/offload-batch)",
+    "Chaos test: force background worker stall and verify backpressure metrics and safe failure mode (drops with metric, no blocking of hot path)",
+    "Regression: run previously failing perf regression test suite (ENG-19876 regression list) and assert no regressions introduced"
+  ],
+  "rollout_plan": [
+    "1) Feature gated merge to main behind 'sampling.background.enabled' (dev-only default off)",
+    "2) Canary: enable for 5% of runtime instances in staging product cluster; run 48-hour smoke/perf suite",
+    "3) Monitor: allocations/sec, p50/p95/p99 latency, 'tracing.sampling.dropped' and compare to baseline dashboards",
+    "4) Expand to 25% then 100% if stable; if dropped metric >1% or latency regressions >5% rollback immediately",
+    "5) Post-rollout: enable background sampling for dedicated/different deployment types after validating VPC/on-prem memory behavior",
+    "6) Add dashboard tile to console: 'Sampling offload KPIs' showing drop rate, enqueue latency, background batch time"
+  ],
+  "updates": [
+    "2026-02-15 - Aisha Patel created ticket after profiling in customer-prod showed 65k allocs/sec on tracer hot path.",
+    "2026-02-17 - Spike completed: implemented PoC using ring buffer and background worker in internal dev build. Observed ~45% alloc reduction in PoC. PoC PR: https://github.com/redwood/inference/pull/1207",
+    "2026-02-19 - Design review with Trace team and Runtime: agreed on token size constraints and backpressure semantics; added preallocated arena idea to reduce batch GC spikes.",
+    "2026-02-22 - Implemented initial worker and integrated with tail-sampling evaluator. Benchmarks: allocations/sec down 38%, p99 latency neutral. Internal PR: https://github.com/redwood/inference/pull/1253",
+    "2026-02-25 - QA found edge-case where long-running spans never flushed if worker crashed; added watchdog and flush-on-shutdown in 1253.2",
+    "2026-02-28 - Running staging canary on 'platform-staging-2' with 5% traffic; monitoring dashboards configured (link below).",
+    "NEXT - Complete additional load tests, add docs, and prepare runtime-1.20 release notes entry"
+  ],
+  "attachments": [
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/OBS/pages/Offload+Batch+Sampling+Design",
+    "Perf harness: https://github.com/redwood/infra/tree/main/perf/tracing/offload-batch",
+    "PR (PoC): https://github.com/redwood/inference/pull/1207",
+    "PR (implementation): https://github.com/redwood/inference/pull/1253",
+    "Staging dashboard: https://console.redwood.ai/dashboards/sampling-offload-canary"
+  ],
+  "risks_and_mitigations": [
+    "Risk: Background worker falls behind under sustained burst load -> Mitigation: bounded ring buffer with drop metrics and adaptive backoff for background evaluator",
+    "Risk: Missing span metadata for late sampling decisions -> Mitigation: capture minimal snapshot (ids, critical attributes) in token; allow optional lazy enrichment if needed",
+    "Risk: Increased memory footprint due to arenas -> Mitigation: tune arena sizes per-service and use shared pools with eviction",
+    "Risk: Observability regressions in edge-case flows -> Mitigation: keep full sampling path for error/high-priority spans and add end-to-end tests"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "design_decisions",
+    "implementation_notes",
+    "acceptance_criteria",
+    "tests",
+    "rollout_plan",
+    "updates",
+    "risks_and_mitigations"
+  ],
+  "dataset_doc_uuid": "dsid_2af751a415c44b96b78137b4125446fc"
+}

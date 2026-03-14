@@ -1,0 +1,53 @@
+{
+  "key": "ENG-76459",
+  "team": "engineering",
+  "title": "Lease-anchored slot reclamation with skyline-watermark invariants for prefix-coherent KV cache",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-03-12",
+  "creator": "Maya Chen",
+  "assignee": "Rafael Ortiz",
+  "project": "runtime-kv-2026",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-04-01",
+  "labels": [
+    "kv-cache",
+    "eviction",
+    "gpu-memory",
+    "continuous-batching",
+    "correctness",
+    "prefetching"
+  ],
+  "parent_issue": [
+    "ENG-33421"
+  ],
+  "dependencies": [
+    "ENG-61234",
+    "ENG-47205"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.24",
+  "security_review_required": "false",
+  "description": "Background:\nRedwood's KV cache is critical for continuous batching performance. Current hybrid LRU/TTL strategies reduce miss rates but leave edge cases where prefix-affinity (multiple in-flight requests sharing prefixes) and lease/TTL interactions can cause either premature eviction or memory holds that prevent batch throughput. This ticket designs and implements a lease-anchored slot reclamation mechanism with a skyline-watermark invariant to ensure prefix-consistent correctness and bounded staleness while improving GPU memory compaction.\n\nGoals:\n- Introduce a slot-based reclamation layer on top of existing KV slabs that: (1) groups entries into short-lived \"slots\" aligned with live leases; (2) allows bulk reclamation when skyline watermarks indicate safe compacting without violating prefix-affinity constraints.\n- Define formal invariants that guarantee no request will observe a missing prefix entry if the request's lease claims it should be visible (prefix linearizability relative to lease epochs).\n- Ensure eviction decisions respect a hybrid score combining LRU recency, TTL expiration, and prefix-affinity weight, but underpinned by the skyline-watermark safety check to avoid unsafe reclamation during concurrent prefetch/evict cycles.\n- Reduce long-tail GPU memory spikes by 20% on 95th percentile and maintain token-latency SLOs (p50 < 30ms, p95 < 120ms) for typical production workloads.\n\nDesign overview (high level):\n1) Slots and leases:\n   - Each cache shard maintains a circular sequence of slots (configurable length N, default 128).\n   - Each entry is pinned to a slot when created or prefetched; slot assignment is based on the active lease epoch of the request that populated it.\n   - Leases have short lifetimes aligned to batching windows (e.g., 50-200ms) to provide coalescing semantics for continuous batching.\n\n2) Skyline-watermark invariant:\n   - Maintain two monotonic watermarks per shard: reclaimable_watermark and safe_visibility_watermark.\n   - reclaimable_watermark <= safe_visibility_watermark always. reclaimable_watermark marks the latest slot index eligible for reclamation by default; safe_visibility_watermark marks the latest slot index whose entries are guaranteed visible to any in-flight request with an earlier lease epoch.\n   - Reclamation can only free slots with index <= reclaimable_watermark AND only when safe_visibility_watermark has advanced beyond them.\n\n3) Hybrid scoring and prefix-affinity:\n   - Each entry has a score = alpha*recency_rank + beta*(TTL_expiry_score) + gamma*(prefix_affinity_score). Coeffs tunable via runtime config.\n   - Prefix affinity scoring increases weight for entries observed in multi-request prefix cohorts. This biases retention for hot prefixes even if recency is lower, but the skyline invariant prevents this from producing inconsistent visibility.\n\n4) Correctness invariants (to prove/validate):\n   - V1 (No-unsafe-evict): A slot can be reclaimed only if all in-flight leases that could reference its prefixes have ended or the safe_visibility_watermark has advanced.\n   - V2 (Prefix-linearizability): For any prefix P and times t1 < t2, if a request at t2 observes value v for P, then any request at t1 that had a lease intersecting t2 must not observe a value that implies v was already evicted inconsistent with lease semantics.\n   - V3 (Bounded-staleness): The maximum time between an entry's logical expiration (TTL or explicit invalidation) and physical reclamation is bounded by R ms (configurable default 500ms).\n\nImplementation plan:\n- Phase A (design + testing harness): author a standalone simulation harness (python + property-based tests using Hypothesis) to encode skyline-watermark transitions and validate invariants under adversarial lease and prefetch patterns. Link: docs/design/slot-reclaim-harness.md.\n- Phase B (shard-level runtime): implement slot metadata (compact u32 slot index per entry) and skyline watermarks; add reclamation worker loop with feature-flag. Ensure memory layout keeps entry footprint minimal (<= 8 bytes overhead).\n- Phase C (scoring + telemetry): plug hybrid scoring into eviction path, add per-prefix counters, expose metrics (slot_free_rate, skyline_lag_ms, bad-evict-events).\n- Phase D (canary rollout): behind a rollout flag, enable on dedicated staging GPU cluster and run A/B experiments vs baseline eviction with synthetic prefix-heavy workloads and production trace replay.\n\nAcceptance criteria:\n- Property-based harness shows zero invariant violations across 10k random lease/prefetch scenarios and targeted adversarial traces.\n- Unit + integration tests added covering: reclaimable_watermark advancement, safe_visibility gating, score-driven eviction decisions, and eviction under heavy prefetch bursts.\n- Benchmarks: 95th-percentile GPU memory usage reduced by >= 15% (goal 20%), end-to-end token latency p95 unchanged or improved by <= +5% relative delta.\n- No observed production regressions in canary; rollout to 25% of dedicated capacity with rollback instrumentation ready.\n\nKey tradeoffs and decisions considered:\n- Option A: aggressive slot trimming yields lower memory but higher coordination; Option B: conservative TTL-based reclaiming simpler but leaves fragmentation. We pick hybrid slot-level reclaiming gated by skyline-watermark to get best of both while keeping correctness checks lightweight.\n- We prefer lease epochs aligned to batching windows (short leases) rather than per-request unique ids to limit metadata churn. This increases chance of coalescing but requires careful watermark progression.\n\nTesting strategy and coverage:\n- Property tests: use hypothes.is-like fuzz harness to verify invariants under randomized lease durations, out-of-order request completion, and simulated crashes.\n- Fuzz harness in CI that runs 1M operations nightly (fast mode for PRs ~50k ops).\n- Integration: run production trace replay for 12 hours on staging with feature-flag on and compare cache hit/miss, evict anomalies, and skyline lag.\n\nRollout and monitoring:\n- Feature flag rollout plan: off -> 10% canary (dedicated staging) -> 25% (limited prod) -> 100% (release).\n- Critical metrics to watch: slot_free_rate, skyline_lag_ms, eviction_conflicts (counter for attempted reclaim blocked by safe_visibility), prefix_miss_regressions, p95_memory. Alert if eviction_conflicts spike or prefix_miss_regressions > 0.5% relative.\n\nOpen questions / follow-ups:\n- Should slot size be adaptive per-shard based on observed prefix cohort cardinality? (defer to follow-up ticket if needed)\n- Interaction with long-lived private deployments: consider exposing per-customer TTL/lease knobs.\n\nReferences and artifacts:\n- Design doc: docs/design/slot-reclaim-harness.md\n- Simulation harness: repo/tools/kv_slot_harness/README.md\n- Draft RFC: docs/rfc/2026-02-slot-reclaim-rfc.md\n\nImplementation notes:\n- Keep on-disk/host-visible metadata minimal: single 32-bit slot index + 16-bit affinity score saturating counter per entry.\n- Reclamation worker must use a fast path: check reclaimable_watermark and safe_visibility_watermark stamp without acquiring per-entry locks; only in contested cases acquire per-prefix fence.\n\n",
+  "comments": [
+    "2026-02-12 - Maya Chen: Added initial design sketch and invariants. Shared with runtime and research for review.",
+    "2026-02-18 - Rafael Ortiz: Prototype harness merged: PR https://github.com/redwood-inference/kv-tools/pull/118. Found edge case where concurrent prefetch can advance safe_visibility too slowly; added conservative backoff.",
+    "2026-02-24 - Priya Nair (REVIEW): Suggest changing default slot count to 256 for NVLink-attached shards; noted possible memory overhead, requested memory budget analysis.",
+    "2026-03-03 - Rafael Ortiz: Implemented shard skyline counters and added metrics. Initial microbench shows 12% p95 memory reduction on small replay.",
+    "2026-03-10 - Security (J. Park): Reviewed for potential timing side-channels; no immediate issues but requested a short doc on watermark exposure to telemetry."
+  ],
+  "attachments": [
+    "https://confluence.redwood.ai/display/RUNTIME/Slot+Reclaim+RFC+2026-02",
+    "https://github.com/redwood-inference/kv-runtime/pull/922",
+    "docs/design/slot-reclaim-harness.md",
+    "repo/tools/kv_slot_harness/README.md"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_47840179c6c046af8a54219f9d250015"
+}

@@ -1,0 +1,73 @@
+{
+  "key": "ENG-50321",
+  "team": "engineering",
+  "title": "Fix delayed quota reconciliation caused by API-key shadowing in proxy rotation",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-03-03",
+  "creator": "Aisha Gupta",
+  "assignee": "Riley Chen",
+  "project": "billing-consistency",
+  "cycle": "2026-W09",
+  "estimate": "8",
+  "due_date": "2026-03-10",
+  "labels": [
+    "billing",
+    "quota",
+    "rate-limiter",
+    "api-key",
+    "investigation"
+  ],
+  "parent_issue": [
+    "ENG-42190"
+  ],
+  "dependencies": [
+    "ENG-31228",
+    "ENG-24409"
+  ],
+  "customer_impact": "high",
+  "release": "billing-2026.03",
+  "security_review_required": "true",
+  "description": "Summary: Multiple customers reported over-quota errors followed by delayed billing reconciliation (hours later) after we rotated upstream API keys through the proxy fleet. Root cause appears to be an interaction between API-key shadowing in the edge proxy (short overlap window during rolling rotations), our realtime usage-aggregator that attributes tokens by key, and a separate background reconciliation job that deduplicates and attributes late-arriving proxy logs.\n\nScope & systems: attribution-service (real-time attribution), proxy (edge key routing + shadowing), usage-aggregator (stream consumer), backfill/reconciliation worker (batch consumer). Affected customers: enterprise accounts with sub-orgs that use short-lived API key rotation and route via our HTTP proxy layer (Dedicated + Private customers behind regional proxies).\n\nHypothesis: During a rolling key rotation where proxies shadow both old and new key headers for a brief period, some requests are forwarded with the new key but contain the old key in downstream X-Forwarded-Key headers (or vice versa). The realtime attribution uses the first-seen key header from proxy metadata, while the reconciliation job groups by token hash and then applies the latest binding timestamp. A race causes events to be temporarily recorded under an ephemeral placeholder tenant in the realtime store; reconciliation merges them later, creating a delayed reconciliation window which results in incorrect per-project quota enforcement (rate limiter hits) during the interim.\n\nReproduction steps (local cluster):\n1) Create two API keys for workspace W, rotate with overlap enabled on proxies.\n2) Send 500 short requests at T0 using new key but with proxy injecting old-key in X-Forwarded-Key for subset of requests.\n3) Observe realtime attribution stream showing ~25% of tokens attributed to orphan placeholder id; rate-limiter for project triggers at T0+10s.\n4) Run backfill worker manually; observe tokens merged into proper workspace and quota counters corrected.\n\nInitial metrics observed (Prod region us-east-1):\n- 2026-02-09 14:03\u201314:12: abnormal 1.9x increase in \"orphan-token\" counts per minute for 3 tenants.\n- Average reconciliation lag for affected shards: 34 minutes (tail 95th: 2.1 hours).\n\nImmediate mitigation: added an emergency retry in proxy to prefer canonical api_key header and strip stale forwarded key headers when rotation header present. This reduced orphan creation but is tactical.\n\nLong-term fixes considered: 1) make attribution idempotent by token hash + deterministic key binding precedence using rotation-timestamp; 2) change reconciliation worker to fast-path merge for recent windows (<1h) and update rate-limiter to consult both realtime store and reconciliation delta when evaluating per-request quota enforcement.\n\nNotes: this ticket focuses on implementing deterministic attribution precedence and guardrails in rate-limiter evaluation. Separate follow-up will harden proxy rotation choreography and add e2e tests.",
+  "comments": [
+    "2026-02-11 \u2014 Riley Chen: Initial triage complete. Reprobed on staging with minimal traffic; confirmed orphaned_attribution id set is created by aggregate-consumer when proxy forwarded legacy header. Captured message IDs and offsets. Created kafka dumps and uploaded to S3 (link in attachments).",
+    "2026-02-14 \u2014 Aisha Gupta (PM): Prioritized as P1 due to enterprise customers seeing quota spikes and support escalations. Suggested short-term mitigation to avoid hitting rate-limits for active users while we implement deterministic attribution.",
+    "2026-02-18 \u2014 Priya Nair (Infra): Implemented proxy header strip + canonicalize patch on staging (PR: https://github.com/redwood/proxy/pull/462). Staging shows orphan counts drop ~70% under rotation. Need unit tests for header precedence and a load test for overlap windows.",
+    "2026-02-22 \u2014 Riley Chen: Drafted change to attribution-service: add key_binding_timestamp field and make attribution selection choose binding with highest timestamp <= request_time. Patch in review: https://github.com/redwood/attribution/pull/1187. Requires migration to populate key_binding_timestamp for historical records before enabling feature.",
+    "2026-02-25 \u2014 Security (Ivan Morales): Reviewed approach; no keys or secrets will be persisted differently. Recommend audit log entry for rotation events to be surfaced to reconciliation workers. Marked security_review_required=true.",
+    "2026-02-27 \u2014 QA (Jin Park): Test plan for canary: create two workspaces, simulate rotation, inject mixed headers, run E2E. Added test harness and fixtures in repo. Will run on canary cluster next sprint.",
+    "2026-03-03 \u2014 Riley Chen: Migration strategy approved. Running backfill on a single shard as smoke test. Monitoring shows reconciliation lag reduces to <5 minutes for that shard. Planning staged rollout to 20% shards by 2026-03-07."
+  ],
+  "attachments": [
+    "https://dashboards.redwood.ai/d/billing/rotation-orphaned-tokens?orgId=1&from=1676000000&to=1676040000",
+    "s3://redwood-prod-dumps/ENG-50321/kafka-dump-20260211.tar.gz",
+    "https://github.com/redwood/attribution/pull/1187",
+    "https://github.com/redwood/proxy/pull/462",
+    "https://confluence.redwood.ai/display/BILL/Rotation+Attribution+Investigation"
+  ],
+  "acceptance_criteria": [
+    "Deterministic attribution logic implemented: attribution-service selects binding by token hash and key_binding_timestamp <= request_time",
+    "Rate-limiter evaluation consults reconciliation delta for last 10 minutes to avoid premature quota blocks",
+    "Backfill/migration completes for >90% shards within maintenance window and decreases reconciliation lag under 10 minutes",
+    "E2E tests added that simulate proxy overlap window pass consistently in CI",
+    "No increase in end-to-end request latency >2% in canary rolling deployment"
+  ],
+  "mitigation": "Short-term: proxy header canonicalization and header-stripping patch deployed to edge on Feb 16 (region us-east-1). Medium-term: deterministic attribution + fast-path reconciliation. Support runbook added to respond to quota complaints: temporarily lift per-project hard limits and force backfill on affected shards.",
+  "implementation_notes": [
+    "Add key_binding_timestamp column (nullable) to attribution DB (migration path: populate from rotation events stream).",
+    "Attribution selection algorithm: prefer binding where binding.timestamp <= request_time and has the longest lifetime; fall back to legacy behavior only if no binding exists.",
+    "Rate-limiter change: when evaluating a request, consult recent reconciliation-delta cache for token hashes seen in last 10min; merge counters before enforcing hard limits.",
+    "Backfill job: implement parallel shard workers with progress checkpoints and idempotent writes; provide opt-in dry-run flag.",
+    "Monitoring: add reconciliation-lag metric per-shard and broken-down by workspace. Alert if median > 15m or 95th > 2h."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "acceptance_criteria",
+    "mitigation",
+    "implementation_notes"
+  ],
+  "dataset_doc_uuid": "dsid_f3508d080c3748f0b3b106d9cd897687"
+}

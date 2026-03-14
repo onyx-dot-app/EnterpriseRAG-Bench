@@ -1,0 +1,45 @@
+{
+  "key": "ENG-582941",
+  "team": "engineering",
+  "title": "Hierarchical policy merge race causes 'unbounded' inheritance and bypass of route throttle",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-10",
+  "creator": "Ravi Menon",
+  "assignee": "Aisha Patel",
+  "project": "rate-engine-stability",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "metering",
+    "rate-limiter",
+    "postmortem-followup",
+    "high-impact"
+  ],
+  "customer_impact": "high",
+  "release": "enforcer-2.4.1",
+  "security_review_required": "false",
+  "dependencies": [
+    "ENG-421007",
+    "ENG-271819"
+  ],
+  "description": "Summary: We observed a production incident where traffic for a small number of orgs briefly bypassed per-route throttles and consumed quota far above configured limits. The root cause appears to be a race in the hierarchical policy merge logic combined with how we represent 'unbounded' policies. This ticket tracks the investigation, short-term mitigation, and the longer-term fix plan.\n\nWhat happened: At ~2026-03-01T09:37:12Z a sudden spike of requests from 3 customers generated an unusual surge of per-key throughput (10-20x expected). The runtime's enforcement logs show the route-level enforcer returning ALLOW for many requests that should have been RATE_LIMITED given org and route quotas. Billing dashboards showed corresponding token usage jumps and some customers received quota-exceeded alerts after the fact.\n\nScope: Affected path is the policy merge and evaluate flow (policy-loader -> policy-merge -> effective-policy cache -> route-enforcer). Only services using hierarchical policies (org -> project -> route) with at least one policy explicitly set to 'unbounded' were impacted. Rough estimate: 0.08% of traffic across hosted cluster during window; customer-facing high-severity for 3 orgs.\n\nReproduction steps (dev/staging):\n1) Create org-level policy with per-minute limit = 1000\n2) Create project-level policy with per-minute limit = 500 and route-level policy marked 'unbounded' (sentinel = null or MAX)\n3) Deploy a policy-loader refresh during high-concurrency request generation (use loadgen with 1k concurrent connections)\n4) Observe route-enforcer allowing >500 req/min while metric delta shows project limit not applied\n\nObserved logs and artifacts:\n- Enforcer trace snippets: 'merge_policies: selected_limit=MAX_INT effective_window=60s' followed by 'evaluate: allow for key=org:123 route=/v1/chat'\n- policy-loader audit: 'hot-reload: applied delta for org:123 at 2026-03-01T09:37:11.985Z'\n- Dashboard: /dashboards/billing/spikes?window=2026-03-01T09:30..09:45 (internal)\n- Incident runbook notes: https://confluence.redwood.ai/incident/2026-03-01-rate-merge-bypass\n- Draft PR with additional logs: https://github.com/redwood-inference/infra/pull/4123\n\nHypothesis / root cause:\n1) Policy representation: we encode 'unbounded' as a sentinel numeric MAX (2^63-1) to simplify arithmetic in evaluation.\n2) Merge algorithm picks the most permissive candidate by numeric comparison during hierarchical merges (org vs project vs route).\n3) During concurrent policy refresh, a transient state existed where the project-level policy record was briefly omitted from the in-memory policy set (race between delete+add operations from the loader).\n4) When merging, route-level 'unbounded' with sentinel MAX compared greater than project-level finite limit, so the resulting effective policy for the key ended up MAX.\n5) Combined with short TTL on effective-policy cache and the timing of refresh, requests in that window used the wrong merged policy, resulting in bypass.\n\nWhy this is different from previous 'shard/failover' bugs: the failure is logical (merge ordering + sentinel semantics) not a storage replication gap. Existing tickets focus on shard rebalances and duplicate credits; this is an invariance violation in the merge comparator and sentinel design.\n\nMitigations applied:\n- Short-term hotfix (deployed 2026-03-01 10:05Z): change merge comparator to prefer the most restrictive non-unbounded value if any non-unbounded exists in the ancestor chain (fallback rule). This was deployed as enforcer-2.4.1-hotfix.\n- Killswitch: added runtime flag 'enforce-prefer-restrictive-merge' to protect older clusters while we roll out.\n\nProposed long-term fixes:\n1) Policy model change: represent 'unbounded' with explicit enum rather than numeric sentinel; require merge to understand unbounded semantics (explicit precedence rules).\n2) Atomic policy refresh: coalesce loader updates for a single org/project into a single atomic swap to prevent intermediate omission states.\n3) Add unit + fuzz tests around merge semantics: combinations of bounded/unbounded values across 3 levels and concurrent update sequences.\n4) Backfill audit traces: emit 'effective-policy-source' in enforcer logs so we can trace where the effective limit originated (org/project/route) for any allow/deny decision.\n\nAcceptance criteria (done when):\n- Merge implementation uses explicit unbounded type and deterministic precedence documented in code and Confluence.\n- Loader performs atomic swap for policy bundles; tests ensure no intermediate missing-project state observable by enforcer.\n- New unit+integration tests added and passing in CI.\n- Rollout plan executed to all clusters and monitoring shows no similar spike for 7 days.\n\nImplementation plan and timeline:\n- 2026-03-02 to 2026-03-06: implement model change and merge logic (+ unit tests) (owner: Aisha)\n- 2026-03-07 to 2026-03-09: implement atomic bundle loader and integration tests (owner: Dev infra)\n- 2026-03-10: internal canary on staging and a single-hosted region (owner: SRE)\n- 2026-03-11 to 2026-03-13: progressive rollout across regions with runtime flag enabled by default after canary (owner: SRE/infra)\n- 2026-03-14: disable hotfix fallback and monitor for regressions (rollback window 2 hours)\n\nTesting notes:\n- Added a concurrency fuzz harness that simulates concurrent loader updates while loadgen exercises enforcers.\n- Integration test covers 1k concurrent clients and asserts no effective-policy ever becomes 'MAX_INT' when any ancestor level is bounded.\n\nOpen questions / trade-offs:\n- Backwards compatibility: changing policy model requires conversion for persisted bundles; we plan a migration path in loader that reads old numeric sentinels and writes explicit type. This is slightly more complex but safer than keeping sentinel arithmetic.\n- Performance: explicit enum handling adds a branch in hot path evaluation. Measurement in benchmark shows ~0.6% p99 latency increase in synthetic microbench; we'll micro-optimize if needed (e.g., precompute bitmask).\n\nReview feedback so far:\n- PM (Dana Liu): prioritize auditability; requester asked for 'effective-policy-source' field in logs \u2014 added.\n- Security (Noah Kim): no secrets or data exposure; ok.\n- SRE (Miguel Ortega): require a killswitch and staged rollout \u2014 implemented.\n\nLinks and artifacts:\n- Incident notes: https://confluence.redwood.ai/incident/2026-03-01-rate-merge-bypass\n- Draft design doc: https://confluence.redwood.ai/display/RATE/Explicit-Unbounded-Policy-Design\n- Draft PRs: https://github.com/redwood-inference/enforcer/pull/877 (merge logic), https://github.com/redwood-inference/infra/pull/4155 (atomic loader)\n- Canary dashboard: https://grafana.redwood.ai/d/abc123/policy-merge-canary\n\nNext steps: finish implementation tasks assigned to Aisha and infra, land PRs, run canary, then full rollout. After rollout, schedule a 1-week observation window and postmortem update with final root-cause and learnings.",
+  "notes": "2026-03-01 09:47: hotpatch applied; 10:05: hotfix deployed to prod; 2026-03-02: design approved; 2026-03-10: integration tests green in CI",
+  "sub_issues": [
+    "ENG-583002",
+    "ENG-583003"
+  ],
+  "related_links": [
+    "https://confluence.redwood.ai/incident/2026-03-01-rate-merge-bypass",
+    "https://github.com/redwood-inference/enforcer/pull/877",
+    "https://github.com/redwood-inference/infra/pull/4155"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_0d82e9861de148868261dabc5974d028"
+}

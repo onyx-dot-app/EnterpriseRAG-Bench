@@ -1,0 +1,98 @@
+{
+  "key": "ENG-37211",
+  "team": "engineering",
+  "title": "Redis route alias key collision causing silent throttles and cross-route token leakage",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-08",
+  "updated_at": "2026-03-12",
+  "creator": "Anika Rao",
+  "assignee": "Diego Martinez",
+  "project": "rate-limiter-hardening",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "release": "runtime-1.23",
+  "labels": [
+    "rate-limiting",
+    "billing",
+    "redis",
+    "urgent",
+    "observability"
+  ],
+  "customer_impact": "high",
+  "description": "Summary:\\nA bug in the token-bucket key construction for per-route rate policies allows route aliases to collide across different orgs and route families. In production this manifests as silent throttling of legitimate requests (tokens drained by unrelated routes) or, conversely, unintended allowance when a hot route replenishes a shared bucket. The root cause appears to be inconsistent canonicalization: some enforcement paths use route alias (human-friendly string) while others use canonical route_id, and the Redis key prefix omitted org scoping for burst buckets introduced in the 2025 burst refactor.\\n\\nWhy this is urgent:\\n- Affects per-route and per-key burst enforcement across org boundaries in multi-tenant setups.\\n- Can cause customer-facing throttles and incorrect billing signals.\\n- Existing mitigations (temporary circuit breakers) only mask symptoms; we need a deterministic fix and backfill for corrupted counters.",
+  "steps_to_reproduce": [
+    "1) Create two routes: r1 in org A with alias 'summarize', r2 in org B also aliased 'summarize'.",
+    "2) Configure a per-route burst policy that stores ephemeral burst counters in Redis under namespace REDIS_NAMESPACE='rate:v2:burst'.",
+    "3) From org B send a sustained burst to r2 until it exhausts tokens; observe the counter keys in Redis (using redis-cli HGETALL).",
+    "4) From org A send normal traffic to r1 and observe unexpected 429s even though its quota should be available.",
+    "5) Capture redis keys: note keys containing alias-only form 'rate:v2:burst:summarize' instead of 'rate:v2:burst:org-<org_id>:route-<route_id>'."
+  ],
+  "observed_logs": [
+    "2026-03-06T17:02:14Z enforce.go:542 WARN enforcement=burst route_alias=summarize org_id=org-A bucket_key=rate:v2:burst:summarize tokens_left=0",
+    "2026-03-06T17:02:14Z gatekeeper.go:213 DEBUG computed_key=rate:v2:burst:summarize policy_id=pbk-21 caller_key=k_abc",
+    "2026-03-06T17:02:14Z enforce.go:551 INFO fallback=global allow=false reason=exhausted_bucket",
+    "2026-03-06T17:02:15Z enforce.go:542 WARN enforcement=burst route_alias=summarize org_id=org-B bucket_key=rate:v2:burst:summarize tokens_left=0"
+  ],
+  "investigation_notes": [
+    "2026-03-07: Initial pager: multiple customers reported unexplained 429s with correlated timestamps across unrelated projects; SLO alerts for per-route latency spikes after throttle enforcement increased.",
+    "2026-03-07: Pulled Redis keyspace snapshot using hot-replica; found ~1200 buckets keyed without org prefix. These keys have mixed TTLs and show activity from multiple orgs.",
+    "2026-03-08: Cross-checked enforcement call sites: legacy path (pre-refactor) used canonical route_id and org_id when building token key. Burst refactor added a helper that returned route_alias to reduce key length; helper omitted org scope in two enforcement branches.",
+    "2026-03-09: Reproduced locally with docker-compose and redis v6 image; unit test added that triggers key collisions when alias duplicated across orgs.",
+    "2026-03-10: Confirmed that billing ingestion reads from per-org aggregated counters (not the burst ephemeral keys) so billing inaccuracies are possible but limited \u2014 main risk is transient customer-facing throttles and incorrect metrics in console per-route dashboards.",
+    "2026-03-11: Identified mitigations: add org-scoping to key helper, add a migration to rename orphaned keys to canonical names, and add runtime guard to prefer canonical route_id for enforcement until migration completes.",
+    "2026-03-12: Spike PR created to implement canonicalization + feature flag gate for rollout (PR: github.com/redwood-internal/rate-limiter/pull/7890)."
+  ],
+  "impact": "Some enterprise customers in EU and NA observed transient increased 429 rates for route-level burst policies. Cross-org token leakage also caused noisy metrics and occasional underbilling signals in route dashboards. Overall customer-facing impact high during window 2026-03-06 to 2026-03-07; since then we applied temporary per-org isolation feature flag on the routing plane which reduced occurrence.",
+  "mitigation": "Short-term (applied 2026-03-08): enabled per-org isolation feature flag for burst buckets on hosters with multi-tenant traffic; added throttling shedder to drop high-frequency bursters at edge.\\nLong-term (plan):",
+  "long_term_plan": [
+    "1) Fix: Update token-bucket Redis key helper to always include org_id and route_id and a policy namespace. Add a deterministic version suffix to avoid accidental reuse (e.g., rate:v3:burst:org-<id>:route-<id>:v1)",
+    "2) Migration: Implement offline migration job that scans rate:v2:burst:* keys, attribute them by matching recent access records (edge logs) and rekey into canonical names; fallback move into TTL-preserving keys for safety.",
+    "3) Runtime guard: Add fail-open safety that, during migration, checks both canonical and legacy keys and merges token counts atomically (with Redis Lua script) to prevent double-charge or accidental allowance.",
+    "4) Tests: Add unit and integration tests that create duplicate aliases across orgs and assert isolation; add property tests for key-canonicalization under concurrent writes.",
+    "5) Observability: Add a new metric rate_limiter.key_collisions{environment} and dashboard with alert when > 10 collisions/minute; add audit log event for migration operations.",
+    "6) Postmortem: Document customer incidents, notify affected accounts, and schedule a follow-up customer outreach program with SRE/Customer Success."
+  ],
+  "acceptance_criteria": [
+    "All enforcement code paths use canonical key helper with org+route scoping (code review \u2705).",
+    "Migration job successfully rekeys a production snapshot in a staging cluster without token loss (staging test \u2705).",
+    "Runtime guard merges legacy and canonical keys deterministically and has unit tests covering concurrent access (tests \u2705).",
+    "No regression in per-route latency or billing ingestion observed for a 48h canary in production region (canary metrics \u2705).",
+    "Monitoring and alerting for key collisions are in place and firing on synthetic collision test (observability \u2705)."
+  ],
+  "next_steps": [
+    "Diego: finish PR to change key helper and add unit tests (in review) - target merge 2026-03-13.",
+    "SRE (Leah): schedule migration run in staging and validate with traffic replay - target 2026-03-15.",
+    "PM (Marco): prepare customer communications for impacted orgs and coordinate with CS - draft by 2026-03-14.",
+    "QA: create integration scenario to run nightly for 7 days to ensure no regressions across traffic shapes.",
+    "Add a follow-up ticket to instrument billing pipeline to detect anomalies during migration (PM-42011)."
+  ],
+  "links": [
+    "PR: https://github.com/redwood-internal/rate-limiter/pull/7890",
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/INF/pages/Rate+Key+Collision+Postmortem",
+    "Dashboard: https://console.redwood.ai/dashboards/rl-key-collisions",
+    "Runbook: https://docs.redwood.ai/runbooks/rate-limiter-key-migration"
+  ],
+  "attachments": [
+    "redis-snapshot-2026-03-07-keys.txt",
+    "enforcement-trace-2026-03-06.log",
+    "staging-migration-plan.md"
+  ],
+  "dependencies": [
+    "ENG-37105",
+    "INFRA-2102"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_logs",
+    "investigation_notes",
+    "impact",
+    "mitigation",
+    "long_term_plan",
+    "acceptance_criteria",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_6ba590a7b3774186ab0dc5d85fef830f"
+}

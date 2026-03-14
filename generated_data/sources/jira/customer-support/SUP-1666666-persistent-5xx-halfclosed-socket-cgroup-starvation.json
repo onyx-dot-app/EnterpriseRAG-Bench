@@ -1,0 +1,83 @@
+{
+  "key": "SUP-1666666",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Sustained 5xx elevation caused by half-closed HTTP/2 sockets + cgroup CPU starvation on dedicated VPC",
+  "status": "Resolved",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-09",
+  "updated_at": "2026-03-11",
+  "reporter": "Aisha Patel",
+  "assignee": "Diego Morales",
+  "customer_company": "Nimbus Health",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "networking",
+    "dedicated-vpc"
+  ],
+  "labels": [
+    "5xx",
+    "http2",
+    "fd-exhaustion",
+    "cgroup",
+    "priority-p1"
+  ],
+  "environment": "prod us-east",
+  "affected_models": [
+    "gpt-large-v2",
+    "gpt-embed-1"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "first_response_due_at": "2026-03-09T16:00:00Z",
+  "sla_due_at": "2026-03-09T20:00:00Z",
+  "linked_issues": [
+    "INT-4298",
+    "SUP-472901"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/infra/pull/4012",
+    "https://github.com/redwood-inference/serving-runtime/commit/8b9c3f2"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/HC-HTTP2+Keepalive+Runbook",
+    "https://redwood.atlassian.net/wiki/spaces/CS/pages/Customer+VPC+Networking+FAQ"
+  ],
+  "description": "Issue summary:\\nCustomer Nimbus Health reported a sustained elevation in 5xx responses for their dedicated VPC tenant during steady traffic (mix of short chat and embedding requests). Errors manifested as API gateway 502/503/504s and frequent serving-runtime restarts for backends pinned to the customer's dedicated pool.\\n\\nImpact:\\n- Customer-facing requests returned 5xx at ~8-12% of requests for a 90-minute window, causing multiple downstream app failures and an incident page alert.\\n- Affected both streaming and non-streaming routes.\\n- No billing discrepancy reported. Priority set to P1 due to customer SLA and critical workflows.\\n\\nTimeline (high-level):\\n- 2026-03-09 14:05 UTC: Nimbus Health support pinged #support reporting elevated 5xx and streaming disconnects.\\n- 2026-03-09 14:12 UTC: Initial triage by CS; escalated to SRE and Dedicated-Team.\\n- 2026-03-09 14:30\u201315:55 UTC: Correlated spikes with large number of half-closed HTTP/2 streams from a specific app version in the customer's fleet.\\n- 2026-03-09 15:20 UTC: Observed repeated serving-runtime restarts on 3 dedicated GPU nodes.\\n- 2026-03-09 17:00 UTC: Mitigations applied (aggressively closed stale keepalives, temporary route weight reduction).\\n- 2026-03-09 18:50 UTC: 5xx rate returned to baseline; resolved and monitoring continued.\\n\\nSteps to reproduce (investigation guidance):\\n1) Replay customer traffic on a staging cluster using the same HTTP/2 client behavior (long-lived streams with intermittent half-close).\\n2) Run a scripted fanout using short chat requests + embedding calls and artificially delay client RST/FIN to emulate half-closed sockets.\\n3) Observe apigw socket counts, epoll wake rates, and runtime fd counts while increasing concurrency to the customer baseline.\\n\\nInvestigation notes / evidence:\\n- API gateway metrics: accept-queue depth rose modestly but connection count with state \"half-closed\" spiked 7x for the tenant between 14:10\u201315:30 UTC.\\n- netstat and socket diagnostics on edge proxies showed many sockets in CLOSE_WAIT and FIN_WAIT2 tied to the tenant's source IPs.\\n- Serving-runtime logs showed repeated EMFILE and \\\"too many open files\\\" traces immediately prior to SIGTERM restarts on GPU nodes (see logs_snippets below).\\n- cgroups metrics (cpu.stat) for the dedicated pool showed very high throttling (nr_throttled increased) concurrent with a drop in runnable threads in the runtime process; CPU steal/pressure caused slow handling of epoll events.\\n- NVML/kernel logs: no GPU OOMs, but several guarded watchdog timeouts caused by mainloop starvation; dmesg showed some user-space watchdog kills where runtime failed liveness check.\\n- Heap and file descriptor analysis: runtime leaked FDs under heavy half-closed stream conditions (multiplexed HTTP/2), exacerbated by delayed client RST which prevented close() paths from running promptly.\\n- We observed interaction: half-closed sockets increased internal epoll wake storms, main thread started spinning on select/epoll with high syscall rate; when cgroup CPU throttling kicked in (due to noisy neighbor within dedicated pool), the runtime could not catch up processing close() and cleanup, leaving FDs accumulating until EMFILE and process restart.\\n\\nRoot cause (summary):\\nA chain of factors created the 5xx wave: (1) the customer's app version opened many multiplexed HTTP/2 streams and left sessions half-closed; (2) apigw and serving runtime code paths did not aggressively reclaim half-closed sockets under high FD pressure; (3) a late-occurring cgroup CPU throttle in the dedicated GPU pool slowed runtime cleanup, causing a runaway FD accumulation and subsequent EMFILE-induced restarts. The combination (half-closed socket accumulation + CPU throttling) produced the sustained elevated 5xx.\\n\\nMitigation & resolution applied:\\n- Short-term (within incident window):\\n  - Applied tenant-specific keepalive timeout reduction and enabled aggressive half-close reclamation on the apigw for Nimbus Health (reduces CLOSE_WAIT lifetime).\\n  - Temporarily reduced route weight to the dedicated pool to lower concurrency and give runtime headroom.\\n  - Restarted affected runtime processes sequentially to drain FD backlog and re-establish healthy state.\\n- Long-term (follow-up actions implemented):\\n  - Serving-runtime change merged to main branch to better detect and forcibly close stale half-closed streams after N seconds and to proactively release FD resources during high accept rates (PR referenced below).\\n  - Infrastructure tweak: adjust cgroup CPU cap/limits for dedicated pools and add a guard that raises an alert when nr_throttled rises above threshold for >30s.\\n  - CS/AM item: ask Nimbus Health to roll forward to client v2.3.1 which fixes a known HTTP/2 stream shutdown bug (they confirmed planning a rollout).\\n\\nCurrent status and monitoring:\\n- Post-fix monitoring shows 5xx dropped back to baseline within 2 hours of mitigations and no further runtime restarts recorded for that tenant. We left a dedicated alert for the tenant that triggers at 3% 5xx for >5m.\\n\\nNotes and evidence links:\\n- Grafana: /d/edge/tenant-traffic?orgId=1&var-tenant=Nimbus+Health (apigw conn states, 14:00\u201319:00 UTC)\\n- Runtime logs (obfuscated): https://internal-logs/redwood/nimbus/2026-03-09/runtime-rotated.log.gz\\n- Kernel logs from node-03: https://internal-logs/redwood/nimbus/2026-03-09/dmesg-node-03.txt\\n\\nFollow-up items (owners):\\n- Serving runtime team: backport FD-reclamation change to the 2025.10 LTS branch and add unit tests (owner: Diego Morales).\\n- Infra/SRE: add cgroup-throttle alert and revise dedicated pool guardrails (owner: SRE team).\\n- CS: confirm customer rollout of client v2.3.1 and validate in staging after their upgrade (owner: Aisha Patel).\\n- Postmortem: publish short incident note in Confluence with timeline and RCA, link to fixes (owner: Incident Lead).",
+  "steps_to_reproduce": [
+    "Deploy a serving runtime and apigw on a dedicated pool sized ~3 nodes",
+    "Use an HTTP/2 client that opens 100s of multiplexed streams per connection and intentionally delays RST/FIN (simulate client bug)",
+    "Ramp to customer-concurrency baseline (approx 150 concurrent streams), include embedding + chat mix",
+    "Observe apigw socket states (CLOSE_WAIT, FIN_WAIT2), runtime FD counts, and nr_throttled in cgroups",
+    "Trigger CPU burst on same cgroup (simulate noisy neighbor) to reproduce throttle and observe EMFILE/restarts"
+  ],
+  "logs_snippets": [
+    "[2026-03-09T15:18:22Z] runtime ERROR: accept() succeeded but next close path failed: EMFILE (too many open files)",
+    "[2026-03-09T15:18:22Z] runtime WARN: fd_count=10240, fd_limit=10240, pending_cleanup=312",
+    "[node-03 dmesg 15:19] watchdog: task runtime_main: killed as it stalled for >30s",
+    "[apigw 15:14] conn_state: half-closed count for tenant Nimbus Health rose from 12->86 in 6m"
+  ],
+  "comments": [
+    "2026-03-09 14:20 Aisha Patel (CS): Customer reports ~9% 5xx. Provided request ids and sample traces.",
+    "2026-03-09 14:33 Diego Morales (SRE): Observed elevated CLOSE_WAIT sockets tied to Nimbus source CIDR; escalating to infra and runtime teams.",
+    "2026-03-09 15:05 Infra Pager: cgroup throttling event for dedicated-pool-7. Investigating noisy neighbor.",
+    "2026-03-09 16:40 Diego Morales (SRE): Applied keepalive timeout reduction and route weight change. Seeing immediate drop in half-closed sockets.",
+    "2026-03-09 18:30 Aisha Patel (CS): Customer confirms stability after rolling client's fixed version to 20% of their fleet; will complete rollout by EOD.",
+    "2026-03-11 09:10 Diego Morales (SRE): Backport PR merged (https://github.com/redwood-inference/serving-runtime/pull/401) and cgroup alert added to infra playbook. Marking incident resolved."
+  ],
+  "resolution": "Mitigations (aggressive keepalive/half-close reclamation and route weight reduction) removed immediate pressure. Root-cause fix deployed to serving-runtime (FD reclamation) and infra alerting added; customer upgraded client. Incident closed after 48h of stable telemetry.",
+  "postmortem_link": "https://redwood.atlassian.net/wiki/spaces/OPS/pages/INC-2026-03-09-Nimbus+HalfClosed+Socket+RCA",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs_snippets",
+    "comments",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_0714666048f54ac5beda4863761b2e07"
+}

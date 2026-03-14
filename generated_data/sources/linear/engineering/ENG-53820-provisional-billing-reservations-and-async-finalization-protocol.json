@@ -1,0 +1,126 @@
+{
+  "key": "ENG-53820",
+  "team": "engineering",
+  "title": "Provisional billing reservations and async finalization protocol",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-02-12",
+  "updated_at": "2025-03-01",
+  "creator": "Priya Nair",
+  "assignee": "Miguel Alvarez",
+  "project": "Metering and Billing Reliability",
+  "cycle": "2025-W07",
+  "estimate": "8",
+  "due_date": "2025-03-15",
+  "labels": [
+    "billing",
+    "metering",
+    "idempotency",
+    "reconciliation",
+    "runtime"
+  ],
+  "dependencies": [
+    "ENG-54001",
+    "ENG-54002"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.21",
+  "security_review_required": "true",
+  "description": "Problem: transient network errors, client retries, and long-running streaming sessions sometimes result in duplicate or prematurely recorded consumption against a customer's quota. Current approaches either overcharge immediately (optimistic billing on ingest) or risk under-reserving capacity (billing only on final commit), leading to customer disputes and throttling anomalies.\n\nThis ticket introduces a protocol for provisional billing reservations: when an inbound request is accepted for processing, the system will create a short-lived provisional reservation that deducts capacity and associates a reservation token with the request. Final billing is performed asynchronously when the request reaches a definitive terminal state (success, client-cancel, or failed-after-replay-window). Reservations auto-expire and are reconciled by a background finalizer that turns provisional reservations into final ledger entries or releases them back to quota under defined rules.",
+  "background": "Existing artifacts: several mitigation tickets explored ledgers, ack tokens, and windowed proxies but do not provide a simple client-facing reservation token that preserves quota semantics across retries and long-running streaming sessions. Customer incident INC-2024-11 exposed a production case where a multi-chunk streaming call retried a chunk and was billed twice because the service charged on first ingest without a durable finalization step.\n\nWe must keep API ergonomics for SDKs and hosted API while enabling Dedicated/Private deployments to opt into the protocol or use a compatibility shim.",
+  "goals": [
+    "Prevent duplicate billing for at-least-once ingestion and common retry patterns",
+    "Ensure predictable quota reservations for throttling and capacity planning",
+    "Allow fast acceptance path (low latency) without requiring synchronous durable ledger commit",
+    "Provide reconciliation and observability hooks for billing support and audits",
+    "Remain compatible with existing backends and allow gradual rollout"
+  ],
+  "non_goals": [
+    "Replace the canonical consumption ledger in this ticket (that remains a separate initiative)",
+    "Provide new billing UI for customers (billing UI work will be a follow-up)",
+    "Solve every edge-case for air-gapped private deployments in the first iteration"
+  ],
+  "proposed_protocol": "1) On request accept, runtime creates a provisional reservation record with: reservation_id (UUID), customer_id, model_id, estimated_token_budget, ttl (configurable, default 5 minutes), and origin metadata (client provided idempotency_key if present). This operation is cached in memory and written to a fast reservations store (redis/rocksdb) with a tombstone TTL for quick lookup. 2) The API returns reservation_id in headers: X-Redwood-Reservation. Clients and SDKs are encouraged to send this header on retries instead of the idempotency key. 3) When the request reaches a terminal state, the worker calls the reservations finalizer API: FinalizeReservation(reservation_id, final_token_usage, status). The finalizer atomically turns the provisional entry into a final ledger entry (debit) or marks it released. 4) If TTL expires without finalization, a background reconciler sweep marks older reservations as stale, attempts to correlate with logs and ingest traces, and then either finalizes them with a conservative estimate or releases them depending on configured policies per customer tier. 5) Retries that present the same reservation_id will dedupe at the admission layer and be routed to the in-flight session; if the reservation_id is missing, the server will honor idempotency_key but prefer reservation lookup. 6) Reservation records are immutable except by the finalizer; update paths are only allowed for extension requests (ExtendReservation), which refreshes TTL and updates estimated_token_budget (e.g., for long-running streams).",
+  "api_changes": [
+    "Add response header X-Redwood-Reservation: <reservation_id> on accepted requests",
+    "New endpoints: POST /reservations/finalize and POST /reservations/extend",
+    "Admission layer accepts optional header X-Redwood-Reservation to correlate retries",
+    "Document fallback behavior when neither reservation nor idempotency key is present"
+  ],
+  "sdk_changes": [
+    "All official SDKs add transparent reservation propagation: on initial request record returned header and attach it to subsequent retry attempts",
+    "Expose opt-in helper to pre-reserve capacity for multi-request workflows (reserve->send-chunks->finalize)",
+    "Retry logic prefers reservation propagation over generating new idempotency keys"
+  ],
+  "data_migration": "Reservations store is additive and ephemeral. We will introduce a reservations namespace in our fast store and a mapping table to the canonical ledger. No changes to existing ledger rows are required. During rollout we will enable a one-way export of finalized reservations to the ledger consumer so historical data remains consistent. Reconciler will tag migrated records with migration_tag to avoid double finalization.",
+  "reconciliation_playbook": [
+    "Reconciler runs a prioritized sweep ordering by reservation_age desc and customer_risk_profile",
+    "If correlation confidence > 90% (log trace matching consumption_id), finalize with the traced token count",
+    "If correlation confidence < 40% and reservation_age < 24h, release reservation back to quota and surface to billing support",
+    "If reservation_age >= 24h and no correlation, finalize with conservative estimate (min(config.conservative_pct * estimated_budget, observed_max_for_customer))",
+    "All reconciliations produce audit events and a support ticket autopopulated for manual review if policy-tied thresholds are exceeded"
+  ],
+  "metrics_and_alerting": [
+    "metric: reservations.created_total",
+    "metric: reservations.finalized_total",
+    "metric: reservations.expired_total",
+    "metric: reservations.reconciled_total",
+    "metric: reservations.dedupe_hit_rate",
+    "SLO: reservation finalization latency P95 < 10s for sync finalizers, background reconciler SLA for 95% within 1h",
+    "Alert: reconciler-error-rate > 0.5% for 15m",
+    "Alert: anomalies in reservation-to-ledger delta > 0.1% of daily volume"
+  ],
+  "testing_plan": [
+    "Unit tests for reservation lifecycle state machine",
+    "Integration tests: simulate client retries, streaming chunk restarts, and worker crashes during finalize",
+    "Chaos tests: kill process before finalize to validate reconcilers claim or finalize conservatively",
+    "Load tests: ensure reservations store can sustain peak qps with TTL churn",
+    "E2E billing sandbox: show no duplicate charges for common retry patterns across SDKs"
+  ],
+  "rollout_plan": "1) Feature-flag the protocol for internal sandbox customers. 2) SDK minor release enabling transparent propagation default off. 3) Enable reservation header on a small % of traffic for low-risk customers and observe dedupe_hit_rate and reservation finalization latency. 4) Gradually increase rollout while enabling reconciler dashboards and alerting. 5) Flip default SDK behavior after two weeks of stable metrics. 6) Announce to all customers with migration guide and opt-out for Dedicated/Private either via config flag or compatibility shim.",
+  "rollback_plan": "If reconciliation or customer-support tickets spike beyond thresholds, revert by disabling reservation creation and stop honoring reservation header; reservations already created will be reconciled using legacy path. SDKs will continue to back off to idempotency keys. Rollback requires a one-hour notification window for Dedicated customers to avoid split-brain quota treatments.",
+  "open_questions": [
+    "Policy: What conservative percentage should be used when finalizing stale reservations for enterprise customers vs. self-serve?",
+    "Storage: Use Redis with persistence vs. RocksDB local store for Private deployments?",
+    "Billing UX: Should customers see provisional reservations in the cost dashboard or only finalized entries?",
+    "Legal/audit: What retention period for reservation records is required for compliance?"
+  ],
+  "stakeholders": [
+    "Priya Nair (Product - Metering)",
+    "Miguel Alvarez (SRE - Billing Runtime)",
+    "Tanya Becker (Billing Operations)",
+    "Ethan Wu (SDK Lead)",
+    "Anika Sharma (Legal & Compliance)"
+  ],
+  "links": [
+    "https://confluence.redwood/PM/metering/reservations-proposal",
+    "https://github.com/redwood-inference/runtime/pulls/8421",
+    "https://docs.redwood/api#reservation-header",
+    "https://incident-reports/internal/INC-2024-11"
+  ],
+  "comments": [
+    "2025-02-14 Priya Nair: Core design reviewed with Billing Ops \u2014 agreed to keep conservative finalize default for self-serve and allow enterprise overrides.",
+    "2025-02-18 Miguel Alvarez: POC of reservations store using RocksDB on node shows <1ms median read/write under load; will test persistence tradeoffs.",
+    "2025-02-24 Ethan Wu: SDK changes drafted; prefer to return reservation id via response metadata object rather than raw header for typed SDKs.",
+    "2025-03-01 Tanya Becker: Reconciliation playbook looks good. Request adding a manual 'finalize now' tool in the billing console for support use."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "background",
+    "goals",
+    "non_goals",
+    "proposed_protocol",
+    "api_changes",
+    "sdk_changes",
+    "data_migration",
+    "reconciliation_playbook",
+    "metrics_and_alerting",
+    "testing_plan",
+    "rollout_plan",
+    "rollback_plan",
+    "open_questions",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_8316ab7991d04e669cd8907bcc1e9bf6"
+}

@@ -1,0 +1,78 @@
+{
+  "key": "SUP-531907",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "KV cache serialization spike causes backpressure and client timeouts on deep prompts with high max_tokens",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2025-01-17",
+  "updated_at": "2025-01-20",
+  "reporter": "Ava Chen",
+  "assignee": "Diego Morales",
+  "customer_company": "LumaDocs",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "kv-cache",
+    "api-gateway",
+    "scheduler"
+  ],
+  "labels": [
+    "long-context",
+    "timeout",
+    "kv-serialization",
+    "priority-investigation"
+  ],
+  "environment": "prod | us-east",
+  "affected_models": [
+    "redwood-alpha-1",
+    "gptj-6b"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2025-01-17T18:30:00Z",
+  "first_response_due_at": "2025-01-17T13:00:00Z",
+  "linked_issues": [
+    "INT-8842"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/2784"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/SUPPORT/pages/Long+Context+Timeouts"
+  ],
+  "description": "Issue summary:\nCustomer LumaDocs reports repeated request timeouts (504 / client disconnects) when sending prompts with very large context + max_tokens=120000 via the Redwood hosted API. Occurs primarily for streams that use function-calling and chunked streaming.\n\nImpact:\n- Several production API calls for LumaDocs are timing out during long-document summarization jobs, causing failed jobs and user-facing errors.\n- Error rate ~12% for affected routes over a 6-hour window; spikes align with heavy serialization activity on the serving nodes.\n\nEnvironment:\n- Hosted (Redwood managed), dedicated tenant for LumaDocs\n- Region: us-east\n- Models: redwood-alpha-1 (default), gptj-6b used for fallback testing\n\nSteps to reproduce (customer):\n1) Send a streaming generation request with a prompt consisting of concatenated OCRed pages (~90k tokens) plus system instructions (function-calls enabled).\n2) Set max_tokens to 120000 and enable streaming with chunk_size=1024.\n3) Observe response flow: initial tokens stream, then long pause (~20-60s), then 504 or client disconnect.\n\nObserved behavior:\n- Serving-runtime logs show a sharp CPU spike on the inference host coincident with a call to kv-cache serialize/flush.\n- During the spike, the request is held in the finalizer queue; downstream router returns 504 or the client times out.\n- When reproducing in a dedicated test cluster, increasing the CPU limit on the host delays but does not eliminate timeouts.\n\nExpected behavior:\n- Long-context requests should stream tokens progressively; KV cache maintenance should not block final token flushing or cause client-visible timeouts.\n\nLogs and traces:\n- Sample trace: https://observability.internal/redwood/traces/trace-2025-01-17-22abcd\n- Example serving log excerpt: \n  [2025-01-17T16:42:12Z] INFO finalizer: start finalize request SUP-531907-ctx-123\n  [2025-01-17T16:42:30Z] WARN kv-cache: beginning bulk-serialize (size=512MB, entries=19278)\n  [2025-01-17T16:42:55Z] ERROR api-gateway: upstream timeout after 30s while waiting for response\n  [2025-01-17T16:43:02Z] INFO finalizer: aborted due to client disconnect\n\nAdditional notes:\n- No concurrent autoscaler events recorded for the node.\n- Node has nvme-backed local disk; serialization writes are synchronous to disk in current runtime build.\n",
+  "steps_to_reproduce": [
+    "Prepare prompt: aggregate ~90k tokens of context (e.g., 100 pages OCR text).",
+    "Issue streaming generation call to /v1/generate with model=redwood-alpha-1, max_tokens=120000, streaming=true, chunk_size=1024, function_call enabled.",
+    "Observe token stream for ~10-20s, then long pause and eventual 504 or client disconnect."
+  ],
+  "comments": [
+    "2025-01-17 17:05 - Support (Ava): Acknowledged with customer, collected request ids and sample payloads. Escalating to infra on-call.",
+    "2025-01-17 17:22 - SRE (Diego): Reproduced on dedicated repro cluster. Observed large synchronous KV serialization spikes. Adding as investigation owner.",
+    "2025-01-17 18:10 - Support (Ava): Provided customer with temporary mitigation: reduce max_tokens to 40k OR disable function-calls for long-document summarization. Customer confirms reduced error rate but requires long-term fix.",
+    "2025-01-18 09:30 - Eng (Priya Rao): Hypothesis - synchronous kv-cache flush runs on finalizer thread causing blocking; propose async background serialization and streaming of final tokens before flush.",
+    "2025-01-19 11:15 - Eng (Diego): Deployed config change to defer KV flush until post-response for a subset of traffic (canary). Observed drop in 504s for canary traffic from 11% to 1.5%.",
+    "2025-01-20 08:05 - Support (Ava): Customer accepted the canary behavior as interim; requested ETA for full fix and follow-up on SLA impact."
+  ],
+  "investigation_notes": [
+    "Hypothesis validated: bulk synchronous KV serialization on finalize path is the root trigger for CPU spike and blocking behavior.",
+    "Reproducible locally with the same model and payload sizes. Profiling shows finalize thread spends ~25s in serialization (memcpy + compression) before returning.",
+    "Alternative mitigations tried: increasing finalize thread pool size reduces collisions but increases memory pressure; streaming token pacing reduces visibility of spikes but is not acceptable for customer's latency needs.",
+    "Canary config (defer-kv-flush=true) routed 5% of LumaDocs traffic; telemetry shows 90th/95th percentile token latency improved and timeout rate dropped substantially in canary.",
+    "Related internal ticket: INT-8842 tracking runtime rewrite for background KV compaction and non-blocking finalizer.",
+    "Trigger conditions: payloads > ~50k tokens and aggressive max_tokens (>100k) with chunked streaming and function-call serialization tend to hit this path."
+  ],
+  "resolution": "Interim: Enabled defer-kv-flush=true canary for LumaDocs and similar heavy long-context tenants; customer accepted as short-term mitigation. Workaround documented: reduce max_tokens, increase chunk_size to 4096, or disable function-calls for massive documents.\n\nPermanent: Engineering PR landed to implement asynchronous KV serialization and streaming-first finalizer behavior (see PR: https://github.com/redwood-inference/serving-runtime/pull/2784). Rollout plan: staged canaries across regions, monitor timeout rates and CPU/memory pressure, full rollout targeted for 2025-02-05.\n\nPostmortem action items created: INT-8842 (runtime refactor), DOC-124 (customer-facing guidance on long-context best practices), and add automated regression tests for >50k token flows in CI.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_08bd258df6aa445eaf0603fe8057684e"
+}

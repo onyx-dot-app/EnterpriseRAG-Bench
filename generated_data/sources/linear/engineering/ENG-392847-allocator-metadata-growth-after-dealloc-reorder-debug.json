@@ -1,0 +1,99 @@
+{
+  "key": "ENG-392847",
+  "team": "engineering",
+  "title": "Allocator metadata growth after dealloc reordering under continuous batching",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-14",
+  "creator": "Aisha Kumar",
+  "assignee": "Liam O'Connor",
+  "project": "runtime-memory-2026-Q1",
+  "cycle": "2026-W11",
+  "estimate": "5",
+  "due_date": "2026-03-21",
+  "labels": [
+    "cudaMallocAsync",
+    "kv-cache",
+    "allocator",
+    "memory-leak",
+    "continuous-batching",
+    "stream-epochs"
+  ],
+  "release": "runtime-1.28",
+  "security_review_required": "false",
+  "description": "Summary:\nWe observe steady growth in allocator-side metadata (hash table entries and deferred-free bookkeeping) over long-running continuous-batching workloads. Resident GPU memory (RSS) does not grow proportionally to payloads allocated, but allocator internal maps and deferred-free queues accumulate entries until a restart. This appears distinct from visible slab/page fragmentation; root cause seems to be reordering of dealloc calls across CUDA streams combined with pool metadata not reconciling migrated ownership entries.\n\nWhy this matters:\n- Leads to long-tail process RSS growth (1-3% over 24h on heavy KV-cache workloads) and increased CPU overhead during allocation path lookups.\n- Affects Dedicated pools with sustained small-chunk churn; customers with sustained throughput see gradual memory pressure and occasional OOM throttles.\n\nObserved behavior and signal: \n- Heap snapshots show map size increasing by ~0.8% per hour for steady tpm request rates.\n- Tracing shows many frees being enqueued to deferred-free lists tied to the stream that performed the allocation, but subsequent execution moves ownership and frees happen on different streams.\n- cudaMallocAsync logs show matching frees but allocator metadata (per-stream registry and global pool index) retains tombstone entries with stale stream affinity.\n\nPriority: P1 \u2014 causes customer-visible degradation on long-lived nodes and complicates rolling upgrades/eviction windows.",
+  "reproducer_steps": [
+    "Deploy runtime-1.28 on a single Dedicated worker with 8xA100 and default pooling enabled",
+    "Run continuous-batcher harness (internal: cbatch-2026-smallchunks) with synthetic KV cache pattern: 60k requests/min, mean seq_len=384, many prefix cache hits causing KV prefetches and small transient allocations",
+    "Capture periodic allocator snapshots (every 15m) using admin debug endpoint: /admin/allocator/snapshot",
+    "Enable verbose allocator tracing (ENV: ALLOC_TRACE=2) and collect 1h of traces",
+    "Observe map growth and compare to baseline run with batching disabled"
+  ],
+  "logs_evidence": [
+    "[2026-03-11T02:15:21Z] alloc_pool: insert key=0x7f8b3a9c size=4096 stream=cuStream_45 (deferred)",
+    "[2026-03-11T02:15:21Z] free_enqueue: ptr=0x7f8b3a9c stream=cuStream_12 -> deferred_on_stream=cuStream_12",
+    "[2026-03-11T02:15:21Z] reconcile_attempt: ptr=0x7f8b3a9c expected_stream=cuStream_45 found_stream=cuStream_12; tombstone retained",
+    "[2026-03-11T04:15:21Z] allocator_map.size=124832 -> 126104 (+1272 over 2h)"
+  ],
+  "experiments": [
+    "Experiment A: Force single-stream execution (serialize batches). Result: metadata growth stopped, map stable over 6h run.",
+    "Experiment B: Disable pooling (fallback to cudaMalloc/cudaFree). Result: no map growth; overall RSS higher but allocator metadata stable.",
+    "Experiment C: Add periodic global drain that attempts to reclaim tombstones every 5m. Result: slowed growth (~0.1%/h) but did not eliminate entirely due to racing allocations during drain.",
+    "Experiment D: Tag frees with allocation-epoch and force epoch reconciliation at batch boundary. Result: promising \u2014 map shrank after boundaries, but introduced a tail latency regression in microbenchmarks."
+  ],
+  "hypotheses": [
+    "H1: Deferred-free queues are keyed by stream id, but when ownership moves (KV cache warmup moves pointers between streams), metadata entries are not migrated or compacted and tombstones accumulate.",
+    "H2: cudaMallocAsync interaction with our multipool's per-stream slab registry leads to duplicate map entries for same pointer when freed on different stream, and the dedupe path is not always hit due to timing windows.",
+    "H3: Periodic trimming is insufficient because it does not run under the same thread/stream context as the allocator's fast path, causing missed reconciliation of in-flight pointer state.",
+    "H4: CRC/hash collisions in the pool index are not the core issue, but reveal logic gaps when an allocation's metadata is mutated concurrently with deferred-free processing.",
+    "Root suspected: race between stream-affinity bookkeeping and interleaved prefetch/free operations from the KV cache layer under continuous batching"
+  ],
+  "proposed_fix": "Short-term: add an aggressive drain path at batch end that performs epoch-based reclamation and a best-effort cross-stream reconciliation of deferred frees. Disable it behind a feature flag (ALLOC_RECONCILE_BATCH_END) and roll to Dedicated nodes first.\n\nMedium-term: refactor pool metadata to make deferred-free ownership explicit and transferable: store canonical allocation id + epoch; when a free on different stream is observed, canonicalize and reconcile immediately (idempotent path) instead of creating tombstones. Add unit tests simulating cross-stream reorders and a stress harness.\n\nLong-term: add a lightweight periodic compaction thread (configurable) that walks pool indices with bounded CPU budget and ensures metadata COW cleanup without affecting fast path. Consider augmenting cudaMallocAsync integration to provide explicit stream drain callbacks we can rely on.",
+  "acceptance_criteria": [
+    "No sustained allocator map growth (>0.05%/h) on cbatch-2026-smallchunks 24h run with feature flag enabled",
+    "End-to-end regression: p95 latency change < 2% with medium-term fix on baseline microbench",
+    "Unit and integration tests covering cross-stream free/order races included in CI",
+    "Rollout plan and feature flag present with telemetry to detect re-introduction"
+  ],
+  "prs": [
+    "https://github.com/redwood-inference/runtime/pull/1842 (drain-at-batch-end prototype)",
+    "https://github.com/redwood-inference/runtime/pull/1859 (pool-metadata-canonical-id-refactor WIP)"
+  ],
+  "next_steps": [
+    "Finalize prototype PR 1842 and run canary on 3 Dedicated nodes (owner: Liam)",
+    "Add deterministic race unit tests (owner: Aisha)",
+    "Schedule post-canary 24h cbatch run and collect allocator snapshots (owner: SRE: Priya Desai)",
+    "If canary stable, prepare runtime-1.28.1 patch release with feature flag off by default; enable for Dedicated by config",
+    "Document incident summary and mitigation in Confluence: https://confluence.redwood.ai/display/RUNTIME/Allocator+Deferred+Free+Reconciliation"
+  ],
+  "updates": [
+    "2026-03-10: Ticket created after oncall alerted to slow metadata growth on Dedicated pool nodes (INC-2026-0310-gpu-rss). Initial traces attached.",
+    "2026-03-11: Reproducer harness run, confirmed growth under continuous-batching. Experiment A/B/C executed; data in logs_evidence and experiments.",
+    "2026-03-12: Prototype drain-at-batch-end implemented (PR 1842). Microbench p50 unchanged, p99 +4% (investigating).",
+    "2026-03-13: Began refactor plan for canonical allocation ids and idempotent free path. Spike indicates moderate complexity in lock-free paths; pairing scheduled.",
+    "2026-03-14: Planning canary rollout and adding more telemetry counters: allocator.tombstones.count, allocator.reconcile_ops.count. Assigned to Liam for rollout orchestration."
+  ],
+  "related_issues": [
+    "ENG-40780",
+    "ENG-783214"
+  ],
+  "attachments": [
+    "s3://redwood-artifacts/allocator-snapshots/2026-03-11/snapshot-02.json",
+    "s3://redwood-artifacts/traces/allocator/2026-03-11/trace-01.jfr",
+    "https://dashboards.redwood.ai/d/allocator/metadata-growth?from=2026-03-10T00:00:00Z&to=2026-03-14T00:00:00Z"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "reproducer_steps",
+    "logs_evidence",
+    "experiments",
+    "hypotheses",
+    "proposed_fix",
+    "acceptance_criteria",
+    "next_steps",
+    "updates"
+  ],
+  "dataset_doc_uuid": "dsid_952270906135487eb1ab3146ba89c19c"
+}

@@ -1,0 +1,94 @@
+{
+  "key": "ENG-206172",
+  "team": "engineering",
+  "title": "Priority decay on stale shard lease causes low-priority requests to become unthrottled",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-05",
+  "updated_at": "2026-03-12",
+  "creator": "Sofia Chen",
+  "assignee": "Rohit Bhatia",
+  "project": "rate-limiter-stability",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "labels": [
+    "metering",
+    "rate-limiting",
+    "throttle",
+    "reliability",
+    "billing-impact"
+  ],
+  "description": "Summary: During a geo failover scenario, the shard lease refresher occasionally fails to reconcile priority decay state for per-key accumulators. The system then applies a time-based priority decay that incorrectly elevates the effective allowance for low-priority requests, allowing them to bypass normal throttles for a short window. This results in unmetered or undercounted requests and potential billing exposure.\n\nTechnical context: Our rate limiting runtime maintains two orthogonal pieces of state per logical key: (1) a token accumulator (bucket) and (2) a priority score that decays over time for low-priority classes to enable backpressure. Shard leases ensure a single authoritative writer per key. When a shard lease heartbeat is lost and the lease is considered stale, the lease manager triggers a local priority-decay fast-path to avoid stall; however, the fast-path was implemented to mutate the local priority without revalidating the token accumulator epoch. In single-shard normal flows this is safe; during cross-shard geo failovers it permits a period where priority is lowered while the token accumulator snapshot is stale, effectively widening the allowance window for the low-priority class.\n\nWhy new and different: Most recent tickets looked at duplicate meter events, shard collisions, or token-bucket desync. This bug is about an ordering problem between priority-decay and accumulator epoch reconciliation that transiently changes throttling semantics (not raw double-counting). It mixes policy evaluation ordering with lease lifecycle, and has both correctness and billing implications.",
+  "steps_to_reproduce": [
+    "1) Deploy a two-region runtime with shard affinity (region-a primary, region-b replica).",
+    "2) Configure a per-key policy with a low-priority class that uses time-decay and a small bucket (e.g., 10 tokens, refill 1/sec).",
+    "3) Start steady low-priority traffic to consume tokens until near 0 allowance.",
+    "4) Simulate a transient network partition causing region-a lease heartbeats to fail and region-b to assume leadership for those keys (fast failover).",
+    "5) Observe that for ~10-30s low-priority requests in region-b are admitted despite token counts indicating exhaustion. Check metrics and request traces for bypassed throttles."
+  ],
+  "observed_behavior": "Low-priority requests are accepted for a short window after a shard-leader transition. Request traces show policy evals reporting an elevated priority_score and token_accumulator epoch behind the authoritative store. Billing logs show a burst of unmetered or under-attributed requests to the org over the 10-30s window.",
+  "expected_behavior": "During lease transitions the runtime should not apply local priority-decay that can widen admission windows unless the token accumulator epoch has been reconciled with the authoritative shard. Either delay priority-decay until reconciliation completes or make the decay decision conservative (no-op) when lease state is stale.",
+  "impact_summary": "Customer impact: medium-high for orgs with tight per-key quotas and mixed-priority traffic. Risk: financial exposure due to unbilled requests, and potential SLA violations for higher-priority tenants if low-priority traffic preempts capacity. Observed in internal staging with a synthetic load generator and correlated to a small production incident affecting 3 customers for ~12s each.",
+  "severity": "high",
+  "customer_impact": "high",
+  "logs_and_artifacts": [
+    "Grafana dashboard: https://grafana.internal.redwood/company/rate-limiter/last-24h?panel=priority-decay",
+    "Incident runbook notes: https://confluence.redwood/company/rl_incidents#2026-03-priority-decay",
+    "Relevant traces (zipkin): https://traces.redwood/internal/trace/7f1a2b3c",
+    "Slack thread: https://redwood.slack.com/archives/C01234567/p1678001234567890",
+    "Repro harness (k8s job): github.com/redwood-inference/rl-tools/pull/142",
+    "Draft PR with initial fix: https://github.com/redwood-inference/runtime/pull/4218"
+  ],
+  "mitigation": [
+    "Hotfix: disable local priority-decay fast-path when lease_heartbeat_age > 2s (deployed to regions A/B) \u2014 reduces time window for unsafe decay.",
+    "Fallback: enforce read-after-write check where policy evals consult epoch tag; if epoch mismatch, apply conservative deny for low-priority class until reconciled.",
+    "Monitoring: add an alert on priority_score drift vs token_accumulator_epoch > 0 for any key with > 5 rejected high-priority requests in same window."
+  ],
+  "proposed_fix": "Primary fix: change the lease-manager/priority-decay sequence so that any local priority mutation is gated by a successful epoch reconciliation with the accumulator store. Introduce an atomic update path: fetch epoch -> apply reconcile -> apply decay in single coordinated transition. Add unit tests and chaos test that exercises heartbeat loss + failover.",
+  "rollout_plan": [
+    "1) Merge runtime PR with gating logic and tests (staging smoke).",
+    "2) Canary deploy to 5% traffic in a non-critical region for 24 hours with synthetic low-priority load.",
+    "3) If stable, roll to 50% then 100% over next 48 hours.",
+    "4) Post-deploy: run mass-scan to compare priority_score vs epoch drift across all keys and validate no residual windows."
+  ],
+  "notes": [
+    "Engineering notes: this touches hot path in policy-eval; keep latency overhead <1ms. We should prefer a logical epoch tag compare rather than a blocking read to authoritative store in steady state.",
+    "Design trade-offs: conservative approach denies low-priority requests during ambiguity (safer billing) but may increase user-perceived throttling; need product sign-off on acceptable temporary strictness.",
+    "PM feedback: customers prefer over-throttling to unexpected free capacity. Suggest customer-facing postmortem and potential billing reconciliation process for affected customers."
+  ],
+  "dependencies": [
+    "ENG-712908",
+    "ENG-771333"
+  ],
+  "parent_issue": [],
+  "sub_issues": [],
+  "release": "runtime-1.19",
+  "security_review_required": "false",
+  "qa_steps": [
+    "Add unit tests for epoch+decay gating logic in rate-evaluator module.",
+    "Integration test: simulate lease heartbeat drop and assert low-priority requests are denied until epoch reconcile completes.",
+    "Load test: verify no >1% increase in p50/p95 policy-eval latency after change."
+  ],
+  "updates": [
+    "2026-03-06: Initial triage \u2014 reproduced in staging with rl-tools harness (Sofia).",
+    "2026-03-07: Confirmed billing anomaly correlated to priority_score drift; notified PMs and SRE (Rohit).",
+    "2026-03-09: Deployed mitigation (disable fast-path when heartbeat_age>2s) to canary; observed reduction in incident rate (Eleanor verified).",
+    "2026-03-11: PR#4218 opened with gating logic; code review started (assign reviewers: @miguel, @eleanor).",
+    "2026-03-12: Security and Product reviewed trade-offs; proceeding with canary rollout plan."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "impact_summary",
+    "mitigation",
+    "proposed_fix",
+    "rollout_plan",
+    "qa_steps",
+    "updates",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_7e3b399e175c47a0bf17b7f621aeb686"
+}

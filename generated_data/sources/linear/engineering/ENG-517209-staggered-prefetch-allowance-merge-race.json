@@ -1,0 +1,110 @@
+{
+  "key": "ENG-517209",
+  "team": "engineering",
+  "title": "staggered-prefetch-allowance-merge-race-during-shard-eviction",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-28",
+  "updated_at": "2026-03-05",
+  "creator": "Alejandro Ruiz",
+  "assignee": "Priya Khatri",
+  "project": "metering-2026-Q1",
+  "cycle": "2026-W09",
+  "estimate": "5",
+  "due_date": "2026-03-12",
+  "labels": [
+    "metering",
+    "rate-limiter",
+    "kv-cache",
+    "high-impact",
+    "bug"
+  ],
+  "description": "Intermittent correctness bug in the rate-limiting policy engine observed during shard eviction and KV cache prefetch flows. Two asynchronous code paths (prefetch completion handler and eviction reconciliation job) can both apply allowance deltas to the same per-key ledger entry without robust idempotency, leading to either double-crediting or lost-credit depending on ordering. This manifests as transient throttling spikes for some orgs/routes and anomalous billing spikes for others.",
+  "reproduction_steps": [
+    "Deploy runtime build with ENABLE_PREFETCH=true and run a simulated shard-migration using the dev shard-rebalance tool",
+    "Create a synthetic tenant with high short-burst traffic (50 reqs/s) against a single route with per-route burst pool enabled",
+    "Trigger a TTL-based KV cache eviction mid-burst by forcing a shard move with --force-evict flag",
+    "Observe allowance updates in the ledger by streaming internal-metering events from the dev metrics endpoint (http://dev-internal/metrics/ledger)",
+    "Repeat with different network latencies between shard manager and reconciler components to increase chance of interleaving"
+  ],
+  "observed_behavior": [
+    "Immediate ~2x allowance delta applied in logs for a small window (30-200ms) for certain keys",
+    "Downstream: 5-15s throttle spikes on affected routes followed by a burst of allowed requests once reconciler corrects ledger",
+    "Billing pipeline: sampled usage shows transient duplicate increments for some keys in the hourly rollup dashboard",
+    "SLO: per-route p99 latency increases during the throttle spike windows due to retry storms"
+  ],
+  "expected_behavior": "Allowance mutations for a single logical request or reconciliation event should be applied exactly once and be idempotent across concurrent reconciliation/prefetch/eviction flows. No transient double-credit or lost-credit should occur regardless of interleaving or network latency.",
+  "logs_snippet": "[2026-02-28T14:22:10.123Z] reconciler: apply_delta key=user:acct:42 delta=+120 trace=rek-3f2\n[2026-02-28T14:22:10.150Z] prefetch-handler: commit_prefetch key=user:acct:42 delta=+120 trace=pref-98a\n[2026-02-28T14:22:10.155Z] ledger: new_balance key=user:acct:42 balance=240 (expected 120)\n[2026-02-28T14:22:15.001Z] throttler: throttle key=user:acct:42 route=/chat p99=512ms",
+  "hypothesis": [
+    "Root cause: lack of a global idempotency token when separate components reconcile the same ledger row",
+    "Secondary: optimistic merge path in the fastpath writes a delta without checking an ongoing reconciliation marker, so two writers can both commit deltas",
+    "Tertiary: background reconciliation job does not currently use compare-and-swap semantics against a monotonic revision field for ledger rows"
+  ],
+  "experiments_run": [
+    "Added temporary fastpath guard (in-memory) to prevent two concurrent writers in the same process: reduced incidence in single-node tests",
+    "Injected artificial 50-200ms latency on reconciler RPCs: reproduced interleaving deterministically in perf lab",
+    "Implemented a patched compare-and-swap prototype using ledger.revision integer and ran 2k synthetic rebalances without duplicate deltas"
+  ],
+  "immediate_mitigation": [
+    "Enable conservative single-writer feature flag for shard-reconciler on affected clusters (flag: reconciler.single_writer=true)",
+    "Temporarily increase sampling of per-key meter events in production for suspect orgs to detect duplicates earlier",
+    "Notify SRE to monitor billing rollups and pause downstream auto-backfill for 1 hour windows if duplicate patterns spike"
+  ],
+  "proposed_fix": [
+    "Primary fix: make ledger updates transactional with a compare-and-swap on ledger.revision and attach an operation idempotency token for prefetch/reconcile operations",
+    "Add server-side idempotency store for short-lived reconcile op ids (TTL 60s) to reject duplicate commits",
+    "Hardening: extend unit+integration tests to include simulated shard failovers with injected RPC latency and verify ledger invariants",
+    "Add end-to-end regression test to the nightly canary harness that runs a deterministic shard move scenario and asserts no duplicate meter increments"
+  ],
+  "rollout_plan": [
+    "Merge change behind feature flag 'ledger.cas_reconcile' and run in dev/staging for 72 hours",
+    "Canary rollout to 5% of edge clusters with high-traffic test tenants and increased ledger sampling",
+    "If no duplicates observed after 48 hours, expand to 50% then to 100% over a week",
+    "Post-rollout: run billing reconciliation job and compare hourly aggregates to baseline for first 24 hours"
+  ],
+  "acceptance_criteria": [
+    "No duplicate allowance increments for test scenarios covering >10k shard moves in staging",
+    "Billing rollups show <=0.1% variance vs baseline after fix when exercising synthetic bursts",
+    "E2E regression in nightly canary shows zero occurrences of the prefetch/reconcile interleaving assertion",
+    "Code review signoff from runtime, metering, and SRE teams"
+  ],
+  "related_issues": [
+    "ENG-314159",
+    "ENG-271819",
+    "ENG-512919"
+  ],
+  "links": [
+    "https://github.com/redwood-inference/runtime/pull/7421",
+    "https://confluence.redwood.ai/display/METER/Shard+reconciliation+design+notes",
+    "https://grafana.redwood.ai/d/ledger/ledger-duplicates?orgId=1&from=now-1h&to=now",
+    "https://drive.google.com/drive/folders/1XxExamplePerfRepro"
+  ],
+  "comments": [
+    "2026-02-28 Alejandro Ruiz: Initial issue filed after customer report (acct 42) and lab repro. Attached logs and initial hypothesis.",
+    "2026-03-01 Priya Khatri: Implemented CAS prototype and ran 2k shard-move synthetic test; appears to eliminate duplicates in staging. Need review and perf analysis.",
+    "2026-03-02 Marcus Lee (SRE): Put conservative single-writer reconciler flag on prod-2 cluster at 03:00 UTC; observed drop in duplicate meter alerts from 8/hr to 0/hr for sampled keys.",
+    "2026-03-04 Emma Zhang (Billing): Noted small set of affected orgs where hourly rollups had duplicate increments. Advised paused backfills while fix is validated.",
+    "2026-03-05 Priya Khatri: Preparing PR with CAS + op-idempotency store. Running performance benchmark to ensure no >5% throughput regression on reconciler hot path."
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.21",
+  "security_review_required": "false",
+  "notes": "This ticket covers correctness of allowance accounting during ephemeral shard topology changes. Related work to follow: expand ledger schema to include last_op_id and last_seen_ts, and add cross-service tracing tags for reconciler operations to make future investigations simpler.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "reproduction_steps",
+    "observed_behavior",
+    "expected_behavior",
+    "logs_snippet",
+    "hypothesis",
+    "experiments_run",
+    "immediate_mitigation",
+    "proposed_fix",
+    "rollout_plan",
+    "acceptance_criteria",
+    "comments",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_e82f78677e24434eb7b2eab2b34c0584"
+}

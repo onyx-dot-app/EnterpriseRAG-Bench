@@ -1,0 +1,87 @@
+{
+  "key": "SUP-863210",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Inconsistent rate-limit headers and apparent token double-counting during multiplexed websocket + HTTP upload workload",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2024-10-15",
+  "updated_at": "2024-10-17",
+  "reporter": "Maya Hernandez",
+  "assignee": "Arjun Patel",
+  "severity": "Sev1",
+  "customer_company": "HelioSearch Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "rate-limiter",
+    "edge-proxy",
+    "serving-runtime"
+  ],
+  "labels": [
+    "429",
+    "rate-limits",
+    "websocket",
+    "http2",
+    "multiplexing"
+  ],
+  "environment": "prod | us-east",
+  "affected_regions": [
+    "us-east"
+  ],
+  "affected_models": [
+    "open-llama-13b-v2"
+  ],
+  "sla_due_at": "2024-10-16",
+  "first_response_due_at": "2024-10-15",
+  "description": "Issue summary:\nCustomer reports receiving 429 responses for a subset of requests even though the X-RateLimit-* headers returned in prior responses implied available quota. The workload is a mix of long-lived websocket streams (chat-style) and short-lived HTTP POST chunked uploads for document ingestion.\n\nImpact:\n- Intermittent 429s for streaming clients after a period of bulk ingestion (customer-visible errors).\n- Clients report header values (X-RateLimit-Remaining/X-RateLimit-Reset) that do not match subsequent immediate 429 status.\n- Customer cannot reliably separate streaming vs bulk traffic due to tenant-level token accounting; this threatens their SLA for real-time features.\n\nEnvironment:\n- Dedicated pool (customer-dedicated GPU farm) in us-east.\n- Traffic through Redwood edge-proxy fronting HTTP/1.1, HTTP/2 and websocket upgrades on the same IPs.\n- Mixed API key usage: single API key reused by ingest workers and streaming clients.\n\nObserved behavior:\n1) Start ~20 long-lived streaming websocket sessions (low token rate).\n2) Kick off concurrent multipart HTTP uploads from ~50 short-lived workers.\n3) Within 30\u2013120s some streaming clients receive 429s with headers indicating non-zero Remaining tokens in previous responses.\n\nExpected behavior:\n- Rate headers should reflect per-tenant accounting and be coherent with immediate acceptance/rejection decisions.\n- Streaming sessions should not see sudden 429s when tenant-level tokens are sufficient or when headers indicate remaining allowance.\n\nWorkaround requested: guidance on configuration and mitigations until root cause is fixed.",
+  "steps_to_reproduce": [
+    "1) Using dedicated tenant on us-east, open 20 websocket streaming sessions to /v1/chat/stream with same API key.",
+    "2) Start 50 parallel HTTP/2 POST multipart uploads to /v1/ingest with same API key; each upload does 10 concurrent chunks.",
+    "3) Observe client-side logs for any 429 responses on websocket connections and check X-RateLimit-* headers on both accepted and rejected requests.",
+    "4) Repeat with separate API keys for streaming and uploads to compare behavior."
+  ],
+  "logs": [
+    "[2024-10-15T14:03:22Z] edge-proxy: conn=0x7f34 accept POST /v1/ingest tenant=helio-42 tokens_before=1200 tokens_after=1140",
+    "[2024-10-15T14:03:22Z] serving-runtime: serve request id=abc123 model=open-llama-13b-v2 tokens=60",
+    "[2024-10-15T14:03:22Z] edge-proxy: websocket conn=0x7f20 send event=chat.token tenant=helio-42 X-RateLimit-Remaining=1040 X-RateLimit-Reset=1697375000",
+    "[2024-10-15T14:03:50Z] edge-proxy: websocket conn=0x7f20 receive error=429 tenant=helio-42 decision=reject tokens_available_cache=980 actual_accounting=0",
+    "[2024-10-15T14:04:02Z] rate-limiter: debug tenant=helio-42 policy=tenant-window window_ms=10000 bucket=standard_accounting local_count=5 remote_count=5"
+  ],
+  "comments": [
+    "Support (Maya): Logged ticket after initial report from customer. Asked for request IDs and timeline. Provided immediate mitigations: recommend separating API keys for streaming and bulk ingestion and reducing chunk parallelism.",
+    "Customer (HelioSearch): Confirmed separation decreased but did not eliminate 429s. Provided pcap and a list of request ids where headers reported Remaining>0 shortly before 429s.",
+    "SRE (Arjun): Triaged and pulled edge-proxy traces and rate-limiter metrics. Noted an aggregation mismatch in request attribution between HTTP/2 connection-level counters and per-request accounting.",
+    "SRE (Arjun): Requested an experiment window to turn on detailed per-request accounting in prod for the tenant for 1 hour to collect fine-grained traces."
+  ],
+  "investigation_notes": [
+    "Initial hypothesis: per-connection accounting for HTTP/2 + websocket upgrade was being cached at the edge and not reconciled with per-request token consumption, causing stale X-RateLimit-Remaining headers to be emitted.",
+    "Trace analysis: correlation between 429 events and connection reuse across multiplexed streams (HTTP/2) showed that the edge code path emitted headers from a connection-level snapshot that wasn't updated after concurrent chunked POSTs finished.",
+    "Metric evidence: spikes in metric edge.rateheader.stale_count coincident with customer bulk-ingest windows. CPU and serving-runtime metrics normal. No model OOMs or GPU shortages found.",
+    "Repro attempt: using a local cluster with HTTP/2 multiplexing we reproduced header mismatch when a health-check thread and chunked uploads incremented the same connection-level counter between header emission and final accounting commit.",
+    "Related artifacts: slack thread #support-helio (https://slack.redwood/support-helio), dashboard: https://grafana.redwood/tenant/helio-42/rate-accounting, and traces: https://jaeger.redwood/trace/abc123",
+    "Linked code area: edge-proxy header cache and rate-limiter attribution (see pr link below)."
+  ],
+  "resolution": "Mitigation applied: turned off connection-level header caching and switched the tenant to per-request authoritative accounting for the 2-hour experiment window. Immediate effect: streaming clients no longer observed 429s in the test window.\n\nShort-term recommendation to customer:\n- Use separate API keys for streaming vs ingestion (we provided a script to rotate keys).\n- Reduce parallel chunk concurrency to 4 per worker for now.\n- Implement client-side exponential backoff with jitter as documented in our SDK guidelines.\n\nPlanned long-term fix: patch edge-proxy to decouple header emission from cached connection snapshots and add atomic commit semantics so headers reflect post-accounting consumptions. Patch submitted: PR #9876. QA plan: canary release to 10% of edge-proxy fleet, verify metrics edge.rateheader.stale_count drops to 0 and no regression in latency.\n\nFollow-up: monitor for 72 hours and schedule a postmortem with HelioSearch; include changes in rate-limiter runbook.",
+  "linked_issues": [
+    "INT-9843",
+    "SUP-71234-legacy-ref"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/edge-proxy/pull/9876"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/edge-rate-accounting-runbook"
+  ],
+  "related_incident_id": "INC-20241015-2",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_a8952844bfbe497b8370acff25651806"
+}

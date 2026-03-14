@@ -1,0 +1,65 @@
+{
+  "key": "SUP-137642",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Intermittent long-tail TTFB from HAProxy per-connection buffering + keepalive churn affecting streaming completions",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-13",
+  "reporter": "Maya Chen",
+  "assignee": "Diego Alvarez",
+  "customer_company": "LexiCorp",
+  "customer_tier": "dedicated",
+  "components": [
+    "ingress-haproxy",
+    "api-gateway",
+    "serving-runtime"
+  ],
+  "labels": [
+    "ttfb",
+    "haproxy",
+    "streaming",
+    "keepalive",
+    "buffering"
+  ],
+  "environment": "prod us-west-2",
+  "affected_models": [
+    "gpt-open-13b",
+    "redwood-v1-small"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-27384",
+    "SUP-77412"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood/infra/pull/4123"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/HAProxy+Streaming+TTFB+Runbook"
+  ],
+  "description": "Issue summary:\nCustomers have reported intermittent, long-tail increases in time-to-first-byte (TTFB) for streaming completions during peak traffic windows. The pattern is: initial bytes arrive quickly for most requests, but a subset of streaming sessions stall for 5\u201320s before the first chunk is delivered.\n\nImpact:\n- Several enterprise customers experienced degraded UX on long completions; a small percentage (~0.6% p95-p99) of streaming requests hit >5s TTFB.\n- Errors are not always returned; many requests eventually succeed but at unacceptable latency for real-time apps.\n\nEnvironment:\n- Fronted by HAProxy 2.6 in the edge fleet (tcp/http mode), using connection reuse (keepalive) between client and frontend.\n- Backend pool: dedicated serving-runtime instances pinned to the customer\u2019s pool.\n- Observed in prod (us-west-2) during peak morning traffic.\n\nSteps to reproduce (intermittent):\n1) Open streaming completion request with large per-request metadata (cookies and trace headers ~12\u201320KB).\n2) Reuse the same TCP/HTTP connection for multiple simultaneous small streaming and non-streaming requests from the same client.\n3) Observe that some streaming requests do not receive the first chunk until another connection activity triggers a flush or until internal buffer thresholds are reached.\n\nObserved logs / metrics:\n- HAProxy edge metrics show spikes in output-buffered-bytes for specific backend servers correlated with TTFB spikes.\n- No 5xx spike in backends; backend latency (processing) remains stable.\n- TCP stats show many reused client connections with >100 requests and intermittent write-blocks on frontend sockets.\n- Sample haproxy log lines around incidents: \"Mar 10 08:14:22 haproxy[2345]: Server srv/usw2-srv1 output buffer full, flushing delayed\" (derived from edge debug).\n\nInitial hypothesis:\n- HAProxy per-connection output buffering + aggressive connection reuse (keepalive) is coalescing multiple backend responses or trace-heavy request headers into a per-connection buffer and delaying flushes to clients. For streaming responses this results in head-of-line delays until the buffer either fills or a flush event occurs.\n\nWhy unique / not earlier tickets:\n- Earlier tickets focused on ALB/APIGW idle timeouts and HTTP/2 hpack growth. This incident implicates HAProxy's per-connection buffering behavior combined with keepalive reuse and unusually large request metadata as the root contributor to delayed-first-byte for streaming flows.\n",
+  "comments": [
+    "2026-03-10 09:12 - LexiCorp-SRE: Noticing many of our long streaming completions are delayed only when using SDK which reuses connections. If we disable client reuse (new TCP per request) the problem disappears.",
+    "2026-03-10 09:35 - Support (Maya Chen): Thanks for the clue \u2014 we are investigating HAProxy edge behavior and buffer metrics. Can you capture an example request id and timestamp?",
+    "2026-03-10 10:02 - LexiCorp-SRE: Example request id: req_20260310_usw2_7a1f. Occurred 08:13:54 UTC. Attached pcap and SDK traces to the ticket.",
+    "2026-03-11 14:28 - Eng (Diego Alvarez): We reproduced locally by running a client that keeps a 100x request per connection mix with one large trace header (16KB). HAProxy output-buffered-bytes grows and we saw delayed writes until 'tune.bufsize' threshold was hit.",
+    "2026-03-12 02:11 - Infra (S. Patel): Temporary mitigation deployed to canary edge nodes: set 'option http-server-close' on the problematic frontend + increased tune.bufsize from 32768 to 131072. Early canary metrics show p99 TTFB improved from 9.3s -> 1.1s for affected flows.",
+    "2026-03-13 11:00 - Support (Maya Chen): Customer confirmed perceived improvement after canary. Monitoring in progress; rolling to remaining edge nodes pending validation."
+  ],
+  "investigation_notes": "What we looked at:\n- Correlated HAProxy metrics (bytes_out_buffered, conn_reuse_ratio) with p95/p99 TTFB and found strong temporal correlation.\n- Captured socket-level traces showing frontend socket write blocked while HAProxy queued additional responses/headers.\n- Verified backends return streaming chunks promptly (via internal trace), so problem is in the edge path.\n\nHypothesis refinement:\n- Large request metadata leads to read-side buffering and increased internal memory pressure; combined with keepalive reuse, HAProxy accumulates bytes to optimize network writes. For streaming this optimization harms latency because HAProxy waits for larger chunks before flushing.\n\nTests run:\n- Reproduced with synthetic client that: (a) sends streaming request with 16KB headers, (b) reuses connection for 40 mixed requests. Observed same TTFB stalls.\n- Canary config changes applied to a small subset of edge nodes: (1) option http-server-close, (2) tune.bufsize=131072, (3) enable 'debug-flush-on-response' (internal flag) for experimental flush behavior.\n\nOpen questions:\n- Does increasing bufsize mask the issue by allowing more coalescing before stall? Early signs show better p99 but more memory use.\n- Are there traffic shaping knobs at client SDK level we should document (e.g., avoid extremely large per-request metadata, enable connection rotation)?\n",
+  "resolution_notes": "Workarounds applied:\n- Canary edge nodes updated with 'option http-server-close' and tune.bufsize increased; this reduces connection reuse buffering and forces HAProxy to flush more eagerly for responses.\n- Recommendation to LexiCorp: patch SDK to rotate connections every N requests (N=20) and reduce per-request metadata where possible.\n\nPlanned permanent fixes:\n- Infra to roll the canary HAProxy config to all edge nodes after 72h of monitoring if no regressions.\n- Implement targeted instrumentation to expose 'haproxy.output_buffered_bytes' at per-tenant granularity into Console dashboards and create an alert if > 64KB aggregated per connection.\n- Long-term: evaluate switching streaming frontends to an HTX-enabled path with explicit flush triggers or migrate to a proxy mode that better supports chunked streaming semantics.\n\nStatus:\n- Mitigation validated on canary, customer acknowledged improvement. Rolling to rest of fleet pending capacity validation. Monitoring until 2026-03-16, after which we will close if stable.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_7a45613a3b8b43a9a2184ffeaf4d68d1"
+}

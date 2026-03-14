@@ -1,0 +1,47 @@
+{
+  "key": "ENG-783214",
+  "team": "engineering",
+  "title": "Transparent staged-free backpressure and page holdovers in variable-length continuous batching",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-25",
+  "updated_at": "2026-03-10",
+  "creator": "Marco Chen",
+  "assignee": "Aisha Patel",
+  "project": "runtime-memory",
+  "cycle": "Cycle 56",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "cudaMallocAsync",
+    "allocator",
+    "kv-cache",
+    "memory-telemetry",
+    "continuous-batching"
+  ],
+  "parent_issue": [
+    "ENG-101999"
+  ],
+  "dependencies": [
+    "ENG-142309",
+    "ENG-526301"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Summary: Production inference fleet shows slow, reproducible resident GPU memory growth under mixed-length continuous batching. Behavior looks like a leak (RSS climbs across hours) but investigation indicates deferred-free backlog, cross-stream free ordering, and pinned staging pages being held alive across pool boundaries. This ticket captures the investigation, reproducer, telemetry to add, mitigation experiments, and a proposal for a short-term patch and longer-term allocator changes.\n\nObserved symptoms:\n- Gradual GPU resident memory increase over 6\u201312 hours when serving workloads with mixed short (<=64) and long (>=1024) tokens in the same runtime.\n- Frequent small-spike latency regressions during batch merges coincident with allocation churn.\n- cudaMallocAsync deferred free queue depth (observed via our custom allocator metrics) climbs to 1000s, correlated with pinned staging bytes not being released to OS.\n- GPU mem snapshots show many small device-owned extents marked as free in pool metadata but still resident on device.\n- Reproduces reliably on dedicated M60-equivalent pools and on our A100 testbed when using real traffic replay with sequence-length mixing.\n\nReproducer (short):\n1) Run workload-replay-pipeline with mixed_trace_v3.json (attached to Drive) that interleaves 90% short/10% long requests in continuous batching mode.\n2) Start allocator telemetry script (alloc-trace.sh) which records deferred_free_depth, pool_resident_bytes, staging_pinned_bytes, and per-stream pending_free_count every 10s.\n3) Observe resident growth after ~30\u201390 minutes and deferred_free_depth ramping.\n\nInvestigation notes and findings:\n- Hypothesis 1: cudaMallocAsync deferred free batches are not draining because frees are posted to streams that are not synchronized due to our continuous merging strategy. When long requests hold a stream's work, frees accumulate behind them.\n- Hypothesis 2: The staging/pinned host buffer used for device->host transfers is being recycled into the allocator's pinned pool without a final cudaFreeAsync drain; the pool keeps the pages pinned and they remain resident until the device driver reconciles them, which our code path never triggers frequently.\n- Hypothesis 3: Pool compaction thresholds are too conservative for fragmented patterns produced by interleaved short/long sequences; small free extents scattered across arenas are not coalesced and therefore not returned to the OS.\n- Correlation: deferred_free_depth and staging_pinned_bytes are the strongest predictors of RSS climb in regression tests (Pearson r ~0.78).\n\nShort-term mitigations attempted (results):\n- Periodic cudaDeviceSynchronize() in the batch merge path (experiment A): forced drain reduces backlog but adds 2\u20136ms median latency and is unacceptable at scale.\n- Introduced a background epoch trim thread that calls a limited cudaDeviceSynchronize on a low-priority stream every 30s (experiment B): reduced resident growth significantly in test but added nondeterministic jitter and occasional 200ms spikes in tail latency.\n- Lowered deferred-free batching window from 512 -> 64 frees (experiment C): lowered memory growth and minimal latency impact. This is promising but increases kernel invocation overhead in very busy cases.\n\nProposed roadmap and changes: short-term (canary in runtime-1.20):\n1) Add a ceiling on deferred_free_depth per-device-per-pool (configurable, default 256). When ceiling reached, prefer opportunistic draining of oldest free batches on a dedicated low-priority internal stream.\n2) Emit new telemetry metrics: deferred_free_depth, avg_free_batch_latency_ms, staging_pinned_bytes, pool_fragmentation_ratio (free_extents / total_extents), per-stream-pending-free-count. Add Grafana panels and alert if deferred_free_depth > 500 for 10m.\n3) Backfill pooling policy: when reclaimed total resident < threshold for X minutes, proactively coalesce small extents into larger extents and release to OS. Tunable to avoid frequent kernel churn.\n\nLonger-term design proposals (runtime-1.22):\n- Per-stream free credits: allow streams to post frees but hold credit-limited ownership so a long-running stream cannot fence infinite frees. Those credits are replenished when the stream makes progress.\n- Cross-stream free re-assignment: if a free batch is blocked behind an active kernel for >T ms, migrate the free work to an internal maintenance stream with proper ordering semantics using cudaGraph-merged dependencies to avoid global sync.\n- Better fragmentation-aware allocator: track adjacency and age for extents and prefer compaction when fragmentation increases during mixed-length traffic patterns.\n\nTelemetry and dashboards added in this ticket:\n- Grafana: fleet/runtime/memory/deferred_free_depth (per cluster/device pool)\n- Alert: deferred_free_depth > 500 for 10m -> paging to #infra-oncall\n- Canary dashboard: staging_pinned_bytes / pool_resident_bytes heatmap by model family\n\nTesting plan:\n- Stage canary on 5 dedicated instances in eu-west-1 with realistic replay trace for 72 hours.\n- Run A/B with lowered deferred-free-batching window vs. default. Measure tail latency, per-token cost delta, and RSS differential.\n- Run synthetic adversarial test (100% short then 100% long) to confirm no regressions in worst-case churn.\n\nArtifacts and links:\n- Reproducer trace: drive.redwood/app/drive/mixed_trace_v3.json (internal)\n- Alloc telemetry script: github.com/redwood/infra/alloc-trace (PR #1256)\n- Draft design doc: confluence.redwood/runtime/allocator/compact-and-deferred-free-design (internal)\n- Canary PR: github.com/redwood/runtime/pull/3421 (allocator: enforce deferred-free ceiling)\n\nAcceptance criteria for short-term patch:\n- No fleet-wide increase in 95th latency > 5% during canary compared to baseline.\n- Deferred_free_depth alarm triggers resolved within 30 minutes and resident growth plateaued for canary hosts.\n- No reproducible OOMs introduced by compaction heuristics.\n\nOpen questions / tradeoffs:\n- How to choose deferred_free_depth ceiling across a variety of GPU types (A100 vs older cards) without manual per-hardware tuning? Suggest adaptive ceiling based on recent free throughput metrics.\n- Is periodic low-priority drain an acceptable operational burden if we can bound latency spikes? Might be necessary for heavy long-running kernels.\n- How to test cross-stream free migration in CI reliably? Needs synthetic multi-stream harness and validation of ordering semantics.\n\nNext steps (short):\n- Aisha: land telemetry PR and Grafana panels (ETA 2026-03-12).\n- Marco: land canary allocator change with deferred_free_depth ceiling + config flag (PR #3421) and coordinate canary rollout (ETA 2026-03-14).\n- Priya: prepare replay traces and cost/latency comparison dashboards for canary (ETA 2026-03-15).",
+  "comments": [
+    "2026-02-26 Marco Chen: Initial triage - reproduced on local A100 with mixed_trace_v3. Attached alloc traces and resident snapshots. Suspect frees queued behind long-kernel streams.",
+    "2026-03-01 Aisha Patel: Ran experiment C (batch window 64). Memory growth reduced ~70% over 6h but CPU overhead increased marginally. See experiment logs in PR #3310.",
+    "2026-03-03 Priya Rao: Added fleet replay for eu-west-1. Deployed experiment B to 3 nodes - background epoch trim suppressed growth but observed occasional 120\u2013250ms jitter spikes. Need better guardrails.",
+    "2026-03-05 Diego Martinez: Reviewed PR #3421. Concern: default ceiling 256 might be too low for some high-throughput models; recommend making ceiling adaptive based on live free throughput metrics.",
+    "2026-03-08 Marco Chen: Updated canary PR to make deferred_free_ceiling adaptive (min 128, max 4096) using 1-min free-throughput smoothing. Push scheduled for 2026-03-10.",
+    "2026-03-10 Aisha Patel: Telemetry PR merged, Grafana panels created, canary rollout scheduled for 2026-03-11. Will monitor deferred_free_depth and staging_pinned_bytes closely."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_ae1f3284a2c1411c91ee6a72bd9ee9c9"
+}

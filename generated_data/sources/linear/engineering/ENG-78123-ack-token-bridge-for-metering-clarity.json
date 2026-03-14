@@ -1,0 +1,108 @@
+{
+  "key": "ENG-78123",
+  "team": "engineering",
+  "title": "Ack-token bridge to correlate retries with original consumption and prevent duplicate charges",
+  "status": "Planned",
+  "priority": "P1",
+  "created_at": "2026-03-13",
+  "updated_at": "2026-03-14",
+  "creator": "Aisha Patel",
+  "assignee": "Marcus Chen",
+  "project": "Metering & Billing Hardening",
+  "cycle": "2026-W11",
+  "estimate": "5",
+  "due_date": "2026-04-10",
+  "labels": [
+    "billing",
+    "idempotency",
+    "ingest-proxy",
+    "safety"
+  ],
+  "dependencies": [
+    "ENG-74211",
+    "ENG-51789"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.27",
+  "security_review_required": "true",
+  "description": "Problem: At-least-once ingestion patterns and flaky clients cause repeated POSTs that sometimes result in multiple billing events for the same logical request. Current mitigation relies on client-provided idempotency keys and periodic reconciliation sweeps. These approaches are effective but brittle when clients drop or reuse keys, when retries cross load-balanced frontends, or when network partitions occur. Proposal: implement an \"ack-token bridge\" \u2014 a server-issued, short-lived, cryptographically-signed acknowledgement token returned at reservation time that clients must return on subsequent retry attempts so the ingestion path can unambiguously correlate retries with an existing reservation and avoid double-charging.",
+  "acceptance_criteria": [
+    "Server issues signed ack tokens for each reserved consumption event (token format and signature documented)",
+    "Ingest proxies consume ack tokens on retry and reconcile to a single committed billing event per logical request",
+    "Backward-compatibility: clients that do not support ack tokens are still accepted but are subject to best-effort dedup and reconciliation sweeps",
+    "Integration tests that simulate network partitions, dropped responses, and client replays must prove no duplicate billing for 99.99% of cases in our test harness",
+    "Observability: new metrics for ack-issuance, ack-reuse, ack-expiry, and uncovered-duplicates are emitted and dashboarded"
+  ],
+  "design_overview": "When an incoming request arrives that will create billable consumption, the ingestion service will first create a reservation record in the consumption ledger and return a signed ack token in the response header (Agg-ACK). The token contains: reservation_id, tenant_id, creation_ts, expiry_ts, and a nonce, and is HMAC-signed with a rotation-capable key. Clients receiving the ACK will persist it and include it in the next retry as a header or in the payload. When the ingest gateway receives a request with an ack token, it validates the signature and timestamp, looks up the reservation_id, and routes the request as an update to the reservation rather than creating a new one. Reservations have state transitions: RESERVED -> COMMITTED -> FINALIZED. Billing only counts on COMMITTED -> FINALIZED transitions. Tokens are single-use for commit operations; retries that attempt to re-commit with the same token are treated as idempotent nops. For clients that do not include an ack token, the gateway will fall back to existing idempotency-key logic and reconciliation sweeps. The design supports cross-region routing by embedding region and version info into tokens and by making the reservation lookup a strongly consistent read via the ledger's primary/secondary forwarding approach.",
+  "detailed_flow": [
+    "1) Client POST /generate -> Gateway reserves consumption: ledger.create_reservation(tenant, estimate) -> returns 202 + Agg-ACK header with signed token",
+    "2) Client sees 202 and stores Agg-ACK; if client times out and retries, it includes Agg-ACK in Retry-ACK header",
+    "3) Gateway receives request with Retry-ACK -> validate signature, lookup reservation by id; merge request payload into reservation and proceed without creating a new ledger entry",
+    "4) On final acceptance server transitions reservation to COMMITTED and emits billing event; token is marked consumed",
+    "5) If token expires before commit, reservation auto-cancels after short grace period and is safe to ignore in billing; client must reattempt a fresh reservation",
+    "6) Reconciliation sweep remains as secondary safety for any uncovered divergent states"
+  ],
+  "tradeoffs_and_rationale": "Pros: Strong correlation between retries and original reservation, lower likelihood of double charges, explicit audit trail, compatible with existing ledger. Cons: Requires issuing and validating signed tokens and client changes for best behaviour. We accept some complexity at the gateway and a small increase in header parsing cost to greatly reduce reconciliation load and customer-impacting billing issues. We choose HMAC-signed tokens (not full JWT) to minimize crypto complexity and validation cost. Single-use semantics reduce accidental double-commit but increase need for deterministic retry semantics for long-running requests.",
+  "schema_and_token_format": "Ack token (Agg-ACK) serialized base64 of: v|rid|tid|created_ts|expiry_ts|nonce|region|sig_version and then HMAC-SHA256 over prefix fields. Example (pseudo): v1|r-12345|t-9876|1678560000|1678560060|n-239|us-east-1|1|<sig>. Token length goal: <= 512 bytes. Rotation: sign keys rotated weekly; token encodes sig_version to allow validation during rotation window.",
+  "api_changes": [
+    "Gateway: accept optional HTTP header Retry-Ack: <agg-ack-token>",
+    "Gateway: return HTTP header Agg-Ack: <agg-ack-token> when reservation created (202) or when reservation updated",
+    "Client SDK: persist Agg-Ack per logical request and include on retries",
+    "Console/operator APIs: ability to query a reservation by reservation_id and view token state"
+  ],
+  "migration_and_rollout_plan": "1) Implement server-side ledger reservation and ack-token issuance behind a feature flag (internal only). 2) Dark launch: emit tokens and store reservation records, but ignore Retry-Ack header path (observe metrics). 3) Enable gateway validation for internal traffic and beta customers behind an opt-in flag. 4) SDK release: add Agg-Ack persistence and Retry-Ack support for node/python SDKs, encourage customers to upgrade via release notes. 5) Gradually enable for more customers after 2 weeks of beta and successful metrics. 6) Turn on for all tenants and keep reconciliation sweep on for 30 days as fallback. 7) Post-mortem and retrospective.",
+  "testing_plan": [
+    "Unit tests for token generation/validation + key rotation logic",
+    "Integration tests: client timeout -> retry with token -> assert single ledger entry and single billing event",
+    "Chaos tests: simulate Gateway crash after issuing ACK but before commit; assert client replay still reconciles and does not double-bill",
+    "Cross-region tests: inbound retry routed to secondary region, validate token still resolves to primary ledger or forwarded lookup",
+    "Load test: benchmark token validation latency and CPU cost under typical QPS (goal < 0.1ms avg overhead)"
+  ],
+  "monitoring_and_metrics": [
+    "metering.ack_issued_count",
+    "metering.ack_reused_count",
+    "metering.ack_invalid_count",
+    "metering.ack_expired_count",
+    "metering.reservation_commit_count",
+    "metering.duplicate_billing_detected_count",
+    "dashboards: 1) Ack adoption over time by SDK version 2) Duplicate-billing rate pre/post rollout 3) Reconciliation sweep uncovered items"
+  ],
+  "alerts": [
+    "P90 duplicate_billing_detected_count > 10/min for 5m",
+    "ack_invalid_count > 1% of ack_issued_count over 15m",
+    "reservation_commit_lat_p50 increased > 10% after rollout"
+  ],
+  "security_considerations": "Tokens are HMAC-signed and short-lived (default expiry 60s). They contain opaque reservation ids; no PII must be included. Key rotation and secure key storage in KMS required. Threat model includes token theft replay; mitigate with single-use semantics and short expiry. For high-security customers we offer the option to disable token issuance and rely on stricter server-side idempotency and reconciliation.",
+  "risks_and_mitigation": "Risk: Clients never upgrade and we cannot rely on ack tokens -> mitigation: maintain backward-compatible idempotency-key path and run reconciliation sweeps. Risk: increased gateway CPU for HMAC validation -> mitigation: use optimized native crypto libs and cache validation results for short windows. Risk: cross-region lookup latency -> mitigation: use small reservation routing table with TTL and forward requests to primary ledger only when necessary.",
+  "open_questions": [
+    "What is the ideal token expiry? (60s default; consider per-client workload tuning)",
+    "Should tokens be strictly single-use or allow safe replays for idempotent idempotency semantics?",
+    "How to best signal to clients that a token was consumed vs token expired vs reservation cancelled? (HTTP status codes + structured error body required)",
+    "Do we need customer-configurable retention of reservation audit records for compliance?"
+  ],
+  "notes_and_progress_updates": [
+    "2026-03-13: Initial RFC drafted and reviewed with billing and infra. Feedback: prefer HMAC over asymmetric crypto for speed. - Aisha",
+    "2026-03-14: Design review with gateway, ledger, and SDK owners. Action: add key rotation plan and cross-region lookup design. - Marcus",
+    "2026-03-14: Created tech spike task ENG-78123-spike-token-benchmark to measure HMAC overhead (owner: Lina Ortega).",
+    "Links: Confluence design doc https://confluence.redwood.ai/display/METER/Ack+Token+Bridge (internal), GitHub draft PR https://github.com/redwood-inference/platform/pull/4321 (internal)"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "design_overview",
+    "detailed_flow",
+    "tradeoffs_and_rationale",
+    "schema_and_token_format",
+    "api_changes",
+    "migration_and_rollout_plan",
+    "testing_plan",
+    "monitoring_and_metrics",
+    "alerts",
+    "security_considerations",
+    "risks_and_mitigation",
+    "open_questions",
+    "notes_and_progress_updates"
+  ],
+  "dataset_doc_uuid": "dsid_cba6c1b0c984412c998adc17c938610d"
+}

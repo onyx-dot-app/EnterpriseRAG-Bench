@@ -1,0 +1,34 @@
+{
+  "title": "Pacing and pin concurrency playbook (personal notes)",
+  "owner": "Luke Murray",
+  "drive_area": "users",
+  "path": "users/pacing-and-pin-concurrency-playbook-luke",
+  "doc_type": "doc",
+  "created_at": "2026-02-15",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Priya Raman",
+    "Amira Santos"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "rollout",
+    "canary",
+    "pinning",
+    "concurrency",
+    "warmup",
+    "playbook"
+  ],
+  "linked_artifacts": [
+    "JIRA-8342",
+    "https://github.com/redwood-inference/inference-runtime/pull/4123",
+    "confluence:deploy/runbooks/pacing-playbook"
+  ],
+  "content": "Context and intent:\n- Personal scratchpad for a phased roll (canary -> ramp -> pin -> unpin) when flipping model versions or quantization variants.\n- Focus: pacing (how much traffic over time), per-tenant concurrency caps, and safe unpin strategy that avoids cold-start avalanches.\n- Not a formal runbook but intended to be read by SRE/serving engineers doing the flip.\n\nKey constraints we need to respect:\n- Latency SLO p95 < 250ms for standard tier, p99 < 600ms (on Dedicated).\n- Error budget strictness during business hours: 0.01% error rate allowed, otherwise freeze ramp.\n- KV cache warming is slow for large context tenants. Avoid big client cohorts flipping simultaneously.\n\nHigh-level plan (phasewise):\n1) Canary (0.5% traffic global) \u2014 30 minutes observation window\n   - Targets: telemetry p50/p95/p99, token error rate (400/500), model-qa regression (score on 50 prompt eval set), crash-free metric.\n   - Concurrency cap: 2 per-tenant on canary variant.\n   - Warmup: pre-warm by replaying recent 500 requests (synthetic) for top 10 tenants (CS to approve).\n   - Slack alert template: see bottom.\n\n2) Mini-ramp (2% -> 10% over 3 hours)\n   - Step increases every 30 minutes, pause for 20min observation between steps.\n   - Increase tenant concurrency caps gradually: 2 -> 4 -> 8.\n   - Watch for tail latency and KV miss spikes. If KV miss > 15% (baseline 3%), rollback to previous fraction.\n\n3) Anchor / Pin (25% cohort anchoring + reserved-pin for select customers)\n   - Allocate pinned slots for paying customers that require stability. Pin map: preserve current model for those customers for 48 hours, then consider unpin test.\n   - Use routing tag: routing.pin=customer-id to maintain affinity.\n\n4) Full roll (if metrics stable)\n   - Gradually expand to 100% over 2 days. Keep automatic fallback policy enabled (fallback to quantized variant if memory pressure or OOM).\n\nPer-tenant concurrency & safe caps notes:\n- Default conservative cap = max(2, floor(avg-qps * 0.2)) during canary window.\n- For tenants with large sequence lengths (> 2k tokens median), cap at 1 or schedule later.\n- For tenants with async SDKs: validate their retry/backoff behavior before increasing concurrency.\n\nTelemetry thresholds and gating signals (fast checks):\n- Latency: p95 increase > 25% relative to baseline -> pause.\n- Errors: 5xx spikes (5x baseline) sustained 3min -> rollback.\n- Quality: automated eval loss increase > 0.8% on golden prompts -> hold.\n- User-facing regressions: CS reports >2 escalations in 1 hour -> freeze.\n- Resource: GPU memory tilt (OOM events) -> immediate variant fallback.\n\nKV cache warmup & priming strategy:\n- Warmup synthetic generator (replay service): pick N recent requests per tenant up to 1k and push to canary pool with low QPS to populate KV cache.\n- For models with quantization changes: run a small sampled warmup (50 requests x top 5 tenants) because quantized KV layout might differ and cause perf anomalies.\n\nSoft-unpin (how to unpin safely):\n- Do not unpin more than 10% of pinned tenants in any 24h window.\n- For each unpin candidate: run a shadow comparison for 2 hours (route 1% to new variant under independent observability).\n- If warmup fails (p95 increases) re-pin and flag for manual analysis.\n\nEmergency rollback commands (ops cheat):\n- Immediate rollback (global): /infra roll model-set --to previous --force (requires duty auth)\n- Per-region rollback: /infra roll region us-west --to previous\n- Per-tenant pining: /routing set-pin --tenant <id> --model <sha>\n- Quick throttle: /traffic throttle --to 20% --reason \"safety\"\n(These are shorthand; check internal infra CLI for exact syntax.)\n\nCanary experiments and hypothesis to validate during canary:\n- Hypothesis A: Quantized variant gives 1.7x token throughput without regressing top-10 prompt accuracy more than 1%. Test: run 1k golden prompts, compare logits/top1.\n- Hypothesis B: Batching improvements reduce p95 for small requests (<64 tokens). Test: heat small-request cohort and measure per-token latency.\n\nChecklist: Pre-deploy (must check)\n- [ ] CI green: runtime tests and model validation PR merged (linked).\n- [ ] Smoke image built and pushed to staging registry.\n- [ ] Warmup synthetic sets prepared for top N tenants (CS list).\n- [ ] Canary launch window scheduled on calendar with SRE and on-call.\n- [ ] Slack channel #deploy-<id> created with notification hooks.\n- [ ] Observability alerts staged (latency/error/kv-miss).\n- [ ] Backout PR ready (fast revert).\n\nChecklist: During canary\n- [ ] Confirm canary traffic routed.\n- [ ] Monitor telemetry every 5 minutes first 30 min, then 15 minutes.\n- [ ] Post to #deploy-<id> every check-window with snapshot (p50/p95, 5xx count, KV miss, eval-score).\n- [ ] CS on-call informed for pinned customers.\n\nPost-mortem triggers (auto):\n- Any rollback within 24h -> write short postmortem (what, when, impact, fix).\n- If quality regression on golden set -> schedule evaluation triage with model owner.\n\nSlack alert template (copy/paste):\n- \"[ALERT] Canary flip: model vX.Y -> vX.Y+1 started. Window: 30m. Initial fraction: 0.5%. Watch p95/p99 + 5xx. Link: <deployment_link>. On-call: @oncall-sre. If issues react: /infra roll --to previous.\"\n\nOpen questions / TODOs (notes to self):\n- How to encode per-tenant warmup priority in routing layer? (ticket?)\n- Need a safety metric for hallucinations \u2014 can we auto-check hallucination risk with a small NLI classifier on golden set?\n- Should we expose a client-facing SDK toggle for delayed model swap (client opt-in)? Pros/cons.\n\nRandom scraps / heuristics I keep thinking about:\n- Stagger by QPS buckets rather than tenant alphabetical to avoid correlated warmups.\n- Prefer evening quiet-windows for non-critical tenants, midday for enterprise tenants with SRE standing by.\n- Keep a rolling list of 10 tenants to never unpin without explicit CS signoff (billing impact).\n\nIf you touch this doc: leave date and short note at top.\n\n-- Luke\n\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_f53193a50aed421b9ae2b1aac63c8260"
+}

@@ -1,0 +1,115 @@
+{
+  "key": "ENG-864321",
+  "team": "engineering",
+  "title": "Route policy fanout amplification after route rename causing transient unmetered windows",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-12",
+  "updated_at": "2026-03-10",
+  "creator": "Aisha Patel",
+  "assignee": "Marcus Lee",
+  "description": "Several customers reported brief periods where per-route quota usage dropped to zero despite sustained traffic. Investigation shows a policy fanout amplification that occurs when a route is renamed: the policy engine temporarily produces duplicated policy keys and the metering path misses debits for one of the duplicates, creating short unmetered windows for affected orgs/routes. This ticket captures the investigation, short-term mitigations, and the proposed permanent fix to prevent future occurrences.",
+  "steps_to_reproduce": [
+    "1) Create route R with policy set P and generate steady traffic (synthetic client ~100 req/s).",
+    "2) Rename route R -> R_new via Console API while traffic continues.",
+    "3) Observe metering/tokens emitted to the billing pipeline and per-route aggregation dashboards.",
+    "4) Look for a transient drop to near-zero debits for R_new or duplicate debit keys in the runtime debug logs (metric: meter.key.duplicates).",
+    "5) Reproduce in a staging cluster with a subset of orgs to validate fix candidates."
+  ],
+  "observed_behavior": "During route rename there is a ~5-20s window where the policy engine emits two distinct fanout keys for the same logical route. The meter ingestion deduplicator treats them as separate buckets and, due to a race in the debit path, one bucket's debits are dropped. The result is a transient period of unmetered usage for affected route/org pairs, causing incorrect quota allowance and potential overage.",
+  "expected_behavior": "Route renames should be atomic from a policy/metering perspective: the engine should either consider the old or the new route key but not both, and all debits should be accounted to a single stable bucket. No transient unmetered windows should be possible as a result of metadata changes.",
+  "impact_summary": "Medium: affects a small fraction of route renames (customer-driven operation) but can cause short unmetered windows leading to inaccurate quotas and potential unexpected usage. We've observed this in 3 paying orgs during the last 30 days (support tickets opened). No charge-level billing losses identified yet but accounting drift makes reconciliations harder and may allow brief misuse.",
+  "investigation_notes": [
+    "2026-02-13 09:12 - Initial triage: alert spike for per-route usage gap; correlated with route rename events recorded in Console Audit Log.",
+    "2026-02-14 14:40 - Attached a staging reproducer that performs route rename under load; debugger shows two policy fanout keys: 'route:12345:name:v1' and 'route:12345:name:v2'.",
+    "2026-02-16 11:03 - Found the policy-transform step was using a route name string in the fanout fingerprint. The rename path creates a short window where both old and new fanout fingerprints are considered live until the policy cache TTL expires or an explicit reconcile runs.",
+    "2026-02-18 16:27 - Debit path race: when two fanout keys exist the meter-aggregator uses last-writer semantics and an async commit path can drop debits for the older fanout bucket if a shard leader rotates during the rename window.",
+    "2026-02-25 10:55 - Confirmed end-to-end that disabling the policy-transform name component prevents duplicate fanout keys and eliminates the unmetered window in staging.",
+    "2026-03-01 08:22 - SRE simulated leader rotations and confirmed the race surface is the async debit ack path + inconsistent fanout key set in the policy cache."
+  ],
+  "root_cause": "The fanout fingerprint used by the rate-limiter included mutable metadata (route name). A route rename creates two fingerprints that both map to the same logical quota, but the runtime treats them as distinct buckets. Combined with an async debit acknowledgement path and shard leader re-election, debits for one fingerprint can be lost, producing transient unmetered windows.",
+  "short_term_mitigation": [
+    "1) Disable route-name-in-fingerprint toggle on the policy transform (feature flag) in production to prevent generation of mutable fingerprints (rolled out 2026-02-26 to all regions).",
+    "2) Schedule an immediate reconcile job to collapse duplicate fanout keys for recently renamed routes (background job queued; targeted run executed 2026-02-27).",
+    "3) Add a guard to the metering pipeline that rejects a duplicate fanout key set if both keys map to the same stable route id and instead canonicalize debits to the stable id until the cache converges.",
+    "4) Temporarily advise Console to throttle route rename operations for high-throughput routes via admin guideline (PM note issued)."
+  ],
+  "proposed_fix": "Permanent fix consists of three coordinated changes: (A) remove mutable route name from the fanout fingerprint and ensure fingerprints are derived only from immutable identifiers (route_id + org_id + route_version), (B) strengthen the debit ack path to be idempotent for duplicate fanout keys (introduce per-bucket causal tokens), and (C) add a fast reconcile path on rename to retire old fingerprints immediately. Implement change A first (low risk), then B, then C.",
+  "rollout_plan": [
+    "1) Implement change A in runtime repo, feature-gated behind 'stable-fingerprint' toggle (PR referenced below).",
+    "2) Run CI and synthetic stress tests (route rename under load) in staging cluster; run canary job for 48h in staging-2.",
+    "3) Flip feature flag for 5% of production traffic (small orgs) for 24h and monitor metrics (duplicate-fanout-rate, unmetered-window-count).",
+    "4) If stable, ramp to 50% for 24h, then 100% for all regions.",
+    "5) Ship change B in a follow-up release with backward-compatible idempotency keys; rollout with canary then global deploy.",
+    "6) Deploy reconcile job C as a separate service with gradual ramp and run against historical rename events to ensure it correctly collapses duplicates.",
+    "7) Post-deploy: run billing reconciliations for the affected orgs covering the window of incidents and communicate findings to support and finance."
+  ],
+  "test_plan": [
+    "Unit tests for fingerprint derivation (ensure route_name excluded).",
+    "Integration test: route rename under sustained traffic with leader re-election simulated; assert no duplicate fanout keys and zero unmetered windows.",
+    "Chaos test: simulate shard leader failover during rename window to validate idempotent debit path (for change B).",
+    "E2E staging run with real-like traffic for 72h before production canary.",
+    "Add regression test in the billing-backfill harness to detect historical occurrences during backfills."
+  ],
+  "monitoring_and_alerting": [
+    "New metric: runtime.policy.fanout.duplicate_keys.rate - alert if > 0.05% across orgs within 10m.",
+    "New dashboard: per-org per-route fanout key map with time-series of active keys and associated debits.",
+    "Alert: 'unmetered-window-detected' when per-route debits drop >95% while ingress remains >50% of baseline for >5s.",
+    "Pager policy: P1 alert to on-call runtime engineer and SRE for sustained (>5m) occurrences affecting >3 orgs."
+  ],
+  "related_links": [
+    "GitHub PR: https://github.com/redwood-inference/runtime/pull/12045",
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/INF/pages/987654321/Route+Rename+Fanout+Investigation",
+    "Grafana dashboard: https://grafana.redwood.internal/d/olm123/fanout-duplicates",
+    "Slack thread: https://redwood.slack.com/archives/C01RUNTIME/p1676543212345",
+    "Support tickets: SUP-4123, SUP-4180"
+  ],
+  "labels": [
+    "billing",
+    "metering",
+    "rate-limiter",
+    "high-priority",
+    "needs-postmortem"
+  ],
+  "estimate": "8",
+  "cycle": "Cycle 55",
+  "release": "runtime-1.25",
+  "customer_impact": "medium",
+  "security_review_required": "false",
+  "due_date": "2026-03-20",
+  "parent_issue": [
+    "ENG-512919"
+  ],
+  "dependencies": [
+    "ENG-712908",
+    "ENG-842719"
+  ],
+  "comments": [
+    "2026-02-13 12:02 - Marcus Lee: Assigned to me. I'll reproduce in staging and capture debug logs for fanout fingerprints.",
+    "2026-02-14 15:00 - Aisha Patel (PM): Notifying SRE and Support; collecting impacted org list and opening support threads for affected customers.",
+    "2026-02-20 09:30 - Keiko Tanaka (SRE): Reconcile job ran on staging and cleaned up duplicates; metrics show immediate reduction in unmetered-window-count.",
+    "2026-02-26 18:45 - Marcus Lee: Temporary feature-flag flip to disable name-in-fingerprint rolled to prod regions A/B; monitoring is green for 12h.",
+    "2026-03-03 11:10 - Code Review (Lucas Nguyen): Suggested adding an integration test for leader election during rename (added to test plan).",
+    "2026-03-08 16:40 - Finance (Emma Ross): Requested a list of affected invoices for reconciliation; added to post-deploy checklist.",
+    "2026-03-10 09:00 - Marcus Lee: PR #12045 opened for change A; awaiting approval and CI.",
+    "2026-03-10 17:22 - Aisha Patel: Updated release target to runtime-1.25 and added due date to align with next ops window."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "impact_summary",
+    "investigation_notes",
+    "root_cause",
+    "short_term_mitigation",
+    "proposed_fix",
+    "rollout_plan",
+    "test_plan",
+    "monitoring_and_alerting",
+    "related_links",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_05588b5a3ffb49dfb91326e8e0811979"
+}

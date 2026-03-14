@@ -1,0 +1,118 @@
+{
+  "key": "ENG-146518",
+  "team": "engineering",
+  "title": "Heap-fuse and allocator thresholding: investigation of gradual GPU RSS growth under continuous batching with KV cache warmup",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-13",
+  "creator": "Riley Chen",
+  "assignee": "Miguel Santos",
+  "project": "runtime-memory-stability",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "memory",
+    "cudaMallocAsync",
+    "kv-cache",
+    "continuous-batching",
+    "investigation",
+    "observability"
+  ],
+  "dependencies": [
+    "ENG-11021",
+    "ENG-142309"
+  ],
+  "release": "runtime-1.24",
+  "customer_impact": "medium",
+  "security_review_required": "false",
+  "description": "Summary: Production nodes running continuous-batching workloads with aggressive KV cache warmup show a slow, sustained increase in GPU RSS over hours (10-30% drift) even after request volume returns to baseline. This appears correlated with: (1) high prefix reuse during warmup, (2) frequent stream ownership handoffs from the runtime batcher, and (3) cudaMallocAsync pool growth that is not reclaimed promptly. Hypothesis: allocator thresholding logic + host-side staging allocation patterns are leaving small resident heap fragments that prevent the runtime from compacting or returning memory to the CUDA pool, causing cumulative RSS drift when KV cache entries are pinned across many epochs.",
+  "steps_to_reproduce": [
+    "1) Start a dedicated-inference node with runtime-1.24 image and default gpu allocator settings",
+    "2) Run a continuous-batching driver that ramps to 4x baseline QPS for 45 minutes using variable sequence lengths (avg 512 tokens) to trigger KV cache warmup",
+    "3) After warmup, drop QPS back to baseline and continue traffic for 3 hours",
+    "4) Observe nvidia-smi and process RSS; collect allocator traces (MALLOC_ASYNC_TRACE) and runtime allocation logs every 5 minutes",
+    "5) Repeat with allocator tuning knobs: POOL_MIN_BLOCK=4MB, POOL_MAX_BLOCK=128MB, and with stream-affinity pinned vs. unpinned"
+  ],
+  "observations": [
+    "- RSS rises steadily during warmup and continues a slower upward trend for hours even at baseline traffic",
+    "- cudaMallocAsync pool size increases in coarse-grained steps (power-of-two bins) with many tiny resident pages interleaved",
+    "- Host-side staging buffers (pinned host memory) spike during batch merges and do not fully release due to lingering CUDA streams holding references",
+    "- Frequent small returns to the pool appear delayed \u2014 free/return latency correlated with stream synchronization events",
+    "- KV cache keeps pointers to small per-token allocations that prevent slab coalescing under current pooling policy"
+  ],
+  "telemetry_links": [
+    "https://grafana.redwood.internal/d/allocator/2026-03-10-allocator-trace?panel=heap-growth",
+    "https://sentry.redwood.internal/issue/alloc-drift-146518",
+    "https://github.com/redwood-inference/runtime/pull/10892 (experiment branch)"
+  ],
+  "experiments_run": [
+    "A) Increase POOL_MAX_BLOCK -> 256MB: reduced number of pool bins but RSS still grew (slower)",
+    "B) Stream-affinity pinning: reduced staging churn but introduced latencies on tiny batches",
+    "C) Aggressive KV eviction (LRU threshold lowered): immediate RSS drop but increased tail latency on cold prefixes",
+    "D) Inserted explicit cudaStreamSynchronize at batch boundaries: allowed cudaMallocAsync to return memory faster but added ~1.8ms median latency"
+  ],
+  "analysis_notes": [
+    "1) Unlike previous 'slab thrashing' bugs, fragmentation here is dominated by many small resident allocations that are windowed across stream lifetimes rather than single large unused arenas",
+    "2) The allocator's heuristic to keep recently-used mini-chunks for reuse is preventing page merging; when the KV cache pins pointers scatter across multiple bins, coalescing fails",
+    "3) cudaMallocAsync's return-to-os behavior is gated by stream callbacks; our runtime batches open transient streams which extend lifetime of freed blocks until stream completion callbacks run",
+    "4) The combination of prefix caching (long-lived small allocations) and our continuous-batcher merging policy produces many interleaved lifetimes that inhibit defragmentation"
+  ],
+  "proposed_mitigations": [
+    "Short term (safe): add periodic background 'stream-flush and pool-trim' task running every 15 minutes to call cudaStreamQuery + attempt pool shrink on idle streams",
+    "Short term (config): expose POOL_MIN_BLOCK and POOL_MAX_BLOCK as per-node flags and set conservative defaults for heavy-KV nodes",
+    "Medium term: implement a lightweight allocator compaction pass that coalesces adjacent free mini-chunks on the host before returning them to cudaMallocAsync bins",
+    "Medium term (runtime): change batcher to reuse a bounded set of streams instead of spawning ephemeral streams per merge to reduce cross-stream lifetime overlap",
+    "Long term: redesign KV cache allocation to use chunked per-prefix arenas (large contiguous allocations per prefix) to avoid scattering tiny allocations across bins"
+  ],
+  "implementation_notes": [
+    "- For pool-trim task: use cudaStreamQuery on a pinned 'cleanup' stream to avoid synchronizing application streams; ensure it is opt-in via node config",
+    "- Compaction pass must be lock-free enough to not block token emission; consider running in a low-priority background thread with exponential backoff",
+    "- Per-prefix arenas require migration plan for on-disk/serialized caches and eviction behavior in presence of multi-tenant workloads",
+    "- Metrics to add: per-bin resident pages, avg chunk lifetime histogram, stream-holding-block-count, pool-trim success rate"
+  ],
+  "decisions": [
+    "2026-03-11: ship background pool-trim task as opt-in flag runtime.experimental.pool_trim (owner: Miguel)",
+    "2026-03-12: enable additional allocator telemetry in canary fleet for 48 hours (owner: Observability)"
+  ],
+  "next_steps": [
+    "1) Create canary build with pool-trim task and updated POOL_* defaults: PR #10892 -> merge to canary by 2026-03-14",
+    "2) Roll to 10% of Dedicated fleet with heavy-KV traces, monitor RSS and latency (SLO: <5% percent change in P95 latency)",
+    "3) Start design doc for per-prefix arenas and compaction pass (owner: Miguel, due 2026-03-21)",
+    "4) Add metrics and dashboard panels referenced above and run load tests for 72 hours"
+  ],
+  "comments": [
+    "2026-03-10 09:12 - Riley Chen: Initial triage \u2014 reproduced on local dev rig (A100) with workload driver. Attaching allocator traces.",
+    "2026-03-11 14:03 - Priya Nair: Obs: stream-affinity experiment looks promising; can we quantify additional latency introduced? I added a tail-latency panel.",
+    "2026-03-11 18:22 - Miguel Santos: Implemented prototype pool-trim task in PR #10892. It performs non-blocking stream queries and attempts pool shrinking. Running in canary now.",
+    "2026-03-12 10:05 - Observability Bot: Canary nodes show 12% lower pool bin count after 1 hour; RSS slope reduced but still positive. Full traces in dashboard.",
+    "2026-03-13 08:41 - Riley Chen: Noted an outlier node where RSS did not drop \u2014 investigating whether a user workload pinned many prefixes. Added potential dependency ENG-218210 for cross-checking prefetch patterns.",
+    "2026-03-13 16:00 - Miguel Santos: Plan to expose POOL_MAX_BLOCK flag in node config and coordinate with deployments team for staged rollout next week."
+  ],
+  "attachments": [
+    "s3://redwood-artifacts/alloc-traces/ENG-146518/trace-2026-03-10.tgz",
+    "gs://redwood-dumps/heap-snapshots/eng-146518-20260310.heapsnap",
+    "https://github.com/redwood-inference/runtime/pull/10892",
+    "https://confluence.redwood.internal/pages/viewpage.action?pageId=872146518 (design notes)"
+  ],
+  "notes_for_reviews": [
+    "- Performance reviewers: look at added median latency impact of explicit stream synchronization in experiment C",
+    "- Security reviewers: no new user data surfaces, only allocator and stream housekeeping (security_review_required=false), but ensure SRE review for rollout",
+    "- Platform: coordinate with Dedicated rollout schedule because flag defaults change node memory behavior"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observations",
+    "experiments_run",
+    "analysis_notes",
+    "proposed_mitigations",
+    "implementation_notes",
+    "decisions",
+    "next_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_4f7970739cc54b24a12fef8640adab82"
+}

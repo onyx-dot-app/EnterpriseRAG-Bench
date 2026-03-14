@@ -1,0 +1,88 @@
+{
+  "key": "ENG-762314",
+  "team": "engineering",
+  "title": "Intermittent FP16 accumulation bias during kernel hot-swap under adaptive batching",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-03-11",
+  "creator": "Maya Chen",
+  "assignee": "Diego Alvarez",
+  "project": "runtime-performance",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "labels": [
+    "kernel-selection",
+    "fp16",
+    "hot-swap",
+    "adaptive-batching",
+    "prefill-decode",
+    "investigation"
+  ],
+  "description": "Summary: While rolling out the adaptive kernel hot-swap path to reduce tail latency, we observed intermittent numerical drift in long-sequence decoding runs. The drift presents as a small but growing bias in FP16 accumulator values that leads to softmax instability and token distribution skew after ~1500 decode steps. This ticket tracks the investigation and proposed mitigation.",
+  "steps_to_repro": [
+    "1) Deploy runtime binary with kernel-hot-swap feature flag enabled (hot-swap = on, adaptive_batching = aggressive)",
+    "2) Run the regression harness: python tests/regressions/long_sequence_decode.py --model=xgen-13b --seq_len=2048 --batch_size=8 --tokens=1600 --retries=20",
+    "3) Observe divergence metric in tests/metrics/divergence.log and intermittent softmax NaN or large-prob jumps in decode traces",
+    "4) Reproduce more reliably when GPU utilization > 80% and persistent kernel handoffs occur (kernel A -> kernel B on warmup path)",
+    "5) Attach --enable-kv-cache=true to increase stateful pressure and speed up divergence"
+  ],
+  "observed_behavior": "After ~1200-1800 decode steps, model outputs start to diverge from baseline: top-k token probabilities shift by 0.03-0.12 L1 distance. Occasional softmax values saturate causing token repetition. Logs occasionally show non-zero 'accum_state' on kernel entry after hot-swap.",
+  "expected_behavior": "Numerical outputs should remain within deterministic tolerance of baseline (L1 < 0.005) for identical seeds and inputs. Kernel hot-swap should transfer execution without leaving stale accumulator state.",
+  "logs": "[2026-03-07T16:12:31Z] kernel_swap: src=kernel.A id=0x7fa2f1 swap_in\n[2026-03-07T16:12:31Z] kernel_entry: kernel.B id=0x8b3c2f accum_state_sum=1.2e-05\n[2026-03-07T16:12:31Z] decode_step=1348 softmax_max=0.9999 divergence=0.004\n[2026-03-07T16:12:32Z] kernel_swap: src=kernel.B id=0x8b3c2f swap_out\n[2026-03-07T16:12:33Z] kernel_entry: kernel.A id=0x7fa2f1 accum_state_sum=0.00034  <-- unexpected non-zero\n[2026-03-07T16:12:35Z] decode_step=1389 softmax_max=1.0000 divergence=0.038\n[2026-03-07T16:12:37Z] runtime-warning: fp16-accum-aliasing detected on stream 4",
+  "investigation_findings": "Preliminary root-cause hypothesis: when we perform kernel hot-swap under high batching pressure, the accumulator buffer used for attention accumulation (FP16) is not being fully zeroed/reinitialized for the incoming kernel variant. Two contributing factors found:\n- scheduler uses a racey heartbeat to preempt and migrate in-flight batches; the lifecycle hooks assume the outgoing kernel will clear shared accum buffers but there are code paths where it returns ownership without zeroing.\n- new fused attention kernel (kernel.B) uses an aliasing buffer view for accumulator to avoid an extra allocation; when it maps onto the same slab as the previous kernel variant, stale FP16 residuals remain and get added into subsequent reductions, causing monotonic bias (small positive offset).\nReproduction correlates with: high GPU utilization, large KV cache footprints, and sequence lengths > 1024. Unit tests with deterministic single-kernel runs pass; issue only appears across hot-swap boundary.",
+  "root_cause": "Race between scheduler hot-swap finalizer and kernel teardown + buffer aliasing optimization in kernel.B. The finalizer assumes kernel-owned accumulator has been zeroed by teardown; kernel.B trusted a shared slab and performed lazy zeroing only on write, letting tiny FP16 denorms persist when write paths are short-circuited by prefetch heuristics.",
+  "fix_proposal": "1) Short-term: Explicitly zero accumulator slab on kernel-entry path as a safe guard (adds one memclear) and disable aliasing heuristic under hot-swap_enabled flag. 2) Medium-term: Add ownership transfer handshake to scheduler that atomically revokes buffer aliases before kernel swap completes. 3) Add unit/integration tests to simulate hot-swap with aggressive batching and KV cache pressure; assert accumulators are cleared. 4) Add telemetry metric 'accum_nonzero_on_entry' and an alert for >0.1% rate.",
+  "work_done": "- Reproduced locally on test cluster with harness and captured logs (see linked PR).\n- Built instrumented runtime with 'accum-probe' enabled to count non-zero accumulator entries.\n- Drafted initial non-zero guard patch (memclear on entry) and validated it prevents divergence on the regression harness in 20/20 runs.",
+  "next_steps": [
+    "1) Open internal RFC for scheduler ownership handshake and buffer aliasing semantics (owner: scheduler team)",
+    "2) Land hotfix memclear + feature-flag rollback path (PR: see linked_prs) and enable on canary cluster",
+    "3) Add integration test in CI that runs long_sequence_decode against both kernel variants under hot-swap flag",
+    "4) Monitor accum_nonzero_on_entry telemetry for 72h after canary rollout",
+    "5) Follow-up: design a lower-cost zeroing strategy (page-level tombstone or write barrier) to avoid full memclear perf regression"
+  ],
+  "linked_prs": [
+    "https://github.com/redwood-inference/runtime/pull/17234 (hotfix/accum-zero-on-entry)",
+    "https://github.com/redwood-inference/runtime/pull/17285 (instrumentation/accum-probe)",
+    "https://github.com/redwood-inference/runtime/pull/17302 (rfc/scheduler-handshake)"
+  ],
+  "dashboards": [
+    "https://grafana.redwood.ai/d/rt-hot-swap/hot-swap-health?orgId=1",
+    "https://grafana.redwood.ai/d/rt-numerics/accumulator-metrics?orgId=1"
+  ],
+  "dependencies": [
+    "ENG-847362",
+    "ENG-631227"
+  ],
+  "linked_incidents": [
+    "INC-2026-1143"
+  ],
+  "release": "runtime-1.23",
+  "due_date": "2026-03-18",
+  "customer_impact": "medium",
+  "security_review_required": "false",
+  "comments": [
+    "2026-02-21 Maya Chen: Initial report from regression harness; assigning to Diego for triage.",
+    "2026-02-24 Diego Alvarez: Reproduced locally with harness. Collected heap and slab maps. Observed non-zero accum entries post-swap. Adding instrumentation.",
+    "2026-03-02 Anika Roy (SRE): Canary traces show 0.18% of hot-swap events with accum_nonzero_on_entry > 0. We should be cautious before broad rollout.",
+    "2026-03-05 Diego Alvarez: Landed instrumented build to staging. Drafted hotfix memclear patch. Performance regression locally: memclear adds ~1.2% decode latency at p95; acceptable for canary but we need better long-term plan.",
+    "2026-03-10 Priyanka Singh (PM): Prioritize hotfix canary for runtime-1.23. Notify customers on dedicated capacity who have aggressive hot-swap enabled.",
+    "2026-03-11 Diego Alvarez: Preparing PR for hotfix; will run canary in eu-central-1 with 5% traffic tomorrow. Follow-up RFC scheduled for 2026-03-16.",
+    "Links: Confluence runbook - https://confluence.redwood.ai/display/RUNTIME/HotSwap+Accumulator+Investigation"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_repro",
+    "observed_behavior",
+    "expected_behavior",
+    "logs",
+    "investigation_findings",
+    "root_cause",
+    "fix_proposal",
+    "work_done",
+    "next_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_91e9c25efb0d468d894533211f0b4c2f"
+}

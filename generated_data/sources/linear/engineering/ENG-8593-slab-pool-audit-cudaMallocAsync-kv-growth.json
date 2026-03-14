@@ -1,0 +1,93 @@
+{
+  "key": "ENG-8593",
+  "team": "engineering",
+  "title": "Slab-pool audit and fragmentation debug: intermittent GPU memory growth during continuous batching and KV cache retention",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-09",
+  "creator": "Lina Gomez",
+  "assignee": "Arjun Patel",
+  "project": "serving-runtime",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "labels": [
+    "kv-cache",
+    "cudaMallocAsync",
+    "allocator",
+    "memory-leak",
+    "investigation",
+    "continuous-batching"
+  ],
+  "description": "High-level: Several production instances in europe-prod show sustained GPU memory growth over ~12\u201336 hours under continuous batching workloads with long-lived KV cache entries. Memory usage increases until OOMs are observed in one pod and graceful fallback triggers. This ticket scopes an investigation into allocator behavior (cudaMallocAsync + internal slab pooling) and KV cache lifecycle interactions to identify whether the root cause is leakage, fragmentation causing ineffective reuse, or incorrect free-paths for KV cache buffers created during prefix reuse. Goal is to identify a root cause and implement a fix or mitigation (config toggles, pool tuning, or allocator patch).",
+  "repro_steps": [
+    "Deploy a dedicated serving pod with model x-small-v2 on a single A10 instance using the europe-prod config (container image: runtime-2026.02.3-debug).",
+    "Run a continuous batcher worker that issues variable-length requests (min tokens=64, max tokens=1024) at high qps to keep GPUs >60% util. Use prefix reuse to simulate KV cache lifetimes: reuse prefixes for ~90% of requests, with 10% new conversation starts.",
+    "Enable KV cache caching and set cache TTL to 48h. Run for 48+ hours and monitor nvidia-smi, runtime metrics (gpu_mem_total, gpu_mem_free, allocator_leaked_bytes) and kernel logs.",
+    "Compare behavior with environment variable RUNTIME_FORCE_CUDA_MALLOC_ASYNC=0 (fall back to cudaMalloc) and RUNTIME_POOL_SLAB_BYTES=0 (disable slab pooling) to isolate allocator influence."
+  ],
+  "observed_behavior": "Memory footprint reported by nvidia-smi gradually increases by ~5\u201312% every 6\u201312 hours until one serving process hits an allocation failure. Internal allocator metrics show high number of small retained blocks in the slab arena (median size ~8KB) and increasing fragmentation score. Turning off cudaMallocAsync reduces observed growth rate but does not eliminate retention entirely.",
+  "expected_behavior": "Under steady-state continuous batching with KV cache reuse, GPU memory usage should plateau after warmup. Allocator should reuse freed blocks or return to CUDA so that fragmentation does not cause unbounded growth.",
+  "hypotheses": [
+    "H1: cudaMallocAsync internal arena grows due to never-returned CUDA pages because slab freelist lengths keep small fragments and default population policy prevents page release.",
+    "H2: KV cache lifecycle holds onto small transient buffers (attn/kv buffers) that are not freed due to pointer aliasing or missing refcount decrements in the runtime\u2019s cache eviction path.",
+    "H3: Continuous batching mixes many sequence lengths causing slab allocator internal fragmentation (mis-sized slab buckets) leading to lots of small retained blocks that cannot satisfy larger allocations, forcing new page commits.",
+    "H4: A race during rollback/fallback (canary->fallback path) leaves allocation metadata inconsistent, leaking descriptors to the pool."
+  ],
+  "investigation_notes": [
+    "Attached profiler snapshot (perf traces) shows many small cudaMallocAsync allocations in allocation hot path: avg size 7.9KB over 30 minutes.",
+    "Heap snapshots taken with NVIDIA's memory pool tracing show steady increase in 'unsplit' blocks marked as 'in-use' by runtime bookkeeping though corresponding logical references appear freed at application layer.",
+    "Reproducer with RUNTIME_FORCE_CUDA_MALLOC_ASYNC=0 shows much slower leak growth; suggests page return semantics in CudaMallocAsync are contributing, but not sole cause.",
+    "Review of KV cache eviction code: eviction path uses epoch-based markers. Found a code path where stale pointers are moved to a 'pending_free' list but not drained when batcher backpressure happens \u2014 could delay actual freeing indefinitely.",
+    "Kernel scheduler logs: when batch mix has high variance (short+long) the runtime creates temporary KV slices for large sequences; slices are backed by pooled small buffers that sometimes remain in LRU tail due to incorrect touch on reuse."
+  ],
+  "logs_summaries": [
+    "2026-03-02 04:22 UTC - Pod runtime-7b9: GPU mem used 11.2GB -> 13.9GB over 18h; allocator_leaked_blocks metric increased from 2.3k to 7.1k.",
+    "2026-03-04 15:04 UTC - With RUNTIME_FORCE_CUDA_MALLOC_ASYNC=0: growth limited to +0.8GB over same interval; allocator retained blocks still present but fragmentation score lower.",
+    "2026-03-06 07:12 UTC - OOM event: cudaErrorMemoryAllocation on allocation of 64MB; backtrace points to kv_cache_write() path called from batcher fastpath."
+  ],
+  "experiments_run": [
+    "Disable slab pooling: set RUNTIME_POOL_SLAB_BYTES=0 -> immediate reduction in fragmentation metric but CPU overhead increases and throughput drops ~6%.",
+    "Force synchronous cudaMalloc: RUNTIME_FORCE_CUDA_MALLOC_ASYNC=0 -> reduced growth rate, suggests cudaMallocAsync page-commit behavior factors into problem.",
+    "Introduce aggressive pending_free draining at end of each batch flush (local patch): prevented long tail retention in load test but caused 2\u20133% p90 latency increase.",
+    "Run with smaller batch targets (reduce dynamic batching window) -> reduced allocator churn and memory growth but impacts throughput."
+  ],
+  "next_steps": [
+    "1) Create minimal unit test reproducer that triggers the leak deterministically in CI using the debug runtime image. Goal: isolation without external services (by 2026-03-12).",
+    "2) Add diagnostic counters to track 'pending_free' list length and last-touch epoch for KV slices; deploy to a canary pool and observe (by 2026-03-14).",
+    "3) Prototype a small allocator shim that coalesces small free blocks before returning to cudaMallocAsync to reduce fragmentation; evaluate performance and memory behavior (by 2026-03-21).",
+    "4) If repro confirmed to be cudaMallocAsync-specific, file upstream bug with NVIDIA including heap dump and timeline; meanwhile expose runtime toggle to disable cudaMallocAsync per-deployment and recommend conservative slab sizing as mitigation.",
+    "5) Coordinate with infra to rotate affected pods and ramp canaries after fixes; prepare rollout plan in console with opt-in toggle."
+  ],
+  "dependencies": [
+    "ENG-7934",
+    "ENG-4127"
+  ],
+  "related_links": [
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/RUN/pages/123456789/kv-cache-slab-pooling-and-cudaMallocAsync-investigation",
+    "Grafana dashboard: https://grafana.redwood.example/d/serve/memory-allocator-overview",
+    "Reproducer repo: https://github.com/redwood-inference/runtime-debug/tree/ENG-8593-reproducer",
+    "PR: https://github.com/redwood-inference/runtime/pull/1456 (pending internal review)",
+    "NVIDIA forum thread: https://forums.developer.nvidia.com/t/cudamallocasync-page-return-behavior/"
+  ],
+  "acceptance_criteria": [
+    "Root cause identified and documented (one of H1\u2013H4 of hypotheses or a new root cause) with evidence (heap traces, diff, or repro).",
+    "Either a code fix merged that prevents unbounded growth under continuous batching or a documented and supported mitigation (config toggle + guidance) with performance impact assessed.",
+    "Canary deployment demonstrates stable GPU memory footprint over 72h under the original load profile (no greater than 5% growth after warmup).",
+    "Post-mortem notes with timeline, mitigations, and follow-up tickets created for long-term improvements (e.g., allocator redesign, kernel tuning)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "repro_steps",
+    "observed_behavior",
+    "expected_behavior",
+    "hypotheses",
+    "investigation_notes",
+    "logs_summaries",
+    "experiments_run",
+    "next_steps",
+    "acceptance_criteria"
+  ],
+  "dataset_doc_uuid": "dsid_cd1e0a66a4c44da9a412efcb39786f48"
+}

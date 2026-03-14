@@ -1,0 +1,101 @@
+{
+  "key": "SUP-76240",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Delayed initial response and mid-request disconnects traced to reverse-proxy buffer exhaustion on oversized metadata headers",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Kumar",
+  "assignee": "Marcus Lee",
+  "customer_company": "Beacon Health Analytics",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "edge-proxy"
+  ],
+  "labels": [
+    "streaming",
+    "timeout",
+    "buffering",
+    "investigating",
+    "customer-impact"
+  ],
+  "environment": "prod us-east",
+  "affected_models": [
+    "gpt-open-compat-30b",
+    "redwood-llama-13b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-12T18:00:00Z",
+  "description": "Issue summary:\nCustomers observe long delays to first byte (often 10\u201340s) for streaming completions and intermittent connection termination mid-stream. This appears correlated with requests that carry large, repeated metadata headers (distributed tracing + custom tenant routing headers) and slow initial client upload patterns. Impact: production traffic for Beacon Health Analytics (Dedicated) experiences degraded UX and occasional failed completions (~3\u20137% of streaming sessions during peak).\n\nEnvironment:\n- Prod cluster: us-east inference plane behind internal edge-proxy fleet (nginx 1.20 variant + custom proxy layer) -> API gateway -> serving runtime.\n- Customer on Dedicated capacity, model pins to gpt-open-compat-30b.\n\nSteps to reproduce (observed pattern):\n1) Client opens streaming completion and attaches heavy tracing/metadata headers (~3\u20136KB total) across multiple hop headers (x-baggage, x-trace, x-tenant-meta).\n2) Client uploads prompt slowly (small chunks over ~2\u20136s).\n3) Edge proxy aggregates headers and buffers request body while awaiting end of client chunking; buffer memory allocation is hit and NGINX proxy_buffering begins to coalesce writes.\n4) First byte to client is delayed until proxy flush threshold or timeout (observed ~20\u201330s in some traces).\n5) In certain cases, the proxy or ALB tears down the upstream after crossing an internal idle/send timeout resulting in mid-stream disconnects (client gets ECONNRESET / 502).\n\nLogs/Telemetry:\n- Traces: internal request IDs 2026-03-10T14:21:xxZ (trace-id: 7f1a-...), associated with customer session ids BH-9932-*.\n- Proxy metrics: proxy_buffer_busy_time spiked for these requests; downstream socket send buffer growth and multiple small write syscalls observed.\n- Edge proxy error logs show repeated \"upstream prematurely closed connection\" entries and \"client aborted\" entries correlated with requests carrying >4KB of combined metadata headers.\n\nNotes: This differs from previous header-growth incidents because the trigger here is both large combined metadata headers and slow-chunked body upload; the proxy behavior is to hold and coalesce which amplifies send latency and then hits idle/send prune thresholds configured in fronting load balancers.",
+  "steps_to_reproduce": [
+    "Send a streaming completion with large distributed-tracing and tenant headers totaling >3KB while uploading prompt body in 100\u2013500B chunks at 200\u2013500ms intervals",
+    "Observe TTFB delay of 10\u201340s and check proxy logs for buffer allocations and upstream close messages",
+    "Repeat with smaller headers or fast single-shot upload \u2014 problem does not reproduce consistently"
+  ],
+  "comments": [
+    "Aisha Kumar (Support) 2026-03-10: Customer reported spike in failed streaming completions during morning ingest window. Provided initial traces and asked for SRE assistance.",
+    "Marcus Lee (SRE) 2026-03-10: Reproduced in staging with a test harness that replays customer headers + chunked upload. Confirmed TTFB delay and proxy buffering behavior. Noted nginx proxy_buffer_size and proxy_busy_buffers_size hover near default in edge image.",
+    "Marcus Lee (SRE) 2026-03-11: Temporarily disabled proxy_buffering for a narrow route in staging; immediate improvement in TTFB and no mid-stream disconnects. Need coordinated rollout and risk review before prod change.",
+    "Customer (Beacon Health) 2026-03-11: Able to confirm reduced failures when client switches to single-shot upload; asks whether platform can accept chunked uploads reliably without client changes.",
+    "Product (Lana Cho) 2026-03-12: Needs impact summary and recommended mitigations (config + client guidance) to share with customer success."
+  ],
+  "investigation_notes": [
+    "Hypothesis: proxy internal buffering + slow client upload causes upstream write coalescing; combined with load balancer idle/send pruning this yields long TTFB and sometimes upstream termination.",
+    "Observed nginx config: proxy_buffering on by default; proxy_buffers and proxy_busy_buffers_size set to conservative values for memory control in edge fleet.",
+    "ALB/ELB (fronting load balancer) has hard idle/send timeouts that will close connections after no observed bytes for configured window; when proxy holds bytes instead of flushing, ALB triggers prune.",
+    "Staging change: disabled proxy_buffering on specific streaming route \u2014 confirmed fixe for both TTFB and mid-stream disconnects. No regression in throughput seen in the narrow test run.",
+    "Risk: disabling buffering increases number of small write syscalls and could raise CPU on high-concurrency nodes; need to estimate cost impact for Dedicated pool sizing.",
+    "Alternate mitigation: increase proxy_buffer sizes and reduce proxy coalescing thresholds, and tune upstream idle/send timeouts where possible."
+  ],
+  "related_github_prs": [
+    "gh-redwood/edge-proxy#482",
+    "gh-redwood/infra-config#1290"
+  ],
+  "related_confluence_pages": [
+    "Confluence: Edge Proxy Runbook - buffering tuning",
+    "Confluence: Streaming API SLOs and Load Balancer Guidance"
+  ],
+  "linked_issues": [
+    "SUP-11208",
+    "SUP-77412"
+  ],
+  "resolution": [
+    "Temporary workaround: customer switched to single-shot uploads for critical traffic which reduced failures (confirmed).",
+    "Short-term fix (canary): disabled proxy_buffering for /v1/streaming-completions route in staging and a small canary in prod (10% of traffic) \u2014 observed 90% reduction in TTFB incidents for canary traffic.",
+    "Mid-term plan: coordinate with Infra to roll out proxy_buffering=off for streaming routes in Dedicated clusters + add autoscaling margin for CPU/memory increased write syscall cost. Also increase proxy_busy_buffers_size to handle edge cases.",
+    "Long-term: implement explicit backpressure-aware flush signals from gateway to edge-proxy and document recommended client chunk sizes; add automated detection on proxy metrics to trigger dynamic tuning."
+  ],
+  "postmortem_actions": [
+    "SRE to create infra RFC for disabling proxy_buffering by default on streaming endpoints (owner: Marcus Lee, due 2026-03-19)",
+    "Product to update streaming API docs with guidance on chunk size and metadata header limits (owner: Lana Cho, due 2026-03-17)",
+    "Support to notify Beacon Health Analytics and provide mitigation checklist (owner: Aisha Kumar, due 2026-03-13)",
+    "Telemetry: add alert on proxy_buffer_busy_time and upstream-close-rate for streaming routes (owner: Observability team, due 2026-03-16)"
+  ],
+  "attachments": [
+    "s3://redwood-support/attachments/SUP-76240/proxy-logs-2026-03-10.gz",
+    "s3://redwood-support/attachments/SUP-76240/debug-trace-BH-9932-20260310.json"
+  ],
+  "customer_communication": [
+    "2026-03-10 initial ack sent with request for sample traces and session IDs",
+    "2026-03-11 provided temporary client workaround (single-shot upload) and validation steps",
+    "2026-03-12 shared canary plan and expected timeline for infra change; asked to approve scheduled maintenance window if needed"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "investigation_notes",
+    "comments",
+    "resolution",
+    "postmortem_actions",
+    "customer_communication"
+  ],
+  "dataset_doc_uuid": "dsid_5858007b13b84e1fae31be61f8c1a7e9"
+}

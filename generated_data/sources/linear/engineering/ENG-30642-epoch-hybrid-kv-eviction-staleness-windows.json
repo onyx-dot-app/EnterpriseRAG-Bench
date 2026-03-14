@@ -1,0 +1,58 @@
+{
+  "key": "ENG-30642",
+  "team": "engineering",
+  "title": "Epoch-based hybrid eviction with staleness windows and KV epoch checks",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-02-10",
+  "updated_at": "2025-03-05",
+  "creator": "Aisha Khan",
+  "assignee": "Miguel Ortega",
+  "project": "KV Cache Resilience",
+  "cycle": "2025-W06",
+  "estimate": "5",
+  "due_date": "2025-03-20",
+  "labels": [
+    "kv-cache",
+    "eviction",
+    "gpu-memory",
+    "continuous-batching",
+    "correctness"
+  ],
+  "dependencies": [
+    "ENG-24167",
+    "ENG-25618"
+  ],
+  "parent_issue": [
+    "ENG-19342"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Problem statement:\nWe need an eviction policy for the KV cache that simultaneously: (1) minimizes GPU memory pressure under mixed workloads with continuous batching, (2) preserves correctness and prefix-level atomicity for generation sessions (so we never evict partial prefix state that would break future continuation), and (3) offers predictable latency/regression properties for production rollouts. Existing LRU and TTL-only schemes either evict too aggressively during bursty workloads (causing cache churn and increased token latency) or keep stale entries indefinitely (wasting costly GPU memory). Prefix-aware pinning mitigates correctness but can fragment memory and starve competing prefixes.\n\nProposal summary:\nIntroduce an epoch-based hybrid eviction controller combining three layers: 1) epoch segmentation, 2) staleness windows (soft TTL) per epoch, and 3) bounded-LRU within epoch with prefix-cohort atomicity. Key ideas: every KV entry carries an epoch ID (monotonically increasing for the serving runtime), a last_access_ts, and a prefix_cohort_id (opaque token grouping keys that must be evicted together). The eviction controller advances epochs on memory pressure or on explicit compaction events. When selecting victims, eviction picks whole prefix cohorts whose max(last_access_ts) falls outside the current staleness window for their epoch. Within an epoch, leftover capacity is reclaimed by bounded-LRU that respects cohort boundaries (evict smallest cohorts first). A TTL shadow keeps recently produced but infrequently accessed entries pinned for a short grace period to avoid thrashing during short bursts.\n\nCorrectness guarantees and invariants:\n- Cohort atomicity: eviction will only remove an entry in a prefix cohort if the cohort's metadata marks it eligible (all entries in cohort satisfy staleness predicate OR explicit tombstone from model change). This prevents partial prefix evictions which could corrupt continuations.\n- Epoch monotonicity: epoch IDs are monotonic and only increase. Any request capturing a KV snapshot will be able to detect epoch changes; if the epoch advanced during a request, the runtime either uses a fallback compatible model variant or triggers a conservative re-fetch.\n- Observational consistency: reads in the same generation request observe cache entries from a single epoch snapshot (no cross-epoch mixing). We provide a fast epoch-checking path in hot loops (single compare on the per-request snapshot token).\n- Memory bound: the eviction controller enforces a soft watermark and a hard watermark. Soft watermark triggers background compaction and cohort scavenging (non-blocking). The hard watermark triggers synchronous eviction and backpressure to the batcher (reject/break batches if necessary).\n\nGPU memory & batching considerations:\n- Continuous batching: batches may span requests referencing multiple prefixes. We ensure that any prefix cohort used by a running batch is pinned for the duration of batch processing. Pin counts are lightweight 16-bit counters in device memory; they avoid CPU roundtrips for hot-path checks.\n- Fragmentation mitigation: when cohorts are evicted, we schedule async device-side compaction tasks that coalesce freed KV blocks into large contiguous spans. Compaction is epoch-bounded and happens at low-priority streams to avoid impacting token generation.\n- Quantization/representation: eviction favors evicting higher-memory-per-entry representations first (float32 > float16 > quantized encodings) to gain immediate headroom while keeping more compact entries.\n\nImplementation plan (phases):\n1) Simulation harness (2w): extend the existing eviction-emulator to model epochs, cohorts, and batching patterns. Run workloads derived from production traffic traces (prefix lengths, batch sizes, burstiness).\n2) Prototype runtime changes (3w): add epoch metadata to KV entries, implement cohort metadata, implement bounded-LRU within epoch, and soft TTL. Integrate pin counters accessible from batch hot path.\n3) Canary rollout (2 weeks): ship to a small fleet in us-west for a single customer with low-risk traffic. Collect metrics: evictions/sec, generation latency P50/P95/P99, cache hit rate, and fragmentation ratio.\n4) Full rollout (gradual) with feature flag and automatic fallback to existing LRU policy if hard watermark events exceed threshold.\n\nTesting and validation:\n- Unit tests for epoch monotonicity, cohort atomicity, and pin/unpin races.\n- Fuzz tests that interleave batch pin/unpin with compaction and epoch advance.\n- Property-based tests asserting that no request sees cross-epoch key mixes.\n- Load tests with synthetic bursts to validate hard/soft watermark behavior.\n\nTrade-offs considered:\n- Complexity vs. simplicity: epoch/cohort adds metadata and logic but gives strong correctness and controllable eviction. Simpler LRU cannot enforce cohort atomicity at low cost.\n- Latency vs. memory: pinned cohorts reduce eviction but increase memory pressure; bounding pin durations and adding TTL grace balances it.\n- Device-side pin counters add device memory overhead (small) but avoid CPU-GPU synchronization on hot path.\n\nRollout metrics (success criteria):\n- Cache hit-rate increases or stays within 2% of baseline under normal traffic.\n- P95 latency does not regress by more than 5% in steady state.\n- Fragmentation ratio reduced by >20% after compaction events.\n- No observed continuity failures (tested by regeneration suites) during canary.\n\nFollow-ups and open questions:\n- Should cohort IDs be derived deterministically from prefix hashes or assigned at generation time? Deterministic simplifies metadata sharing but may cause cohort hotspots.\n- Investigate machine-learning heuristic to decide which representation to evict first based on historical re-access patterns.\n- Explore adding probabilistic sampling to reduce metadata writes for very hot keys.\n\nArtifacts and links:\n- Design doc (internal): https://redwood.atlassian.net/l/cp/kv-epoch-eviction-design\n- Eviction emulator PR: https://github.com/redwood-inference/serving/pull/2198\n- Experiments dashboard (canary): https://console.redwood.ai/dashboards/kv-epoch-canary\n\nEstimated rollout time to GA: 8-10 weeks including testing and enterprise safety window.",
+  "comments": [
+    "2025-02-11 | Miguel Ortega: Spiked on device-side pin counters; they add ~128B per cohort on device but avoid CPU roundtrips. Initial microbenchmarks look promising (hot-path latency unaffected).",
+    "2025-02-17 | Priya Menon (PM): Need to validate customer-visible continuity scenarios. Add a test harness that runs real generation prompts from 3 tier-1 customers. Also, include SLO guardrails in the canary checklist.",
+    "2025-02-21 | Elena Park (SRE): Hard watermark semantics are critical. Recommend we implement a telemetry invoice when hard watermark is hit so sales/CS are alerted. Also propose a circuit-breaker that disables compaction if device temperature is high.",
+    "2025-02-28 | Code review: PR 2198 requested a clearer API for epoch advancement triggers. Miguel updated to support manual epoch bump for debug and automatic bump based on memory pressure events.",
+    "2025-03-04 | QA: Added fuzz tests for pin/unpin race; found a rare double-unpin bug when a batch errors early. Patch submitted and tested."
+  ],
+  "attachments": [
+    "confluence:kv-epoch-eviction-design-v1.pdf",
+    "drive:kv-eviction-simulation-results-2025-02-26.csv"
+  ],
+  "github_prs": [
+    "https://github.com/redwood-inference/serving/pull/2198",
+    "https://github.com/redwood-inference/serving/pull/2207"
+  ],
+  "links": [
+    "https://console.redwood.ai/dashboards/kv-epoch-canary",
+    "https://redwood.atlassian.net/l/cp/kv-epoch-eviction-design"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_356f337578944f72a799b6a98546c641"
+}

@@ -1,0 +1,111 @@
+{
+  "key": "INT-200412",
+  "project": "internal-support",
+  "issue_type": "Bug",
+  "summary": "SLA dependency-graph inconsistency causes stale SLA inheritance after template rename",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-13",
+  "reporter": "Maya Chen",
+  "assignee": "Ethan Brooks",
+  "components": [
+    "sla-engine",
+    "template-registry",
+    "routing-service",
+    "reporting"
+  ],
+  "labels": [
+    "ops",
+    "sla-drift",
+    "template-rename",
+    "hotfix-candidate"
+  ],
+  "environment": "prod (us-east)",
+  "linked_issues": [
+    "INT-46290",
+    "INT-7765",
+    "INT-40177"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/support-tooling/pull/482"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SUPPORT/SLA+Dependency+Graph+Runbook"
+  ],
+  "description": "Issue summary: After several template renames and bulk imports last week, the SLA dependency graph that derives effective SLA weights for autoroute macros is returning stale parent bindings for a subset of templates. Impact: internal routing is mis-prioritizing support queues for about ~2.3% of incoming internal tickets causing delayed escalations and inaccurate SLA reporting buckets in the ops dashboard. Scope: internal-support only; no customer-facing queues affected, but impacts internal on-call SLO reporting and automated escalations. Hypothesis: when template_registry entries are renamed or re-keyed, the dependency graph reconciliation job sometimes fails to update in-memory binding indices, leaving older template IDs referenced by compiled macros. This yields an effective SLA weight mismatch between computed routing decisions and the persisted template manifest.",
+  "steps_to_reproduce": [
+    "1) Create a template 'HighTouch-DB-Migrations-v1' with SLA weight = P0 (10) and bind to macro 'db-migration-alerts'",
+    "2) Bulk-rename template to 'HighTouch-DB-Migrations-archived' via template-import job (template_registry import v2) and create new template 'HighTouch-DB-Migrations' with a different ID and SLA weight = P2 (3)",
+    "3) Trigger reconcile-run (manual run of sla-dependency-reconciler) but observe logs: job reports 'partial-sync: 37/49 reconciled' without error code",
+    "4) Send a test internal ticket matching macro 'db-migration-alerts' and observe routing: ticket routed with previous P0 priority instead of the new P2 weight",
+    "5) Check in-memory dependency graph endpoint /internal/debug/dep-graph?macro=db-migration-alerts and note parent template ID still points to the archived template ID",
+    "6) Query DB: SELECT * FROM template_bindings WHERE macro='db-migration-alerts' shows both bindings present; reconcile job should have pruned the archived binding but did not."
+  ],
+  "logs": [
+    "2026-03-09T22:11:03Z sla-reconciler INFO partial-sync: reconciled=37 total=49 duration_ms=12430",
+    "2026-03-09T22:11:03Z sla-reconciler WARN missing-template-id=tmpl_0f3a98 referenced_by=macro_db-migration-alerts",
+    "2026-03-09T22:11:04Z routing-service DEBUG decision=route_to_queue queue=oncall-db weight=10 computed_weight=10 source=dep-graph parent_template=tmpl_0f3a98"
+  ],
+  "investigation_notes": [
+    "2026-03-10 - Initial triage by Maya: reproduced locally using staging copy of template_registry; confirmed reconcile reports partial-sync without throwing exception; suspect batching window in reconcile job is skipping orphaned bindings when import metadata contains 'rename' marker.",
+    "2026-03-11 - Ethan injected additional logging into sla-reconciler: discovered a race where template-imports create a tombstone + new template in same transaction; reconciler iterate over listing but uses cached index that is lazily refreshed every 60s, causing missed pruning of tombstones.",
+    "2026-03-12 - SRE (Priya Kapoor) reviewed memory cache TTL; found cache.default_ttl is 60s and reconcile batching sets page_size=200. When import volume spikes, last page is skipped by condition 'if page_count == 0 break' which is off-by-one in current implementation.",
+    "Observed side-effect: reporting pipelines compute SLA cohorts from the in-memory dep-graph endpoint; since it retained archived binding, historical daily reports for 2026-03-09 show an inflated P0 count for internal queues.",
+    "Temporary mitigation tested: manual run of 'sla-dependency-reconciler --force-full-sync' cleared stale bindings and subsequent routing adhered to updated weights."
+  ],
+  "customer_impact": "internal teams only \u2014 delayed escalations for internal-support tickets and incorrect SLA cohort counts in ops dashboards. No external customer SLOs impacted.",
+  "metrics_affected": [
+    "internal_sla_violations_daily",
+    "macro_routing_counts_by_weight",
+    "ops_dashboard_p0_pct"
+  ],
+  "diagnostic_commands": [
+    "curl -sS 'http://ops-internal/api/debug/dep-graph?macro=db-migration-alerts'",
+    "psql -c \"SELECT macro, template_id, binding_state FROM template_bindings WHERE macro='db-migration-alerts'\" support_metadata_db",
+    "kubectl logs -n infra deployment/sla-reconciler --since=2h | grep partial-sync"
+  ],
+  "short_term_workaround": "Run 'sla-dependency-reconciler --force-full-sync' on prod in maintenance window (low traffic). If immediate routing correctness is required, manually update macro binding to point to new template ID via admin console (not recommended at scale).",
+  "long_term_fix_candidates": [
+    "1) Fix reconciler pagination off-by-one and add deterministic watermark to detect missed pages",
+    "2) Reduce cache.default_ttl to 5s during import windows or add cache invalidation hook from template-import job",
+    "3) Add end-to-end test that simulates rename+import and asserts reconciler prunes tombstones",
+    "4) Emit reconciliation metrics (pages_scanned, pages_skipped) and alert on partial-sync rates > 0 for > 10 minutes"
+  ],
+  "next_steps": [
+    "Schedule hotfix deploy for sla-reconciler with pagination fix (owner: Ethan) - target: 2026-03-14",
+    "Add a cache-invalidation webhook to template-import pipeline (owner: Platform Infra - Priya) - target: 2026-03-20",
+    "Run full reconciliation and backfill ops reports for 2026-03-09..2026-03-12 (owner: Reporting - Jonah) - target: 2026-03-15",
+    "Create postmortem and include in-team retrospective; assign action items to owners above"
+  ],
+  "comments": [
+    "Maya Chen (Support): Confirmed reproduction on staging w/ copy of prod templates. Manual force-sync cleared stale bindings. Recording runbook steps in confluence.",
+    "Ethan Brooks (Platform): Added extra logs and identified pagination off-by-one. Will prepare hotfix branch and smoke tests.",
+    "Priya Kapoor (SRE): Agrees hotfix should include additional reconciliation metrics. Will coordinate safe deploy window 03-14 02:00-03:00 UTC.",
+    "Jonah Ruiz (Reporting): Noted dashboards already show spike; will backfill and annotate graphs to avoid confusion for exec review.",
+    "PM (Clara Liu): Requesting ETA for fix and asking whether any boleto jobs (billing) rely on these macros \u2014 flagged for review."
+  ],
+  "resolution": "Work in progress: hotfix branch created and scheduled for deploy. Full sync performed as short-term workaround. Pending: post-deploy verification and backfill of reporting data.",
+  "resolution_notes": "Hotfix addressed pagination logic; cache ttl change scheduled and will be added after post-deploy verification. Reporting backfill job will annotate changed rows with reconciliation timestamp.",
+  "safety_checks": [
+    "Run smoke test that creates-rename-import-create sequence and validates reconciler prunes tombstone binding",
+    "Verify no impact on hosted customer-facing routing by running canary against internal nodes only",
+    "Ensure reconcile job respects rate limits and has idempotency guards"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "short_term_workaround",
+    "long_term_fix_candidates",
+    "next_steps",
+    "comments",
+    "resolution",
+    "resolution_notes",
+    "safety_checks"
+  ],
+  "dataset_doc_uuid": "dsid_f8dc99cd50fc406b9d21fdba97aa994b"
+}

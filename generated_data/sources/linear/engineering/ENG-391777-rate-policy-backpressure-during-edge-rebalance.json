@@ -1,0 +1,102 @@
+{
+  "key": "ENG-391777",
+  "team": "engineering",
+  "title": "Rate policy backpressure during edge rebalance causes transient over-throttles and missing metering",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "creator": "Aisha Patel",
+  "assignee": "Marco Diaz",
+  "project": "runtime-rate-engine-reliability",
+  "cycle": "2026-W11",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "billing",
+    "rate-limiter",
+    "edge-rebalance",
+    "investigation",
+    "high-severity"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-2.3.1",
+  "security_review_required": "false",
+  "description": "Summary: During planned and unplanned edge shard rebalances the rate-policy backpressure signals can be applied out-of-order and with stale state to shard-local enforcers. The result is a short window where some keys are aggressively throttled (double-enforced) while their meter increments are dropped or delayed, causing both user-facing latency/throttles and undercounted usage for billing. This ticket drives diagnosis, short-term mitigation, and a robust fix.\n\nWhy it matters: customer-facing throttles for active keys + undercounted metering = incorrect SLA behavior and potential billing variance. We observed this during a geo-rebalance yesterday and have one on-call report from a high-usage customer complaining about elevated 429s and missing line items in billing exports.",
+  "reproduction_steps": [
+    "1) Deploy a two-shard edge pool and enable per-route hierarchical policies with burst credits and grace windows.",
+    "2) Drive high, sustained traffic from a single API key that will be split across shards during rebalance (simulate by toggling shard weights).",
+    "3) Trigger a rebalance (scale-down one shard or issue manual shard-move) while traffic is active.",
+    "4) Observe that enforcer A receives a backpressure broadcast and applies a local cooldown; enforcer B receives a delayed cancel and applies overlapping backpressure leading to double-throttle on the same key.",
+    "5) Check metering ingestion stream: some meter events originating from the briefly-throttled path are missing or delayed by >30s.",
+    "Expected: consistent allow/deny decision across shards with no loss of meter increments during rebalance."
+  ],
+  "observations": [
+    "- Reproducible in staging with a scripted rebalance (100% when using small rebalance interval).",
+    "- Traces show duplicate policy-eval messages, then an out-of-order expiry event that causes sticky cooldown on the wrong shard for ~7-20s.",
+    "- Metering log consumer shows a gap in events correlated to the time window of the double-throttle; the producer path retries but commits are deduplicated/missed during shard handoff.",
+    "- Backpressure messages currently rely on a best-effort pub/sub with no causal ordering and no per-key epoch stamping."
+  ],
+  "hypothesis": [
+    "Root cause is a combination of: (a) lack of monotonic epoch/version per-key when broadcasting backpressure; (b) short anti-entropy missing between enforcer handoff and meter flush; (c) local enforcers applying cooldowns that are not reversible when newer state arrives due to idempotency gaps.",
+    "Secondary contributor: meter producer buffers are dropped during graceful shutdown and not fully drained before shard claim transfer."
+  ],
+  "proposed_short_term_mitigations": [
+    "1) Disable aggressive cooldowns on backpressure events during an active rebalance window (feature flag runtime.disable_aggressive_cooldown).",
+    "2) Increase meter-producer drain timeout from 2s -> 15s during shard shutdown to reduce lost increments (configurable).",
+    "3) Add a temporary reconciliation job to replay missed meter events from producer logs into the billing pipeline for the incident window.",
+    "4) Notify affected customers and add credits where appropriate while fix is deployed."
+  ],
+  "proposed_long_term_fix": [
+    "- Introduce per-key monotonic epochs for policy broadcasts: every broadcast includes key_epoch and sequence, enforcers ignore stale epochs.",
+    "- Make cooldown application idempotent and reversible: cooldowns must carry expiry and origin_epoch; newer epochs can cancel older cooldowns atomically.",
+    "- Implement a handoff handshake: when a shard transfer occurs, the old owner performs a synchronous drain+handoff of outstanding meter batches for keys being migrated (best-effort with retries).",
+    "- Add anti-entropy pass in the enforcer reconciler that verifies local counters against global aggregator every 30s for recently-moved keys and emits fixup meter events if delta > threshold."
+  ],
+  "acceptance_criteria": [
+    "- In staging, scripted rebalance no longer produces overlapping double-throttles for the same key (observed allow/deny decisions consistent across shards).",
+    "- Metering ingestion gaps observed before are eliminated in a repeatable test (no missing events beyond normal retry window).",
+    "- Performance impact: added epoch metadata and handshake adds <1% p50 latency to policy evals in benchmarked tests.",
+    "- Rollout plan and feature flags exist for the aggressive cooldown toggle and increased drain timeout.",
+    "- Post-deploy runbook for monitoring: per-key rebalancing counters, stale-epoch rejects, and meter-replay alerts instrumented in console."
+  ],
+  "work_log": [
+    "2026-03-12: Aisha created ticket after PagerDuty alert and initial blameless postmortem notes. Linked to customer's support thread and billing export snapshot.",
+    "2026-03-12: Marco reproduced failure in staging with small-pool rebalance script; captured traces and prepared flamegraphs. (see /artifacts/staging/rebalance-traces-0312.tar.gz)",
+    "2026-03-13: Infra added temporary feature flag runtime.disable_aggressive_cooldown=true in staging; observed immediate reduction in double-throttles but meter gaps remained.",
+    "2026-03-13: Billing lead (Sofia Nguyen) requested a reconciliation of customer invoices while we investigate. Temporary credit agreed for affected customers.",
+    "2026-03-14: Prototype epoch-stamping added to broadcast layer (branch: github.com/redwood-inference/platform/tree/kl/epoch-backpressure-proto). Initial unit tests passing."
+  ],
+  "artifacts": [
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/ENG/pages/Rate+Backpressure+Investigation",
+    "GitHub repro branch: https://github.com/redwood-inference/platform/pull/8352",
+    "Staging traces bundle: s3://redwood-staging/artifacts/rebalance-traces-2026-03-12.tar.gz",
+    "Billing export snapshot: https://drive.google.com/file/d/1ExampleBillingSnapshot"
+  ],
+  "risks_and_tradeoffs": [
+    "- Increasing drain timeout reduces event loss risk but increases overall shard shutdown time and may delay autoscaling responsiveness.",
+    "- Adding epochs increases per-message size and enforcer CPU parsing cost; must measure overhead across high-throughput clusters.",
+    "- Synchronous handoff introduces a blocking path on shard transfer; we must mitigate with backoff and fallbacks."
+  ],
+  "next_steps": [
+    "1) Ship short-term mitigations behind flags to production canary (Marco + Infra).",
+    "2) Extend benchmark suite to include epoch metadata and measure p50/p95 impact (Perf team).",
+    "3) Implement and test epoch-based broadcasts and idempotent cooldown semantics (ENG runtime team).",
+    "4) Prepare billing reconciliation utility and run it for the incident window (Billing + SRE).",
+    "5) Draft runbook and monitoring dashboards for post-deploy validation (SRE + Console)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "reproduction_steps",
+    "observations",
+    "hypothesis",
+    "proposed_short_term_mitigations",
+    "proposed_long_term_fix",
+    "acceptance_criteria",
+    "work_log",
+    "risks_and_tradeoffs",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_3e63a70607fd4598805ca280feeebe7c"
+}

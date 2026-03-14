@@ -1,0 +1,94 @@
+{
+  "key": "ENG-35012",
+  "team": "engineering",
+  "title": "Paged block allocator for KV cache with thermal-aware GPU page swapping",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-10",
+  "creator": "Aisha Malik",
+  "assignee": "Jun Park",
+  "project": "runtime-memory-optimizations",
+  "cycle": "2026-W09",
+  "estimate": "8",
+  "due_date": "2026-03-22",
+  "labels": [
+    "kv-cache",
+    "gpu-paging",
+    "continuous-batching",
+    "allocator",
+    "prefetch",
+    "observability"
+  ],
+  "description": "Goal: Implement a paged/blocked KV cache allocator that reduces OOMs and p99 token latency under oversubscription by aligning KV allocations to GPU-friendly blocks, supporting staged swap buffers, and introducing a thermal-aware swap policy that cooperates with continuous batching.\n\nProblem statement: Current KV cache uses a simple slab allocator that fragments memory under mixed-length sequences and variable batch concurrency. When active sequences exceed physical GPU residency we experience high swap churn and burst p99 increases. Existing tickets (ENG-33412, ENG-31240) explored sharded scheduling and atomic swap orchestration but left open the allocator-level layout, prefetch strategy, and how to incorporate GPU telemetry (temperature/SM utilization) into swap decisions.\n\nProposal summary: Build a paged block allocator which: 1) divides each model KV region into fixed 'blocks' (configurable 64KB-1MB depending on model and GPU page sizes) with per-block residency metadata; 2) maintains LRU+cost heuristics at block granularity instead of per-kv-entry; 3) exposes cooperative hints to the batching layer to prefer grouping requests with contiguous block affinity; 4) implements a swap path using pinned host staging buffers + async peer-to-peer transfers where available; 5) integrates a thermal-aware swap damping factor: as GPU temperature or SM saturation rises, aggressive prefetching and large swaps are throttled in favor of smaller targeted migrations to protect latency and hardware thermal headroom.\n\nKey components: allocator metadata table (compact bitmap + epoch), block residency manager (resident, staged, swapped), swap engine (async cudaMemcpy/GPUDirect or NIC-based RDMA where available), prefetch adviser (batch-aware hints), and an observability surface (per-block metrics, swap-rate, avg-residency, batch-affinity misses).\n\nWhy block granularity: Blocks reduce metadata churn (bitmap fits L2 cache better than per-entry maps), let us align allocations to GPU kernel page sizes (reduces fragmented VRAM waste), and enable batching to reuse proximate KV blocks within the same inflight microbatch.\n\nThermal-aware swapping rationale: High swap throughput can increase SM contention and thermal throttling, which degrades latency SLOs. We will sample temperature and SM occupancy counters and compute a throttle multiplier in the swap engine. When multiplier < 1, the engine prefers eviction of cold blocks and defers large prefetch windows. This keeps p99 stable under long running heavy workloads (e.g., real-time chat ingestion).\n\nCompatibility & fallbacks: The allocator supports: (a) GPU local pages only; (b) pinned-host staging buffers with zero-copy where supported; (c) pure host-swap fallback for older instances. A runtime flag will allow disabling thermal damping for benchmarking.\n\nDocumentation/Artifacts: design doc on Confluence link, perf microbench harness, and integration PRs are referenced below.",
+  "acceptance_criteria": [
+    "Allocator divides KV regions into configurable blocks and exposes block-level residency API",
+    "Swap engine performs async GPU<->host transfers using pinned buffers and avoids blocking critical warp paths",
+    "Batching layer can request block-affinity hints and scheduler shows measurable reduction in cross-block fetches in perf tests",
+    "End-to-end benchmarks show <=5% increase in token throughput for resident-heavy workloads and >=25% reduction in swap churn for oversubscribed traces compared to baseline",
+    "p99 generation latency under representative oversubscription workload is improved or stable compared to baseline when thermal damping is enabled",
+    "Comprehensive metrics added: swap_rate, block_residency, prefetch_miss_rate, swap_latency_p50_p95_p99, gpu_temp_trace linked to swap events"
+  ],
+  "progress_updates": [
+    "2026-03-02: Spike implemented - prototype block allocator + simple LRU eviction tested on small model (7B). Observed 18% reduction in fragmentation vs slab baseline. - Jun",
+    "2026-03-04: Added pinned staging buffer path and async memcpy; initial microbench shows host-swap latency median 2.4ms for 256KB blocks on p4d. Need to validate on A100 nodes for PCIe vs NVLink behaviour. - Aisha",
+    "2026-03-06: Design review notes from Tomas Ortega: ask to add safety margin for CUDA OOMs, and to expose a per-model block size tuning parameter. Also suggested more granular metrics for batch-affinity misses. Action: add tuning config and extra metrics. - Review",
+    "2026-03-08: Implemented thermal damping factor using NVML temperature and SM utilization. On high temp traces, swap throughput reduced by 30% and p99 improved by 22% in synthetic tests. Need real workload validation and to ensure damping does not starve memory for hot requests. - Jun",
+    "2026-03-10: Integration tests added into CI. Failing test discovered: race between batch scheduler hint revocation and block eviction leading to stale prefetches. Mitigation: introduce per-block epoch and fast revocation token. Working on fix. - Aisha"
+  ],
+  "design_decisions": [
+    "Block size default chosen as 256KB for mid-size and 1MB for large models; empirical sweet spot balances metadata overhead vs swap granularity",
+    "LRU+cost heuristic: cost = estimated refrequency * block_size_penalty + last_access_age; avoids evicting small hot fragments inside a block",
+    "Use pinned host staging for best portability and GPUDirect paths where available; avoids requiring host-visible unified memory in customer infra",
+    "Thermal damping uses an exponential backoff multiplier derived from NVML temp delta and SM utilization; simpler throttle preferred over complex ML-based predictors for predictability",
+    "Prefetch strategy is batch-affinity first: prefetch contiguous neighbors up to N blocks or until budget exhausted; N is adaptive based on recent hit-rate"
+  ],
+  "tests": [
+    "Unit: allocator APIs, block bitmap correctness, epoch revocation logic",
+    "Integration: simulate mixed-length sequences with continuous batching to validate prefetch hints reduce cross-block fetches",
+    "Perf: run replicated token-generation traces used in infra-benchmarks; compare swap rates, p50/p95/p99 token latency between baseline and new allocator",
+    "Fault: force OOM at specific allocation points to validate fast fallback to host-swap and safe rollback of in-progress prefetches",
+    "Long-run: 72h soak with synthetic chat workload to surface thermal and swap-stability regressions"
+  ],
+  "rollout_plan": [
+    "Feature gated behind runtime flag: kv.paged_allocator.enable",
+    "Stage 1 (canary): 5% of traffic on dedicated staging cluster with identical model versions; collect block-level metrics and heatmaps",
+    "Stage 2 (ramp): 25% with thermal damping enabled; monitor p99, swap_rate, and GPU temp correlation",
+    "Stage 3 (full): 100% after 2 weeks of stable metrics and no regressions; enable auto-tuning of block size for models with stable patterns",
+    "Rollback: runtime flag off and a quick migrate path to reconstruct per-entry slab metadata from block snapshots (fast path less than 30s)"
+  ],
+  "links": [
+    "https://confluence.redwood.internal/pages/KV-Paged-Allocator-Proposal",
+    "https://github.com/redwood-inference/runtime/pull/4123",
+    "https://github.com/redwood-inference/runtime/pull/4160 (thermal-damping)",
+    "benchmarks: https://perf.redwood.internal/runs/kv-paged-2026-03",
+    "notes: https://drive.google.com/drive/folders/1KV-block-allocator-spikes"
+  ],
+  "parent_issue": [
+    "ENG-33412"
+  ],
+  "dependencies": [
+    "ENG-31240",
+    "ENG-29124"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "notes_for_reviewers": [
+    "Focus on race conditions between batch scheduler and eviction; see progress update 2026-03-10",
+    "Validate thermal damping parameters on A100 vs V100; sensor sampling rate is currently 500ms - we may need to tune",
+    "Check that pinned buffer pool size is bounded to avoid host OOM; current default pool = 4GB per node",
+    "Review metrics coverage: need per-model tag support for block_residency and swap_rate"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "progress_updates",
+    "design_decisions",
+    "tests",
+    "rollout_plan",
+    "notes_for_reviewers"
+  ],
+  "dataset_doc_uuid": "dsid_bb5589729df64fc3a66f74f35b26fbb6"
+}

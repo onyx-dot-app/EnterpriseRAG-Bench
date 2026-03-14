@@ -1,0 +1,33 @@
+{
+  "title": "Nanopulse residuals brief \u2014 exploratory runs",
+  "owner": "Alfred N. Park",
+  "drive_area": "users",
+  "path": "users/nanopulse-residuals-brief-alfred.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-04",
+  "last_modified": "2025-11-06",
+  "collaborators": [
+    "Samira Kaur",
+    "Diego Morales"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "microburst",
+    "priming",
+    "telemetry",
+    "scratch"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/throughput-scripts/pull/412",
+    "https://jira.redwood.ai/browse/INF-2819",
+    "https://grafana.redwood.ai/d/priming/nanopulse-overview?orgId=1"
+  ],
+  "content": "Purpose: quick write-up of a small set of runs that surfaced recurring ~2\u20138ms residual latency pulses during sustained low-qps traffic. Trying to capture what I observed, how I reproduced it, and next hypotheses to triage.\n\nBackground/context:\n- Observed in customer sim where typical qps=3\u20138 and sequences ~40 tokens. Warm cache expected. Platform: Dedicated pool (A100s), runtime v2.7.1-canary.\n- Issue: occasional narrow latency spikes (\"nanopulses\") that add 2\u20138ms on top of p50 baseline for a small fraction of requests (~0.4\u20131.2% depending on run). Not regular cold start or large-scale microburst.\n\nExperiment surface (local cluster repro):\n- Script: scripts/loadtests/nanopulse_repro.py (see linked PR for runner config)\n- Model: vicuna-13b-8bit-fp16-hybrid (quant profile: q2_8hb)\n- Hardware: 1x A100 80GB (no node sharing), CUDA 12.2, cuBLAS/cuDNN stack default\n- Workload patterns:\n  * steady-1: constant Poisson arrivals, mean qps=5, 95% seq len=40, batch_timeout=6ms, max_batch=16\n  * steady-2: same qps but batch_timeout=3ms (attempt tight latency SLO)\n  * pulsed: base qps=2 with a 1s spike to qps=30 every 30s\n- Duration: 30 minutes per run, 3 warmup minutes discarded\n\nObserved numbers (representative runs, trimmed):\n- steady-1 (bt=6ms, warm): p50=10.8ms, p95=28.7ms, p99=94.2ms, nanopulse fraction ~0.9%\n- steady-2 (bt=3ms): p50=10.3ms, p95=31.9ms, p99=120.6ms, nanopulse fraction ~1.4%\n- pulsed (spike every 30s): p50=11.5ms, p95=34.2ms, p99=128.9ms, nanopulse fraction ~0.6% (mostly outside spikes)\n\nNanopulse signature (qualitative):\n- Very short (2\u20138ms additional tail) and narrow in time (isolated requests)\n- Often correlates with: tiny bumps in device PCIe utilization (~0.5\u20131% change), short-lived kernel scheduling jitter on the host (2\u20134ms), and a small KV cache miss burst (12\u201330 keys missed in 10ms window)\n- Happens even after warmups and when batch sizes are near-optimal -> suggests not simple cold-path.\n\nQuick ascii visualization (p99 timeline excerpt, 1-min slice; each char = ~500ms bucket):\n[normal]  |====|====|=====|====|==|====|\n[nanop]   |===|====|*|====|====|*|====|  (\"*\" = bucket with >2% nanopulse events)\n\nLow-level traces (sample of one event):\n- request id: r-44f9\n- timeline (ms): enqueue 0 -> pick/batch 1.2 -> copy-to-device start 1.7 -> kernel-launch 2.3 -> kernel-blocking-preempt 4.8 -> kernel-resume 6.9 -> finish 11.4\n- delta compared to clean req: kernel-blocking-preempt stage added ~2.6\u20134.5ms\n\nHypotheses (ranked):\n1) Short-lived kernel preemption/OS scheduling causing tiny stalls during kernel execution. Evidence: host scheduling jitter, correlation with minor PCIe blips.\n2) KV cache eviction ripple: a sudden small set of misses causes extra host<->device copies (observed small increase in memcpy counts).\n3) Runtime GC/epoch sync in the batching layer causing sub-ms pauses that accumulate under certain alignments with kernel phases.\n4) GPU power management transient (less likely \u2014 no thermal signature).\n\nRepro tips & commands used:\n- Repro runner: python3 scripts/loadtests/nanopulse_repro.py --pattern steady-1 --duration 1800 --seed 821\n- To capture deeper traces: ENABLE_TRACING=1 TRACE_DIR=/tmp/trace ./bin/runtime --config conf/test-nanopulse.yaml\n- Useful perf counters: ncu for kernel timelines; perf sched for host scheduling; custom KV logging (see linked PR)\n\nImmediate mitigations tried (notes):\n- Increase batch_timeout from 3ms -> 8ms: reduced nanopulse fraction by ~0.6 percentage points, but p95 moved slightly up. Tradeoff.\n- Pin runtime threads to isolated cores: reduced host scheduling jitter observably, nanopulse fraction dropped ~0.35 percentage points. Promising.\n- Forced KV cache prefetch priming before run: tiny effect, not consistent.\n\nQuick conclusions:\n- These nanopulses are real, reproducible in a controlled harness, and appear tied to short host-level scheduling or tiny memcpy spikes that add a few ms inside kernel runtime phases.\n- Practical mitigation for customers: recommend pinning critical runtime threads + slightly relaxed batch_timeout for latency-sensitive tiny-QPS workloads.\n\nNext steps (actionable):\n- 1) Add deterministic kernel-level tracing for the exact preempt window (instrument libcudart callbacks) \u2014 low-level task for runtime team. Owner: Samira. Target: 2 weeks.\n- 2) Try a run with isolated CPU cores + CPU governor set to performance, also disable C-states on hosts (A/B). Owner: me. Target: this week.\n- 3) Explore a two-tier priming: keep a tiny persistent \"hedge\" batch that runs at 1 qps to keep device memcpy patterns steady. Owner: Diego. Target: spike test next week.\n- 4) Open a short-lived telemetry job to track nanospikes across prod clusters (sampling, not full traces). Owner: Observability. Ticket: INF-2819.\n\nNotes-to-self / open questions:\n- Could kernel scheduling jitter be introduced by kubelet/node exporter sidecars? Need node-level process lists around events.\n- If this maps to an infrequent host interrupt, maybe a NIC/driver path \u2014 check dmesg patterns during repro.\n\nAppendix: raw sample of event histogram (counts per ms delta relative to baseline) \u2014 trimmed:\n0\u20131ms: 86%\n1\u20132ms: 11%\n2\u20135ms: 2.4%  <-- nanopulse band\n5\u201310ms: 0.5%\n>10ms: 0.1%\n\nIf anything useful shows up from Samira's kernel traces I'll paste below. For now this is a short running memo so I can iterate quickly.\n\n-- Alfred\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_d6b95c147c394a2ab9743d963e6af4ab"
+}

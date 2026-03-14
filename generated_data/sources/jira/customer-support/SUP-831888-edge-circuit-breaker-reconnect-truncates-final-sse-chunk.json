@@ -1,0 +1,109 @@
+{
+  "key": "SUP-831888",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "SSE stream truncates final choice after CDN edge circuit-breaker reconnect with auth token rotation",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Asha Patel",
+  "assignee": "Liam O'Connor",
+  "customer_company": "NoteStream Inc.",
+  "customer_tier": "enterprise",
+  "components": [
+    "api-gateway",
+    "sse-streaming",
+    "edge-proxy",
+    "auth"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "edge",
+    "auth-rotation",
+    "investigation"
+  ],
+  "environment": "prod-us-west",
+  "affected_models": [
+    "gptj-13b-v1",
+    "redwood-llm-3.1"
+  ],
+  "affected_regions": [
+    "us-west"
+  ],
+  "sla_due_at": "2026-03-11",
+  "related_github_prs": [
+    "infra/edge-proxy#5248",
+    "sdk/java#5331"
+  ],
+  "related_confluence_pages": [
+    "CON-Stream-Runbook-2026-03"
+  ],
+  "linked_issues": [
+    "INT-4092"
+  ],
+  "description": "Issue summary:\nCustomer NoteStream reports that long-running SSE generation sessions occasionally complete but the final 'choice' record (terminal chunk + metadata) is missing after a brief CDN edge circuit-breaker-triggered reconnect. The stream delivers partial text, sometimes duplicates a short prefix on resume, and never sends the terminal metadata event that includes the request_id and final token offsets.\n\nImpact:\n- Intermittent loss of final sentence/terminal metadata for a subset (~0.4%) of user sessions during peak load behind FastEdge CDN.\n- Customer-side UX reports 'incomplete document' and retries result in duplicate prefixes.\n\nEnvironment:\n- Production (prod-us-west) behind FastEdge CDN and our api-gateway v2.3.0.\n- Customer using streaming SSE client with short-lived OAuth token rotation (10s refresh window).\n- Observed against model gptj-13b-v1 and redwood-llm-3.1.\n",
+  "steps_to_reproduce": [
+    "1) Configure short-lived auth token rotation on client (rotate every 8-12 seconds).",
+    "2) Send a long-stream SSE generation request (prompt length ~800 tokens, expected output ~1200 tokens) through FastEdge edge with circuit-breaker configured to RST on backend latency > 8s.,",
+    "3) Induce transient backend latency (simulate 150ms CPU stall or connection freeze) so edge circuit-breaker opens and triggers reconnect path,",
+    "4) Observe that the client receives partial streamed chunks, then on reconnect sees a duplicated 8-20 token prefix and then stream ends without a terminal metadata event (no 'done' marker or final offsets)."
+  ],
+  "observed_behavior": "Partial streaming payload arrives; on a small percentage of reconnects the client sees a short duplicated prefix, then stream terminates with no terminal metadata event (missing request_id and final_token_offset). Downstream SDK treats stream as incomplete and surfaces 'incomplete finalization' to app.",
+  "expected_behavior": "On transient reconnection the stream should either fully resume and deliver the terminal metadata (single coherent final choice) or fail with a clear terminal error. No silent truncation or missing metadata should occur.",
+  "logs": [
+    "2026-03-10T14:23:17Z api-gateway request_id=rn-4b7e6 trace_id=tx-88a3 stream=open upstream=host-12 path=/v1/generate status=200 latency=7.9s",
+    "2026-03-10T14:23:26Z edge-proxy trace_id=tx-88a3 circuit_breaker=open backend=host-12 action=rst reason=latency_spike",
+    "2026-03-10T14:23:26Z api-gateway request_id=rn-4b7e6 trace_id=tx-88a3 stream=resume token_ver=rot-20260310-14:23:25 client_token_id=note-auth-xx",
+    "2026-03-10T14:23:27Z serving-runtime request_id=rn-4b7e6 choice_stream_chunk sequence=... partial_text=\"...and conclude with a recommendation to...\",",
+    "2026-03-10T14:23:27Z serving-runtime request_id=rn-4b7e6 final_meta=missing error=none"
+  ],
+  "investigation_notes": [
+    "Initial triage by Level 1: reproduced with FastEdge in staging when circuit-breaker threshold set low and client token rotates in the reconnect window.",
+    "Hypothesis A: auth token rotation on reconnect leads api-gateway to treat resumed connection as a different session and server-side streaming state is garbage-collected before terminal metadata is emitted.",
+    "Hypothesis B: edge circuit-breaker issues an upstream RST and our resume path emits a duplicate small prefix because prefix caching + resume offset recalculation drift by N tokens under race conditions.",
+    "Trace analysis: trace tx-88a3 shows resume path invoked with a different token_ver header; serving-runtime logs show final metadata field absent rather than an explicit error, suggesting finalization hook may have been skipped.",
+    "Kibana dashboard: https://kibana.internal.redwood/streaming?trace=tx-88a3 (customer link redacted).",
+    "Relevant config: api-gateway session-ttl=5s, resume-grace=2s, token-rotation-window=10s, edge circuit-breaker latency-threshold=8s.",
+    "Reproduced in our internal staging cluster when rotating token at 9s and circuit-breaker threshold at 6s -> ~15% reproduction rate in synthetic runs (higher than prod)."
+  ],
+  "temporary_workaround": [
+    "Customer workaround: increase client token lifetime to avoid rotation during expected long-running streams, or disable aggressive CDN circuit-breaker for streaming endpoints.",
+    "Support workaround: enable 'streaming-grace' feature flag on customer's api-gateway which increases resume-grace to 30s (mitigates GC race)."
+  ],
+  "resolution": [
+    "Fix planned: engineering to adjust resume flow to accept stateless token rotation by mapping new token to previous session id when resume headers include prior_request_id; add idempotent finalization that emits terminal metadata even if resume token differs.",
+    "Short-term patch: extend resume-grace default from 2s -> 10s and make finalization commit occur before session TTL expiry. Rollout planned to prod-us-west on 2026-03-16 under canary.",
+    "Post-fix verification: synthetic test harness will run 10k long-stream sessions with intentional circuit-breaker RST and token rotation to verify <0.01% truncation rate."
+  ],
+  "follow_up_actions": [
+    "ENG: PR for resume-tolerant-auth mapping and idempotent-finalizer (infra/edge-proxy#5248) assigned to Liam; target review by 2026-03-13.",
+    "SRE: monitor stream-terminal-missing metric and set alert threshold >0.05% over 1h to PagerDuty. Agent: Priya Sinha.",
+    "CS: advise NoteStream to temporarily lengthen token TTL or route streaming traffic to bypass FastEdge for mission-critical customers until patch ships.",
+    "DOCS: update runbook with recommended token TTL and circuit-breaker settings for streaming endpoints (owner: Product Ops)."
+  ],
+  "comments": [
+    "2026-03-10T15:05Z Asha Patel: Received initial report from NoteStream support. They included two example request_ids: rn-4b7e6 and rn-4b7e7. Both show identical symptom. Captured HAR and client logs attached in customer portal.",
+    "2026-03-10T16:12Z Liam O'Connor: I reproduced this in staging. Looks like resume path garbage-collects session state when token in resume header doesn't exactly match active session token. Adding investigation notes to linked repo PR.",
+    "2026-03-11T09:40Z Priya Sinha (SRE): Created metric stream_terminal_missing_count and dashboard tile. Enabled verbose tracing for api-gateway resumes for 24h in prod-us-west.",
+    "2026-03-11T12:30Z NoteStream-Support: Thanks \u2014 we applied the temporary token-lifetime increase and reports of incomplete streams dropped to near zero. We've paused our CDN aggressive failover rule as well.",
+    "2026-03-12T10:02Z Liam O'Connor: Drafted patch to make finalizer idempotent and tolerate token rotation. Opening PR for review: infra/edge-proxy#5248. Scheduling canary for 2026-03-16.",
+    "2026-03-12T14:10Z Asha Patel: Updated customer that we're working on a fix and provided a checklist for short-term mitigations. Marking ticket In Progress until patch verification."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "logs",
+    "investigation_notes",
+    "temporary_workaround",
+    "resolution",
+    "follow_up_actions",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_bcbe06121660466f86fd22051f7dbb6d"
+}

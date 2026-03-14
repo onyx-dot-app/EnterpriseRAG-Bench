@@ -1,0 +1,49 @@
+{
+  "key": "ENG-63214",
+  "team": "engineering",
+  "title": "Slot-based upgrade orchestrator with safe capacity fencing",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-25",
+  "updated_at": "2026-03-12",
+  "creator": "Maya Chen",
+  "assignee": "Liam O'Connor",
+  "project": "Dedicated Fleet Stability",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "due_date": "2026-04-02",
+  "labels": [
+    "upgrade",
+    "autoscaling",
+    "capacity",
+    "lts",
+    "release-engineering"
+  ],
+  "dependencies": [
+    "ENG-27109",
+    "ENG-31822",
+    "ENG-40988"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.21",
+  "security_review_required": "false",
+  "description": "Background:\nWe regularly perform rolling upgrades across Dedicated GPU pools for runtime and kernel updates. Past strategies (naive drain all nodes in a wave) caused temporary capacity cliffs and latency spikes during peak traffic. Recent work introduced phased drains and autoscaler coordination, but we still see bursty eviction churn when multiple pools upgrade concurrently or when autoscaler latency interacts poorly with drain signals.\n\nProblem statement:\n1) Upgrades must not cause capacity deficits that breach SLOs for customer requests (p95 latency and error budgets).\n2) Current per-node rolling drains are brittle: they rely on cluster autoscaler reacting quickly and on global knobs (eviction windows) that are coarse-grained.\n3) We need a reusable orchestration primitive that: 1) reserves capacity for in-flight traffic during drains, 2) coordinates with autoscaling to avoid negative interactions, and 3) supports staged canaries and LTS channel gating.\n\nProposal (slot-based upgrade orchestrator):\nIntroduce an \"Upgrade Slot\" abstraction: a quota representing a fixed amount of serving capacity (GPU slots) that the upgrade controller may take offline at a time. The orchestrator will: \n- Allocate a bounded number of slots per pool based on peak utilization and configured safety budget.\n- Fence slots: mark nodes owned by those slots as \"upgrade-target\" so routing and autoscaler treat them specially.\n- Coordinate a three-way handshake between the Upgrade Orchestrator, Autoscaler, and Routing Proxy to ensure capacity reservation and graceful handoff.\n\nKey behaviors:\n- Slot sizing: computed from historical peak token/sec distribution + safety margin (default 15%). Admins may pin slot_size per pool or use the autosizing predictor service.\n- Slot fencing: nodes placed into a slot are annotated with upgrade:slot=<id>. Router data plane avoids assigning new long-running requests or cached sessions to these nodes. Short requests may still land if capacity remains.\n- Autoscaler handshake: before draining a slot, orchestrator signals autoscaler with a temporary capacity constraint (reduce scale-down aggressiveness + warm-up allowance). Autoscaler can proactively launch new instances if needed.\n- KV cache awareness: when a slot drains, orchestrator triggers a cache pre-warm on candidate replacement nodes (prefix warming) using a prioritized prefix list from recent hot keys.\n- LTS and rollout gates: slot allocation respects LTS channel gates; only pools subscribed to a channel will accept slot-based upgrades for builds approved for that channel. Canary slices are represented as special slots with tighter observation windows.\n\nDesign details and APIs:\n- New CRD: UpgradeSlotRequest (controller-managed). Fields visible to ops UI: pool, slot_id, desired_state (pending/allocated/draining/completed), slot_size_tokens, started_at, reason, operator.\n- Controller workflow: validate -> allocate slot -> prewarm -> drain nodes in slot -> post-checks -> complete.\n- Autoscaler API additions: /v1/upgrade-handshake (PATCH) with slot_id and hold_duration. Response: accepted|deferred|rejected and recommended buffer replicas.\n- Router integration: routing service reads node annotations and avoids assigning new streaming sessions to annotated nodes. For HTTP requests, use priority queueing with a small per-node admission controller.\n\nObservability and metrics:\n- upgrade.slot.allocations{pool,slot_id,status}\n- upgrade.slot.drain_duration_ms\n- upgrade.slot.kv_prewarm_success_ratio\n- autoscaler.handshake.latency\n- capacity.buffer.available_tokens_by_pool\n- routing.fallback_calls_during_drain\nCreate dashboards: \"Upgrade Slots - Capacity Safety\" (by pool) and \"Upgrade Canary Health\" (for slot canaries).\n\nRunbook and SLOs during upgrade: \n- Before slot start: ensure available buffer >= slot_size * 1.15.\n- During slot drain: p95 latency must not increase >10% vs baseline and error-rate increase <0.1% sustained for >5 minutes.\n- If breached, orchestrator automatically pauses and triggers rollback of in-progress slots and calls the fallback policy to route to hosted fallback variants.\n\nRollout plan (phased):\n1) Internal alpha on non-production pools: implement controller + metrics only (no router/auto changes). Run synthetic traffic tests. (2 weeks)\n2) Beta with autoscaler handshake enabled for a single low-traffic production pool; operators monitor dashboards and runbook. (2 weeks)\n3) Canary slice support: add canary slots for staged LTS channels (runtime-1.21-canary). Deploy to 10% of pools with extended telemetry. (3 weeks)\n4) Full rollout with default slot allocations and operator training; expose admin override in Console. (2 weeks)\n\nAcceptance criteria:\n- Controller can allocate and complete slot drains end-to-end in staging with prewarm success >= 90%.\n- Autoscaler handshake latency < 1s median and < 5s p95 in staging.\n- No production pool experiences p95 latency regression >10% attributable to slot drains during a 2-week beta window.\n- Console shows slot state and ability to abort a slot mid-drain; abort path validated by runbook.\n\nTesting plan:\n- Unit and integration tests for UpgradeSlotRequest lifecycle.\n- Load test harness simulating bursty traffic and KV cache warmups (compare baseline vs slot orchestration).\n- Chaos tests: kill replacement nodes during prewarm to ensure graceful degradation.\n- Simulated autoscaler API failures to validate rollback logic.\n\nRisks and mitigations:\n- Risk: Router change might prematurely deprioritize requests causing cold-start tail latency. Mitigation: allow short tail requests and prioritize streaming session continuity. Tune admission controls conservatively during rollout.\n- Risk: Autoscaler misinterprets handshake leading to over-provisioning. Mitigation: add recommended buffer cap and operator dashboard to observe buffer utilization.\n- Risk: Incorrect slot sizing on multi-tenant pools. Mitigation: conservative default sizing + per-pool override and canary validations.\n\nOpen questions:\n- What is the canonical signal for long-lived sessions versus short HTTP calls across our router stacks? (Action: SRE to document by 2026-03-05)\n- How to express slot costs to billing (should prewarmed capacity billed differently)? (Action: PM + Finance sync)\n\nNext steps / milestones:\n- Week 0: finalize CRD schema and autoscaler handshake contract. (owner: Liam)\n- Week 1: implement controller allocation logic + router annotation reader. (owner: Maya)\n- Week 2: integrate KV prewarm routine and metrics. (owner: Xander Ruiz)\n- Week 3: internal alpha tests and dashboards. (owner: team)\n\nLinks and artifacts:\n- Design doc (Drive): https://drive.redwood.ai/docs/upgrade-slot-design\n- Autoscaler handshake PR (draft): https://github.com/redwood-inference/prs/pull/8123\n- Staging runbook (confluence): https://confluence.redwood.ai/x/RtYB\n\nNotes: This approach intentionally separates the notion of \"how many nodes to evict\" (slots) from node identity to reduce churn when multiple upgrades operate concurrently across pools. Slots provide a predictable capacity budget to reason about SLO impact and to implement automated rollback/gating for LTS rollouts.",
+  "comments": [
+    "2026-02-26 - Maya Chen: Initial draft of slot orchestrator posted; awaiting autoscaler API design review.",
+    "2026-03-01 - SRE review by Priya Raman: suggested exposing buffer utilization metric and tightening prewarm priority lists.",
+    "2026-03-05 - Liam O'Connor: Started CRD prototype and basic controller loop; pushed branch ENG-63214/slot-controller.",
+    "2026-03-10 - Design review: agreed to conservative default 15% safety margin; Xander to own KV prewarm implementation.",
+    "2026-03-12 - PM review by Jonah Blake: add Console operator override and clear rollback CTA in runbook."
+  ],
+  "attachments": [
+    "https://drive.redwood.ai/docs/upgrade-slot-design",
+    "https://github.com/redwood-inference/prs/pull/8123",
+    "https://confluence.redwood.ai/x/RtYB"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_13f20ab8817a4b53b1e010e29b08f0ff"
+}

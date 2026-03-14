@@ -1,0 +1,54 @@
+{
+  "key": "ENG-27488",
+  "team": "engineering",
+  "title": "Paged & blocked KV cache: slab allocator, async page transfer, and batching coordination",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-14",
+  "creator": "Liam O'Connor",
+  "assignee": "Priya Nair",
+  "project": "runtime-1.19",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "due_date": "2026-03-28",
+  "labels": [
+    "kv-cache",
+    "gpu-memory",
+    "batching",
+    "performance",
+    "design-doc"
+  ],
+  "parent_issue": [
+    "ENG-27000"
+  ],
+  "dependencies": [
+    "ENG-27109",
+    "ENG-26855"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.19",
+  "security_review_required": "false",
+  "description": "Summary:\\nThis ticket captures the design and implementation plan for a paged/blocked KV cache optimized for GPU memory constraints and continuous batching. Goals: (1) keep hot KV visible on GPU to minimize per-token latency, (2) support large sequence workloads by spilling cold KV to host memory in page-sized blocks, (3) coordinate async page transfers with the continuous batching runtime to avoid head-of-line blocking, and (4) minimize fragmentation and memory overhead via a slab-style allocator for KV blocks.\\n\\nScope:\\n- Block/page layout and size heuristics (alignment with GPU DMA pages and model layer topology)\\n- Slab allocator for small variable-length KV entries (per-layer slabs + global backup)\\n- Async pinned-host staging + CUDA stream-based memcpy for page-in/page-out\\n- Prefetch heuristics tied to batch predictor (next-token/sequence-length forecast)\\n- Eviction policy: segmented LRU with hot/cold tiers and reference counting to avoid evicting in-use pages\\n- Coordination primitives between batching runtime and KV manager (reservation API, read-locks, page-status querying)\\n- Metrics and SLO targets for page-fault rate, transfer latency, and memory footprint\\n\\nDesign decisions and rationale:\\n1) Block size: 256KB page blocks as the default. Rationale: tradeoff between transfer overhead (smaller blocks = more transfers) and wasted memory (larger blocks increase fragmentation). 256KB maps well to common GPU PCIe/CCIX transfer chunk sizes and keeps read latency for a single missing KV region in the low-ms range on NVMe->host->GPU paths.\\n\\n2) Slab allocator: per-layer slab pools sized at model load time using empirical average KV length distribution. Small KV entries (< 32KB) are packed into slabs to reduce metadata overhead. Large KV entries allocate dedicated page chains. This reduces fragmentation and speeds up compaction because slabs can be freed in bulk.\\n\\n3) Async transfer path: use pinned host staging buffers and dedicated per-GPU transfer streams. Page-in is posted on a stream with an associated future/promise object. We avoid CUDA unified memory to retain deterministic prefetch behavior and to control when transfers occur (UVM can introduce implicit page faults that stall the main compute stream).\\n\\n4) Prefetching & predictor: lightweight predictor based on current batch sequence lengths + per-request micro-history. For chat-like workloads, we predict next N tokens (N configurable) and warm corresponding KV pages ahead of token emission. Conservative default enabled; aggressive mode enabled for low-latency SLAs.\\n\\n5) Eviction/locking: segmented LRU with hot-list promoted on access. Each page has a reference count; the eviction scanner only targets pages with refcount==0. To avoid batching stalls, eviction runs on a background thread and marks pages for deferred free if in-flight batches reference them.\\n\\n6) Continuous batching implications: before a batch is scheduled to run on a GPU shard, the scheduler queries the KV manager to ensure required pages are resident. If pages are missing, scheduler can: (a) wait for page-in (preferred for latency-sensitive requests); (b) route request to another replica with warm KV; (c) fall back to a smaller model variant kept warm. Reservation API allows the batcher to atomically reserve pages to avoid multiple concurrent downloads of the same page.\\n\\n7) NUMA + multi-GPU: maintain per-GPU residency tables and use peer-to-peer (P2P) peer copies when cheaper than host round-trip. Page migration between GPUs uses CUDA P2P where supported; otherwise we fall back to host-staged copy.\\n\\n8) Fragmentation and compaction: track free-space fragmentation ratio; when > 0.35 schedule compaction during low-util windows. Compaction is slab-aware and avoids blocking active batches by migrating cold pages first.\\n\\nMetrics and SLOs:\\n- page_fault_rate < 0.5% (target for typical production mixes)\\n- median_page_transfer_ms < 4ms (PCIe NVMe + host pinned memcpy baseline)\\n- 99th_page_transfer_ms < 20ms (accounting for worst-case NVMe reads)\\n- fragmentation_ratio < 0.35 after compaction\\n\\nImplementation notes:\\n- API additions: KVManager.reserve_pages(list<page_id>) -> reservation_token; KVManager.page_status(page_id) -> {resident|fetching|evicted} (exposed as strings). Since Linear docs require flat fields, this ticket includes sample RPC names in 'links'.\\n- Memory accounting: maintain charged bytes per-customer and per-model to enable cost-aware routing (tiered fallback to cheaper memory modes).\\n- Testing: synthetic trace generator with heavy long-context workloads (4k-32k tokens), real-chat replay traces, and adversarial patterns that hammer random KV regions.\\n\\nPerf expectations (early microbench results):\\n- With prefetch + slab allocator: average per-token tail latency increased by ~7% vs baseline with infinite GPU memory.\\n- Without prefetch or pinned staging (naive on-demand transfer): tail latency increases by ~35% on same traces.\\n- Memory footprint reduction: slab packing + page-level compression yields ~30-45% host-memory savings for typical decoder-only models compared to naive per-token allocations.\\n\\nRisks and mitigations:\\n- Risk: page transfer stalls degrade latency spikes. Mitigation: conservative prefetch defaults, reservation API, and fallback routing to warm replicas.\\n- Risk: fragmentation causing inability to place large pages. Mitigation: proactive compaction and dynamic slab resizing during low-load periods.\\n- Risk: complexity of correctness when interacting with continuous batching. Mitigation: small set of atomic ops (reserve, pin, release) and reference-counting enforced by runtime; heavy unit/integration testing.\\n\\nOpen questions:\\n- Optimal default page size across model families (LLM-7B vs LLM-70B); plan to run automated sweeps during cycle.\\n- Whether to expose aggressive prefetching toggles to end-users or keep as an operator-only knob.\\n\\nDeliverables:\\n- Design doc (Confluence) + sequence diagrams\\n- Slab allocator implementation + unit tests\\n- Async transfer and reservation API + integration tests with continuous batcher\\n- Stress test harness and perf dashboards\\n",
+  "comments": [
+    "2026-03-11 - Priya: Spike complete. Prototype using 256KB page size + pinned staging shows deterministic transfers on p3.2xlarge. Uploaded perf traces to drive: https://drive.company.com/kv-paging/trace-20260311",
+    "2026-03-12 - Liam: Reviewed design. Agreed to avoid UVM for now (implicit faults nondeterministic). Added segmented LRU with refcounts to prevent evict-in-flight. See design doc: https://confluence.company.com/display/RUNTIME/Paged+KV+Design",
+    "2026-03-13 - Derek (runtime): Raised concern about compaction overhead on 8-GPU heads. We'll gate compaction on cluster-wide low-util signals. Added dependency: ENG-26855 (scheduler low-util signals).",
+    "2026-03-14 - Priya: Implemented reservation API and unit tests. Pushed draft PR for slab allocator: https://github.com/redwood-inference/runtime/pull/8342 (WIP). Benchmark notes in PR description.",
+    "2026-03-14 - QA: Added test plan and failure modes. Will add chaos testing to simulate PCIe stalls and NVMe read timeouts."
+  ],
+  "links": [
+    "Design doc (Confluence): https://confluence.company.com/display/RUNTIME/Paged+KV+Design",
+    "Prototype trace: https://drive.company.com/kv-paging/trace-20260311",
+    "Draft PR - slab allocator: https://github.com/redwood-inference/runtime/pull/8342",
+    "Benchmark dashboard (internal): https://metrics.company.com/dashboards/kv-paging",
+    "Related ticket ENG-27109: https://linear.company.com/ENG-27109"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "links"
+  ],
+  "dataset_doc_uuid": "dsid_f22ab8dfab4b4ca09bd600bc3bf9e26d"
+}

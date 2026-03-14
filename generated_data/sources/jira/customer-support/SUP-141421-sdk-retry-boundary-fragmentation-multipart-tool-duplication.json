@@ -1,0 +1,68 @@
+{
+  "key": "SUP-141421",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "SDK retry boundary normalization causes multipart tool payload fragmentation and duplicate function execution",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev2",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Alex Chen",
+  "assignee": "Maya Patel",
+  "customer_company": "Zephyr Analytics",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "sdk-python",
+    "sdk-typescript",
+    "serving-runtime",
+    "edge-proxy"
+  ],
+  "labels": [
+    "idempotency",
+    "retry-normalization",
+    "multipart",
+    "function-calling",
+    "investigation"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "redwood-v2-small",
+    "open-llama-13b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-472999",
+    "SUP-315799"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/sdk-python/pull/332",
+    "https://github.com/redwood-inference/runtime/pull/1248"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SUPPORT/Streaming+and+Multipart+Tool+Guidance"
+  ],
+  "description": "Issue summary:\nCustomer reports duplicate external tool executions (webhook POSTs) originating from a single client request when using the Python and TypeScript SDKs with multipart tool payloads.\n\nImpact:\n- Zephyr Analytics (dedicated) observed duplicate downstream POSTs to their payment microservice for ~0.5% of requests during peak traffic windows starting 2026-03-09 22:00 UTC.\n- Duplicates are side-effecting (charging) and require manual reconciliation.\n\nEnvironment:\n- Redwood Dedicated pool: dedicated-gpu-prod-2 (us-east-1)\n- SDKs: python-sdk v1.8.3 (customer pinned), ts-sdk v0.6.1\n- Request pattern: streaming generation with function/tool calling; tool payloads include a multipart/related boundary and a binary attachment part (image/png) in the same request.\n\nSteps to reproduce (customer supplied):\n1) Start a streaming generation session that triggers a single function/tool call which includes a multipart/related body with boundary token like \"----redwood-boundary-<uuid>\" and a ~120KB image part.\n2) Simulate transient network failure on client (close connection) causing SDK retry logic to re-establish stream and replay the outgoing tool call.\n3) Observe two POSTs at downstream webhook (same payload except boundary token differs after retry).\n\nObserved behavior / logs:\n- Downstream webhooks show two POSTs within ~2s with identical form-data content but different multipart boundary strings.\n- SDK client-side logs show: \"retry: resending tool call (normalized headers)\".\n- Edge logs (us-east) show the incoming request trace ID and two proxied requests; server assigns new internal invocation IDs because boundary is treated as part of canonicalization used by the dedupe key.\n\nExpected behavior:\n- Retries should be deduplicated at the platform level for the same logical tool call (same user-supplied idempotency/nonce) even if multipart boundary tokens differ during re-serialization.\n\nAdditional notes:\n- Customer uses per-request nonce header X-Redwood-Idempotency but this header is omitted by the SDK during retry normalization step for multipart requests in some code paths.\n- Reproducible in both python-sdk and ts-sdk when multipart payloads include binary attachments and the SDK applies chunked re-serialization during retry.\n",
+  "comments": [
+    "Support (Alex Chen) 2026-03-10: Acknowledged customer ticket and requested request/response traces, edge request IDs, and SDK client logs. Provided temporary workaround: set client to non-retriable for that route until we investigate (customer declined long-term).",
+    "Customer (Zephyr SRE - Jordan Miles) 2026-03-10: Uploaded sample HTTP trace (trace-id: trc-us-44822) and webhook payloads. Confirmed duplicated POSTs contain identical body bytes except multipart boundary string. Also provided SDK logs from python v1.8.3.",
+    "Support (Alex Chen) 2026-03-11: Correlated trace-id to edge session and handoff logs. Observed that dedupe key includes a canonicalized content-hash that currently includes the multipart boundary token. Raised hypothesis: SDK rewrite/normalization replaces original boundary on retry leading to different hash and new invocation. Added INT ticket to route to SDK/Runtime teams. Linked SUP-141421 -> INT-556700.",
+    "SRE (Maya Patel) 2026-03-11: Initial reproduction performed in staging. Confirmed that when SDK re-serializes multipart body it generates a new boundary token and the runtime's dedupe mechanism uses content canonicalization that includes the boundary. Creating remediation plan: runtime should ignore boundary tokens when producing canonical dedupe key for multipart/related. SDKs should preserve explicit idempotency headers across retries.",
+    "SDK Eng (Diego Ramos) 2026-03-12: Reproduced locally. Found in python-sdk v1.8.3 retry path: multipart library invocation uses uuid4() for boundary during re-serialization. Patch idea: on retry, preserve original boundary from client buffer if available; if not, runtime canonicalization must normalize boundaries prior to hashing. Preparing PRs."
+  ],
+  "investigation_notes": "Hypotheses considered:\n- H1: SDK retry normalization drops / mutates X-Redwood-Idempotency header in multipart retry flow -> leads to new invocation. (Partial hit: header omitted sometimes.)\n- H2: Runtime canonicalization includes multipart boundary in content hash -> different boundary leads to a new dedupe key. (Confirmed in staging.)\n- H3: Edge proxy re-chunking splits binary attachment causing reassembly differences. (Low confidence: bytes identical except boundary.)\n\nFindings:\n- Repro reproduced with both python and ts SDKs when SDK re-serializes multipart and generates new boundary.\n- Runtime dedupe key computation currently computes SHA256 over the serialized MIME body as-is (including boundary).\n- Customer's X-Redwood-Idempotency header was present on initial send but SDK retry path for streaming-multipart omitted it when rebuilding the retry envelope in ~12% of attempts in a stress test.\n\nImmediate mitigations tested:\n- Runtime change: canonicalize multipart by normalizing boundary markers to a fixed token before hashing. Test in staging: dedupe key stable across retries and duplicates stop.\n- SDK change: ensure idempotency header is preserved across retry envelope builds and, when re-serializing multipart, try to reuse original boundary if buffer available.",
+  "resolution": "Workaround applied (2026-03-12): Enabled runtime multipart-normalization flag in prod-us-east for the affected dedicated pool. This prevents the dedupe key from differing when only boundary tokens change. Customer confirmed duplicates dropped to 0.\n\nPermanent fix plan:\n- SDK teams: land python and ts SDK patches to preserve X-Redwood-Idempotency on retry and reuse original boundary where possible (PRs linked). Target: python-sdk v1.8.4, ts-sdk v0.6.3.\n- Runtime teams: land canonicalization change to ignore boundary randomness at hash stage and add unit tests for multipart normalization. (PR referenced).\n- Edge: add additional logging to detect header omission during retry envelope rebuild.\n\nFollow-ups / action items:\n- INT-556700: SDK patch and release coordination.\n- INT-556701: Runtime canonicalization unit tests and rollout.\n- Customer communication: draft postmortem and compensation guidance for Zephyr billing team.\n\nStatus: mitigation deployed, customer confirmed fix. Pending SDK releases and runtime merge to master.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_10b34465e4fb46108db26bde3c8ff267"
+}

@@ -1,0 +1,33 @@
+{
+  "title": "Burst-echo fusion fieldnotes",
+  "owner": "Skyler Chen",
+  "drive_area": "users",
+  "path": "users/burst-echo-fusion-fieldnotes-skyler.json",
+  "doc_type": "doc",
+  "created_at": "2025-10-03",
+  "last_modified": "2025-10-06",
+  "collaborators": [
+    "Aria Patel",
+    "Noah Park"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "microbench",
+    "burst-echo",
+    "kvcache",
+    "p99",
+    "scratch"
+  ],
+  "linked_artifacts": [
+    "github.com/redwood-inference/repro-bench/pulls/487",
+    "LIN-1987",
+    "confluence.redwood/display/INF/Burst+Echo+Notes"
+  ],
+  "content": "Quick fieldnotes: burst-echo fusion experiment (scratch)\n\nObjective:\n- Explore how small clustered bursts followed by low-rate \"echo\" traffic affects tail latency and cache priming. Trying to capture interaction between: arrival clustering, KV cache reuse, and batching/coalescing heuristics.\n\nHypothesis:\n- Short intense bursts (~10\u201320 requests over 100\u2013300ms) that are then followed by a sparse echo pattern (1\u20132 requests every 200\u2013800ms) will:\n  1) prime KV/cache for the short sequence contexts and reduce p50 on echo requests,\n  2) create transient p99 spikes when bursts overflow batching window or trigger kernel-switches,\n  3) reveal whether continuous-batching heuristics are paying off when bursts are non-uniform.\n\nSetup (notes-to-self):\n- Fleet: single dedicated GPU (A10G), model: gpt-small-open (1.9B), quantized int8 profile alpha-2.\n- Runtime flags: --batch-window-ms=8 --max-batch-tokens=4096 --cold-kv-guard=150ms --kvcache-prefix=true\n- Client: local loadgen (go) run on a c6i.large, synthetic harness that emits:\n    * Burst: 15 requests over 250ms, seq_len=64 (prompt tokens), sampling temp=0.0\n    * Echo tail: 1 request every 350ms for 10s after burst, seq_len=16\n    * Repeat every 45s for 30 cycles (to see warm->cool transitions)\n- Telemetry: sampling traces at 100Hz, capture server-side batch sizes, kernel type, kv_hit boolean, queue_time_ms, service_time_ms, p95/p99.\n- Commands used: \n    ./loadgen --pattern=burst-echo --burst-size=15 --burst-window=250 --echo-interval=350 --cycles=30 --seq-burst=64 --seq-echo=16 --out=runA.log\n    curl -s \"https://console.redwood/api/metrics?run=runA\" > runA-metrics.json\n\nRaw / selected results (high level):\n- steady baseline (single steady 120 qps uniform) for same model: p50 ~28ms, p95 ~86ms, p99 ~220ms (sanity).\n- burst-echo run (runA): overall average qps over window ~18qps, but within-burst instantaneous qps ~60. Observed:\n    * during bursts: batch sizes peaked at 12\u201315; queue_time jumped to 12\u201328ms; service_time per token stable. p95 inside bursts ~140\u2013220ms; p99 inside bursts ~330\u2013480ms.\n    * echo requests (350ms after bursts): kv_hit=true in ~62% of echoes; those hits had p50 ~32ms, p95 ~78ms, p99 ~160ms. Echo misses had p99 up to 420ms.\n    * interesting pattern: first echo after a *cold* gap (>=8s) had no KV reuse and p99 ~510ms. Subsequent echoes within 4s window saw much lower tails.\n    * kernel switch events (float->quantized fallback) observed when seq_len variability > 40 tokens in same batch \u2014 correlated with worst p99s.\n\nObservations / Interpretations:\n- KV cache priming is real here: when bursts include tokens that match echo prefix patterns, echoes benefit (p99 drop ~2.5x vs miss). However priming decays quickly \u2014 TTL looks to be ~3\u20136s under current policy.\n- Batching window (8ms) is small enough that bursts still coalesce, but the burst density causes transient queueing; queue_time is primary driver of burst p99 spikes.\n- Kernel fallback/switch is a surprising tail contributor: mixed-length batches cause kernel selection path changes, adding ~120\u2013200ms on some batches. Need to correlate with kernel selection logs.\n- The echo spacing (350ms) is long enough to avoid being batched with the preceding burst, so echoes mostly hit hot paths but rely on cached KV. If echo interval shorter (~100ms), they start to join tail of burst and suffer queueing.\n\nQuick conclusions (for now):\n- For products with bursty inputs followed by follow-up small queries (search-like or clarification calls), small (<8s) KV cache TTL + prefix caching helps reduce p50/p95 on follow-ups but not fully eliminate p99 spikes from the bursts themselves.\n- To reduce p99 during bursts: consider increasing batch-window slightly (trade off latency) or implement rapid micro-coalescing that caps per-request queue_time. Alternatively, prioritize small echo-like requests through fast-path lanes (if we can detect them).\n- Kernel-switch tail feels like low-hanging fruit: avoid mixing very different seq lengths inside same batch, or bias kernel selection to quantized path when possible.\n\nNext steps / experiments to run (prioritized):\n1) Run same harness with --batch-window-ms=12 and 16 to see p99 sensitivity vs p50 degradation. (run B, C)\n2) Force homogenous batches by padding seq lengths in-burst and test kernel-switch frequency. (run D)\n3) Shorten echo interval to 100ms to see threshold where echoes rejoin bursts and examine p95/p99 crossover. (run E)\n4) Experiment with kvcache-ttl tuning: try ttls 2s, 6s, 12s and measure echo kv_hit fraction and cost. (run F,G,H)\n5) Add a fast-path tag on client for echoes and measure: does lane isolation reduce echo p99 without harming burst throughput? (run I)\n\nOpen questions / TODOs:\n- Need to find exact condition that triggers kernel fallback \u2014 get kernel logs and map event ids to trace IDs. (@Noah to fetch kernel log dump for runs B/C)\n- Cost impact: more TTL keeps KV longer (memory + hit-maintenance). Need to approximate memory trade-off. Quick rough calc: TTL 6s -> avg cached prefixes per model ~6k entries (estimate) -> cost at fleet scale TBD.\n- Is there an application-level heuristic to detect \"echo\" vs burst requests to route them to lanes? What are false-positive rates?\n\nNotes to self: avoid reusing \"burst\" + \"echo\" in final writeup; call it \"burst-echo fusion\" as shorthand. Save raw tracing for runA and runB in GH PR. Post quick-thread in #eng-serving-runtime with p99 heatmap.\n\nCommands/shortcuts copied:\n- to replay: ./loadgen --replay-from=runA.log --speed=1x --out=replayA.log\n- trace query: ./trace-fetch --run runA --min-duration-ms=200 --out=heavy-traces.json\n\nEnd of scratch \u2014 will refine after runs B/C and kernel logs are in.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_f1421e1eed834fb4b4adc2c7d24ae0a0"
+}

@@ -1,0 +1,88 @@
+{
+  "key": "SUP-741999",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Guidance requested: shard-aware idempotency strategy for multiplexed tool chains across Go/TS SDKs",
+  "status": "Triage",
+  "priority": "P2",
+  "severity": "Sev2",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-13",
+  "reporter": "Ava Chen",
+  "assignee": "Diego Martinez",
+  "customer_company": "NimbusPayments",
+  "customer_tier": "dedicated",
+  "environment": "prod (dedicated, us-east-1)",
+  "components": [
+    "sdk-go",
+    "sdk-ts",
+    "serving-runtime",
+    "console"
+  ],
+  "labels": [
+    "idempotency",
+    "sharding",
+    "multiplexing",
+    "guidance-request"
+  ],
+  "affected_models": [
+    "gpt-redwood-13b-instruct"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-13",
+  "first_response_due_at": "2026-03-12",
+  "linked_issues": [
+    "INT-1223",
+    "SUP-302900"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/sdk-go/pull/412"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SRE/Idempotency+and+Sharding+Patterns"
+  ],
+  "description": "Issue summary:\nNimbusPayments is implementing a high-throughput payment-validation workflow that orchestrates three external tools in sequence (risk-check, account-lookup, settlement-prep). They use multiplexed client connections and the TS client on the web front-end plus a Go worker pool for server-side orchestration. They are asking for best-practice guidance for designing an idempotency strategy that avoids collisions and duplicate tool-side effects when requests are sharded across multiple worker processes and both SDKs are used.\n\nImpact:\n- Potential duplicate downstream charges or duplicate webhook posts observed in a narrow subset of high-concurrency runs (approx 0.01% of transactions).\n- Customer is hesitant to roll to 100% for a dedicated flow because of regulatory payout concerns.\n\nWhat they want:\n- Concrete, shard-aware idempotency key design patterns that work when requests are rebalanced between workers, when streaming reconnects occur, and when some calls are retried at the orchestration layer.\n- SDK compatibility notes: how to ensure Go and TS SDKs generate equivalent idempotency identifiers and headers.\n\nObserved behavior:\n- Customer currently derives idempotency keys using: sha1(truncate(payload_json, 1024) + tool_name + user_id) then base64-url-encode and sets header X-Redwood-Idempotency.\n- Under heavy load with the Go worker pool (20 workers, multiplexing on a single HTTP/2 connection) they see occasional duplicate tool invocations when a worker is restarted and the orchestration retry replays.\n- Duplicates correlate with requests that were routed to a different worker shard (same client session) within ~45s of original execution.\n\nCustomer configuration details:\n- Dedicated pool: 8x A100s per shard, autoscaled by queue depth.\n- Go worker pool uses per-process in-memory idempotency cache with TTL 60s. No shared cache.\n- TS frontend sends requests via the Redwood hosted API to the dedicated pool and attaches same X-Redwood-Idempotency header value computed in client JS.",
+  "steps_to_reproduce": [
+    "1) Deploy a Go worker pool with 4 processes handling multiplexed requests (http2).",
+    "2) Use the current deterministic key: truncated(sha1(payload))+tool_name+user_id base64-url header from both TS and Go clients.",
+    "3) Simulate burst: 5k similar requests/sec targeting same small set of user_ids, force a worker restart for one process mid-burst (SIGTERM) to cause reroute and replay.",
+    "4) Observe downstream tool webhook logs for duplicate invocations within 2 minutes of the original run."
+  ],
+  "logs": [
+    "2026-03-12T14:02:15Z [go-worker-3] INFO dispatch request id=nd9x... tool=risk-check user=acct_42",
+    "2026-03-12T14:02:17Z [go-worker-3] INFO tool-call webhooks POST /risk-check 200 idempotency_header=YmFzZTY0c2FtcGxl",
+    "2026-03-12T14:02:18Z [go-worker-1] INFO dispatch request id=nd9x... tool=risk-check user=acct_42 (replayed after worker restart)",
+    "2026-03-12T14:02:18Z [go-worker-1] INFO tool-call webhooks POST /risk-check 200 idempotency_header=YmFzZTY0c2FtcGxl",
+    "2026-03-12T14:02:18Z [webhook-receiver] WARN duplicate webhook detected for user=acct_42 trace_id=trc_901"
+  ],
+  "comments": [
+    "2026-03-12T15:05 Diego Martinez: Thanks for the clear reproduction notes, Ava. Initial thought: per-process in-memory cache is the weak link here. If a worker restarts the cache is lost and the server will see a replay as new unless the request-level idempotency header maps to a shared store or is checked against a persistent dedup table.",
+    "2026-03-12T15:22 Ava Chen: Customer asked whether increasing TTL to 5 minutes will be safe. They worry about poisoning dedup state for legitimate replays across retries. Also asked about namespace/shard-prefixing best practices so multiple workers can co-exist without collisions.",
+    "2026-03-12T16:10 SRE (Priya Rao): Adding notes from infra \u2014 dedicated pools have an optional Redis-backed dedup store (internal flag dedup_store=on). We should confirm whether the SDKs support attaching a shard id or a monotonic sequence to the idempotency key and whether we have library helpers documented."
+  ],
+  "investigation": [
+    "2026-03-12T17:00 Diego Martinez: Reproduced locally with stress harness. When worker cache is in-memory only, a restart causes duplicates. When switching to a shared Redis dedup store with strict write-once semantics for (idempotency_key -> terminal_status) duplicates disappear in test cluster.",
+    "2026-03-12T17:30 Diego Martinez: Observed that the customer's JS helper was trimming non-ASCII characters before hashing while Go used binary protobuf bytes directly \u2014 this can produce mismatched hashes if payload canonicalization differs. Recommended canonical JSON (utf-8 normalization NFC) prior to hash.",
+    "2026-03-12T18:05 Priya Rao: Checked dedicated pool metrics and found a small window (~30\u201390s) where autoscaler rebalances and reconnects caused in-flight requests to be replayed. With per-process cache TTL < 120s those replays escape the dedup window."
+  ],
+  "resolution": "Temporary workaround provided: enable our Redis-backed dedup_store for the affected dedicated pool and increase TTL to 5 minutes while they complete rollout. Provided a canonicalization checklist for keys: (1) normalize payload JSON to canonical ordering and NFC unicode, (2) include tool_name + user_id + operator-shard-id as explicit components before hashing, (3) use sha256 and base64url encode without truncation.\n\nLong-term recommended solution: adopt a shard-aware key: prefix keys with a deterministic shard id OR use a global request UUID generated by the orchestrator and propagated to all SDKs (recommended). We opened an internal task to add a lightweight helper in both SDKs that exposes a canonical idempotency_key builder for multi-language parity.\n\nFollow-ups created: INT-3321 to add SDK helper; docs PR requested: https://github.com/redwood-inference/docs/pull/210; customer confirmed workaround reduces duplicates in staging after enabling dedup_store.",
+  "resolution_status": "Workaround applied; awaiting SDK helper and docs",
+  "follow_up_actions": [
+    "INT-3321: Add canonical idempotency key builder to sdk-ts and sdk-go (owner: Diego)",
+    "DOC-210: Update best-practices page with shard-aware patterns and canonicalization checklist",
+    "SRE-flag: Recommend enabling dedup_store by default for dedicated pools handling financial flows"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation",
+    "resolution",
+    "follow_up_actions"
+  ],
+  "dataset_doc_uuid": "dsid_78f0244310684e8087defb4cdc9c9c13"
+}
