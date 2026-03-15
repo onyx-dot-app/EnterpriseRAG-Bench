@@ -1,0 +1,111 @@
+{
+  "key": "ENG-513209",
+  "team": "engineering",
+  "title": "Tenant handoff ephemeral arena leak and graceful evict rollout",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-03-10",
+  "updated_at": "2025-03-18",
+  "creator": "Aisha Patel",
+  "assignee": "Marco Alvarez",
+  "project": "runtime-stability",
+  "cycle": "2025-W11",
+  "estimate": "8",
+  "due_date": "2025-03-21",
+  "labels": [
+    "hosted",
+    "dedicated",
+    "kvcache",
+    "gpu-oom",
+    "p0-escalation"
+  ],
+  "dependencies": [
+    "ENG-61234",
+    "ENG-221953"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.21",
+  "security_review_required": "false",
+  "description": "Summary: Multiple customers (hosted burst workloads and one Dedicated tenant) reported recurrent GPU OOMs over multi-hour sessions. Root cause analysis points to an intermittent race during tenant handoff + async snapshot commit that leaves ephemeral tensor arenas and KV-cache fence objects un-freed. Over time these orphaned arenas accumulate, producing severe GPU memory fragmentation and eventual OOM on nodes serving long-lived sessions. This ticket tracks the investigation, short-term mitigations, and rollout of a runtime patch that adds explicit fence reconciliation and a graceful-evict canary rollout.",
+  "steps_to_reproduce": [
+    "1) Provision a hosted node configured for burst tenancy with prefetch watermark enabled",
+    "2) Start 30 concurrent long-running chat sessions that perform repeated prefix appends and attention cache growth (avg seq_len 2048 per session)",
+    "3) Trigger tenant handoff by simulating tenant shutdown/reconnect loops (kill-restart client + force session transfer)",
+    "4) Observe GPU resident set growth (nvidia-smi) and increasing count of 'arena' allocations in runtime gc logs",
+    "5) After ~2-5 hours, node reports OOM and sessions fail with allocation error E_GPU_OOM"
+  ],
+  "investigation_notes": [
+    "Initial alert: hosted customer A reported spike in 503s and OOMs at 2025-03-08 04:12 UTC; Dedicated customer B later reproduced on a reserved pool node",
+    "Heap snapshot (lldb/nvprof) showed multiple 'TensorArena' allocations with identical base IDs but no corresponding free calls after snapshot commit",
+    "Trace logs show async snapshot commit path takes a fast-path that skips 'fence-resolve' when retry_count > 0; cadence of tenant handoffs correlates with leak windows",
+    "KV-cache's fence objects are reference-counted; we found a code path where fence moved between threads without incrementing refcount leading to a lost finalizer",
+    "Fragmentation: small unreachable holes between large allocated arenas -> allocator can't coalesce because fence metadata pinned adjacent slabs",
+    "Metric anomalies: persistent rise in runtime.memory.arena_count and host.gpu.fragmentation_ratio preceding OOM by 30-90 minutes",
+    "Reproducible locally with a stress harness (runtime/tools/tenancy_replay) when latency injection added to snapshot commit",
+    "Crashdumps: one crashdump showed device-side allocation failure but host process still had ~6GB of non-accounted device memory in tracked arenas"
+  ],
+  "logs_and_artifacts": [
+    "Link: https://confluence.redwood.ai/runtime/ephemeral-arena-leak-root-cause (design doc + timeline)",
+    "PR: https://github.com/redwood-inference/runtime/pull/4321 (patch: fence-refcount-and-async-reconcile)",
+    "Canary dashboard: https://grafana.redwood.ai/d/tenancy/tenant-handoff-canary?orgId=1",
+    "Debug harness: runtime/tools/tenancy_replay (branch: eng/arena-leak-repro)",
+    "Core dump: s3://redwood-dumps/2025-03-08/hostedA-node1234-core.gz",
+    "Perf trace: https://perf.redwood.ai/trace/2025-03-09-tenant-handoff.svg"
+  ],
+  "decision_and_plan": [
+    "Short-term mitigation (hotfix): Add explicit periodic fence reconciliation job that runs on node leader every 5 minutes to detect and free orphaned arenas. Backported to 1.20-hotfix branch.",
+    "Root fix (runtime-1.21): Ensure atomic refcount increment on fence handoff code path and make async snapshot commit await fence reconciliation on teardown path when handoff_count > 0",
+    "Canary rollout: staged canary across 3 host pools: small internal pool -> hosted non-production -> hosted prod with rate limit 1% -> Dedicated reserved nodes (smoke first)",
+    "Feature flag: runtime.enable_fence_reconcile (default true on canary) and runtime.strict_refcount (default false, enabled in next step after monitoring)",
+    "Customer remediation: advise customers to perform rolling session restarts if they see fragmentation_ratio > 0.6 while we push hotfix",
+    "Post-release: add an automated regression test to the nightly harness that exercises rapid tenant handoffs under latency injection"
+  ],
+  "rollback_and_mitigation_steps": [
+    "If canary shows regression in latency or increased transient errors, flip runtime.enable_fence_reconcile=false and roll back runtime image to runtime-1.20.9-hotfix",
+    "Emergency kill: drain affected nodes (nodectl cordon && nodectl drain) to prevent further OOMs and shift traffic to backup pools",
+    "Manual memory reclaim: restart serving runtime on affected nodes (low-impact window) to reclaim orphaned device memory",
+    "Notify customers via status page: post incident update with steps taken and expected ETA for full patch"
+  ],
+  "deploy_plan": [
+    "1) Merge PR#4321 to runtime/main with feature flags and unit tests (done)",
+    "2) Build runtime-1.21-canary image and deploy to internal canary pool (2025-03-17)",
+    "3) Monitor canary metrics (memory.arena_count, gpu.fragmentation_ratio, tail-latency) for 48h",
+    "4) If stable, promote to hosted non-prod for 24h, then to 1% prod traffic and Dedicated smoke nodes",
+    "5) After 72h of stable signals, enable strict_refcount and roll to 100%",
+    "6) Postmortem and follow-up tasks scheduled in next cycle"
+  ],
+  "postmortem_todo": [
+    "Document RCA and timeline in Confluence (owner: Aisha Patel)",
+    "Add regression harness test and incorporate into PR gating (owner: Marco Alvarez)",
+    "Create alert runbook entry for rapid tenant-handoff leaks (oncall playbook)",
+    "Audit other async-commit paths for similar refcount assumptions (owner: runtime-dev lead)",
+    "Quantify customer cost impact and draft compensation proposals if needed (support + finance)",
+    "Follow-up: evaluate allocator changes to reduce fragmentation susceptibility (research spike)\n"
+  ],
+  "comments": [
+    "2025-03-10 11:02 - Aisha Patel: Filed after initial support escalations. Added reproducer and early traces.",
+    "2025-03-11 09:18 - Marco Alvarez: Confirmed repro locally with tenancy_replay + latency injection. Found missing refcount increment in fence_move().",
+    "2025-03-12 16:45 - Priya Srinivasan (SRE): Pushed hotfix job to leader nodes to run reconcile every 5m. Observed immediate plateau in arena_count on two hosted pools.",
+    "2025-03-14 08:30 - Carlos Mendes (Customer Success): Notified affected customers of mitigation; customers asked for ETA on full fix.",
+    "2025-03-17 21:05 - Marco Alvarez: PR created and canary build pushed. Monitoring in progress.",
+    "2025-03-18 07:12 - Aisha Patel: Added postmortem todo list and linking confluence doc"
+  ],
+  "related_links": [
+    "ENG-61234: session-seam-memory-tessellation-kv-shadow-patch.json",
+    "runtime PR#4318: allocator-prefetch-stability",
+    "Confluence: https://confluence.redwood.ai/ops/playbooks/tenant-handoff-leaks"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "investigation_notes",
+    "logs_and_artifacts",
+    "decision_and_plan",
+    "rollback_and_mitigation_steps",
+    "deploy_plan",
+    "postmortem_todo",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_223e8389d4d5496ab9f8dd871a1175eb"
+}

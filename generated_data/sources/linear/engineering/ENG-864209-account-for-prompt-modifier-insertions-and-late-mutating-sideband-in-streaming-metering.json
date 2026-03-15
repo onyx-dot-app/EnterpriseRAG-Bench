@@ -1,0 +1,72 @@
+{
+  "key": "ENG-864209",
+  "team": "engineering",
+  "title": "Account for prompt-modifier insertions and late-mutating sideband in streaming metering",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-14",
+  "creator": "Lena Park",
+  "assignee": "Mateo Ruiz",
+  "project": "metering-core",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "due_date": "2026-03-25",
+  "labels": [
+    "metering",
+    "streaming",
+    "billing",
+    "token-accounting",
+    "high-impact"
+  ],
+  "parent_issue": [
+    "ENG-314159"
+  ],
+  "dependencies": [
+    "ENG-314159",
+    "ENG-562890",
+    "ENG-271888"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.27",
+  "security_review_required": "false",
+  "description": "Background: Some streaming sessions include prompt modifiers or sideband events that are injected after an initial request has started. Examples: a client upgrades a prompt via a late 'insert-instruction' sideband message, a proxy injects an assistant guidance rewrite mid-stream, or a code-runner attaches a generated snippet after an initial response fragment.\n\nProblem: The current metering pipeline assigns token credits based on an optimistic, first-seen tokenization snapshot. When a modifier is later inserted or an existing prompt fragment is mutated mid-stream, we either double-count tokens (if insertion is treated as new input and prior output remains) or leave orphaned credits (if the later mutation replaces previously accounted input without reconciling previously used output). This is most visible for long-running streaming sessions, multi-party proxies, and attach/patch flows.\n\nGoal: Ensure deterministic, auditable per-session token accounting when prompt modifiers or sideband mutations occur during an active stream. The fix must handle: (1) idempotent replays of sideband events, (2) late-insertions that should be billed as incremental inputs vs full re-tokenization, and (3) reconciliation of output credits tied to mutated prefix material.\n\nScope: Changes to the streaming ingest protocol, metering ledger anchors, and the reconciliation step in the billing pipeline. Backwards-compatible for older clients via feature-flagged behavior and a shadow-billing phase.",
+  "acceptance_criteria": "1) Introduce a stable per-sideband-event ID and ensure the ledger records a mapping from event_id -> token_delta for all insert/mutate events.\n2) For late-insert events tagged as \"incremental\", meter only the incremental token delta computed against the canonical prefix snapshot and never re-bill previously finalized output.\n3) For mutation events that replace prior input, billing must emit a reconciliation entry that either credits back the delta or marks a prorate adjustment; audit queries should be able to reconstruct final billed tokens per session deterministically.\n4) No customer sees a charge increase >2% in production shadow for a representative 72-hour traffic sample compared to baseline; spikes must be investigated.\n5) Unit tests cover at least 10 mutation/insertion permutations including replayed events, out-of-order delivery, and compressed attachment cases.\n6) End-to-end performance impact <4ms p50 add on ingest path in the worst-case shadow mode.",
+  "technical_decision_record": "Decision: Introduce an 'event-anchoring' model in the streaming metering pipeline. Each sideband event (insert/mutate/attach) carries a stable uuid, an event_type, and a sequence_anchor that references the last acknowledged frame. The metering ingest will: \n- Compute a canonicalized tokenization snapshot for the session at the sequence_anchor.\n- Compute token_delta = token_count(after_event) - token_count(snapshot).\n- Emit a ledger row (session_id, event_id, sequence_anchor, token_delta, provenance_tag).\n\nRationale: This minimizes re-tokenization scope, supports idempotent replay (dedupe by event_id), and produces auditable deltas. Tradeoffs: Extra memory to cache canonical snapshots for warm sessions; mitigated by TTL and heuristics to only keep snapshots when sideband events are frequent. We considered full re-tokenization of entire session but rejected due to cost for long-lived sessions.\n\nComplementary: A lightweight reconciliation worker will scan mutation events that have replace semantics and emit credit events (negative deltas) to preserve ledger invariants. The reconciliation worker runs asynchronously but must finish within 1 minute for sessions with SLA 'dedicated' tier; otherwise we mark 'pending_reconciliation' in the invoice metadata.",
+  "reproduction_steps": [
+    "1) Start a streaming text generation session with client A: initial prompt 'Summarize this document: <doc>...'.\n",
+    "2) Stream the model output; observe token credits recorded for initial prompt and streaming output in the ledger.\n",
+    "3) Mid-stream, send a sideband event with event_id='sb-123' of type 'insert-instruction' that inserts two sentences into the prompt (expected incremental +25 tokens).\n",
+    "4) Observe the ledger: before fix, check for either double-counting or no accounting for the inserted tokens. After fix, expect a single delta entry tied to sb-123 with +25 tokens.\n",
+    "5) Repeat with a mutation sideband event that replaces a 50-token prefix; expect ledger to emit a -50 credit plus a +new_delta if necessary, resulting in a net adjustment equal to the canonical token diff.\n",
+    "6) Test replay: resend sb-123 identical payload; ledger must dedupe and not change billed tokens.\n",
+    "7) Test out-of-order delivery: deliver mutation before sequence_anchor; system should buffer or reject with clear error and not corrupt ledger invariants."
+  ],
+  "telemetry_queries": [
+    "Q1: count(*) from ledger where event_type in ('insert','mutate') and delta > 0 group by event_type;",
+    "Q2: sample(100) from sessions where pending_reconciliation = true order by last_event_time desc;",
+    "Q3: aggregate 72h compare: sum(billed_tokens)_postfix - sum(billed_tokens)_baseline / sum(billed_tokens)_baseline;",
+    "Q4: top 20 sessions by reconciliation_delta in last 24h;",
+    "Q5: failure-rate ingestion-sideband over last 7d where dedupe_miss = true;",
+    "Q6: p50/p95 ingest-path latency for sessions with sideband events vs baseline without sideband"
+  ],
+  "rollout_plan": "1) Implement feature behind 'sideband-metering-v2' feature flag.\n2) Deploy to canary region with shadow-billing enabled for all sessions flagged experimental.\n3) Run 72-hour shadow run and compare telemetry queries Q1..Q6; escalate if >2% billing variance or reconciliation backlog >5k.\n4) Open PRs for runtime, ingest-proxy, and billing-worker with cross-team review.\n5) If shadow is green, enable live billing for 5% of sessions (traffic ramp) with monitoring dashboards and automatic rollback on critical alerts.\n6) Full rollout after 2 weeks of stable metrics or earlier if manual sign-off from billing and reliability teams.\n7) Post-rollout: run backfill for sessions that had 'pending_reconciliation' and emit invoice adjustments where reconciliation completed with non-zero delta.\n8) Document new event contract and SDK guidance for clients to avoid inserting extremely large modifier payloads mid-stream.",
+  "comments": [
+    "2026-03-10 Lena Park: Created initial ticket after on-call incident where a large enterprise proxy injected multiple sideband rewrites and caused spike in disputed invoices. Logged sample session id: sess-20260310-8a2b.",
+    "2026-03-11 Mateo Ruiz: Prototype of event-anchoring in a local harness. Early perf numbers show +3.4ms p50 add on ingest for sessions with cached snapshot. Push PR draft: https://github.com/redwood-inference/infra/pull/2873",
+    "2026-03-12 Aisha Khan (Billing): Reviewed approach; requested reconciliation guarantees for reserved/dedicated customers and a clear backfill plan for invoices older than 30 days. Added dependency on ENG-562890 for invoice adjustments API.",
+    "2026-03-13 Jonah Li (Runtime): Raised concern that canonical snapshot TTL must be tuned to avoid OOM on long-lived sessions. Suggested LRU cache with session-weight heuristics.",
+    "2026-03-14 PR feedback: design doc updated with sequence_anchor format and idempotency semantics. Code review requested changes to worker retry backoff. Link to design: https://confluence.redwood.ai/display/METER/sideband-metering-v2"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "technical_decision_record",
+    "reproduction_steps",
+    "telemetry_queries",
+    "rollout_plan",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_b70c97e47d0246e59cc53de87cb34456"
+}
