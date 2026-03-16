@@ -5,11 +5,10 @@ Target number of files:
 200000
 
 File name format:
-The documents are named some timestamp.json in unix time (just a single number with no underscore etc.) followed by a description of the thread (e.g., 1740535447-v2-api-rollout-blockers.json).
+The documents are named some timestamp-description.json with the timestamp in unix time (just a single number with no underscore etc.) followed by a description of the thread (e.g., 1740535447-v2-api-rollout-blockers.json).
 
 Content rules:
 - Each document represents exactly one Slack thread.
-  - The documents are named some timestamp.json, just a single number with no underscore etc.
   - Include the root message and all replies.
   - Present messages in chronological order.
 - Every Slack thread should be contained as a single continuous string containing messages from different people
@@ -23,7 +22,8 @@ Content rules:
   - @mentions, emoji shortcodes (e.g., :thumbsup:), reactions (as lightweight annotations), and links.
   - Inline code and fenced code blocks for logs, commands, config snippets.
   - Occasional bot/system messages (e.g., incident bot, deploy bot) are allowed.
-- Most threads are very short but some can be quite long depending on the topic.
+- Almost all threads are very short, typically a single message or 2-3 messages all quite short. Very few will be long but the long ones could be quite long with a lot of messages exchanged between people.
+  - Determine the length based on what is being discussed but note that the vast majority of documents should be very short.
 
 Metadata rules:
 - Required metadata for every thread document:
