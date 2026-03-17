@@ -1,0 +1,49 @@
+{
+  "maria_support": [
+    "Hey team \u2014 customer reports chat stream (websocket) cuts off right after the last token, client shows socket still open but no more messages. They say it works if they reconnect. Request ID they sent: req_8f3c9b2a. Client: mobile app behind corporate proxy (iOS WebSocket). Happening ~2025-09-12T16:02:10Z. Can we collect repro steps + what logs to ask for?"
+  ],
+  "lee_customer": [
+    "repro steps I have so far. Start chat, send prompt that yields ~1200 tokens, stream enabled. After ~7-10s of final token activity, server stops sending and socket stays ESTABLISHED. Reconnect -> remaining tokens arrive. I captured one tcpdump and client logs, attaching in DM.",
+    "I ran the curl SSE -> it printed events then stopped with no error. Full stdout attached. The last \"data:\" line is truncated: ended mid-word. Request headers: X-Forwarded-For present.",
+    "sharing a small pcap: I see continuous TCP ACKs but no payload after 16:02:27. No FIN/RST. The client logs show repeated reads returning 0 bytes (socket read 0).",
+    "I can try capture with ngrep/tcpdump; will upload remote pcap. Also testing from a non-corporate network now.",
+    "Uploaded bundle -> https://files.redwood.ai/s/abc123/repro_bundle_req_8f3c9b2a.tar.gz. Includes pcap, curl.log, wscat.log, client debug."
+  ],
+  "jonathan_runtime": [
+    "thanks. Likely either proxy buffering or kv-cache flush race. First ask: can you provide the full request-id header (x-request-id) and the backend request-id (x-rrid) if present? Also the websocket handshake headers. If you can reproduce, run these two quick checks:",
+    "1) reproduce with a direct curl SSE stream (bypass websocket) to see if SSE also truncates:\n```bash\ncurl -N -H \"Authorization: Bearer $REDWOOD_KEY\" -H \"Accept: text/event-stream\" \\\n  -H \"X-Request-Id: req_8f3c9b2a-test\" \\\n  'https://api.redwood.ai/v1/chat/stream' \\\n  -d '{\"model\":\"redwood-1\",\"messages\":[{\"role\":\"user\",\"content\":\"<long prompt>\"}],\"stream\":true}'\n```",
+    "2) reproduce with wscat to check websocket-only path (install wscat or websocat):\n```bash\nwscat -c \"wss://api.redwood.ai/v1/chat/ws?stream=true\" -H \"Authorization: Bearer $REDWOOD_KEY\" \\\n  -H \"X-Request-Id: req_8f3c9b2a-test2\"\n# then send the same JSON payload as above\n```",
+    "Interesting: edge.event=stream_end reason=client_idle suggests edge decided to close stream due to idle gap between event frames. Could be client TCP window/gap or proxy coalescing preventing the keepalive. Can we get the app's socket-level logs (tcpdump around the time) \u2014 look for FIN/RST or long silence. Also check that server is emitting final SSE event with `data: [DONE]` or similar.",
+    "read 0 bytes with ESTABLISHED usually means remote side closed without FIN? Strange. Could be middlebox swallowing packets. Two more server checks for us: 1) grep the runtime logs for backend.req-az1-12 around that req; 2) enable debug trace for that request id to collect kv-cache events.",
+    "Also ask customer to try adding small keepalive NOP frames every 1s from client while streaming to see if that prevents edge from coalescing/closing. For websocket path send a heartbeat JSON {} every second. For SSE you'd need an intermediate keepalive comment `:hb\\n\\n` from server; but client can send pings only on ws.",
+    "Thanks \u2014 grabbing it now. If infra change eliminates issue we'll follow up with a permanent fix (ensure final chunk flush + explicit small sleep on server write to let OS buffer drain under those proxies)."
+  ],
+  "sre_oncall": [
+    "Can we pull worker/edge logs for req_8f3c9b2a? Also check nginx/edge config for proxy_buffering and proxy_read_timeout. On Fastly/Cloudflare worker layers look for queued bytes not flushed. I'll grep logs now.",
+    "Found entry in edge logs:\n```\nedge.req=req_8f3c9b2a status=200 backend=req-az1-12 latency=2345ms bytes_sent=3124 conn_state=ESTABLISHED\nedge.event=stream_end reason=client_idle\n```",
+    "Can we get the app's socket-level logs (tcpdump around the time) \u2014 look for FIN/RST or long silence. Also check that server is emitting final SSE event with `data: [DONE]` or similar.",
+    "pulled runtime logs for backend req:\n```\n2025-09-12T16:02:25Z [info] req=req_8f3c9b2a stream_chunk emitted seq=1 size=2048\n2025-09-12T16:02:26Z [info] req=req_8f3c9b2a stream_chunk emitted seq=2 size=2048\n2025-09-12T16:02:27Z [info] req=req_8f3c9b2a stream_chunk emitted seq=3 size=512\n2025-09-12T16:02:27Z [warn] req=req_8f3c9b2a kv_cache_flush delayed\n2025-09-12T16:02:27Z [info] req=req_8f3c9b2a stream_complete\n```",
+    "I've flagged infra to temporarily disable aggressive proxy coalescing on the edge pool that handled req_8f3c9b2a. If customer repros after that change, we'll know for sure.",
+    "pulled runtime logs for backend req:\n```\n2025-09-12T16:02:25Z [info] req=req_8f3c9b2a stream_chunk emitted seq=1 size=2048\n2025-09-12T16:02:26Z [info] req=req_8f3c9b2a stream_chunk emitted seq=2 size=2048\n2025-09-12T16:02:27Z [info] req=req_8f3c9b2a stream_chunk emitted seq=3 size=512\n2025-09-12T16:02:27Z [warn] req=req_8f3c9b2a kv_cache_flush delayed\n2025-09-12T16:02:27Z [info] req=req_8f3c9b2a stream_complete\n```"
+  ],
+  "deploy-bot": [
+    "Canary config change applied to pool edge-pool-az1: proxy_buffering=off for 15m window \u2014 rollout id roll_2025_09_12_az1. Monitoring for 30m."
+  ],
+  "maria_support_addendum": [
+    "If SSE reproduces the truncation it's probably server-side flush. If only WS hits it, could be edge/proxy. Ask customer to run both and paste outputs. Also ask them to try disabling any corporate proxy or test from home network / mobile data.",
+    "For debug bundle please ask customer to include: curl output (raw bytes), wscat transcript, browser devtools network capture (if using web), tcpdump pcap snippet around the session, and the two request ids (x-request-id header and the value server returned). Also include client user-agent + proxy chain.",
+    "Looks like server finished sending but edge logged `client_idle`. Could be that the final bytes left in socket buffer weren't flushed to client. Ask customer to run an `nc` client to capture raw bytes from server side (if possible) and share.",
+    "Great. Lee, once you upload the debug bundle (curl stdout, wscat session, pcap, headers) drop the S3 link here and I'll escalate to infra with attached logs. If we confirm edge coalescing, recommend adding explicit flush on final chunk and also a short trailing keepalive (server-side margin) to guarantee last bytes hit client.",
+    "I'll update customer and set follow-up ticket with SRE + runtime. :thumbsup!"
+  ],
+  "title_field_name": "maria_support",
+  "content_field_names": [
+    "maria_support",
+    "lee_customer",
+    "jonathan_runtime",
+    "sre_oncall",
+    "deploy-bot",
+    "maria_support_addendum"
+  ],
+  "dataset_doc_uuid": "dsid_076e8c6259ce4b31b7c24aeeb6efd95a"
+}

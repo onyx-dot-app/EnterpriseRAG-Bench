@@ -5,10 +5,7 @@ Target number of files:
 200000
 
 File name format:
-The documents are named some timestamp.json in unix time (just a single number with no underscore etc.) followed by a description of the thread (e.g., 1740535447-v2-api-rollout-blockers.json).
-Approximately 1 in 10 files should have a -long before the .json (so the same file would be 1740535447-v2-api-rollout-blockers-long.json). This indicates a longer and more detailed Slack thread.
-Threads which are not -long should be very short conversations, often just a single message, but sometimes a very short exchange between 1-3 people and very small amounts of content.
-If the number of -long files is lower than 1/10th approximately, create more -long files.
+The documents are named some timestamp.json in unix time (just a single number with no underscore etc.) followed by a description of the thread (e.g., 1740535447-v2-api-rollout-blockers.json). Note that the vast majority of Slack threads (even on technical or complex seeming topics) should be very short. This should reflect how users actually communicate on Slack. Nearly all messages are just a short message (1-2 concise phrases) and a short response (or even no responses at all).
 
 Content rules:
 - Each document represents exactly one Slack thread.
@@ -25,7 +22,6 @@ Content rules:
   - @mentions, emoji shortcodes (e.g., :thumbsup:), reactions (as lightweight annotations), and links.
   - Inline code and fenced code blocks for logs, commands, config snippets.
   - Occasional bot/system messages (e.g., incident bot, deploy bot) are allowed.
-- About 1/10 messages should be longer and more detailed as a thread. 9/10ths are very short, similar to real Slack threads.
 
 Metadata rules:
 - Required metadata for every thread document:
