@@ -6,7 +6,10 @@ import os
 from src.llm import Message, get_llm
 from src.paths import QUESTIONS_PATH
 from src.prompts.answer_generation import SINGLE_DOCUMENT_ANSWER_GENERATION
-from src.prompts.question_fact_extraction import FACT_EXTRACTION_PROMPT
+from src.prompts.question_fact_extraction import (
+    ANTI_HALLUCINATION_FACT_VALIDATOR_PROMPT,
+    FACT_EXTRACTION_PROMPT,
+)
 from src.utils.document_content import DocumentFieldError, extract_document_content
 from src.utils.file_io import load_json_file
 from src.utils.json_extraction import extract_json_from_response
@@ -194,6 +197,57 @@ def extract_answer_facts(
         return None
 
     return facts
+
+
+def extract_anti_hallucination_facts(
+    facts: list[str],
+    quiet: bool = False,
+) -> list[str] | None:
+    """
+    Identify anti-hallucination guard facts from a list of facts.
+
+    These are negation-type statements that prevent hallucinations
+    (e.g., "the answer should not mention X").
+
+    Args:
+        facts: List of fact strings to filter.
+        quiet: If True, suppress LLM output.
+
+    Returns:
+        List of anti-hallucination fact strings, or None on failure.
+    """
+    prompt = ANTI_HALLUCINATION_FACT_VALIDATOR_PROMPT.format(
+        fact_list=json.dumps(facts),
+    )
+
+    llm = get_llm(tools=None, quiet=quiet)
+    messages: list[Message] = [Message(role="user", content=prompt)]
+
+    response = ""
+    for chunk in llm.generate(messages):
+        if isinstance(chunk, str):
+            if not quiet:
+                print(chunk, end="", flush=True)
+            response += chunk
+
+    if not quiet:
+        print()
+
+    response = response.strip()
+
+    try:
+        result = json.loads(response)
+    except json.JSONDecodeError:
+        try:
+            response = extract_json_from_response(response)
+            result = json.loads(response)
+        except Exception:
+            return None
+
+    if not isinstance(result, list):
+        return None
+
+    return result
 
 
 def extract_source_type(doc_path: str) -> str:
