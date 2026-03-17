@@ -367,6 +367,7 @@ def process_question_docs(
 def score_answer(
     answer_row: dict,
     question_data: dict,
+    original_question_data: dict,
 ) -> dict:
     """Score a single answer against its question data.
 
@@ -377,6 +378,11 @@ def score_answer(
     answer_doc_ids = answer_row.get("document_ids") or []
     expected_doc_ids = question_data.get("expected_doc_ids", [])
     answer_facts = question_data.get("answer_facts", [])
+    question_type = original_question_data.get("question_type")
+    gold_answer_updated = (
+        original_question_data.get("gold_answer")
+        != question_data.get("gold_answer")
+    )
 
     # Dedupe answer doc_ids
     seen: set[str] = set()
@@ -420,11 +426,90 @@ def score_answer(
 
     return {
         "question_id": qid,
+        "question_type": question_type,
+        "gold_answer_updated": gold_answer_updated,
         "answer_correct": answer_correct,
         "completeness_pct": round(completeness_pct, 2),
         "document_recall_pct": round(document_recall_pct, 2),
         "invalid_extra_docs": invalid_extra_docs,
     }
+
+
+def compute_stats_for_group(results: list[dict]) -> dict[str, float | int]:
+    """Compute average stats for a group of question results."""
+    n = len(results)
+    if n == 0:
+        return {
+            "count": 0,
+            "average_correctness_pct": 0.0,
+            "average_completeness_pct": 0.0,
+            "average_recall_pct": 0.0,
+            "average_extra_docs": 0.0,
+        }
+    return {
+        "count": n,
+        "average_correctness_pct": round(
+            sum(1 for r in results if r["answer_correct"]) / n * 100, 2,
+        ),
+        "average_completeness_pct": round(
+            sum(r["completeness_pct"] for r in results) / n, 2,
+        ),
+        "average_recall_pct": round(
+            sum(r["document_recall_pct"] for r in results) / n, 2,
+        ),
+        "average_extra_docs": round(
+            sum(r["invalid_extra_docs"] for r in results) / n, 2,
+        ),
+    }
+
+
+def build_question_type_stats(
+    question_results: list[dict],
+) -> dict[str, dict[str, float | int]]:
+    """Build per-question-type stats breakdown."""
+    by_type: dict[str, list[dict]] = {}
+    for r in question_results:
+        qt = r.get("question_type", "unknown")
+        by_type.setdefault(qt, []).append(r)
+    return {qt: compute_stats_for_group(group) for qt, group in sorted(by_type.items())}
+
+
+def build_aggregate_stats(
+    question_results: list[dict],
+    skip_count: int,
+    total_questions: int,
+) -> dict[str, float | int]:
+    """Build aggregate stats for the current evaluation snapshot."""
+    stats = compute_stats_for_group(question_results)
+    num_corrected = sum(1 for r in question_results if r.get("gold_answer_updated"))
+    return {
+        "total_questions": total_questions,
+        "completed_questions": stats.pop("count"),
+        "skipped_rows": skip_count,
+        "num_corrected_questions": num_corrected,
+        **stats,
+    }
+
+
+def write_results_snapshot(
+    results_file: str,
+    output_file: str,
+    question_results: list[dict],
+    skip_count: int,
+    total_questions: int,
+) -> None:
+    """Write the current results snapshot to disk atomically."""
+    results_output = {
+        "updated_question_file": output_file,
+        "aggregate_stats": build_aggregate_stats(
+            question_results=question_results,
+            skip_count=skip_count,
+            total_questions=total_questions,
+        ),
+        "question_type_stats": build_question_type_stats(question_results),
+        "questions": question_results,
+    }
+    write_json_file(results_file, results_output)
 
 
 # =============================================================================
@@ -504,54 +589,103 @@ def main() -> None:
         print(f"\n  {skip_count} rows skipped due to failures")
 
     # =========================================================================
-    # Phase 1: Document evaluation
+    # Resume from existing results if available
     # =========================================================================
 
-    rows_with_docs = [r for r in valid_rows if r.get("document_ids")]
-    print(f"\n  {len(rows_with_docs)} rows have document_ids to evaluate")
-
     updated_questions: dict[str, dict] = {}
-    doc_stats = {"ok": 0, "updated": 0, "evaluated": 0, "errors": 0}
+    question_results: list[dict] = []
+    completed_qids: set[str] = set()
 
-    if rows_with_docs:
-        print(f"\nPhase 1: Document evaluation (parallelism={args.parallelism})...")
+    if os.path.exists(args.results_file):
+        try:
+            existing_results = load_json_file(args.results_file)
+            for r in existing_results.get("questions", []):
+                qid = r.get("question_id")
+                if qid:
+                    completed_qids.add(qid)
+                    question_results.append(r)
+            if completed_qids:
+                print(f"\n  Resuming: found {len(completed_qids)} already-evaluated questions in {args.results_file}")
+        except Exception:
+            print(f"\n  [WARN] Could not load existing results from {args.results_file}, starting fresh")
 
-        def run_doc_eval(row: dict) -> tuple[str, dict | None]:
-            return process_question_docs(row, questions, uuid_index)
+    # Filter out already-completed questions
+    remaining_rows = [row for row in valid_rows if row["question_id"] not in completed_qids]
+    total_questions = len(valid_rows)
+
+    # =========================================================================
+    # Per-question evaluation: document eval + answer scoring
+    # =========================================================================
+
+    def evaluate_single_question(
+        row: dict,
+    ) -> tuple[dict | None, dict]:
+        """Evaluate a single question: doc eval then answer scoring."""
+        qid = row["question_id"]
+        updated_q: dict | None = None
+
+        if row.get("document_ids"):
+            status, updated_q = process_question_docs(row, questions, uuid_index)
+            print(f"  {qid} docs: {status}")
+
+        original_question = questions[qid]
+        effective_question = updated_q if updated_q else original_question
+        result = score_answer(row, effective_question, original_question)
+        print(
+            f"  {qid} score: correct={result['answer_correct']}"
+            f"  completeness={result['completeness_pct']}%"
+            f"  recall={result['document_recall_pct']}%"
+            f"  extra_docs={result['invalid_extra_docs']}"
+        )
+        return updated_q, result
+
+    # Keep results.json populated as questions finish. All writes happen here
+    # on the main thread, even when evaluation itself runs in parallel.
+    print(f"\nInitializing results file at {args.results_file}...")
+    write_results_snapshot(
+        results_file=args.results_file,
+        output_file=args.output_file,
+        question_results=question_results,
+        skip_count=skip_count,
+        total_questions=total_questions,
+    )
+
+    def handle_completed_question(
+        updated_q: dict | None,
+        result: dict,
+    ) -> None:
+        """Record a completed question and flush the snapshot to disk."""
+        if updated_q:
+            updated_questions[updated_q["question_id"]] = updated_q
+        question_results.append(result)
+        write_results_snapshot(
+            results_file=args.results_file,
+            output_file=args.output_file,
+            question_results=question_results,
+            skip_count=skip_count,
+            total_questions=total_questions,
+        )
+
+    remaining_count = len(remaining_rows)
+    if remaining_count == 0:
+        print("\nAll questions already evaluated, nothing to do.")
+    else:
+        print(f"\nEvaluating {remaining_count} remaining questions (parallelism={args.parallelism})...")
 
         if args.parallelism <= 1:
-            for row in rows_with_docs:
-                status, updated_row = run_doc_eval(row)
-                print(f"  {status}")
-                if updated_row:
-                    updated_questions[updated_row["question_id"]] = updated_row
-                if status.startswith("OK"):
-                    doc_stats["ok"] += 1
-                elif status.startswith("UPDATED"):
-                    doc_stats["updated"] += 1
-                elif status.startswith("EVALUATED"):
-                    doc_stats["evaluated"] += 1
-                else:
-                    doc_stats["errors"] += 1
+            for i, row in enumerate(remaining_rows, 1):
+                print(f"\n[{i}/{remaining_count}] {row['question_id']}")
+                updated_q, result = evaluate_single_question(row)
+                handle_completed_question(updated_q, result)
         else:
             with ThreadPoolExecutor(max_workers=args.parallelism) as executor:
                 futures = {
-                    executor.submit(run_doc_eval, row): row
-                    for row in rows_with_docs
+                    executor.submit(evaluate_single_question, row): row
+                    for row in remaining_rows
                 }
                 for future in as_completed(futures):
-                    status, updated_row = future.result()
-                    print(f"  {status}")
-                    if updated_row:
-                        updated_questions[updated_row["question_id"]] = updated_row
-                    if status.startswith("OK"):
-                        doc_stats["ok"] += 1
-                    elif status.startswith("UPDATED"):
-                        doc_stats["updated"] += 1
-                    elif status.startswith("EVALUATED"):
-                        doc_stats["evaluated"] += 1
-                    else:
-                        doc_stats["errors"] += 1
+                    updated_q, result = future.result()
+                    handle_completed_question(updated_q, result)
 
     # Write updated questions file
     print(f"\nWriting updated questions to {args.output_file}...")
@@ -570,89 +704,32 @@ def main() -> None:
                     f.write(json.dumps(row) + "\n")
 
     # =========================================================================
-    # Phase 2: Answer scoring
-    # =========================================================================
-
-    print(f"\nPhase 2: Answer scoring (parallelism={args.parallelism})...")
-
-    # Build effective question data: use updated version if available, else original
-    def get_effective_question(qid: str) -> dict:
-        return updated_questions.get(qid, questions[qid])
-
-    def run_score(row: dict) -> dict:
-        return score_answer(row, get_effective_question(row["question_id"]))
-
-    question_results: list[dict] = []
-
-    if args.parallelism <= 1:
-        for row in valid_rows:
-            result = run_score(row)
-            qid = result["question_id"]
-            print(
-                f"  {qid}: correct={result['answer_correct']}"
-                f"  completeness={result['completeness_pct']}%"
-                f"  recall={result['document_recall_pct']}%"
-                f"  extra_docs={result['invalid_extra_docs']}"
-            )
-            question_results.append(result)
-    else:
-        with ThreadPoolExecutor(max_workers=args.parallelism) as executor:
-            futures = {
-                executor.submit(run_score, row): row
-                for row in valid_rows
-            }
-            for future in as_completed(futures):
-                result = future.result()
-                qid = result["question_id"]
-                print(
-                    f"  {qid}: correct={result['answer_correct']}"
-                    f"  completeness={result['completeness_pct']}%"
-                    f"  recall={result['document_recall_pct']}%"
-                    f"  extra_docs={result['invalid_extra_docs']}"
-                )
-                question_results.append(result)
-
-    # =========================================================================
     # Aggregate stats and write results
     # =========================================================================
 
-    n = len(question_results)
-    if n > 0:
-        avg_correctness = sum(1 for r in question_results if r["answer_correct"]) / n * 100
-        avg_completeness = sum(r["completeness_pct"] for r in question_results) / n
-        avg_recall = sum(r["document_recall_pct"] for r in question_results) / n
-        avg_extra_docs = sum(r["invalid_extra_docs"] for r in question_results) / n
-    else:
-        avg_correctness = 0.0
-        avg_completeness = 0.0
-        avg_recall = 0.0
-        avg_extra_docs = 0.0
+    aggregate_stats = build_aggregate_stats(
+        question_results=question_results,
+        skip_count=skip_count,
+        total_questions=total_questions,
+    )
 
-    aggregate_stats = {
-        "total_questions": n,
-        "skipped_rows": skip_count,
-        "average_correctness_pct": round(avg_correctness, 2),
-        "average_completeness_pct": round(avg_completeness, 2),
-        "average_recall_pct": round(avg_recall, 2),
-        "average_extra_docs": round(avg_extra_docs, 2),
-    }
-
-    results_output = {
-        "updated_question_file": args.output_file,
-        "questions": question_results,
-        "aggregate_stats": aggregate_stats,
-    }
-
-    print(f"\nWriting results to {args.results_file}...")
-    write_json_file(args.results_file, results_output)
+    print(f"\nFinalizing results at {args.results_file}...")
+    write_results_snapshot(
+        results_file=args.results_file,
+        output_file=args.output_file,
+        question_results=question_results,
+        skip_count=skip_count,
+        total_questions=total_questions,
+    )
 
     print(f"\nDone.")
-    print(f"  Questions scored: {n}")
-    print(f"  Skipped rows:     {skip_count}")
-    print(f"  Avg correctness:  {aggregate_stats['average_correctness_pct']}%")
-    print(f"  Avg completeness: {aggregate_stats['average_completeness_pct']}%")
-    print(f"  Avg recall:       {aggregate_stats['average_recall_pct']}%")
-    print(f"  Avg extra docs:   {aggregate_stats['average_extra_docs']}")
+    print(f"  Questions scored:    {aggregate_stats['completed_questions']}")
+    print(f"  Skipped rows:        {skip_count}")
+    print(f"  Corrected questions: {aggregate_stats['num_corrected_questions']}")
+    print(f"  Avg correctness:     {aggregate_stats['average_correctness_pct']}%")
+    print(f"  Avg completeness:    {aggregate_stats['average_completeness_pct']}%")
+    print(f"  Avg recall:          {aggregate_stats['average_recall_pct']}%")
+    print(f"  Avg extra docs:      {aggregate_stats['average_extra_docs']}")
 
 
 if __name__ == "__main__":
