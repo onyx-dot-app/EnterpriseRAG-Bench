@@ -6,24 +6,21 @@ If any of the details do not align with the query, the document should be classi
 In rare situations, the candidate documents may be better than the gold set of documents and ALSO through their existence, invalidate the gold documents. \
 For each gold and candidate document, provide a classification of either "valid" or "invalid" as well as the "reason" for the classification.
 
-## Query:
+## Query
 ```
 {query}
 ```
 
-## Gold Documents:
-```
+## Gold Documents
 {gold_documents}
-```
 
-## Candidate Documents:
-```
+## Candidate Documents
 {candidate_documents}
-```
+
 
 CRITICAL: Output only a JSON object with the following fields (make sure to include all gold and candidate documents):
 {{
-  "dsid-key": {{
+  "dsid_key": {{
     "classification": "valid or invalid",
     "reason": "reason for the classification"
   }}
@@ -56,19 +53,19 @@ CRITICAL: Output only the new gold answer and nothing else.
 
 
 INDIVIDUAL_FACT_VALIDATOR_PROMPT = """
-You are an answer validator. Given a list of statements, evaluate each one to see if the answer is consistent with the statement. \
-The answer may contain more details or richer information than the statements but as long as it does not contradict the statements, this is ok. \
-You must give a total count of of validated statements out of the total number of statements.
+You are an answer validator. Given an answer and a statement, determine if the answer is consistent with and contains the information in the statement. \
+The answer may contain more details or richer information than the statement but as long as it does not contradict the statement, this is ok. \
+Output a simple yes or no for if the answer is consistent with and contains the information in the statement.
 
 ## Answer
 ```
 {answer}
 ```
 
-## Statements
+## Statement
 ```
-{statements}
+{statement}
 ```
 
-CRITICAL: output only an integer number representing the total number of validated statements and nothing else.
+CRITICAL: output only a simple yes if the answer is consistent with the statement or a no if the answer does not contain the information in the statement or contradicts the statement.
 """.strip()

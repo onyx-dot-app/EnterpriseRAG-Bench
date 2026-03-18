@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -13,7 +14,14 @@ from src.prompts.answer_evaluation import (
     ANSWER_UPDATOR_PROMPT,
     INDIVIDUAL_FACT_VALIDATOR_PROMPT,
 )
-from src.utils.document_content import extract_document_content
+from src.utils.cli import confirm_yes_no
+from src.utils.document_index import (
+    DEFAULT_UUID_INDEX_CACHE_FILE,
+    load_document_content_by_uuid,
+    load_document_json_by_uuid,
+    load_or_build_uuid_index,
+    rebuild_uuid_index,
+)
 from src.utils.file_io import load_json_file, write_json_file
 from src.utils.json_extraction import extract_json_from_response
 from src.utils.questions import extract_answer_facts, extract_anti_hallucination_facts
@@ -21,6 +29,10 @@ from src.utils.questions import extract_answer_facts, extract_anti_hallucination
 DEFAULT_ANSWER_FILE = "answer_evaluation/answers.jsonl"
 DEFAULT_OUTPUT_FILE = "generated_data/questions_updated.jsonl"
 DEFAULT_RESULTS_FILE = "answer_evaluation/results.json"
+
+
+class MissingDocumentIdsError(ValueError):
+    """Raised when referenced document ids are missing from the UUID index."""
 
 
 # =============================================================================
@@ -43,6 +55,24 @@ def load_questions(questions_path: str) -> dict[str, dict]:
     return questions
 
 
+def load_updated_questions(output_path: str) -> dict[str, dict]:
+    """Load previously updated question rows keyed by question_id."""
+    if not os.path.exists(output_path):
+        return {}
+
+    updated_questions: dict[str, dict] = {}
+    with open(output_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            qid = row.get("question_id")
+            if qid and row.get("updated"):
+                updated_questions[qid] = row
+    return updated_questions
+
+
 def load_answers(answer_path: str) -> list[dict]:
     """Load answer file, returning all rows."""
     answers: list[dict] = []
@@ -60,54 +90,138 @@ def load_answers(answer_path: str) -> list[dict]:
     return answers
 
 
-UUID_INDEX_PATH = os.path.join("generation_cache", "uuid_index.json")
+def normalize_document_ids(document_ids: object, context: str) -> list[str]:
+    """Validate and normalize a list of document ids."""
+    if document_ids is None:
+        return []
+    if not isinstance(document_ids, list):
+        raise ValueError(
+            f"{context} must be a list of document ids, got "
+            f"{type(document_ids).__name__}",
+        )
+
+    normalized: list[str] = []
+    for i, dsid in enumerate(document_ids, 1):
+        if not isinstance(dsid, str) or not dsid:
+            raise ValueError(
+                f"{context} has invalid document id at position {i}: {dsid!r}",
+            )
+        normalized.append(dsid)
+    return normalized
 
 
-def build_uuid_index() -> dict[str, str]:
-    """Build a mapping of dataset_doc_uuid -> relative path from SOURCES_DIR."""
-    index: dict[str, str] = {}
-    for root, _dirs, files in os.walk(SOURCES_DIR):
-        for filename in files:
-            if not filename.endswith(".json"):
-                continue
-            full_path = os.path.join(root, filename)
-            try:
-                doc = load_json_file(full_path)
-                uuid = doc.get("dataset_doc_uuid")
-                if uuid:
-                    rel_path = os.path.relpath(full_path, SOURCES_DIR)
-                    index[uuid] = rel_path
-            except Exception:
-                continue
-    return index
+def build_document_path_map(
+    questions: dict[str, dict],
+    answers: list[dict],
+    uuid_index: dict[str, str],
+    updated_questions: dict[str, dict] | None = None,
+) -> dict[str, str]:
+    """Build a referenced-document id -> relative path map or fail loudly."""
+    referenced_ids: set[str] = set()
+
+    for qid, row in questions.items():
+        referenced_ids.update(
+            normalize_document_ids(
+                row.get("expected_doc_ids"),
+                f"Question {qid} expected_doc_ids",
+            ),
+        )
+
+    for i, row in enumerate(answers, 1):
+        qid = row.get("question_id") or f"row-{i}"
+        referenced_ids.update(
+            normalize_document_ids(
+                row.get("document_ids"),
+                f"Answer {qid} document_ids",
+            ),
+        )
+
+    for qid, row in (updated_questions or {}).items():
+        referenced_ids.update(
+            normalize_document_ids(
+                row.get("expected_doc_ids"),
+                f"Updated question {qid} expected_doc_ids",
+            ),
+        )
+
+    missing_ids = sorted(dsid for dsid in referenced_ids if dsid not in uuid_index)
+    if missing_ids:
+        preview = ", ".join(missing_ids[:20])
+        remainder = len(missing_ids) - 20
+        if remainder > 0:
+            preview = f"{preview}, ... (+{remainder} more)"
+        raise MissingDocumentIdsError(
+            "Referenced document ids missing from the source index. "
+            f"Underlying data is invalid: {preview}"
+        )
+
+    return {dsid: uuid_index[dsid] for dsid in sorted(referenced_ids)}
 
 
-def load_or_build_uuid_index() -> dict[str, str]:
-    """Load UUID index from cache, or build and save it."""
-    if os.path.exists(UUID_INDEX_PATH):
-        print(f"  Loading UUID index from {UUID_INDEX_PATH}...")
-        return load_json_file(UUID_INDEX_PATH)
+def resolve_document_path_map(
+    questions: dict[str, dict],
+    answers: list[dict],
+    updated_questions: dict[str, dict],
+    uuid_index_cache_file: str,
+) -> dict[str, str]:
+    """Build the referenced document path map, optionally regenerating cache."""
+    print("Loading UUID index...")
+    uuid_index = load_or_build_uuid_index(uuid_index_cache_file)
+    print(f"  Indexed {len(uuid_index)} documents")
 
-    print("  Building UUID index (first run, this may take a moment)...")
-    index = build_uuid_index()
-    os.makedirs(os.path.dirname(UUID_INDEX_PATH), exist_ok=True)
-    write_json_file(UUID_INDEX_PATH, index)
-    print(f"  Saved UUID index with {len(index)} entries to {UUID_INDEX_PATH}")
-    return index
-
-
-def load_document_content(dsid: str, uuid_index: dict[str, str]) -> str | None:
-    """Load document content by dsid, returning a formatted string or None."""
-    rel_path = uuid_index.get(dsid)
-    if not rel_path:
-        return None
-    full_path = os.path.join(SOURCES_DIR, rel_path)
+    print("Validating referenced document IDs...")
     try:
-        doc_data = load_json_file(full_path)
-        title, content = extract_document_content(doc_data)
-        return f"[{dsid}] {title}\n{content}"
-    except Exception:
-        return None
+        document_path_map = build_document_path_map(
+            questions=questions,
+            answers=answers,
+            uuid_index=uuid_index,
+            updated_questions=updated_questions,
+        )
+    except MissingDocumentIdsError as exc:
+        print(f"\n  [WARN] {exc}")
+        try:
+            should_regenerate = confirm_yes_no(
+                "Referenced document IDs are missing from the UUID index cache. "
+                "Regenerate the cache now?",
+                default=False,
+                retry_on_invalid=True,
+            )
+        except EOFError:
+            should_regenerate = False
+
+        if not should_regenerate:
+            raise ValueError(
+                f"{exc} Cache regeneration declined; cannot continue.",
+            ) from exc
+
+        print(f"\nRegenerating UUID index cache at {uuid_index_cache_file}...")
+        uuid_index = rebuild_uuid_index(uuid_index_cache_file)
+
+        try:
+            document_path_map = build_document_path_map(
+                questions=questions,
+                answers=answers,
+                uuid_index=uuid_index,
+                updated_questions=updated_questions,
+            )
+        except MissingDocumentIdsError as regenerate_exc:
+            raise ValueError(
+                f"{regenerate_exc} Missing UUIDs remain after regenerating the cache.",
+            ) from regenerate_exc
+
+    print(f"  Validated {len(document_path_map)} referenced document ids")
+    return document_path_map
+
+
+def format_document_for_doc_evaluation(dsid: str, document_data: dict) -> str:
+    """Format a document entry for ANSWER_DOC_EVALUATION_PROMPT."""
+    document_body = json.dumps(document_data, indent=2, ensure_ascii=False)
+    return f"Document ID: {dsid}\n```\n{document_body}\n```"
+
+
+def format_document_for_answer_update(title: str, content: str) -> str:
+    """Format a document entry for ANSWER_UPDATOR_PROMPT."""
+    return "\n".join(part for part in (title, content) if part)
 
 
 # =============================================================================
@@ -119,28 +233,25 @@ def evaluate_documents(
     question: str,
     gold_doc_ids: list[str],
     candidate_doc_ids: list[str],
-    uuid_index: dict[str, str],
-) -> dict[str, dict[str, str]] | None:
+    document_path_map: dict[str, str],
+) -> tuple[dict[str, dict[str, str]] | None, str | None]:
     """Evaluate candidate documents against gold documents using LLM.
 
-    Returns a dict mapping each dsid to {"classification": ..., "reason": ...},
-    or None on failure.
+    Returns a normalized dict mapping each dsid to
+    {"classification": ..., "reason": ...}, or None plus an error string if the
+    LLM output cannot be parsed in the expected shape.
     """
     gold_docs_text = []
     for dsid in gold_doc_ids:
-        content = load_document_content(dsid, uuid_index)
-        if content:
-            gold_docs_text.append(content)
-        else:
-            gold_docs_text.append(f"[{dsid}] (document not found)")
+        doc_data = load_document_json_by_uuid(dsid, document_path_map)
+        gold_docs_text.append(format_document_for_doc_evaluation(dsid, doc_data))
 
     candidate_docs_text = []
     for dsid in candidate_doc_ids:
-        content = load_document_content(dsid, uuid_index)
-        if content:
-            candidate_docs_text.append(content)
-        else:
-            candidate_docs_text.append(f"[{dsid}] (document not found)")
+        doc_data = load_document_json_by_uuid(dsid, document_path_map)
+        candidate_docs_text.append(
+            format_document_for_doc_evaluation(dsid, doc_data),
+        )
 
     prompt = ANSWER_DOC_EVALUATION_PROMPT.format(
         query=question,
@@ -160,27 +271,45 @@ def evaluate_documents(
 
     try:
         parsed = json.loads(extract_json_from_response(response))
-    except Exception:
-        return None
+    except Exception as exc:
+        return (None, f"could not parse JSON output ({exc.__class__.__name__})")
 
     if not isinstance(parsed, dict):
-        return None
+        return (None, "output was not a JSON object")
 
-    return parsed
+    normalized: dict[str, dict[str, str]] = {}
+    expected_doc_ids = gold_doc_ids + candidate_doc_ids
+    for dsid in expected_doc_ids:
+        entry = parsed.get(dsid)
+        if not isinstance(entry, dict):
+            return (None, f"missing or invalid entry for {dsid}")
+
+        classification = entry.get("classification")
+        reason = entry.get("reason")
+        if classification not in {"valid", "invalid"}:
+            return (None, f"invalid classification for {dsid}")
+        if not isinstance(reason, str):
+            return (None, f"invalid reason for {dsid}")
+
+        normalized[dsid] = {
+            "classification": classification,
+            "reason": reason,
+        }
+
+    return (normalized, None)
 
 
 def update_gold_answer(
     question: str,
     previous_gold_answer: str,
     valid_doc_ids: list[str],
-    uuid_index: dict[str, str],
+    document_path_map: dict[str, str],
 ) -> str | None:
     """Generate an updated gold answer based on the new valid document set."""
     docs_text = []
     for dsid in valid_doc_ids:
-        content = load_document_content(dsid, uuid_index)
-        if content:
-            docs_text.append(content)
+        title, content = load_document_content_by_uuid(dsid, document_path_map)
+        docs_text.append(format_document_for_answer_update(title, content))
 
     if not docs_text:
         return None
@@ -209,35 +338,47 @@ def validate_answer_completeness(
 ) -> int | None:
     """Validate how many facts are supported by the answer using LLM.
 
+    Each fact is evaluated independently in parallel. A fact counts as valid
+    only if the first line of the model output contains "yes" in any casing.
     Returns the number of validated facts, or None on failure.
     """
     if not facts:
         return 0
 
-    prompt = INDIVIDUAL_FACT_VALIDATOR_PROMPT.format(
-        answer=answer,
-        statements=json.dumps(facts),
-    )
+    def validate_single_fact(statement: str) -> bool:
+        prompt = INDIVIDUAL_FACT_VALIDATOR_PROMPT.format(
+            answer=answer,
+            statement=statement,
+        )
 
-    llm = get_llm(tools=None, quiet=True)
-    messages: list[Message] = [Message(role="user", content=prompt)]
+        llm = get_llm(tools=None, quiet=True)
+        messages: list[Message] = [Message(role="user", content=prompt)]
 
-    response = ""
-    for chunk in llm.generate(messages):
-        if isinstance(chunk, str):
-            response += chunk
+        response = ""
+        for chunk in llm.generate(messages):
+            if isinstance(chunk, str):
+                response += chunk
 
-    response = response.strip()
+        first_line = response.strip().splitlines()[0].strip() if response.strip() else ""
+        return re.search(r"\byes\b", first_line, re.IGNORECASE) is not None
 
-    try:
-        return int(response)
-    except ValueError:
-        # Try to extract a number from the response
-        import re
-        match = re.search(r"\d+", response)
-        if match:
-            return int(match.group())
-        return None
+    max_workers = min(len(facts), 8)
+    validated_count = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(validate_single_fact, statement)
+            for statement in facts
+        ]
+
+        for future in as_completed(futures):
+            try:
+                if future.result():
+                    validated_count += 1
+            except Exception:
+                return None
+
+    return validated_count
 
 
 # =============================================================================
@@ -248,7 +389,7 @@ def validate_answer_completeness(
 def process_question_docs(
     answer_row: dict,
     questions: dict[str, dict],
-    uuid_index: dict[str, str],
+    document_path_map: dict[str, str],
 ) -> tuple[str, dict | None]:
     """Process document evaluation for a single answer row.
 
@@ -284,15 +425,19 @@ def process_question_docs(
     candidate_only = [d for d in deduped_doc_ids if d not in gold_set]
 
     # Evaluate all documents (gold + candidates)
-    eval_result = evaluate_documents(
+    eval_result, eval_error = evaluate_documents(
         question=question_row["question"],
         gold_doc_ids=gold_doc_ids,
         candidate_doc_ids=candidate_only,
-        uuid_index=uuid_index,
+        document_path_map=document_path_map,
     )
 
     if eval_result is None:
-        return (f"ERROR {qid}: LLM evaluation failed", None)
+        return (
+            f"[WARN] document evaluation returned unusable output ({eval_error}); "
+            "using original gold set",
+            None,
+        )
 
     # Build update_reasons from eval_result
     update_reasons: dict[str, dict[str, str]] = {}
@@ -316,6 +461,13 @@ def process_question_docs(
         if entry.get("classification") == "valid":
             valid_doc_ids.append(dsid)
 
+    if not valid_doc_ids:
+        return (
+            "[WARN] document evaluation marked no documents as valid; "
+            "using original gold set",
+            None,
+        )
+
     new_set = set(valid_doc_ids)
     docs_changed = new_set != gold_set
 
@@ -332,7 +484,7 @@ def process_question_docs(
             question=question_row["question"],
             previous_gold_answer=question_row.get("gold_answer", ""),
             valid_doc_ids=valid_doc_ids,
-            uuid_index=uuid_index,
+            document_path_map=document_path_map,
         )
         if new_answer:
             updated_row["gold_answer"] = new_answer
@@ -491,6 +643,20 @@ def build_aggregate_stats(
     }
 
 
+def sort_question_results(question_results: list[dict]) -> list[dict]:
+    """Return question results sorted by question_id in ascending order."""
+
+    def sort_key(result: dict) -> tuple[int, str, int]:
+        qid = result.get("question_id", "")
+        match = re.match(r"^(.*?)(\d+)$", qid)
+        if match:
+            prefix, suffix = match.groups()
+            return (0, prefix, int(suffix))
+        return (1, qid, 0)
+
+    return sorted(question_results, key=sort_key)
+
+
 def write_results_snapshot(
     results_file: str,
     output_file: str,
@@ -499,6 +665,7 @@ def write_results_snapshot(
     total_questions: int,
 ) -> None:
     """Write the current results snapshot to disk atomically."""
+    sorted_question_results = sort_question_results(question_results)
     results_output = {
         "updated_question_file": output_file,
         "aggregate_stats": build_aggregate_stats(
@@ -507,7 +674,7 @@ def write_results_snapshot(
             total_questions=total_questions,
         ),
         "question_type_stats": build_question_type_stats(question_results),
-        "questions": question_results,
+        "questions": sorted_question_results,
     }
     write_json_file(results_file, results_output)
 
@@ -540,10 +707,25 @@ def main() -> None:
         help=f"Path to output results JSON (default: {DEFAULT_RESULTS_FILE})",
     )
     parser.add_argument(
+        "--uuid-index-cache-file",
+        default=DEFAULT_UUID_INDEX_CACHE_FILE,
+        help=(
+            "Path to the UUID index cache JSON file "
+            f"(default: {DEFAULT_UUID_INDEX_CACHE_FILE})"
+        ),
+    )
+    parser.add_argument(
         "--parallelism",
         type=int,
         default=1,
         help="Number of parallel evaluation threads (default: 1)",
+    )
+    parser.add_argument(
+        "--question-id",
+        help=(
+            "Only evaluate a single question_id. Forces parallelism=1 and "
+            "reruns that question even if it already exists in the results file."
+        ),
     )
     args = parser.parse_args()
 
@@ -555,6 +737,10 @@ def main() -> None:
         print(f"Error: questions file not found: {args.questions_file}")
         sys.exit(1)
 
+    if args.question_id and args.parallelism != 1:
+        print("  [INFO] --question-id set; forcing parallelism=1")
+        args.parallelism = 1
+
     # Load data
     print(f"Loading questions from {args.questions_file}...")
     questions = load_questions(args.questions_file)
@@ -564,9 +750,23 @@ def main() -> None:
     answers = load_answers(args.answer_file)
     print(f"  Loaded {len(answers)} answer rows")
 
-    print("Loading UUID index...")
-    uuid_index = load_or_build_uuid_index()
-    print(f"  Indexed {len(uuid_index)} documents")
+    updated_questions = load_updated_questions(args.output_file)
+    if updated_questions:
+        print(
+            f"  Loaded {len(updated_questions)} updated questions from "
+            f"{args.output_file}"
+        )
+
+    try:
+        document_path_map = resolve_document_path_map(
+            questions=questions,
+            answers=answers,
+            updated_questions=updated_questions,
+            uuid_index_cache_file=args.uuid_index_cache_file,
+        )
+    except ValueError as exc:
+        print(f"\nFATAL: {exc}")
+        sys.exit(1)
 
     # Validate answer rows and separate failures
     valid_rows: list[dict] = []
@@ -588,11 +788,33 @@ def main() -> None:
     if skip_count:
         print(f"\n  {skip_count} rows skipped due to failures")
 
+    if args.question_id:
+        selected_rows = [
+            row for row in valid_rows if row["question_id"] == args.question_id
+        ]
+        if not selected_rows:
+            print(
+                f"Error: question_id '{args.question_id}' not found in the "
+                "validated answer rows"
+            )
+            sys.exit(1)
+        if len(selected_rows) > 1:
+            print(
+                f"Error: question_id '{args.question_id}' appeared "
+                f"{len(selected_rows)} times in the validated answer rows"
+            )
+            sys.exit(1)
+
+        valid_rows = selected_rows
+        print(f"  Targeting single question: {args.question_id}")
+
     # =========================================================================
     # Resume from existing results if available
     # =========================================================================
 
-    updated_questions: dict[str, dict] = {}
+    if args.question_id:
+        updated_questions.pop(args.question_id, None)
+
     question_results: list[dict] = []
     completed_qids: set[str] = set()
 
@@ -601,9 +823,9 @@ def main() -> None:
             existing_results = load_json_file(args.results_file)
             for r in existing_results.get("questions", []):
                 qid = r.get("question_id")
-                if qid:
+                question_results.append(r)
+                if qid and qid != args.question_id:
                     completed_qids.add(qid)
-                    question_results.append(r)
             if completed_qids:
                 print(f"\n  Resuming: found {len(completed_qids)} already-evaluated questions in {args.results_file}")
         except Exception:
@@ -611,7 +833,10 @@ def main() -> None:
 
     # Filter out already-completed questions
     remaining_rows = [row for row in valid_rows if row["question_id"] not in completed_qids]
-    total_questions = len(valid_rows)
+    if args.question_id:
+        total_questions = len(question_results) + len(valid_rows)
+    else:
+        total_questions = len(valid_rows)
 
     # =========================================================================
     # Per-question evaluation: document eval + answer scoring
@@ -625,7 +850,11 @@ def main() -> None:
         updated_q: dict | None = None
 
         if row.get("document_ids"):
-            status, updated_q = process_question_docs(row, questions, uuid_index)
+            status, updated_q = process_question_docs(
+                row,
+                questions,
+                document_path_map,
+            )
             print(f"  {qid} docs: {status}")
 
         original_question = questions[qid]
@@ -657,6 +886,12 @@ def main() -> None:
         """Record a completed question and flush the snapshot to disk."""
         if updated_q:
             updated_questions[updated_q["question_id"]] = updated_q
+
+        question_results[:] = [
+            existing
+            for existing in question_results
+            if existing.get("question_id") != result["question_id"]
+        ]
         question_results.append(result)
         write_results_snapshot(
             results_file=args.results_file,

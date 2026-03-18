@@ -17,6 +17,7 @@ from src.tools.tool_implementations import DocumentReadTool
 from src.utils import (
     append_to_jsonl,
     count_existing_questions,
+    load_or_build_uuid_index,
     extract_answer_facts,
     extract_json_from_response,
     extract_source_type,
@@ -26,49 +27,7 @@ from src.utils import (
 )
 
 CACHE_DIR = "generation_cache"
-UUID_INDEX_PATH = os.path.join(CACHE_DIR, "uuid_index.json")
 PROJECT_USAGE_PATH = os.path.join(CACHE_DIR, "project_questions.json")
-
-
-# =============================================================================
-# UUID Index
-# =============================================================================
-
-
-def build_uuid_index() -> dict[str, str]:
-    """Build a mapping of dataset_doc_uuid -> relative path from SOURCES_DIR.
-
-    Walks all JSON files in SOURCES_DIR, loads each to extract the UUID.
-    """
-    index: dict[str, str] = {}
-    for root, _dirs, files in os.walk(SOURCES_DIR):
-        for filename in files:
-            if not filename.endswith(".json"):
-                continue
-            full_path = os.path.join(root, filename)
-            try:
-                doc = load_json_file(full_path)
-                uuid = doc.get("dataset_doc_uuid")
-                if uuid:
-                    rel_path = os.path.relpath(full_path, SOURCES_DIR)
-                    index[uuid] = rel_path
-            except Exception:
-                continue
-    return index
-
-
-def load_or_build_uuid_index() -> dict[str, str]:
-    """Load UUID index from cache, or build and save it."""
-    if os.path.exists(UUID_INDEX_PATH):
-        print(f"Loading UUID index from {UUID_INDEX_PATH}...")
-        return load_json_file(UUID_INDEX_PATH)
-
-    print("Building UUID index (first run, this may take a moment)...")
-    index = build_uuid_index()
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    write_json_file(UUID_INDEX_PATH, index)
-    print(f"Saved UUID index with {len(index)} entries to {UUID_INDEX_PATH}")
-    return index
 
 
 # =============================================================================

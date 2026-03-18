@@ -4,6 +4,15 @@ from src.utils.agents_md import get_agents_md_for_path, get_agents_md_for_source
 from src.utils.cli import confirm_regenerate, confirm_yes_no
 from src.utils.dataset_id import add_dataset_doc_uuid, generate_dataset_doc_uuid, get_dataset_doc_uuid
 from src.utils.document_content import DocumentFieldError, extract_document_content
+from src.utils.document_index import (
+    DEFAULT_UUID_INDEX_CACHE_FILE,
+    build_uuid_index,
+    load_document_content_by_uuid,
+    load_document_json_by_uuid,
+    load_or_build_uuid_index,
+    rebuild_uuid_index,
+    write_uuid_index_cache,
+)
 from src.utils.dates import get_current_date_formatted
 from src.utils.directory_tree import get_directory_tree
 from src.utils.document_processing import process_written_document
@@ -62,6 +71,7 @@ __all__ = [
     "extract_source_type",
     "generate_dataset_doc_uuid",
     "generate_question",
+    "DEFAULT_UUID_INDEX_CACHE_FILE",
     "get_existing_doc_uuids",
     "get_agents_md_for_path",
     "get_agents_md_for_source",
@@ -75,11 +85,15 @@ __all__ = [
     "label_single_document",
     "load_document",
     "load_file",
+    "load_document_content_by_uuid",
+    "load_document_json_by_uuid",
     "load_json_file",
+    "load_or_build_uuid_index",
     "needs_reordering",
     "normalize_source_path",
     "PathResolver",
     "process_written_document",
+    "rebuild_uuid_index",
     "reorder_document_fields",
     "select_random_file_hierarchical",
     "sources_resolver",
@@ -87,5 +101,7 @@ __all__ = [
     "validate_no_nested_dicts",
     "validate_question",
     "validate_source_path",
+    "build_uuid_index",
+    "write_uuid_index_cache",
     "write_json_file",
 ]
