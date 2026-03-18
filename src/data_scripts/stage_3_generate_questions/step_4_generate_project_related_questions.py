@@ -15,14 +15,14 @@ from src.prompts.project_question import (
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import DocumentReadTool
 from src.utils import (
-    append_to_jsonl,
     count_existing_questions,
-    load_or_build_uuid_index,
     extract_answer_facts,
     extract_json_from_response,
     extract_source_type,
     get_next_question_id,
     load_json_file,
+    load_or_build_uuid_index,
+    save_question,
     write_json_file,
 )
 
@@ -351,16 +351,15 @@ def main() -> None:
         ))
 
         # Append to questions file
-        question_data = {
-            "question_id": question_id,
-            "question": question,
-            "expected_doc_ids": relevant_uuids,
-            "source_types": source_types,
-            "gold_answer": gold_answer,
-            "answer_facts": answer_facts,
-            "question_type": "project_related",
-        }
-        append_to_jsonl(QUESTIONS_PATH, question_data)
+        save_question(
+            question_id=question_id,
+            question=question,
+            expected_doc_ids=relevant_uuids,
+            source_types=source_types,
+            gold_answer=gold_answer,
+            answer_facts=answer_facts,
+            question_type="project_related",
+        )
         next_question_id += 1
 
         # Update project usage

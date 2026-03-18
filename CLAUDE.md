@@ -37,6 +37,16 @@
 - **`field_ordering.py`** - `reorder_document_fields()`, `needs_reordering()` - Ensures trailing fields (title_field_name, content_field_names, dataset_doc_uuid) are at end of documents
 - **`dataset_id.py`** - `generate_dataset_doc_uuid()`, `add_dataset_doc_uuid()`, `get_dataset_doc_uuid()` - UUID generation and management for documents
 
+### Question Generation
+- **`questions.py`** - Shared utilities for question generation scripts. **Always check here before writing question generation code.**
+  - `save_question()` - Standardized writer for `questions.jsonl`. Enforces consistent field order (`question_id`, `source_types`, `question`, `expected_doc_ids`, `gold_answer`, `answer_facts`, `question_type`). All question generation steps must use this instead of writing question dicts directly.
+  - `generate_question()`, `validate_question()` - LLM-based question generation and validation
+  - `extract_answer_facts()`, `extract_anti_hallucination_facts()` - Fact extraction from gold answers
+  - `load_document()` - Load and extract UUID/title/content from a source document
+  - `count_existing_questions()`, `get_next_question_id()`, `get_existing_doc_uuids()` - Question file state queries
+  - `append_to_jsonl()`, `extract_source_type()` - Low-level helpers
+- **`document_index.py`** - `load_or_build_uuid_index()`, `load_document_content_by_uuid()`, `load_document_json_by_uuid()` - UUID-based document lookup
+
 ### Other Utilities
 - **`cli.py`** - `confirm_yes_no()`, `confirm_regenerate()` - Interactive CLI prompts for user confirmation
 - **`dates.py`** - `get_current_date_formatted()` - Returns current date as "Month DD, YYYY"

@@ -7,7 +7,6 @@ import random
 from src.paths import QUESTIONS_PATH
 from src.prompts.basic_questions import BASIC_QUERIES_PROMPT
 from src.utils import (
-    append_to_jsonl,
     count_existing_questions,
     count_json_files,
     extract_answer_facts,
@@ -17,6 +16,7 @@ from src.utils import (
     get_next_question_id,
     load_document,
     load_json_file,
+    save_question,
     select_random_file_hierarchical,
     sources_resolver,
     validate_question,
@@ -174,16 +174,15 @@ def main() -> None:
         question_id = f"qst_{next_question_id:04d}"
 
         # Append to questions file
-        question_data = {
-            "question_id": question_id,
-            "question": question,
-            "expected_doc_ids": [doc_uuid],
-            "source_types": [extract_source_type(doc_path)],
-            "gold_answer": gold_answer,
-            "answer_facts": answer_facts,
-            "question_type": "basic",
-        }
-        append_to_jsonl(QUESTIONS_PATH, question_data)
+        save_question(
+            question_id=question_id,
+            question=question,
+            expected_doc_ids=[doc_uuid],
+            source_types=[extract_source_type(doc_path)],
+            gold_answer=gold_answer,
+            answer_facts=answer_facts,
+            question_type="basic",
+        )
         existing_uuids.add(doc_uuid)
         next_question_id += 1
 

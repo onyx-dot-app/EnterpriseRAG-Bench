@@ -23,7 +23,6 @@ from src.tools.tool_implementations import (
 )
 from src.utils import (
     DocumentFieldError,
-    append_to_jsonl,
     count_existing_questions,
     extract_answer_facts,
     extract_document_content,
@@ -32,6 +31,7 @@ from src.utils import (
     get_next_question_id,
     load_file,
     load_json_file,
+    save_question,
     write_json_file,
 )
 
@@ -447,16 +447,15 @@ def main() -> None:
         question_id = f"qst_{next_question_id:04d}"
 
         # Append to questions file
-        question_data = {
-            "question_id": question_id,
-            "question": query,
-            "expected_doc_ids": relevant_uuids,
-            "source_types": source_types,
-            "gold_answer": gold_answer,
-            "answer_facts": answer_facts,
-            "question_type": "constrained",
-        }
-        append_to_jsonl(QUESTIONS_PATH, question_data)
+        save_question(
+            question_id=question_id,
+            question=query,
+            expected_doc_ids=relevant_uuids,
+            source_types=source_types,
+            gold_answer=gold_answer,
+            answer_facts=answer_facts,
+            question_type="constrained",
+        )
         next_question_id += 1
 
         # Update used document paths cache

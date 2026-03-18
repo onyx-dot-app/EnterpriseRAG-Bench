@@ -250,6 +250,35 @@ def extract_anti_hallucination_facts(
     return result
 
 
+def save_question(
+    question_id: str,
+    question: str,
+    expected_doc_ids: list[str],
+    source_types: list[str],
+    gold_answer: str,
+    answer_facts: list[str],
+    question_type: str,
+    path: str = QUESTIONS_PATH,
+) -> None:
+    """
+    Save a question entry to the questions JSONL file with standardized field order.
+
+    Fields are always written in this order:
+        question_id, source_types, question, expected_doc_ids,
+        gold_answer, answer_facts, question_type
+    """
+    question_data = {
+        "question_id": question_id,
+        "source_types": source_types,
+        "question": question,
+        "expected_doc_ids": expected_doc_ids,
+        "gold_answer": gold_answer,
+        "answer_facts": answer_facts,
+        "question_type": question_type,
+    }
+    append_to_jsonl(path, question_data)
+
+
 def extract_source_type(doc_path: str) -> str:
     """Extract the source type (top-level directory) from a path relative to SOURCES_DIR.
 

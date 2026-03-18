@@ -8,7 +8,6 @@ from src.paths import QUESTIONS_PATH
 from src.prompts.answer_generation import SINGLE_DOCUMENT_MULTIHOOP_ANSWER_GENERATION
 from src.prompts.single_doc_multihop import SINGLE_DOC_MULTIHOOP_PROMPT
 from src.utils import (
-    append_to_jsonl,
     collect_json_files_by_size,
     count_existing_questions,
     extract_answer_facts,
@@ -17,6 +16,7 @@ from src.utils import (
     get_existing_doc_uuids,
     get_next_question_id,
     load_document,
+    save_question,
     validate_question,
 )
 
@@ -176,16 +176,15 @@ def main() -> None:
         question_id = f"qst_{next_question_id:04d}"
 
         # Append to questions file
-        question_data = {
-            "question_id": question_id,
-            "question": question,
-            "expected_doc_ids": [doc_uuid],
-            "source_types": [extract_source_type(doc_path)],
-            "gold_answer": gold_answer,
-            "answer_facts": answer_facts,
-            "question_type": "single_doc_multi_hop",
-        }
-        append_to_jsonl(QUESTIONS_PATH, question_data)
+        save_question(
+            question_id=question_id,
+            question=question,
+            expected_doc_ids=[doc_uuid],
+            source_types=[extract_source_type(doc_path)],
+            gold_answer=gold_answer,
+            answer_facts=answer_facts,
+            question_type="single_doc_multi_hop",
+        )
         existing_uuids.add(doc_uuid)
         next_question_id += 1
 
