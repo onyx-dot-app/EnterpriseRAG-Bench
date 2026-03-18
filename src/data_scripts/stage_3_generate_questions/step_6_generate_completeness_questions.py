@@ -7,7 +7,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.llm import Message, get_llm
-from src.paths import QUESTION_CACHE_DIR, QUESTIONS_PATH, SOURCES_DIR
+from src.paths import QUESTION_CACHE_DIR, QUESTIONS_PATH
 from src.prompts.completeness_questions import (
     COMPLETENESS_ANSWER_GENERATION_PROMPT,
     COMPLETENESS_DOC_EVALUATION_PROMPT,
