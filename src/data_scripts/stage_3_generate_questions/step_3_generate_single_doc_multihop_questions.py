@@ -5,7 +5,7 @@ import os
 import random
 
 from src.paths import QUESTIONS_PATH
-from src.prompts.answer_generation import SINGLE_DOCUMENT_MULTIHOOP_ANSWER_GENERATION
+from src.prompts.answer_generation import SINGLE_DOCUMENT_MULTIHOP_ANSWER_GENERATION
 from src.prompts.single_doc_multihop import SINGLE_DOC_MULTIHOOP_PROMPT
 from src.utils import (
     collect_json_files_by_size,
@@ -153,7 +153,7 @@ def main() -> None:
             content,
             question,
             quiet=args.quiet,
-            answer_prompt_template=SINGLE_DOCUMENT_MULTIHOOP_ANSWER_GENERATION,
+            answer_prompt_template=SINGLE_DOCUMENT_MULTIHOP_ANSWER_GENERATION,
         )
 
         if not valid:

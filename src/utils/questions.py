@@ -264,17 +264,17 @@ def save_question(
     Save a question entry to the questions JSONL file with standardized field order.
 
     Fields are always written in this order:
-        question_id, source_types, question, expected_doc_ids,
-        gold_answer, answer_facts, question_type
+        question_id, question_type, source_types, question, expected_doc_ids,
+        gold_answer, answer_facts
     """
     question_data = {
         "question_id": question_id,
+        "question_type": question_type,
         "source_types": source_types,
         "question": question,
         "expected_doc_ids": expected_doc_ids,
         "gold_answer": gold_answer,
         "answer_facts": answer_facts,
-        "question_type": question_type,
     }
     append_to_jsonl(path, question_data)
 
