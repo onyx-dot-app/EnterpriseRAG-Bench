@@ -7,7 +7,6 @@ import random
 
 from src.llm import Message, get_llm
 from src.paths import (
-    QUESTION_CACHE_DIR,
     SOURCES_DIR,
     SOURCE_TREE_PATH,
 )
@@ -21,6 +20,7 @@ from src.prompts.new_duplicate_file import (
 from src.tools.tool_implementations import WriteTool
 from src.utils import (
     count_json_files,
+    duplications_cache,
     extract_json_from_response,
     get_agents_md_for_path,
     get_dataset_doc_uuid,
@@ -31,7 +31,6 @@ from src.utils import (
     sources_resolver,
     try_recover_json,
     validate_no_nested_dicts,
-    write_json_file,
 )
 from src.utils.statistics import update_statistics
 
@@ -459,23 +458,6 @@ def main() -> None:
     # Get source tree
     source_tree = get_source_tree()
 
-    # Ensure question cache directory exists
-    os.makedirs(QUESTION_CACHE_DIR, exist_ok=True)
-
-    # Find the next duplication number
-    existing_duplications = [
-        f for f in os.listdir(QUESTION_CACHE_DIR)
-        if f.startswith("duplication_") and f.endswith(".json")
-    ]
-    if existing_duplications:
-        max_num = max(
-            int(f.replace("duplication_", "").replace(".json", ""))
-            for f in existing_duplications
-        )
-        duplication_counter = max_num + 1
-    else:
-        duplication_counter = 1
-
     success_count = 0
     fail_count = 0
     errors: list[str] = []
@@ -524,17 +506,12 @@ def main() -> None:
             old_uuid = get_dataset_doc_uuid(old_full_path)
             new_uuid = get_dataset_doc_uuid(new_full_path)
 
-            # Write duplication cache file
-            cache_filename = f"duplication_{duplication_counter:04d}.json"
-            cache_path = os.path.join(QUESTION_CACHE_DIR, cache_filename)
-            cache_data = {
+            # Append to generation cache
+            duplications_cache.append({
                 "document_old": old_uuid,
                 "document_new": new_uuid,
-            }
-            write_json_file(cache_path, cache_data)
-            print(f"\nWrote cache: {cache_filename}")
-
-            duplication_counter += 1
+            })
+            print(f"\nWrote cache entry to {duplications_cache.path}")
             print(f"\nSUCCESS: {message}")
         else:
             fail_count += 1

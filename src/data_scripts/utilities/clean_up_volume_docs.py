@@ -1,9 +1,9 @@
 """Clean up volume documents and track non-volume document UUIDs.
 
 Tracks UUIDs from:
-- projects: from question_cache/project_*.json
-- completeness: from question_cache/completeness_*.json
-- duplication: from question_cache/duplication_*.json
+- projects: from generation_cache/projects.json
+- completeness: from generation_cache/completeness.json
+- duplication: from generation_cache/duplications.json
 
 Also flags project files that don't have UUIDs and optionally cleans up:
 1. Orphaned source files that don't correspond to any tracked UUIDs
@@ -12,49 +12,44 @@ Also flags project files that don't have UUIDs and optionally cleans up:
 
 from pathlib import Path
 
-from src.paths import DEBUG_DIR, QUESTION_CACHE_DIR, SOURCES_DIR, VOLUME_DIR
-from src.utils import confirm_yes_no, load_json_file, write_json_file
+from src.paths import DEBUG_DIR, SOURCES_DIR, VOLUME_DIR
+from src.utils import (
+    completeness_cache,
+    confirm_yes_no,
+    duplications_cache,
+    load_json_file,
+    projects_cache,
+    write_json_file,
+)
 
 
 NON_VOLUME_DOCUMENTS_PATH = f"{DEBUG_DIR}/non_volume_documents.json"
 
 
-def get_project_uuids(question_cache_dir: Path) -> list[str]:
-    """Extract all document UUIDs from project question cache files."""
+def get_project_uuids() -> list[str]:
+    """Extract all document UUIDs from project cache entries."""
     uuids: set[str] = set()
-
-    for project_file in sorted(question_cache_dir.glob("project_*.json")):
-        data = load_json_file(str(project_file))
-        documents = data.get("documents", [])
-        uuids.update(documents)
-
+    for entry in projects_cache.load():
+        uuids.update(entry.get("documents", []))
     return sorted(uuids)
 
 
-def get_completeness_uuids(question_cache_dir: Path) -> list[str]:
-    """Extract all document UUIDs from completeness question cache files."""
+def get_completeness_uuids() -> list[str]:
+    """Extract all document UUIDs from completeness cache entries."""
     uuids: set[str] = set()
-
-    for completeness_file in sorted(question_cache_dir.glob("completeness_*.json")):
-        data = load_json_file(str(completeness_file))
-        documents = data.get("documents", [])
-        uuids.update(documents)
-
+    for entry in completeness_cache.load():
+        uuids.update(entry.get("documents", []))
     return sorted(uuids)
 
 
-def get_duplication_uuids(question_cache_dir: Path) -> list[str]:
-    """Extract all document UUIDs from duplication question cache files."""
+def get_duplication_uuids() -> list[str]:
+    """Extract all document UUIDs from duplication cache entries."""
     uuids: set[str] = set()
-
-    for duplication_file in sorted(question_cache_dir.glob("duplication_*.json")):
-        data = load_json_file(str(duplication_file))
-
-        if "document_old" in data:
-            uuids.add(data["document_old"])
-        if "document_new" in data:
-            uuids.add(data["document_new"])
-
+    for entry in duplications_cache.load():
+        if "document_old" in entry:
+            uuids.add(entry["document_old"])
+        if "document_new" in entry:
+            uuids.add(entry["document_new"])
     return sorted(uuids)
 
 
@@ -177,7 +172,6 @@ def cleanup_files(files_to_delete: list[Path]) -> int:
 def main() -> None:
     """Main function to generate the non-volume documents tracker and cleanup."""
     base_dir = Path.cwd()
-    question_cache_dir = base_dir / QUESTION_CACHE_DIR
     sources_dir = base_dir / SOURCES_DIR
     volume_dir = base_dir / VOLUME_DIR
     output_dir = base_dir / DEBUG_DIR
@@ -187,10 +181,10 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Collect UUIDs from each source
-    print("Collecting document UUIDs from question cache...")
-    project_uuids = get_project_uuids(question_cache_dir)
-    completeness_uuids = get_completeness_uuids(question_cache_dir)
-    duplication_uuids = get_duplication_uuids(question_cache_dir)
+    print("Collecting document UUIDs from generation cache...")
+    project_uuids = get_project_uuids()
+    completeness_uuids = get_completeness_uuids()
+    duplication_uuids = get_duplication_uuids()
 
     # Build output structure
     output_data = {

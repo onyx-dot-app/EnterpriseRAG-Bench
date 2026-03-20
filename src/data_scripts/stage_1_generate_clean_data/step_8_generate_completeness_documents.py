@@ -9,7 +9,6 @@ from src.llm import get_llm
 from src.llm.conversation import Conversation
 from src.paths import (
     COMPANY_OVERVIEW_PATH,
-    QUESTION_CACHE_DIR,
     SOURCE_TREE_PATH,
     SOURCES_DIR,
 )
@@ -24,7 +23,8 @@ from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import FinishTool, GlobTool, ReadTool, RmTool, WriteTool
 from src.utils.dataset_id import add_dataset_doc_uuid
 from src.utils.field_labeling import label_single_document
-from src.utils.file_io import delete_file, load_file, load_json_file, write_json_file
+from src.utils.file_io import delete_file, load_file, load_json_file
+from src.utils.generation_cache import completeness_cache
 from src.utils.path_resolver import default_resolver
 from src.utils.validation import validate_no_nested_dicts
 
@@ -75,30 +75,8 @@ def delete_written_files(file_paths: list[str]) -> None:
 
 
 def count_existing_traces() -> int:
-    """Count existing completeness trace files in question_cache."""
-    if not os.path.exists(QUESTION_CACHE_DIR):
-        return 0
-    return len([f for f in os.listdir(QUESTION_CACHE_DIR) if f.startswith("completeness_") and f.endswith(".json")])
-
-
-def get_next_trace_number() -> int:
-    """Get the next available trace number."""
-    if not os.path.exists(QUESTION_CACHE_DIR):
-        return 1
-    existing = [
-        f for f in os.listdir(QUESTION_CACHE_DIR)
-        if f.startswith("completeness_") and f.endswith(".json")
-    ]
-    if not existing:
-        return 1
-    numbers = []
-    for f in existing:
-        try:
-            num = int(f.replace("completeness_", "").replace(".json", ""))
-            numbers.append(num)
-        except ValueError:
-            pass
-    return max(numbers) + 1 if numbers else 1
+    """Count existing completeness traces in generation cache."""
+    return completeness_cache.count()
 
 
 def add_uuids_to_files(file_paths: list[str]) -> list[str]:
@@ -133,16 +111,12 @@ def label_files(file_paths: list[str]) -> None:
             print(f"  Warning: Failed to label {rel_path}: {message}")
 
 
-def write_question_cache(trace_number: int, question: str, document_uuids: list[str]) -> str:
-    """Write a completeness question cache JSON file."""
-    os.makedirs(QUESTION_CACHE_DIR, exist_ok=True)
-    cache_path = os.path.join(QUESTION_CACHE_DIR, f"completeness_{trace_number:04d}.json")
-    cache_data = {
+def write_completeness_entry(question: str, document_uuids: list[str]) -> None:
+    """Append a completeness entry to the generation cache."""
+    completeness_cache.append({
         "question": question,
         "documents": document_uuids,
-    }
-    write_json_file(cache_path, cache_data)
-    return cache_path
+    })
 
 
 def get_question_type_prompt() -> tuple[int, str]:
@@ -206,11 +180,11 @@ def main() -> None:
         if quit_requested:
             break
 
-        trace_number = get_next_trace_number()
+        trace_index = count_existing_traces() + 1
 
         print()
         print("=" * 40)
-        print(f"Generating trace {i + 1} of {num_to_generate} (will be saved as completeness_{trace_number:04d}.json)")
+        print(f"Generating trace {i + 1} of {num_to_generate} (will be entry #{trace_index})")
         print("=" * 40)
         print()
 
@@ -295,10 +269,10 @@ def main() -> None:
                 print("Adding dataset_doc_uuid to documents...")
                 document_uuids = add_uuids_to_files(files)
 
-                # Write the question cache with UUIDs
-                cache_path = write_question_cache(trace_number, question, document_uuids)
+                # Write to generation cache
+                write_completeness_entry(question, document_uuids)
                 traces_generated += 1
-                print(f"\nSaved to {cache_path}")
+                print(f"\nSaved to {completeness_cache.path}")
                 print(f"  Question: {question}")
                 print(f"  Document UUIDs: {document_uuids}")
                 break

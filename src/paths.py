@@ -18,7 +18,6 @@ DEBUG_DIR = f"{GENERATED_DATA_DIR}/debug"
 AGGREGATE_STATISTICS_PATH = f"{GENERATED_DATA_DIR}/aggregate_statistics.json"
 COMPLETENESS_DIR = f"{GENERATED_DATA_DIR}/completeness"
 VOLUME_DIR = f"{GENERATED_DATA_DIR}/volume"
-QUESTION_CACHE_DIR = "question_cache"
 QUESTIONS_PATH = f"{GENERATED_DATA_DIR}/questions.jsonl"
 
 EXPORT_DATA_DIR = "export_data"

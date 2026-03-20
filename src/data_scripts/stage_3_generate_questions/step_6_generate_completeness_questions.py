@@ -1,25 +1,24 @@
 """Script for generating completeness questions from cached completeness entries."""
 
 import argparse
-import glob
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.llm import Message, get_llm
-from src.paths import QUESTION_CACHE_DIR, QUESTIONS_PATH
+from src.paths import QUESTIONS_PATH
 from src.prompts.completeness_questions import (
     COMPLETENESS_ANSWER_GENERATION_PROMPT,
     COMPLETENESS_DOC_EVALUATION_PROMPT,
 )
 from src.utils import (
+    completeness_cache,
     count_existing_questions,
     extract_answer_facts,
     extract_json_from_response,
     extract_source_type,
     get_next_question_id,
     load_document_content_by_uuid,
-    load_json_file,
     load_or_build_uuid_index,
     save_question,
 )
@@ -32,20 +31,8 @@ from src.utils.document_content import DocumentFieldError
 
 
 def load_completeness_entries() -> list[dict]:
-    """Load all completeness cache files from question_cache, sorted by filename."""
-    pattern = os.path.join(QUESTION_CACHE_DIR, "completeness_*.json")
-    files = sorted(glob.glob(pattern))
-
-    entries: list[dict] = []
-    for filepath in files:
-        try:
-            data = load_json_file(filepath)
-            data["cache_file"] = os.path.basename(filepath)
-            entries.append(data)
-        except Exception as e:
-            print(f"Warning: Failed to load {filepath}: {e}")
-
-    return entries
+    """Load all completeness entries from generation cache."""
+    return completeness_cache.load()
 
 
 # =============================================================================
@@ -216,15 +203,15 @@ def process_single_question(
         (success, message, question_data) tuple.
         On failure, question_data is None.
     """
-    cache_file = entry.get("cache_file", "unknown")
+    entry_label = entry.get("question", "unknown")[:60]
     question = entry.get("question", "")
     doc_uuids = entry.get("documents", [])
 
     if not question:
-        return (False, f"{cache_file}: Missing question", None)
+        return (False, f"{entry_label}: Missing question", None)
 
     if len(doc_uuids) < 2:
-        return (False, f"{cache_file}: Need at least 2 documents, got {len(doc_uuids)}", None)
+        return (False, f"{entry_label}: Need at least 2 documents, got {len(doc_uuids)}", None)
 
     # Format candidate documents
     if not quiet:
@@ -233,7 +220,7 @@ def process_single_question(
     candidate_text, valid_uuids = format_candidate_documents(doc_uuids, uuid_index)
 
     if len(valid_uuids) < 2:
-        return (False, f"{cache_file}: Only {len(valid_uuids)} resolvable documents (need >= 2)", None)
+        return (False, f"{entry_label}: Only {len(valid_uuids)} resolvable documents (need >= 2)", None)
 
     if not quiet:
         print(f"Loaded {len(valid_uuids)} of {len(doc_uuids)} documents")
@@ -247,7 +234,7 @@ def process_single_question(
     )
 
     if not required_uuids:
-        return (False, f"{cache_file}: Document evaluation failed or no required docs", None)
+        return (False, f"{entry_label}: Document evaluation failed or no required docs", None)
 
     if not quiet:
         print(f"\nRequired documents: {len(required_uuids)} of {len(valid_uuids)}")
@@ -263,7 +250,7 @@ def process_single_question(
     )
 
     if not valid or not gold_answer:
-        return (False, f"{cache_file}: Answer generation failed", None)
+        return (False, f"{entry_label}: Answer generation failed", None)
 
     if not quiet:
         print(f"\nGold answer: {gold_answer[:200]}...")
@@ -275,7 +262,7 @@ def process_single_question(
     answer_facts = extract_answer_facts(question, gold_answer, quiet=quiet)
 
     if not answer_facts:
-        return (False, f"{cache_file}: Answer fact extraction failed", None)
+        return (False, f"{entry_label}: Answer fact extraction failed", None)
 
     if not quiet:
         print(f"\nExtracted {len(answer_facts)} facts")
@@ -296,7 +283,7 @@ def process_single_question(
         "question_type": "completeness",
     }
 
-    return (True, f"{cache_file}: Success", question_data)
+    return (True, f"{entry_label}: Success", question_data)
 
 
 # =============================================================================
@@ -335,9 +322,9 @@ def main() -> None:
     # Load completeness entries
     entries = load_completeness_entries()
     if not entries:
-        print("No completeness cache files found in question_cache/.")
+        print("No completeness entries found in generation cache.")
         return
-    print(f"Loaded {len(entries)} completeness entries from question cache.")
+    print(f"Loaded {len(entries)} completeness entries from generation cache.")
 
     # Limit count
     if args.count is not None:
@@ -372,7 +359,7 @@ def main() -> None:
         # Sequential mode — verbose output
         for i, entry in enumerate(entries):
             print("\n" + "-" * 40)
-            print(f"Entry {i + 1} of {len(entries)}: {entry.get('cache_file', '?')}")
+            print(f"Entry {i + 1} of {len(entries)}")
             print(f"Question: {entry.get('question', '?')}")
             print("-" * 40)
 

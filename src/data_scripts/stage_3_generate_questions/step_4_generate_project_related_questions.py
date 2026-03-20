@@ -1,13 +1,12 @@
 """Script for generating project-related cross-document questions."""
 
 import argparse
-import glob
 import json
 import os
 import random
 
 from src.llm import Message, get_llm, run_auto_conversation
-from src.paths import QUESTION_CACHE_DIR, QUESTIONS_PATH, SOURCES_DIR
+from src.paths import QUESTIONS_PATH, SOURCES_DIR
 from src.prompts.project_question import (
     PROJECT_RELATED_QUERIES_ANSWER_VALIDATION_PROMPT,
     PROJECT_RELATED_QUERIES_PROMPT,
@@ -22,6 +21,7 @@ from src.utils import (
     get_next_question_id,
     load_json_file,
     load_or_build_uuid_index,
+    projects_cache,
     save_question,
     write_json_file,
 )
@@ -36,20 +36,8 @@ PROJECT_USAGE_PATH = os.path.join(CACHE_DIR, "project_questions.json")
 
 
 def load_projects() -> list[dict]:
-    """Load all project cache files from question_cache, sorted by filename."""
-    pattern = os.path.join(QUESTION_CACHE_DIR, "project_*.json")
-    files = sorted(glob.glob(pattern))
-
-    projects: list[dict] = []
-    for filepath in files:
-        try:
-            data = load_json_file(filepath)
-            data["cache_file"] = os.path.basename(filepath)
-            projects.append(data)
-        except Exception as e:
-            print(f"Warning: Failed to load {filepath}: {e}")
-
-    return projects
+    """Load all project entries from generation cache."""
+    return projects_cache.load()
 
 
 def select_next_project(
@@ -59,7 +47,10 @@ def select_next_project(
     """Select the project with the lowest usage count."""
     return min(
         projects,
-        key=lambda p: (project_usage.get(p["cache_file"], 0), p["cache_file"]),
+        key=lambda p: (
+            project_usage.get(p["project_outline_file"], 0),
+            p["project_outline_file"],
+        ),
     )
 
 
@@ -209,9 +200,9 @@ def main() -> None:
     # Load projects
     projects = load_projects()
     if not projects:
-        print("No project cache files found in question_cache/.")
+        print("No project entries found in generation cache.")
         return
-    print(f"Loaded {len(projects)} projects from question cache.")
+    print(f"Loaded {len(projects)} projects from generation cache.")
 
     # Load or build UUID index
     uuid_index = load_or_build_uuid_index()
@@ -247,8 +238,8 @@ def main() -> None:
 
         # Select the least-used project
         project = select_next_project(projects, project_usage)
-        cache_file = project["cache_file"]
-        print(f"Project: {cache_file}")
+        project_file = project["project_outline_file"]
+        print(f"Project: {project_file}")
 
         # Resolve document UUIDs to paths
         doc_uuids = project.get("documents", [])
@@ -261,9 +252,9 @@ def main() -> None:
         if len(doc_paths) < 3:
             print(f"Skipping: only {len(doc_paths)} resolvable documents (need >= 3)")
             fail_count += 1
-            errors.append(f"{cache_file}: Too few resolvable documents")
+            errors.append(f"{project_file}: Too few resolvable documents")
             # Mark as used so we don't get stuck on the same project
-            project_usage[cache_file] = project_usage.get(cache_file, 0) + 1
+            project_usage[project_file] = project_usage.get(project_file, 0) + 1
             continue
 
         print(f"  Documents: {len(doc_paths)} resolvable out of {len(doc_uuids)}")
@@ -298,20 +289,20 @@ def main() -> None:
             question = question.strip()
         except RuntimeError as e:
             fail_count += 1
-            errors.append(f"{cache_file}: {e}")
+            errors.append(f"{project_file}: {e}")
             print(f"\nFailed: {e}")
             continue
 
         if not question:
             fail_count += 1
-            errors.append(f"{cache_file}: LLM returned empty response")
+            errors.append(f"{project_file}: LLM returned empty response")
             print("\nFailed: LLM returned empty response")
             continue
 
         read_docs = doc_read_tool.read_documents
         if not read_docs:
             fail_count += 1
-            errors.append(f"{cache_file}: No documents were read by LLM")
+            errors.append(f"{project_file}: No documents were read by LLM")
             print("\nFailed: No documents were read by LLM")
             continue
 
@@ -326,7 +317,7 @@ def main() -> None:
 
         if not valid or not gold_answer or not relevant_uuids:
             fail_count += 1
-            errors.append(f"{cache_file}: Question validation failed")
+            errors.append(f"{project_file}: Question validation failed")
             print("\nFailed: Question validation failed")
             continue
 
@@ -336,7 +327,7 @@ def main() -> None:
 
         if not answer_facts:
             fail_count += 1
-            errors.append(f"{cache_file}: Answer fact extraction failed")
+            errors.append(f"{project_file}: Answer fact extraction failed")
             print("\nFailed: Answer fact extraction failed")
             continue
 
@@ -363,7 +354,7 @@ def main() -> None:
         next_question_id += 1
 
         # Update project usage
-        project_usage[cache_file] = project_usage.get(cache_file, 0) + 1
+        project_usage[project_file] = project_usage.get(project_file, 0) + 1
         save_project_usage(project_usage)
 
         success_count += 1

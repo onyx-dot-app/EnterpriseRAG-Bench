@@ -47,6 +47,12 @@
   - `append_to_jsonl()`, `extract_source_type()` - Low-level helpers
 - **`document_index.py`** - `load_or_build_uuid_index()`, `load_document_content_by_uuid()`, `load_document_json_by_uuid()` - UUID-based document lookup
 
+### Generation Cache
+- **`generation_cache.py`** - `GenerationCache` class with thread-safe `load()`, `append()`, `write_all()`, `count()` methods. Stores consolidated JSON arrays in `generation_cache/`. Three singleton instances:
+  - `projects_cache` → `generation_cache/projects.json` (key: `"projects"`)
+  - `completeness_cache` → `generation_cache/completeness.json` (key: `"completeness"`)
+  - `duplications_cache` → `generation_cache/duplications.json` (key: `"duplications"`)
+
 ### Other Utilities
 - **`cli.py`** - `confirm_yes_no()`, `confirm_regenerate()` - Interactive CLI prompts for user confirmation
 - **`dates.py`** - `get_current_date_formatted()` - Returns current date as "Month DD, YYYY"

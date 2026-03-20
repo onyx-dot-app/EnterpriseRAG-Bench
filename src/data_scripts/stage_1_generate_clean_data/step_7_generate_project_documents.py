@@ -14,7 +14,6 @@ from src.paths import (
     COMPANY_OVERVIEW_PATH,
     DEBUG_DIR,
     PROJECTS_DIR,
-    QUESTION_CACHE_DIR,
     SOURCES_DIR,
 )
 from src.prompts.document_generation import (
@@ -33,6 +32,7 @@ from src.utils import (
     label_single_document,
     load_file,
     load_json_file,
+    projects_cache,
     validate_no_nested_dicts,
     write_json_file,
 )
@@ -611,20 +611,17 @@ def add_dataset_uuids(max_parallelism: int = 20) -> None:
 
 def write_question_cache() -> None:
     """
-    Phase 4: Write project entries to question_cache directory.
+    Phase 4: Write project entries to generation_cache/projects.json.
 
-    Each project gets a file like project_1.json with:
+    Each entry contains:
     - project_outline_file: the project JSON filename
     - description: the project description
     - documents: list of dataset_doc_uuid values for project documents
     """
     print()
     print("=" * 40)
-    print("Phase 4: Write to Question Cache")
+    print("Phase 4: Write to Generation Cache")
     print("=" * 40)
-
-    # Ensure question_cache directory exists
-    os.makedirs(QUESTION_CACHE_DIR, exist_ok=True)
 
     # Get all project JSON files
     project_files = sorted([
@@ -639,10 +636,10 @@ def write_question_cache() -> None:
     print(f"Found {len(project_files)} projects to write.")
     print()
 
-    succeeded = 0
+    entries: list[dict] = []
     failed: list[tuple[str, str]] = []
 
-    for i, project_filename in enumerate(project_files, start=1):
+    for project_filename in project_files:
         project_path = os.path.join(PROJECTS_DIR, project_filename)
 
         try:
@@ -665,21 +662,17 @@ def write_question_cache() -> None:
                     except Exception:
                         pass
 
-            # Write cache file
-            cache_data = {
+            entries.append({
                 "project_outline_file": project_filename,
                 "description": description,
                 "documents": document_uuids,
-            }
-
-            cache_path = os.path.join(QUESTION_CACHE_DIR, f"project_{i:04d}.json")
-            write_json_file(cache_path, cache_data)
-            succeeded += 1
+            })
 
         except Exception as e:
             failed.append((project_filename, str(e)))
 
-    print(f"Complete. {succeeded} entries written, {len(failed)} failed.")
+    projects_cache.write_all(entries)
+    print(f"Complete. {len(entries)} entries written to {projects_cache.path}, {len(failed)} failed.")
 
     if failed:
         print()
@@ -718,7 +711,7 @@ def main() -> None:
     print("Phase 1: Generate documents based on project overviews")
     print("Phase 2: Add title/content field labels to documents")
     print("Phase 3: Add dataset_doc_uuid to all documents")
-    print("Phase 4: Write project cache files to question_cache")
+    print("Phase 4: Write project cache to generation_cache")
     print()
     print("Note: If any of the documents fail validation, you may need to rerun the script.")
     print()

@@ -1,21 +1,20 @@
 """Script for generating conflicting/outdated information questions from document pairs."""
 
 import argparse
-import glob
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.llm import Message, get_llm
-from src.paths import QUESTION_CACHE_DIR, QUESTIONS_PATH
+from src.paths import QUESTIONS_PATH
 from src.prompts.conflicting_query import CONFLICTING_INFO_PROMPT
 from src.utils import (
     count_existing_questions,
+    duplications_cache,
     extract_json_from_response,
     extract_source_type,
     get_next_question_id,
     load_document_content_by_uuid,
-    load_json_file,
     load_or_build_uuid_index,
     rebuild_uuid_index,
     save_question,
@@ -29,20 +28,8 @@ from src.utils.document_content import DocumentFieldError
 
 
 def load_duplication_entries() -> list[dict]:
-    """Load all duplication cache files from question_cache, sorted by filename."""
-    pattern = os.path.join(QUESTION_CACHE_DIR, "duplication_*.json")
-    files = sorted(glob.glob(pattern))
-
-    entries: list[dict] = []
-    for filepath in files:
-        try:
-            data = load_json_file(filepath)
-            data["cache_file"] = os.path.basename(filepath)
-            entries.append(data)
-        except Exception as e:
-            print(f"Warning: Failed to load {filepath}: {e}")
-
-    return entries
+    """Load all duplication entries from generation cache."""
+    return duplications_cache.load()
 
 
 # =============================================================================
@@ -81,12 +68,12 @@ def process_single_entry(
         (success, message, question_data) tuple.
         On failure, question_data is None.
     """
-    cache_file = entry.get("cache_file", "unknown")
+    entry_label = f"{entry.get('document_old', '?')[:16]}..{entry.get('document_new', '?')[:16]}"
     old_uuid = entry.get("document_old", "")
     new_uuid = entry.get("document_new", "")
 
     if not old_uuid or not new_uuid:
-        return (False, f"{cache_file}: Missing document_old or document_new", None)
+        return (False, f"{entry_label}: Missing document_old or document_new", None)
 
     # Format both documents
     if not quiet:
@@ -94,11 +81,11 @@ def process_single_entry(
 
     doc_old_text = format_document(old_uuid, uuid_index)
     if not doc_old_text:
-        return (False, f"{cache_file}: Could not load document_old ({old_uuid})", None)
+        return (False, f"{entry_label}: Could not load document_old ({old_uuid})", None)
 
     doc_new_text = format_document(new_uuid, uuid_index)
     if not doc_new_text:
-        return (False, f"{cache_file}: Could not load document_new ({new_uuid})", None)
+        return (False, f"{entry_label}: Could not load document_new ({new_uuid})", None)
 
     if not quiet:
         print(f"Loaded document_old: {old_uuid}")
@@ -136,23 +123,23 @@ def process_single_entry(
             response = extract_json_from_response(response)
             data = json.loads(response)
         except Exception:
-            return (False, f"{cache_file}: Failed to parse LLM JSON response", None)
+            return (False, f"{entry_label}: Failed to parse LLM JSON response", None)
 
     if not isinstance(data, dict):
-        return (False, f"{cache_file}: LLM response is not a JSON object", None)
+        return (False, f"{entry_label}: LLM response is not a JSON object", None)
 
     query = data.get("query", "").strip()
     gold_answer = data.get("gold_answer", "").strip()
     answer_facts = data.get("verifiable_statements", [])
 
     if not query:
-        return (False, f"{cache_file}: LLM returned empty query", None)
+        return (False, f"{entry_label}: LLM returned empty query", None)
 
     if not gold_answer:
-        return (False, f"{cache_file}: LLM returned empty gold_answer", None)
+        return (False, f"{entry_label}: LLM returned empty gold_answer", None)
 
     if not answer_facts or not isinstance(answer_facts, list):
-        return (False, f"{cache_file}: LLM returned no verifiable_statements", None)
+        return (False, f"{entry_label}: LLM returned no verifiable_statements", None)
 
     if not quiet:
         print(f"\nQuery: {query}")
@@ -177,7 +164,7 @@ def process_single_entry(
         "question_type": "conflicting",
     }
 
-    return (True, f"{cache_file}: Success", question_data)
+    return (True, f"{entry_label}: Success", question_data)
 
 
 # =============================================================================
@@ -217,9 +204,9 @@ def main() -> None:
     # Load duplication entries
     entries = load_duplication_entries()
     if not entries:
-        print("No duplication cache files found in question_cache/.")
+        print("No duplication entries found in generation cache.")
         return
-    print(f"Loaded {len(entries)} duplication entries from question cache.")
+    print(f"Loaded {len(entries)} duplication entries from generation cache.")
 
     # Limit count
     if args.count is not None:
@@ -270,7 +257,7 @@ def main() -> None:
         # Sequential mode — verbose output
         for i, entry in enumerate(entries):
             print("\n" + "-" * 40)
-            print(f"Entry {i + 1} of {len(entries)}: {entry.get('cache_file', '?')}")
+            print(f"Entry {i + 1} of {len(entries)}")
             print(f"  Old: {entry.get('document_old', '?')}")
             print(f"  New: {entry.get('document_new', '?')}")
             print("-" * 40)

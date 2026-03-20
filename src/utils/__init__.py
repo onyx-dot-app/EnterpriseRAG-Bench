@@ -23,6 +23,12 @@ from src.utils.field_labeling import (
 )
 from src.utils.field_ordering import needs_reordering, reorder_document_fields
 from src.utils.file_io import delete_file, load_file, load_json_file, write_json_file
+from src.utils.generation_cache import (
+    GenerationCache,
+    completeness_cache,
+    duplications_cache,
+    projects_cache,
+)
 from src.utils.file_selection import (
     collect_json_files_by_size,
     count_json_files,
@@ -104,6 +110,10 @@ __all__ = [
     "validate_question",
     "validate_source_path",
     "build_uuid_index",
+    "completeness_cache",
+    "duplications_cache",
+    "GenerationCache",
+    "projects_cache",
     "write_uuid_index_cache",
     "write_json_file",
 ]
