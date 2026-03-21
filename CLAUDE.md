@@ -45,13 +45,18 @@
   - `load_document()` - Load and extract UUID/title/content from a source document
   - `count_existing_questions()`, `get_next_question_id()`, `get_existing_doc_uuids()` - Question file state queries
   - `append_to_jsonl()`, `extract_source_type()` - Low-level helpers
-- **`document_index.py`** - `load_or_build_uuid_index()`, `load_document_content_by_uuid()`, `load_document_json_by_uuid()` - UUID-based document lookup
+- **`document_index.py`** - UUID-based document lookup and indexing
+  - `load_or_build_uuid_index()` - Load UUID index from cache or build from disk
+  - `ensure_uuids_resolved(needed_uuids, uuid_index=None)` - Load UUID index and **automatically rebuild once** if any needed UUIDs are missing. All question generation scripts should use this instead of `load_or_build_uuid_index()` when they have a known set of required UUIDs.
+  - `rebuild_uuid_index()` - Force-rebuild the UUID index from disk
+  - `load_document_content_by_uuid()`, `load_document_json_by_uuid()` - Load document data by UUID
 
 ### Generation Cache
-- **`generation_cache.py`** - `GenerationCache` class with thread-safe `load()`, `append()`, `write_all()`, `count()` methods. Stores consolidated JSON arrays in `generation_cache/`. Three singleton instances:
+- **`generation_cache.py`** - `GenerationCache` class with thread-safe `load()`, `append()`, `write_all()`, `count()` methods. Stores consolidated JSON arrays in `generation_cache/`. Four singleton instances:
   - `projects_cache` → `generation_cache/projects.json` (key: `"projects"`)
   - `completeness_cache` → `generation_cache/completeness.json` (key: `"completeness"`)
   - `duplications_cache` → `generation_cache/duplications.json` (key: `"duplications"`)
+  - `misc_files_cache` → `generation_cache/misc_dirs_and_files.json` (key: `"files"`)
 
 ### Other Utilities
 - **`cli.py`** - `confirm_yes_no()`, `confirm_regenerate()` - Interactive CLI prompts for user confirmation

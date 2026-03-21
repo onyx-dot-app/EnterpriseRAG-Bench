@@ -6,7 +6,7 @@ import os
 import random
 
 from src.llm import Message, get_llm, run_auto_conversation
-from src.paths import GENERATED_DATA_DIR, QUESTIONS_PATH, SOURCE_TREE_PATH, SOURCES_DIR
+from src.paths import GENERATED_DATA_DIR, QUESTIONS_PATH, SOURCE_TREE_PATH
 from src.prompts.constrained_queries import (
     CONSTRAINED_QUERIES_ANSWER_VALIDATION_PROMPT,
     CONSTRAINED_QUERIES_ERROR_PROMPT,

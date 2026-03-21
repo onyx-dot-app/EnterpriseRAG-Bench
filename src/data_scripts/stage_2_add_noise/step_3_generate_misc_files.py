@@ -30,13 +30,12 @@ from src.utils import (
     get_directory_tree,
     load_file,
     load_json_file,
+    misc_files_cache,
     sources_resolver,
     write_json_file,
 )
+from src.utils.generation_cache import GENERATION_CACHE_DIR
 from src.utils.statistics import update_statistics
-
-CACHE_DIR = "generation_cache"
-CACHE_PATH = os.path.join(CACHE_DIR, "misc_files.json")
 
 
 # =============================================================================
@@ -51,9 +50,9 @@ def load_cache() -> dict:
     Returns:
         Cache dict with "directories" and "files" keys, or empty structure.
     """
-    if os.path.exists(CACHE_PATH):
+    if os.path.exists(misc_files_cache.path):
         try:
-            return load_json_file(CACHE_PATH)
+            return load_json_file(misc_files_cache.path)
         except Exception:
             pass
     return {"directories": [], "files": []}
@@ -61,8 +60,8 @@ def load_cache() -> dict:
 
 def save_cache(cache: dict) -> None:
     """Save the misc files cache."""
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    write_json_file(CACHE_PATH, cache)
+    os.makedirs(GENERATION_CACHE_DIR, exist_ok=True)
+    write_json_file(misc_files_cache.path, cache)
 
 
 # =============================================================================
@@ -582,7 +581,7 @@ def main() -> None:
     cached_files = cache.get("files", [])
 
     if cached_dirs:
-        print(f"Found existing cache at {CACHE_PATH}")
+        print(f"Found existing cache at {misc_files_cache.path}")
         print(f"  Directories: {len(cached_dirs)}")
         print(f"  Files: {len(cached_files)}")
         print()
@@ -632,7 +631,7 @@ def main() -> None:
     print()
     print("=" * 40)
     print(f"Done. {total_files}/{args.count} miscellaneous files generated.")
-    print(f"Cache saved to: {CACHE_PATH}")
+    print(f"Cache saved to: {misc_files_cache.path}")
     print("=" * 40)
 
     # Update aggregate statistics

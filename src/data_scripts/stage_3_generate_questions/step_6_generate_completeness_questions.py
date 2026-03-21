@@ -14,12 +14,12 @@ from src.prompts.completeness_questions import (
 from src.utils import (
     completeness_cache,
     count_existing_questions,
+    ensure_uuids_resolved,
     extract_answer_facts,
     extract_json_from_response,
     extract_source_type,
     get_next_question_id,
     load_document_content_by_uuid,
-    load_or_build_uuid_index,
     save_question,
 )
 from src.utils.document_content import DocumentFieldError
@@ -331,8 +331,12 @@ def main() -> None:
         entries = entries[: args.count]
         print(f"Processing {len(entries)} entries (limited by --count).")
 
-    # Load UUID index
-    uuid_index = load_or_build_uuid_index()
+    # Load UUID index, rebuilding if needed UUIDs are missing
+    needed_uuids: set[str] = set()
+    for entry in entries:
+        needed_uuids.update(entry.get("documents", []))
+
+    uuid_index = ensure_uuids_resolved(needed_uuids)
     print(f"UUID index has {len(uuid_index)} entries.")
 
     # Load existing question state

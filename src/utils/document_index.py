@@ -66,6 +66,43 @@ def load_or_build_uuid_index(
     return rebuild_uuid_index(cache_file=cache_file, sources_dir=sources_dir)
 
 
+def ensure_uuids_resolved(
+    needed_uuids: set[str],
+    uuid_index: dict[str, str] | None = None,
+    cache_file: str = DEFAULT_UUID_INDEX_CACHE_FILE,
+    sources_dir: str = SOURCES_DIR,
+) -> dict[str, str]:
+    """Load (or reuse) the UUID index, rebuilding once if any needed UUIDs are missing.
+
+    Args:
+        needed_uuids: Set of UUIDs that must be resolvable.
+        uuid_index: Pre-loaded index to check first. If None, loads from cache.
+        cache_file: Path to the UUID index cache file.
+        sources_dir: Root directory of source documents.
+
+    Returns:
+        UUID index guaranteed to have been rebuilt if any needed UUIDs were
+        initially missing. Prints a warning if some remain unresolvable even
+        after the rebuild.
+    """
+    if uuid_index is None:
+        uuid_index = load_or_build_uuid_index(cache_file=cache_file, sources_dir=sources_dir)
+
+    missing = needed_uuids - uuid_index.keys()
+    if not missing:
+        return uuid_index
+
+    print(f"  {len(missing)} UUID(s) missing from cache, rebuilding index...")
+    uuid_index = rebuild_uuid_index(cache_file=cache_file, sources_dir=sources_dir)
+    print(f"  UUID index now has {len(uuid_index)} entries.")
+
+    still_missing = missing - uuid_index.keys()
+    if still_missing:
+        print(f"  Warning: {len(still_missing)} UUID(s) still unresolvable after rebuild.")
+
+    return uuid_index
+
+
 def load_document_json_by_uuid(
     dataset_doc_uuid: str,
     uuid_index: dict[str, str],

@@ -15,12 +15,12 @@ from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import DocumentReadTool
 from src.utils import (
     count_existing_questions,
+    ensure_uuids_resolved,
     extract_answer_facts,
     extract_json_from_response,
     extract_source_type,
     get_next_question_id,
     load_json_file,
-    load_or_build_uuid_index,
     projects_cache,
     save_question,
     write_json_file,
@@ -204,8 +204,12 @@ def main() -> None:
         return
     print(f"Loaded {len(projects)} projects from generation cache.")
 
-    # Load or build UUID index
-    uuid_index = load_or_build_uuid_index()
+    # Load UUID index, rebuilding if needed UUIDs are missing
+    needed_uuids: set[str] = set()
+    for p in projects:
+        needed_uuids.update(p.get("documents", []))
+
+    uuid_index = ensure_uuids_resolved(needed_uuids)
     print(f"UUID index has {len(uuid_index)} entries.")
 
     # Load project usage cache

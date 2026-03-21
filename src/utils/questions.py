@@ -250,6 +250,39 @@ def extract_anti_hallucination_facts(
     return result
 
 
+def normalize_text(text: str) -> str:
+    """Replace special Unicode characters with their ASCII equivalents."""
+    replacements = {
+        "\u2011": "-",   # non-breaking hyphen → hyphen
+        "\u2010": "-",   # hyphen → hyphen-minus
+        "\u2012": "-",   # figure dash
+        "\u2013": "-",   # en dash
+        "\u2014": "-",   # em dash
+        "\u2015": "-",   # horizontal bar
+        "\u2018": "'",   # left single quotation mark
+        "\u2019": "'",   # right single quotation mark
+        "\u201A": "'",   # single low-9 quotation mark
+        "\u201B": "'",   # single high-reversed-9 quotation mark
+        "\u201C": '"',   # left double quotation mark
+        "\u201D": '"',   # right double quotation mark
+        "\u201E": '"',   # double low-9 quotation mark
+        "\u201F": '"',   # double high-reversed-9 quotation mark
+        "\u2026": "...", # ellipsis
+        "\u00A0": " ",   # non-breaking space
+        "\u2003": " ",   # em space
+        "\u2002": " ",   # en space
+        "\u2009": " ",   # thin space
+        "\u200A": " ",   # hair space
+        "\u00B7": "*",   # middle dot → asterisk
+        "\u2022": "*",   # bullet → asterisk
+        "\u2032": "'",   # prime
+        "\u2033": '"',   # double prime
+    }
+    for original, replacement in replacements.items():
+        text = text.replace(original, replacement)
+    return text
+
+
 def save_question(
     question_id: str,
     question: str,
@@ -271,10 +304,10 @@ def save_question(
         "question_id": question_id,
         "question_type": question_type,
         "source_types": source_types,
-        "question": question,
+        "question": normalize_text(question),
         "expected_doc_ids": expected_doc_ids,
-        "gold_answer": gold_answer,
-        "answer_facts": answer_facts,
+        "gold_answer": normalize_text(gold_answer),
+        "answer_facts": [normalize_text(fact) for fact in answer_facts],
     }
     append_to_jsonl(path, question_data)
 

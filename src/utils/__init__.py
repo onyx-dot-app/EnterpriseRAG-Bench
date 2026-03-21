@@ -7,6 +7,7 @@ from src.utils.document_content import DocumentFieldError, extract_document_cont
 from src.utils.document_index import (
     DEFAULT_UUID_INDEX_CACHE_FILE,
     build_uuid_index,
+    ensure_uuids_resolved,
     load_document_content_by_uuid,
     load_document_json_by_uuid,
     load_or_build_uuid_index,
@@ -27,7 +28,9 @@ from src.utils.generation_cache import (
     GenerationCache,
     completeness_cache,
     duplications_cache,
+    misc_files_cache,
     projects_cache,
+    unanswerable_used_paths_cache,
 )
 from src.utils.file_selection import (
     collect_json_files_by_size,
@@ -110,10 +113,13 @@ __all__ = [
     "validate_question",
     "validate_source_path",
     "build_uuid_index",
+    "ensure_uuids_resolved",
     "completeness_cache",
     "duplications_cache",
     "GenerationCache",
+    "misc_files_cache",
     "projects_cache",
+    "unanswerable_used_paths_cache",
     "write_uuid_index_cache",
     "write_json_file",
 ]

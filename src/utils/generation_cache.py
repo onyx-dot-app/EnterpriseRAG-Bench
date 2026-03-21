@@ -34,25 +34,25 @@ class GenerationCache:
     def key(self) -> str:
         return self._key
 
-    def load(self) -> list[dict[str, Any]]:
+    def load(self) -> list[Any]:
         """Load all entries from the cache file.
 
         Returns:
-            List of entry dicts. Empty list if file doesn't exist.
+            List of entries. Empty list if file doesn't exist.
         """
         if not os.path.exists(self._path):
             return []
         data = load_json_file(self._path)
         return data.get(self._key, [])
 
-    def append(self, entry: dict[str, Any]) -> None:
+    def append(self, entry: Any) -> None:
         """Append a single entry to the cache file (thread-safe)."""
         with self._lock:
             entries = self.load()
             entries.append(entry)
             write_json_file(self._path, {self._key: entries})
 
-    def write_all(self, entries: list[dict[str, Any]]) -> None:
+    def write_all(self, entries: list[Any]) -> None:
         """Overwrite the cache with the given entries (thread-safe)."""
         with self._lock:
             write_json_file(self._path, {self._key: entries})
@@ -66,3 +66,5 @@ class GenerationCache:
 projects_cache = GenerationCache("projects.json", "projects")
 completeness_cache = GenerationCache("completeness.json", "completeness")
 duplications_cache = GenerationCache("duplications.json", "duplications")
+misc_files_cache = GenerationCache("misc_dirs_and_files.json", "files")
+unanswerable_used_paths_cache = GenerationCache("unanswerable_used_paths.json", "paths")

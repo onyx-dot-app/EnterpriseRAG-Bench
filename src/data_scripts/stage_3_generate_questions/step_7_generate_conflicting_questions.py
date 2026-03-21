@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.llm import Message, get_llm
@@ -11,12 +10,11 @@ from src.prompts.conflicting_query import CONFLICTING_INFO_PROMPT
 from src.utils import (
     count_existing_questions,
     duplications_cache,
+    ensure_uuids_resolved,
     extract_json_from_response,
     extract_source_type,
     get_next_question_id,
     load_document_content_by_uuid,
-    load_or_build_uuid_index,
-    rebuild_uuid_index,
     save_question,
 )
 from src.utils.document_content import DocumentFieldError
@@ -213,25 +211,15 @@ def main() -> None:
         entries = entries[: args.count]
         print(f"Processing {len(entries)} entries (limited by --count).")
 
-    # Load UUID index
-    uuid_index = load_or_build_uuid_index()
-    print(f"UUID index has {len(uuid_index)} entries.")
-
-    # Check if all needed UUIDs are present; rebuild once if any are missing
+    # Load UUID index, rebuilding if needed UUIDs are missing
     needed_uuids = set()
     for entry in entries:
         needed_uuids.add(entry.get("document_old", ""))
         needed_uuids.add(entry.get("document_new", ""))
     needed_uuids.discard("")
 
-    missing = needed_uuids - uuid_index.keys()
-    if missing:
-        print(f"  {len(missing)} UUID(s) missing from cache, rebuilding index...")
-        uuid_index = rebuild_uuid_index()
-        print(f"  UUID index now has {len(uuid_index)} entries.")
-        still_missing = missing - uuid_index.keys()
-        if still_missing:
-            print(f"  Warning: {len(still_missing)} UUID(s) still unresolvable after rebuild.")
+    uuid_index = ensure_uuids_resolved(needed_uuids)
+    print(f"UUID index has {len(uuid_index)} entries.")
 
     # Load existing question state
     next_question_id = get_next_question_id()
