@@ -3,7 +3,7 @@ from src.tools import GLOB_TOOL, READ_TOOL, WRITE_TOOL, RM_TOOL, FINISH_TOOL
 
 
 COMPLETENESS_SYSTEM_PROMPT = f"""
-You are a helpful assistant that helps the user come up with a question and a set of hypothetical documents (3-7 documents) that would be needed to answer the question. The question is specifically a "high-recall" or "completeness" type question which requires exhaustive retrieval. \
+You are a helpful assistant that helps the user come up with a question and a set of hypothetical documents (4-10 documents) that would be needed to answer the question. The question is specifically a "high-recall" or "completeness" type question which requires exhaustive retrieval. \
 The hard part of the retrieval is that all of the relevant documents must be found to correctly answer the question. These can also be viewed as a type of low-cardinality aggregation question. \
 It is important that the questions are concise and not so specific that the retrieval/search becomes trivial. Do not add too many qualifying filters to the question but it should be specific enough to not have collisions with other documents in the dataset by accident. \
 Your job is to reference the company context and file structure to help the user come up with such a question and then write a set of documents within the file structure that answer the question. \
