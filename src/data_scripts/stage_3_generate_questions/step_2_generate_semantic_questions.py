@@ -2,7 +2,6 @@
 
 import argparse
 import os
-import random
 
 from src.paths import QUESTIONS_PATH
 from src.prompts.basic_questions import SEMANTIC_QUERIES_PROMPT
@@ -34,12 +33,6 @@ def main() -> None:
         help="Number of questions to generate (default: 50)",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed for reproducibility",
-    )
-    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress LLM output streaming",
@@ -51,10 +44,6 @@ def main() -> None:
     print("This script generates semantic questions from randomly sampled documents.")
     print("Semantic questions avoid strong lexical matches to test semantic retrieval.")
     print()
-
-    if args.seed is not None:
-        random.seed(args.seed)
-        print(f"Random seed: {args.seed}")
 
     # Count JSON files
     total_files = count_json_files()

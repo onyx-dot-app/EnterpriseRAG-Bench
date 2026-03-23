@@ -115,12 +115,6 @@ def main() -> None:
         help="Number of parallel workers (default: 1, verbose output)",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed for reproducibility",
-    )
-    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress LLM output streaming",
@@ -132,10 +126,6 @@ def main() -> None:
     print("This script generates questions from miscellaneous noise documents")
     print("tracked in the generation cache.")
     print()
-
-    if args.seed is not None:
-        random.seed(args.seed)
-        print(f"Random seed: {args.seed}")
 
     # Load misc file UUIDs from generation cache
     file_uuids = misc_files_cache.load()
@@ -163,7 +153,7 @@ def main() -> None:
 
     # Shuffle and select
     selected = resolvable[:count]
-    if args.seed is not None or args.count is not None:
+    if args.count is not None:
         random.shuffle(resolvable)
         selected = resolvable[:count]
 

@@ -3,7 +3,6 @@
 import argparse
 import json
 import os
-import random
 
 from src.llm import Message, get_llm, run_auto_conversation
 from src.paths import GENERATED_DATA_DIR, QUESTIONS_PATH, SOURCE_TREE_PATH
@@ -320,12 +319,6 @@ def main() -> None:
         help="Number of questions to generate (default: 50)",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed for reproducibility",
-    )
-    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress LLM output streaming",
@@ -337,10 +330,6 @@ def main() -> None:
     print("This script generates constrained questions by exploring the corpus.")
     print("Each question uses qualifiers to narrow the answer to a small set of documents.")
     print()
-
-    if args.seed is not None:
-        random.seed(args.seed)
-        print(f"Random seed: {args.seed}")
 
     # Load source tree
     if not os.path.exists(SOURCE_TREE_PATH):

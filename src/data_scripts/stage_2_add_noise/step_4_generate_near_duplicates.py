@@ -3,7 +3,6 @@
 import argparse
 import json
 import os
-import random
 
 from src.llm import Message, get_llm
 from src.paths import (
@@ -425,12 +424,6 @@ def main() -> None:
         default=20,
         help="Number of near-duplicate files to generate (default: 20)",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed for reproducibility",
-    )
     args = parser.parse_args()
 
     print("Step 1: Generate Near-Duplicate Files")
@@ -439,10 +432,6 @@ def main() -> None:
     print("Each near-duplicate is a newer version of an existing document in a")
     print("different location with some facts updated.")
     print()
-
-    if args.seed is not None:
-        random.seed(args.seed)
-        print(f"Random seed: {args.seed}")
 
     # Count JSON files
     total_files = count_json_files()

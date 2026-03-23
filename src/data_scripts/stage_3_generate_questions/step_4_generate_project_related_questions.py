@@ -3,7 +3,6 @@
 import argparse
 import json
 import os
-import random
 
 from src.llm import Message, get_llm, run_auto_conversation
 from src.paths import QUESTIONS_PATH, SOURCES_DIR
@@ -175,12 +174,6 @@ def main() -> None:
         help="Number of questions to generate (default: 50)",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed for reproducibility",
-    )
-    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress LLM output streaming",
@@ -192,10 +185,6 @@ def main() -> None:
     print("This script generates cross-document questions from project data.")
     print("Each question may require information from multiple project documents.")
     print()
-
-    if args.seed is not None:
-        random.seed(args.seed)
-        print(f"Random seed: {args.seed}")
 
     # Load projects
     projects = load_projects()

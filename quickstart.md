@@ -78,4 +78,205 @@ The stages of generation are broken down into:
 
 Each stage has provided scripts to be run in order to generate the data. Some steps will require interactions between the user and LLM to guide the direction of the generation.
 
-For more details, check out the [developer guide](developer_guide.md).
+### Environment Variables
+
+Before running any scripts, set up the required environment variables:
+
+```bash
+# Required: LLM provider ("openai" or "anthropic", defaults to "openai")
+export LLM_PROVIDER="openai"
+
+# Required: API key for your chosen provider
+export LLM_API_KEY="your-api-key-here"
+
+# Optional: Override the default model (defaults: "gpt-5.2" for OpenAI, "claude-sonnet-4-6" for Anthropic)
+export LLM_MODEL_NAME="gpt-5.2"
+
+# Optional: Override the cheap model used for less critical operations (defaults: "gpt-5-mini" for OpenAI, "claude-haiku-4-5" for Anthropic)
+export CHEAP_LLM_MODEL_NAME="gpt-5-mini"
+
+# Optional: Enable Braintrust tracing for monitoring LLM calls
+export BRAINTRUST_API_KEY="your-braintrust-key"
+export BRAINTRUST_PROJECT="your-project-name"
+```
+
+### Running the scripts
+
+#### 1. Generating clean data
+
+**Step 1 — Generate company overview** (interactive)
+```bash
+python -m src.data_scripts.stage_1_generate_clean_data.step_1_generate_company_overview
+```
+
+**Step 2 — Generate initiatives** (interactive)
+```bash
+python -m src.data_scripts.stage_1_generate_clean_data.step_2_generate_initiatives
+```
+
+**Step 3 — Generate employee directory** (interactive)
+```bash
+python -m src.data_scripts.stage_1_generate_clean_data.step_3_generate_employee_directory
+```
+
+**Step 4 — Generate source structure** (interactive)
+```bash
+python -m src.data_scripts.stage_1_generate_clean_data.step_4_generate_source_structure
+```
+
+**Step 5 — Generate agents.md files** (interactive)
+```bash
+python -m src.data_scripts.stage_1_generate_clean_data.step_5_generate_agents_md
+```
+
+**Step 6 — Generate projects**
+```bash
+python -m src.data_scripts.stage_1_generate_clean_data.step_6_generate_projects \
+    --max-parallelization 5 \  # Max parallel project enrichments (default: 5)
+    --dedup-parallelism 20     # Max parallel deduplication operations (default: 20)
+```
+
+**Step 7 — Generate project documents**
+```bash
+python -m src.data_scripts.stage_1_generate_clean_data.step_7_generate_project_documents \
+    --project-parallelism 5 \       # Number of projects to process in parallel (default: 5)
+    --project-file-parallelism 5 \  # Number of files per project to process in parallel (default: 5)
+    --labeling-parallelism 20       # Number of documents to label in parallel (default: 20)
+```
+
+**Step 8 — Generate completeness documents** (interactive)
+```bash
+python -m src.data_scripts.stage_1_generate_clean_data.step_8_generate_completeness_documents \
+    --count 10  # Number of completeness traces to generate (default: 10)
+```
+
+**Step 9 — Generate volume documents**
+```bash
+python -m src.data_scripts.stage_1_generate_clean_data.step_9_generate_volume_documents \
+    --max-parallelism 5 \     # Max parallel volume generation operations (default: 5)
+    --project-parallelism 1   # Documents per project to generate in parallel (default: 1)
+```
+
+#### 2. Adding noise
+
+**Step 1 — Random shuffle**
+```bash
+python -m src.data_scripts.stage_2_add_noise.step_1_random_shuffle \
+    --percentage 3.0  # Percentage of documents to shuffle within each source type (default: 3.0)
+```
+
+**Step 2 — LLM-based shuffle**
+```bash
+python -m src.data_scripts.stage_2_add_noise.step_2_llm_based_shuffle \
+    --percentage 5.0 \  # Percentage of documents to shuffle within each source type (default: 5.0)
+    --parallelism 50    # Number of files to process in parallel (default: 50)
+```
+
+**Step 3 — Generate miscellaneous files** (interactive)
+```bash
+python -m src.data_scripts.stage_2_add_noise.step_3_generate_misc_files \
+    --count 20 \       # Total number of miscellaneous files to generate (default: 20)
+    --parallelism 5    # Number of files to generate in parallel (default: 5)
+```
+
+**Step 4 — Generate near-duplicate files**
+```bash
+python -m src.data_scripts.stage_2_add_noise.step_4_generate_near_duplicates \
+    --count 20  # Number of near-duplicate files to generate (default: 20)
+```
+
+#### 3. Generating questions
+
+**Step 1 — Basic questions**
+```bash
+python -m src.data_scripts.stage_3_generate_questions.step_1_generate_basic_questions \
+    --count 50 \  # Number of questions to generate (default: 50)
+    --quiet       # Suppress LLM output streaming (optional)
+```
+
+**Step 2 — Semantic questions**
+```bash
+python -m src.data_scripts.stage_3_generate_questions.step_2_generate_semantic_questions \
+    --count 50 \  # Number of questions to generate (default: 50)
+    --quiet       # Suppress LLM output streaming (optional)
+```
+
+**Step 3 — Single-doc multi-hop questions**
+```bash
+python -m src.data_scripts.stage_3_generate_questions.step_3_generate_single_doc_multihop_questions \
+    --count 50 \             # Number of questions to generate (default: 50)
+    --min-doc-length 3000 \  # Minimum document content length in characters (default: 3000)
+    --quiet                  # Suppress LLM output streaming (optional)
+```
+
+**Step 4 — Project-related questions**
+```bash
+python -m src.data_scripts.stage_3_generate_questions.step_4_generate_project_related_questions \
+    --count 50 \  # Number of questions to generate (default: 50)
+    --quiet       # Suppress LLM output streaming (optional)
+```
+
+**Step 5 — Constrained questions**
+```bash
+python -m src.data_scripts.stage_3_generate_questions.step_5_generate_constrained_questions \
+    --count 50 \  # Number of questions to generate (default: 50)
+    --quiet       # Suppress LLM output streaming (optional)
+```
+
+**Step 6 — Conflicting info questions**
+```bash
+python -m src.data_scripts.stage_3_generate_questions.step_6_generate_conflicting_questions \
+    --count 20 \      # Max number of questions to process (default: all available)
+    --parallelism 1 \ # Number of parallel workers (default: 1)
+    --quiet           # Suppress LLM output streaming (optional)
+```
+
+**Step 7 — Completeness questions**
+```bash
+python -m src.data_scripts.stage_3_generate_questions.step_7_generate_completeness_questions \
+    --count 10 \      # Max number of questions to process (default: all available)
+    --parallelism 1 \ # Number of parallel workers (default: 1)
+    --quiet           # Suppress LLM output streaming (optional)
+```
+
+**Step 8 — Miscellaneous questions**
+```bash
+python -m src.data_scripts.stage_3_generate_questions.step_8_generate_miscellaneous_questions \
+    --count 20 \      # Number of questions to generate (default: all available)
+    --parallelism 1 \ # Number of parallel workers (default: 1)
+    --quiet           # Suppress LLM output streaming (optional)
+```
+
+**Step 9 — High-level questions**
+```bash
+python -m src.data_scripts.stage_3_generate_questions.step_9_generate_high_level_questions \
+    --count 10 \           # Number of validated questions to produce (default: 10)
+    --num-candidates 20 \  # Number of candidate queries to generate before filtering (default: 20)
+    --parallelism 1 \      # Number of parallel workers for answer generation (default: 1)
+    --skip-validation \    # Skip the tool-based validation step (default: enabled)
+    --no-skip-validation \ # Enable the tool-based validation step
+    --quiet                # Suppress LLM output streaming (optional)
+```
+
+**Step 10 — Unanswerable questions**
+```bash
+python -m src.data_scripts.stage_3_generate_questions.step_10_generate_unanswerable_questions \
+    --count 20 \  # Number of questions to generate (default: 20)
+    --quiet       # Suppress LLM output streaming (optional)
+```
+
+#### 4. Data export
+
+```bash
+python -m src.data_scripts.stage_4_data_export.default_basic_file_export \
+    --sources slack gmail \   # List of source types to include, e.g. "confluence slack" (default: all)
+    --create-zip \            # Create zip file(s) of the exported data (optional)
+    --max-files-per-zip 5000 \  # Max files per zip, creates incremental slices (optional)
+    --max-files 100 \         # Max total files to export, useful for testing (optional)
+    --split-by-source         # Create separate zip files for each source type (optional)
+```
+
+To export in Onyx metadata format (includes `.onyx_metadata.json` sidecar files), set:
+```bash
+export EXPORT_IN_ONYX_FORMAT="true"
+```

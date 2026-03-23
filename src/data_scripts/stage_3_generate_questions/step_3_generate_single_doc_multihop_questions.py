@@ -43,12 +43,6 @@ def main() -> None:
         help="Minimum document content length in characters (default: 3000)",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed for reproducibility",
-    )
-    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress LLM output streaming",
@@ -60,10 +54,6 @@ def main() -> None:
     print("This script generates multi-hop questions from randomly sampled documents.")
     print("Each question requires information from multiple parts of a single document.")
     print()
-
-    if args.seed is not None:
-        random.seed(args.seed)
-        print(f"Random seed: {args.seed}")
 
     # Pre-scan for docs meeting minimum file size (proxy for content length)
     min_file_bytes = int(args.min_doc_length * FILE_SIZE_PROXY_RATIO)

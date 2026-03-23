@@ -35,7 +35,7 @@ The question set can be found in [questions.jsonl](export_data/questions.jsonl).
 To make this dataset as realistic as possible, the generation begins by gathering high level information about the company, initiatives, applications used, etc.
 Documents are generated with both high level knowledge and other documents to ensure they are meaningfully connected and coherent (as they would be in a real company).
 
-Noise is also introduced after the initial generation through steps like shuffling documents, creating near duplicates, etc. also to simulate the imperfect nature of real company data.
+Noise is also introduced after the initial generation through steps like shuffling documents, creating near duplicates, etc. These steps act to simulate the imperfect nature of real company data.
 
 Finally to ensure users can realistically generate their own customized datasets, the entire process is designed with cost-optimization in mind.
 Some documents need to be more strongly related to answer more interesting question types in which case more cost is acceptable.

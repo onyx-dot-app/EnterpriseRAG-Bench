@@ -188,23 +188,12 @@ def main() -> None:
         default=3.0,
         help="Percentage of documents to shuffle within each source type (default: 5)",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed for reproducibility",
-    )
     args = parser.parse_args()
 
     print("Step 1: Random Shuffle")
     print("=" * 40)
     print(f"Shuffling {args.percentage}% of documents within each source type.")
     print()
-
-    if args.seed is not None:
-        random.seed(args.seed)
-        print(f"Random seed: {args.seed}")
-        print()
 
     # Get top-level source types (skip files like agents.md)
     source_types = sorted(

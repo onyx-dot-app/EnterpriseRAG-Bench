@@ -331,12 +331,6 @@ def main() -> None:
         default=50,
         help="Number of files to process in parallel (default: 50)",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed for reproducibility",
-    )
     args = parser.parse_args()
 
     print("Step 2: LLM-Based Shuffle")
@@ -344,11 +338,6 @@ def main() -> None:
     print(f"Shuffling {args.percentage}% of documents per source type using LLM.")
     print(f"Parallelism: {args.parallelism}")
     print()
-
-    if args.seed is not None:
-        random.seed(args.seed)
-        print(f"Random seed: {args.seed}")
-        print()
 
     # Get top-level source types (skip files like agents.md)
     source_types = sorted(
