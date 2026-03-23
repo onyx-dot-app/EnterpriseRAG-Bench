@@ -178,7 +178,8 @@ class Conversation:
                     print("Goodbye!")
                     return False
 
-                self.run_turn(user_input)
+                exit_on = [finish_tool.name] if finish_tool is not None else None
+                self.run_turn(user_input, exit_on_tools=exit_on)
                 print()
 
             except KeyboardInterrupt:

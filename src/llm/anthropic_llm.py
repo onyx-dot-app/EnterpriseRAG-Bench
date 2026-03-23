@@ -54,16 +54,15 @@ class AnthropicLLM(LLMInterface):
         else:
             self.client = anthropic.Anthropic(api_key=self.api_key)
 
-    def _convert_tools(self, openai_tools: list[dict]) -> list[dict]:
-        """Convert OpenAI tool format to Anthropic tool format."""
+    def _convert_tools(self, tools: list[dict]) -> list[dict]:
+        """Convert Responses API tool format to Anthropic tool format."""
         anthropic_tools = []
-        for tool in openai_tools:
+        for tool in tools:
             if tool.get("type") == "function":
-                func = tool["function"]
                 anthropic_tools.append({
-                    "name": func["name"],
-                    "description": func.get("description", ""),
-                    "input_schema": func.get("parameters", {"type": "object", "properties": {}}),
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "input_schema": tool.get("parameters", {"type": "object", "properties": {}}),
                 })
         return anthropic_tools
 
@@ -105,6 +104,10 @@ class AnthropicLLM(LLMInterface):
 
             i += 1
 
+        # Anthropic requires at least one message; inject a placeholder if only system was provided
+        if not anthropic_messages:
+            anthropic_messages.append({"role": "user", "content": "Begin."})
+
         return system_message, anthropic_messages
 
     def generate(self, messages: list[Message]) -> Generator[str | ToolCall, None, None]:
@@ -125,8 +128,7 @@ class AnthropicLLM(LLMInterface):
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": anthropic_messages,
-            "max_tokens": 8192,
-            "stream": True,
+            "max_tokens": 64000,
         }
         if system_message:
             kwargs["system"] = system_message

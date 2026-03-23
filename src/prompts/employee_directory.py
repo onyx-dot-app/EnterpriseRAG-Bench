@@ -24,14 +24,14 @@ departments:
       email: "email@company.com"
       start_date: "YYYY-MM-DD"
       manager: "Manager Name"  # omit for top-level executives
-      bio: "Brief bio or background (1-2 sentences)"
+      bio: "Brief bio or background (1 sentence)"
   Product:
     - name: "Full Name"
       title: "Job Title"
       email: "email@company.com"
       start_date: "YYYY-MM-DD"
       manager: "Manager Name"
-      bio: "Brief bio or background (1-2 sentences)"
+      bio: "Brief bio or background (1 sentence)"
 ```
 
 Include a mix of seniority levels (executives, managers, individual contributors) appropriate for each department.
