@@ -1,0 +1,21 @@
+{
+  "channel": "eng-runtime",
+  "thread_ts": "1779012345",
+  "first_message_ts": "1779012345",
+  "last_message_ts": "1779015920",
+  "participants": [
+    "cheng",
+    "sam",
+    "lina",
+    "paul",
+    "maya",
+    "ops-bot"
+  ],
+  "messages": "cheng: quick heads-up \u2014 after landing the FA-v2 kernels i see a regression on 1-off decode latencies for small-batch (b=1..2). attaching profiler snip below, this looks like a kernel-selection issue + kv-copy churn.\n\nsam: can you paste the profiler output? is this prefill or decode path?\n\ncheng: decode path. raw ns timings from torch profiler (avg over 200 steps):\n```\nprefill: attention.flash_v2_kernel     2.1 ms   (seq=64, batch=8)\ndecode: attention.flash_v2_small       12.4 ms   (seq=1, batch=1)\ndecode: attention.fused_paged         3.4 ms    (seq=1, batch=1, paged_kv=true)\nkv-copy: cudaMemcpyAsync             6.8 ms    (hmm)\n```\nlooks like the selector picked `flash_v2_small` which then triggers a full kv copy each step instead of using paged_fusion that would stream pages.\n\nlina: omg that memcpy is the culprit. why is kv-copy happening on decode? we should be reusing cached KV on-device.\n\npaul: selector currently uses this heuristic: `if seq_len >= 32 or model > 7B => flash_v2; else fused_paged` but we only evaluate `seq_len` based on input prefix length at the start of the request. for incremental decode we pass seq_len=1 so the rule biases toward small flash kernel. it ignores `cached_kv_bytes`/`kv_pages` entirely.\n\ncheng: exactly. continuous-batching makes things worse: when we coalesce multiple decode requests the runtime reports a larger effective seq_len (we use the max prefix seen) for prefill, but decode path still gets per-step seq_len=1 so the kernel flip is inconsistent across prefill->decode causing extra memcpy to reshape kvs for the new kernel.\n\nmaya: any perf delta numbers end-to-end? can we show p95 for single-token step?\n\ncheng: yes \u2014 p95 single-token step: old (pre-FA-v2) = 9.6 ms, new (FA-v2 with selector) = 27.2 ms. If we force `fused_paged` for decode: 10.8 ms. so the kernel itself is fine, selector is costlier.\n\nsam: we should add a quick fix: when `has_kv_cache==true` prefer `fused_paged` or any kernel that supports zero-copy KV streaming. also add a metric `kernel_switch_count{request}` so we can see how often prefill->decode flips.\n\nlina: agree. also add a threshold based on `cached_kv_bytes` (e.g., if > 128KB prefer paged). smaller models can still use flash small, but only if KV is resident.\n\npaul: i'll prototype a selector change:\n```python\n# old\nif seq_len >= 32 or model_size >= 7B:\n    kernel = 'flash_v2_small'\nelse:\n    kernel = 'fused_paged'\n\n# new\nif has_kv_cache and cached_kv_bytes > 128*1024:\n    kernel = 'fused_paged'\nelif seq_len >= 32 or model_size >= 7B:\n    kernel = 'flash_v2_small'\nelse:\n    kernel = 'fused_paged'\n```\n^ this forces decode to a paged-friendly kernel when KV exists. i'll run microbench across the bucket.\n\ncheng: also add a guard to avoid memcpy when switching \u2014 we can failfast if the runtime would need to reorder kv layouts and instead pick the other kernel. that avoids copying in the hot path.\n\nmaya: can we canary this behind a rollout flag? ops-bot: create a canary job and add a console chart for kernel_switch_count and avg_kv_memcpy_ms.\n\nops-bot: created canary: infra/canaries/eng-runtime/kernel-selector-2026-03-17, dashboards linked: https://console/redwood/dashboards/kernel-selector-2026-03-17\n\nsam: also add an eval: 1) 1-token decode latency B=1 (chat loop); 2) 8-token chunked decode B=4; 3) heavy-prefill (seq=1024). compare p50/p95 and token throughput. keep the profiler traces attached.\n\ncheng: i'll push a branch with the selector change + metrics and ping for review. after canary, if stable we'll fold into autoscaler rollout. thanks everyone, this explains the mysterious regression. :+1:\n",
+  "title_field_name": "channel",
+  "content_field_names": [
+    "messages"
+  ],
+  "original_location": "slack/eng-runtime/1779012345-decode-smallbatch-kvcache-mystery.json",
+  "dataset_doc_uuid": "dsid_f8cf6e074f0b4443a98818059ba71ce4"
+}

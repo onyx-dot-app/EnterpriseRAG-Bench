@@ -1,0 +1,79 @@
+{
+  "repo": "redwood",
+  "pr_number": "748200",
+  "title": "streaming: client quiesce window + finalization marker and toolcall commit negotiation (OpenAI compatibility)",
+  "author": "Maya Chen",
+  "created_at": "2024-11-06",
+  "updated_at": "2024-11-12",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/stream-quiesce-and-toolcall-commit",
+  "reviewers": [
+    "Diego Rivera",
+    "Anjali Prakash",
+    "Benji O'Neill"
+  ],
+  "labels": [
+    "streaming",
+    "openai-compat",
+    "api",
+    "sre",
+    "perf"
+  ],
+  "linked_linear": [
+    "ENG-2148",
+    "ENG-2173"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "421",
+  "deletions": "77",
+  "breaking_change": "false",
+  "description": "Context and motivation: Users observed a class of errors where in-flight function/tool calls during abrupt client disconnects either caused duplicate side-effects (retries) or left the server holding resources for long periods while clients attempted to reconnect. This PR introduces a client-driven \"quiesce window\" and an explicit finalization marker for streaming responses, plus a small negotiation around a toolcall commit token so that tool providers and callers can deterministically decide commit/rollback on reconnect.\n\nDesign summary: single continuous description below (the server and OpenAI-compat adapter changes are gated by feature flag 'stream_quiesce_v1' and roll out in three phases). Key pieces: 1) Client quiesce window header: the OpenAI-compat adapter accepts optional header \"X-Client-Quiesce-Ms\" (integer ms) and exposes it down the runtime as quiesce_deadline_ms. When a client sends a soft-cancel (0-length final chunk or explicit cancel event) with a quiesce window, the session enters QUIESCE state for up to quiesce_deadline_ms before transitioning to TERMINATED; during QUIESCE the server keeps toolcall context and KV caches pinned and extends provisional leases so reconnecting clients can reattach without losing in-flight toolcalls. 2) Finalization marker: streaming payloads may include a special JSON envelope {\"redwood_final\":true, \"commit_id\":\"<hex>\"} which signals the server to mark output final. When present, adapter and runtime will emit a deterministic commit_id which can be used to dedupe toolcall side-effects on reconnect. 3) Toolcall commit negotiation: toolcall RPCs now produce a short stable commit token (commit_id). If a client reconnects and resumes with a matching commit_id, the runtime will suppress re-execution and deliver the previously recorded toolcall result. If commit_id is absent or mismatched, the server treats the toolcall as orphaned and runs configured rollback or compensating workflow. 4) Timeout and resource limits: a configurable quiesce_max_ms per-account caps how long QUIESCE can run (default 30s) and a background reaper enforces resource reclamation. 5) Observability and audit: added metrics (stream.quiesce.enter, stream.quiesce.resume, stream.toolcall.commit_replay, stream.quiesce.expire), and an audit log entry for commit_id issuance and reuse.\n\nAPI compatibility notes: the new header and finalization envelope are optional and backward compatible. The OpenAI-compat adapter translates existing cancel semantics to the new QUIESCE state when the feature flag is enabled; otherwise behavior is unchanged. We document the new envelope in docs/streaming-quiesce.md and SDK helpers in python and typescript to construct/inspect commit_id.\n\nImplementation notes: changes touch the OpenAI adapter (api/openai/adapter/streaming_handler.go), the session manager (runtime/stream/session_manager.go), the toolcall coordinator (runtime/tool coordinator), and the KV/lease layer to add provisional lease extension. The adapter now normalizes incoming client signals into internal events: SOFT_CANCEL (quiesce), HARD_CANCEL (immediate abort), RESUME_WITH_COMMIT. The session manager persists lightweight session checkpoints (checkpoint_id and last_commit_id) into the session cache to allow fast resume without going to durable DB in the common case.\n\nTesting and rollout: unit tests added for commit_id generation and dedupe logic; e2e tests simulate flaky networks and verify no duplicate toolcall side-effects; load tests ensure quiesce overhead does not increase p95 latency by more than 5% at 95th percentile. Rollout plan: 1) deploy behind feature flag to 10% of traffic for 48h; 2) monitor stream.quiesce.expire and toolcall.commit_replay metrics for anomalies; 3) increase to 100% after 7d with opt-out toggle for accounts with special compliance needs.\n\nChecklist: - [x] feature flag gating - [x] unit + integration tests - [x] e2e flaky-network scenario - [x] docs update - [x] SDK helper (python) - [x] metrics + audit logs - [x] canary rollout plan\n\nRelated work and references: Linear ENG-2148 (stream reconnect robustness), ENG-2173 (toolcall idempotency). See design doc: https://linear.app/redwood/issue/ENG-2148/stream-quiesce-finalization (internal).\n\nCommits summary: see commits list below.\n\nChanged areas & high-level diffs: (small illustrative snippets included inline in code review) - api/openai/adapter/streaming_handler.go: parse X-Client-Quiesce-Ms header and emit SOFT_CANCEL event. - runtime/stream/session_manager.go: add QUIESCE state path, provisional lease extension, checkpoint emit. - runtime/tool/coordinator.go: store and return commit_id for toolcalls; add replay path. - sdk/python/redwood/stream.py: add helper Stream.resume_with_commit(commit_id). - docs/streaming-quiesce.md: new doc with examples and recommended client patterns.\n\nMerge strategy: squash-merge; PR includes small migration script to populate quiesce_max_ms default in account configs (no data schema change).",
+  "commits": [
+    "a1b3e9d: add quiesce header parsing and SOFT_CANCEL normalization",
+    "d4c7f2a: session manager QUIESCE state + provisional lease extension",
+    "fa9b21c: tool coordinator commit_id generation and replay path",
+    "e3c4b92: add python SDK resume_with_commit helper and tests",
+    "b8e55aa: docs and rollout notes"
+  ],
+  "changed_files": [
+    "api/openai/adapter/streaming_handler.go",
+    "runtime/stream/session_manager.go",
+    "runtime/tool/coordinator.go",
+    "runtime/lease/provisional.go",
+    "sdk/python/redwood/stream.py",
+    "sdk/typescript/streaming/README.md",
+    "tests/e2e/stream_quiesce_test.go",
+    "tests/unit/tool_commit_test.go",
+    "docs/streaming-quiesce.md",
+    "infra/feature_flags/flags.yaml",
+    "scripts/migrations/20241106_set_quiesce_defaults.sql",
+    "observability/metrics/stream_quiesce_dashboards.json"
+  ],
+  "review_comments": [
+    "Diego Rivera: This looks solid. Two questions: (1) can you explain how commit_id is generated and why it's not just a monotonically increasing sequence from the tool coordinator? (answer: using a stable hash over (session_id, toolcall_nonce, timestamp) + truncated HMAC so it's stable across retries but non-guessable)",
+    "Anjali Prakash: Need to be careful with the default quiesce_max_ms for large customers \u2014 suggest exposing per-account override and a circuit-breaker. Also, please add a test for exceeding quiesce_max_ms to ensure cleanup path is exercised.",
+    "Maya Chen (author): addressed Anjali's test request and added account override config. Commit fa9b21c includes the test. Also clarified commit_id derivation in comments and docs.",
+    "Benji O'Neill: small nit: rename 'redwood_final' to 'redwood_finalized' for clarity; I don't feel strongly. Maya: kept 'redwood_final' for backwards brevity in envelope, added alias handling in adapter so either key is accepted."
+  ],
+  "merge_outcome": "merged",
+  "merge_method": "squash",
+  "merged_at": "2024-11-12",
+  "release_notes": [
+    "Streaming: introduce optional client quiesce window (X-Client-Quiesce-Ms) to allow reconnects without duplicate tool execution",
+    "Streaming: finalization envelope (\"redwood_final\") for deterministic output commit handling",
+    "Tooling: toolcalls now return commit_id to enable safe replay/dedup on reconnect",
+    "Docs + SDK: examples and helpers for resume_with_commit"
+  ],
+  "summary": "Add client-side quiesce window and a commit negotiation flow for toolcalls to reduce duplicate side-effects and improve reconnect behavior. Backward compatible and gated behind feature flag.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_comments",
+    "release_notes",
+    "summary"
+  ],
+  "original_location": "github/redwood/pr-748200-client-quiesce-window-finalize-toolcall-commit-negotiation-openai-compat.json",
+  "dataset_doc_uuid": "dsid_b475edae5ec04b00943ca78514e72e3f"
+}

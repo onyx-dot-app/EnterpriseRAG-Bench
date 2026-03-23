@@ -1,0 +1,56 @@
+{
+  "key": "ENG-33421",
+  "team": "engineering",
+  "title": "Formal eviction invariants and implementation plan for prefix-aware LRU+TTL hybrid KV cache",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-13",
+  "creator": "Marcus Chen",
+  "assignee": "Aisha Patel",
+  "project": "KV Cache Reliability",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "kv-cache",
+    "eviction",
+    "gpu-memory",
+    "formal-spec",
+    "batching"
+  ],
+  "parent_issue": [
+    "ENG-24167"
+  ],
+  "dependencies": [
+    "ENG-30642",
+    "ENG-25618"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Background: Our continuous-batching runtime relies heavily on a prefix-scoped KV cache to avoid repeated computation of initial token blocks and attention state. As we scale to multi-GPU pods and mixed workloads, we must guarantee that eviction semantics never lead to safety/regression bugs (e.g., serving a response that reuses an evicted KV entry leading to incorrect completions, or non-deterministic failures under canary rollouts).\n\nProblem statement: Current heuristics mix LRU recency, TTL expiration, and prefix affinity with ad-hoc atomic invalidation. This leads to corner cases: (1) concurrent eviction + read races when a prefix is being re-populated, (2) stale references after cross-device migration, and (3) TTL windows that interact poorly with batching-induced latency. We need a formal set of invariants and a concrete implementation that meets them with measurable performance impact.\n\nGoal: Produce a rigorously specified eviction policy (LRU+TTL+prefix-aware hybrid) with correctness guarantees, implement it in the runtime, and validate via deterministic emulator tests and production canary. Deliverables: formal invariants doc, algorithm pseudocode, runtime implementation (GPU bookkeeping + atomic ops), comprehensive unit+integration tests, and rollout plan with metrics and rollback criteria.\n\nDesign summary:\n1) Logical model: Each KV entry is (prefix_id, seq_range, version, last_access_ts, ttl_expiry_ts, pinned_flag). The canonical state is stored in host metadata; GPU resident pages reference entries by stable ids.\n2) Eviction priority: (a) pinned_flag prevents eviction, (b) expired TTL entries are reclaimable immediately, (c) otherwise LRU score is used but computed per-prefix cohort to avoid evicting frequently-shared prefixes across many requests. Score = base_age_weight * age + access_count_penalty + device_migration_penalty. Tunable weights live in config.\n3) Atomicity and correctness: Eviction must present a linearizable view to readers. Implement a two-phase reclaim protocol: mark-for-evict -> barrier/wait for outstanding readers -> reclaim. Readers use lightweight generation numbers: when a reader obtains a KV pointer, it reads the entry.generation and verifies after access that generation hasn't changed. If change detected, reader aborts and falls back to recompute or fetch fresh value.\n4) Prefix-aware coherence: Use prefix epochs. Any topology change that moves or migrates a prefix bumps its epoch. GPUs check epoch compatibility on access and trigger on-miss refill when mismatch.\n5) TTL semantics: TTL expiry is evaluated at access time and via background sweeper. To handle batching latency, we allow a small grace window = max_batch_latency + safety_margin; TTL expiry must be conservative (i.e., treat near-expiry entries as expired for long-running batches).\n6) Memory reclamation: Batch reclaim operations coalesce multiple evictions into a single GPU free to reduce kernel churn. Memory accounting is maintained with atomic counters per GPU and global watermark thresholds.\n\nCorrectness invariants (to be proved/tested):\n- I1 (No-use-after-evict): Once an entry is reclaimed, no future reader can observe stale data for that stable id and prefix epoch.\n- I2 (Prefix-consistency): For a given prefix and sequence range, readers that observe the same prefix epoch must see a consistent sequence of KV entries (monotonic generation numbers).\n- I3 (Eviction monotonicity): Eviction decisions are monotonic with respect to priority scores within a single epoch (i.e., an item with strictly lower score at time t will not be retained while a higher-score item is evicted, absent pins/TTL).\n- I4 (Bounded-staleness on TTL): TTL semantics guarantee that staleness <= grace_window + scheduling_jitter.\n\nProof sketch: We will formalize the two-phase reclaim as a compare-and-swap on an entry state machine (VALID -> MARKED -> RECLAIMED) plus per-reader generation checks. Linearizability follows from the fact that readers validate generation before commit and writers advance generation only after making the new entry fully visible. The eviction monotonicity is enforced by using a deterministic selection algorithm within an epoch and logging decisions to an audit stream for replay.\n\nImplementation plan:\n- Phase A (spec + emulator) [1 week]: Write formal spec and implement an eviction emulator that deterministically replays traces (based on production traffic sampling) to test invariants across synthetic races. Link: https://confluence.redwood.ai/display/INF/ENG-33421-eviction-spec (draft).\n- Phase B (runtime prototype) [2 weeks]: Implement host metadata changes and lightweight generation checks in runtime, add mark-for-evict path, background sweeper, and coalesced GPU free path. PR: https://github.com/redwood-inference/runtime/pull/2114 (WIP).\n- Phase C (integration + tests) [1 week]: Add unit tests for state transitions, emulator-driven integration tests, and a fault-injection suite that simulates device disconnects and migration.\n- Phase D (canary + rollout) [1 week]: Canary on dedicated capacity with strict observability (error-rate, tail latency, cache-hit divergence). Gradual rollout if metrics stable, otherwise rollback.\n\nTesting approach:\n- Deterministic eviction emulator with recorded production traces (replayable).\n- Chaos tests: simulate concurrent reader/writer, GPU memory pressure, prefix migration, and coordinator restarts.\n- Invariant checker: background job that scans audit log and validates I1-I4 for every epoch.\n\nMetrics and success criteria:\n- Functional: zero correctness regressions detected by invariant checker on canary.\n- Performance: cache hit-rate drop <= 2% relative to baseline; p99 latency regression <= 5ms; reclaim CPU overhead < 3% of runtime.\n- Observability: expose eviction decisions, pin counts, epoch bumps, and generation mismatches as traceable events in Console.\n\nRollout and migration: Start with non-critical tenants (low traffic Dedicated pools). If issues arise, force immediate full-evict and fall back to previous policy via feature flag. Migration utility will allow replay of audit logs to reconcile host metadata with GPU resident pages.\n\nRisks and mitigations:\n- Risk: generation checks may add CPU overhead on hot paths. Mitigation: microbenchmark, then implement fast-path where generation checks are elided when the entry is pinned or when the reader holds a read-token.\n- Risk: TTL + batching interactions create false misses. Mitigation: conservative grace window and per-route TTL tuning.\n\nOpen decisions:\n- How to weight prefix cohort size vs recency in the LRU score? (tunable; propose default weight 0.6 recency / 0.4 cohort-sharedness).\n- Should we allow negative-scored items for forced eviction during OOM? (yes, as emergency bypass).\n\nLinks and artifacts:\n- Draft spec: https://confluence.redwood.ai/display/INF/ENG-33421-eviction-spec\n- Emulator repo: https://github.com/redwood-inference/eviction-emulator (branch eng-33421)\n- Runtime PR: https://github.com/redwood-inference/runtime/pull/2114\n- Regression dashboard (canary): https://console.redwood.ai/dashboards/kv-eviction-canary\n",
+  "acceptance_criteria": [
+    "Formal spec doc with invariants I1-I4 published and reviewed by runtime+research",
+    "Deterministic emulator reproduces at least three historical races from production traces and validates invariants",
+    "Runtime prototype PR merged with feature-flag guard and unit/integration tests",
+    "Canary run for 72h with no invariant violations and metrics within thresholds (hit-rate drop <=2%, p99 latency <=5ms regression)",
+    "Rollout plan and rollback playbook documented in Confluence"
+  ],
+  "updates": [
+    "2026-03-01: Ticket created by Marcus Chen. Initial spec outline posted to Confluence.",
+    "2026-03-04: Emulator skeleton implemented; able to replay sampled trace 2026-02-21 with deterministic outcomes. See eviction-emulator branch eng-33421.",
+    "2026-03-07: Design review with Research and Runtime teams. Decided on two-phase mark-for-evict protocol and generation checks. Action: Aisha to prototype host metadata changes.",
+    "2026-03-09: Prototype host metadata structs pushed to runtime branch (WIP). Perf microbench planned to measure generation-check overhead.",
+    "2026-03-11: PR #2114 opened (WIP). Added initial coalesced GPU free path and background TTL sweeper. Awaiting security and infra sign-off.",
+    "2026-03-13: Integration test harness added to CI; simulated device migration test failing intermittently (race on epoch bump). Investigating; currently blocked on deterministic ordering guarantee from coordinator (see dependency ENG-30642)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "updates"
+  ],
+  "dataset_doc_uuid": "dsid_d992052a095f4bff9d930e357ca8853d",
+  "original_location": "linear/engineering/ENG-33421-formalize-eviction-invariants-prefix-aware-hybrid.json"
+}

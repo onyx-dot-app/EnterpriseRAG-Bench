@@ -11,7 +11,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
-from src.llm import Message, get_llm
+from src.llm import Message, get_cheap_llm
 from src.paths import SOURCES_DIR, SOURCE_TREE_PATH
 from src.prompts.neighboring_shuffle import PATH_ERROR_RESPONSE, SHUFFLE_PROMPT
 from src.utils.directory_tree import get_directory_tree
@@ -141,7 +141,7 @@ def pick_directory_with_llm(
         source_directory_structure=source_tree,
     )
 
-    llm = get_llm(tools=None, quiet=True)
+    llm = get_cheap_llm(tools=None, quiet=True)
     messages: list[Message] = [Message(role="user", content=prompt)]
 
     for attempt in range(max_attempts):
@@ -322,8 +322,8 @@ def main() -> None:
     parser.add_argument(
         "--percentage",
         type=float,
-        default=5.0,
-        help="Percentage of documents to shuffle within each source type (default: 5)",
+        default=3.0,
+        help="Percentage of documents to shuffle within each source type (default: 3)",
     )
     parser.add_argument(
         "--parallelism",

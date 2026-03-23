@@ -1,0 +1,60 @@
+{
+  "key": "ENG-23042",
+  "team": "engineering",
+  "title": "Fused attention kernel selection timing race leads to subtle decoder numerical drift",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-05",
+  "updated_at": "2026-03-14",
+  "creator": "Marco Rivera",
+  "assignee": "Priya Nair",
+  "project": "runtime-performance",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "labels": [
+    "kernel-selection",
+    "attention",
+    "decoder-scheduler",
+    "regression",
+    "hotfix"
+  ],
+  "description": "Summary: After enabling the new fused attention kernel selector path and aggressive prefill/decode scheduling heuristics, we observed small but reproducible numerical drift in model outputs during long decode sessions for a subset of models. The drift sometimes manifests as token-level deviations that cascade into semantic divergence for long conversations. This ticket captures investigation, short-term mitigation, and a long-term fix plan.",
+  "steps_to_reproduce": "1) Checkout runtime at release candidate branch runtime-1.20-rc (sha: a1b2c3d).\n2) Start a local dedicated worker with fused-attn-selector feature flag set to 'auto' and scheduler_mode='mixed-prefetch'.\n3) Use the attached minimal reproducer (decode script) with model rwd-open-6b and prompt length of ~256 tokens, then run decode to 1024 tokens.\n4) Repeat the run 10x concurrently.\n5) Compare outputs across runs or against baseline runtime-1.19 fused flag disabled.\nExpected: Deterministic outputs up to floating tolerance.\nObserved: Small token substitutions starting ~token 300 that are not explained by stochastic sampling; differences grow over subsequent tokens.",
+  "reproducer": "scripts/repro/eng-23042-decode-repro.py (internal gist link: drive.google.com/drive/folders/REDACTED) - includes config to toggle fused kernel selector and scheduler policy.",
+  "logs": "Key snippets:\n- scheduler: INFO kernel_selector picked fused_attn_v2 for layer 7, seq_len=128, batch=1\n- kvcache: WARN evict candidate index=42 still referenced by active decode id=0x7f2a\n- decoder: DEBUG softmax_sum mismatch delta=3.4e-5 layer=7\n- attention_kernel: ERROR concurrent-kernel-swap detected timing window (t0=2026-03-07T14:22:07.123Z, t1=2026-03-07T14:22:07.125Z)\nStack traces and full logs uploaded to: s3://redwood-internal/eng/ENG-23042/logs.zip",
+  "investigation_notes": "- Initial hypothesis: numerical drift due to different floating-point rounding in fused_attn_v2 vs legacy kernels. Verified that a deterministic single-threaded run with fused_attn_v2 always matches itself (no internal nondeterminism).\n- Second hypothesis: race between scheduler deciding which kernel to use and KV cache compaction/eviction step that moves KV blocks in memory. We found a narrow timing window where the kernel pointer is selected, then an async KV compaction moves the base pointer causing the kernel to read stale offsets.\n- Instrumentation added: kernel_selector now emits kernel_version + pointer_epoch. KV cache compaction increments pointer_epoch. We saw cases where kernel_version=2 pointer_epoch=17 but by the time the kernel reads the KV the pointer_epoch had advanced to 18 and internal offsets were inconsistent.\n- Reproducer only triggers under mixed-prefetch scheduling with >2 concurrent decode streams on the same worker and with aggressive kv_compaction_threshold set to 0.6.\n- Numerical deltas were small (1e-5 to 1e-3) initially but propagate through softmax and cause token ranking differences at later steps.\n- Related to but distinct from previous prefilling/KV index mismatch issues because this is a timing race at kernel selection time, not a persistent index corruption.\n- Cross-checked on GPU types: reproducer seen on both A100 and H100, slightly more frequent on H100 (likely due to different CUDA kernel queue timings).",
+  "proposed_fix": "Short-term (hotfix): 1) Disable 'auto' fused-attn-selector by default; expose 'fused_attn_selector_strict_sync' config to force scheduler->kernel pointer handoff to be synchronized (atomic handoff). 2) Add a fast path that increments pointer_epoch under lock before scheduler returns kernel pointer. This reduces throughput slightly but eliminates race.\nLong-term: 1) Introduce versioned KV handles: each kernel accepts a (kv_handle_version, base_ptr) tuple and validates at start-of-invoke that the handle matches expected version; if mismatch, kernel returns EBUSY and scheduler will reschedule or fallback to legacy kernel. 2) Move compaction to safe-points where no decode is using affected KV blocks (cooperative compaction). 3) Add a microbenchmark fuzz harness that stresses scheduler vs compaction interleavings across GPU types.",
+  "mitigation_applied": "Feature flag rolled: fused-attn-selector='off' for rows in prod autopool starting 2026-03-09. Config pushed to dedicated workers via infra patch infra/patches/2026-03-09-disable-fused-attn.json. Immediate impact: incident rate of decoder drift dropped to baseline.\nTrade-off: 1-3% p99 latency regression under heavy mixed workloads while sync is on.",
+  "test_plan": "1) Unit tests: add deterministic kernel-selector unit that validates pointer_epoch invariants. 2) Integration: extended decode regression tests to run 50 concurrent decodes for 1024 tokens and compare token-level diffs against golden outputs; fail on >0.01% tokens diverging. 3) Fuzz: CI job that runs scheduler+kv_compaction fuzz matrix across GPU targets for 24 hours. 4) Performance: run load tests to quantify throughput/latency impacts of strict_sync and versioned-handle fallback. 5) Post-merge: canary rollout to 5% of traffic with detailed per-request KV pointer telemetry enabled.",
+  "rollout_plan": "- Prepare runtime-1.20.1-hotfix branch with short-term sync patch.\n- Merge to canary cluster (canary=runtime-canary-3) for 48 hours running stress harness.\n- If stable, promote to 20% traffic with monitoring for decoder-drift-alerts and p99 latency.\n- Plan to merge long-term versioned-handle design in runtime-1.21 with staged rollout and no default compaction during transition.",
+  "followups": [
+    "ENG-23110 (implement versioned-kv-handles)",
+    "ENG-23111 (compaction-safe-points implementation)",
+    "PM-412 (customer impact postmortem and comms for affected accounts)"
+  ],
+  "related_issues": [
+    "ENG-17921",
+    "ENG-18675",
+    "ENG-21234"
+  ],
+  "comments": [
+    "2026-03-06 Marco Rivera: Initial triage. Reproducer attached and minimal logs show pointer_epoch mismatch. Assigning to Priya for deep dive.",
+    "2026-03-07 Priya Nair: Confirmed race window and added pointer_epoch instrumentation. Observed EBUSY-like symptoms when compaction overlaps kernel invocation. Working on short-term lock-based mitigation.",
+    "2026-03-09 Evan Green: Rolled feature flag off in prod autopool; customer incidents decreased. Captured perf regression numbers: p99 latency +2.1% under skews.",
+    "2026-03-12 Aisha Patel: Reviewed proposed long-term design. Suggest adding kernel-level fast sanity check (checksum of KV block header) to detect stale reads early and avoid silent numerical drift.",
+    "2026-03-14 Priya Nair: Implemented short-term sync patch branch and smoke tests. Pushing branch for infra canary deployment. Next: integrate kernel EBUSY handshake and add CI fuzz job."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "investigation_notes",
+    "proposed_fix",
+    "mitigation_applied",
+    "test_plan",
+    "rollout_plan",
+    "comments"
+  ],
+  "original_location": "linear/engineering/ENG-23042-fused-attn-selector-timing-race-causing-decoder-drift.json",
+  "dataset_doc_uuid": "dsid_5f09b0aff3144427ad3831315bfa4771"
+}

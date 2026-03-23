@@ -1,0 +1,61 @@
+{
+  "key": "ENG-4829",
+  "team": "engineering",
+  "title": "Audit log ingestion: buffering + retry/backpressure semantics + failure-mode tests",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-01-20",
+  "updated_at": "2026-02-24",
+  "creator": "Marcus Lin",
+  "assignee": "Sean Gallagher",
+  "project": "Audit Logging Standardization (Schema v1 + 100% Sensitive Action Coverage)",
+  "cycle": "2026-W07",
+  "estimate": "8",
+  "due_date": "2026-03-08",
+  "labels": [
+    "security",
+    "audit-logging",
+    "reliability",
+    "sre",
+    "backpressure",
+    "at-least-once",
+    "private-parity"
+  ],
+  "dependencies": [
+    "ENG-4830",
+    "ENG-4827",
+    "ENG-4835",
+    "ENG-4834"
+  ],
+  "customer_impact": "high",
+  "security_review_required": "true",
+  "description": "## Context\nAudit events are becoming a hard requirement for enterprise (Hosted/Dedicated) and especially Private deployments. As we instrument more sensitive actions, we are seeing that the ingestion path is the limiting factor for reliability: transient sink outages, regional partitions, and backpressure can cause drops, long delays, or (worse) services blocking in unpredictable ways.\n\nThis ticket hardens the audit event ingestion pipeline with:\n- bounded buffering (in-memory + durable where appropriate)\n- explicit retry policy with jitter/backoff and retry classification\n- clear backpressure behavior (what happens when buffers fill)\n- failure-mode / chaos-style tests so we can prove behavior and avoid regressions\n\n## Current behavior (summary of observed issues)\n- Producers often do best-effort HTTP fire-and-forget to the ingestion API. On timeout/5xx we sometimes drop events without a consistent metric.\n- Some producers retry aggressively (tight loops) causing thundering herd during outages; others never retry.\n- During sink degradation (Kafka/stream backlog, exporter slowdown), ingestion API returns 429/503 but producer behavior is inconsistent.\n- Private: installer/upgrade tooling sometimes runs in constrained environments; losing events during upgrades is common because there is no durable buffer.\n\n## Goals / non-goals\n### Goals\n1) Define and implement the ingestion reliability contract for sensitive-action audit events (practical at-least-once) with bounded buffers.\n2) Ensure services behave predictably when the audit sink is down/slow:\n   - do not melt down core services\n   - do not silently drop sensitive events\n   - expose clear metrics so SRE can detect and respond\n3) Provide failure-mode tests that simulate:\n   - ingestion API down\n   - sink backlog / slow downstream\n   - network partitions / packet loss\n   - producer restarts with buffered events\n\n### Non-goals\n- Building a customer-facing audit log UI\n- Changing event schema/taxonomy (covered by ENG-4821/4822); we only add transport semantics + tests\n\n## Proposed design (implementation direction)\n### Producer-side library (preferred default)\n- Add an async audit publisher in the shared audit library:\n  - bounded in-memory queue (configurable, default sized by service QPS)\n  - background worker(s) to publish batches\n  - exponential backoff with jitter on retryable failures\n  - classify retryable vs non-retryable (e.g., 400/validation error is non-retryable; 408/429/5xx retryable)\n  - emit metrics: enqueue_rate, dequeue_rate, retry_count, drop_count, queue_depth, publish_latency\n\n### Durable buffering (where required)\n- For \u201cmust-audit\u201d sensitive actions (RBAC changes, credential lifecycle, routing/policy changes, export config, retention/residency changes):\n  - persist event to a local WAL (write-ahead log) before acknowledging the admin action where feasible.\n  - publish from WAL asynchronously; on restart, replay.\n- Hosted/Dedicated services: WAL on local disk (or ephemeral + backed by node disk), size-limited with rotation.\n- Private installer/upgrade tooling: spool to a local file buffer (e.g., JSONL with checksums) and flush when ingestion is reachable.\n\n### Backpressure behavior (explicit)\n- When in-memory queue is full:\n  - default: drop non-sensitive (or non-must-audit) events with a clear metric and log at WARN with rate limiting.\n  - must-audit events: attempt WAL write; if WAL cannot be written (disk full / permissions / corruption), fail the admin action with 503 and a deterministic error code (so customers know this is \u201caudit pipeline not healthy\u201d).\n- When WAL is full (size cap reached):\n  - treat as must-audit failure for must-audit events (return 503 for the admin action)\n  - for non-must-audit: drop with metric\n\n### Delivery semantics and duplicates\n- We assume at-least-once delivery is acceptable; duplicates must be expected.\n- Require event_id presence (ENG-4830) so downstream and SIEM guidance can dedupe.\n- Retries must not regenerate event_id.\n\n### Ingestion API behavior (server-side)\n- Return explicit status codes:\n  - 202 accepted for async ingestion\n  - 429 when throttling/backpressure (include Retry-After)\n  - 503 when sink unavailable\n- Add server-side buffering where appropriate (short-lived queue) to avoid rejecting brief spikes.\n\n## Acceptance criteria\n- When the downstream sink is unavailable for 30 minutes, producers with must-audit actions:\n  - do not lose events (WAL replay after restart)\n  - do not exceed configured disk cap; if cap reached, must-audit admin actions fail with 503 + documented error code\n- When downstream is slow (p95 publish latency > 5s), producer queue depth increases but:\n  - service CPU/mem remains within +10% of baseline\n  - no request handler thread starvation / deadlocks\n- Metrics and dashboards show:\n  - drop_count = 0 for must-audit event types\n  - end-to-end delivery latency p99 < 5 minutes under normal conditions\n- Failure-mode tests run in CI (or nightly) and validate:\n  - retry behavior conforms to backoff spec\n  - WAL replay works after forced restart\n  - backpressure returns expected status codes and does not produce unbounded memory growth\n\n## Test plan (failure modes)\n- Unit tests (library):\n  - retry classification, jitter/backoff, queue overflow behavior\n  - WAL append + replay + corruption handling\n- Integration tests (local env):\n  - run a fake ingestion server that returns sequences: 503 -> 202, 429 with Retry-After, timeouts\n  - verify published count == enqueued count for must-audit types\n- Chaos / staging:\n  - temporarily block egress from a canary service to ingestion endpoint\n  - inject sink latency/backlog (rate limit consumer)\n  - verify alerts + runbook steps are actionable\n\n## Rollout / migration\n- Phase 1: ship producer library changes behind feature flag (audit.publisher.v2)\n- Phase 2: enable for Control Plane + Console backend (highest customer impact)\n- Phase 3: enable for API Gateway admin endpoints + Private installer\n- Phase 4: enforce must-audit semantics for the sensitive action list (ties to coverage gating)\n\n## Open questions\n1) Which exact event types are \u201cmust-audit\u201d (fail admin action if cannot persist)? Proposed set aligns with PM-938 list; confirm with Naomi/Olga.\n2) WAL location/permissions in Kubernetes (Hosted/Dedicated) and disk sizing defaults.\n3) Private installer identity: if operator identity is missing, do we still treat events as must-audit? (Proposed: yes; actor.type=system/operator_unknown but must log action.)\n\n## Owners / reviewers\n- Owner (SRE): Sean Gallagher\n- Security Eng reviewer: Kevin Osei\n- Platform reviewer: Ethan Park\n- GRC consult: Olga Petrov\n\n## References\n- ADR: Audit Event Delivery Guarantees (Confluence)\n- Related tickets: ENG-4835 (alerts), ENG-4830 (correlation IDs), ENG-4827 (exporter normalization)\n- Customer signals: SUP-18510 (duplicate events on retries), SUP-18421 (Private missing events)\n",
+  "updates": [
+    "2026-02-03 (Sean Gallagher): Drafted producer retry/backoff spec + queue/WAL semantics. Shared in #eng-sre for feedback; consensus: must-audit should fail closed once WAL cap hit, but only for admin/sensitive actions.",
+    "2026-02-10 (Kevin Osei): Confirmed Security preference: at-least-once with documented dedupe guidance; no requirement for exactly-once. Need explicit error code for \u201caudit unavailable\u201d so Support can triage quickly.",
+    "2026-02-14 (Rafael Mendes): Added staging game-day outline to validate sink outage behavior; propose running after dashboards/alerts are live (ENG-4835).",
+    "2026-02-21 (Ethan Park): Control Plane can persist to node disk for WAL; request: keep library defaults conservative to avoid disk churn on high-volume endpoints.",
+    "2026-02-24 (Sean Gallagher): Implementation started in shared audit publisher: bounded queue + retry classification + metrics. WAL implementation in progress; targeting canary in control-plane first."
+  ],
+  "comments": [
+    "Naomi Feldman (2026-02-05): Please document customer-facing behavior for: (a) what happens when audit logging is misconfigured in Private, (b) whether admin actions can fail due to audit sink issues. We need aligned wording for security reviews.",
+    "Logan Wright (2026-02-12): For coverage dashboards: please emit a metric when must-audit action fails due to audit pipeline (distinct from generic 5xx) so we can separate product outages from audit enforcement.",
+    "Aisha Bello (2026-02-19): Once metrics names are finalized, loop me in so we can wire alert thresholds without redoing dashboards."
+  ],
+  "related_links": [
+    "sources/confluence/architecture-and-standards/decision-records/adr-audit-event-delivery-guarantees.json",
+    "sources/jira/customer-support/SUP-18510-audit-log-exporter-retries-causing-duplicate-events.json",
+    "sources/jira/customer-support/SUP-18421-private-audit-logs-missing-rbac-events.json",
+    "sources/linear/engineering/ENG-4835-add-alert-audit-log-drop-rate.json",
+    "sources/linear/engineering/ENG-4830-audit-event-correlation-trace-and-request-ids.json",
+    "sources/linear/engineering/ENG-4827-audit-log-exporter-normalization-and-schema-version-tagging.json"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "updates",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_1d6c84263b40491988b1e7e98ccf4559",
+  "original_location": "linear/engineering/ENG-4829-audit-log-ingestion-retry-buffering.json"
+}

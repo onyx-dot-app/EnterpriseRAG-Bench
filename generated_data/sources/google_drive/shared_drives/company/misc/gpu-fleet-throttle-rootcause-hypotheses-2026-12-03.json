@@ -1,0 +1,98 @@
+{
+  "title": "GPU fleet throttle rootcause hypotheses - postmortem data pull",
+  "owner": "Arjun Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/infrastructure/gpu-fleet-throttle-rootcause-hypotheses-2026-12-03.json",
+  "doc_type": "sheet",
+  "created_at": "2026-12-03",
+  "last_modified": "2026-12-05",
+  "collaborators": [
+    "Maya Chen",
+    "Liam O'Connor",
+    "Sofia Ramirez",
+    "Jamal Thompson"
+  ],
+  "team": "engineering-infrastructure",
+  "status": "in_review",
+  "tags": [
+    "capacity",
+    "postmortem",
+    "gpu",
+    "throttle",
+    "queueing",
+    "regional"
+  ],
+  "linked_artifacts": [
+    "JIRA-INC-8241",
+    "https://redwood.slack.com/archives/C02FLE3M9/p1670001234567",
+    "https://confluence.redwood.ai/pages/INC-8241-capacity-postmortem"
+  ],
+  "summary": "Data pull to support postmortem for intermittent throttling across EU-West and US-West on 2026-11-29. Focused on request-level signals (queue depth, throttle markers, KV cache evictions) and fleet state (GPU util, pod restarts, region headroom) to test three root-cause hypotheses.",
+  "objective": "Produce a compact, query-first sheet that teams can use to validate or refute candidate root causes. Provide event-level joins, aggregated pivots by region/hour/model/tier, and sample trace examples for debugging rollout logic and autoscaler interactions.",
+  "approach": "1) Pull request-level telemetry for 48-hours around incident window. 2) Join with fleet control-plane events (scale up/down, preemptions, node restarts). 3) Compute derived signals (normalized queue depth, throttle-rate per-GPU, eviction-rate). 4) Surface top anomalous tenants and models for targeted replay and eval.",
+  "raw_queries": [
+    "-- Request-level slice: bigquery style\nSELECT timestamp, region, zone, gpu_type, instance_id, tenant_id, model_name, request_id, seq_len, tokens_generated, batch_size, is_streaming, kv_cache_hit, queue_depth, throttle_flag, throttle_reason, latency_ms, p95_latency_ms FROM telemetry.requests WHERE timestamp BETWEEN TIMESTAMP('2026-11-28') AND TIMESTAMP('2026-11-30') AND (throttle_flag = TRUE OR queue_depth > 10)",
+    "-- Fleet events: control plane (k8s events + autoscaler)\nSELECT event_ts, event_type, region, node_id, gpu_capacity_change, reason, linked_scale_id FROM control_plane.events WHERE event_ts BETWEEN '2026-11-28' AND '2026-11-30'",
+    "-- Pod restarts + OOMs (ClickHouse)\nSELECT ts, region, node, pod, reason, exit_code FROM infra.node_events WHERE reason LIKE '%OOM%' OR reason LIKE '%Restart%' AND ts BETWEEN '2026-11-28' AND '2026-11-30'",
+    "-- KV cache eviction telemetry\nSELECT ts, region, model_name, tenant_id, eviction_count, total_kv_size_bytes FROM caching.kv_metrics WHERE ts BETWEEN '2026-11-28' AND '2026-11-30'",
+    "-- Derived aggregation: per-region per-hour throttle rate\nSELECT region, HOUR(timestamp) as hour, COUNTIF(throttle_flag)/COUNT(*) as throttle_rate, AVG(queue_depth) as avg_q_depth, PERCENTILE_CONT(latency_ms, 0.95) as latency_p95 FROM telemetry.requests WHERE timestamp BETWEEN '2026-11-28' AND '2026-11-30' GROUP BY region, hour ORDER BY region, hour",
+    "-- Top offending tenants by throttle volume\nSELECT tenant_id, region, model_name, COUNT(*) as throttle_count, AVG(batch_size) as avg_batch, SUM(tokens_generated) as tokens FROM telemetry.requests WHERE throttle_flag = TRUE AND timestamp BETWEEN '2026-11-29' AND '2026-11-29 23:59:59' GROUP BY tenant_id, region, model_name ORDER BY throttle_count DESC LIMIT 50"
+  ],
+  "columns": [
+    "timestamp",
+    "region",
+    "zone",
+    "gpu_type",
+    "instance_id",
+    "node_id",
+    "tenant_id",
+    "model_name",
+    "request_id",
+    "queue_depth",
+    "in_flight",
+    "throttle_flag",
+    "throttle_reason",
+    "latency_ms",
+    "p95_latency_ms",
+    "batch_size",
+    "tokens_generated",
+    "kv_cache_hit",
+    "eviction_count",
+    "pod_restart_count",
+    "autoscaler_change"
+  ],
+  "sample_rows": [
+    "2026-11-29T10:14:03Z, eu-west1, eu-west1-b, a100-80, i-0a1b2c, node-123, tenant-42, gptx-8k, r-5f7e, 12, 4, TRUE, BACKPRESSURE_QUEUE, 412.2, 860.1, 1, 128, FALSE, 0, 0, scale_down:-2",
+    "2026-11-29T10:14:04Z, eu-west1, eu-west1-b, a100-80, i-0a1b2d, node-124, tenant-55, gptx-8k, r-73d2, 2, 2, FALSE, NULL, 34.5, 70.0, 1, 64, TRUE, 1, 1, scale_up:+1",
+    "2026-11-29T10:16:19Z, us-west2, us-west2-a, a100-80, i-0f2e3d, node-210, tenant-13, gptx-16k, r-9a0b, 20, 6, TRUE, KV_EVICT, 1023.7, 1520.8, 2, 640, FALSE, 12, 3, scale_down:-4"
+  ],
+  "observations": "Preliminary joins show two distinct signatures during the event window: (A) localized spikes in queue_depth and throttle_flag that map to short-lived node restarts in eu-west1, often preceded by KV cache eviction bursts; (B) broader region-level throttle increases with no corresponding node events but coincident with autoscaler cooldown windows in US-West. Latency p95 correlates strongly with queue depth for signature A; signature B shows rising throttle_rate before p95 moves drastically.",
+  "hypotheses": [
+    "Hypothesis 1: KV cache eviction cascade \u2014 sudden eviction bursts (large models + many tenants warming) caused cache misses that amplified request latencies and produced queue backpressure; manifests as eviction_count spikes shortly before throttle events and node OOM/restarts.",
+    "Hypothesis 2: Autoscaler hysteresis + burst arrivals \u2014 autoscaler cooldowns prevented capacity from catching up to short bursts, causing sustained queueing at region level; manifests as throttle_rate climbing across the region while individual nodes remain healthy.",
+    "Hypothesis 3: Scheduler packing/affinity regression \u2014 a deployment change in the scheduler increased co-location density on some nodes leading to momentary GPU oversubscription and higher pod restart counts; manifests as correlated pod_restart_count and increased per-node in_flight despite nominal reported capacity.",
+    "Hypothesis 4: Traffic shaping / tenant misconfiguration \u2014 a small number of tenants sent large batched bulk requests (high batch_size, high tokens_generated) that congested local queues and evicted KV caches for shared models.",
+    "Hypothesis 5: Regional network hiccup \u2014 transient egress/backhaul latency caused slowed worker-heartbeats leading to temporary inaccurate capacity signals and aggressive throttling by the router layer (no node events but region-level throttle upticks)."
+  ],
+  "action_items": [
+    "1) Run targeted replays for top 10 tenants from sample_rows on a local staging fleet with KV cache enabled to reproduce eviction signature (owner: Maya).",
+    "2) Correlate autoscaler decision logs with throttle_rate timeline and add a short-term metric alert for 'throttle_rate > 1% for 5m during autoscaler cooldown' (owner: Liam).",
+    "3) Capture extended debug traces (router + serving runtime) for next 7 days for models in top offending list and enable 1% debug sampling for these tenants (owner: Sofia).",
+    "4) Add a control-plane runbook to detect cache-eviction cascades: alert when eviction_count / total_kv_size increases > 300% within 10m and throttle_rate > 0.5% (owner: Jamal).",
+    "5) Follow-up: schedule a scheduler-snapshot audit to review recent packing changes in the last 30 days and roll back if density anomalies are found (owner: infra-scheduling team)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "objective",
+    "approach",
+    "raw_queries",
+    "columns",
+    "sample_rows",
+    "observations",
+    "hypotheses",
+    "action_items"
+  ],
+  "dataset_doc_uuid": "dsid_633c42db9d394522b7933cd9da534617",
+  "original_location": "google_drive/shared_drives/engineering/infrastructure/gpu-fleet-throttle-rootcause-hypotheses-2026-12-03.json"
+}

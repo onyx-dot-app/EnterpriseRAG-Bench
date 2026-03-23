@@ -1,0 +1,96 @@
+{
+  "key": "ENG-881234",
+  "team": "engineering",
+  "title": "Stride-aware KV pool and incremental compaction playbook",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-01-12",
+  "updated_at": "2026-03-04",
+  "creator": "Maya Thompson",
+  "assignee": "Jin Park",
+  "project": "runtime-memory-2026",
+  "cycle": "2026-W09",
+  "estimate": "5",
+  "release": "runtime-1.24",
+  "labels": [
+    "kv-cache",
+    "gpu-memory",
+    "continuous-batching",
+    "compaction",
+    "telemetry"
+  ],
+  "security_review_required": "false",
+  "description": "High-level design and implementation plan for a stride-aware KV allocation pool combined with an incremental, low-latency compaction mechanism to reduce GPU memory fragmentation while preserving continuous batching throughput and latency SLOs.",
+  "background": "Current KV cache allocation is a mixed-size arena that suffers from long-tail fragmentation when workloads interleave short- and long-sequence requests. Fragmentation increases peak GPU memory usage and causes OOM handoffs to fallbacks or model variant downgrades. Continuous batching interactions make heavy-handed global compaction unacceptable because it stalls serving and degrades tail latency. Several prior tickets experimented with slabbing, microstripes, and background relocation; this work aims to introduce a complementary stride-aware pool and an incremental compaction playbook that targets the fragmentation modes we see in production traces.",
+  "goals": "1) Reduce resident fragmentation by at least 30% on 95th-percentile memory usage across representative workloads. 2) Keep single-request p95 / p99 latency regressions under 3% while compaction runs. 3) Integrate with continuous batching so compaction work happens within batch-scheduling gaps and during KV-access idle windows. 4) Provide actionable telemetry for future tuning and automatic policies.",
+  "proposed_solution": "A hybrid allocator that partitions the KV store into stride classes based on recent sequence-length distributions (stride buckets like S, M, L, XL). Each stride class has its own sub-pool with slot sizing tuned to its typical token/key footprint. New allocations are fast-path routed to the matching stride pool using a cheap length-hint from the request. To mitigate long-lived fragmentation within a pool we run an incremental compaction controller that: (a) selects candidate segments using live-change density + coldness heuristics, (b) batch-relocates hot keys into contiguous slots using small relocation micro-batches aligned with serving micro-batches, and (c) updates indirection metadata atomically so in-flight requests use redirection stubs until relocation completes. The compaction controller yields to latency-critical serving by tracking in-flight token/pipeline windows and pacing relocation to gaps between continuous-batching dispatches.",
+  "implementation_details": "- Stride buckets: determine stride boundaries via sampled per-request sequence histograms over a rolling 1-minute window. Default buckets: 0-32, 33-128, 129-512, 513+. Buckets are configurable per-deployment.\n- Sub-pools: each bucket uses a compacting arena with power-of-two slot sizing tuned to median+90th token footprint. Pools maintain free-lists and a lightweight allocation bitmap in GPU device memory for O(1) allocation.\n- Metadata layout: keep a host-side checkpointed allocation directory with per-key (pool_id, slot_id, version) and a small device-resident indirection table for fast lookup. Indirection entries are updated via CAS on the host driver and flipped in a single device-atomic write to avoid races.\n- Incremental compaction controller: runs as a low-priority thread in the serving process. Candidate selection uses a decay-weighted coldness score (access_count * recency_decay) and a fragmentation score (free_ratio in local segment). We only relocate when coldness > threshold and expected relocation bytecount < pacing_budget.\n- Relocation micro-batching: relocation is grouped into relocation batches sized to match typical continuous-batch token windows (configurable, default 1280 tokens worth of KV movement). These micro-batches execute between contiguous serving dispatch windows to minimize queuing interference.\n- Fallbacks: if compaction backlog grows or tail latency spikes, controller reduces pace and falls back to opportunistic GC-only reclamation. In extreme memory pressure, oldest XL pool entries are paged out to host memory with a best-effort async swap to preserve serving.\n- Crash safety: relocation uses a two-phase commit: write-new-slot -> flush device metadata -> flip indirection -> mark old slot free. Host checkpoint (every N relocations) ensures recovery can rebuild pools after unexpected restarts.",
+  "compatibility_constraints": "Must interoperate with existing KV API (get/put/evict) and the continuous-batching scheduler. Requires adding a small device-side indirection table and host-side relocation coordinator. No change to model formats or user-facing APIs. Existing config flags for eviction/quantization must be honored; this feature can be toggled per-deployment.",
+  "rollout_plan": "1) Feature branch with allocator and controller behind a runtime flag. 2) Unit+integration tests in CI that simulate mix workloads (short vs long) and verify safety properties. 3) Canary rollout to low-traffic region with telemetry gates. 4) Gradual expansion to production by traffic % while monitoring memory-frag, p95/p99 latency and relocation error rates. 5) Automatic scaling: enable auto-pacing heuristics after 2 weeks stable canary behavior.",
+  "acceptance_criteria": [
+    "Mem-fragmentation reduction >= 30% on 95th percentile compared to baseline on three benchmark workloads (chat, completion burst, long-context streaming)",
+    "End-to-end tests cover relocation atomicity and crash recovery with simulated GPU/process failures",
+    "P95/P99 latency during steady-state and during controlled compaction runs within 3% of baseline",
+    "Telemetry dashboards for pool utilization, relocation throughput, compaction backlog, and swap-to-host counts exist and are populated in staging",
+    "Canary rollout shows no increase in error budget or SLO violations for 48h at each expansion step"
+  ],
+  "metrics": [
+    "kv_mem_fragmentation_95pct",
+    "kv_pool_utilization_by_stride",
+    "relocation_bytes_per_minute",
+    "compaction_backlog_size",
+    "p95_request_latency",
+    "p99_request_latency",
+    "host_swap_count",
+    "compaction_retries_and_errors"
+  ],
+  "test_plan": [
+    "Unit tests for allocator correctness and free-list semantics",
+    "Integration test: mixed-length synthetic workload (50/30/20 short/medium/long) with continuous-batching on/off",
+    "Chaos test: kill serving process mid-relocation and validate recovery reconstructs indirection and frees old slots",
+    "Perf test: run production-like traffic in perf cluster and measure fragment reduction & latency impact",
+    "Long-running soak: 72h canary with heavy tail workload and automated alerts"
+  ],
+  "risks": [
+    "Relocation can interact poorly with hot keys, causing extra tail latency if heuristics misclassify hotness",
+    "Indirection table size increases device memory pressure slightly; if mis-sized we can lose expected gains",
+    "Swap-to-host during compaction could thrash PCIe if triggered aggressively",
+    "Complexity of two-phase relocation increases surface area for bugs and recovery edge-cases"
+  ],
+  "dependencies": [
+    "ENG-742001: continuous-batching scheduler hooks (for gap detection)",
+    "ENG-810210: device-resident CAS primitives and small atomic-write support",
+    "PM-556: rollout plan and canary gating signoff",
+    "infra-kms: permissions for host checkpoint storage"
+  ],
+  "links": [
+    "https://confluence.redwood/runtime-memory/stride-aware-kv-design",
+    "https://github.com/redwood-inference/runtime/pull/1589",
+    "perf-dashboard://dashboards/kv-frag/stride-aware-canary"
+  ],
+  "comments": [
+    "2026-01-15: Jin Park - Created prototype of sub-pool free-list in device memory; microbench shows 8% allocation latency improvement for short buckets.",
+    "2026-01-28: Maya Thompson - Updated coldness score to include per-segment variance to avoid relocating segments with a small number of long-running hot keys.",
+    "2026-02-10: QA - Added chaos recovery tests to test_plan after finding a race in indirection flip under high concurrency.",
+    "2026-03-02: Eng-Infra - Confirmed device CAS primitive is available in runtime-1.24; minor adjustments to metadata layout recommended."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "background",
+    "goals",
+    "proposed_solution",
+    "implementation_details",
+    "compatibility_constraints",
+    "rollout_plan",
+    "acceptance_criteria",
+    "metrics",
+    "test_plan",
+    "risks",
+    "dependencies",
+    "links",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_34e7a72efb6347e7afbf8d51c550ff4d",
+  "original_location": "linear/engineering/ENG-881234-kv-stride-aware-pool-and-incremental-compaction-playbook.json"
+}

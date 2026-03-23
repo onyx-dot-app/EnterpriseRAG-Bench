@@ -1,0 +1,34 @@
+{
+  "title": "wavepacket-surge-benchmark-diary-daniel",
+  "owner": "Daniel Ortega",
+  "drive_area": "users",
+  "path": "users/wavepacket-surge-benchmark-diary-daniel",
+  "doc_type": "doc",
+  "created_at": "2026-02-20",
+  "last_modified": "2026-03-01",
+  "collaborators": [
+    "Priya Menon",
+    "Samir Rao"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "burst",
+    "benchmark",
+    "wavelet",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "https://linear.app/RED/issue/WV-421-wavepacket-gen",
+    "https://github.com/redwood-inference/benchmarks/pull/312",
+    "slack://channel/eng-runtime#thread-8n2x"
+  ],
+  "content": "Context and goal:\n- Quick personal log of a run I did to understand tail behavior for 'wavepacket' arrival shapes (sine-modulated Poisson) against the 8xA100 serving pool. Trying to capture repeatable steps + raw observations so we can iterate.\n\nHypothesis:\n- Periodic microbursts (wavepackets) with short high-density windows overwhelm batching heuristic and cause >2x p99 inflations vs steady Poisson at same average QPS.\n- Root levers: batch timeout, max-batch-size, KV cache warm/priming strategy, preemption/backpressure thresholds.\n\nSetup summary:\n- Model: openlm-7b-quant (seq_len=1024) pinned to instance group rwd-dedicated-8xA100-32G\n- Runtime: rwd-serving v3.8.1 (local build with debug batch-allocator flag enabled)\n- Load generator: custom tool 'wavegen-v0.4' (node) that emits sine-modulated Poisson arrivals: lambda(t) = base + amp * sin(2*pi*t/period).\n- Test parameters: base=60 qps, amp=90 qps, period=30s (i.e., bursts lasting ~8-10s), test duration 30 min.\n- Payload: avg tokens 128 (prompt+gen), temperature=0.2, streaming disabled.\n- Concurrency settings: 200 client connections, 4 clients across 4 worker hosts.\n- Batch config under test: default (batch_timeout_ms=15, max_batch_tokens=16384, max_batch_examples=32) and tuned (batch_timeout_ms=6, max_batch_examples=16).\n\nCommands (approx):\n- Start runtime: ./rwd-serving --config configs/dedicated-8xA100.json --enable-debug-batch-allocator\n- Launch wavegen: node wavegen.js --base 60 --amp 90 --period 30 --duration 1800 --conns 200 --seq 1024 --token-dist \"128,32\" --targets http://rwd-host:8080/generate\n\nKey raw metrics (representative run, default batch config):\n- avg QPS (observed): 145\n- throughput (tokens/sec): ~18k\n- p50 latency (response complete): 48 ms\n- p95 latency: 210 ms\n- p99 latency: 1.12 s\n- p999 latency: 2.8 s (tail spikes during burst onset)\n- batch size median: 22 examples; during peaks median -> 28, spikes hit 32 (capped)\n- KV cache hit-rate: 0.82 overall; drops to 0.74 during burst start (cache priming gap)\n- observed CPU on host: 78% avg, GPU utilization: 91% during bursts\n- observed queue length (server-side): short spikes to 110 reqs queued at burst onset, then drained within 1.5-3s once batching ramps.\n\nTuned run (batch_timeout_ms=6, max_batch_examples=16):\n- avg QPS: 143 (similar)\n- p50: 46 ms\n- p95: 160 ms (improved)\n- p99: 520 ms (improved ~2x)\n- p999: 1.4 s\n- batch size median: 12; during peaks -> 16 (capped)\n- queue spikes smaller: to ~48 reqs queued\n- noticed throughput drop during sustained peak slices if we over-aggressively reduce batch window (net tokens/sec lost ~8%)\n\nShort conclusions / takeaways:\n- Reducing batch_timeout and max_examples helps considerably for tail latency (p99/p999) at the expense of peak token throughput. For latency-sensitive customers, the tradeoff looks attractive up to a ~8% cost in tokens/sec.\n- The biggest jerk in tail happens at burst onsets where KV-cache effective hit-rate dips (priming IO + model kv-population mismatch). Those ~1-3s tails correlate with cache-miss floods.\n- Batching heuristics that adapt to arrival curvature (d/dt of QPS) would likely reduce onset spikes: i.e., shorten timeout proactively when a fast up-slope is detected.\n\nObservations / oddities to investigate:\n- Occasionally saw a 6-8s outlier (~p9999) where request stayed in queue but server reported 'batch allocated' and then timed out. Need to check RPC layer and any per-batch backoff/retry interactions. Create trace id next time.\n- The debug batch allocator logs show occasional lock contention inside allocator when two large batches try to merge; need to repro with smaller cluster and instrumentation.\n- When I re-ran with streaming enabled, p99 improved slightly (less variance on response complete) but overall complexity increased (client-side windowing). Worth a separate pass.\n\nNext actions / TODOs:\n- [ ] Re-run with KV-cache priming baseline: run short warmup traffic 30s before every burst window, measure difference.\n- [ ] Add instrumentation: emit trace-id from wavegen and ensure server logs batch_id -> trace_id mapping; upload to GH PR linked above.\n- [ ] Try adaptive batch timeout: simple PID-like controller that drops batch_timeout by 2x for 3s when slope > threshold. Quick simulator in Python first.\n- [ ] Investigate lock contention in allocator: reproduce with stress harness and enable lock profiling (tsan-like).\n- [ ] Run with heterogenous GPU mix (mix of A100 + H100) to see scheduling artifacts.\n\nNotes to self / quick heuristics:\n- If p99 > 3x desired SLO during 10s burst windows, try batch_timeout<=8ms and max_examples<=16 as first cut.\n- If tokens/sec drop >10% after tuning, consider adding short burst-only burst-queue lane with temporary reserved slots (costly but stabilizes p99).\n\nReferences and context links:\n- Linear: WV-421 (wavepacket load generator)\n- Bench PR: github.com/redwood-inference/benchmarks/pull/312 (contains the wavegen code and parse scripts)\n- Slack thread: #eng-runtime 'wavepacket burst observations' dated Feb 20 2026\n\nFreeform scratch / raw CLI outputs (pasted):\n- default run snippet: \"[2026-02-20 14:08:32] avg_qps=145 p50=48ms p95=210ms p99=1120ms queued_peak=110 batch_median=22\"\n- tuned run snippet: \"[2026-02-20 15:42:18] avg_qps=143 p50=46ms p95=160ms p99=520ms queued_peak=48 batch_median=12\"\n\nRandom thoughts:\n- Could try a middle ground: keep batch_timeout small for first 150ms of a detected up-slope, then relax to normal to recover throughput. Might need two-tier timers per worker.\n- Consider exposing an 'arrival-curvature' metric in console so customers can correlate time windows with SLO breaches.\n\nEnd of log. Will re-run after adding trace-id mapping and capture full flamegraphs for allocator.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_95b67d80a0e84b209e73953f5db7f36b",
+  "original_location": "google_drive/users/wavepacket-surge-benchmark-diary-daniel.json"
+}

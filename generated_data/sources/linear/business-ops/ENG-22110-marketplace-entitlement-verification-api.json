@@ -1,0 +1,53 @@
+{
+  "key": "ENG-22110",
+  "team": "engineering",
+  "title": "Marketplace entitlement verification API (AWS/GCP) for subscription \u2192 org provisioning flow",
+  "status": "In Review",
+  "priority": "P0",
+  "created_at": "2026-01-10",
+  "updated_at": "2026-02-10",
+  "creator": "Priya Natarajan",
+  "assignee": "Ethan Park",
+  "project": "Cloud Marketplace Listing Refresh",
+  "cycle": "2026-W06",
+  "estimate": "8",
+  "due_date": "2026-02-12",
+  "labels": [
+    "marketplace",
+    "entitlements",
+    "control-plane",
+    "aws",
+    "gcp",
+    "onboarding",
+    "api"
+  ],
+  "dependencies": [
+    "PM-1843",
+    "PM-1844",
+    "ENG-22116",
+    "ENG-22115"
+  ],
+  "sub_issues": [
+    "ENG-22112",
+    "ENG-22114",
+    "ENG-22111"
+  ],
+  "customer_impact": "high",
+  "release": "control-plane-2026.02",
+  "security_review_required": "true",
+  "body": "## Context\nMarketplace buyers currently hit a confusing failure mode in the first 30\u201390 minutes after subscription: Redwood Console can\u2019t reliably determine whether the customer is entitled (and to what SKU limits), especially when entitlement propagation is delayed or when the customer already has a Redwood org.\n\nThis ticket implements/extends control-plane API endpoints used by the marketplace onboarding entrypoint to:\n1) verify a buyer\u2019s AWS/GCP marketplace subscription is active and mapped to a Redwood SKU\n2) return a stable entitlement object (or a clear, retryable error) that Console + provisioning can act on\n3) support edge cases (existing org linking, multiple subscriptions, delayed propagation)\n\nThis is a critical dependency for the marketplace refresh launch (time-to-first-token + reduced support escalations).\n\n## Goals / Non-goals\n### Goals\n- Provide a single verification API surface for both AWS and GCP.\n- Standardize error codes/messages so Console can show actionable UI states.\n- Keep the source-of-truth in our entitlement DB (fed by sync job), while allowing on-demand refresh when safe.\n- Add audit-grade logging for verification attempts and outcomes (no secrets).\n\n### Non-goals (for this ticket)\n- Rewriting the entitlement sync pipeline (tracked in ENG-22116).\n- Implementing billing dimension mapping (tracked in ENG-22111).\n- Console UI work (tracked in ENG-22112).\n\n## Proposed API surface\nAll endpoints are under control-plane (\"api.redwoodinference.com\") and require Redwood user auth (session/JWT) unless otherwise noted.\n\n### 1) Verify entitlement (primary)\n**POST** `/v1/marketplace/entitlements:verify`\n\n**Request fields (conceptual)**\n- `provider`: `aws` | `gcp`\n- `subscription_id`: provider-specific subscription identifier (AWS customer identifier / agreement id; GCP entitlement id)\n- `account_id`: provider account/project identifier (AWS payer/account; GCP billing account/project) (optional but recommended)\n- `org_id`: Redwood org being linked (optional; required for \"link\" flows)\n\n**Response**\n- `status`: `entitled` | `not_entitled` | `pending` | `blocked`\n- `entitlement_id`: Redwood internal entitlement id (when available)\n- `sku`: marketplace SKU identifier (e.g., `ri.hosted.usage`, `ri.dedicated.reserved`, `ri.private.license`, + add-ons)\n- `limits`: derived limits/quotas for onboarding display (high-level; no billing internals)\n- `effective_at`, `expires_at` (if contract/term-based)\n- `next_action`: `link_org` | `create_org` | `retry` | `contact_support`\n\n### 2) Fetch entitlement by provider identifier (support/debug + Console polling)\n**GET** `/v1/marketplace/entitlements/{provider}/{subscription_id}`\n- Returns the last-known entitlement record from our DB (including `last_synced_at`).\n\n### 3) Link entitlement to org (explicit step)\n**POST** `/v1/marketplace/entitlements:link`\n- Requires user has admin role on `org_id`.\n- Idempotent: linking the same entitlement to the same org is a no-op.\n- If entitlement is already linked to a different org, return a deterministic error for Console (see error codes).\n\n## Error codes / Console-facing semantics\nReturn structured errors with a stable `code` and human-safe `message`.\n\nRequired codes:\n- `ENTITLEMENT_PENDING_PROPAGATION`: No entitlement found yet; recommend retry after N minutes.\n- `ENTITLEMENT_NOT_FOUND`: Verified lookup completed but no active entitlement exists.\n- `ENTITLEMENT_INACTIVE_OR_EXPIRED`: Entitlement exists but is not active.\n- `ENTITLEMENT_ALREADY_LINKED`: Entitlement is linked to a different org.\n- `PROVIDER_ID_MISMATCH`: Subscription id does not match account/project context.\n- `PROVIDER_UNAVAILABLE`: Provider API timeout/unavailable (only if we attempt on-demand provider validation).\n- `SYNC_STALE_TRY_AGAIN`: DB record exists but is older than staleness threshold and refresh attempt failed.\n- `UNAUTHORIZED_ORG_ADMIN_REQUIRED`: user lacks permission to link.\n\nConsole mapping guidance (to share w/ Chloe/Design):\n- `PENDING_PROPAGATION` and `SYNC_STALE_TRY_AGAIN` are retryable with clear CTA and expected timing.\n- `ALREADY_LINKED` should direct user to contact support with entitlement id.\n\n## Implementation notes\n### Data sources\n- Primary: `marketplace_entitlements` table (populated by entitlement sync job).\n- Optional on-demand refresh:\n  - If `last_synced_at` older than threshold (proposed: 10 minutes during onboarding), we may enqueue a sync for that provider+subscription and immediately return `pending` with `next_action=retry`.\n  - Avoid synchronous calls to provider APIs on the request path unless we have strict timeouts + caching; preference is enqueue refresh + return.\n\n### Idempotency + concurrency\n- `:link` endpoint must be idempotent; use transaction with unique constraint on `entitlement_id`.\n- Protect against double-linking in multi-tab onboarding.\n\n### Authz\n- Verify caller is a Redwood user.\n- For link operations: require org admin.\n- Do not expose provider raw contract details; only return minimal SKU + status + timestamps.\n\n### Logging / audit\n- Emit audit event: `marketplace.entitlement.verify` with fields: provider, subscription_id_hash (hash), org_id (if present), result status, error code, latency_ms.\n- Emit audit event: `marketplace.entitlement.link` with entitlement_id, org_id, actor_user_id, outcome.\n\n### Telemetry hooks\nCoordinate event names w/ Nadia Rahman (ENG-22114):\n- `mp_verify_start`, `mp_verify_result` (status + error_code)\n- `mp_link_result`\n\n## Acceptance criteria\n- [ ] POST `:verify` returns deterministic status (`entitled`/`pending`/`not_entitled`/`blocked`) for AWS and GCP test subscriptions.\n- [ ] GET entitlement endpoint returns last-known record including `last_synced_at`.\n- [ ] POST `:link` is idempotent and enforces org-admin permission.\n- [ ] Error codes above are implemented and documented in internal API docs.\n- [ ] Unit + integration tests cover:\n  - pending propagation\n  - inactive/expired\n  - already-linked\n  - multi-subscription per org\n  - stale sync record triggering refresh enqueue\n- [ ] Audit logs/events are emitted and visible in staging.\n\n## Rollout plan\n1) Ship behind feature flag `marketplace_entitlement_verification_v2` (default off).\n2) Enable in staging; run end-to-end test plan from Partnerships (AWS/GCP).\n3) Enable for internal dogfood orgs + a small % of marketplace onboarding traffic.\n4) Full rollout after 48h with no increase in provisioning-delay tickets.\n\n## Notes from partner + support feedback\n- Support escalation SUP-4821 indicates customers can wait ~45 minutes for entitlement propagation; Console must show \"pending\" state with guidance.\n- We must avoid wording that implies Redwood can see full marketplace billing details; keep responses minimal.\n\n## Open questions\n- What is the canonical AWS identifier we can reliably request from users in Console (CustomerIdentifier vs AgreementId)? (need alignment w/ Partnerships)\n- For GCP, do we require both entitlement id and project id, or is entitlement id sufficient for verification?\n- Staleness threshold during onboarding: 10 minutes vs 5 minutes?\n\n## Links\n- Design spec (subscription \u2192 provisioning flow): sources/confluence/product-docs/design-specs/marketplace-subscription-to-org-provisioning-flow.json\n- Instrumentation task: ENG-22114\n- Console entrypoint task: ENG-22112\n- Sync hardening task: ENG-22116",
+  "comments": [
+    "2026-01-22 (Ethan Park): Drafted endpoint shapes and error codes. Preference is DB-first + enqueue refresh; synchronous provider calls only if we can bound to <2s with aggressive caching.",
+    "2026-01-28 (Chloe Martin): Console needs stable codes for UI states. Pending propagation copy should recommend retry window and surface support link only after ~90 minutes.",
+    "2026-02-03 (Marcus Lin): Security review: ensure we never log raw subscription IDs; hash before logging. Response payload should not include payer email/name from provider payloads.",
+    "2026-02-07 (Leila Farouk): Added E2E test cases to QA checklist: already-linked entitlement, switching org mid-flow, and delayed propagation with backoff retries.",
+    "2026-02-10 (Ethan Park): Implementation ready for review; added transaction guard for link idempotency + audit events. Requesting PM sign-off on staleness threshold defaults."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_312fa7def9c047f6bd9c2ca6d4f840f8",
+  "original_location": "linear/engineering/ENG-22110-marketplace-entitlement-verification-api.json"
+}

@@ -1,0 +1,93 @@
+{
+  "key": "ENG-35210",
+  "team": "engineering",
+  "title": "Define formal eviction contracts and GPU memory slicing for KV cache correctness",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-11-04",
+  "updated_at": "2026-03-05",
+  "creator": "Aisha Patel",
+  "assignee": "Marco Reyes",
+  "project": "kv-cache-core",
+  "cycle": "2026-W09",
+  "estimate": "8",
+  "due_date": "2026-03-15",
+  "labels": [
+    "kv-cache",
+    "eviction",
+    "gpu-memory",
+    "correctness",
+    "batching"
+  ],
+  "parent_issue": [
+    "ENG-33421"
+  ],
+  "dependencies": [
+    "ENG-30642",
+    "ENG-25618"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.22",
+  "security_review_required": "true",
+  "description": "Motivation: As we push continuous batching and denser KV cache packing on GPUs to optimize cost and latency, we need a precise, auditable contract for eviction behavior and a memory-slicing model that guarantees correctness across concurrent batches. Current heuristics (LRU/TTL/prefix bias) occasionally allow subtle races where an in-flight batch reads a KV entry that is concurrently reclaimed, or where prefix-scoped invalidation creates inconsistent responses across replica fallbacks. This ticket specifies formal eviction contracts, a GPU memory slicing design, and the runtime semantics required to prove 'no-stale-serves' and 'prefix-coherence' for served sequences.\n\nGoals:\n- Define an eviction contract (observable guarantees) covering LRU, TTL, and prefix-aware policies.\n- Specify snapshot-consistency semantics for continuous batching: what a batch can assume about KV entries' liveness/immutability.\n- Propose a lightweight GPU memory slicing abstraction (slices = reservation + reclamation window) that prevents in-flight reads from hitting reclaimed memory.\n- Produce an implementation plan with runtime changes, metrics, and tests sufficient to certify correctness properties for release.\n\nNon-goals:\n- This ticket does not change the cache replacement algorithm itself (we'll keep LRU/TTL/prefix heuristics configurable). It focuses on formalizing guarantees and the glue to make those heuristics safe in our continuous-batching runtime.",
+  "acceptance_criteria": [
+    "A written eviction contract document exists (PDF/Confluence) that defines observable guarantees for LRU/TTL/prefix-aware modes.",
+    "Runtime implements slice-based reservation with an API to acquire/release a slice for a batch request.",
+    "Unit + integration tests proving that no in-flight request reads memory belonging to a different lifetime than the contract allows (property tests included).",
+    "Metrics emitted: eviction_events_total, eviction_reason{policy}, slice_acquisitions_total, slice_conflicts_total, kv_stale_serves_detected (should be 0 in tests), and per-prefix eviction_churn_rate.",
+    "Canary rollout plan and rollback criteria documented and validated on dedicated-dev cluster."
+  ],
+  "implementation_notes": [
+    "Eviction contract (informal summary):\n  - Liveness window: an entry must remain readable for the duration of any batch that began while the entry was live. Batches take a logical snapshot at dequeue time.\n  - Atomic invalidation: prefix invalidation API must atomically mark entries as invalid for any batches starting after the invalidation point. Ongoing batches that took a snapshot before invalidation must continue to see the old entry.\n  - TTL semantics: expire-time is treated as 'not-visible' for batches that start at or after expiry; batches that started before expiry retain visibility until completion.\n  - LRU/space-reclamation: physical memory reclamation can only occur after all batches that could reference the entry complete and after a reclamation grace window tied to slice semantics.\n\n  These are expressed in the Confluence doc as state-transition invariants and observable test cases.",
+    "GPU memory slicing:\n  - Model GPU memory is partitioned into slices. Each slice tracks a small set of KV allocations and an 'active epoch' counter.\n  - A batch acquires a read-hold on the relevant slices (by prefix-hash) before decoding; this increments slice.active_epoch and prevents reclamation.\n  - Eviction marks entries for reclamation but physically frees memory only when slice.active_epoch == slice.last_closed_epoch and after a per-slice reclamation delay (configurable, default 50ms).\n  - This avoids global locking and keeps slice eviction cheap; slices are sized to balance contention vs memory fragmentation (default 8-32MB).",
+    "Integration with continuous batching:\n  - Batcher will produce a list of relevant prefixes (approx or exact) at dequeue time. That list is used to acquire slice read-holds before the first token generation.\n  - For cases where prefixes cannot be known precisely (e.g., prompt prefixing caused by dynamic tools), we use an overapproximation that acquires extra slices (bounded by a 3-slice cap) to avoid blocking the pipeline.\n  - We must ensure KV reads in the decoder reference slice-local offsets; any relocation must be synchronized with epoch fences.",
+    "API changes:\n  - kv.reserve_slices(prefix_hashes) -> reservation_token\n  - kv.release_reservation(reservation_token)\n  - kv.mark_prefix_invalidate(prefix_hashes, invalidation_id) (atomic semantics)",
+    "Rollback plan: If we detect regressions during canary, the system gates will fall back to previous eviction path with a runtime flag (kv.enable_slice_reservations=false) and revert batcher to conservative single-batch mode."
+  ],
+  "test_plan": [
+    "Unit tests for slice reservation: simulate concurrent batches that touch overlapping prefixes and verify no memory overlap freed while reads occur.",
+    "Property-based tests: random sequences of inserts/evictions/invalidations and batch start/complete events; assert invariants (no-read-after-free, prefix-coherence).",
+    "Integration test on dedicated-dev with mixed workload (chat + long-context generation) to observe cache hit/loss and verify kv_stale_serves_detected==0 over 24h soak.",
+    "Fuzz test: race fuzzing on eviction + batch dequeue + prefix invalidation operations using our race harness.",
+    "Perf benchmarks comparing baseline (no slicing) vs slicing with various slice sizes (8MB, 16MB, 32MB) measuring tail latency and GC stalls."
+  ],
+  "rollout_plan": [
+    "Phase 1 - internal dev: merger of spec and core runtime changes behind feature flag; run unit and property tests locally (owner: Marco).",
+    "Phase 2 - dedicated-dev canary: enable on 5% of traffic for a non-critical model fleet for 72h; monitor stale-serves, p95/p99 latencies, and eviction churn. If kv_stale_serves_detected>0 or p99 regresses >5%, roll back immediately.",
+    "Phase 3 - customer pilot: enable for selected Dedicated customers with explicit opt-in and extended telemetry (7 days).",
+    "Phase 4 - GA: enable by default with conservative defaults and guided tuning doc."
+  ],
+  "comments": [
+    "2025-11-06 - Marco Reyes: Initial draft of eviction contract posted to Confluence https://redwood.atlassian.net/wiki/spaces/INF/pages/EVCT-Contracts. Need feedback from infra and runtime teams on the 'active_epoch' semantics.",
+    "2025-11-20 - Linh Tran (runtime): Reviewed. Concern: acquiring slices per-dequeue may add overhead for very low-latency short prompts. Suggest a fast-path that skips reservation for single-token micro requests. Action: add metric 'slice_reservation_latency_ms'.",
+    "2025-12-02 - SRE (Javier Morales): Added monitoring checklist and alert thresholds. Proposed alert: eviction_conflict_rate > 0.1% sustained -> pager if customer_impact=high.",
+    "2026-01-15 - Design review (Aisha): Decided to prefer small fixed-size slices over variable size to simplify GPU allocator integration. Trade-off: slightly higher fragmentation vs simpler correctness reasoning.",
+    "2026-02-10 - PR #4389 opened: runtime: add slice reservation counters and API stubs. https://github.com/redwood-inference/runtime/pull/4389",
+    "2026-03-02 - Marco Reyes: Added property-test harness in tests/kv_proptests, discovered a race where TTL expiry at precise boundary allowed stale read when batch start==expiry. Fix: treat expiry as exclusive for new batches; appended to doc.",
+    "2026-03-05 - Aisha Patel: Updated acceptance criteria to require integration soak on dedicated-dev. Assigned estimate=8."
+  ],
+  "links": [
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/INF/pages/EVCT-Contracts",
+    "Design doc (PDF): drive://redwood-internal/kv-eviction-contracts-v1.pdf",
+    "GitHub PR: https://github.com/redwood-inference/runtime/pull/4389",
+    "Benchmark dashboard: https://dash.redwood.ai/d/kv-eviction-slices"
+  ],
+  "notes": [
+    "Key trade-offs: stronger guarantees (no stale serves) require per-batch acquisition overhead and some memory fragmentation. We tune slice size and grace window to balance latency vs memory efficiency.",
+    "Operationally important: per-prefix eviction churn is now a first-class metric to detect noisy tenants. We'll work with marketplace and sales to notify high-churn customers with suggested config changes.",
+    "Long-term: explore hardware-assisted fencing (CUDA stream fences + memory mapping) to reduce slice reservation overhead; tracked in RFC-eviction-hw-accel (future)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "implementation_notes",
+    "test_plan",
+    "rollout_plan",
+    "comments",
+    "notes",
+    "links"
+  ],
+  "dataset_doc_uuid": "dsid_b99085a1aeee48ab81016aefc92ff7ec",
+  "original_location": "linear/engineering/ENG-35210-kv-eviction-contracts-memory-slicing.json"
+}

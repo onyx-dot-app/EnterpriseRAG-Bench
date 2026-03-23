@@ -1,0 +1,62 @@
+{
+  "repo": "redwood",
+  "pr_number": "39521",
+  "title": "pipeline: introduce prefill/decode handshake with adaptive kernel handoff and KV-aware throttle",
+  "author": "Asha Iyer",
+  "created_at": "2025-09-30",
+  "updated_at": "2025-10-05",
+  "merged_at": "2025-10-05",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/pipeline-prefill-handshake-adaptive-scheduler",
+  "reviewers": [
+    "Jonah Park",
+    "Marta Ruiz",
+    "Eliot Chen"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kv-cache",
+    "scheduler"
+  ],
+  "linked_linear": [
+    "ENG-7623",
+    "ENG-7790"
+  ],
+  "linked_jira": [
+    "SUP-1121"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "1842",
+  "deletions": "312",
+  "merge_method": "squash",
+  "breaking_change": "false",
+  "release_notes": "Introduces a handshake between prefill and decode stages that enables an adaptive kernel handoff and KV-cache-aware throttling to reduce tail latency and microburst-induced KV thrashing. No API changes.",
+  "files_changed": [
+    "runtime/scheduler/handshake_scheduler.py",
+    "runtime/kernels/kernel_selector.cpp",
+    "runtime/kv/kv_throttle_manager.cpp",
+    "runtime/kv/kv_throttle_manager.h",
+    "runtime/serving/prefill_protocol.proto",
+    "runtime/serving/prefill_handler.cpp",
+    "runtime/serving/decode_handler.cpp",
+    "metrics/telemetry/prefill_handshake_events.yaml",
+    "tests/integration/test_prefill_handshake.py",
+    "benchmarks/pipeline/bench_prefill_handoff.py",
+    "docs/ops/prefill-handshake.md",
+    "ci/gpu-kernel-smoke.yml",
+    "examples/pipeline-alignment/README.md",
+    "tools/trace/handshake_visualizer.py"
+  ],
+  "description": "Motivation: We observed two classes of production tail events for short (<=128 token)generation workloads: 1) microbursting where many concurrent prefill requests enter the runtime and cause KV-cache churn and eviction storms; 2) kernel cold-switch overhead where decode stage must switch kernel/code-paths mid-response for a small subset of requests, adding 10-30ms tail noise. This PR implements a lightweight handshake between prefill and decode so the scheduler can make an informed kernel handoff decision and apply KV-cache-aware backpressure.\n\nWhat this change does (high level):\n- Adds a prefill/decode handshake protocol (prefill_protocol.proto) where prefill includes a small header: model_hint, expected_decode_window (tokens), kv_version_hint, and preferred_kernel_mask. The handshake is intentionally small (few bytes) to keep cost negligible.\n- Introduces HandshakeScheduler (runtime/scheduler/handshake_scheduler.py + C++ hotpath hooks) that maintains a short-lived per-request \"handoff\" state. The scheduler uses the handshake to:  a) choose an initial kernel candidate, b) reserve a kernel window slot (adaptive window) to avoid kernel cold starts during decode, c) apply KV-aware throttle tokens to stagger prefill admission when KV eviction pressure is high.\n- Implements adaptive kernel handoff in kernel_selector.cpp: we added a moving-window heuristic that prefers kernels previously hot for similar model_hint+sequence_length buckets. This reduces per-request kernel initialization for mixed-model clusters.\n- Adds KVThrottleManager (kv_throttle_manager.*) which tracks per-GPU KV eviction rate and issues short (10-200ms) prefill admission holds for low-priority requests. The throttle integrates with the existing priority queues so bursty traffic is smoothed without global capacity drops.\n- Alignment/continuous-batching tweak: a light-weight microbatch aligner ensures decode-stage token window boundaries align with previously reserved kernel windows to let the handoff produce fewer kernel switches. This is a runtime-only optimization with a feature-flag and config knobs.\n\nBenchmarks and numbers (internal perf lab):\n- Workload: mix of 60% chat-short (max 64), 30% completion-short (max 128), 10% long tails (512), 8 concurrent clients at 100rps overall.\n- Baseline (main): 95th latency for short responses = 128ms. With this PR: 95th latency = 105ms (18% reduction). P99 improved ~12%.\n- KV eviction cycles reduced by ~26% under synthetic microburst tests. Throughput at steady-state unchanged (+1-2%).\n\nTests added:\n- integration/test_prefill_handshake.py: end-to-end handshake + fallback when decode ignores handshake.\n- bench_prefill_handoff.py: microbench harness comparing kernel switch counts with/without handoff.\n- unit tests for kv_throttle_manager and kernel_selector heuristics.\n\nOperational notes and rollout plan:\n- Feature gated (runtime config: enable_prefill_handshake=false by default). We enable on internal \"staging-prefill\" cluster for 48h, then progressively enable for low-traffic tenants for one week, monitor handshake_events telemetry, kernel_switch_rate, and kv_eviction_rate.\n- Added telemetry (metrics/telemetry/prefill_handshake_events.yaml) that emits: handshake_latency_ms, kernel_handoff_decision, kv_throttle_applied, throttle_duration_ms.\n- Rollback: set enable_prefill_handshake=false and kv_throttle_disabled=true; scheduler state decays in-flight and does not block traffic.\n\nCompatibility and fallback:\n- The handshake is backward-compatible: decode stage treats missing handshake header as a neutral hint and falls back to current behavior. Throttle manager operates on a best-effort basis and will not drop requests.\n\nCommits (summary):\n- 92f3b49 Add prefill_protocol.proto and basic handshake plumbing\n- d4a2c11 HandshakeScheduler initial implementation and python shim\n- a7c9e03 Kernel selector: adaptive window and model_hint bucket mapping\n- c1b6f2e KVThrottleManager with eviction detector and admission hold\n- f6d0fff Tests and perf harness + docs\n\nFiles changed (high level): small but focused changes across serving runtime kernel selection, scheduler, KV manager and telemetry. No public API changes.\n\nWhy this is different from previous prefill/decode work: earlier PRs focused on speculative prefill chunking and stage overlap for throughput improvements. This PR is operating at the handshake level \u2014 providing an explicit, low-cost signal between stages to coordinate kernel selection and admission control. The goal is tail-latency smoothing and KV eviction reduction rather than raw throughput wins.\n\nDocumentation: docs/ops/prefill-handshake.md describes the feature, config knobs and troubleshooting steps. Example trace visualizer (tools/trace/handshake_visualizer.py) helps ops correlate handshake decisions with kernel switches.\n\nTODOs and follow-ups:\n- Expand model_hint taxonomy with automatic fingerprinting (ENG-7790).\n- Investigate integrating handshake with regional routing to prefer co-located KV hot-shards.\n- Evaluate handshake overhead at extremely high request fan-out (>1000 concurrent clients).\n",
+  "review_conversation": "Jonah Park: Please add telemetry and unit tests for the throttle boundary. Also call out the magic numbers (10/200ms) as config knobs.\nAsha Iyer: Added throttle_duration_ms telemetry and made bounds configurable; updated tests to cover edge cases (commit a7c9e03).\nMarta Ruiz: CI flaked on gpu-kernel-smoke (kernel selection test). Can we add retry in the smoke job?\nAsha Iyer: Re-ran CI, found a race in kernel_selector cache initialization on multi-GPU test harness; fixed in d4a2c11 and added a guard. CI passed on re-run.\nEliot Chen: Reviewed kernel_selector heuristics; suggested reducing the model_hint bucket granularity to avoid overfitting; changed to coarse buckets per-model-family (commit a7c9e03). Approved after telemetry added.\nOps (Datadog): Alert suggestion: add SLO alert when kv_eviction_rate rises 2x baseline for >2 mins. Noted in docs.\nMerge: squash-and-merge after green CI and two approvals.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_conversation"
+  ],
+  "original_location": "github/redwood/pr-39521-pipeline-handshake-kernel-handoff-kv-throttle.json",
+  "dataset_doc_uuid": "dsid_51f37cc1ee474e5bbb5435db8bd0aa77"
+}

@@ -185,7 +185,7 @@ def main() -> None:
     parser.add_argument(
         "--percentage",
         type=float,
-        default=3.0,
+        default=5.0,
         help="Percentage of documents to shuffle within each source type (default: 5)",
     )
     args = parser.parse_args()

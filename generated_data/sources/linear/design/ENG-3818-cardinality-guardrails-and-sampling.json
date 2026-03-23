@@ -1,0 +1,54 @@
+{
+  "key": "ENG-3818",
+  "team": "engineering",
+  "title": "Usage Insights: cardinality guardrails + sampling for route/model breakdowns",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-01-07",
+  "updated_at": "2026-02-20",
+  "creator": "Logan Wright",
+  "assignee": "Thomas Baird",
+  "project": "In-console usage insights",
+  "cycle": "2026-W08",
+  "estimate": "8",
+  "due_date": "2026-03-01",
+  "release": "console-2026.03",
+  "customer_impact": "high",
+  "security_review_required": "false",
+  "labels": [
+    "telemetry",
+    "analytics",
+    "cardinality",
+    "performance",
+    "guardrails",
+    "beta-blocker"
+  ],
+  "parent_issue": "PM-1427",
+  "dependencies": [
+    "ENG-3812",
+    "ENG-3813",
+    "ENG-3814",
+    "ENG-3822",
+    "ENG-3821"
+  ],
+  "description": "Problem\nUsage Insights requires grouping usage/cost by route + model. Without guardrails, the route dimension can explode (e.g., untemplated IDs, user-defined paths, OpenAI-compat proxies), driving:\n- warehouse costs (scan + group-by)\n- slow/timeout queries for 7\u201330d ranges\n- noisy/misleading \u201ctop drivers\u201d (long tail dominates)\n- ingestion issues (high-cardinality tags)\n\nThis ticket implements guardrails across ingestion/aggregation/query to keep cardinality bounded while preserving useful reporting.\n\nGoals\n1) Prevent route dimension explosion in the aggregated dataset and query service.\n2) Handle untemplated or unknown paths safely (bucket + visibility).\n3) Cap query complexity so the console remains interactive (and export remains reliable).\n4) Add alerts so we detect regressions early (new route patterns, normalization failures, abusive queries, etc.).\n\nNon-goals\n- Changing the canonical route normalization rules themselves (owned by ENG-3813 / ADR).\n- Building per-customer custom dimensions beyond the fixed set.\n\nProposed guardrails (implementation)\nA) Ingestion + normalization hardening\n- Enforce use of normalized_route from the shared library (ENG-3813) at the point of metering event creation (ENG-3822).\n- Introduce a dedicated field: route_group (string) used for analytics, which is:\n  - the normalized templated route if normalization succeeds (e.g., \"/v1/files/{file_id}\")\n  - otherwise one of:\n    - \"/__unknown_route\" (missing/empty)\n    - \"/__untemplated\" (detected dynamic segment w/o template)\n    - \"/__invalid\" (malformed)\n- Add boolean flags on event -> aggregation input:\n  - route_is_templated\n  - route_is_openai_compat (best-effort; based on gateway route map)\n\nNotes\n- We must keep raw route_path out of the aggregation key. Raw route is allowed only in debug logs (sampled) and never in the warehouse grouping key.\n\nB) Aggregation dataset constraints (ENG-3812 integration)\n- Aggregate key uses route_group, not raw path.\n- Additional constraints at aggregation time:\n  - Cap distinct route_group per workspace+day at N (proposal: N=2,000). If exceeded, automatically bucket long-tail routes into \"/__other_routes\" with route_overflow_count incremented.\n  - For each workspace+day+model_family, optionally store TopK routes (proposal: K=200) + \u201cother\u201d bucket.\n- Emit dataset-level metrics:\n  - distinct_route_group_count{workspace_id, bucket=hour|day}\n  - route_overflow_triggered_count\n  - route_unknown_count, route_untemplated_count\n  - percent_routes_untemplated\n\nRationale\nThe Console breakdown is a \u201ctop costs\u201d UI; TopK + other maintains accurate totals while preventing a pathological group-by.\n\nC) Query service guardrails (ENG-3814 integration)\nHard limits (server-side; applies to console + API + export initiation):\n- time range max:\n  - interactive endpoints: 31 days\n  - export endpoints: 90 days (async only) with explicit warnings and rate limiting\n- max group-by dimensions per request: 2 (route_group, model_family/model_version_bucket). Additional dimensions allowed only if they are low-cardinality and explicitly whitelisted (deployment_mode, region) and only one of them can be added at a time.\n- max page size: 500 rows (default 100)\n- max \u201cinclude breakdown details\u201d toggles: reject requests that request per-route per-model per-region per-project simultaneously.\n\nAdaptive behavior\n- If a request hits a complexity threshold (estimated by planner), return 422 with a structured error explaining how to narrow (shorter range, drop dimension, filter to a model/route first).\n- For console UI: we should fail gracefully with a \u201cToo much data\u201d banner and suggested filters, not a generic error.\n\nQuery complexity estimator (v1)\n- Complexity score = (days * dims_multiplier * estimated_distinct_routes * estimated_distinct_models)\n- Use recent stats table (daily distinct counts) to estimate; fall back to conservative defaults if missing.\n\nD) Sampling (debug-only)\nWe still need visibility into what is causing route explosions.\n- Add a sampled debug log stream (e.g., 0.1% per workspace, capped) that logs raw route_path + normalized_route + reason for bucketing.\n- The sampled logs are for internal debugging only and must not be exposed in customer-facing exports.\n\nE) Alerting + dashboards (SRE/Observability)\nAdd alerts (paging vs ticket) with thresholds tuned during beta:\n- distinct_route_group_count spike (e.g., >2x weekly baseline) for a workspace or globally\n- percent_routes_untemplated > 5% for >30 minutes (global) OR >10% for a specific workspace\n- route_overflow_triggered_count > 0 for any workspace in the last hour (ticket during beta; page only if sustained)\n- query_rejected_complexity_count spikes\n- p95 query latency correlated with high distinct route counts (for diagnosing)\n\nLinks / references\n- ADR: Route normalization and attribution semantics: sources/confluence/architecture-and-standards/decision-records/adr-route-normalization-and-attribution.json\n- Query service doc: sources/confluence/eng-platform/systems-and-services/usage-insights-query-service.json\n- Data freshness/quality plan: sources/confluence/eng-platform/dashboards-and-alerts/usage-insights-data-freshness-and-quality.json\n- Related support pain: SUP-24827 (missing route breakdown for OpenAI-compat), SUP-24863 (timeouts for 30-day range)\n\nAcceptance criteria\n- Aggregated dataset key is route_group (templated) and does not include raw path.\n- Distinct route groups are capped (TopK + \u201cother\u201d bucketing) without changing totals.\n- Query API rejects overly complex requests deterministically with a user-actionable error.\n- Console can render the route/model breakdown table for 30 days for a typical enterprise workspace with p95 < SLO target (see ENG-3821) and without timeouts.\n- Alerts exist for route cardinality spikes, untemplated routes, overflow bucketing, and complexity rejections.\n- Documentation snippet for internal teams: how to debug route explosions using sampled logs + metrics (add to runbook or internal notes).\n\nOpen questions\n- What should N (cap per workspace+day) be for GA? Proposal starts at 2,000; verify against top beta accounts.\n- Should \"/__other_routes\" be shown as \u201cOther\u201d in the UI (preferred) or hidden? PM to confirm.\n- For OpenAI-compat endpoints, do we want a separate normalization map in gateway to avoid \"/__untemplated\"? Likely yes, but may be a follow-up.\n\nRollout plan\n- Gate overflow bucketing behind a server-side flag: usage_insights_route_cap_enabled.\n- Beta: enable for internal + allowlist accounts first; watch distinct_route_group_count and overflow.\n- GA: enable globally once thresholds are stable and we have validated totals vs billing (ENG-3817).\n",
+  "comments": [
+    "2026-01-09 (Thomas Baird): Initial pass at constraints proposal. Biggest risk is silently hiding routes; plan is TopK + \u201cOther\u201d so totals stay correct and customers can still see the long tail impact. Will coordinate with PM on UI labeling.",
+    "2026-01-14 (Nadia Rahman): Please ensure overflow bucketing does NOT drop cost\u2014must remain included in totals to reconcile with billing. Also track overflow as a separate metric so we can explain discrepancies (\u201cOther routes aggregated\u201d).",
+    "2026-01-18 (Chloe Martin): Query-side caps are required for the console. We\u2019ve seen 30d queries time out when route cardinality goes wild. Strong preference for deterministic 422 + console copy rather than internal 500/timeout.",
+    "2026-01-22 (Allison Grant): Add alerting for untemplated ratio by region too. We had a region-specific issue for streaming endpoints missing route tags; this would have caught it earlier.",
+    "2026-02-03 (Thomas Baird): Implemented route_group bucketing logic in aggregation job branch; still need stats table for distinct counts + query complexity estimator. Overflow threshold set to 2,000 (configurable).",
+    "2026-02-12 (Felix Schneider): Console needs to render \u201cOther\u201d row with tooltip explaining bucketing. Please expose overflow_count + overflowed=true in the API response so UI can show messaging.",
+    "2026-02-19 (Thomas Baird): Added counters for route_untemplated and route_unknown. Next: wire alert templates into observability-pack (PR forthcoming) and add 422 error shape to query service (coordinate with ENG-3814)."
+  ],
+  "sub_issues": [
+    "ENG-3821"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_e6567fc8e81f4207b3f4f41a289829f3",
+  "original_location": "linear/engineering/ENG-3818-cardinality-guardrails-and-sampling.json"
+}
