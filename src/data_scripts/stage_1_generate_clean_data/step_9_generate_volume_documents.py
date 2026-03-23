@@ -7,6 +7,7 @@ import os
 import re
 import signal
 import threading
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 
 from tqdm import tqdm
@@ -910,6 +911,26 @@ class VolumeState:
 
         return []
 
+    def get_topic_remaining(self, source_type: str, topic_path_parts: list[str]) -> int:
+        """Get remaining doc count (desired - completed) for a leaf topic."""
+        with self._lock:
+            data = self._data.get(source_type)
+            if not data:
+                return 0
+            current = data.get("topics", {})
+            for i, part in enumerate(topic_path_parts):
+                if part not in current:
+                    return 0
+                if i == len(topic_path_parts) - 1:
+                    desired = current[part].get("desired", 0)
+                    completed = current[part].get("completed", 0)
+                    return max(0, desired - completed)
+                else:
+                    if "sub_topics" not in current[part]:
+                        return 0
+                    current = current[part]["sub_topics"]
+        return 0
+
     def mark_completed(
         self,
         source_type: str,
@@ -1341,9 +1362,16 @@ def generate_documents(company_overview: str, parallelism: int = 10, doc_limit: 
         print(f"\nDocument limit: will generate at most {doc_limit} of {total_pending} pending documents.")
     print()
 
-    # Track active topics and results
-    active_topics: set[tuple[str, tuple[str, ...]]] = set()
-    active_lock = threading.Lock()
+    # Build work queue — one entry per leaf topic that still needs docs
+    work_queue: deque[tuple[str, str, list[str]]] = deque()
+    for source_type in sorted(source_contexts.keys()):
+        data = volume_state.get_data(source_type)
+        if not data:
+            continue
+        for topic_path, topic_parts, desired, completed in collect_leaf_topics(data.get("topics", {})):
+            if desired > completed:
+                work_queue.append((source_type, topic_path, topic_parts))
+
     total_success = 0
     total_fail = 0
     all_errors: list[str] = []
@@ -1353,37 +1381,21 @@ def generate_documents(company_overview: str, parallelism: int = 10, doc_limit: 
         pbar = tqdm(total=effective_total, desc="Generating documents")
 
         try:
-            while True:
-                # Get pending work items from in-memory state (no disk I/O)
-                pending_work = volume_state.get_pending_work_items(
-                    set(source_contexts.keys()), active_topics, active_lock
-                )
-
+            while work_queue or futures:
                 # Check if we've hit the document limit
                 if doc_limit is not None and (total_success + total_fail) >= doc_limit:
-                    # Cancel remaining futures and break
                     for f in futures:
                         f.cancel()
                     break
 
-                # Submit new work up to available slots
+                # Fill available slots from queue (O(1) per item)
                 available_slots = parallelism - len(futures)
                 if doc_limit is not None:
-                    # Don't submit more than remaining limit
                     remaining_limit = doc_limit - (total_success + total_fail + len(futures))
                     available_slots = min(available_slots, remaining_limit)
-                submitted = 0
 
-                for source_type, topic_path, topic_parts in pending_work:
-                    if submitted >= available_slots:
-                        break
-
-                    topic_key = (source_type, tuple(topic_parts))
-                    with active_lock:
-                        if topic_key in active_topics:
-                            continue
-                        active_topics.add(topic_key)
-
+                while work_queue and available_slots > 0:
+                    source_type, topic_path, topic_parts = work_queue.popleft()
                     ctx = source_contexts[source_type]
                     future = executor.submit(
                         generate_single_document,
@@ -1398,9 +1410,8 @@ def generate_documents(company_overview: str, parallelism: int = 10, doc_limit: 
                         volume_state,
                     )
                     futures[future] = (source_type, topic_path, topic_parts)
-                    submitted += 1
+                    available_slots -= 1
 
-                # If no futures and no new work, we're done
                 if not futures:
                     break
 
@@ -1409,10 +1420,6 @@ def generate_documents(company_overview: str, parallelism: int = 10, doc_limit: 
 
                 for future in done:
                     source_type, topic_path, topic_parts = futures.pop(future)
-                    topic_key = (source_type, tuple(topic_parts))
-
-                    with active_lock:
-                        active_topics.discard(topic_key)
 
                     try:
                         success, message = future.result()
@@ -1426,6 +1433,10 @@ def generate_documents(company_overview: str, parallelism: int = 10, doc_limit: 
                         all_errors.append(f"{source_type}/{topic_path}: {e}")
 
                     pbar.update(1)
+
+                    # Re-enqueue if topic still needs more docs (success or failure)
+                    if volume_state.get_topic_remaining(source_type, topic_parts) > 0:
+                        work_queue.append((source_type, topic_path, topic_parts))
         finally:
             volume_state.stop()
             pbar.close()
