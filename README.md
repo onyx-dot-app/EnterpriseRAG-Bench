@@ -1,29 +1,57 @@
-# IndustryRAG-Dataset
+# IndustryRAG-Bench
 
-## Abstract
-**Retrieval-Augmented Generation (RAG)** has become the standard approach for grounding large language models in information that was not available during training. While many existing datasets and benchmarks focus on web or other public sources, there is still no widely adopted dataset that realistically reflects the nature of internal company knowledge. Meanwhile, startups, enterprises, and researchers are increasingly developing Agents designed to operate over exactly this kind of proprietary data. To help close this gap, we introduce a new dataset that simulates enterprise knowledge environments and provide a flexible framework for extending and tailoring the data to specific use cases.
+## 📖 Overview
 
-Key considerations:
-1. **Enterprise data varies widely** across industries, company stages, and organizational structures; therefore, any dataset-generation framework must be sufficiently general to support diverse real-world settings.
-2. To better mirror real usage, documents should be **meaningfully connected** through shared initiatives, recurring themes, overlapping topics, common authorship, and other organizational relationships.
-3. Real-world enterprise corpora are often **imperfect and noisy**, including misfiled or poorly organized documents, duplicates, and partially conflicting or outdated information; a representative dataset should capture these characteristics rather than assuming a clean, curated knowledge base.
+IndustryRAG Bench provides a dataset for company internal documents as well as a way of generating similar datasets for different industries, scales of companies, etc.
+Existing Retrieval Augmented Generation (RAG) and Information Retrieval (IR) datasets largely focus on publically accessible document sets (Bing searches, Stack Overflow forums, etc.).
+Up until now, there hasn't been a publically accessible dataset which focuses entirely on company internal data. This dataset/repo aims to provide that.
 
+The dataset consists of ~450,000 documents and 500 questions. It simulates a company called "Redwood Inference" that provides AI model inference as a service.
 
-## Quickstart
-To generate a new dataset or quickly get started with the existing, follow quickstart.md
+The data sources and rough volumes are as follows:
+- Slack: ~225,000 docs
+- Gmail: ~120,000 docs
+- Linear: ~35,000 docs
+- Google Drive: ~25,000 docs
+- Hubspot: ~15,000 docs
+- Fireflies: ~10,000 docs
+- GitHub: ~8,000 docs
+- Jira: ~6,000 docs
+- Confluence: ~5,000 docs
 
-## Methodology
-NOTE: The stuff below needs a rewrite.
+The corpus provides broad coverage across key areas of business activity including (but not limited to) planning, engineering, documentation, sales, customer success, internal discussions, emails, and more.
 
-We begin with a list of the main challenges addressed in the different stages of the dataset creation
+## Using the dataset
 
-Phase 1: Creating the clean data.
-1. The documents need to have consistent guiding principles behind them to ensure they are realistic to the company / industry they are being generated for.
-2. The generation process must allow for interdependencies between individual documents. For example code changes (Pull-Requests) are necessarily linked to Product Requirement Documents (PRDs).
-3. The distribution of documents should be realistic to real world data. As a basic example, there is likely to be orders of magnitude more discussions channel messages (Slack/MS Teams/Discord) as compared to polish product documentation.
-4. The creation of the data must allow for the generation of interesting questions for the dataset, the questions must be verifiable and answerable by the underlying data.
-5. The dataset creation process should be flexible to industry (or vertical) specific use cases and able to handle different volumes of artificial data generation (at least to some maximum number of documents).
-6. The creation of large volumes of data should not be prohibitively expensive.
+> [!TIP]
+> For more info on getting started refer to the [Quickstart Guide](quickstart.md)
 
-Phase 2: Adding noise to the data
+The dataset is downloadable from the release notes and also under export_data. To get the entire dataset as a single zip file, download [all_documents.zip](export_data/all_documents.zip).
 
+The question set can be found in [questions.jsonl](export_data/questions.jsonl).
+
+## Key Considerations
+
+To make this dataset as realistic as possible, the generation begins by gathering high level information about the company, initiatives, applications used, etc.
+Documents are generated with both high level knowledge and other documents to ensure they are meaningfully connected and coherent (as they would be in a real company).
+
+Noise is also introduced after the initial generation through steps like shuffling documents, creating near duplicates, etc. also to simulate the imperfect nature of real company data.
+
+Finally to ensure users can realistically generate their own customized datasets, the entire process is designed with cost-optimization in mind.
+Some documents need to be more strongly related to answer more interesting question types in which case more cost is acceptable.
+But at the scales of many hundreds of thousands of documents, documents cannot all be fully aware of one another without the cost exploding.
+More intelligent ways of communicating knowledge between documents is required to accomplish this.
+
+For more details on the process, refer to [methodology.md](methodology.md)
+
+## Benchmark
+
+There will be a leaderboard released for the IndustryRAG Benchmark shortly. As Onyx is also a company which sells a product based around LLMs and RAG, we will not include ourselves on the leaderboard to avoid any conflicts of interest.
+
+To provide a submission for the leaderboard please reach out to joachim@onyx.app. Submissions are required to provide a method of verification.
+- For open source applications, please provide a guide for reproducing results.
+- For closed source applications, please provide a sandbox or URL where the questions can be sent for verification.
+
+## Citation
+
+If you use IndustryRAG Bench in your research, please cite our paper: TBD

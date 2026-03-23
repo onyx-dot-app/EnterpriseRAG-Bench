@@ -8,7 +8,7 @@ import zipfile
 
 from pydantic import BaseModel
 
-from src.paths import EXPORT_DATA_DIR, SOURCES_DIR
+from src.paths import EXPORT_DATA_DIR, QUESTIONS_PATH, SOURCES_DIR
 from src.utils import (
     confirm_yes_no,
     DocumentFieldError,
@@ -427,6 +427,14 @@ def main() -> None:
     # Export files
     print("Exporting files...", flush=True)
     stats, metadata_list = export_files(config)
+
+    # Copy questions file if it exists
+    if os.path.exists(QUESTIONS_PATH):
+        questions_dest = os.path.join(EXPORT_DATA_DIR, os.path.basename(QUESTIONS_PATH))
+        shutil.copy2(QUESTIONS_PATH, questions_dest)
+        print(f"Copied {QUESTIONS_PATH} → {questions_dest}")
+    else:
+        print(f"Warning: {QUESTIONS_PATH} not found, skipping questions export.")
 
     print()
     print("Export Statistics:")

@@ -18,7 +18,7 @@ The dataset simulates a company called "Redwood Inference" that provides AI mode
 - Jira: ~6,000 docs
 - Confluence: ~5,000 docs
 
-The dataset provides broad coverage across key areas of business activity including (but not limited to) planning, engineering, documentation, sales, customer success, internal discussions, emails, and more.
+The corpus provides broad coverage across key areas of business activity including (but not limited to) planning, engineering, documentation, sales, customer success, internal discussions, emails, and more.
 
 ## Repo Layout
 
@@ -29,7 +29,8 @@ The dataset provides broad coverage across key areas of business activity includ
 `answer_evaluation` is a convenience directory with explanations on how to run eval on your final results.
 
 ### Questions File
-The dataset comes with 500 questions broken up into 10 categories:
+
+The dataset comes with 500 questions (see [questions.jsonl](generated_data/questions.jsonl)) broken up into 10 categories:
 
 | # | Category | Count | Description |
 |---|----------|-------|-------------|
@@ -46,7 +47,8 @@ The dataset comes with 500 questions broken up into 10 categories:
 
 Additionally 100 questions are provided outside of the benchmark which require parsing the metadata of the documents to answer correctly.
 These are not included in the standard set as different systems may parse metadata fields differently and the export functions provided in this code repository drop these by default.
-The intent of the export is to make the dataset as easy to use for researchers and developers as possible. To run your own exports and include the metadata, refer to the Developer Guide.
+The intent of the export is to make the dataset as easy to use for researchers and developers as possible.
+These extra questions outside of the benchmark are provided for convenience as there are many valuable use cases which rely on this type of information.
 
 For a detailed explanation on the generation/validation of these questions, refer to the paper here.
 
@@ -63,7 +65,8 @@ When unzipped, the top level will contain the different source types and within 
 A separate set of exports is provided as `export_data/google_drive_slice_0001.zip` etc. which is broken down by source type and includes up to 5000 documents max per zip.
 This is done to make it easier to use subsets of the data for different use cases. The files under this format do not contain the directory structure.
 
-## Generate your own data
+## Generating your own data
+
 One of the key considerations of this repository is to make it easy for teams to generate their own datasets which simulate company internal data.
 To do this, delete the directories `export_data`, `generated_data`, and `generation_cache` and run through the different data generation scripts.
 
@@ -75,4 +78,4 @@ The stages of generation are broken down into:
 
 Each stage has provided scripts to be run in order to generate the data. Some steps will require interactions between the user and LLM to guide the direction of the generation.
 
-For more details, check out the developer guide.
+For more details, check out the [developer guide](developer_guide.md).
