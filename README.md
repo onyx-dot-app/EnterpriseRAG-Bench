@@ -6,10 +6,10 @@ IndustryRAG Bench provides a dataset for company internal documents as well as a
 Existing Retrieval Augmented Generation (RAG) and Information Retrieval (IR) datasets largely focus on publically accessible document sets (Bing searches, Stack Overflow forums, etc.).
 Up until now, there hasn't been a publically accessible dataset which focuses entirely on company internal data. This dataset/repo aims to provide that.
 
-The dataset consists of ~450,000 documents and 500 questions. It simulates a company called "Redwood Inference" that provides AI model inference as a service.
+The dataset consists of ~500,000 documents and 500 questions. It simulates a company called "Redwood Inference" that provides AI model inference as a service.
 
 The data sources and rough volumes are as follows:
-- Slack: ~225,000 docs
+- Slack: ~275,000 docs
 - Gmail: ~120,000 docs
 - Linear: ~35,000 docs
 - Google Drive: ~25,000 docs
