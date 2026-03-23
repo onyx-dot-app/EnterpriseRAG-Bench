@@ -6,6 +6,7 @@ All functions are safe to call when tracing is not configured — they become no
 
 import atexit
 import os
+import sys
 from contextlib import contextmanager
 from typing import Any, Generator
 
@@ -53,16 +54,35 @@ def traced_span(name: str, span_type: str | None = None) -> Generator[Any, None,
     if not _initialized:
         yield None
         return
+
+    # Separate setup from body so exceptions from the body propagate correctly.
+    # Yielding inside an except block after throw() causes "generator didn't stop after throw()".
+    span_ctx = None
     try:
         from braintrust import start_span
 
         kwargs: dict[str, Any] = {"name": name}
         if span_type:
             kwargs["type"] = span_type
-        with start_span(**kwargs) as span:
-            yield span
+        span_ctx = start_span(**kwargs)
+        span = span_ctx.__enter__()
     except Exception:
         yield None
+        return
+
+    try:
+        yield span
+    except Exception:
+        try:
+            span_ctx.__exit__(*sys.exc_info())
+        except Exception:
+            pass
+        raise
+    else:
+        try:
+            span_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
 
 
 def log_to_span(span: Any, **kwargs: Any) -> None:

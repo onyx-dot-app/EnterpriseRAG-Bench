@@ -9,6 +9,7 @@ from src.prompts.company_overview import COMPANY_OVERVIEW_SYSTEM_PROMPT
 from src.utils.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import WriteTool
+from src.tools.tool_implementations.finish import FinishTool
 from src.utils import confirm_regenerate
 
 
@@ -25,13 +26,15 @@ def main() -> None:
 
     # Create write tool with override to company_overview.md
     write_tool = WriteTool(file_path_override=COMPANY_OVERVIEW_PATH)
+    finish_tool = FinishTool()
 
     # Initialize LLM with write tool schema
-    llm = get_llm(tools=[write_tool.schema])
+    llm = get_llm(tools=[write_tool.schema, finish_tool.schema])
 
     # Create tool runner and register the write tool
     tool_runner = ToolRunner()
     tool_runner.register(write_tool)
+    tool_runner.register(finish_tool)
 
     # Create conversation with LLM and tool runner
     conversation = Conversation(llm=llm, tool_runner=tool_runner)
@@ -52,7 +55,9 @@ def main() -> None:
     print()
 
     # Interactive loop
-    conversation.run_interactive_loop()
+    completed = conversation.run_interactive_loop(finish_tool=finish_tool)
+    if completed:
+        print("\nNext step: run step_2_generate_initiatives.py")
 
     # Update statistics if file was created
     if os.path.exists(COMPANY_OVERVIEW_PATH):
