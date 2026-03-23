@@ -1,9 +1,11 @@
 """Script for generating volume task documents per source type."""
 
 import argparse
+import atexit
 import json
 import os
 import re
+import signal
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 
@@ -831,17 +833,15 @@ class VolumeState:
 
     Replaces per-operation disk I/O with in-memory lookups.
     Flushes dirty state to disk every `flush_interval` updates
-    and on a background timer for crash resilience.
+    and on stop/shutdown.
     """
 
-    def __init__(self, flush_interval: int = 100, flush_timer_seconds: float = 30.0):
+    def __init__(self, flush_interval: int = 1000):
         self._lock = threading.Lock()
         self._data: dict[str, dict] = {}
         self._dirty: set[str] = set()
         self._flush_interval = flush_interval
         self._update_count = 0
-        self._flush_timer_seconds = flush_timer_seconds
-        self._timer: threading.Timer | None = None
 
         # Load all volume JSONs into memory
         if os.path.exists(VOLUME_DIR):
@@ -853,19 +853,6 @@ class VolumeState:
                         self._data[source_type] = load_json_file(filepath)
                     except Exception:
                         pass
-
-        self._start_flush_timer()
-
-    def _start_flush_timer(self) -> None:
-        if self._flush_timer_seconds <= 0:
-            return
-        self._timer = threading.Timer(self._flush_timer_seconds, self._timed_flush)
-        self._timer.daemon = True
-        self._timer.start()
-
-    def _timed_flush(self) -> None:
-        self.flush()
-        self._start_flush_timer()
 
     def get_data(self, source_type: str) -> dict | None:
         """Get the full volume data for a source type (read-only snapshot)."""
@@ -930,8 +917,11 @@ class VolumeState:
         created_file_path: str,
         increment: int = 1,
     ) -> None:
-        """Update completed count and files list in memory, flush periodically."""
-        snapshots: list[tuple[str, dict]] = []
+        """Update completed count and files list in memory.
+
+        Triggers a flush every `flush_interval` updates.
+        """
+        should_flush = False
 
         with self._lock:
             data = self._data.get(source_type)
@@ -955,40 +945,41 @@ class VolumeState:
 
             self._dirty.add(source_type)
             self._update_count += 1
+            should_flush = self._update_count >= self._flush_interval
 
-            if self._update_count >= self._flush_interval:
-                snapshots = self._collect_dirty_snapshots()
-
-        # Write outside lock
-        for st, snap_data in snapshots:
-            filepath = os.path.join(VOLUME_DIR, f"{st}.json")
-            write_json_file(filepath, snap_data)
-
-    def _collect_dirty_snapshots(self) -> list[tuple[str, dict]]:
-        """Collect deep copies of dirty data and reset dirty state. Must be called with _lock held."""
-        snapshots = []
-        for source_type in self._dirty:
-            data = self._data.get(source_type)
-            if data:
-                snapshots.append((source_type, json.loads(json.dumps(data))))
-        self._dirty.clear()
-        self._update_count = 0
-        return snapshots
+        if should_flush:
+            self.flush()
 
     def flush(self) -> None:
-        """Force-write all dirty state to disk (I/O happens outside lock)."""
+        """Write all dirty state to disk (I/O happens outside lock)."""
         with self._lock:
-            snapshots = self._collect_dirty_snapshots()
+            if not self._dirty:
+                return
+            snapshots = []
+            for source_type in self._dirty:
+                data = self._data.get(source_type)
+                if data:
+                    snapshots.append((source_type, json.loads(json.dumps(data))))
+            self._dirty.clear()
+            self._update_count = 0
 
         for source_type, data in snapshots:
             filepath = os.path.join(VOLUME_DIR, f"{source_type}.json")
             write_json_file(filepath, data)
 
+    def register_shutdown_hooks(self) -> None:
+        """Register atexit and signal handlers to flush on process termination."""
+        atexit.register(self.flush)
+
+        def _signal_handler(signum: int, _frame: object) -> None:
+            self.flush()
+            raise SystemExit(1)
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, _signal_handler)
+
     def stop(self) -> None:
-        """Stop the background flush timer and do a final flush."""
-        if self._timer:
-            self._timer.cancel()
-            self._timer = None
+        """Final flush on shutdown."""
         self.flush()
 
 
@@ -1308,7 +1299,8 @@ def generate_documents(company_overview: str, parallelism: int = 10, doc_limit: 
         return
 
     # Load all volume state into memory once
-    volume_state = VolumeState(flush_interval=100, flush_timer_seconds=30.0)
+    volume_state = VolumeState(flush_interval=1000)
+    volume_state.register_shutdown_hooks()
 
     # Pre-load source contexts
     source_contexts: dict[str, dict] = {}
