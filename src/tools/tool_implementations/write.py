@@ -80,7 +80,7 @@ def _recover_path_with_llm(
             candidate = line[idx:].split()[0].strip("\"'`,.")
             # Remove the base_name prefix since we want path relative to base_dir
             if candidate.startswith(f"{base_name}/"):
-                return candidate[len(base_name) + 1:]
+                return candidate[len(base_name) + 1 :]
         # Also check for paths that might already be relative
         if "/" in line and line.endswith(".json"):
             candidate = line.split()[0].strip("\"'`,.")
@@ -146,7 +146,9 @@ class WriteTool(ToolInterface):
         self._file_path_override = file_path_override
         self._validator = validator
         self._expected_format = expected_format
-        self._display_name = display_name or (os.path.basename(base_dir) if base_dir else None)
+        self._display_name = display_name or (
+            os.path.basename(base_dir) if base_dir else None
+        )
         self._allow_create_dirs = allow_create_dirs
         # Document JSON parameters
         self._is_document_json = is_document_json
@@ -170,7 +172,7 @@ class WriteTool(ToolInterface):
         path = path.lstrip("/")
         base_name = os.path.basename(self._base_dir)
         if path.startswith(f"{base_name}/"):
-            path = path[len(base_name) + 1:]
+            path = path[len(base_name) + 1 :]
         elif path == base_name:
             path = ""
         return path
@@ -218,7 +220,7 @@ class WriteTool(ToolInterface):
             },
         }
 
-    def execute(self, content: str, file_path: str = "") -> str:
+    def execute(self, content: str, file_path: str = "") -> str:  # type: ignore[override]
         """
         Write content to a file.
 
@@ -313,7 +315,9 @@ class WriteTool(ToolInterface):
         - Optionally runs field labels + UUID post-processing
         """
         if not file_path:
-            return "Error: No file path provided. Please specify a valid .json file path."
+            return (
+                "Error: No file path provided. Please specify a valid .json file path."
+            )
 
         # Validate path format using existing utilities
         if self._expected_source_type:
@@ -340,19 +344,26 @@ class WriteTool(ToolInterface):
                     return f"Error: {path_error}"
 
             # Normalize path to be relative to SOURCES_DIR
-            normalized_path = normalize_source_path(file_path, self._expected_source_type)
+            normalized_path = normalize_source_path(
+                file_path, self._expected_source_type
+            )
             abs_path = sources_resolver.to_absolute(normalized_path)
 
             # Check if file already exists
             if os.path.exists(abs_path):
-                return self._conflict_message or f"Error: File already exists at {file_path}. Please choose a different filename."
+                return (
+                    self._conflict_message
+                    or f"Error: File already exists at {file_path}. Please choose a different filename."
+                )
         else:
             # Basic validation without source type
             if not file_path.endswith(".json"):
                 return f"Error: File path must end with .json, got: {file_path}. Please use a .json extension."
 
             # Check proper directory structure
-            normalized_path = self._normalize_path(file_path) if self._base_dir else file_path
+            normalized_path = (
+                self._normalize_path(file_path) if self._base_dir else file_path
+            )
             path_parts = normalized_path.replace("\\", "/").split("/")
             if len(path_parts) < 2:
                 return f"Error: File must be in a subdirectory, not directly in sources root. Got: {file_path}"
@@ -381,7 +392,10 @@ class WriteTool(ToolInterface):
                         return f"Error: Parent directory does not exist: {parent_dir}. Please use an existing directory path."
 
                 if os.path.exists(abs_path):
-                    return self._conflict_message or f"Error: File already exists at {file_path}. Please choose a different filename."
+                    return (
+                        self._conflict_message
+                        or f"Error: File already exists at {file_path}. Please choose a different filename."
+                    )
             else:
                 abs_path = normalized_path
 

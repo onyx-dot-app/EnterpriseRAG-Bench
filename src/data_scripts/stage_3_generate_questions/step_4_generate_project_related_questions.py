@@ -63,7 +63,7 @@ def load_project_usage() -> dict[str, int]:
     if os.path.exists(PROJECT_USAGE_PATH):
         try:
             data = load_json_file(PROJECT_USAGE_PATH)
-            return data.get("project_usage", {})
+            return dict(data.get("project_usage", {}))
         except Exception:
             pass
     return {}
@@ -272,7 +272,9 @@ def main() -> None:
 
         # Generate question via auto conversation
         print("\n--- Generating Question ---")
-        llm = get_llm(tools=[doc_read_tool.schema], reasoning_level="high", quiet=args.quiet)
+        llm = get_llm(
+            tools=[doc_read_tool.schema], reasoning_level="high", quiet=args.quiet
+        )
         messages: list[Message] = [Message(role="user", content=prompt)]
 
         try:
@@ -328,11 +330,13 @@ def main() -> None:
         question_id = f"qst_{next_question_id:04d}"
 
         # Derive source types from relevant UUIDs
-        source_types = sorted(set(
-            extract_source_type(uuid_index[uuid])
-            for uuid in relevant_uuids
-            if uuid in uuid_index
-        ))
+        source_types = sorted(
+            set(
+                extract_source_type(uuid_index[uuid])
+                for uuid in relevant_uuids
+                if uuid in uuid_index
+            )
+        )
 
         # Append to questions file
         save_question(

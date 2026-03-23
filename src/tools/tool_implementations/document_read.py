@@ -41,7 +41,7 @@ class DocumentReadTool(ReadTool):
         """Clear tracked reads for reuse across iterations."""
         self._read_documents.clear()
 
-    def execute(self, path: str) -> str:
+    def execute(self, path: str) -> str:  # type: ignore[override]
         """
         Read a file, optionally extracting document content.
 
@@ -63,12 +63,14 @@ class DocumentReadTool(ReadTool):
             uuid = doc_data.get("dataset_doc_uuid", "")
 
             normalized_path = self._normalize_path(path)
-            self._read_documents.append({
-                "path": normalized_path,
-                "uuid": uuid,
-                "title": title,
-                "content": content,
-            })
+            self._read_documents.append(
+                {
+                    "path": normalized_path,
+                    "uuid": uuid,
+                    "title": title,
+                    "content": content,
+                }
+            )
 
             return f"{title}\n{content}"
         except (json.JSONDecodeError, DocumentFieldError):

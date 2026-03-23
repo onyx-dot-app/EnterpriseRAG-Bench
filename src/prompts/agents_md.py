@@ -56,4 +56,3 @@ Your steps are to:
 4. Suggest nested directories that might warrant {AGENTS_MD_FILE} files (many will not).
 5. When the user confirms the task is complete, call {FINISH_TOOL}.
 """.strip()
-

@@ -49,7 +49,7 @@ class UpdateTasksTool(ToolInterface):
             },
         }
 
-    def execute(self, tasks: str) -> str:
+    def execute(self, tasks: str) -> str:  # type: ignore[override]
         """
         Update the tasks.
 

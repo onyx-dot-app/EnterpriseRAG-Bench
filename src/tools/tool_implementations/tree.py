@@ -55,7 +55,7 @@ class TreeTool(ToolInterface):
         path = path.lstrip("/")
         base_name = os.path.basename(self._base_dir)
         if path.startswith(f"{base_name}/"):
-            path = path[len(base_name) + 1:]
+            path = path[len(base_name) + 1 :]
         elif path == base_name:
             path = ""
         return path
@@ -108,7 +108,7 @@ class TreeTool(ToolInterface):
 
         return lines
 
-    def execute(
+    def execute(  # type: ignore[override]
         self,
         path: str = "",
         level: int | None = None,

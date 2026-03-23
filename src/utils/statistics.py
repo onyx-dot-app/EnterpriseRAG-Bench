@@ -14,7 +14,8 @@ def _load_stats() -> dict[str, Any]:
     if os.path.exists(AGGREGATE_STATISTICS_PATH):
         try:
             with open(AGGREGATE_STATISTICS_PATH) as f:
-                return json.load(f)
+                result: dict[str, Any] = json.load(f)
+                return result
         except Exception:
             pass
     return {"last_updated": None}

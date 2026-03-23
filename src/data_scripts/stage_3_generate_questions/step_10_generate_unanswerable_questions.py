@@ -130,7 +130,9 @@ def main() -> None:
 
     print("Step 10: Generate Unanswerable Questions")
     print("=" * 40)
-    print("This script generates questions that are not answerable from the document set.")
+    print(
+        "This script generates questions that are not answerable from the document set."
+    )
     print()
 
     # Build source tree

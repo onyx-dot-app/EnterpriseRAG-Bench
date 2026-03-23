@@ -141,7 +141,9 @@ def main() -> None:
     # Filter to resolvable UUIDs (may still have gaps after rebuild)
     resolvable = [uid for uid in file_uuids if uid in uuid_index]
     if len(resolvable) < len(file_uuids):
-        print(f"  {len(file_uuids) - len(resolvable)} UUID(s) not resolvable, skipping them.")
+        print(
+            f"  {len(file_uuids) - len(resolvable)} UUID(s) not resolvable, skipping them."
+        )
     if not resolvable:
         print("No resolvable misc file UUIDs. Nothing to do.")
         return
@@ -149,7 +151,9 @@ def main() -> None:
     # Determine count (capped to available documents)
     count = len(resolvable) if args.count is None else min(args.count, len(resolvable))
     if args.count is not None and args.count > len(resolvable):
-        print(f"  Requested {args.count} but only {len(resolvable)} documents available. Using {count}.")
+        print(
+            f"  Requested {args.count} but only {len(resolvable)} documents available. Using {count}."
+        )
 
     # Shuffle and select
     selected = resolvable[:count]

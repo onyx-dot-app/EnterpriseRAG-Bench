@@ -88,7 +88,9 @@ def label_document_fields(document: dict, quiet: bool = False) -> dict:
     field_labels = parse_field_labels(json_str)
 
     # Validate that the field names exist in the document
-    doc_validation_error = validate_field_labels_against_document(field_labels, document)
+    doc_validation_error = validate_field_labels_against_document(
+        field_labels, document
+    )
     if doc_validation_error:
         raise ValueError(f"Field labels reference invalid keys: {doc_validation_error}")
 
@@ -99,7 +101,9 @@ def label_document_fields(document: dict, quiet: bool = False) -> dict:
     return document
 
 
-def label_single_document(file_path: str, quiet: bool = False, fix_ordering: bool = True) -> tuple[bool, str]:
+def label_single_document(
+    file_path: str, quiet: bool = False, fix_ordering: bool = True
+) -> tuple[bool, str]:
     """
     Add field labels to a single document file.
 

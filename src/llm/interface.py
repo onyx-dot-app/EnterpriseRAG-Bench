@@ -10,6 +10,7 @@ ReasoningLevel = Literal["low", "medium", "high"]
 
 class ToolCall(BaseModel):
     """Represents a tool call made by the LLM."""
+
     name: str
     args: dict[str, Any]
     call_id: str
@@ -17,6 +18,7 @@ class ToolCall(BaseModel):
 
 class Message(BaseModel):
     """A message in the conversation."""
+
     role: str  # "system", "user", "assistant", "tool_call", "tool_result"
     content: str
     # For tool_call messages
@@ -29,7 +31,9 @@ class LLMInterface(ABC):
     """Abstract interface for LLM providers."""
 
     @abstractmethod
-    def generate(self, messages: list[Message]) -> Generator[str | ToolCall, None, None]:
+    def generate(
+        self, messages: list[Message]
+    ) -> Generator[str | ToolCall, None, None]:
         """
         Generate a streaming response from the LLM.
 

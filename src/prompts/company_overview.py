@@ -23,5 +23,5 @@ Important aspects to cover:
 
 After calling the {WRITE_TOOL} tool, tell the user to verify the company_overview.md file and ask if they are happy with it. \
 If they are not happy, ask them what modifications they would like to make. Do not call the {WRITE_TOOL} tool again unless the user has asked for specific changes. \
-Once the user confirms they are happy with the overview, call the {FINISH_TOOL} tool to end the session. Do not offer to do any additional work for the user. There are other dedicated flows for the next step.
+Once the user confirms they are happy with the overview, call the {FINISH_TOOL} tool.
 """.strip()

@@ -60,7 +60,9 @@ def restore_document(file_path: str) -> tuple[bool, str]:
 
     # Handle collision at original location
     dest_path = original_abs
-    if os.path.exists(dest_path) and os.path.abspath(dest_path) != os.path.abspath(file_path):
+    if os.path.exists(dest_path) and os.path.abspath(dest_path) != os.path.abspath(
+        file_path
+    ):
         base, ext = os.path.splitext(os.path.basename(dest_path))
         counter = 1
         while os.path.exists(dest_path):

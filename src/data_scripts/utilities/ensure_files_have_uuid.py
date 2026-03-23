@@ -41,7 +41,9 @@ def main() -> None:
     print(f"Found {len(json_files)} JSON files in {directory}")
 
     # Check which files need UUIDs or reordering
-    files_to_process: list[tuple[str, bool, bool]] = []  # (path, needs_uuid, needs_reorder)
+    files_to_process: list[tuple[str, bool, bool]] = (
+        []
+    )  # (path, needs_uuid, needs_reorder)
     for filepath in json_files:
         try:
             data = load_json_file(filepath)
@@ -57,8 +59,12 @@ def main() -> None:
         return
 
     needs_uuid_count = sum(1 for _, needs_uuid, _ in files_to_process if needs_uuid)
-    needs_reorder_count = sum(1 for _, _, needs_reorder in files_to_process if needs_reorder)
-    print(f"Processing {len(files_to_process)} files ({needs_uuid_count} need UUID, {needs_reorder_count} need reordering)...")
+    needs_reorder_count = sum(
+        1 for _, _, needs_reorder in files_to_process if needs_reorder
+    )
+    print(
+        f"Processing {len(files_to_process)} files ({needs_uuid_count} need UUID, {needs_reorder_count} need reordering)..."
+    )
 
     added = 0
     reordered = 0
@@ -82,7 +88,9 @@ def main() -> None:
             print(f"  Failed: {filepath} - {e}")
             failed += 1
 
-    print(f"Done. Added UUIDs to {added} files, fixed ordering in {reordered} files, {failed} failed.")
+    print(
+        f"Done. Added UUIDs to {added} files, fixed ordering in {reordered} files, {failed} failed."
+    )
 
 
 if __name__ == "__main__":

@@ -51,4 +51,6 @@ def confirm_regenerate(data_description: str) -> bool:
     Returns:
         True if user confirms regeneration, False otherwise.
     """
-    return confirm_yes_no(f"{data_description} already exists. Regenerate?", default=False)
+    return confirm_yes_no(
+        f"{data_description} already exists. Regenerate?", default=False
+    )

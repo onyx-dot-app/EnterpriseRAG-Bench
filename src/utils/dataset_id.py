@@ -39,7 +39,7 @@ def add_dataset_doc_uuid(file_path: str, fix_ordering: bool = True) -> str:
     if needs_write:
         write_json_file(file_path, data)
 
-    return data["dataset_doc_uuid"]
+    return str(data["dataset_doc_uuid"])
 
 
 def get_dataset_doc_uuid(file_path: str) -> str | None:

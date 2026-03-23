@@ -18,9 +18,13 @@ def main() -> None:
     if os.path.exists(INITIATIVES_PATH):
         if not confirm_regenerate("Initiatives"):
             print("Updating statistics only...")
-            update_statistics("Stage 1: Generate Clean Data", "Step 2: Initiatives", {
-                "status": f"Completed - see file at {INITIATIVES_PATH}",
-            })
+            update_statistics(
+                "Stage 1: Generate Clean Data",
+                "Step 2: Initiatives",
+                {
+                    "status": f"Completed - see file at {INITIATIVES_PATH}",
+                },
+            )
             print("Statistics updated.")
             return
 
@@ -48,8 +52,12 @@ def main() -> None:
 
     print("Step 2: Initiatives & Roadmap Generator")
     print("=" * 40)
-    print("This script generates company initiatives and roadmap based on the company overview.")
-    print("These initiatives will inform the content and context of generated documents.")
+    print(
+        "This script generates company initiatives and roadmap based on the company overview."
+    )
+    print(
+        "These initiatives will inform the content and context of generated documents."
+    )
     print()
     print("You will have a conversation with an LLM to guide you through the process.")
     input("Press Enter to begin...")
@@ -68,9 +76,13 @@ def main() -> None:
 
     # Update statistics if file was created
     if os.path.exists(INITIATIVES_PATH):
-        update_statistics("Stage 1: Generate Clean Data", "Step 2: Initiatives", {
-            "status": f"Completed - see file at {INITIATIVES_PATH}",
-        })
+        update_statistics(
+            "Stage 1: Generate Clean Data",
+            "Step 2: Initiatives",
+            {
+                "status": f"Completed - see file at {INITIATIVES_PATH}",
+            },
+        )
 
 
 if __name__ == "__main__":

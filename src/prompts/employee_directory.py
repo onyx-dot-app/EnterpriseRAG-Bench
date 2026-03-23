@@ -46,5 +46,5 @@ Include a mix of seniority levels (executives, managers, individual contributors
 {{initiatives_md_contents}}
 ```
 
-After calling the {WRITE_TOOL} tool, tell the user to verify the employee_directory.yaml file. If they are happy with the document, call {FINISH_TOOL}.
+After calling the {WRITE_TOOL} tool, tell the user to verify the employee_directory.yaml file. Once the user confirms they are happy with the document, call {FINISH_TOOL}.
 """.strip()

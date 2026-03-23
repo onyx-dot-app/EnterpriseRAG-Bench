@@ -9,6 +9,7 @@ import signal
 import threading
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from typing import Any
 
 from tqdm import tqdm
 
@@ -54,10 +55,13 @@ def get_source_types() -> list[str]:
     """
     if not os.path.exists(SOURCES_DIR):
         return []
-    return sorted([
-        d for d in os.listdir(SOURCES_DIR)
-        if os.path.isdir(os.path.join(SOURCES_DIR, d)) and not d.startswith(".")
-    ])
+    return sorted(
+        [
+            d
+            for d in os.listdir(SOURCES_DIR)
+            if os.path.isdir(os.path.join(SOURCES_DIR, d)) and not d.startswith(".")
+        ]
+    )
 
 
 def count_existing_docs(source_type: str) -> int:
@@ -99,7 +103,10 @@ def extract_total_docs_rule_based(agents_md_content: str) -> int | None:
     lines = agents_md_content.split("\n")
     for i, line in enumerate(lines):
         line_lower = line.lower().strip()
-        if "target number of files" in line_lower or "target number of documents" in line_lower:
+        if (
+            "target number of files" in line_lower
+            or "target number of documents" in line_lower
+        ):
             # Look at the next line for the number
             if i + 1 < len(lines):
                 next_line = lines[i + 1].strip()
@@ -294,8 +301,7 @@ def normalize_volume_json(
     """
     data = json.loads(json_str)
     topics = {
-        topic: {"desired": int(count), "completed": 0}
-        for topic, count in data.items()
+        topic: {"desired": int(count), "completed": 0} for topic, count in data.items()
     }
 
     total_docs_in_topics = sum(int(count) for count in data.values())
@@ -514,11 +520,13 @@ def split_topic(
             for topic_entry in topics_list:
                 for name, count in topic_entry.items():
                     count_int = int(count)
-                    sub_topics.append({
-                        "name": name,
-                        "desired": count_int,
-                        "completed": 0,
-                    })
+                    sub_topics.append(
+                        {
+                            "name": name,
+                            "desired": count_int,
+                            "completed": 0,
+                        }
+                    )
                     total += count_int
 
             # Check estimation accuracy
@@ -542,7 +550,10 @@ def split_topic(
         except Exception:
             if attempt == max_attempts - 1:
                 # Return original topic as single sub-topic on failure
-                return ([{"name": topic_name, "desired": topic_count, "completed": 0}], True)
+                return (
+                    [{"name": topic_name, "desired": topic_count, "completed": 0}],
+                    True,
+                )
 
     # Fallback: return original topic
     return ([{"name": topic_name, "desired": topic_count, "completed": 0}], True)
@@ -742,14 +753,18 @@ def split_large_topics(company_overview: str, parallelism: int = 1) -> list[str]
         return []
 
     total_large = sum(count for _, count in sources_to_process)
-    print(f"Found {len(sources_to_process)} source(s) with {total_large} large topic(s).")
+    print(
+        f"Found {len(sources_to_process)} source(s) with {total_large} large topic(s)."
+    )
     print()
 
     all_warnings: list[str] = []
 
     if parallelism <= 1:
         # Sequential processing
-        for source_type, large_count in tqdm(sources_to_process, desc="Splitting topics"):
+        for source_type, large_count in tqdm(
+            sources_to_process, desc="Splitting topics"
+        ):
             modified, message, warnings = split_large_topics_for_source(
                 source_type=source_type,
                 company_overview=company_overview,
@@ -776,7 +791,9 @@ def split_large_topics(company_overview: str, parallelism: int = 1) -> list[str]
                     try:
                         modified, message, warnings = future.result()
                         if warnings:
-                            all_warnings.extend([f"{source_type}/{w}" for w in warnings])
+                            all_warnings.extend(
+                                [f"{source_type}/{w}" for w in warnings]
+                            )
                     except Exception as e:
                         tqdm.write(f"[FAIL] {source_type}: {e}")
                     pbar.update(1)
@@ -800,7 +817,9 @@ def split_large_topics(company_overview: str, parallelism: int = 1) -> list[str]
 
     if still_large:
         print()
-        print(f"WARNING: {len(still_large)} topic(s) still exceed {MAX_TOPIC_SIZE} docs:")
+        print(
+            f"WARNING: {len(still_large)} topic(s) still exceed {MAX_TOPIC_SIZE} docs:"
+        )
         for topic in still_large[:10]:
             print(f"  - {topic}")
         if len(still_large) > 10:
@@ -828,6 +847,7 @@ def split_large_topics(company_overview: str, parallelism: int = 1) -> list[str]
 # =============================================================================
 # Phase 3: Document Generation
 # =============================================================================
+
 
 class VolumeState:
     """In-memory cache of volume state with periodic disk persistence.
@@ -922,8 +942,8 @@ class VolumeState:
                 if part not in current:
                     return 0
                 if i == len(topic_path_parts) - 1:
-                    desired = current[part].get("desired", 0)
-                    completed = current[part].get("completed", 0)
+                    desired = int(current[part].get("desired", 0))
+                    completed = int(current[part].get("completed", 0))
                     return max(0, desired - completed)
                 else:
                     if "sub_topics" not in current[part]:
@@ -955,7 +975,9 @@ class VolumeState:
                     return
 
                 if i == len(topic_path_parts) - 1:
-                    current[part]["completed"] = current[part].get("completed", 0) + increment
+                    current[part]["completed"] = (
+                        current[part].get("completed", 0) + increment
+                    )
                     if "files" not in current[part]:
                         current[part]["files"] = []
                     current[part]["files"].append(created_file_path)
@@ -976,7 +998,7 @@ class VolumeState:
         with self._lock:
             if not self._dirty:
                 return
-            snapshots = []
+            snapshots: list[tuple[str, dict[str, Any]]] = []
             for source_type in self._dirty:
                 data = self._data.get(source_type)
                 if data:
@@ -1038,6 +1060,18 @@ def collect_leaf_topics(
     return result
 
 
+_volume_locks: dict[str, threading.Lock] = {}
+_volume_locks_guard = threading.Lock()
+
+
+def _get_volume_lock(source_type: str) -> threading.Lock:
+    """Get or create a per-source-type lock for volume file access."""
+    with _volume_locks_guard:
+        if source_type not in _volume_locks:
+            _volume_locks[source_type] = threading.Lock()
+        return _volume_locks[source_type]
+
+
 def update_volume_completed(
     source_type: str,
     topic_path_parts: list[str],
@@ -1070,7 +1104,9 @@ def update_volume_completed(
 
             if i == len(topic_path_parts) - 1:
                 # This is the leaf topic - update completed and add file
-                current[part]["completed"] = current[part].get("completed", 0) + increment
+                current[part]["completed"] = (
+                    current[part].get("completed", 0) + increment
+                )
                 if "files" not in current[part]:
                     current[part]["files"] = []
                 current[part]["files"].append(created_file_path)
@@ -1083,7 +1119,9 @@ def update_volume_completed(
         write_json_file(filepath, data)
 
 
-def get_existing_docs_for_topic(source_type: str, topic_path_parts: list[str]) -> list[str]:
+def get_existing_docs_for_topic(
+    source_type: str, topic_path_parts: list[str]
+) -> list[str]:
     """
     Get list of existing document paths from a specific leaf topic's files list.
 
@@ -1113,7 +1151,7 @@ def get_existing_docs_for_topic(source_type: str, topic_path_parts: list[str]) -
 
             if i == len(topic_path_parts) - 1:
                 # This is the leaf topic - get its files
-                return current[part].get("files", [])
+                return list(current[part].get("files", []))
             else:
                 # Navigate to sub_topics
                 if "sub_topics" not in current[part]:
@@ -1153,7 +1191,9 @@ def generate_single_document(
     """
     # Get existing docs for this specific topic to help with diversity
     if volume_state:
-        existing_docs = volume_state.get_existing_docs_for_topic(source_type, topic_path_parts)
+        existing_docs = volume_state.get_existing_docs_for_topic(
+            source_type, topic_path_parts
+        )
     else:
         existing_docs = get_existing_docs_for_topic(source_type, topic_path_parts)
     existing_docs_str = "\n".join(existing_docs) if existing_docs else "(none yet)"
@@ -1289,7 +1329,9 @@ def get_pending_work_items(
     return work
 
 
-def generate_documents(company_overview: str, parallelism: int = 10, doc_limit: int | None = None) -> None:
+def generate_documents(
+    company_overview: str, parallelism: int = 10, doc_limit: int | None = None
+) -> None:
     """
     Phase 3: Generate documents for all sources based on volume files.
 
@@ -1338,7 +1380,9 @@ def generate_documents(company_overview: str, parallelism: int = 10, doc_limit: 
                 continue
             topics = data.get("topics", {})
             leaf_topics = collect_leaf_topics(topics)
-            pending = sum(desired - completed for _, _, desired, completed in leaf_topics)
+            pending = sum(
+                desired - completed for _, _, desired, completed in leaf_topics
+            )
 
             if pending > 0:
                 source_contexts[source_type] = {
@@ -1354,12 +1398,18 @@ def generate_documents(company_overview: str, parallelism: int = 10, doc_limit: 
         print("No sources have pending documents to generate.")
         return
 
-    effective_total = total_pending if doc_limit is None else min(total_pending, doc_limit)
-    print(f"Found {len(source_contexts)} source(s) with {total_pending} pending document(s):")
+    effective_total = (
+        total_pending if doc_limit is None else min(total_pending, doc_limit)
+    )
+    print(
+        f"Found {len(source_contexts)} source(s) with {total_pending} pending document(s):"
+    )
     for source_type, ctx in source_contexts.items():
         print(f"  - {source_type}: {ctx['pending']} documents")
     if doc_limit is not None and doc_limit < total_pending:
-        print(f"\nDocument limit: will generate at most {doc_limit} of {total_pending} pending documents.")
+        print(
+            f"\nDocument limit: will generate at most {doc_limit} of {total_pending} pending documents."
+        )
     print()
 
     # Build work queue — one entry per leaf topic that still needs docs
@@ -1368,7 +1418,9 @@ def generate_documents(company_overview: str, parallelism: int = 10, doc_limit: 
         data = volume_state.get_data(source_type)
         if not data:
             continue
-        for topic_path, topic_parts, desired, completed in collect_leaf_topics(data.get("topics", {})):
+        for topic_path, topic_parts, desired, completed in collect_leaf_topics(
+            data.get("topics", {})
+        ):
             if desired > completed:
                 work_queue.append((source_type, topic_path, topic_parts))
 
@@ -1391,7 +1443,9 @@ def generate_documents(company_overview: str, parallelism: int = 10, doc_limit: 
                 # Fill available slots from queue (O(1) per item)
                 available_slots = parallelism - len(futures)
                 if doc_limit is not None:
-                    remaining_limit = doc_limit - (total_success + total_fail + len(futures))
+                    remaining_limit = doc_limit - (
+                        total_success + total_fail + len(futures)
+                    )
                     available_slots = min(available_slots, remaining_limit)
 
                 while work_queue and available_slots > 0:
@@ -1600,7 +1654,9 @@ def main() -> None:
 
         # Phase 1 Summary
         print()
-        print(f"Phase 1 complete. {succeeded} created, {skipped} skipped, {failed} failed.")
+        print(
+            f"Phase 1 complete. {succeeded} created, {skipped} skipped, {failed} failed."
+        )
 
         if errors:
             print()
@@ -1626,7 +1682,9 @@ def main() -> None:
     if estimation_warnings:
         print()
         print("=" * 40)
-        print(f"WARNING: {len(estimation_warnings)} topic(s) have inaccurate estimations (>10% off):")
+        print(
+            f"WARNING: {len(estimation_warnings)} topic(s) have inaccurate estimations (>10% off):"
+        )
         for warning in estimation_warnings[:20]:
             print(f"  - {warning}")
         if len(estimation_warnings) > 20:
@@ -1665,19 +1723,25 @@ def _print_statistics() -> None:
             source_name = filename.replace(".json", "")
             topics = data.get("topics", {})
             topic_count = len(topics)
-            doc_count = data.get("total_docs_in_topics", sum(t["desired"] for t in topics.values()))
+            doc_count = data.get(
+                "total_docs_in_topics", sum(t["desired"] for t in topics.values())
+            )
             existing = data.get("pre_existing_doc_count", 0)
             remaining = data.get("remaining_doc_count", doc_count)
             total_topics += topic_count
             total_target_docs += doc_count
             total_existing += existing
             total_remaining += remaining
-            print(f"  {source_name}: {topic_count} topics, {doc_count} target, {existing} existing, {remaining} remaining")
+            print(
+                f"  {source_name}: {topic_count} topics, {doc_count} target, {existing} existing, {remaining} remaining"
+            )
         except Exception:
             pass
 
     print()
-    print(f"Total: {total_topics} topics, {total_target_docs} target, {total_existing} existing, {total_remaining} remaining")
+    print(
+        f"Total: {total_topics} topics, {total_target_docs} target, {total_existing} existing, {total_remaining} remaining"
+    )
 
 
 def _update_statistics() -> None:
@@ -1701,7 +1765,9 @@ def _update_statistics() -> None:
             source_name = filename.replace(".json", "")
             topics = data.get("topics", {})
             topic_count = len(topics)
-            doc_count = data.get("total_docs_in_topics", sum(t["desired"] for t in topics.values()))
+            doc_count = data.get(
+                "total_docs_in_topics", sum(t["desired"] for t in topics.values())
+            )
             existing = data.get("pre_existing_doc_count", 0)
             remaining = data.get("remaining_doc_count", doc_count)
             total_topics += topic_count
@@ -1717,14 +1783,18 @@ def _update_statistics() -> None:
         except Exception:
             pass
 
-    update_statistics("Stage 1: Generate Clean Data", "Step 9: Volume Tasks", {
-        "total_source_types": len(source_summaries),
-        "total_topics": total_topics,
-        "total_target_documents": total_target_docs,
-        "total_existing_documents": total_existing,
-        "total_remaining_documents": total_remaining,
-        "per_source": source_summaries,
-    })
+    update_statistics(
+        "Stage 1: Generate Clean Data",
+        "Step 9: Volume Tasks",
+        {
+            "total_source_types": len(source_summaries),
+            "total_topics": total_topics,
+            "total_target_documents": total_target_docs,
+            "total_existing_documents": total_existing,
+            "total_remaining_documents": total_remaining,
+            "per_source": source_summaries,
+        },
+    )
 
 
 if __name__ == "__main__":

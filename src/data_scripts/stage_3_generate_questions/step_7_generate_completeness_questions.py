@@ -62,9 +62,7 @@ def format_candidate_documents(
         except (DocumentFieldError, Exception):
             continue
 
-        parts.append(
-            f"Document ID: {uuid}\n```\n{title}\n{content}\n```"
-        )
+        parts.append(f"Document ID: {uuid}\n```\n{title}\n{content}\n```")
         valid_uuids.append(uuid)
 
     return "\n\n".join(parts), valid_uuids
@@ -211,7 +209,11 @@ def process_single_question(
         return (False, f"{entry_label}: Missing question", None)
 
     if len(doc_uuids) < 2:
-        return (False, f"{entry_label}: Need at least 2 documents, got {len(doc_uuids)}", None)
+        return (
+            False,
+            f"{entry_label}: Need at least 2 documents, got {len(doc_uuids)}",
+            None,
+        )
 
     # Format candidate documents
     if not quiet:
@@ -220,7 +222,11 @@ def process_single_question(
     candidate_text, valid_uuids = format_candidate_documents(doc_uuids, uuid_index)
 
     if len(valid_uuids) < 2:
-        return (False, f"{entry_label}: Only {len(valid_uuids)} resolvable documents (need >= 2)", None)
+        return (
+            False,
+            f"{entry_label}: Only {len(valid_uuids)} resolvable documents (need >= 2)",
+            None,
+        )
 
     if not quiet:
         print(f"Loaded {len(valid_uuids)} of {len(doc_uuids)} documents")
@@ -234,7 +240,11 @@ def process_single_question(
     )
 
     if not required_uuids:
-        return (False, f"{entry_label}: Document evaluation failed or no required docs", None)
+        return (
+            False,
+            f"{entry_label}: Document evaluation failed or no required docs",
+            None,
+        )
 
     if not quiet:
         print(f"\nRequired documents: {len(required_uuids)} of {len(valid_uuids)}")
@@ -268,11 +278,13 @@ def process_single_question(
         print(f"\nExtracted {len(answer_facts)} facts")
 
     # Derive source types from required UUIDs
-    source_types = sorted(set(
-        extract_source_type(uuid_index[uuid])
-        for uuid in required_uuids
-        if uuid in uuid_index
-    ))
+    source_types = sorted(
+        set(
+            extract_source_type(uuid_index[uuid])
+            for uuid in required_uuids
+            if uuid in uuid_index
+        )
+    )
 
     question_data = {
         "question": question,
@@ -352,7 +364,9 @@ def main() -> None:
         print(f"Questions file not found. Will create: {QUESTIONS_PATH}")
 
     print()
-    print(f"Processing {len(entries)} completeness entries with parallelism={args.parallelism}.")
+    print(
+        f"Processing {len(entries)} completeness entries with parallelism={args.parallelism}."
+    )
     print()
 
     success_count = 0

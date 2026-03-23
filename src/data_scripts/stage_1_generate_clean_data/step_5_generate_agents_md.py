@@ -42,7 +42,9 @@ def _has_agents_md_files() -> bool:
 
 def _confirm_generate_more() -> bool:
     """Prompt user to confirm generating more agents.md files."""
-    return confirm_yes_no("agents.md files already exist. Generate more?", default=False)
+    return confirm_yes_no(
+        "agents.md files already exist. Generate more?", default=False
+    )
 
 
 def main() -> None:
@@ -52,10 +54,14 @@ def main() -> None:
             # Just update statistics and exit
             print("Updating statistics only...")
             agents_paths = find_agents_md_files(SOURCES_DIR)
-            update_statistics("Stage 1: Generate Clean Data", "Step 5: Agents MD", {
-                "total_agents_md_files": len(agents_paths),
-                "paths": agents_paths,
-            })
+            update_statistics(
+                "Stage 1: Generate Clean Data",
+                "Step 5: Agents MD",
+                {
+                    "total_agents_md_files": len(agents_paths),
+                    "paths": agents_paths,
+                },
+            )
             print("Statistics updated.")
             return
 
@@ -73,10 +79,12 @@ def main() -> None:
     finish_tool = FinishTool()
 
     # Initialize main LLM with tool schemas
-    llm = get_llm(tools=[
-        write_tool.schema,
-        finish_tool.schema,
-    ])
+    llm = get_llm(
+        tools=[
+            write_tool.schema,
+            finish_tool.schema,
+        ]
+    )
 
     # Create tool runner and register tools
     tool_runner = ToolRunner()
@@ -88,15 +96,23 @@ def main() -> None:
 
     print(f"Step 5: {AGENTS_MD_FILE} Generator")
     print("=" * 40)
-    print(f"This script creates {AGENTS_MD_FILE} files that guide document generation for each directory.")
-    print("These files define content rules, metadata rules, and target document counts.")
+    print(
+        f"This script creates {AGENTS_MD_FILE} files that guide document generation for each directory."
+    )
+    print(
+        "These files define content rules, metadata rules, and target document counts."
+    )
     print(f"Base directory: {SOURCES_DIR}")
     print()
     print(f"NOTE: You can generate as many {AGENTS_MD_FILE} files as you would like.")
     print("      The relatively important piece is that the top level directories")
-    print(f"      all have an {AGENTS_MD_FILE} file but additional ones are at your discretion.")
+    print(
+        f"      all have an {AGENTS_MD_FILE} file but additional ones are at your discretion."
+    )
     print()
-    print(f"TIP:  You are encouraged to manually modify the generated {AGENTS_MD_FILE} files")
+    print(
+        f"TIP:  You are encouraged to manually modify the generated {AGENTS_MD_FILE} files"
+    )
     print("      to best represent what you want in there.")
     print()
     print("You will have a conversation with an LLM to guide you through the process.")
@@ -113,10 +129,14 @@ def main() -> None:
         """Handle finish signal."""
         # Update aggregate statistics
         agents_paths = find_agents_md_files(SOURCES_DIR)
-        update_statistics("Stage 1: Generate Clean Data", "Step 5: Agents MD", {
-            "total_agents_md_files": len(agents_paths),
-            "paths": agents_paths,
-        })
+        update_statistics(
+            "Stage 1: Generate Clean Data",
+            "Step 5: Agents MD",
+            {
+                "total_agents_md_files": len(agents_paths),
+                "paths": agents_paths,
+            },
+        )
         print(f"\n{AGENTS_MD_FILE} generation complete!")
         return True
 

@@ -200,9 +200,7 @@ def enrich_single_project(
     tool_runner.register(employee_tool)
 
     # Initialize messages
-    messages: list[Message] = [
-        Message(role="system", content=prompt)
-    ]
+    messages: list[Message] = [Message(role="system", content=prompt)]
 
     # First attempt
     response = run_auto_conversation(llm, tool_runner, messages, quiet=quiet)
@@ -469,7 +467,11 @@ def find_file_conflicts(projects_dir: str) -> dict[str, list[tuple[str, int]]]:
             continue
 
     # Filter to only conflicts (paths used by more than one project/file)
-    conflicts = {path: projects for path, projects in path_to_projects.items() if len(projects) > 1}
+    conflicts = {
+        path: projects
+        for path, projects in path_to_projects.items()
+        if len(projects) > 1
+    }
     return conflicts
 
 
@@ -584,7 +586,12 @@ def propose_dedup(
         for prev_output in previous_attempts:
             messages.append(Message(role="assistant", content=prev_output))
             _path = _path_from_dedup_response(prev_output) or "that path"
-            messages.append(Message(role="user", content=f"The proposed file '{_path}' already exists. Please try again with a different filename."))
+            messages.append(
+                Message(
+                    role="user",
+                    content=f"The proposed file '{_path}' already exists. Please try again with a different filename.",
+                )
+            )
 
     response = ""
     for chunk in llm.generate(messages):
@@ -739,7 +746,9 @@ def deduplicate_file_paths(max_parallelism: int = 10) -> None:
         return
 
     # Build list of conflicts to resolve (skip first occurrence of each path)
-    to_resolve: list[tuple[str, str, int]] = []  # (conflicting_path, project_filename, file_index)
+    to_resolve: list[tuple[str, str, int]] = (
+        []
+    )  # (conflicting_path, project_filename, file_index)
     for conflicting_path, project_refs in conflicts.items():
         # Keep first occurrence, deduplicate the rest
         for i, (project_filename, file_index) in enumerate(project_refs):
@@ -747,7 +756,9 @@ def deduplicate_file_paths(max_parallelism: int = 10) -> None:
                 continue
             to_resolve.append((conflicting_path, project_filename, file_index))
 
-    print(f"Found {len(conflicts)} conflicting paths, {len(to_resolve)} files need deduplication.")
+    print(
+        f"Found {len(conflicts)} conflicting paths, {len(to_resolve)} files need deduplication."
+    )
     print(f"Running automatic deduplication with parallelism={max_parallelism}...")
     print()
 
@@ -757,10 +768,14 @@ def deduplicate_file_paths(max_parallelism: int = 10) -> None:
 
     # Create per-project locks to prevent concurrent modifications to the same file
     unique_projects = {project_filename for _, project_filename, _ in to_resolve}
-    project_locks: dict[str, threading.Lock] = {pf: threading.Lock() for pf in unique_projects}
+    project_locks: dict[str, threading.Lock] = {
+        pf: threading.Lock() for pf in unique_projects
+    }
 
     resolved = 0
-    failed: list[tuple[str, str, int]] = []  # (conflicting_path, project_filename, file_index)
+    failed: list[tuple[str, str, int]] = (
+        []
+    )  # (conflicting_path, project_filename, file_index)
 
     with ThreadPoolExecutor(max_workers=max_parallelism) as executor:
         futures = {
@@ -839,7 +854,9 @@ def deduplicate_file_paths(max_parallelism: int = 10) -> None:
                 # Build full path and check for collision
                 new_full_path = os.path.join(directory, new_filename)
                 if new_full_path in all_paths:
-                    print(f"  '{new_filename}' already exists in this directory. Try another.")
+                    print(
+                        f"  '{new_filename}' already exists in this directory. Try another."
+                    )
                     continue
 
                 # Apply the change
@@ -856,7 +873,9 @@ def deduplicate_file_paths(max_parallelism: int = 10) -> None:
                 break
 
         print()
-        print(f"Manual resolution: {manual_resolved} resolved, {manual_skipped} skipped.")
+        print(
+            f"Manual resolution: {manual_resolved} resolved, {manual_skipped} skipped."
+        )
 
     # Final summary
     print()
@@ -879,7 +898,9 @@ def deduplicate_file_paths(max_parallelism: int = 10) -> None:
         print()
         print("IMPORTANT: You do not need to regenerate the projects.")
         print()
-        raise RuntimeError(f"File path conflicts remain: {remaining_count} conflicts across {len(remaining)} paths")
+        raise RuntimeError(
+            f"File path conflicts remain: {remaining_count} conflicts across {len(remaining)} paths"
+        )
     else:
         print("All conflicts resolved.")
 
@@ -1142,7 +1163,9 @@ def main() -> None:
     print("Step 6: Generate Projects")
     print("=" * 40)
     print("This script generates and enriches projects based on company context.")
-    print("Projects are smaller in scope than initiatives - concrete work items for teams.")
+    print(
+        "Projects are smaller in scope than initiatives - concrete work items for teams."
+    )
     print()
     print("Phases:")
     print("  1. Interactive project list generation")
@@ -1156,7 +1179,9 @@ def main() -> None:
     if _has_project_files():
         if not confirm_regenerate("Projects"):
             skip_generation = True
-            print("Skipping generation phases, will run validation and completion phases...")
+            print(
+                "Skipping generation phases, will run validation and completion phases..."
+            )
 
     if not skip_generation:
         # Phase 1: Generate project list (interactive) or skip if exists
@@ -1187,9 +1212,13 @@ def main() -> None:
 
     # Update aggregate statistics
     project_count = len([f for f in os.listdir(PROJECTS_DIR) if f.endswith(".json")])
-    update_statistics("Stage 1: Generate Clean Data", "Step 6: Projects", {
-        "total_projects": project_count,
-    })
+    update_statistics(
+        "Stage 1: Generate Clean Data",
+        "Step 6: Projects",
+        {
+            "total_projects": project_count,
+        },
+    )
 
 
 if __name__ == "__main__":

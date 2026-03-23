@@ -35,7 +35,8 @@ def load_json_file(path: str) -> dict[str, Any]:
         The parsed JSON data as a dictionary.
     """
     with open(path) as f:
-        return json.load(f)
+        result: dict[str, Any] = json.load(f)
+    return result
 
 
 def write_json_file(path: str, data: dict[str, Any]) -> None:

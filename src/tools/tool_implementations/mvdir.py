@@ -50,12 +50,12 @@ class MvdirTool(ToolInterface):
         path = path.lstrip("/")
         base_name = os.path.basename(self._base_dir)
         if path.startswith(f"{base_name}/"):
-            path = path[len(base_name) + 1:]
+            path = path[len(base_name) + 1 :]
         elif path == base_name:
             path = ""
         return path
 
-    def execute(self, source: str, destination: str) -> str:
+    def execute(self, source: str, destination: str) -> str:  # type: ignore[override]
         """
         Move or rename a directory.
 

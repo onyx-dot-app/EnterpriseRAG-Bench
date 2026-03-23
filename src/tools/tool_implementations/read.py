@@ -52,7 +52,7 @@ class ReadTool(ToolInterface):
             path = ""
         return path
 
-    def execute(self, path: str) -> str:
+    def execute(self, path: str) -> str:  # type: ignore[override]
         """
         Read the contents of a file.
 

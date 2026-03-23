@@ -43,9 +43,7 @@ class ProjectPeople(BaseModel):
 
     @field_validator("people")
     @classmethod
-    def validate_people_not_empty(
-        cls, v: list[ProjectPerson]
-    ) -> list[ProjectPerson]:
+    def validate_people_not_empty(cls, v: list[ProjectPerson]) -> list[ProjectPerson]:
         """Validate that people list is not empty."""
         if not v:
             raise ValueError("people list cannot be empty")
@@ -395,7 +393,9 @@ def filter_invalid_paths(
                         ProjectFile(path=recovered_path, description=file.description)
                     )
                 else:
-                    print(f"  Recovery failed (parent dir doesn't exist): {recovered_path}")
+                    print(
+                        f"  Recovery failed (parent dir doesn't exist): {recovered_path}"
+                    )
             else:
                 print("  Recovery failed (no path returned)")
 

@@ -43,7 +43,8 @@ class GenerationCache:
         if not os.path.exists(self._path):
             return []
         data = load_json_file(self._path)
-        return data.get(self._key, [])
+        result: list[Any] = data.get(self._key, [])
+        return result
 
     def append(self, entry: Any) -> None:
         """Append a single entry to the cache file (thread-safe)."""

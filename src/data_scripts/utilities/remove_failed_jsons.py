@@ -45,7 +45,8 @@ def main() -> None:
         help=f"Directory to process (default: {SOURCES_DIR})",
     )
     parser.add_argument(
-        "--yes", "-y",
+        "--yes",
+        "-y",
         action="store_true",
         help="Skip confirmation prompt and delete files automatically",
     )
@@ -93,7 +94,9 @@ def main() -> None:
 
     # Prompt for confirmation
     if not args.yes:
-        response = input(f"Delete these {len(invalid_files)} file(s)? [y/N]: ").strip().lower()
+        response = (
+            input(f"Delete these {len(invalid_files)} file(s)? [y/N]: ").strip().lower()
+        )
         if response not in ("y", "yes"):
             print("Aborted. No files deleted.")
             return

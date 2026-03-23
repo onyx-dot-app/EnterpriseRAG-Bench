@@ -7,9 +7,18 @@ import yaml
 
 from src.llm import get_llm
 from src.llm.conversation import Conversation
-from src.paths import COMPANY_OVERVIEW_PATH, EMPLOYEE_DIRECTORY_PATH, INITIATIVES_PATH, VISUAL_EMPLOYEE_DIRECTORY_PATH
+from src.paths import (
+    COMPANY_OVERVIEW_PATH,
+    EMPLOYEE_DIRECTORY_PATH,
+    INITIATIVES_PATH,
+    VISUAL_EMPLOYEE_DIRECTORY_PATH,
+)
 from src.prompts.employee_directory import EMPLOYEE_DIRECTORY_SYSTEM_PROMPT
-from src.schemas.employee_directory import EXPECTED_FORMAT, EmployeeDirectory, validate_employee_directory
+from src.schemas.employee_directory import (
+    EXPECTED_FORMAT,
+    EmployeeDirectory,
+    validate_employee_directory,
+)
 from src.utils.statistics import update_statistics
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import FinishTool, WriteTool
@@ -257,10 +266,14 @@ def main() -> None:
             print("Updating statistics only...")
             directory = load_employee_directory()
             total_employees = sum(len(emps) for emps in directory.departments.values())
-            update_statistics("Stage 1: Generate Clean Data", "Step 3: Employee Directory", {
-                "total_employees": total_employees,
-                "departments": len(directory.departments),
-            })
+            update_statistics(
+                "Stage 1: Generate Clean Data",
+                "Step 3: Employee Directory",
+                {
+                    "total_employees": total_employees,
+                    "departments": len(directory.departments),
+                },
+            )
             print("Statistics updated.")
             return
 
@@ -297,9 +310,15 @@ def main() -> None:
 
     print("Step 3: Employee Directory Generator")
     print("=" * 40)
-    print("This script generates an employee directory with org structure and team members.")
-    print("Employees will be referenced as authors and participants in generated documents.")
-    print("After you are satisfied with the directory, state it to the LLM and the script will run validation to ensure it is valid.")
+    print(
+        "This script generates an employee directory with org structure and team members."
+    )
+    print(
+        "Employees will be referenced as authors and participants in generated documents."
+    )
+    print(
+        "After you are satisfied with the directory, state it to the LLM and the script will run validation to ensure it is valid."
+    )
     print()
     print("You will have a conversation with an LLM to guide you through the process.")
     input("Press Enter to begin...")
@@ -318,10 +337,14 @@ def main() -> None:
             # Update aggregate statistics
             directory = load_employee_directory()
             total_employees = sum(len(emps) for emps in directory.departments.values())
-            update_statistics("Stage 1: Generate Clean Data", "Step 3: Employee Directory", {
-                "total_employees": total_employees,
-                "departments": len(directory.departments),
-            })
+            update_statistics(
+                "Stage 1: Generate Clean Data",
+                "Step 3: Employee Directory",
+                {
+                    "total_employees": total_employees,
+                    "departments": len(directory.departments),
+                },
+            )
             print("\nEmployee directory generation complete!")
             return True
         else:

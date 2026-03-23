@@ -359,7 +359,9 @@ def validate_answer_completeness(
             if isinstance(chunk, str):
                 response += chunk
 
-        first_line = response.strip().splitlines()[0].strip() if response.strip() else ""
+        first_line = (
+            response.strip().splitlines()[0].strip() if response.strip() else ""
+        )
         return re.search(r"\byes\b", first_line, re.IGNORECASE) is not None
 
     max_workers = min(len(facts), 8)
@@ -367,8 +369,7 @@ def validate_answer_completeness(
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            executor.submit(validate_single_fact, statement)
-            for statement in facts
+            executor.submit(validate_single_fact, statement) for statement in facts
         ]
 
         for future in as_completed(futures):
@@ -493,14 +494,23 @@ def process_question_docs(
             original_facts = question_row.get("answer_facts", [])
 
             # Preserve anti-hallucination guard facts from the original set
-            anti_hallucination_facts = extract_anti_hallucination_facts(
-                original_facts, quiet=True,
-            ) or []
+            anti_hallucination_facts = (
+                extract_anti_hallucination_facts(
+                    original_facts,
+                    quiet=True,
+                )
+                or []
+            )
 
             # Extract new facts from the updated gold answer
-            new_facts = extract_answer_facts(
-                question_row["question"], new_answer, quiet=True,
-            ) or []
+            new_facts = (
+                extract_answer_facts(
+                    question_row["question"],
+                    new_answer,
+                    quiet=True,
+                )
+                or []
+            )
 
             # Combine: new facts + anti-hallucination guards (deduped)
             new_facts_set = set(new_facts)
@@ -511,9 +521,15 @@ def process_question_docs(
 
             updated_row["answer_facts"] = combined_facts
 
-        return (f"UPDATED {qid}: document set changed ({len(gold_doc_ids)} -> {len(valid_doc_ids)} docs)", updated_row)
+        return (
+            f"UPDATED {qid}: document set changed ({len(gold_doc_ids)} -> {len(valid_doc_ids)} docs)",
+            updated_row,
+        )
     else:
-        return (f"EVALUATED {qid}: document set unchanged after evaluation", updated_row)
+        return (
+            f"EVALUATED {qid}: document set unchanged after evaluation",
+            updated_row,
+        )
 
 
 def score_answer(
@@ -531,10 +547,9 @@ def score_answer(
     expected_doc_ids = question_data.get("expected_doc_ids", [])
     answer_facts = question_data.get("answer_facts", [])
     question_type = original_question_data.get("question_type")
-    gold_answer_updated = (
-        original_question_data.get("gold_answer")
-        != question_data.get("gold_answer")
-    )
+    gold_answer_updated = original_question_data.get(
+        "gold_answer"
+    ) != question_data.get("gold_answer")
 
     # Dedupe answer doc_ids
     seen: set[str] = set()
@@ -601,16 +616,20 @@ def compute_stats_for_group(results: list[dict]) -> dict[str, float | int]:
     return {
         "count": n,
         "average_correctness_pct": round(
-            sum(1 for r in results if r["answer_correct"]) / n * 100, 2,
+            sum(1 for r in results if r["answer_correct"]) / n * 100,
+            2,
         ),
         "average_completeness_pct": round(
-            sum(r["completeness_pct"] for r in results) / n, 2,
+            sum(r["completeness_pct"] for r in results) / n,
+            2,
         ),
         "average_recall_pct": round(
-            sum(r["document_recall_pct"] for r in results) / n, 2,
+            sum(r["document_recall_pct"] for r in results) / n,
+            2,
         ),
         "average_extra_docs": round(
-            sum(r["invalid_extra_docs"] for r in results) / n, 2,
+            sum(r["invalid_extra_docs"] for r in results) / n,
+            2,
         ),
     }
 
@@ -685,7 +704,9 @@ def write_results_snapshot(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate answer files against gold questions")
+    parser = argparse.ArgumentParser(
+        description="Evaluate answer files against gold questions"
+    )
     parser.add_argument(
         "--answer-file",
         default=DEFAULT_ANSWER_FILE,
@@ -827,12 +848,18 @@ def main() -> None:
                 if qid and qid != args.question_id:
                     completed_qids.add(qid)
             if completed_qids:
-                print(f"\n  Resuming: found {len(completed_qids)} already-evaluated questions in {args.results_file}")
+                print(
+                    f"\n  Resuming: found {len(completed_qids)} already-evaluated questions in {args.results_file}"
+                )
         except Exception:
-            print(f"\n  [WARN] Could not load existing results from {args.results_file}, starting fresh")
+            print(
+                f"\n  [WARN] Could not load existing results from {args.results_file}, starting fresh"
+            )
 
     # Filter out already-completed questions
-    remaining_rows = [row for row in valid_rows if row["question_id"] not in completed_qids]
+    remaining_rows = [
+        row for row in valid_rows if row["question_id"] not in completed_qids
+    ]
     if args.question_id:
         total_questions = len(question_results) + len(valid_rows)
     else:
@@ -905,7 +932,9 @@ def main() -> None:
     if remaining_count == 0:
         print("\nAll questions already evaluated, nothing to do.")
     else:
-        print(f"\nEvaluating {remaining_count} remaining questions (parallelism={args.parallelism})...")
+        print(
+            f"\nEvaluating {remaining_count} remaining questions (parallelism={args.parallelism})..."
+        )
 
         if args.parallelism <= 1:
             for i, row in enumerate(remaining_rows, 1):

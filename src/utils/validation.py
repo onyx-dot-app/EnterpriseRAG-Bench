@@ -6,7 +6,9 @@ def is_simple_value(val: object) -> bool:
     if isinstance(val, (str, int, float, bool, type(None))):
         return True
     if isinstance(val, list):
-        return all(isinstance(item, (str, int, float, bool, type(None))) for item in val)
+        return all(
+            isinstance(item, (str, int, float, bool, type(None))) for item in val
+        )
     return False
 
 

@@ -31,7 +31,9 @@ class RmTool(ToolInterface):
         self._base_dir = base_dir
         self._get_deletable_paths = get_deletable_paths
         self._deleted_paths: list[str] = []
-        self._display_name = display_name or (os.path.basename(base_dir) if base_dir else None)
+        self._display_name = display_name or (
+            os.path.basename(base_dir) if base_dir else None
+        )
 
     @property
     def name(self) -> str:
@@ -75,7 +77,7 @@ class RmTool(ToolInterface):
             },
         }
 
-    def execute(self, file_path: str) -> str:
+    def execute(self, file_path: str) -> str:  # type: ignore[override]
         """
         Remove a file if it was created in the current session.
 

@@ -125,6 +125,12 @@ def main() -> None:
             print(f"\nFailed: {message}")
             continue
 
+        if title is None or content is None:
+            fail_count += 1
+            errors.append(f"{doc_path}: Missing title or content")
+            print("\nFailed: Missing title or content")
+            continue
+
         # Generate question
         print("\n--- Generating Question ---")
         question = generate_question(
@@ -143,7 +149,7 @@ def main() -> None:
             title, content, question, quiet=args.quiet
         )
 
-        if not valid:
+        if not valid or gold_answer is None:
             fail_count += 1
             errors.append(f"{doc_path}: Question validation failed")
             print("\nFailed: Question validation failed")

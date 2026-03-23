@@ -93,7 +93,7 @@ def validate_proposed_dir(proposed_dir: str, source_type: str) -> str | None:
 
     # Strip leading "sources/" if present (we only store under SOURCES_DIR)
     if cleaned.startswith("sources/"):
-        cleaned = cleaned[len("sources/"):]
+        cleaned = cleaned[len("sources/") :]
 
     source_type_dir = os.path.join(SOURCES_DIR, source_type)
 
@@ -374,14 +374,18 @@ def main() -> None:
         selected = random.sample(json_files, min(num_to_move, total))
         source_tree = get_source_type_tree(source_type)
 
-        print(f"[{source_type}] {total} documents, selected {len(selected)} ({args.percentage}%)")
+        print(
+            f"[{source_type}] {total} documents, selected {len(selected)} ({args.percentage}%)"
+        )
 
         for file_path_abs in selected:
-            tasks.append(ShuffleTask(
-                file_path_abs=file_path_abs,
-                source_type=source_type,
-                source_tree=source_tree,
-            ))
+            tasks.append(
+                ShuffleTask(
+                    file_path_abs=file_path_abs,
+                    source_type=source_type,
+                    source_tree=source_tree,
+                )
+            )
 
     if not tasks:
         print("\nNo files to shuffle.")
@@ -404,14 +408,20 @@ def main() -> None:
 
             if result.error:
                 errors.append(f"[{result.source_type}] {result.error}")
-                print(f"  [{completed}/{len(tasks)}] FAILED: [{result.source_type}] {result.rel_original}")
+                print(
+                    f"  [{completed}/{len(tasks)}] FAILED: [{result.source_type}] {result.rel_original}"
+                )
             else:
                 moved += 1
-                print(f"  [{completed}/{len(tasks)}] Moved: {result.rel_original} -> {result.rel_new}")
+                print(
+                    f"  [{completed}/{len(tasks)}] Moved: {result.rel_original} -> {result.rel_new}"
+                )
 
     # Summary
     print("\n" + "=" * 40)
-    print(f"Done. Moved {moved} of {len(tasks)} selected ({total_docs} total documents).")
+    print(
+        f"Done. Moved {moved} of {len(tasks)} selected ({total_docs} total documents)."
+    )
 
     if errors:
         print(f"\nErrors ({len(errors)}):")
@@ -420,13 +430,17 @@ def main() -> None:
         if len(errors) > 20:
             print(f"  ... and {len(errors) - 20} more")
 
-    update_statistics("Stage 2: Add Noise", "Step 2: LLM-Based Shuffle", {
-        "total_documents": total_docs,
-        "documents_selected": len(tasks),
-        "documents_moved": moved,
-        "errors": len(errors),
-        "shuffle_percentage": args.percentage,
-    })
+    update_statistics(
+        "Stage 2: Add Noise",
+        "Step 2: LLM-Based Shuffle",
+        {
+            "total_documents": total_docs,
+            "documents_selected": len(tasks),
+            "documents_moved": moved,
+            "errors": len(errors),
+            "shuffle_percentage": args.percentage,
+        },
+    )
 
 
 if __name__ == "__main__":

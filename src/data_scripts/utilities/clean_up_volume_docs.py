@@ -127,8 +127,6 @@ def clear_volume_file_references(volume_dir: Path) -> int:
     return total_cleared
 
 
-
-
 def find_orphaned_source_files(
     sources_dir: Path,
     all_tracked_uuids: set[str],
@@ -205,7 +203,9 @@ def main() -> None:
     # Cleanup option
     print("\n" + "=" * 60)
     if confirm_yes_no("Would you like to run cleanup?"):
-        all_tracked_uuids = set(project_uuids) | set(completeness_uuids) | set(duplication_uuids)
+        all_tracked_uuids = (
+            set(project_uuids) | set(completeness_uuids) | set(duplication_uuids)
+        )
 
         # Find orphaned files
         print(f"\nScanning {sources_dir} for orphaned files...")
@@ -263,7 +263,9 @@ def main() -> None:
                 print(f"  Deleted {deleted_count} files.")
 
                 # Step 2: Clear volume JSON references
-                print("\nStep 2: Clearing volume JSON references (topics and sub_topics)...")
+                print(
+                    "\nStep 2: Clearing volume JSON references (topics and sub_topics)..."
+                )
                 cleared_refs = clear_volume_file_references(volume_dir)
                 print(f"  Total cleared: {cleared_refs} file references.")
 

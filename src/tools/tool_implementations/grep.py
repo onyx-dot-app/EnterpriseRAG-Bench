@@ -74,7 +74,7 @@ class GrepTool(ToolInterface):
             path = ""
         return path
 
-    def execute(self, pattern: str, path: str = "") -> str:
+    def execute(self, pattern: str, path: str = "") -> str:  # type: ignore[override]
         """
         Search for files containing a text pattern.
 

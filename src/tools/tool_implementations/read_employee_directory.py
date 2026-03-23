@@ -63,7 +63,7 @@ class ReadEmployeeDirectoryTool(ToolInterface):
             },
         }
 
-    def execute(self, query: str) -> str:
+    def execute(self, query: str) -> str:  # type: ignore[override]
         """
         Read and filter the employee directory based on the query.
 

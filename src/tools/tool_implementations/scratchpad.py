@@ -54,7 +54,7 @@ class ScratchpadTool(ToolInterface):
             },
         }
 
-    def execute(self, content: str, overwrite: bool = False) -> str:
+    def execute(self, content: str, overwrite: bool = False) -> str:  # type: ignore[override]
         """
         Write to the scratchpad.
 

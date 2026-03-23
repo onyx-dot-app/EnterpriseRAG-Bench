@@ -66,22 +66,28 @@ class OpenAILLM(LLMInterface):
             elif msg.role == "assistant":
                 input_items.append({"role": "assistant", "content": msg.content})
             elif msg.role == "tool_call" and msg.tool_call:
-                input_items.append({
-                    "type": "function_call",
-                    "call_id": msg.tool_call.call_id,
-                    "name": msg.tool_call.name,
-                    "arguments": json.dumps(msg.tool_call.args),
-                })
+                input_items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": msg.tool_call.call_id,
+                        "name": msg.tool_call.name,
+                        "arguments": json.dumps(msg.tool_call.args),
+                    }
+                )
             elif msg.role == "tool_result" and msg.call_id:
-                input_items.append({
-                    "type": "function_call_output",
-                    "call_id": msg.call_id,
-                    "output": msg.content,
-                })
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": msg.call_id,
+                        "output": msg.content,
+                    }
+                )
 
         return input_items
 
-    def generate(self, messages: list[Message]) -> Generator[str | ToolCall, None, None]:
+    def generate(
+        self, messages: list[Message]
+    ) -> Generator[str | ToolCall, None, None]:
         """
         Generate a streaming response from OpenAI using the Responses API.
 

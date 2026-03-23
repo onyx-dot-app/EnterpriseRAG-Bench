@@ -121,7 +121,7 @@ class SingleLevelMkdirTool(ToolInterface):
         """Return list of directories created (relative to base_dir)."""
         return self._created_dirs.copy()
 
-    def execute(self, path: str) -> str:
+    def execute(self, path: str) -> str:  # type: ignore[override]
         """
         Create a directory, ensuring the parent directory already exists.
 
@@ -154,7 +154,9 @@ class SingleLevelMkdirTool(ToolInterface):
 
         # Check if directory already exists
         if os.path.isdir(full_path):
-            return f"Error: Directory already exists: {path}\n\n{DIRECTORY_ERROR_MESSAGE}"
+            return (
+                f"Error: Directory already exists: {path}\n\n{DIRECTORY_ERROR_MESSAGE}"
+            )
 
         try:
             os.mkdir(full_path)
@@ -206,7 +208,9 @@ def create_misc_directories() -> list[str]:
     conv.add_system_message(system_prompt)
 
     # Initial prompt to start proposing directories
-    conv.add_user_message("Please propose miscellaneous directories to add to the dataset.")
+    conv.add_user_message(
+        "Please propose miscellaneous directories to add to the dataset."
+    )
     conv.generate_response()
     print()
 
@@ -429,7 +433,9 @@ def generate_misc_files(
         print(f"Already have {existing_count}/{count} files. Nothing to generate.")
         return []
 
-    print(f"Target: {count} files total ({existing_count} already exist, {remaining} remaining)")
+    print(
+        f"Target: {count} files total ({existing_count} already exist, {remaining} remaining)"
+    )
     print(f"Parallelism: {parallelism}")
     print()
     print("Miscellaneous directories:")
@@ -526,12 +532,16 @@ def _update_statistics(cache: dict) -> None:
         source_type = d.split("/")[0] if "/" in d else "unknown"
         per_source[source_type] = per_source.get(source_type, 0) + 1
 
-    update_statistics("Stage 2: Add Noise", "Step 3: Miscellaneous Files", {
-        "total_directories": len(directories),
-        "total_files": len(files),
-        "directories": directories,
-        "directories_per_source": per_source,
-    })
+    update_statistics(
+        "Stage 2: Add Noise",
+        "Step 3: Miscellaneous Files",
+        {
+            "total_directories": len(directories),
+            "total_files": len(files),
+            "directories": directories,
+            "directories_per_source": per_source,
+        },
+    )
 
 
 # =============================================================================

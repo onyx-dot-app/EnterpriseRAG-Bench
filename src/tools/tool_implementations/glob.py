@@ -36,8 +36,12 @@ class GlobTool(ToolInterface):
         """
         self._base_dir = base_dir
         self._display_name = display_name or os.path.basename(base_dir)
-        self._required_pattern = re.compile(required_pattern) if required_pattern else None
-        self._pattern_error_message = pattern_error_message or "Pattern does not match required format."
+        self._required_pattern = (
+            re.compile(required_pattern) if required_pattern else None
+        )
+        self._pattern_error_message = (
+            pattern_error_message or "Pattern does not match required format."
+        )
 
     @property
     def name(self) -> str:
@@ -71,7 +75,7 @@ class GlobTool(ToolInterface):
             path = ""
         return path
 
-    def execute(self, pattern: str) -> str:
+    def execute(self, pattern: str) -> str:  # type: ignore[override]
         """
         Match files using a glob pattern.
 

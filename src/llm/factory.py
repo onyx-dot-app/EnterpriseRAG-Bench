@@ -31,9 +31,11 @@ def get_llm(
 
     if provider == "openai":
         from src.llm.openai_llm import OpenAILLM
+
         return OpenAILLM(tools=tools, quiet=quiet, reasoning_level=reasoning_level)
     elif provider == "anthropic":
         from src.llm.anthropic_llm import AnthropicLLM
+
         return AnthropicLLM(tools=tools, quiet=quiet, reasoning_level=reasoning_level)
     else:
         raise ValueError(
@@ -66,11 +68,29 @@ def get_cheap_llm(
     provider = LLM_PROVIDER.lower()
 
     if provider == "openai":
-        from src.llm.openai_llm import CHEAP_LLM_MODEL_NAME as OPENAI_CHEAP_MODEL, OpenAILLM
-        return OpenAILLM(model=OPENAI_CHEAP_MODEL, tools=tools, quiet=quiet, reasoning_level=reasoning_level)
+        from src.llm.openai_llm import (
+            CHEAP_LLM_MODEL_NAME as OPENAI_CHEAP_MODEL,
+            OpenAILLM,
+        )
+
+        return OpenAILLM(
+            model=OPENAI_CHEAP_MODEL,
+            tools=tools,
+            quiet=quiet,
+            reasoning_level=reasoning_level,
+        )
     elif provider == "anthropic":
-        from src.llm.anthropic_llm import CHEAP_LLM_MODEL_NAME as ANTHROPIC_CHEAP_MODEL, AnthropicLLM
-        return AnthropicLLM(model=ANTHROPIC_CHEAP_MODEL, tools=tools, quiet=quiet, reasoning_level=reasoning_level)
+        from src.llm.anthropic_llm import (
+            CHEAP_LLM_MODEL_NAME as ANTHROPIC_CHEAP_MODEL,
+            AnthropicLLM,
+        )
+
+        return AnthropicLLM(
+            model=ANTHROPIC_CHEAP_MODEL,
+            tools=tools,
+            quiet=quiet,
+            reasoning_level=reasoning_level,
+        )
     else:
         raise ValueError(
             f"Unsupported LLM provider: {provider}. "

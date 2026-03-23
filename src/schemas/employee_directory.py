@@ -6,6 +6,7 @@ from pydantic import BaseModel, EmailStr, field_validator
 
 class Employee(BaseModel):
     """Schema for an employee entry."""
+
     name: str
     title: str
     email: EmailStr
@@ -18,6 +19,7 @@ class Employee(BaseModel):
     def validate_date_format(cls, v: str) -> str:
         """Validate date is in YYYY-MM-DD format."""
         import re
+
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", v):
             raise ValueError("start_date must be in YYYY-MM-DD format")
         return v
@@ -25,6 +27,7 @@ class Employee(BaseModel):
 
 class EmployeeDirectory(BaseModel):
     """Schema for the employee directory."""
+
     departments: dict[str, list[Employee]]
 
 

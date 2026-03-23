@@ -6,7 +6,6 @@ from src.llm import get_llm
 from src.llm.conversation import Conversation
 from src.paths import (
     COMPANY_OVERVIEW_PATH,
-    GENERATED_DATA_DIR,
     INITIATIVES_PATH,
     SOURCE_TREE_PATH,
     SOURCES_DIR,
@@ -21,7 +20,12 @@ from src.tools.tool_implementations import (
     RmdirTool,
     TreeTool,
 )
-from src.utils import confirm_regenerate, get_current_date_formatted, get_directory_tree, load_file
+from src.utils import (
+    confirm_regenerate,
+    get_current_date_formatted,
+    get_directory_tree,
+    load_file,
+)
 from src.utils.statistics import update_statistics
 
 
@@ -73,10 +77,14 @@ def main() -> None:
             # Regenerate source_tree.txt and update statistics
             write_source_tree()
             top_level, total = count_directories(SOURCES_DIR)
-            update_statistics("Stage 1: Generate Clean Data", "Step 4: Source Structure", {
-                "top_level_directories": top_level,
-                "total_directories": total,
-            })
+            update_statistics(
+                "Stage 1: Generate Clean Data",
+                "Step 4: Source Structure",
+                {
+                    "top_level_directories": top_level,
+                    "total_directories": total,
+                },
+            )
             print("Statistics updated.")
             return
 
@@ -100,14 +108,16 @@ def main() -> None:
     finish_tool = FinishTool()
 
     # Initialize main LLM with tool schemas
-    llm = get_llm(tools=[
-        mkdir_tool.schema,
-        rmdir_tool.schema,
-        mvdir_tool.schema,
-        tree_tool.schema,
-        read_employee_directory_tool.schema,
-        finish_tool.schema,
-    ])
+    llm = get_llm(
+        tools=[
+            mkdir_tool.schema,
+            rmdir_tool.schema,
+            mvdir_tool.schema,
+            tree_tool.schema,
+            read_employee_directory_tool.schema,
+            finish_tool.schema,
+        ]
+    )
 
     # Create tool runner and register tools
     tool_runner = ToolRunner()
@@ -123,13 +133,17 @@ def main() -> None:
 
     print("Step 4: Source Directory Structure Generator")
     print("=" * 40)
-    print("This script creates the directory structure for data sources (Slack, GitHub, etc.).")
+    print(
+        "This script creates the directory structure for data sources (Slack, GitHub, etc.)."
+    )
     print("These directories will be populated with documents in later steps.")
     print(f"Base directory: {SOURCES_DIR}")
     print()
     print("TIP: This step is best run in batches (e.g., one source type at a time).")
     print("     Long conversations cost more per turn as context accumulates.")
-    print("     You can quit and re-run to start fresh while keeping created directories.")
+    print(
+        "     You can quit and re-run to start fresh while keeping created directories."
+    )
     print()
     print("You will have a conversation with an LLM to guide you through the process.")
     input("Press Enter to begin...")
@@ -146,10 +160,14 @@ def main() -> None:
         write_source_tree()
         # Update aggregate statistics
         top_level, total = count_directories(SOURCES_DIR)
-        update_statistics("Stage 1: Generate Clean Data", "Step 4: Source Structure", {
-            "top_level_directories": top_level,
-            "total_directories": total,
-        })
+        update_statistics(
+            "Stage 1: Generate Clean Data",
+            "Step 4: Source Structure",
+            {
+                "top_level_directories": top_level,
+                "total_directories": total,
+            },
+        )
         print("\nSource directory structure generation complete!")
         return True
 

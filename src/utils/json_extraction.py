@@ -41,7 +41,7 @@ def extract_json_from_response(response: str) -> str:
 
         last_close = response.rfind(close_char)
         if last_close != -1 and last_close >= start:
-            candidate = response[start:last_close + 1]
+            candidate = response[start : last_close + 1]
             # Validate it's parseable JSON before returning
             try:
                 json.loads(candidate)

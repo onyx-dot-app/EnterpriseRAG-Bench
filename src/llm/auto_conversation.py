@@ -52,13 +52,24 @@ def run_auto_conversation(
                 # Log LLM output to span
                 log_to_span(
                     step_span,
-                    input=[{"role": m.role, "content": m.content[:500]} for m in messages[-3:]],
+                    input=[
+                        {"role": m.role, "content": m.content[:500]}
+                        for m in messages[-3:]
+                    ],
                     output=full_response if full_response else None,
                     metadata={
-                        "tool_calls": [
-                            {"name": tc.name, "args": tc.args, "call_id": tc.call_id}
-                            for tc in tool_calls
-                        ] if tool_calls else None,
+                        "tool_calls": (
+                            [
+                                {
+                                    "name": tc.name,
+                                    "args": tc.args,
+                                    "call_id": tc.call_id,
+                                }
+                                for tc in tool_calls
+                            ]
+                            if tool_calls
+                            else None
+                        ),
                     },
                 )
 
@@ -103,14 +114,22 @@ def run_auto_conversation(
                         )
 
                     messages.append(
-                        Message(role="tool_result", content=result, call_id=tool_call.call_id)
+                        Message(
+                            role="tool_result",
+                            content=result,
+                            call_id=tool_call.call_id,
+                        )
                     )
 
                     if termination_signal is not None:
                         log_to_span(
                             conversation_span,
                             output=result,
-                            metadata={"total_steps": step, "tool_cycles": tool_cycles, "terminated_by_tool": True},
+                            metadata={
+                                "total_steps": step,
+                                "tool_cycles": tool_cycles,
+                                "terminated_by_tool": True,
+                            },
                         )
                         return result
                 continue

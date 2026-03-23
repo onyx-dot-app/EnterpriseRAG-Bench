@@ -115,7 +115,7 @@ class PathResolver:
                 f"Path '{path}' is not under base directory '{self._base_dir}'"
             )
 
-        rel_path = abs_path[len(base_with_sep):]
+        rel_path = abs_path[len(base_with_sep) :]
         # Normalize to forward slashes for consistency
         return rel_path.replace("\\", "/")
 
@@ -249,7 +249,9 @@ def validate_source_path(
 
     # Check file doesn't already exist
     if os.path.exists(abs_path):
-        return f"File already exists at {file_path}. Please choose a different filename."
+        return (
+            f"File already exists at {file_path}. Please choose a different filename."
+        )
 
     return None
 

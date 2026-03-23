@@ -63,7 +63,7 @@ class LsTool(ToolInterface):
             path = ""
         return path
 
-    def execute(self, directory: str = "") -> str:
+    def execute(self, directory: str = "") -> str:  # type: ignore[override]
         """
         List files in a directory.
 
@@ -77,7 +77,9 @@ class LsTool(ToolInterface):
             return "Error: Path cannot contain '..'"
 
         directory = self._normalize_path(directory)
-        full_path = os.path.join(self._base_dir, directory) if directory else self._base_dir
+        full_path = (
+            os.path.join(self._base_dir, directory) if directory else self._base_dir
+        )
 
         if not os.path.exists(full_path):
             return f"Error: Directory does not exist: {directory}"

@@ -66,7 +66,9 @@ def process_single_entry(
         (success, message, question_data) tuple.
         On failure, question_data is None.
     """
-    entry_label = f"{entry.get('document_old', '?')[:16]}..{entry.get('document_new', '?')[:16]}"
+    entry_label = (
+        f"{entry.get('document_old', '?')[:16]}..{entry.get('document_new', '?')[:16]}"
+    )
     old_uuid = entry.get("document_old", "")
     new_uuid = entry.get("document_new", "")
 
@@ -147,11 +149,13 @@ def process_single_entry(
     # Both documents are expected
     expected_doc_ids = [old_uuid, new_uuid]
 
-    source_types = sorted(set(
-        extract_source_type(uuid_index[uuid])
-        for uuid in expected_doc_ids
-        if uuid in uuid_index
-    ))
+    source_types = sorted(
+        set(
+            extract_source_type(uuid_index[uuid])
+            for uuid in expected_doc_ids
+            if uuid in uuid_index
+        )
+    )
 
     question_data = {
         "question": query,
@@ -234,7 +238,9 @@ def main() -> None:
         print(f"Questions file not found. Will create: {QUESTIONS_PATH}")
 
     print()
-    print(f"Processing {len(entries)} duplication entries with parallelism={args.parallelism}.")
+    print(
+        f"Processing {len(entries)} duplication entries with parallelism={args.parallelism}."
+    )
     print()
 
     success_count = 0

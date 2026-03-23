@@ -13,9 +13,7 @@ class FieldLabels(BaseModel):
 
     @field_validator("content_field_names")
     @classmethod
-    def validate_content_field_names_not_empty(
-        cls, v: list[str]
-    ) -> list[str]:
+    def validate_content_field_names_not_empty(cls, v: list[str]) -> list[str]:
         """Validate that content_field_names list is not empty."""
         if not v:
             raise ValueError("content_field_names list cannot be empty")

@@ -86,7 +86,9 @@ def ensure_uuids_resolved(
         after the rebuild.
     """
     if uuid_index is None:
-        uuid_index = load_or_build_uuid_index(cache_file=cache_file, sources_dir=sources_dir)
+        uuid_index = load_or_build_uuid_index(
+            cache_file=cache_file, sources_dir=sources_dir
+        )
 
     missing = needed_uuids - uuid_index.keys()
     if not missing:
@@ -98,7 +100,9 @@ def ensure_uuids_resolved(
 
     still_missing = missing - uuid_index.keys()
     if still_missing:
-        print(f"  Warning: {len(still_missing)} UUID(s) still unresolvable after rebuild.")
+        print(
+            f"  Warning: {len(still_missing)} UUID(s) still unresolvable after rebuild."
+        )
 
     return uuid_index
 

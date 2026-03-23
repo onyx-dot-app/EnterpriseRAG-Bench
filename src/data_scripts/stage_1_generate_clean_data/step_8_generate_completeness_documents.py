@@ -20,7 +20,13 @@ from src.prompts.completeness_documents import (
 from src.utils.statistics import update_statistics
 from src.tools import FINISH_TOOL
 from src.tools.runner import ToolRunner
-from src.tools.tool_implementations import FinishTool, GlobTool, ReadTool, RmTool, WriteTool
+from src.tools.tool_implementations import (
+    FinishTool,
+    GlobTool,
+    ReadTool,
+    RmTool,
+    WriteTool,
+)
 from src.utils.dataset_id import add_dataset_doc_uuid
 from src.utils.field_labeling import label_single_document
 from src.utils.file_io import delete_file, load_file, load_json_file
@@ -113,10 +119,12 @@ def label_files(file_paths: list[str]) -> None:
 
 def write_completeness_entry(question: str, document_uuids: list[str]) -> None:
     """Append a completeness entry to the generation cache."""
-    completeness_cache.append({
-        "question": question,
-        "documents": document_uuids,
-    })
+    completeness_cache.append(
+        {
+            "question": question,
+            "documents": document_uuids,
+        }
+    )
 
 
 def get_question_type_prompt() -> tuple[int, str]:
@@ -184,7 +192,9 @@ def main() -> None:
 
         print()
         print("=" * 40)
-        print(f"Generating trace {i + 1} of {num_to_generate} (will be entry #{trace_index})")
+        print(
+            f"Generating trace {i + 1} of {num_to_generate} (will be entry #{trace_index})"
+        )
         print("=" * 40)
         print()
 
@@ -203,13 +213,15 @@ def main() -> None:
         finish_tool = FinishTool()
 
         # Initialize LLM with tool schemas
-        llm = get_llm(tools=[
-            glob_tool.schema,
-            read_tool.schema,
-            write_tool.schema,
-            rm_tool.schema,
-            finish_tool.schema,
-        ])
+        llm = get_llm(
+            tools=[
+                glob_tool.schema,
+                read_tool.schema,
+                write_tool.schema,
+                rm_tool.schema,
+                finish_tool.schema,
+            ]
+        )
 
         # Create tool runner and register tools
         tool_runner = ToolRunner()
@@ -224,7 +236,9 @@ def main() -> None:
 
         # Generate random question type and get corresponding user prompt
         question_type, user_prompt = get_question_type_prompt()
-        print(f"Question type: {question_type} ({'existing type' if question_type <= 4 else 'new type'})")
+        print(
+            f"Question type: {question_type} ({'existing type' if question_type <= 4 else 'new type'})"
+        )
         print()
 
         # Add system prompt, then user prompt, and get initial response
@@ -239,12 +253,16 @@ def main() -> None:
                 files = write_tool.written_paths
 
                 if not question:
-                    print("\nWarning: No question provided with finish. Please provide the question.")
+                    print(
+                        "\nWarning: No question provided with finish. Please provide the question."
+                    )
                     finish_tool.reset()
                     continue
 
                 if not files:
-                    print("\nWarning: No files were written. Please write the documents first.")
+                    print(
+                        "\nWarning: No files were written. Please write the documents first."
+                    )
                     finish_tool.reset()
                     continue
 
@@ -259,7 +277,9 @@ def main() -> None:
                     print()
                     print("Deleting all files from this step...")
                     delete_written_files(files)
-                    raise ValueError(f"Validation failed for written files: {validation_errors}")
+                    raise ValueError(
+                        f"Validation failed for written files: {validation_errors}"
+                    )
 
                 # Add field labels to documents (must happen before UUID)
                 print("\nAdding field labels to documents...")
@@ -301,10 +321,14 @@ def main() -> None:
 
     # Update statistics
     total_traces = count_existing_traces()
-    update_statistics("Stage 1: Generate Clean Data", "Step 8: Completeness Traces", {
-        "total_traces": total_traces,
-        "traces_generated_this_run": traces_generated,
-    })
+    update_statistics(
+        "Stage 1: Generate Clean Data",
+        "Step 8: Completeness Traces",
+        {
+            "total_traces": total_traces,
+            "traces_generated_this_run": traces_generated,
+        },
+    )
 
     print()
     print("=" * 40)

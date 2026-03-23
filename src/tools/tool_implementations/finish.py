@@ -46,7 +46,7 @@ class FinishTool(ToolInterface):
             },
         }
 
-    def execute(self, finish_info: str | None = None) -> str:
+    def execute(self, finish_info: str | None = None) -> str:  # type: ignore[override]
         """Mark the step as finished.
 
         Args:

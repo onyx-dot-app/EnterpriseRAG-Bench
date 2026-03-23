@@ -52,7 +52,9 @@ def main() -> None:
     print("Step 3: Generate Single-Document Multi-Hop Questions")
     print("=" * 40)
     print("This script generates multi-hop questions from randomly sampled documents.")
-    print("Each question requires information from multiple parts of a single document.")
+    print(
+        "Each question requires information from multiple parts of a single document."
+    )
     print()
 
     # Pre-scan for docs meeting minimum file size (proxy for content length)
@@ -146,7 +148,7 @@ def main() -> None:
             answer_prompt_template=SINGLE_DOCUMENT_MULTIHOP_ANSWER_GENERATION,
         )
 
-        if not valid:
+        if not valid or gold_answer is None:
             fail_count += 1
             errors.append(f"{doc_path}: Question validation failed")
             print("\nFailed: Question validation failed")

@@ -33,7 +33,9 @@ class Conversation:
 
     def add_tool_result(self, call_id: str, content: str) -> None:
         """Add a tool result to the conversation."""
-        self.messages.append(Message(role="tool_result", content=content, call_id=call_id))
+        self.messages.append(
+            Message(role="tool_result", content=content, call_id=call_id)
+        )
 
     def generate_response(self, exit_on_tools: list[str] | None = None) -> str:
         """
@@ -59,7 +61,9 @@ class Conversation:
                 tool_calls: list[ToolCall] = []
                 should_exit = False
 
-                with traced_span(f"llm_step_{self._step_count}", span_type="llm") as step_span:
+                with traced_span(
+                    f"llm_step_{self._step_count}", span_type="llm"
+                ) as step_span:
                     for chunk in self.llm.generate(self.messages):
                         if isinstance(chunk, str):
                             print(chunk, end="", flush=True)
@@ -69,13 +73,24 @@ class Conversation:
 
                     log_to_span(
                         step_span,
-                        input=[{"role": m.role, "content": m.content[:500]} for m in self.messages[-3:]],
+                        input=[
+                            {"role": m.role, "content": m.content[:500]}
+                            for m in self.messages[-3:]
+                        ],
                         output=full_response if full_response else None,
                         metadata={
-                            "tool_calls": [
-                                {"name": tc.name, "args": tc.args, "call_id": tc.call_id}
-                                for tc in tool_calls
-                            ] if tool_calls else None,
+                            "tool_calls": (
+                                [
+                                    {
+                                        "name": tc.name,
+                                        "args": tc.args,
+                                        "call_id": tc.call_id,
+                                    }
+                                    for tc in tool_calls
+                                ]
+                                if tool_calls
+                                else None
+                            ),
                         },
                     )
 
@@ -86,17 +101,27 @@ class Conversation:
 
                         if self.tool_runner is None:
                             error_msg = f"Tool '{tool_call.name}' called but no tool runner configured"
-                            print(f"\n[Tool Result]\n{error_msg}\n[/Tool Result]\n", flush=True)
+                            print(
+                                f"\n[Tool Result]\n{error_msg}\n[/Tool Result]\n",
+                                flush=True,
+                            )
                             self.add_tool_result(tool_call.call_id, error_msg)
                         else:
-                            with traced_span(tool_call.name, span_type="tool") as tool_span:
-                                result = self.tool_runner.run(tool_call.name, **tool_call.args)
+                            with traced_span(
+                                tool_call.name, span_type="tool"
+                            ) as tool_span:
+                                result = self.tool_runner.run(
+                                    tool_call.name, **tool_call.args
+                                )
                                 log_to_span(
                                     tool_span,
                                     input=tool_call.args,
                                     output=result,
                                 )
-                            print(f"\n[Tool Result]\n{result}\n[/Tool Result]\n", flush=True)
+                            print(
+                                f"\n[Tool Result]\n{result}\n[/Tool Result]\n",
+                                flush=True,
+                            )
                             self.add_tool_result(tool_call.call_id, result)
 
                         # Check if this tool should cause an early exit
@@ -104,7 +129,11 @@ class Conversation:
                             should_exit = True
 
                     if should_exit:
-                        log_to_span(response_span, output=full_response, metadata={"steps": self._step_count})
+                        log_to_span(
+                            response_span,
+                            output=full_response,
+                            metadata={"steps": self._step_count},
+                        )
                         return full_response
 
                     continue
@@ -113,7 +142,11 @@ class Conversation:
                 if full_response:
                     print()  # newline after streaming
                     self.add_assistant_message(full_response)
-                    log_to_span(response_span, output=full_response, metadata={"steps": self._step_count})
+                    log_to_span(
+                        response_span,
+                        output=full_response,
+                        metadata={"steps": self._step_count},
+                    )
                     return full_response
 
     def run_turn(self, user_input: str, exit_on_tools: list[str] | None = None) -> str:

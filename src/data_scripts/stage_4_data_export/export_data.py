@@ -221,7 +221,11 @@ def export_single_file(
 
         metadata = None
         if config.onyx_format:
-            full_rel_path = os.path.join(rel_path, export_filename) if not config.flatten else export_filename
+            full_rel_path = (
+                os.path.join(rel_path, export_filename)
+                if not config.flatten
+                else export_filename
+            )
             metadata = FileMetadata(
                 filename=export_filename,
                 id=uuid,
@@ -440,10 +444,9 @@ def main() -> None:
     args = parser.parse_args()
 
     # Onyx format only applies to txt exports
-    onyx_format = (
-        args.export_format == "txt"
-        and os.environ.get(ONYX_FORMAT_ENV_VAR, "").lower() in ("1", "true", "yes")
-    )
+    onyx_format = args.export_format == "txt" and os.environ.get(
+        ONYX_FORMAT_ENV_VAR, ""
+    ).lower() in ("1", "true", "yes")
 
     config = ExportConfig(
         sources=args.sources,

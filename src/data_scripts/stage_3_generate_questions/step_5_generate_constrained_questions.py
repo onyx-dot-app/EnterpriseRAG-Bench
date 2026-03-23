@@ -48,7 +48,7 @@ def load_used_document_paths() -> list[str]:
     if os.path.exists(CACHE_PATH):
         try:
             data = load_json_file(CACHE_PATH)
-            return data.get("used_document_paths", [])
+            return list(data.get("used_document_paths", []))
         except Exception:
             pass
     return []
@@ -83,12 +83,14 @@ def load_documents_by_paths(
             doc_data = load_json_file(full_path)
             title, content = extract_document_content(doc_data)
             uuid = doc_data.get("dataset_doc_uuid", "")
-            documents.append({
-                "path": rel_path,
-                "uuid": uuid,
-                "title": title,
-                "content": content,
-            })
+            documents.append(
+                {
+                    "path": rel_path,
+                    "uuid": uuid,
+                    "title": title,
+                    "content": content,
+                }
+            )
         except (Exception, DocumentFieldError) as e:
             print(f"  Warning: Failed to load {rel_path}: {e}")
     return documents
@@ -167,10 +169,12 @@ def generate_constrained_question(
     # The LLM may present a proposal and wait for approval before calling
     # finish. If finish wasn't called, send an approval message and continue.
     if not finish_tool.finished:
-        messages.append(Message(
-            role="user",
-            content="Approved. Please call the finish tool with the JSON output now.",
-        ))
+        messages.append(
+            Message(
+                role="user",
+                content="Approved. Please call the finish tool with the JSON output now.",
+            )
+        )
         try:
             run_auto_conversation(
                 llm, tool_runner, messages, max_tool_cycles=5, quiet=quiet
@@ -328,7 +332,9 @@ def main() -> None:
     print("Step 5: Generate Constrained Questions")
     print("=" * 40)
     print("This script generates constrained questions by exploring the corpus.")
-    print("Each question uses qualifiers to narrow the answer to a small set of documents.")
+    print(
+        "Each question uses qualifiers to narrow the answer to a small set of documents."
+    )
     print()
 
     # Load source tree
@@ -424,13 +430,15 @@ def main() -> None:
         # Derive source types from relevant UUIDs.
         # Paths are relative to GENERATED_DATA_DIR (e.g., "sources/confluence/..."),
         # so strip the "sources/" prefix before extracting the source type.
-        source_types = sorted(set(
-            extract_source_type(
-                doc["path"].removeprefix("sources/").removeprefix("sources\\")
+        source_types = sorted(
+            set(
+                extract_source_type(
+                    doc["path"].removeprefix("sources/").removeprefix("sources\\")
+                )
+                for doc in all_docs
+                if doc.get("uuid") in relevant_uuids
             )
-            for doc in all_docs
-            if doc.get("uuid") in relevant_uuids
-        ))
+        )
 
         # Generate question ID
         question_id = f"qst_{next_question_id:04d}"

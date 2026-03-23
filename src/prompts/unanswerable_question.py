@@ -48,4 +48,6 @@ CRITICAL: You must only call tools or output the final query. When you output th
 
 GOLD_ANSWER = "The user query is not answerable from the documents."
 
-GOLD_FACTS = ["The answer may present relevant information and things that are loosely related however it must state that the query is not fully answerable from available documents."]
+GOLD_FACTS = [
+    "The answer may present relevant information and things that are loosely related however it must state that the query is not fully answerable from available documents."
+]

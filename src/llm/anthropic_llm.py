@@ -59,14 +59,20 @@ class AnthropicLLM(LLMInterface):
         anthropic_tools = []
         for tool in tools:
             if tool.get("type") == "function":
-                anthropic_tools.append({
-                    "name": tool["name"],
-                    "description": tool.get("description", ""),
-                    "input_schema": tool.get("parameters", {"type": "object", "properties": {}}),
-                })
+                anthropic_tools.append(
+                    {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "input_schema": tool.get(
+                            "parameters", {"type": "object", "properties": {}}
+                        ),
+                    }
+                )
         return anthropic_tools
 
-    def _build_messages(self, messages: list[Message]) -> tuple[str | None, list[dict[str, Any]]]:
+    def _build_messages(
+        self, messages: list[Message]
+    ) -> tuple[str | None, list[dict[str, Any]]]:
         """Convert messages to Anthropic format, extracting system message."""
         system_message: str | None = None
         anthropic_messages: list[dict[str, Any]] = []
@@ -83,24 +89,32 @@ class AnthropicLLM(LLMInterface):
                 anthropic_messages.append({"role": "assistant", "content": msg.content})
             elif msg.role == "tool_call" and msg.tool_call:
                 # Anthropic includes tool_use in assistant message content
-                anthropic_messages.append({
-                    "role": "assistant",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": msg.tool_call.call_id,
-                        "name": msg.tool_call.name,
-                        "input": msg.tool_call.args,
-                    }],
-                })
+                anthropic_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": msg.tool_call.call_id,
+                                "name": msg.tool_call.name,
+                                "input": msg.tool_call.args,
+                            }
+                        ],
+                    }
+                )
             elif msg.role == "tool_result" and msg.call_id:
-                anthropic_messages.append({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": msg.call_id,
-                        "content": msg.content,
-                    }],
-                })
+                anthropic_messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": msg.call_id,
+                                "content": msg.content,
+                            }
+                        ],
+                    }
+                )
 
             i += 1
 
@@ -110,7 +124,9 @@ class AnthropicLLM(LLMInterface):
 
         return system_message, anthropic_messages
 
-    def generate(self, messages: list[Message]) -> Generator[str | ToolCall, None, None]:
+    def generate(
+        self, messages: list[Message]
+    ) -> Generator[str | ToolCall, None, None]:
         """
         Generate a streaming response from Anthropic.
 
@@ -136,9 +152,17 @@ class AnthropicLLM(LLMInterface):
             kwargs["tools"] = self.tools
 
         # Check if model supports extended thinking (Claude 3.7+, 4.x, 4.5, 4.6)
-        if "claude-3-7" in self.model or "claude-sonnet-4" in self.model or "claude-opus-4" in self.model or "claude-haiku-4" in self.model:
+        if (
+            "claude-3-7" in self.model
+            or "claude-sonnet-4" in self.model
+            or "claude-opus-4" in self.model
+            or "claude-haiku-4" in self.model
+        ):
             budget_tokens_map = {"low": 2000, "medium": 5000, "high": 10000}
-            kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget_tokens_map[self.reasoning_level]}
+            kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": budget_tokens_map[self.reasoning_level],
+            }
             kwargs["temperature"] = 1  # Required for extended thinking
 
         tool_calls: list[ToolCall] = []
@@ -185,11 +209,17 @@ class AnthropicLLM(LLMInterface):
                     elif current_tool is not None:
                         if not self.quiet:
                             yield "\n[/Tool Call]\n"
-                        tool_calls.append(ToolCall(
-                            name=current_tool["name"],
-                            args=json.loads(current_tool["input"]) if current_tool["input"] else {},
-                            call_id=current_tool["id"],
-                        ))
+                        tool_calls.append(
+                            ToolCall(
+                                name=current_tool["name"],
+                                args=(
+                                    json.loads(current_tool["input"])
+                                    if current_tool["input"]
+                                    else {}
+                                ),
+                                call_id=current_tool["id"],
+                            )
+                        )
                         current_tool = None
 
         # Log thinking to Braintrust trace if available

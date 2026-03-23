@@ -398,7 +398,9 @@ def generate_documents(
             pass
 
     print(f"Found {len(project_files)} projects with {total_files} total files.")
-    print(f"Pending: {pending_files} files to generate, {len(existing_files)} already exist.")
+    print(
+        f"Pending: {pending_files} files to generate, {len(existing_files)} already exist."
+    )
     print(f"Project parallelism: {project_parallelism}")
     print(f"File parallelism per project: {project_file_parallelism}")
     print()
@@ -445,7 +447,9 @@ def generate_documents(
             with tqdm(total=len(project_files), desc="Processing projects") as pbar:
                 for future in as_completed(futures):
                     try:
-                        project_name, succeeded, skipped, failed, errors = future.result()
+                        project_name, succeeded, skipped, failed, errors = (
+                            future.result()
+                        )
                         total_succeeded += succeeded
                         total_skipped += skipped
                         total_failed += failed
@@ -454,7 +458,9 @@ def generate_documents(
                             tqdm.write(f"[FAIL] {project_name}: {path} - {error}")
                     except Exception as e:
                         project_file = futures[future]
-                        project_name = os.path.splitext(os.path.basename(project_file))[0]
+                        project_name = os.path.splitext(os.path.basename(project_file))[
+                            0
+                        ]
                         all_errors.append((project_name, "", str(e)))
                         tqdm.write(f"[FAIL] {project_name}: {e}")
                     pbar.update(1)
@@ -462,7 +468,9 @@ def generate_documents(
     # Summary
     print()
     print("=" * 40)
-    print(f"Generation complete. {total_succeeded} created, {total_skipped} skipped (already exist), {total_failed} failed.")
+    print(
+        f"Generation complete. {total_succeeded} created, {total_skipped} skipped (already exist), {total_failed} failed."
+    )
 
     if all_errors:
         print()
@@ -624,10 +632,7 @@ def write_question_cache() -> None:
     print("=" * 40)
 
     # Get all project JSON files
-    project_files = sorted([
-        f for f in os.listdir(PROJECTS_DIR)
-        if f.endswith(".json")
-    ])
+    project_files = sorted([f for f in os.listdir(PROJECTS_DIR) if f.endswith(".json")])
 
     if not project_files:
         print("No project files found.")
@@ -662,17 +667,21 @@ def write_question_cache() -> None:
                     except Exception:
                         pass
 
-            entries.append({
-                "project_outline_file": project_filename,
-                "description": description,
-                "documents": document_uuids,
-            })
+            entries.append(
+                {
+                    "project_outline_file": project_filename,
+                    "description": description,
+                    "documents": document_uuids,
+                }
+            )
 
         except Exception as e:
             failed.append((project_filename, str(e)))
 
     projects_cache.write_all(entries)
-    print(f"Complete. {len(entries)} entries written to {projects_cache.path}, {len(failed)} failed.")
+    print(
+        f"Complete. {len(entries)} entries written to {projects_cache.path}, {len(failed)} failed."
+    )
 
     if failed:
         print()
@@ -713,7 +722,9 @@ def main() -> None:
     print("Phase 3: Add dataset_doc_uuid to all documents")
     print("Phase 4: Write project cache to generation_cache")
     print()
-    print("Note: If any of the documents fail validation, you may need to rerun the script.")
+    print(
+        "Note: If any of the documents fail validation, you may need to rerun the script."
+    )
     print()
 
     # Phase 1: Generate documents
@@ -742,10 +753,14 @@ def main() -> None:
                 top_level = rel_path.split(os.sep)[0]
                 source_counts[top_level] += 1
                 total_docs += 1
-    update_statistics("Stage 1: Generate Clean Data", "Step 7: Documents", {
-        "total_documents": total_docs,
-        "documents_per_source": dict(source_counts),
-    })
+    update_statistics(
+        "Stage 1: Generate Clean Data",
+        "Step 7: Documents",
+        {
+            "total_documents": total_docs,
+            "documents_per_source": dict(source_counts),
+        },
+    )
 
 
 if __name__ == "__main__":

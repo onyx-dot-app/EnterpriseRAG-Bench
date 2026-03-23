@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 
-from src.llm import Message, get_llm
+from src.llm import LLMInterface, Message, get_llm
 from src.paths import (
     SOURCES_DIR,
     SOURCE_TREE_PATH,
@@ -174,7 +174,7 @@ def _rename_file_for_source(
     new_path: str,
     file_path: str,
     messages: list[Message],
-    llm: object,
+    llm: LLMInterface,
     max_attempts: int = 3,
 ) -> str | None:
     """
@@ -225,7 +225,9 @@ def _rename_file_for_source(
             new_filename += ".json"
 
         # Build the full path
-        final_path = os.path.join(target_dir, new_filename) if target_dir else new_filename
+        final_path = (
+            os.path.join(target_dir, new_filename) if target_dir else new_filename
+        )
 
         # Validate the final path
         if final_path != file_path:
@@ -482,7 +484,9 @@ def main() -> None:
 
         print(f"\nSelected source file: {file_path}")
 
-        success, message, old_path, new_path = generate_near_duplicate(file_path, source_tree)
+        success, message, old_path, new_path = generate_near_duplicate(
+            file_path, source_tree
+        )
 
         if success and old_path and new_path:
             success_count += 1
@@ -496,10 +500,12 @@ def main() -> None:
             new_uuid = get_dataset_doc_uuid(new_full_path)
 
             # Append to generation cache
-            duplications_cache.append({
-                "document_old": old_uuid,
-                "document_new": new_uuid,
-            })
+            duplications_cache.append(
+                {
+                    "document_old": old_uuid,
+                    "document_new": new_uuid,
+                }
+            )
             print(f"\nWrote cache entry to {duplications_cache.path}")
             print(f"\nSUCCESS: {message}")
         else:
@@ -521,11 +527,15 @@ def main() -> None:
         if len(errors) > 20:
             print(f"  ... and {len(errors) - 20} more")
 
-    update_statistics("Stage 2: Add Noise", "Step 4: Near-Duplicate Files", {
-        "target_count": args.count,
-        "successfully_created": success_count,
-        "failed": fail_count,
-    })
+    update_statistics(
+        "Stage 2: Add Noise",
+        "Step 4: Near-Duplicate Files",
+        {
+            "target_count": args.count,
+            "successfully_created": success_count,
+            "failed": fail_count,
+        },
+    )
 
 
 if __name__ == "__main__":

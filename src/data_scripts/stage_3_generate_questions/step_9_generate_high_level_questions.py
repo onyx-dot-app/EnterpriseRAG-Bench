@@ -5,7 +5,12 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.llm import Message, ToolCall, get_llm
-from src.paths import COMPANY_OVERVIEW_PATH, INITIATIVES_PATH, QUESTIONS_PATH, SOURCES_DIR
+from src.paths import (
+    COMPANY_OVERVIEW_PATH,
+    INITIATIVES_PATH,
+    QUESTIONS_PATH,
+    SOURCES_DIR,
+)
 from src.prompts.high_level_questions import (
     HIGH_LEVEL_QUESTIONS_EVALUATION_PROMPT,
     HIGH_LEVEL_QUESTIONS_PROMPT,
@@ -168,7 +173,9 @@ def validate_query(
 
                 messages.append(Message(role="tool_call", content="", tool_call=tc))
                 result = tool_runner.run(tc.name, **tc.args)
-                messages.append(Message(role="tool_result", content=result, call_id=tc.call_id))
+                messages.append(
+                    Message(role="tool_result", content=result, call_id=tc.call_id)
+                )
 
             continue
 
@@ -316,8 +323,12 @@ def main() -> None:
         print(f"Error loading initiatives: {e}")
         return
 
-    reference_documents = f"## Company Overview\n{company_overview}\n\n## Initiatives\n{initiatives}"
-    print(f"Loaded company overview ({len(company_overview)} chars) and initiatives ({len(initiatives)} chars).")
+    reference_documents = (
+        f"## Company Overview\n{company_overview}\n\n## Initiatives\n{initiatives}"
+    )
+    print(
+        f"Loaded company overview ({len(company_overview)} chars) and initiatives ({len(initiatives)} chars)."
+    )
 
     # Build directory structure for validation (only needed if validating)
     if not args.skip_validation:
@@ -358,7 +369,9 @@ def main() -> None:
             else:
                 print("    -> INVALID (answerable from single document)")
 
-        print(f"\n{len(valid_queries)} valid queries out of {len(candidates)} candidates.")
+        print(
+            f"\n{len(valid_queries)} valid queries out of {len(candidates)} candidates."
+        )
 
     if not valid_queries:
         print("No valid high-level queries found. Try increasing --num-candidates.")
@@ -383,7 +396,9 @@ def main() -> None:
         print(f"Questions file not found. Will create: {QUESTIONS_PATH}")
 
     print()
-    print(f"Processing {len(valid_queries)} validated queries with parallelism={args.parallelism}.")
+    print(
+        f"Processing {len(valid_queries)} validated queries with parallelism={args.parallelism}."
+    )
     print()
 
     success_count = 0

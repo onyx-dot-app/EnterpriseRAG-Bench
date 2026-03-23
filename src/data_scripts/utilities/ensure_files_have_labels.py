@@ -51,11 +51,15 @@ def main() -> None:
     print(f"Found {len(json_files)} JSON files in {directory}")
 
     # Check which files need labels or reordering
-    files_to_process: list[tuple[str, bool, bool]] = []  # (path, needs_labels, needs_reorder)
+    files_to_process: list[tuple[str, bool, bool]] = (
+        []
+    )  # (path, needs_labels, needs_reorder)
     for filepath in json_files:
         try:
             data = load_json_file(filepath)
-            needs_labels = "title_field_name" not in data or "content_field_names" not in data
+            needs_labels = (
+                "title_field_name" not in data or "content_field_names" not in data
+            )
             needs_reorder = needs_reordering(data)
             if needs_labels or needs_reorder:
                 files_to_process.append((filepath, needs_labels, needs_reorder))
@@ -66,9 +70,15 @@ def main() -> None:
         print("All files already have field labels and correct ordering.")
         return
 
-    needs_labels_count = sum(1 for _, needs_labels, _ in files_to_process if needs_labels)
-    needs_reorder_count = sum(1 for _, _, needs_reorder in files_to_process if needs_reorder)
-    print(f"Processing {len(files_to_process)} files ({needs_labels_count} need labels, {needs_reorder_count} need reordering)...")
+    needs_labels_count = sum(
+        1 for _, needs_labels, _ in files_to_process if needs_labels
+    )
+    needs_reorder_count = sum(
+        1 for _, _, needs_reorder in files_to_process if needs_reorder
+    )
+    print(
+        f"Processing {len(files_to_process)} files ({needs_labels_count} need labels, {needs_reorder_count} need reordering)..."
+    )
     print(f"Using parallelism: {max_parallelism}")
     print()
 
@@ -79,12 +89,16 @@ def main() -> None:
     reordered = 0
     failed: list[tuple[str, str]] = []
 
-    def process_file(filepath: str, file_needs_labels: bool, file_needs_reorder: bool) -> tuple[bool, str, bool, bool]:
+    def process_file(
+        filepath: str, file_needs_labels: bool, file_needs_reorder: bool
+    ) -> tuple[bool, str, bool, bool]:
         """Process a single file. Returns (success, message, did_label, did_reorder)."""
         try:
             if file_needs_labels:
                 # label_single_document will also fix ordering
-                success, message = label_single_document(filepath, quiet=use_quiet, fix_ordering=True)
+                success, message = label_single_document(
+                    filepath, quiet=use_quiet, fix_ordering=True
+                )
                 if success:
                     return (True, message, True, file_needs_reorder)
                 else:
@@ -101,7 +115,9 @@ def main() -> None:
 
     with ThreadPoolExecutor(max_workers=max_parallelism) as executor:
         futures = {
-            executor.submit(process_file, filepath, needs_labels, needs_reorder): filepath
+            executor.submit(
+                process_file, filepath, needs_labels, needs_reorder
+            ): filepath
             for filepath, needs_labels, needs_reorder in files_to_process
         }
 
@@ -124,7 +140,9 @@ def main() -> None:
                 pbar.update(1)
 
     print()
-    print(f"Done. Labeled {labeled} files, fixed ordering in {reordered} files, {len(failed)} failed.")
+    print(
+        f"Done. Labeled {labeled} files, fixed ordering in {reordered} files, {len(failed)} failed."
+    )
 
     if failed:
         print()

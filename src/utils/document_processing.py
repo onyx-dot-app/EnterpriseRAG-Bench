@@ -6,7 +6,9 @@ from src.utils.dataset_id import add_dataset_doc_uuid
 from src.utils.field_labeling import label_single_document
 
 
-def process_written_document(file_path: str, quiet: bool = True) -> tuple[bool, str | None]:
+def process_written_document(
+    file_path: str, quiet: bool = True
+) -> tuple[bool, str | None]:
     """
     Add labels and UUID to a written document.
 

@@ -2,7 +2,11 @@
 
 from src.utils.agents_md import get_agents_md_for_path, get_agents_md_for_source
 from src.utils.cli import confirm_regenerate, confirm_yes_no
-from src.utils.dataset_id import add_dataset_doc_uuid, generate_dataset_doc_uuid, get_dataset_doc_uuid
+from src.utils.dataset_id import (
+    add_dataset_doc_uuid,
+    generate_dataset_doc_uuid,
+    get_dataset_doc_uuid,
+)
 from src.utils.document_content import DocumentFieldError, extract_document_content
 from src.utils.document_index import (
     DEFAULT_UUID_INDEX_CACHE_FILE,
