@@ -1,0 +1,43 @@
+{
+  "title": "Sparsified activation delivery + scratch reuse rollout notes (post-PR #58321)",
+  "owner": "Maya Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/sparsified-activation-scratch-reuse-rollout-notes",
+  "doc_type": "doc",
+  "created_at": "2026-02-19",
+  "last_modified": "2026-03-05",
+  "collaborators": [
+    "Arjun Patel",
+    "Sofia Ramirez",
+    "Liam O'Neill",
+    "Nina Brooks"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "runtime",
+    "gpu",
+    "perf",
+    "memory",
+    "activation-delivery",
+    "scratch-reuse",
+    "rollout",
+    "kv-cache",
+    "continuous-batching"
+  ],
+  "linked_artifacts": [
+    "github:redwood#58321",
+    "linear:ENG-2247",
+    "linear:ENG-2988",
+    "jira:SUP-4123",
+    "docs:runtime/README.md (sparsified activation section)",
+    "benchmark:scratch_reuse_bench.py"
+  ],
+  "content": "Context / what shipped\n- PR redwood#58321 merged 2026-02-18: \u201cSparsified activation delivery and scratch reuse to shrink GPU residency\u201d.\n- Motivation remains the same: reduce peak GPU memory residency for long-context + high concurrency workloads by:\n  (1) delivering activations in a sparsified / demand-driven way so large contiguous activation blobs are not pinned for the full request lifetime\n  (2) reusing short-lived scratch buffers across kernels + batches via a lightweight reuse table\n- Components (same as PR):\n  - activation-delivery: arena-backed shard allocator for activation slices, demand-pull API, soft-prefetch heuristic\n  - scratch-reuse: global per-device reuse table keyed by kernel signature + sequence window; eviction TTL\n  - scheduler hints: batch affinity score + scratch-compatibility check to prefer co-located work that maximizes scratch reuse\n  - KV-cache: soft-evict hint integration so cache reduces pinned windows under scratch pressure\n  - runtime: per-kernel workspace table to avoid redundant allocation/resizing; emits small lifetime metadata for post-kernel compacting\n\nWhat changed since the PR description (updates / corrections)\n- Perf deltas updated with 2 more weeks of staging data (p4 + p8 + a100-80g):\n  - transient workspace reduction: typically 16\u201333% (previously quoted 18\u201335%)\n  - total GPU residency reduction: typically 6\u201311% (previously quoted 7\u201312%)\n  - throughput: no measurable regression at target latency SLOs in steady state; HOWEVER we saw p99 regressions in 2 specific mixes (see \u201cKnown issues\u201d).\n- The metric name we want ops to rely on is now: runtime.metrics.scratch_reuse_hit_rate_pct (we still emit runtime.metrics.scratch_reuse_hit_rate in some builds; deprecate after 2026-03-15).\n- KV pressure metric was renamed for consistency to: runtime.metrics.kv_cache_pressure_pct (the older runtime.metrics.kv_pressure_pct may still exist depending on branch cut).\n- Warmup guidance changed: warmup_iters default recommendation is now 600 (previously 1000). Rationale: we observed faster stabilization of reuse-table population; longer warmup just delays benefit.\n- Eviction TTL guidance changed: scratch_reuse.eviction_ttl_ms recommended 1500 (previously 2000). Rationale: reduces \u201cstale large buffer\u201d hoarding in bursty traffic.\n- Compaction hook threshold changed from \u201cdevice free cycles > 20%\u201d to \u201cdevice free cycles > 15% AND no pending high-priority stream work\u201d. This reduced long-tail regressions in our staging traces.\n\nRollout plan (proposed)\nPhase 0: canary on staging (DONE)\n- Enabled on staging for decoder-only models and long-context configs.\n- Monitoring: GPU residency, peak workspace, p50/p95/p99 latency, scratch reuse hit rate, kv cache pressure.\n\nPhase 1: production opt-in (NOW)\n- Keep feature gated; allow per-cluster enable.\n- Scope: start with 1 small production cluster (low blast radius) + 1 high-concurrency cluster.\n- Duration: minimum 7 days, include at least one traffic spike window.\n\nPhase 2: expand opt-in + start default discussion\n- Expand to 25\u201340% of clusters if Phase 1 meets SLOs.\n- Default-on decision only after we complete the two follow-ups:\n  - ENG-2247 follow-up: scratch packing interactions with reuse-table (reduce fragmentation risk)\n  - ENG-2988 follow-up: kv-cache hotset prioritization + pressure coupling tuning\n\nConfig knobs (current recommendation)\n- Primary gate:\n  - runtime.sparsified_activation: true\n- Activation delivery:\n  - sparsified_activation.warmup_iters: 600\n  - sparsified_activation.prefetch_aggressiveness: \u201cconservative\u201d (string enum in config layer)\n- Scratch reuse:\n  - scratch_reuse.eviction_ttl_ms: 1500\n  - scratch_reuse.max_table_entries: 8192 (leave default unless we see thrash)\n- Scheduler:\n  - scheduler.enable_scratch_affinity: true\n\nOperational notes / what to watch\n- Key metrics (dashboards updated under perf dashboard work):\n  - runtime.metrics.scratch_reuse_hit_rate_pct (higher is better; expect 35\u201365% in steady state depending on model + seq mix)\n  - runtime.metrics.kv_cache_pressure_pct (watch for sustained >80% + rising tail latency)\n  - runtime.metrics.activation_shard_prefetch_miss_rate_pct (goal: <2% after warmup)\n  - GPU memory: peak workspace, total residency\n- Expected behavior:\n  - During warmup, hit rate is low and benefits are muted; should stabilize within ~5\u201315 minutes depending on traffic.\n  - Soft-prefetch should keep misses rare; if misses climb, tail latency will move first.\n\nKnown issues / mitigations (as of 2026-03-05)\n1) Tail latency regression in \u201cbursty long-context + small-batch\u201d mix\n- Symptom: p99 spikes ~3\u20136% above baseline during sudden bursts.\n- Root cause hypothesis: demand-pull misses + reuse-table churn when seq_window changes rapidly.\n- Mitigation:\n  - keep prefetch_aggressiveness=conservative for now (do NOT set aggressive)\n  - reduce eviction_ttl_ms to 1500 (done in recommended config)\n  - if still present: temporarily disable scheduler.enable_scratch_affinity (we saw it amplify churn in one trace)\n\n2) Allocator fragmentation concerns (long-running heterogeneous workloads)\n- We added compaction hook, but it is intentionally conservative.\n- If fragmentation suspected (rising allocation failures / frequent fallback allocations):\n  - confirm compaction is running (low-priority stream)\n  - consider increasing scratch_reuse.max_table_entries only if hit rate is high AND we see frequent evictions (otherwise it can worsen hoarding)\n\n3) CI/integration flake from shard assembly races\n- The 128-concurrency flake mentioned in PR review was addressed (barrier asserts + stress iterations).\n- If we see it again in prod-like runs, first action is to increase shard-assembly stress in staging for that model; do not roll forward default-on until stable.\n\nRollback plan\n- Immediate rollback: set runtime.sparsified_activation=false (no other knobs needed).\n- If rollback is triggered due to tail latency:\n  - capture 30\u201360 min of metrics (prefetch miss rate, hit rate, kv cache pressure)\n  - note model + seq distribution + concurrency; file under SUP-4123 with cluster + build id.\n\nNotes to self / TODO\n- Document metric rename in runtime README + dashboard query updates (deprecate old metric strings after 2026-03-15).\n- Add one pager for SRE: \u201cwhen to disable scratch affinity vs disable sparsified activation entirely\u201d.\n- Decide if warmup_iters should become adaptive (based on stabilization of hit rate) rather than a fixed integer.\n",
+  "dataset_noise_document": true,
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_3e903f9994104cfa937b403e6b3083af"
+}

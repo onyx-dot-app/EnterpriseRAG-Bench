@@ -21,6 +21,45 @@ Once this foundation is set, the system generates a core set of documents that a
 It then defines generation guardrails to keep document distributions aligned with expectations and prevent over-clustering around LLM-favored topics.
 With those rails in place, the system produces the larger-volume document set needed for scale, using high-level context and less detail to improve cost efficiency.
 
-### Step 1
+Once the base document set is created, additional steps introduce noise into the dataset, including both random shuffling and LLM-driven shuffling.
+The pipeline also adds a number of duplicate and misplaced documents, which are marked for downstream question generation.
+This ensures some questions require retrieving correct information despite noisy context.
+
+After the dataset is populated and noise has been introduced, the pipeline generates questions. It supports ten question types, each produced through a distinct generation flow.
+Some flows are straightforward (for example, sampling a document and generating a question), while others are multi-step and require document filtering and verification.
+Additional flows rely on LLM-driven topic discovery and pitfall identification.
+
+For answer verification, the repository includes a script that processes an answers file containing question ids, answers, and supporting documents.
+In most cases, it is impractical to determine whether a better answer exists in the corpus without exhaustively reviewing all documents.
+To address this, the evaluation utility considers not only the gold answer but also the proposed candidate documents, and can update the gold answer when the evidence indicates it should change.
+
+### Stage 1 - Generating the dataset
+
+#### Step 1 - Generating the company overview
+
 To help create a cohere dataset, we begin by generating high level overview about the company to guide all later steps. The user interacts with an LLM to cover topics including:
-- Company
+- Company name and 1 line description
+- Mission and vision
+- Company overview and what it does
+- Product surface area and key features
+- How their core product or technology works
+- Interesting differentiations
+- Business model and revenue streams
+- Go to market strategy
+- Size of the team, funding history, and key departments
+- Positioning in the market and competitive landscape
+
+The result of this is a natural language description of the company in an organized .md format. This document serves as the foundation for most of the downstream tasks.
+It informs nearly all document generation, provides a rough guide for other scaffolding steps, and generally aligns the theme of the dataset.
+
+#### Steps 2 through 5 - Generating more scaffolding
+
+Step 2 generates the high level initiatives for the company based on the company overview and user interactions. This step allows the user to provide more guidance on the high level contents for the dataset.
+It is used by later steps to generate the employee directory, the source structure, more detailed project breakdowns, and provides context for the large volume document generation.
+
+Step 3 generates the employee directory based on the company overview and initiatives. It also allows the user to provide their input into the org structure and inviduals.
+It is used by later steps to generate source structure (for example, emails inboxes all map to real people at the organization), and for generating project scaffolding information.
+
+Step 4 generates the source structure (things like Google Drive, Salesforce, Zoom, etc.) as well as the nested directory structures with them. This step is also guided by the user to specify which sources they are interested in and the structure of the sources.
+It takes into account the company overview and initiatives and can pull in relevant parts of the employee directory as needed.
+
