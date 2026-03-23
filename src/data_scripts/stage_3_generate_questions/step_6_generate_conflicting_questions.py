@@ -343,6 +343,10 @@ def main() -> None:
         if len(errors) > 20:
             print(f"  ... and {len(errors) - 20} more")
 
+    print(
+        "\nThis step is complete, go on to step 7 to generate completeness questions."
+    )
+
 
 if __name__ == "__main__":
     main()

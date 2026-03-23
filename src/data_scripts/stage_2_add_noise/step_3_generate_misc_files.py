@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -26,6 +27,7 @@ from src.tools.interface import ToolInterface
 from src.tools.runner import ToolRunner
 from src.tools.tool_implementations import FinishTool, WriteTool
 from src.utils import (
+    delete_file,
     get_dataset_doc_uuid,
     get_directory_tree,
     load_file,
@@ -376,9 +378,35 @@ def generate_single_misc_file(
 
             rel_path = write_tool.written_paths[0]
             abs_path = sources_resolver.to_absolute(rel_path)
+
+            # Verify field labels exist — if labeling failed, delete and alert
+            try:
+                doc_data = load_json_file(abs_path)
+            except Exception:
+                delete_file(abs_path)
+                return (False, f"Failed to read written file: {rel_path}")
+
+            missing_fields = []
+            if "title_field_name" not in doc_data:
+                missing_fields.append("title_field_name")
+            if "content_field_names" not in doc_data:
+                missing_fields.append("content_field_names")
+
+            if missing_fields:
+                delete_file(abs_path)
+                return (
+                    False,
+                    f"Field labeling failed for {rel_path} "
+                    f"(missing: {', '.join(missing_fields)}). File deleted.",
+                )
+
             doc_uuid = get_dataset_doc_uuid(abs_path)
             if not doc_uuid:
-                return (False, f"File written but no UUID found: {rel_path}")
+                delete_file(abs_path)
+                return (
+                    False,
+                    f"File written but no UUID found: {rel_path}. File deleted.",
+                )
             return (True, doc_uuid)
 
         except Exception as e:
@@ -461,9 +489,10 @@ def generate_misc_files(
         futures: dict = {}
 
         for i in range(remaining):
-            # Snapshot existing files for diversity hint
+            # Snapshot existing files, shuffled for variance
             with created_lock:
                 snapshot = existing_files + created_files.copy()
+            random.shuffle(snapshot)
 
             future = executor.submit(
                 generate_single_misc_file,
@@ -505,13 +534,23 @@ def generate_misc_files(
     print(f"Failures this run: {total_fail}")
     print(f"Total files in cache: {len(cache['files'])}")
 
-    if errors:
+    labeling_failures = [e for e in errors if "Field labeling failed" in e]
+    if labeling_failures:
         print()
-        print("Errors:")
-        for error in errors[:20]:
+        print(
+            f"WARNING: {len(labeling_failures)} file(s) deleted due to field labeling failure:"
+        )
+        for error in labeling_failures:
             print(f"  - {error}")
-        if len(errors) > 20:
-            print(f"  ... and {len(errors) - 20} more")
+
+    other_errors = [e for e in errors if "Field labeling failed" not in e]
+    if other_errors:
+        print()
+        print("Other errors:")
+        for error in other_errors[:20]:
+            print(f"  - {error}")
+        if len(other_errors) > 20:
+            print(f"  ... and {len(other_errors) - 20} more")
 
     return created_files
 
@@ -640,12 +679,14 @@ def main() -> None:
     total_files = len(cache.get("files", []))
     print()
     print("=" * 40)
-    print(f"Done. {total_files}/{args.count} miscellaneous files generated.")
+    print(f"{total_files}/{args.count} miscellaneous files generated.")
     print(f"Cache saved to: {misc_files_cache.path}")
     print("=" * 40)
 
     # Update aggregate statistics
     _update_statistics(cache)
+
+    print("\nThis step is complete, go on to step 4 to generate near-duplicate files.")
 
 
 if __name__ == "__main__":

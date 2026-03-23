@@ -227,6 +227,8 @@ def main() -> None:
         if len(errors) > 20:
             print(f"  ... and {len(errors) - 20} more")
 
+    print("\nThis marks the end of Stage 3: Generate Questions.")
+
 
 if __name__ == "__main__":
     main()

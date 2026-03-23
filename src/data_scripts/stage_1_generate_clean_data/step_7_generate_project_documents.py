@@ -762,6 +762,10 @@ def main() -> None:
         },
     )
 
+    print(
+        "\nThis step is complete, go on to step 8 to generate completeness documents."
+    )
+
 
 if __name__ == "__main__":
     main()

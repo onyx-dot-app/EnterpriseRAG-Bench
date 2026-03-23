@@ -533,7 +533,7 @@ def main() -> None:
             print("  (each zip includes .onyx_metadata.json)")
 
     print()
-    print("Export complete.")
+    print("This marks the end of Stage 4: Data Export.")
 
 
 if __name__ == "__main__":

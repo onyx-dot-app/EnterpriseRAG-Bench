@@ -168,7 +168,7 @@ def main() -> None:
                 "total_directories": total,
             },
         )
-        print("\nSource directory structure generation complete!")
+        print("\nThis step is complete, go on to step 5 to generate agents.md files.")
         return True
 
     # Interactive loop

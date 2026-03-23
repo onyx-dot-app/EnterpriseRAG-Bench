@@ -63,7 +63,7 @@ def main() -> None:
     # Interactive loop
     completed = conversation.run_interactive_loop(finish_tool=finish_tool)
     if completed:
-        print("\nNext step: run step_2_generate_initiatives.py")
+        print("\nThis step is complete, go on to step 2 to generate initiatives.")
 
     # Update statistics if file was created
     if os.path.exists(COMPANY_OVERVIEW_PATH):

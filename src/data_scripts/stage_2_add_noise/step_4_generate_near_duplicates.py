@@ -537,6 +537,8 @@ def main() -> None:
         },
     )
 
+    print("\nThis marks the end of Stage 2: Add Noise.")
+
 
 if __name__ == "__main__":
     main()

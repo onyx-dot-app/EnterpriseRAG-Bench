@@ -332,9 +332,9 @@ def main() -> None:
 
     print()
     print("=" * 40)
-    print("Completeness generation complete!")
     print(f"Generated {traces_generated} trace(s) this session.")
     print(f"Total traces: {total_traces}")
+    print("\nThis step is complete, go on to step 9 to generate volume documents.")
 
 
 if __name__ == "__main__":

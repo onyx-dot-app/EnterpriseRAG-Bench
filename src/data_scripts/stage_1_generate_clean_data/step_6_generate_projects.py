@@ -950,8 +950,7 @@ def run_interactive_generation() -> bool:
     while True:
         # Check if project list was written
         if os.path.exists(PROJECT_LIST_PATH):
-            print("\nProjects generation complete!")
-            print(f"Project list saved to {PROJECT_LIST_PATH}")
+            print(f"\nProject list saved to {PROJECT_LIST_PATH}")
             return True
 
         try:
@@ -1219,6 +1218,8 @@ def main() -> None:
             "total_projects": project_count,
         },
     )
+
+    print("\nThis step is complete, go on to step 7 to generate project documents.")
 
 
 if __name__ == "__main__":

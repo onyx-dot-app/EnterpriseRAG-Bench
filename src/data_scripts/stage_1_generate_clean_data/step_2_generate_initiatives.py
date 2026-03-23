@@ -72,7 +72,9 @@ def main() -> None:
     # Interactive loop
     completed = conversation.run_interactive_loop(finish_tool=finish_tool)
     if completed:
-        print("\nNext step: run step_3_generate_employee_directory.py")
+        print(
+            "\nThis step is complete, go on to step 3 to generate the employee directory."
+        )
 
     # Update statistics if file was created
     if os.path.exists(INITIATIVES_PATH):

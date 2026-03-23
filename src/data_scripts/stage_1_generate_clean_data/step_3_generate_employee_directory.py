@@ -345,7 +345,9 @@ def main() -> None:
                     "departments": len(directory.departments),
                 },
             )
-            print("\nEmployee directory generation complete!")
+            print(
+                "\nThis step is complete, go on to step 4 to generate the source structure."
+            )
             return True
         else:
             print("\nValidation failed. Please review and fix the issues.")

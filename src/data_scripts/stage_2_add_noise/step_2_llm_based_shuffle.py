@@ -419,9 +419,7 @@ def main() -> None:
 
     # Summary
     print("\n" + "=" * 40)
-    print(
-        f"Done. Moved {moved} of {len(tasks)} selected ({total_docs} total documents)."
-    )
+    print(f"Moved {moved} of {len(tasks)} selected ({total_docs} total documents).")
 
     if errors:
         print(f"\nErrors ({len(errors)}):")
@@ -441,6 +439,8 @@ def main() -> None:
             "shuffle_percentage": args.percentage,
         },
     )
+
+    print("\nThis step is complete, go on to step 3 to generate miscellaneous files.")
 
 
 if __name__ == "__main__":

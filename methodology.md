@@ -15,3 +15,12 @@ The following are a list of requirements and challenges addressed by the specifi
 
 ## High level process
 
+At a high level, the process starts by generating structural, top-level information that guides downstream generation and keeps the dataset internally consistent.
+It is human-in-the-loop, allowing users to provide key context such as the hypothetical company’s industry, available data sources, and active initiatives or projects.
+Once this foundation is set, the system generates a core set of documents that are tightly informed by these details and by previously generated outputs.
+It then defines generation guardrails to keep document distributions aligned with expectations and prevent over-clustering around LLM-favored topics.
+With those rails in place, the system produces the larger-volume document set needed for scale, using high-level context and less detail to improve cost efficiency.
+
+### Step 1
+To help create a cohere dataset, we begin by generating high level overview about the company to guide all later steps. The user interacts with an LLM to cover topics including:
+- Company

@@ -1697,6 +1697,8 @@ def main() -> None:
     _print_statistics()
     _update_statistics()
 
+    print("\nThis marks the end of Stage 1: Generate Clean Data.")
+
 
 def _print_statistics() -> None:
     """Print statistics about generated volume documents."""

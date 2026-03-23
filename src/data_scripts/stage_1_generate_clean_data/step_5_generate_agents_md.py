@@ -137,7 +137,7 @@ def main() -> None:
                 "paths": agents_paths,
             },
         )
-        print(f"\n{AGENTS_MD_FILE} generation complete!")
+        print("\nThis step is complete, go on to step 6 to generate projects.")
         return True
 
     # Interactive loop

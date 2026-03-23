@@ -213,7 +213,7 @@ def main() -> None:
         print()
 
     print("=" * 40)
-    print(f"Done. Moved {total_moved} of {total_docs} total documents.")
+    print(f"Moved {total_moved} of {total_docs} total documents.")
 
     update_statistics(
         "Stage 2: Add Noise",
@@ -224,6 +224,8 @@ def main() -> None:
             "shuffle_percentage": args.percentage,
         },
     )
+
+    print("\nThis step is complete, go on to step 2 to perform LLM-based shuffling.")
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ Possible directions for justifying the dataset validity:
 - Check word frequency curves
 - Check clustering
 - Check vector directions
+- Average maybe 70 docs out of 100 being strong overlap with at least 1 other (very very close topically), average cluster size of 5 ish
 
 ## 1) Lexical / surface statistics (fast, very diagnostic)
 These catch a lot of “looks real but isn’t” issues.
