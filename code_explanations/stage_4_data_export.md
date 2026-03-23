@@ -1,6 +1,6 @@
-# Stage 4: Default Basic File Export
+# Stage 4: Export Data
 
-**File:** `src/data_scripts/stage_4_data_export/default_basic_file_export.py`
+**File:** `src/data_scripts/stage_4_data_export/export_data.py`
 
 ## Purpose
 

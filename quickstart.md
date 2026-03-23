@@ -94,10 +94,6 @@ export LLM_MODEL_NAME="gpt-5.2"
 
 # Optional: Override the cheap model used for less critical operations (defaults: "gpt-5-mini" for OpenAI, "claude-haiku-4-5" for Anthropic)
 export CHEAP_LLM_MODEL_NAME="gpt-5-mini"
-
-# Optional: Enable Braintrust tracing for monitoring LLM calls
-export BRAINTRUST_API_KEY="your-braintrust-key"
-export BRAINTRUST_PROJECT="your-project-name"
 ```
 
 ### Running the scripts
@@ -268,15 +264,25 @@ python -m src.data_scripts.stage_3_generate_questions.step_10_generate_unanswera
 #### 4. Data export
 
 ```bash
-python -m src.data_scripts.stage_4_data_export.default_basic_file_export \
-    --sources slack gmail \   # List of source types to include, e.g. "confluence slack" (default: all)
-    --create-zip \            # Create zip file(s) of the exported data (optional)
-    --max-files-per-zip 5000 \  # Max files per zip, creates incremental slices (optional)
-    --max-files 100 \         # Max total files to export, useful for testing (optional)
-    --split-by-source         # Create separate zip files for each source type (optional)
+python -m src.data_scripts.stage_4_data_export.export_data \
+    --max-files 100 \           # Max total files to export (optional)
+    --random-sample \           # Randomly sample files from the entire corpus, only applies with --max-files (optional)
+    --flatten \                 # Place all files at the top level with no directory structure (optional)
+    --sources slack gmail \     # Source types to include, e.g. "confluence slack" (default: all)
+    --create-zip \              # Create zip file(s) of the exported data (optional)
+    --max-files-per-zip 5000 \  # Max files per zip, creates incremental slices when exceeded (optional)
+    --split-by-source \         # Create a separate zip file for each source type (optional)
+    --export-format txt         # "txt" for plain text or "json" for original format with metadata (default: txt)
 ```
 
-To export in Onyx metadata format (includes `.onyx_metadata.json` sidecar files), set:
+The original provided dataset is exported using two approaches. The first is a single zip containing all documents with the full directory structure preserved:
+
 ```bash
-export EXPORT_IN_ONYX_FORMAT="true"
+python -m src.data_scripts.stage_4_data_export.export_data --create-zip
+```
+
+The second splits by source type into flat zips of up to 5,000 files each:
+
+```bash
+python -m src.data_scripts.stage_4_data_export.export_data --create-zip --split-by-source --max-files-per-zip 5000 --flatten
 ```
