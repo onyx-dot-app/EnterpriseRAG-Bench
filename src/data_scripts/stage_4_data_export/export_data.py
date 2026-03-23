@@ -439,8 +439,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Check for Onyx format from environment variable
-    onyx_format = os.environ.get(ONYX_FORMAT_ENV_VAR, "").lower() in ("1", "true", "yes")
+    # Onyx format only applies to txt exports
+    onyx_format = (
+        args.export_format == "txt"
+        and os.environ.get(ONYX_FORMAT_ENV_VAR, "").lower() in ("1", "true", "yes")
+    )
 
     config = ExportConfig(
         sources=args.sources,

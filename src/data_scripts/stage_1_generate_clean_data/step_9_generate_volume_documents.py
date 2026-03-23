@@ -826,17 +826,170 @@ def split_large_topics(company_overview: str, parallelism: int = 1) -> list[str]
 # Phase 3: Document Generation
 # =============================================================================
 
-# Global lock for volume file updates
-_volume_locks: dict[str, threading.Lock] = {}
-_volume_locks_lock = threading.Lock()
+class VolumeState:
+    """In-memory cache of volume state with periodic disk persistence.
 
+    Replaces per-operation disk I/O with in-memory lookups.
+    Flushes dirty state to disk every `flush_interval` updates
+    and on a background timer for crash resilience.
+    """
 
-def _get_volume_lock(source_type: str) -> threading.Lock:
-    """Get or create a lock for a specific source type's volume file."""
-    with _volume_locks_lock:
-        if source_type not in _volume_locks:
-            _volume_locks[source_type] = threading.Lock()
-        return _volume_locks[source_type]
+    def __init__(self, flush_interval: int = 100, flush_timer_seconds: float = 30.0):
+        self._lock = threading.Lock()
+        self._data: dict[str, dict] = {}
+        self._dirty: set[str] = set()
+        self._flush_interval = flush_interval
+        self._update_count = 0
+        self._flush_timer_seconds = flush_timer_seconds
+        self._timer: threading.Timer | None = None
+
+        # Load all volume JSONs into memory
+        if os.path.exists(VOLUME_DIR):
+            for filename in os.listdir(VOLUME_DIR):
+                if filename.endswith(".json"):
+                    source_type = filename.replace(".json", "")
+                    filepath = os.path.join(VOLUME_DIR, filename)
+                    try:
+                        self._data[source_type] = load_json_file(filepath)
+                    except Exception:
+                        pass
+
+        self._start_flush_timer()
+
+    def _start_flush_timer(self) -> None:
+        if self._flush_timer_seconds <= 0:
+            return
+        self._timer = threading.Timer(self._flush_timer_seconds, self._timed_flush)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _timed_flush(self) -> None:
+        self.flush()
+        self._start_flush_timer()
+
+    def get_data(self, source_type: str) -> dict | None:
+        """Get the full volume data for a source type (read-only snapshot)."""
+        with self._lock:
+            data = self._data.get(source_type)
+            return json.loads(json.dumps(data)) if data else None
+
+    def get_pending_work_items(
+        self,
+        source_types: set[str],
+        active_topics: set[tuple[str, tuple[str, ...]]],
+        active_lock: threading.Lock,
+    ) -> list[tuple[str, str, list[str]]]:
+        """Get pending work items from in-memory state (no disk I/O)."""
+        # Snapshot topics under lock (brief hold), traverse outside lock
+        snapshots: list[tuple[str, dict]] = []
+        with self._lock:
+            for source_type in sorted(source_types):
+                data = self._data.get(source_type)
+                if data and data.get("topics"):
+                    snapshots.append((source_type, data["topics"]))
+
+        work = []
+        for source_type, topics in snapshots:
+            leaf_topics = collect_leaf_topics(topics)
+            for topic_path, topic_parts, desired, completed in leaf_topics:
+                if desired > completed:
+                    topic_key = (source_type, tuple(topic_parts))
+                    with active_lock:
+                        if topic_key not in active_topics:
+                            work.append((source_type, topic_path, topic_parts))
+
+        return work
+
+    def get_existing_docs_for_topic(
+        self, source_type: str, topic_path_parts: list[str]
+    ) -> list[str]:
+        """Get existing doc paths for a leaf topic from in-memory state."""
+        with self._lock:
+            data = self._data.get(source_type)
+            if not data:
+                return []
+
+            current = data.get("topics", {})
+            for i, part in enumerate(topic_path_parts):
+                if part not in current:
+                    return []
+
+                if i == len(topic_path_parts) - 1:
+                    return list(current[part].get("files", []))
+                else:
+                    if "sub_topics" not in current[part]:
+                        return []
+                    current = current[part]["sub_topics"]
+
+        return []
+
+    def mark_completed(
+        self,
+        source_type: str,
+        topic_path_parts: list[str],
+        created_file_path: str,
+        increment: int = 1,
+    ) -> None:
+        """Update completed count and files list in memory, flush periodically."""
+        snapshots: list[tuple[str, dict]] = []
+
+        with self._lock:
+            data = self._data.get(source_type)
+            if not data:
+                return
+
+            current = data.get("topics", {})
+            for i, part in enumerate(topic_path_parts):
+                if part not in current:
+                    return
+
+                if i == len(topic_path_parts) - 1:
+                    current[part]["completed"] = current[part].get("completed", 0) + increment
+                    if "files" not in current[part]:
+                        current[part]["files"] = []
+                    current[part]["files"].append(created_file_path)
+                else:
+                    if "sub_topics" not in current[part]:
+                        return
+                    current = current[part]["sub_topics"]
+
+            self._dirty.add(source_type)
+            self._update_count += 1
+
+            if self._update_count >= self._flush_interval:
+                snapshots = self._collect_dirty_snapshots()
+
+        # Write outside lock
+        for st, snap_data in snapshots:
+            filepath = os.path.join(VOLUME_DIR, f"{st}.json")
+            write_json_file(filepath, snap_data)
+
+    def _collect_dirty_snapshots(self) -> list[tuple[str, dict]]:
+        """Collect deep copies of dirty data and reset dirty state. Must be called with _lock held."""
+        snapshots = []
+        for source_type in self._dirty:
+            data = self._data.get(source_type)
+            if data:
+                snapshots.append((source_type, json.loads(json.dumps(data))))
+        self._dirty.clear()
+        self._update_count = 0
+        return snapshots
+
+    def flush(self) -> None:
+        """Force-write all dirty state to disk (I/O happens outside lock)."""
+        with self._lock:
+            snapshots = self._collect_dirty_snapshots()
+
+        for source_type, data in snapshots:
+            filepath = os.path.join(VOLUME_DIR, f"{source_type}.json")
+            write_json_file(filepath, data)
+
+    def stop(self) -> None:
+        """Stop the background flush timer and do a final flush."""
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+        self.flush()
 
 
 def collect_leaf_topics(
@@ -967,6 +1120,7 @@ def generate_single_document(
     agents_md_contents: str,
     quiet: bool = False,
     max_retries: int = 3,
+    volume_state: VolumeState | None = None,
 ) -> tuple[bool, str]:
     """
     Generate a single document for a topic using LLM.
@@ -980,12 +1134,16 @@ def generate_single_document(
         agents_md_contents: Formatted agents.md contents.
         quiet: If True, suppress LLM output.
         max_retries: Maximum retries for validation failures (restarts from scratch).
+        volume_state: In-memory volume state cache. Falls back to disk I/O if None.
 
     Returns:
         (success, message) tuple.
     """
     # Get existing docs for this specific topic to help with diversity
-    existing_docs = get_existing_docs_for_topic(source_type, topic_path_parts)
+    if volume_state:
+        existing_docs = volume_state.get_existing_docs_for_topic(source_type, topic_path_parts)
+    else:
+        existing_docs = get_existing_docs_for_topic(source_type, topic_path_parts)
     existing_docs_str = "\n".join(existing_docs) if existing_docs else "(none yet)"
 
     # Build the system prompt
@@ -1058,7 +1216,10 @@ def generate_single_document(
                 continue
 
             # Success! Update the volume completed count and add file path (relative)
-            update_volume_completed(source_type, topic_path_parts, rel_path, 1)
+            if volume_state:
+                volume_state.mark_completed(source_type, topic_path_parts, rel_path, 1)
+            else:
+                update_volume_completed(source_type, topic_path_parts, rel_path, 1)
             return (True, f"Created {rel_path}")
 
         except Exception as e:
@@ -1146,6 +1307,9 @@ def generate_documents(company_overview: str, parallelism: int = 10, doc_limit: 
         print("No volume directory found.")
         return
 
+    # Load all volume state into memory once
+    volume_state = VolumeState(flush_interval=100, flush_timer_seconds=30.0)
+
     # Pre-load source contexts
     source_contexts: dict[str, dict] = {}
     total_pending = 0
@@ -1154,10 +1318,11 @@ def generate_documents(company_overview: str, parallelism: int = 10, doc_limit: 
         if not filename.endswith(".json"):
             continue
         source_type = filename.replace(".json", "")
-        filepath = os.path.join(VOLUME_DIR, filename)
 
         try:
-            data = load_json_file(filepath)
+            data = volume_state.get_data(source_type)
+            if not data:
+                continue
             topics = data.get("topics", {})
             leaf_topics = collect_leaf_topics(topics)
             pending = sum(desired - completed for _, _, desired, completed in leaf_topics)
@@ -1195,77 +1360,83 @@ def generate_documents(company_overview: str, parallelism: int = 10, doc_limit: 
         futures: dict = {}
         pbar = tqdm(total=effective_total, desc="Generating documents")
 
-        while True:
-            # Get pending work items (sorted by source for same-source priority)
-            pending_work = get_pending_work_items(source_contexts, active_topics, active_lock)
+        try:
+            while True:
+                # Get pending work items from in-memory state (no disk I/O)
+                pending_work = volume_state.get_pending_work_items(
+                    set(source_contexts.keys()), active_topics, active_lock
+                )
 
-            # Check if we've hit the document limit
-            if doc_limit is not None and (total_success + total_fail) >= doc_limit:
-                # Cancel remaining futures and break
-                for f in futures:
-                    f.cancel()
-                break
-
-            # Submit new work up to available slots
-            available_slots = parallelism - len(futures)
-            if doc_limit is not None:
-                # Don't submit more than remaining limit
-                remaining_limit = doc_limit - (total_success + total_fail + len(futures))
-                available_slots = min(available_slots, remaining_limit)
-            submitted = 0
-
-            for source_type, topic_path, topic_parts in pending_work:
-                if submitted >= available_slots:
+                # Check if we've hit the document limit
+                if doc_limit is not None and (total_success + total_fail) >= doc_limit:
+                    # Cancel remaining futures and break
+                    for f in futures:
+                        f.cancel()
                     break
 
-                topic_key = (source_type, tuple(topic_parts))
-                with active_lock:
-                    if topic_key in active_topics:
-                        continue
-                    active_topics.add(topic_key)
+                # Submit new work up to available slots
+                available_slots = parallelism - len(futures)
+                if doc_limit is not None:
+                    # Don't submit more than remaining limit
+                    remaining_limit = doc_limit - (total_success + total_fail + len(futures))
+                    available_slots = min(available_slots, remaining_limit)
+                submitted = 0
 
-                ctx = source_contexts[source_type]
-                future = executor.submit(
-                    generate_single_document,
-                    source_type,
-                    topic_path,
-                    topic_parts,
-                    company_overview,
-                    ctx["tree"],
-                    ctx["agents_md"],
-                    True,  # quiet
-                )
-                futures[future] = (source_type, topic_path, topic_parts)
-                submitted += 1
+                for source_type, topic_path, topic_parts in pending_work:
+                    if submitted >= available_slots:
+                        break
 
-            # If no futures and no new work, we're done
-            if not futures:
-                break
+                    topic_key = (source_type, tuple(topic_parts))
+                    with active_lock:
+                        if topic_key in active_topics:
+                            continue
+                        active_topics.add(topic_key)
 
-            # Wait for at least one to complete
-            done, _ = wait(futures.keys(), return_when=FIRST_COMPLETED)
+                    ctx = source_contexts[source_type]
+                    future = executor.submit(
+                        generate_single_document,
+                        source_type,
+                        topic_path,
+                        topic_parts,
+                        company_overview,
+                        ctx["tree"],
+                        ctx["agents_md"],
+                        True,  # quiet
+                        3,  # max_retries
+                        volume_state,
+                    )
+                    futures[future] = (source_type, topic_path, topic_parts)
+                    submitted += 1
 
-            for future in done:
-                source_type, topic_path, topic_parts = futures.pop(future)
-                topic_key = (source_type, tuple(topic_parts))
+                # If no futures and no new work, we're done
+                if not futures:
+                    break
 
-                with active_lock:
-                    active_topics.discard(topic_key)
+                # Wait for at least one to complete
+                done, _ = wait(futures.keys(), return_when=FIRST_COMPLETED)
 
-                try:
-                    success, message = future.result()
-                    if success:
-                        total_success += 1
-                    else:
+                for future in done:
+                    source_type, topic_path, topic_parts = futures.pop(future)
+                    topic_key = (source_type, tuple(topic_parts))
+
+                    with active_lock:
+                        active_topics.discard(topic_key)
+
+                    try:
+                        success, message = future.result()
+                        if success:
+                            total_success += 1
+                        else:
+                            total_fail += 1
+                            all_errors.append(f"{source_type}/{topic_path}: {message}")
+                    except Exception as e:
                         total_fail += 1
-                        all_errors.append(f"{source_type}/{topic_path}: {message}")
-                except Exception as e:
-                    total_fail += 1
-                    all_errors.append(f"{source_type}/{topic_path}: {e}")
+                        all_errors.append(f"{source_type}/{topic_path}: {e}")
 
-                pbar.update(1)
-
-        pbar.close()
+                    pbar.update(1)
+        finally:
+            volume_state.stop()
+            pbar.close()
 
     print()
     print("=" * 40)
