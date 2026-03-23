@@ -1,4 +1,7 @@
 Provide python cli commands to run the different steps
+Agents.md explanations at the top of the script before starting
+Explain project enrichment, what is going on?
+Project phases explain more in detail, not super clear
 Release artifacts + link in quickstart
 Paper link in quickstart
 Readme shields: license(MIT), website(onyx), dataset(huggingface), leaderboard(onyx page?), arXiv
