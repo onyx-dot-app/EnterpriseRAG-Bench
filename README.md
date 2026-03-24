@@ -4,18 +4,21 @@
 
 IndustryRAG Bench provides a dataset for company internal documents as well as a way of generating similar datasets for different industries, scales of companies, etc.
 
-The dataset simulates a company called "Redwood Inference" that provides AI model inference as a service. The dataset consists of **~500,000 documents** spread across the following sources:
+The dataset simulates a company called "Redwood Inference" that provides AI model inference as a service. The dataset consists of slightly over **500,000 documents** spread across the following sources:
 
-The data sources and rough volumes are as follows:
-- Slack: ~275,000 docs
-- Gmail: ~120,000 docs
-- Linear: ~35,000 docs
-- Google Drive: ~25,000 docs
-- Hubspot: ~15,000 docs
-- Fireflies: ~10,000 docs
-- GitHub: ~8,000 docs
-- Jira: ~6,000 docs
-- Confluence: ~5,000 docs
+The data sources and approximate volumes are as follows:
+
+| # | Source Type | Approximate Volume | Source Description |
+|---|-------------|-------------------|----------------------|
+| 1 | Slack | 275,000 | Internal channels and team discussions. |
+| 2 | Gmail | 120,000 | Email threads from management, sales, leadership, and ICs. |
+| 3 | Linear | 35,000 | Project management tickets for eng, product, and design. |
+| 4 | Google Drive | 25,000 | Shared files and collaborative documents. |
+| 5 | Hubspot | 15,000 | CRM records for sales. |
+| 6 | Fireflies | 10,000 | Meeting transcripts for both internal and external facing meetings. |
+| 7 | GitHub | 8,000 | Pull requests and comments across different code repositories. |
+| 8 | Jira | 6,000 | Support tickets, both internal and customer facing. |
+| 9 | Confluence | 5,000 | Wikis, runbooks, and structured/polished documentation. |
 
 The corpus provides broad coverage across key areas of business activity including (but not limited to) planning, engineering, documentation, sales, customer success, internal discussions, emails, and more.
 
