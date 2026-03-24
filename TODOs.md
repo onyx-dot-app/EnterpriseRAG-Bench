@@ -22,6 +22,7 @@ Notes and known limitations:
 - Slack in this case contains more meaningful docs
 - At scale there will be some some number of docs that do not conform to the instructions set out for the source type, including some paths which do not make sense
 - Some places there's a limit to model output (like employee directory all at once), and some places that don't scale well
+- At scales some docs will fail, checks can catch many of the issues but some will still be conformant to json but just be empty etc.
 
 
 Possible directions for justifying the dataset validity:

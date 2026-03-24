@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import os
 import random
 
 from src.llm import get_llm
@@ -31,7 +30,7 @@ from src.utils.dataset_id import add_dataset_doc_uuid
 from src.utils.field_labeling import label_single_document
 from src.utils.file_io import delete_file, load_file, load_json_file
 from src.utils.generation_cache import completeness_cache
-from src.utils.path_resolver import default_resolver
+from src.utils.path_resolver import sources_resolver
 from src.utils.validation import validate_no_nested_dicts
 
 
@@ -48,9 +47,9 @@ def validate_written_files(file_paths: list[str]) -> tuple[bool, list[str]]:
     errors = []
 
     for rel_path in file_paths:
-        full_path = default_resolver.to_absolute(rel_path)
+        full_path = sources_resolver.to_absolute(rel_path)
 
-        if not default_resolver.exists(rel_path):
+        if not sources_resolver.exists(rel_path):
             errors.append(f"File not found: {rel_path}")
             continue
 
@@ -75,7 +74,7 @@ def delete_written_files(file_paths: list[str]) -> None:
         file_paths: List of paths relative to GENERATED_DATA_DIR (e.g., "sources/confluence/doc.json")
     """
     for rel_path in file_paths:
-        full_path = default_resolver.to_absolute(rel_path)
+        full_path = sources_resolver.to_absolute(rel_path)
         if delete_file(full_path):
             print(f"  Deleted: {rel_path}")
 
@@ -97,7 +96,7 @@ def add_uuids_to_files(file_paths: list[str]) -> list[str]:
     """
     uuids = []
     for rel_path in file_paths:
-        full_path = default_resolver.to_absolute(rel_path)
+        full_path = sources_resolver.to_absolute(rel_path)
         doc_uuid = add_dataset_doc_uuid(full_path)
         uuids.append(doc_uuid)
     return uuids
@@ -111,7 +110,7 @@ def label_files(file_paths: list[str]) -> None:
         file_paths: List of paths relative to GENERATED_DATA_DIR (e.g., "sources/confluence/doc.json")
     """
     for rel_path in file_paths:
-        full_path = default_resolver.to_absolute(rel_path)
+        full_path = sources_resolver.to_absolute(rel_path)
         success, message = label_single_document(full_path, quiet=True)
         if not success:
             print(f"  Warning: Failed to label {rel_path}: {message}")
@@ -155,6 +154,11 @@ def main() -> None:
         type=int,
         default=10,
         help="Number of completeness traces to generate (default: 10)",
+    )
+    parser.add_argument(
+        "--auto-accept",
+        action="store_true",
+        help="Automatically accept each trace without user input",
     )
     args = parser.parse_args()
 
@@ -298,13 +302,17 @@ def main() -> None:
                 break
 
             try:
-                user_input = input("You: ").strip()
-                if not user_input:
-                    continue
-                if user_input.lower() == "quit":
-                    print("Exiting early...")
-                    quit_requested = True
-                    break
+                if args.auto_accept:
+                    user_input = "Go ahead, continue."
+                    print(f"You (auto): {user_input}")
+                else:
+                    user_input = input("You: ").strip()
+                    if not user_input:
+                        continue
+                    if user_input.lower() == "quit":
+                        print("Exiting early...")
+                        quit_requested = True
+                        break
 
                 conversation.run_turn(user_input, exit_on_tools=[FINISH_TOOL])
 

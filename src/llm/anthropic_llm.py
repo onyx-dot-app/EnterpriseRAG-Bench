@@ -118,9 +118,11 @@ class AnthropicLLM(LLMInterface):
 
             i += 1
 
-        # Anthropic requires at least one message; inject a placeholder if only system was provided
-        if not anthropic_messages:
-            anthropic_messages.append({"role": "user", "content": "Begin."})
+        # Anthropic requires at least one user message; if only a system prompt was
+        # provided, send it as a user message instead of injecting a placeholder.
+        if not anthropic_messages and system_message:
+            anthropic_messages.append({"role": "user", "content": system_message})
+            system_message = None
 
         return system_message, anthropic_messages
 
