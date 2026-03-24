@@ -12,6 +12,7 @@ from src.paths import (
     SOURCES_DIR,
 )
 from src.prompts.completeness_documents import (
+    AUTO_CONTINUE_USER_MESSAGE,
     COMPLETENESS_SYSTEM_PROMPT,
     COMPLETENESS_USER_PROMPT_EXISTING_TYPE,
     COMPLETENESS_USER_PROMPT_NEW_TYPE,
@@ -296,7 +297,7 @@ def main() -> None:
 
             try:
                 if args.auto_accept:
-                    user_input = "Go ahead, continue."
+                    user_input = AUTO_CONTINUE_USER_MESSAGE
                     print(f"You (auto): {user_input}")
                 else:
                     user_input = input("You: ").strip()

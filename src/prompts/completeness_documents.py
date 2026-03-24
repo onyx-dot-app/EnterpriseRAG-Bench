@@ -54,3 +54,5 @@ I want a question of the {question_type_number} type from the `# Question Types`
 COMPLETENESS_USER_PROMPT_NEW_TYPE = """
 Make sure the question you help me come up with is not one of the 4 question types in the `# Question Types` section. Make sure the question is concise and not so specific that the retrieval/search becomes trivial.
 """.strip()
+
+AUTO_CONTINUE_USER_MESSAGE = "Looks good to me."
