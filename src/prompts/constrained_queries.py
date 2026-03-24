@@ -23,6 +23,7 @@ A constrained query has:
    - **Causal/resolution**: what caused it, how it was fixed, who was involved
    - **Scope**: a region, environment, tier, or deployment type
    - **Condition**: a specific circumstance or state (e.g. "after upgrading SDK", "during peak traffic")
+Note: Try to use Entity type qualifiers very sparingly or avoid them altogether, as these make the retrieval and answer generation overly simple which is detrimental to the evaluation.
 
 ## Example
 
@@ -31,12 +32,12 @@ Topic area: streaming issues (many documents discuss streaming problems)
 Query: "What was the root cause and server-side fix for the streaming freeze reported by Arcadia Health in January 2026?"
 
 Qualifiers and what they filter:
-- "Arcadia Health" (entity) -> eliminates streaming tickets for Acme AI, Northwind Robotics, Zenlytics, Bluepeak AI
+- "Arcadia Health" (entity) -> eliminates streaming tickets for Acme AI, Northwind Robotics, Zenlytics, Bluepeak AI. Note: avoid this type of entity qualifier in your queries.
 - "January 2026" (temporal) -> eliminates streaming issues from other months/years
 - "streaming freeze" (condition) -> distinguishes from "connection reset", "truncation", "disconnect after SDK upgrade"
 - "server-side fix" (resolution type) -> eliminates tickets resolved with only customer-side workarounds
 
-Gold documents: A ticket and email thread about Arcadia Health's SSE freeze
+Gold documents: A ticket and email thread about Arcadia Health's SSE freeze in Jan 2026 which together cover the root cause and server-side fix for it.
 Distractor documents: Other streaming tickets for different customers, different time periods, or different root causes
 
 # Your process
@@ -71,8 +72,16 @@ Avoid these documents as they have already been used to generate other questions
 - Do NOT make the query artificially verbose just to pack in constraints. Qualifiers should flow naturally.
 - The gold document set should be small (1-4 documents). If you need more than 4 to answer, the query is too broad.
 - There should be at least 3 distractor documents that share the topic but fail on at least one qualifier.
-- The qualifiers should create genuine ambiguity: a retrieval system SHOULD find the distractors relevant at surface level.
-- Prefer qualifiers that cut across different dimensions (e.g. entity + time, not just two entities).
+- The qualifiers should create genuine ambiguity: a retrieval system SHOULD find the distractors relevant at a surface level.
+- Prefer qualifiers that cut across different dimensions (e.g. scope + time, not just two temporal qualifiers).
+- Avoid overusing entity type qualifiers, they should be used sparingly or avoided altogether.
+
+## Available tools
+- {GLOB_TOOL}: Find files by glob pattern. Use to discover documents in the source directories.
+- {GREP_TOOL}: Find files by grep pattern. Use to discover documents in the source directories.
+- {LS_TOOL}: List files in a directory. Use to discover documents in the source directories.
+- {READ_TOOL}: Read a file and return its contents. Use to read documents and understand their details.
+- {FINISH_TOOL}: Call this with the final JSON output once you have all of the context necessary.
 
 # Output format
 
@@ -84,13 +93,6 @@ When calling {FINISH_TOOL}, provide a JSON object with this structure (without t
   "distractor_documents": ["relative path to document", "..."]
 }}}}
 ```
-
-## Available tools
-- {GLOB_TOOL}: Find files by glob pattern. Use to discover documents in the source directories.
-- {GREP_TOOL}: Find files by grep pattern. Use to discover documents in the source directories.
-- {LS_TOOL}: List files in a directory. Use to discover documents in the source directories.
-- {READ_TOOL}: Read a file and return its contents. Use to read documents and understand their details.
-- {FINISH_TOOL}: Call this with the final JSON output once you have all of the context necessary.
 """.strip()
 
 CONSTRAINED_QUERIES_USER_PROMPT = "Explore the sources directory, find a cluster of topically related documents, and propose a constrained query. Show me the query, the gold documents, the distractor documents, and explain how each qualifier filters."

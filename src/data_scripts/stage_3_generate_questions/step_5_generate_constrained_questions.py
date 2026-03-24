@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from src.llm import Message, get_llm, run_auto_conversation
 from src.paths import GENERATED_DATA_DIR, QUESTIONS_PATH, SOURCE_TREE_PATH
@@ -67,6 +68,7 @@ def save_used_document_paths(paths: list[str]) -> None:
 
 def load_documents_by_paths(
     doc_paths: list[str],
+    quiet: bool = False,
 ) -> list[dict]:
     """Load documents from paths relative to GENERATED_DATA_DIR.
 
@@ -92,7 +94,8 @@ def load_documents_by_paths(
                 }
             )
         except (Exception, DocumentFieldError) as e:
-            print(f"  Warning: Failed to load {rel_path}: {e}")
+            if not quiet:
+                print(f"  Warning: Failed to load {rel_path}: {e}")
     return documents
 
 
@@ -308,6 +311,114 @@ def validate_constrained_question(
 
 
 # =============================================================================
+# Single Question Processing
+# =============================================================================
+
+
+def process_single_constrained_question(
+    source_tree: str,
+    used_document_paths: list[str],
+    quiet: bool = False,
+) -> tuple[bool, str, dict | None]:
+    """
+    Process a single constrained question end-to-end.
+
+    Args:
+        source_tree: Source directory tree string.
+        used_document_paths: Snapshot of paths already used (passed to LLM).
+        quiet: If True, suppress LLM output.
+
+    Returns:
+        (success, message, question_data) tuple.
+        question_data includes gold_paths and distractor_paths for the caller
+        to check overlap and update used_document_paths.
+        On failure, question_data is None.
+    """
+    # Generate constrained question
+    if not quiet:
+        print("\n--- Exploring Corpus & Generating Question ---")
+
+    query, gold_paths, distractor_paths = generate_constrained_question(
+        source_tree, used_document_paths, quiet=quiet
+    )
+
+    if not query or not gold_paths:
+        return (False, "Question generation failed", None)
+
+    if not quiet:
+        print(f"\nQuery: {query}")
+        print(f"Gold documents: {gold_paths}")
+        print(f"Distractor documents: {distractor_paths or []}")
+
+    # Load all documents for validation
+    if not quiet:
+        print("\n--- Loading Documents ---")
+
+    gold_docs = load_documents_by_paths(gold_paths, quiet=quiet)
+    distractor_docs = load_documents_by_paths(distractor_paths or [], quiet=quiet)
+    all_docs = gold_docs + distractor_docs
+
+    if not gold_docs:
+        return (False, "Failed to load any gold documents", None)
+
+    # Validate the question
+    if not quiet:
+        print("\n--- Validating Question ---")
+
+    valid, gold_answer, distractor_explanations, relevant_uuids = (
+        validate_constrained_question(query, all_docs, quiet=quiet)
+    )
+
+    if not valid or not gold_answer or not relevant_uuids:
+        return (False, "Question validation failed", None)
+
+    if not quiet:
+        print(f"\nGold answer: {gold_answer[:200]}...")
+
+    # Extract answer facts
+    if not quiet:
+        print("\n--- Extracting Answer Facts ---")
+
+    extracted_facts = extract_answer_facts(query, gold_answer, quiet=quiet)
+
+    if not extracted_facts:
+        return (False, "Answer fact extraction failed", None)
+
+    if not quiet:
+        print(f"\nExtracted {len(extracted_facts)} facts")
+
+    # Combine extracted facts with distractor explanations
+    answer_facts = extracted_facts + (distractor_explanations or [])
+
+    # Derive source types from relevant UUIDs.
+    # Paths are relative to GENERATED_DATA_DIR (e.g., "sources/confluence/..."),
+    # so strip the "sources/" prefix before extracting the source type.
+    source_types = sorted(
+        set(
+            extract_source_type(
+                doc["path"].removeprefix("sources/").removeprefix("sources\\")
+            )
+            for doc in all_docs
+            if doc.get("uuid") in relevant_uuids
+        )
+    )
+
+    question_data = {
+        "question": query,
+        "expected_doc_ids": relevant_uuids,
+        "source_types": source_types,
+        "gold_answer": gold_answer,
+        "answer_facts": answer_facts,
+        "question_type": "constrained",
+        "gold_paths": gold_paths,
+        "distractor_paths": distractor_paths or [],
+    }
+
+    label = query[:60] if query else "unknown"
+    return (True, f"{label}: Success", question_data)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -321,6 +432,12 @@ def main() -> None:
         type=int,
         default=50,
         help="Number of questions to generate (default: 50)",
+    )
+    parser.add_argument(
+        "--parallelism",
+        type=int,
+        default=1,
+        help="Number of parallel workers (default: 1, verbose output)",
     )
     parser.add_argument(
         "--quiet",
@@ -362,114 +479,156 @@ def main() -> None:
         print(f"Questions file not found. Will create: {QUESTIONS_PATH}")
 
     print()
-    print(f"Will generate {args.count} new question(s).")
+    print(
+        f"Processing {args.count} constrained questions with parallelism={args.parallelism}."
+    )
     print()
 
     success_count = 0
     fail_count = 0
+    discard_count = 0
     errors: list[str] = []
 
-    for i in range(args.count):
-        print("\n" + "-" * 40)
-        print(f"Question {i + 1} of {args.count}")
-        print("-" * 40)
+    if args.parallelism <= 1:
+        # Sequential mode — verbose output
+        for i in range(args.count):
+            print("\n" + "-" * 40)
+            print(f"Question {i + 1} of {args.count}")
+            print("-" * 40)
 
-        # Generate constrained question
-        print("\n--- Exploring Corpus & Generating Question ---")
-        query, gold_paths, distractor_paths = generate_constrained_question(
-            source_tree, used_document_paths, quiet=args.quiet
-        )
-
-        if not query or not gold_paths:
-            fail_count += 1
-            errors.append("Question generation failed")
-            print("\nFailed: Question generation failed")
-            continue
-
-        print(f"\nQuery: {query}")
-        print(f"Gold documents: {gold_paths}")
-        print(f"Distractor documents: {distractor_paths or []}")
-
-        # Load all documents for validation
-        print("\n--- Loading Documents ---")
-        gold_docs = load_documents_by_paths(gold_paths)
-        distractor_docs = load_documents_by_paths(distractor_paths or [])
-        all_docs = gold_docs + distractor_docs
-
-        if not gold_docs:
-            fail_count += 1
-            errors.append("Failed to load any gold documents")
-            print("\nFailed: Failed to load any gold documents")
-            continue
-
-        # Validate the question
-        print("\n--- Validating Question ---")
-        valid, gold_answer, distractor_explanations, relevant_uuids = (
-            validate_constrained_question(query, all_docs, quiet=args.quiet)
-        )
-
-        if not valid or not gold_answer or not relevant_uuids:
-            fail_count += 1
-            errors.append("Question validation failed")
-            print("\nFailed: Question validation failed")
-            continue
-
-        # Extract answer facts
-        print("\n--- Extracting Answer Facts ---")
-        extracted_facts = extract_answer_facts(query, gold_answer, quiet=args.quiet)
-
-        if not extracted_facts:
-            fail_count += 1
-            errors.append("Answer fact extraction failed")
-            print("\nFailed: Answer fact extraction failed")
-            continue
-
-        # Combine extracted facts with distractor explanations
-        answer_facts = extracted_facts + (distractor_explanations or [])
-
-        # Derive source types from relevant UUIDs.
-        # Paths are relative to GENERATED_DATA_DIR (e.g., "sources/confluence/..."),
-        # so strip the "sources/" prefix before extracting the source type.
-        source_types = sorted(
-            set(
-                extract_source_type(
-                    doc["path"].removeprefix("sources/").removeprefix("sources\\")
-                )
-                for doc in all_docs
-                if doc.get("uuid") in relevant_uuids
+            success, message, question_data = process_single_constrained_question(
+                source_tree, used_document_paths, quiet=args.quiet
             )
-        )
 
-        # Generate question ID
-        question_id = f"qst_{next_question_id:04d}"
+            if not success or not question_data:
+                fail_count += 1
+                errors.append(message)
+                print(f"\nFailed: {message}")
+                continue
 
-        # Append to questions file
-        save_question(
-            question_id=question_id,
-            question=query,
-            expected_doc_ids=relevant_uuids,
-            source_types=source_types,
-            gold_answer=gold_answer,
-            answer_facts=answer_facts,
-            question_type="constrained",
-        )
-        next_question_id += 1
+            # Save
+            question_id = f"qst_{next_question_id:04d}"
+            save_question(
+                question_id=question_id,
+                question=question_data["question"],
+                expected_doc_ids=question_data["expected_doc_ids"],
+                source_types=question_data["source_types"],
+                gold_answer=question_data["gold_answer"],
+                answer_facts=question_data["answer_facts"],
+                question_type=question_data["question_type"],
+            )
+            next_question_id += 1
 
-        # Update used document paths cache
-        all_paths = gold_paths + (distractor_paths or [])
-        for p in all_paths:
-            if p not in used_document_paths:
-                used_document_paths.append(p)
-        save_used_document_paths(used_document_paths)
+            # Update used document paths cache
+            all_paths = question_data["gold_paths"] + question_data["distractor_paths"]
+            for p in all_paths:
+                if p not in used_document_paths:
+                    used_document_paths.append(p)
+            save_used_document_paths(used_document_paths)
 
-        success_count += 1
-        print(f"\nSaved question {question_id} (docs: {relevant_uuids})")
+            success_count += 1
+            print(f"\nSaved question {question_id}")
+    else:
+        # Parallel mode — sliding window scheduler.
+        # The main thread dispatches workers with the latest used_document_paths
+        # snapshot, then processes results sequentially as they complete.
+        # If a result's gold documents overlap with the (now-updated)
+        # used_document_paths, the result is discarded.
+        used_paths_set: set[str] = set(used_document_paths)
+        completed = 0
+        submitted = 0
+
+        with ThreadPoolExecutor(max_workers=args.parallelism) as executor:
+            futures: dict = {}
+
+            # Submit initial batch
+            while submitted < args.count and len(futures) < args.parallelism:
+                future = executor.submit(
+                    process_single_constrained_question,
+                    source_tree,
+                    list(used_document_paths),  # snapshot
+                    True,  # quiet=True for parallel workers
+                )
+                futures[future] = submitted
+                submitted += 1
+
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+
+                for future in done:
+                    futures.pop(future)
+                    completed += 1
+
+                    try:
+                        success, message, question_data = future.result()
+                    except Exception as e:
+                        fail_count += 1
+                        errors.append(str(e))
+                        print(f"  [{completed}/{args.count}] ERROR: {e}")
+                    else:
+                        if not success or not question_data:
+                            fail_count += 1
+                            errors.append(message)
+                            print(f"  [{completed}/{args.count}] FAIL: {message}")
+                        else:
+                            # Check for gold document overlap with current state
+                            gold_paths = question_data["gold_paths"]
+                            overlap = [p for p in gold_paths if p in used_paths_set]
+
+                            if overlap:
+                                discard_count += 1
+                                msg = (
+                                    f"Discarded: gold documents already used: {overlap}"
+                                )
+                                errors.append(msg)
+                                print(f"  [{completed}/{args.count}] DISCARD: {msg}")
+                            else:
+                                # Save question
+                                question_id = f"qst_{next_question_id:04d}"
+                                save_question(
+                                    question_id=question_id,
+                                    question=question_data["question"],
+                                    expected_doc_ids=question_data["expected_doc_ids"],
+                                    source_types=question_data["source_types"],
+                                    gold_answer=question_data["gold_answer"],
+                                    answer_facts=question_data["answer_facts"],
+                                    question_type=question_data["question_type"],
+                                )
+                                next_question_id += 1
+                                success_count += 1
+
+                                # Update used document paths
+                                all_paths = (
+                                    gold_paths + question_data["distractor_paths"]
+                                )
+                                for p in all_paths:
+                                    if p not in used_paths_set:
+                                        used_paths_set.add(p)
+                                        used_document_paths.append(p)
+                                save_used_document_paths(used_document_paths)
+
+                                print(
+                                    f"  [{completed}/{args.count}] OK: {message} -> {question_id}"
+                                )
+
+                    # Submit next work item with fresh used_document_paths
+                    if submitted < args.count:
+                        new_future = executor.submit(
+                            process_single_constrained_question,
+                            source_tree,
+                            list(used_document_paths),  # fresh snapshot
+                            True,
+                        )
+                        futures[new_future] = submitted
+                        submitted += 1
 
     print("\n" + "=" * 40)
     print("Summary")
     print("=" * 40)
     print(f"Successfully generated: {success_count}")
     print(f"Failed: {fail_count}")
+    if discard_count > 0:
+        print(f"Discarded (gold doc overlap): {discard_count}")
     print(f"Total questions in file: {count_existing_questions()}")
 
     if errors:
