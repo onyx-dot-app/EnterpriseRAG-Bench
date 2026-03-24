@@ -537,7 +537,7 @@ def main() -> None:
         },
     )
 
-    print("\nThis marks the end of Stage 2: Add Noise.")
+    print("\nThis is the end of Stage 2 - Adding noise to the dataset.")
 
 
 if __name__ == "__main__":

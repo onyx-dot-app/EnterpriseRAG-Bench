@@ -30,7 +30,7 @@ class ExportConfig(BaseModel):
     max_files_per_zip: int | None = None
     max_files: int | None = None
     random_sample: bool = False
-    flatten: bool = False
+    flatten_within_sources: bool = False
     export_format: str = "txt"
     split_by_source: bool = False
     onyx_format: bool = False
@@ -203,8 +203,10 @@ def export_single_file(
         else:
             export_filename = get_export_filename(uuid, filename)
 
-        if config.flatten:
-            export_subdir = EXPORT_DATA_DIR
+        if config.flatten_within_sources:
+            # Flatten into export_data/{source}/ with no deeper subdirectories
+            source_name = rel_path.split(os.sep)[0]
+            export_subdir = os.path.join(EXPORT_DATA_DIR, source_name)
         else:
             export_subdir = os.path.join(EXPORT_DATA_DIR, rel_path)
 
@@ -221,11 +223,11 @@ def export_single_file(
 
         metadata = None
         if config.onyx_format:
-            full_rel_path = (
-                os.path.join(rel_path, export_filename)
-                if not config.flatten
-                else export_filename
-            )
+            if config.flatten_within_sources:
+                source_name = rel_path.split(os.sep)[0]
+                full_rel_path = os.path.join(source_name, export_filename)
+            else:
+                full_rel_path = os.path.join(rel_path, export_filename)
             metadata = FileMetadata(
                 filename=export_filename,
                 id=uuid,
@@ -409,9 +411,9 @@ def main() -> None:
         help="Randomly sample files from the entire corpus (only applies with --max-files)",
     )
     parser.add_argument(
-        "--flatten",
+        "--flatten-within-sources",
         action="store_true",
-        help="Place all files at the top level with no directory structure",
+        help="Flatten files within each source directory (e.g., export_data/slack/ with no subdirectories)",
     )
     parser.add_argument(
         "--sources",
@@ -454,7 +456,7 @@ def main() -> None:
         max_files_per_zip=args.max_files_per_zip,
         max_files=args.max_files,
         random_sample=args.random_sample,
-        flatten=args.flatten,
+        flatten_within_sources=args.flatten_within_sources,
         export_format=args.export_format,
         split_by_source=args.split_by_source,
         onyx_format=onyx_format,
@@ -475,8 +477,10 @@ def main() -> None:
         print(f"Max files: {config.max_files}")
     if config.random_sample:
         print("Random sample: enabled")
-    if config.flatten:
-        print("Flatten: enabled (all files at top level)")
+    if config.flatten_within_sources:
+        print(
+            "Flatten within sources: enabled (files flattened under source directories)"
+        )
     print(f"Export format: {config.export_format}")
     if config.split_by_source:
         print("Split by source: enabled")
@@ -533,7 +537,9 @@ def main() -> None:
             print("  (each zip includes .onyx_metadata.json)")
 
     print()
-    print("This marks the end of Stage 4: Data Export.")
+    print(
+        "This is the end of Dataset generation process. You can now use the zip files for your downstream tasks."
+    )
 
 
 if __name__ == "__main__":
