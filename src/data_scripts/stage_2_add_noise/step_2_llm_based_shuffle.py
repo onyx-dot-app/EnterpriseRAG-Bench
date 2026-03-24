@@ -53,6 +53,22 @@ def get_source_type_tree(source_type: str) -> str:
 # =============================================================================
 
 
+def is_noise_document(file_path: str) -> bool:
+    """Check if a JSON file is already marked as a noise document.
+
+    Args:
+        file_path: Absolute path to a JSON file.
+
+    Returns:
+        True if the file has a dataset_noise_document field.
+    """
+    try:
+        data = load_json_file(file_path)
+        return "dataset_noise_document" in data
+    except Exception:
+        return False
+
+
 def collect_json_files(source_type_dir: str) -> list[str]:
     """Collect all JSON file paths under a source type directory.
 
@@ -370,8 +386,18 @@ def main() -> None:
             print(f"[{source_type}] No nested directories, skipping")
             continue
 
-        num_to_move = max(1, round(total * args.percentage / 100))
-        selected = random.sample(json_files, min(num_to_move, total))
+        # Skip files already marked as noise documents
+        eligible_files = [f for f in json_files if not is_noise_document(f)]
+        skipped = total - len(eligible_files)
+        if skipped:
+            print(f"[{source_type}] Skipped {skipped} noise documents")
+
+        if not eligible_files:
+            print(f"[{source_type}] No eligible files after filtering, skipping")
+            continue
+
+        num_to_move = max(1, round(len(eligible_files) * args.percentage / 100))
+        selected = random.sample(eligible_files, min(num_to_move, len(eligible_files)))
         source_tree = get_source_type_tree(source_type)
 
         print(

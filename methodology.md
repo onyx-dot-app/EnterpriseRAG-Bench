@@ -6,7 +6,7 @@ The following are a list of requirements and challenges addressed by the specifi
 
 1. The documents need to have consistent guiding principles behind them to ensure they are realistic to the company / industry they are being generated for.
 2. The generation process must allow for interdependencies between individual documents. For example code changes (Pull-Requests) are necessarily linked to Product Requirement Documents (PRDs).
-3. The distribution of documents should be realistic to real world data. For example, there are typically orders of magnitude more discussions channel messages (Slack/MS Teams/Discord) as compared to polished product documentation.
+3. The distribution of documents should be realistic to real world data. For example, there are typically orders of magnitude more discussion channel messages (Slack/MS Teams/Discord) as compared to polished product documentation.
 4. The document set must have a realistic level of noise. This includes things like misplaced documents, contradictory statements, ambiguous information, etc.
 5. The creation of the data must allow for the generation of interesting questions for the dataset (not just simple backgenerating questions from single documents), the questions must be verifiable and answerable by the underlying data.
 6. The dataset creation process should be flexible to industry (or vertical) specific use cases and able to handle different volumes of artificial data generation (at least to some maximum number of documents).
@@ -37,7 +37,7 @@ To address this, the evaluation utility considers not only the gold answer but a
 
 #### Step 1 - Generating the company overview
 
-To help create a cohere dataset, we begin by generating high level overview about the company to guide all later steps. The user interacts with an LLM to cover topics including:
+To help create a coherent dataset, we begin by generating a high-level overview of the company to guide all later steps. The user interacts with an LLM to cover topics including:
 - Company name and 1 line description
 - Mission and vision
 - Company overview and what it does
@@ -57,8 +57,8 @@ It informs nearly all document generation, provides a rough guide for other scaf
 **Step 2** generates the high level initiatives for the company based on the company overview and user interactions. This step allows the user to provide more guidance on the high level contents for the dataset.
 It is used by later steps to generate the employee directory, the source structure, more detailed project breakdowns, and provides context for the large volume document generation.
 
-**Step 3** generates the employee directory based on the company overview and initiatives. It also allows the user to provide their input into the org structure and inviduals.
-It is used by later steps to generate source structure (for example, emails inboxes all map to real people at the organization), and for generating project scaffolding information.
+**Step 3** generates the employee directory based on the company overview and initiatives. It also allows the user to provide their input into the org structure and individuals.
+It is used by later steps to generate source structure (for example, email inboxes all map to real people at the organization), and for generating project scaffolding information.
 
 **Step 4** generates the source structure (things like Google Drive, Salesforce, Zoom, etc.) as well as the nested directory structures with them.
 This step is also guided by the user to specify which sources they are interested in and the structure of the sources.
@@ -67,7 +67,7 @@ It takes into account the company overview and initiatives and can pull in relev
 **Step 5** generates agents.md files in different directories to guide the format and contents of the documents that exist within them.
 These files which are created with user input allow the user to specify what kind of data they would like to be generated for the given sources.
 For example, for GitHub in the released dataset, the documents all represent pull-requests (code change descriptions) along with their comments.
-This approach of creating agents.md file which are pulled into document generation steps allow the user to specify in natural language exactly how different areas of the dataset should look like.
+This approach of creating agents.md files that are pulled into document generation steps allows the user to specify in natural language exactly how different areas of the dataset should look.
 This allows for as much or as little oversight from the user in creating the dataset.
 
 #### Steps 6 through 8 - Generating core high fidelity documents
@@ -76,19 +76,19 @@ This allows for as much or as little oversight from the user in creating the dat
 and these `efforts should reflect the full breadth of company operations (including things like technical work, go-to-market, customer-facing, operational, and internal functions)`.
 The difference is that initiatives are higher level and generally too broad to guide a document generation process where the files are strongly aware of one another. Projects break them down into smaller sets of around 100 documents each.
 
-The stages of generating the process are as follows:
+The stages of the generation process are as follows:
 1. Based on the company overview, initiatives, and directory structure, a list of projects is proposed and refined with the user input. These are grouped into major business/functional areas of the company.
 2. For each of the projects individually, a separate flow is run to enrich them. This means generating a longer description as well as a list of documents to be created for this project.
 This step is done also with context of the company and initiatives. For example, an engineering project might have requirement docs, internal meeting transcripts, discussion threads, and code changelogs.
-Additionally, a set of LLM useable tools are provided such as "glob", "tree" etc. to allow exploring the file directory and agents.md files.
+Additionally, a set of LLM-usable tools are provided such as "glob", "tree" etc. to allow exploring the file directory and agents.md files.
 This prevents the LLM from hallucinating for example GitHub issues for that source type when the agents.md explains clearly that the GitHub source type only contains pull-requests.
 3. The projects are then further enriched with people information using the employee directory. The most relevant people are attached to the project and their roles for the project are outlined.
 
 **Step 7** generates the actual project documents based on the scaffolding above. Each project file is aware of:
-- It's own file name/path and description of what to cover
+- Its own file name/path and description of what to cover
 - The company overview
 - The enriched project description with all of the files and descriptions
-- The agent.md files in its path
+- The agents.md files in its path
 - Access to a read tool to read other related project documents if additional details are needed outside of the overview
 
 **Step 8** generates small clusters of related documents (typically 4–10) where every document in the cluster is fully visible to the model alongside the others.
@@ -99,7 +99,7 @@ The cluster is also anchored to a target question so the generation knows which 
 
 #### Step 9 - Generating high volume documents
 
-High-volume document creation is split into scaffolding and generation. The main challenge is model drift: without very tight steering, the model converges on familiar themes and produces near-duplicates documents.
+High-volume document creation is split into scaffolding and generation. The main challenge is model drift: without very tight steering, the model converges on familiar themes and produces near-duplicate documents.
 In a simple experiment we only gave the company overview and asked for 100 documents spanning different parts of the business. Each run used the same prompt and non-zero temperature, with no visibility into documents already produced.
 At that modest scale we still saw tight clusters: the model judged that over 40% of documents had a very close sibling. The exact numbers depend on model and temperature, but the pattern holds across all the tested LLMs.
 
@@ -111,14 +111,51 @@ The LLM is provided with:
 - The directory structure for the source type
 - The agents.md contents for that source type
 
-Topics are split into subtopics until each leaf represents at most 500 documents. During generation, the model sees the other files in that by name/path and is nudged so the documents compliment one another rather than blindly overlapping.
+Topics are split into subtopics until each leaf represents at most 500 documents. During generation, the model sees the other files in the same leaf topic by name/path and is nudged so the documents complement one another rather than blindly overlapping.
 Different leaves also cover different slices of the subject matter. Together, these guardrails prevent the runaway duplicate clustering seen in the naive setup.
 
-It is also significantly more cost efficient compared to the high fidenlity documents. Documents in this flow only need access to global context about the company, a minimal amount of scaffolding for the topic and subtopics,
+It is also significantly more cost efficient compared to the high-fidelity documents. Documents in this flow only need access to global context about the company, a minimal amount of scaffolding for the topic and subtopics,
 and the paths of other documents in the same leaf (capped at 500). This step is also per-source further reducing the amount of structural/directory context needed by the LLM.
 
 Note: there are some acknowledged drawbacks of the high volume generation approach which would be in conflict with cost savings and time needed per document.
 - To save cost, this step is given minimal flexibility/tools that the LLM can call. The documents are therefore not aware of the people in the org or information about their roles.
-Many of the documents will have made up authors, commentors, etc. which do not exist in the employee directory. Note that for the questions provided with the dataset, this is not an issue.
+Many of the documents will have made up authors, commenters, etc. which do not exist in the employee directory. Note that for the questions provided with the dataset, this is not an issue.
 - Since documents are only aware of each other at a surface level and only within leaf topics, there is no guarantee that contents within the files do not contradict each other.
 While some amount of this is desirable, it is unclear if this happens more frequently than in real world corpuses.
+
+### Stage 2 - Adding noise
+
+> Note: The documents that have been shuffled or created by noise generation steps have an additional field called "dataset_noise_document" which has a value of true.
+
+#### Step 1 - Random shuffle
+
+A specified percentage of the documents are randomly shuffled within their source type. For the provided dataset, this percentage is 5%.
+To keep the documents compliant with the expected format of the source type, there is no cross source shuffling in this stage.
+For example, a document for a ticketing system with metadata like "closed date", "assignee", etc. would not make any sense if shuffled into a source like Slack.
+Documents are chosen using a random walk over the directory tree, so selection reflects structure rather than being skewed by how many files sit in each folder.
+After a directory is picked, one document in that directory is randomly selected and moved to a new location.
+
+#### Step 2 - LLM based shuffle
+
+To better match real-world noise, we assume misfiled documents are biased toward local structure: adjacent directories, parent/child directories, or other structured but wrong placements, not a uniform draw over the corpus.
+We use the same directory-based sampling as the step above but then rely on an LLM to propose a realistic misplaced destination. This LLM-based relocation applies to 3% of documents in the released dataset.
+Previously shuffled documents are excluded, so this stage does not re-shuffle them. Cumulatively, 8% of documents in the provided dataset are affected by some shuffle operation.
+
+The LLM is given the original path/name, the contents of the document, and the directory structure of the source and is required to output a different valid path within the existing structure which is reasonable but suboptimal for the document.
+
+#### Step 3 - Miscellaneous type directories and files
+
+The Stage 1 document generation emphasizes coherent, formal subjects aligned with the company inspired scaffolding. Real industry documents also include informal discussion, work-in-progress drafts, and ad hoc notes stored in poorly normalized locations.
+Miscellaneous-type paths and files are introduced to approximate that layer of the document set. Some example misc directories in the dataset include `slack/memes`, `google_drive/shared_drives/go-to-market/misc-assets`, `github/hackathons`, etc.
+
+The process begins with a human-in-the-loop LLM based generation of these directories. Given the existing directory structure, the LLM proposes a set of misc type directories and collaborates with the user to establish the final set.
+
+Once the misc directories are created, a separate flow is run to populate the directories with misc type files. This flow is aware of:
+- The company overview
+- The agents.md files that overlap with the misc directories
+- The misc type directories
+- Other misc type files generated so far (this is to avoid the clustering problem mentioned before)
+
+> Note: The document set assumes a low volume of these types of misc type files. It is not significant in the total volume of the dataset.
+> They are created not to dramatically shift the distribution of the dataset but rather to later create questions based on these misc documents which present some unique challenges in retrieving.
+> To create a very significant volume of misc type documents, a similar scaffolding approach as Stage 1 Step 9 would be recommended.

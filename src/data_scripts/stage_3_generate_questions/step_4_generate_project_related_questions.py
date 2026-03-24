@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.llm import Message, get_llm, run_auto_conversation
 from src.paths import QUESTIONS_PATH, SOURCES_DIR
@@ -159,6 +160,117 @@ def validate_project_question(
 
 
 # =============================================================================
+# Single Question Processing
+# =============================================================================
+
+
+def process_single_project_question(
+    project: dict,
+    doc_paths: list[str],
+    uuid_index: dict[str, str],
+    quiet: bool = False,
+) -> tuple[bool, str, dict | None]:
+    """
+    Process a single project question end-to-end.
+
+    Returns:
+        (success, message, question_data) tuple.
+        On failure, question_data is None.
+    """
+    project_file = project["project_outline_file"]
+
+    # Set up tools
+    doc_read_tool = DocumentReadTool(
+        base_dir=SOURCES_DIR,
+        generated_doc_contents=True,
+        display_name="project_documents",
+    )
+    tool_runner = ToolRunner()
+    tool_runner.register(doc_read_tool)
+
+    # Format prompt
+    project_overview = project.get("description", "")
+    project_document_paths = "\n".join(doc_paths)
+
+    prompt = PROJECT_RELATED_QUERIES_PROMPT.format(
+        project_overview=project_overview,
+        project_document_paths=project_document_paths,
+    )
+
+    # Generate question via auto conversation
+    if not quiet:
+        print("\n--- Generating Question ---")
+
+    llm = get_llm(tools=[doc_read_tool.schema], reasoning_level="high", quiet=quiet)
+    messages: list[Message] = [Message(role="user", content=prompt)]
+
+    try:
+        question = run_auto_conversation(
+            llm, tool_runner, messages, max_tool_cycles=20, quiet=quiet
+        )
+        question = question.strip()
+    except RuntimeError as e:
+        return (False, f"{project_file}: {e}", None)
+
+    if not question:
+        return (False, f"{project_file}: LLM returned empty response", None)
+
+    read_docs = doc_read_tool.read_documents
+    if not read_docs:
+        return (False, f"{project_file}: No documents were read by LLM", None)
+
+    if not quiet:
+        print(f"\nQuestion: {question}")
+        print(f"Documents read: {len(read_docs)}")
+
+    # Validate the question
+    if not quiet:
+        print("\n--- Validating Question ---")
+
+    valid, gold_answer, relevant_uuids = validate_project_question(
+        question, read_docs, quiet=quiet
+    )
+
+    if not valid or not gold_answer or not relevant_uuids:
+        return (False, f"{project_file}: Question validation failed", None)
+
+    if not quiet:
+        print(f"\nGold answer: {gold_answer[:200]}...")
+
+    # Extract answer facts
+    if not quiet:
+        print("\n--- Extracting Answer Facts ---")
+
+    answer_facts = extract_answer_facts(question, gold_answer, quiet=quiet)
+
+    if not answer_facts:
+        return (False, f"{project_file}: Answer fact extraction failed", None)
+
+    if not quiet:
+        print(f"\nExtracted {len(answer_facts)} facts")
+
+    # Derive source types from relevant UUIDs
+    source_types = sorted(
+        set(
+            extract_source_type(uuid_index[uuid])
+            for uuid in relevant_uuids
+            if uuid in uuid_index
+        )
+    )
+
+    question_data = {
+        "question": question,
+        "expected_doc_ids": relevant_uuids,
+        "source_types": source_types,
+        "gold_answer": gold_answer,
+        "answer_facts": answer_facts,
+        "question_type": "project_related",
+    }
+
+    return (True, f"{project_file}: Success", question_data)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -172,6 +284,12 @@ def main() -> None:
         type=int,
         default=50,
         help="Number of questions to generate (default: 50)",
+    )
+    parser.add_argument(
+        "--parallelism",
+        type=int,
+        default=1,
+        help="Number of parallel workers (default: 1, verbose output)",
     )
     parser.add_argument(
         "--quiet",
@@ -204,6 +322,37 @@ def main() -> None:
     # Load project usage cache
     project_usage = load_project_usage()
 
+    # Pre-select all projects and resolve their doc paths.
+    # Incrementing in-memory usage each time ensures even distribution.
+    work_items: list[tuple[dict, list[str]]] = []
+    pre_fail_count = 0
+    pre_errors: list[str] = []
+
+    for _ in range(args.count):
+        project = select_next_project(projects, project_usage)
+        project_file = project["project_outline_file"]
+
+        # Always increment usage so we don't get stuck on the same project
+        project_usage[project_file] = project_usage.get(project_file, 0) + 1
+
+        # Resolve document UUIDs to paths
+        doc_uuids = project.get("documents", [])
+        doc_paths: list[str] = []
+        for uuid in doc_uuids:
+            path = uuid_index.get(uuid)
+            if path:
+                doc_paths.append(path)
+
+        if len(doc_paths) < 3:
+            pre_fail_count += 1
+            pre_errors.append(f"{project_file}: Too few resolvable documents")
+            continue
+
+        work_items.append((project, doc_paths))
+
+    if pre_fail_count > 0:
+        print(f"Skipped {pre_fail_count} project selections (too few documents).")
+
     # Load existing question state
     next_question_id = get_next_question_id()
     existing_questions = count_existing_questions()
@@ -217,145 +366,104 @@ def main() -> None:
         print(f"Questions file not found. Will create: {QUESTIONS_PATH}")
 
     print()
-    print(f"Will generate {args.count} new question(s).")
+    print(
+        f"Processing {len(work_items)} project questions with parallelism={args.parallelism}."
+    )
     print()
 
     success_count = 0
-    fail_count = 0
-    errors: list[str] = []
+    fail_count = pre_fail_count
+    errors: list[str] = list(pre_errors)
 
-    for i in range(args.count):
-        print("\n" + "-" * 40)
-        print(f"Question {i + 1} of {args.count}")
-        print("-" * 40)
+    if args.parallelism <= 1:
+        # Sequential mode — verbose output
+        for i, (project, doc_paths) in enumerate(work_items):
+            project_file = project["project_outline_file"]
+            print("\n" + "-" * 40)
+            print(f"Question {i + 1} of {len(work_items)}")
+            print(f"Project: {project_file}")
+            print(f"  Documents: {len(doc_paths)} resolvable")
+            print("-" * 40)
 
-        # Select the least-used project
-        project = select_next_project(projects, project_usage)
-        project_file = project["project_outline_file"]
-        print(f"Project: {project_file}")
-
-        # Resolve document UUIDs to paths
-        doc_uuids = project.get("documents", [])
-        doc_paths: list[str] = []
-        for uuid in doc_uuids:
-            path = uuid_index.get(uuid)
-            if path:
-                doc_paths.append(path)
-
-        if len(doc_paths) < 3:
-            print(f"Skipping: only {len(doc_paths)} resolvable documents (need >= 3)")
-            fail_count += 1
-            errors.append(f"{project_file}: Too few resolvable documents")
-            # Mark as used so we don't get stuck on the same project
-            project_usage[project_file] = project_usage.get(project_file, 0) + 1
-            continue
-
-        print(f"  Documents: {len(doc_paths)} resolvable out of {len(doc_uuids)}")
-
-        # Set up tools
-        doc_read_tool = DocumentReadTool(
-            base_dir=SOURCES_DIR,
-            generated_doc_contents=True,
-            display_name="project_documents",
-        )
-        tool_runner = ToolRunner()
-        tool_runner.register(doc_read_tool)
-
-        # Format prompt
-        project_overview = project.get("description", "")
-        project_document_paths = "\n".join(doc_paths)
-
-        prompt = PROJECT_RELATED_QUERIES_PROMPT.format(
-            project_overview=project_overview,
-            project_document_paths=project_document_paths,
-        )
-
-        # Generate question via auto conversation
-        print("\n--- Generating Question ---")
-        llm = get_llm(
-            tools=[doc_read_tool.schema], reasoning_level="high", quiet=args.quiet
-        )
-        messages: list[Message] = [Message(role="user", content=prompt)]
-
-        try:
-            question = run_auto_conversation(
-                llm, tool_runner, messages, max_tool_cycles=20, quiet=args.quiet
+            success, message, question_data = process_single_project_question(
+                project, doc_paths, uuid_index, quiet=args.quiet
             )
-            question = question.strip()
-        except RuntimeError as e:
-            fail_count += 1
-            errors.append(f"{project_file}: {e}")
-            print(f"\nFailed: {e}")
-            continue
 
-        if not question:
-            fail_count += 1
-            errors.append(f"{project_file}: LLM returned empty response")
-            print("\nFailed: LLM returned empty response")
-            continue
+            if not success or not question_data:
+                fail_count += 1
+                errors.append(message)
+                print(f"\nFailed: {message}")
+                continue
 
-        read_docs = doc_read_tool.read_documents
-        if not read_docs:
-            fail_count += 1
-            errors.append(f"{project_file}: No documents were read by LLM")
-            print("\nFailed: No documents were read by LLM")
-            continue
-
-        print(f"\nQuestion: {question}")
-        print(f"Documents read: {len(read_docs)}")
-
-        # Validate the question
-        print("\n--- Validating Question ---")
-        valid, gold_answer, relevant_uuids = validate_project_question(
-            question, read_docs, quiet=args.quiet
-        )
-
-        if not valid or not gold_answer or not relevant_uuids:
-            fail_count += 1
-            errors.append(f"{project_file}: Question validation failed")
-            print("\nFailed: Question validation failed")
-            continue
-
-        # Extract answer facts
-        print("\n--- Extracting Answer Facts ---")
-        answer_facts = extract_answer_facts(question, gold_answer, quiet=args.quiet)
-
-        if not answer_facts:
-            fail_count += 1
-            errors.append(f"{project_file}: Answer fact extraction failed")
-            print("\nFailed: Answer fact extraction failed")
-            continue
-
-        # Generate question ID
-        question_id = f"qst_{next_question_id:04d}"
-
-        # Derive source types from relevant UUIDs
-        source_types = sorted(
-            set(
-                extract_source_type(uuid_index[uuid])
-                for uuid in relevant_uuids
-                if uuid in uuid_index
+            # Assign question ID and save
+            question_id = f"qst_{next_question_id:04d}"
+            save_question(
+                question_id=question_id,
+                question=question_data["question"],
+                expected_doc_ids=question_data["expected_doc_ids"],
+                source_types=question_data["source_types"],
+                gold_answer=question_data["gold_answer"],
+                answer_facts=question_data["answer_facts"],
+                question_type=question_data["question_type"],
             )
-        )
+            next_question_id += 1
+            success_count += 1
 
-        # Append to questions file
-        save_question(
-            question_id=question_id,
-            question=question,
-            expected_doc_ids=relevant_uuids,
-            source_types=source_types,
-            gold_answer=gold_answer,
-            answer_facts=answer_facts,
-            question_type="project_related",
-        )
-        next_question_id += 1
+            # Save project usage after each success
+            save_project_usage(project_usage)
 
-        # Update project usage
-        project_usage[project_file] = project_usage.get(project_file, 0) + 1
+            print(f"\nSaved question {question_id}")
+    else:
+        # Parallel mode — quiet workers, save incrementally as they complete
+        completed = 0
+
+        with ThreadPoolExecutor(max_workers=args.parallelism) as executor:
+            futures = {
+                executor.submit(
+                    process_single_project_question,
+                    project,
+                    doc_paths,
+                    uuid_index,
+                    True,  # quiet=True for parallel workers
+                ): idx
+                for idx, (project, doc_paths) in enumerate(work_items)
+            }
+
+            for future in as_completed(futures):
+                idx = futures[future]
+                completed += 1
+                try:
+                    success, message, question_data = future.result()
+                except Exception as e:
+                    fail_count += 1
+                    errors.append(str(e))
+                    print(f"  [{completed}/{len(work_items)}] ERROR: {e}")
+                    continue
+
+                if not success or not question_data:
+                    fail_count += 1
+                    errors.append(message)
+                    print(f"  [{completed}/{len(work_items)}] FAIL: {message}")
+                    continue
+
+                question_id = f"qst_{next_question_id:04d}"
+                save_question(
+                    question_id=question_id,
+                    question=question_data["question"],
+                    expected_doc_ids=question_data["expected_doc_ids"],
+                    source_types=question_data["source_types"],
+                    gold_answer=question_data["gold_answer"],
+                    answer_facts=question_data["answer_facts"],
+                    question_type=question_data["question_type"],
+                )
+                next_question_id += 1
+                success_count += 1
+                print(
+                    f"  [{completed}/{len(work_items)}] OK: {message} -> {question_id}"
+                )
+
+        # Save project usage once after all parallel work completes
         save_project_usage(project_usage)
-
-        success_count += 1
-        print(f"\nSaved question {question_id} (docs: {relevant_uuids})")
 
     print("\n" + "=" * 40)
     print("Summary")

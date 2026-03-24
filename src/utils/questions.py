@@ -322,8 +322,8 @@ def extract_source_type(doc_path: str) -> str:
 
 def append_to_jsonl(path: str, data: dict) -> None:
     """Append a JSON object to a JSONL file."""
-    with open(path, "a") as f:
-        f.write(json.dumps(data) + "\n")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False) + "\n")
 
 
 def count_existing_questions() -> int:
