@@ -2,9 +2,10 @@
 
 ## 📖 Overview
 
-IndustryRAG Bench provides a dataset for company internal documents as well as a way of generating similar datasets for different industries, scales of companies, etc.
+IndustryRAG Bench provides a dataset for company internal documents consisting of slightly over **500,000 documents** and **500 questions**.
+The code additionally provides a way of generating similar datasets for different industries, scales of companies, etc.
 
-The dataset simulates a company called "Redwood Inference" that provides AI model inference as a service. The dataset consists of slightly over **500,000 documents** spread across the following sources:
+The dataset simulates a company called "Redwood Inference" that provides AI model inference as a service.
 
 The data sources and approximate volumes are as follows:
 
@@ -22,7 +23,7 @@ The data sources and approximate volumes are as follows:
 
 The corpus provides broad coverage across key areas of business activity including (but not limited to) planning, engineering, documentation, sales, customer success, internal discussions, emails, and more.
 
-The dataset comes with **500 questions** (see [questions.jsonl](generated_data/questions.jsonl)) broken up into 10 categories:
+The [questions](generated_data/questions.jsonl) are broken up into 10 categories:
 
 | # | Category | Count | Description |
 |---|----------|-------|-------------|
@@ -37,8 +38,8 @@ The dataset comes with **500 questions** (see [questions.jsonl](generated_data/q
 | 9 | High Level | 10 | High level questions where the answer is not located in any single document. Note: these do not have any ground truth documents. |
 | 10 | Info Not Found | 20 | Questions where the answer is not available. Note: these do not have any ground truth documents. |
 
-Additionally 100 questions are provided outside of the benchmark which require parsing the metadata of the documents to answer correctly.
-This is included to enable teams that need it for real world use cases but omitted from the benchmark since it is harder to standardize.
+100 additional questions sit outside the benchmark: the answers depend on metadata, not only on retrieved documents.
+We ship them for teams who care about metadata-aware RAG, but we do not include them in the leaderboard because benchmark design and verification are less straightforward.
 
 Existing Retrieval Augmented Generation (RAG) and Information Retrieval (IR) datasets largely focus on publically accessible document sets (Bing searches, Stack Overflow forums, etc.).
 Up until now, there hasn't been a publically accessible dataset which focuses entirely on company internal data. This dataset/repo aims to provide that.
