@@ -23,7 +23,6 @@ from src.tools.tool_implementations import (
     FinishTool,
     GlobTool,
     ReadTool,
-    RmTool,
     WriteTool,
 )
 from src.utils.dataset_id import add_dataset_doc_uuid
@@ -210,10 +209,6 @@ def main() -> None:
             pattern_error_message="You can only use the glob command on agents.md files.",
         )
         read_tool = ReadTool(base_dir=SOURCES_DIR)
-        rm_tool = RmTool(
-            base_dir=SOURCES_DIR,
-            get_deletable_paths=lambda: write_tool.written_paths,
-        )
         finish_tool = FinishTool()
 
         # Initialize LLM with tool schemas
@@ -222,7 +217,6 @@ def main() -> None:
                 glob_tool.schema,
                 read_tool.schema,
                 write_tool.schema,
-                rm_tool.schema,
                 finish_tool.schema,
             ]
         )
@@ -232,7 +226,6 @@ def main() -> None:
         tool_runner.register(glob_tool)
         tool_runner.register(read_tool)
         tool_runner.register(write_tool)
-        tool_runner.register(rm_tool)
         tool_runner.register(finish_tool)
 
         # Create conversation with LLM and tool runner
@@ -315,10 +308,6 @@ def main() -> None:
                         break
 
                 conversation.run_turn(user_input, exit_on_tools=[FINISH_TOOL])
-
-                # Sync deleted paths - remove from write_tool tracking
-                for deleted_path in rm_tool.deleted_paths:
-                    write_tool.remove_path(deleted_path)
 
                 print()
 

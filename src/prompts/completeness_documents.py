@@ -1,5 +1,5 @@
 from src.paths import AGENTS_MD_FILE
-from src.tools import GLOB_TOOL, READ_TOOL, WRITE_TOOL, RM_TOOL, FINISH_TOOL
+from src.tools import GLOB_TOOL, READ_TOOL, WRITE_TOOL, FINISH_TOOL
 
 
 COMPLETENESS_SYSTEM_PROMPT = f"""
@@ -16,7 +16,6 @@ Many directories will not have {AGENTS_MD_FILE} files, so just make reasonable a
 - {READ_TOOL}: Read a file and return its contents. Use this to read {AGENTS_MD_FILE} files and get context about the directories before writing the files. Only use this to read {AGENTS_MD_FILE} files.
 - {WRITE_TOOL}: Use this to write the files needed to answer the question. Write each file in sequence since each depends on the next. The files must be .json files that conform to the schema for the source type found in the {AGENTS_MD_FILE} file. \
 CRITICAL: it must be a valid JSON file and it must not have nested fields, all of the values must be strings or list of strings.
-- {RM_TOOL}: Remove a file. Only remove files if the user is unhappy with the created documents. You can only delete documents that you have written.
 - {FINISH_TOOL}: Use this once the user is happy with the documents and question, you must call this with the question that requires the generated set of documents.
 
 ## Company Overview
