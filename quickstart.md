@@ -249,8 +249,7 @@ python -m src.data_scripts.stage_3_generate_questions.step_9_generate_high_level
     --count 10 \           # Number of validated questions to produce (default: 10)
     --num-candidates 20 \  # Number of candidate queries to generate before filtering (default: 20)
     --parallelism 1 \      # Number of parallel workers for answer generation (default: 1)
-    --skip-validation \    # Skip the tool-based validation step (default: enabled)
-    --no-skip-validation \ # Enable the tool-based validation step
+    --skip-validation \    # Skip the tool-based validation step
     --quiet                # Suppress LLM output streaming (optional)
 ```
 

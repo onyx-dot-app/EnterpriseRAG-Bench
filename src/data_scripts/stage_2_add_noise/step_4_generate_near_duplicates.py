@@ -24,6 +24,7 @@ from src.utils import (
     get_agents_md_for_path,
     get_dataset_doc_uuid,
     get_directory_tree,
+    is_noise_document,
     JsonRecoveryError,
     load_file,
     select_random_file_hierarchical,
@@ -460,21 +461,17 @@ def main() -> None:
         print("#" * 60)
 
         # Select a random file using hierarchical random walk
+        # Skip noise documents and files already used as sources
         file_path = select_random_file_hierarchical()
-
-        if not file_path:
-            print("Failed to select a file")
-            fail_count += 1
-            errors.append("Failed to select a file")
-            continue
-
-        # Try to avoid selecting the same source file twice
         attempts = 0
-        while file_path in used_source_files and attempts < 10:
-            file_path = select_random_file_hierarchical()
-            attempts += 1
+        while attempts < 20:
             if file_path is None:
                 break
+            full_path = sources_resolver.to_absolute(file_path)
+            if file_path not in used_source_files and not is_noise_document(full_path):
+                break
+            file_path = select_random_file_hierarchical()
+            attempts += 1
 
         if file_path is None:
             print("Failed to select a file")

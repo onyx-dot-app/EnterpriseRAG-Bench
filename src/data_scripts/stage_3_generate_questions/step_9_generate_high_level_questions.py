@@ -289,14 +289,7 @@ def main() -> None:
     parser.add_argument(
         "--skip-validation",
         action="store_true",
-        default=True,
-        help="Skip the tool-based validation step (default: True)",
-    )
-    parser.add_argument(
-        "--no-skip-validation",
-        action="store_false",
-        dest="skip_validation",
-        help="Enable the tool-based validation step",
+        help="Skip the tool-based validation step",
     )
     parser.add_argument(
         "--quiet",

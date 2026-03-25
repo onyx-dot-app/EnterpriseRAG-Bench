@@ -1,9 +1,27 @@
 """Utilities for selecting files from the sources directory."""
 
+import json
 import os
 import random
 
 from src.paths import SOURCES_DIR
+
+
+def is_noise_document(file_path: str) -> bool:
+    """Check if a JSON file is already marked as a noise document.
+
+    Args:
+        file_path: Absolute path to a JSON file.
+
+    Returns:
+        True if the file has a dataset_noise_document field.
+    """
+    try:
+        with open(file_path, encoding="utf-8") as f:
+            data = json.load(f)
+        return "dataset_noise_document" in data
+    except Exception:
+        return False
 
 
 def dir_has_json_files(dir_path: str) -> bool:

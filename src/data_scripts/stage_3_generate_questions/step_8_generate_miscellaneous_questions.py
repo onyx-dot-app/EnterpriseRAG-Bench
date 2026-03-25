@@ -214,8 +214,8 @@ def main() -> None:
             success_count += 1
             print(f"\nSaved question {question_id}")
     else:
-        # Parallel mode — quiet workers, collect results
-        results: list[tuple[int, bool, str, dict | None]] = []
+        # Parallel mode — quiet workers, save incrementally as they complete
+        completed = 0
 
         with ThreadPoolExecutor(max_workers=args.parallelism) as executor:
             futures = {
@@ -230,36 +230,34 @@ def main() -> None:
 
             for future in as_completed(futures):
                 idx = futures[future]
+                completed += 1
                 try:
                     success, message, question_data = future.result()
-                    results.append((idx, success, message, question_data))
-                    status = "OK" if success else "FAIL"
-                    print(f"  [{idx + 1}/{count}] {status}: {message}")
                 except Exception as e:
-                    results.append((idx, False, str(e), None))
-                    print(f"  [{idx + 1}/{count}] ERROR: {e}")
+                    fail_count += 1
+                    errors.append(str(e))
+                    print(f"  [{completed}/{count}] ERROR: {e}")
+                    continue
 
-        # Save results in original order to keep question IDs deterministic
-        results.sort(key=lambda r: r[0])
+                if not success or not question_data:
+                    fail_count += 1
+                    errors.append(message)
+                    print(f"  [{completed}/{count}] FAIL: {message}")
+                    continue
 
-        for idx, success, message, question_data in results:
-            if not success or not question_data:
-                fail_count += 1
-                errors.append(message)
-                continue
-
-            question_id = f"qst_{next_question_id:04d}"
-            save_question(
-                question_id=question_id,
-                question=question_data["question"],
-                expected_doc_ids=question_data["expected_doc_ids"],
-                source_types=question_data["source_types"],
-                gold_answer=question_data["gold_answer"],
-                answer_facts=question_data["answer_facts"],
-                question_type=question_data["question_type"],
-            )
-            next_question_id += 1
-            success_count += 1
+                question_id = f"qst_{next_question_id:04d}"
+                save_question(
+                    question_id=question_id,
+                    question=question_data["question"],
+                    expected_doc_ids=question_data["expected_doc_ids"],
+                    source_types=question_data["source_types"],
+                    gold_answer=question_data["gold_answer"],
+                    answer_facts=question_data["answer_facts"],
+                    question_type=question_data["question_type"],
+                )
+                next_question_id += 1
+                success_count += 1
+                print(f"  [{completed}/{count}] OK: {message} -> {question_id}")
 
     print("\n" + "=" * 40)
     print("Summary")

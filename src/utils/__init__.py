@@ -40,6 +40,7 @@ from src.utils.file_selection import (
     collect_json_files_by_size,
     count_json_files,
     dir_has_json_files,
+    is_noise_document,
     select_random_file_hierarchical,
 )
 from src.utils.json_extraction import extract_json_from_response
@@ -77,6 +78,7 @@ __all__ = [
     "default_resolver",
     "delete_file",
     "dir_has_json_files",
+    "is_noise_document",
     "DocumentFieldError",
     "extract_document_content",
     "extract_answer_facts",

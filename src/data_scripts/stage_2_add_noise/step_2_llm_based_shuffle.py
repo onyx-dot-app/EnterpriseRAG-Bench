@@ -16,6 +16,7 @@ from src.paths import SOURCES_DIR, SOURCE_TREE_PATH
 from src.prompts.neighboring_shuffle import PATH_ERROR_RESPONSE, SHUFFLE_PROMPT
 from src.utils.directory_tree import get_directory_tree
 from src.utils.file_io import load_file, load_json_file, write_json_file
+from src.utils.file_selection import is_noise_document
 from src.utils.statistics import update_statistics
 
 
@@ -51,22 +52,6 @@ def get_source_type_tree(source_type: str) -> str:
 # =============================================================================
 # File Collection
 # =============================================================================
-
-
-def is_noise_document(file_path: str) -> bool:
-    """Check if a JSON file is already marked as a noise document.
-
-    Args:
-        file_path: Absolute path to a JSON file.
-
-    Returns:
-        True if the file has a dataset_noise_document field.
-    """
-    try:
-        data = load_json_file(file_path)
-        return "dataset_noise_document" in data
-    except Exception:
-        return False
 
 
 def collect_json_files(source_type_dir: str) -> list[str]:

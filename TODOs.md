@@ -5,7 +5,7 @@ Project phases explain more in detail, not super clear
 Release artifacts + link in quickstart
 Paper link in quickstart
 Readme shields: license(MIT), website(onyx), dataset(huggingface), leaderboard(onyx page?), arXiv
-
+Give info on the question generation steps for if there are no noise docs to base them on, ask the user to run those steps
 
 
 
