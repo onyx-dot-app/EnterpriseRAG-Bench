@@ -1077,9 +1077,21 @@ def main() -> None:
         total_questions=total_questions,
     )
 
-    def flush_updated_question(qid: str, updated_q: dict | None) -> None:
+    def flush_updated_question(
+        qid: str, updated_q: dict | None, corrected: bool
+    ) -> None:
         """Incrementally update the output questions file for a single qid."""
-        row_to_write = updated_q if updated_q else questions[qid]
+        row_to_write = dict(updated_q if updated_q else questions[qid])
+        if corrected:
+            # Insert "corrected" as second field after question_id
+            ordered: dict = {}
+            for key, value in row_to_write.items():
+                ordered[key] = value
+                if key == "question_id":
+                    ordered["corrected"] = True
+            row_to_write = ordered
+        else:
+            row_to_write.pop("corrected", None)
         with open(args.output_file) as f:
             lines = f.readlines()
 
@@ -1175,7 +1187,7 @@ def main() -> None:
             )
 
             # Flush questions_updated.jsonl incrementally
-            flush_updated_question(qid, updated_q)
+            flush_updated_question(qid, updated_q, result.get("corrected", False))
 
     # =========================================================================
     # 5. Run evaluation
