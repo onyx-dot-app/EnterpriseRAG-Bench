@@ -5,7 +5,6 @@ import json
 import os
 import re
 import sys
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.llm import Message, get_llm
@@ -13,6 +12,7 @@ from src.prompts.answer_evaluation import (
     ANSWER_CITATION_STRIPPING_PROMPT,
     ANSWER_DOC_EVALUATION_PROMPT,
     ANSWER_UPDATOR_PROMPT,
+    ANSWER_WHOLISTIC_EVALUATION_PROMPT,
     INDIVIDUAL_FACT_VALIDATOR_PROMPT,
 )
 from src.utils.cli import confirm_yes_no
@@ -26,6 +26,8 @@ from src.utils.document_index import (
 from src.utils.file_io import load_json_file, write_json_file
 from src.utils.json_extraction import extract_json_from_response
 from src.utils.questions import extract_answer_facts, extract_anti_hallucination_facts
+
+_MAX_LLM_RETRIES = 3
 
 DEFAULT_ANSWERS_FILE = "answer_evaluation/answers.jsonl"
 DEFAULT_QUESTIONS_FILE = "export_data/questions.jsonl"
@@ -95,16 +97,23 @@ def load_answers(answer_path: str) -> list[dict]:
 def strip_answer_citations(answer: str) -> str:
     """Strip citations from an answer string using LLM."""
     prompt = ANSWER_CITATION_STRIPPING_PROMPT.format(answer_string=answer)
-    llm = get_llm(tools=None, quiet=True)
-    messages: list[Message] = [Message(role="user", content=prompt)]
 
-    response = ""
-    for chunk in llm.generate(messages):
-        if isinstance(chunk, str):
-            response += chunk
+    for attempt in range(_MAX_LLM_RETRIES):
+        try:
+            llm = get_llm(tools=None, quiet=True)
+            messages: list[Message] = [Message(role="user", content=prompt)]
 
-    result = response.strip()
-    return result if result else answer
+            response = ""
+            for chunk in llm.generate(messages):
+                if isinstance(chunk, str):
+                    response += chunk
+
+            result = response.strip()
+            return result if result else answer
+        except Exception:
+            if attempt == _MAX_LLM_RETRIES - 1:
+                raise
+    return answer
 
 
 def normalize_document_ids(document_ids: object, context: str) -> list[str]:
@@ -276,44 +285,65 @@ def evaluate_documents(
         candidate_documents="\n\n".join(candidate_docs_text),
     )
 
-    llm = get_llm(tools=None, quiet=True)
-    messages: list[Message] = [Message(role="user", content=prompt)]
-
-    response = ""
-    for chunk in llm.generate(messages):
-        if isinstance(chunk, str):
-            response += chunk
-
-    response = response.strip()
-
-    try:
-        parsed = json.loads(extract_json_from_response(response))
-    except Exception as exc:
-        return (None, f"could not parse JSON output ({exc.__class__.__name__})")
-
-    if not isinstance(parsed, dict):
-        return (None, "output was not a JSON object")
-
-    normalized: dict[str, dict[str, str]] = {}
+    last_error: str | None = None
     expected_doc_ids = gold_doc_ids + candidate_doc_ids
-    for dsid in expected_doc_ids:
-        entry = parsed.get(dsid)
-        if not isinstance(entry, dict):
-            return (None, f"missing or invalid entry for {dsid}")
 
-        classification = entry.get("classification")
-        reason = entry.get("reason")
-        if classification not in {"valid", "invalid"}:
-            return (None, f"invalid classification for {dsid}")
-        if not isinstance(reason, str):
-            return (None, f"invalid reason for {dsid}")
+    for attempt in range(_MAX_LLM_RETRIES):
+        try:
+            llm = get_llm(tools=None, quiet=True)
+            messages: list[Message] = [Message(role="user", content=prompt)]
 
-        normalized[dsid] = {
-            "classification": classification,
-            "reason": reason,
-        }
+            response = ""
+            for chunk in llm.generate(messages):
+                if isinstance(chunk, str):
+                    response += chunk
+        except Exception as exc:
+            last_error = f"LLM call failed ({exc.__class__.__name__})"
+            continue
 
-    return (normalized, None)
+        response = response.strip()
+
+        try:
+            parsed = json.loads(extract_json_from_response(response))
+        except Exception as exc:
+            last_error = f"could not parse JSON output ({exc.__class__.__name__})"
+            continue
+
+        if not isinstance(parsed, dict):
+            last_error = "output was not a JSON object"
+            continue
+
+        normalized: dict[str, dict[str, str]] = {}
+        validation_failed = False
+        for dsid in expected_doc_ids:
+            entry = parsed.get(dsid)
+            if not isinstance(entry, dict):
+                last_error = f"missing or invalid entry for {dsid}"
+                validation_failed = True
+                break
+
+            classification = entry.get("classification")
+            reason = entry.get("reason")
+            if classification not in {"valid", "invalid"}:
+                last_error = f"invalid classification for {dsid}"
+                validation_failed = True
+                break
+            if not isinstance(reason, str):
+                last_error = f"invalid reason for {dsid}"
+                validation_failed = True
+                break
+
+            normalized[dsid] = {
+                "classification": classification,
+                "reason": reason,
+            }
+
+        if validation_failed:
+            continue
+
+        return (normalized, None)
+
+    return (None, last_error)
 
 
 def evaluate_documents_with_consensus(
@@ -446,66 +476,103 @@ def update_gold_answer(
         query=question,
     )
 
-    llm = get_llm(tools=None, quiet=True)
-    messages: list[Message] = [Message(role="user", content=prompt)]
+    for attempt in range(_MAX_LLM_RETRIES):
+        try:
+            llm = get_llm(tools=None, quiet=True)
+            messages: list[Message] = [Message(role="user", content=prompt)]
 
-    response = ""
-    for chunk in llm.generate(messages):
-        if isinstance(chunk, str):
-            response += chunk
+            response = ""
+            for chunk in llm.generate(messages):
+                if isinstance(chunk, str):
+                    response += chunk
 
-    result = response.strip()
-    return result if result else None
+            result = response.strip()
+            return result if result else None
+        except Exception:
+            if attempt == _MAX_LLM_RETRIES - 1:
+                raise
+    return None
 
 
-def validate_answer_completeness(
-    answer: str,
-    facts: list[str],
-) -> int | None:
-    """Validate how many facts are supported by the answer using LLM.
+def validate_single_fact(answer: str, statement: str) -> bool:
+    """Check if a single fact is supported by the answer using LLM.
 
-    Each fact is evaluated independently in parallel. A fact counts as valid
-    only if the first line of the model output contains "yes" in any casing.
-    Returns the number of validated facts, or None on failure.
+    Returns True if the first line of the model output contains "yes".
     """
-    if not facts:
-        return 0
+    prompt = INDIVIDUAL_FACT_VALIDATOR_PROMPT.format(
+        answer=answer,
+        statement=statement,
+    )
 
-    def validate_single_fact(statement: str) -> bool:
-        prompt = INDIVIDUAL_FACT_VALIDATOR_PROMPT.format(
-            answer=answer,
-            statement=statement,
-        )
+    for attempt in range(_MAX_LLM_RETRIES):
+        try:
+            llm = get_llm(tools=None, quiet=True)
+            messages: list[Message] = [Message(role="user", content=prompt)]
 
-        llm = get_llm(tools=None, quiet=True)
-        messages: list[Message] = [Message(role="user", content=prompt)]
+            response = ""
+            for chunk in llm.generate(messages):
+                if isinstance(chunk, str):
+                    response += chunk
 
-        response = ""
-        for chunk in llm.generate(messages):
-            if isinstance(chunk, str):
-                response += chunk
+            first_line = (
+                response.strip().splitlines()[0].strip()
+                if response.strip()
+                else ""
+            )
+            return re.search(r"\byes\b", first_line, re.IGNORECASE) is not None
+        except Exception:
+            if attempt == _MAX_LLM_RETRIES - 1:
+                raise
+    return False
 
-        first_line = (
-            response.strip().splitlines()[0].strip() if response.strip() else ""
-        )
-        return re.search(r"\byes\b", first_line, re.IGNORECASE) is not None
 
-    max_workers = min(len(facts), 8)
-    validated_count = 0
+def evaluate_answer_correctness(
+    question: str,
+    gold_answer: str,
+    candidate_answer: str,
+) -> tuple[bool | None, str]:
+    """Evaluate whether the candidate answer is aligned with the gold answer.
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(validate_single_fact, statement) for statement in facts
-        ]
+    Uses a wholistic LLM evaluation rather than requiring all individual facts
+    to match. Returns (is_aligned, reason). is_aligned is None on failure.
+    """
+    prompt = ANSWER_WHOLISTIC_EVALUATION_PROMPT.format(
+        query=question,
+        gold_answer=gold_answer,
+        candidate_answer=candidate_answer,
+    )
 
-        for future in as_completed(futures):
-            try:
-                if future.result():
-                    validated_count += 1
-            except Exception:
-                return None
+    for attempt in range(_MAX_LLM_RETRIES):
+        try:
+            llm = get_llm(tools=None, quiet=True)
+            messages: list[Message] = [Message(role="user", content=prompt)]
 
-    return validated_count
+            response = ""
+            for chunk in llm.generate(messages):
+                if isinstance(chunk, str):
+                    response += chunk
+        except Exception:
+            continue
+
+        response = response.strip()
+
+        try:
+            parsed = json.loads(extract_json_from_response(response))
+        except Exception:
+            continue
+
+        if not isinstance(parsed, dict):
+            continue
+
+        aligned = parsed.get("aligned", "")
+        reason = parsed.get("reason", "")
+        if not isinstance(aligned, str):
+            continue
+
+        is_aligned = re.search(r"\byes\b", aligned, re.IGNORECASE) is not None
+        return (is_aligned, reason if isinstance(reason, str) else "")
+
+    return (None, "")
 
 
 # =============================================================================
@@ -702,30 +769,74 @@ def score_answer(
         document_recall_pct = None
         invalid_extra_docs = None
 
-    # Answer completeness and correctness
-    if answer_text and answer_facts:
-        validated_count = validate_answer_completeness(answer_text, answer_facts)
-        if validated_count is not None:
-            validated_count = min(validated_count, len(answer_facts))
-            completeness_pct = validated_count / len(answer_facts) * 100
-            answer_correct = validated_count == len(answer_facts)
-        else:
-            completeness_pct = 0.0
-            answer_correct = False
-    elif answer_text and not answer_facts:
-        # No facts to validate against, can't measure completeness
-        completeness_pct = 100.0
-        answer_correct = True
-    else:
-        # No answer provided
-        completeness_pct = 0.0
-        answer_correct = False
+    # Answer completeness (fact-level) and correctness (wholistic) in parallel
+    gold_answer = question_data.get("gold_answer", "")
+    question_text = question_data.get(
+        "question", original_question_data.get("question", "")
+    )
+
+    completeness_pct = 0.0
+    answer_correct = False
+    correctness_reasoning = ""
+
+    if answer_text:
+        # Submit all LLM calls into one pool: individual facts + wholistic eval
+        max_workers = max(len(answer_facts), 1) + (1 if gold_answer else 0)
+        correctness_future = None
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            fact_futures = [
+                executor.submit(validate_single_fact, answer_text, statement)
+                for statement in answer_facts
+            ]
+
+            if gold_answer:
+                correctness_future = executor.submit(
+                    evaluate_answer_correctness,
+                    question_text,
+                    gold_answer,
+                    answer_text,
+                )
+
+            # Collect fact results
+            if answer_facts:
+                validated_count = 0
+                fact_failed = False
+                for future in as_completed(fact_futures):
+                    try:
+                        if future.result():
+                            validated_count += 1
+                    except Exception:
+                        fact_failed = True
+
+                if not fact_failed:
+                    validated_count = min(validated_count, len(answer_facts))
+                    completeness_pct = validated_count / len(answer_facts) * 100
+            else:
+                completeness_pct = 100.0
+
+            # Collect correctness result
+            if correctness_future is not None:
+                try:
+                    correctness_result, correctness_reasoning = (
+                        correctness_future.result()
+                    )
+                    answer_correct = (
+                        correctness_result
+                        if correctness_result is not None
+                        else False
+                    )
+                except Exception:
+                    answer_correct = False
+            else:
+                answer_correct = True
 
     return {
         "question_id": qid,
         "corrected": gold_answer_updated,
         "question_type": question_type,
         "answer_correct": answer_correct,
+        "correctness_reasoning": correctness_reasoning,
         "completeness_pct": round(completeness_pct, 2),
         "document_recall_pct": (
             round(document_recall_pct, 2)
@@ -903,6 +1014,12 @@ def main() -> None:
             "reruns that question even if it already exists in the results file."
         ),
     )
+    parser.add_argument(
+        "--skip-citation-stripping",
+        action="store_true",
+        default=False,
+        help="Skip LLM-based citation stripping from answers",
+    )
     args = parser.parse_args()
 
     # Validate input files exist
@@ -916,6 +1033,27 @@ def main() -> None:
     if args.question_id and args.parallelism != 1:
         print("  [INFO] --question-id set; forcing parallelism=1")
         args.parallelism = 1
+
+    # Check for existing output files that would be overwritten
+    if not args.question_id:
+        existing_files = [
+            f
+            for f in (args.results_file, args.output_file)
+            if os.path.exists(f)
+        ]
+        if existing_files:
+            file_list = ", ".join(existing_files)
+            try:
+                if not confirm_yes_no(
+                    f"Output files already exist ({file_list}). Overwrite?",
+                    default=False,
+                    retry_on_invalid=True,
+                ):
+                    print("Aborted.")
+                    sys.exit(0)
+            except EOFError:
+                print("Aborted (non-interactive).")
+                sys.exit(0)
 
     # =========================================================================
     # 1. Load questions and answers
@@ -1055,20 +1193,7 @@ def main() -> None:
     else:
         total_questions = len(valid_rows)
 
-    # Thread-safe lock for incremental writes
-    write_lock = threading.Lock()
-
-    # Initialize output files
-    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
-    if not os.path.exists(args.output_file):
-        # Seed the output file with the original questions
-        with open(args.output_file, "w") as f:
-            with open(args.questions_file) as qf:
-                for line in qf:
-                    line = line.strip()
-                    if line:
-                        f.write(line + "\n")
-
+    # Initialize results file
     write_results_snapshot(
         results_file=args.results_file,
         output_file=args.output_file,
@@ -1077,43 +1202,6 @@ def main() -> None:
         total_questions=total_questions,
     )
 
-    def flush_updated_question(
-        qid: str, updated_q: dict | None, corrected: bool
-    ) -> None:
-        """Incrementally update the output questions file for a single qid."""
-        row_to_write = dict(updated_q if updated_q else questions[qid])
-        if corrected:
-            # Insert "corrected" as second field after question_id
-            ordered: dict = {}
-            for key, value in row_to_write.items():
-                ordered[key] = value
-                if key == "question_id":
-                    ordered["corrected"] = True
-            row_to_write = ordered
-        else:
-            row_to_write.pop("corrected", None)
-        with open(args.output_file) as f:
-            lines = f.readlines()
-
-        new_lines: list[str] = []
-        replaced = False
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            row = json.loads(stripped)
-            if row.get("question_id") == qid:
-                new_lines.append(json.dumps(row_to_write) + "\n")
-                replaced = True
-            else:
-                new_lines.append(stripped + "\n")
-
-        if not replaced:
-            new_lines.append(json.dumps(row_to_write) + "\n")
-
-        with open(args.output_file, "w") as f:
-            f.writelines(new_lines)
-
     def evaluate_single_question(
         row: dict,
     ) -> tuple[dict | None, dict]:
@@ -1121,7 +1209,7 @@ def main() -> None:
         qid = row["question_id"]
 
         # Strip citations per-question
-        if row.get("answer"):
+        if row.get("answer") and not args.skip_citation_stripping:
             try:
                 row["answer"] = strip_answer_citations(row["answer"])
             except Exception:
@@ -1164,30 +1252,25 @@ def main() -> None:
         updated_q: dict | None,
         result: dict,
     ) -> None:
-        """Record a completed question and flush snapshots to disk."""
-        with write_lock:
-            qid = result["question_id"]
-            if updated_q:
-                updated_questions[qid] = updated_q
+        """Record a completed question and flush results to disk."""
+        qid = result["question_id"]
+        if updated_q:
+            updated_questions[qid] = updated_q
 
-            question_results[:] = [
-                existing
-                for existing in question_results
-                if existing.get("question_id") != qid
-            ]
-            question_results.append(result)
+        question_results[:] = [
+            existing
+            for existing in question_results
+            if existing.get("question_id") != qid
+        ]
+        question_results.append(result)
 
-            # Flush results.json incrementally
-            write_results_snapshot(
-                results_file=args.results_file,
-                output_file=args.output_file,
-                question_results=question_results,
-                skip_count=skip_count,
-                total_questions=total_questions,
-            )
-
-            # Flush questions_updated.jsonl incrementally
-            flush_updated_question(qid, updated_q, result.get("corrected", False))
+        write_results_snapshot(
+            results_file=args.results_file,
+            output_file=args.output_file,
+            question_results=question_results,
+            skip_count=skip_count,
+            total_questions=total_questions,
+        )
 
     # =========================================================================
     # 5. Run evaluation
@@ -1201,7 +1284,6 @@ def main() -> None:
             print(
                 f"\nEvaluating {remaining_count} questions with "
                 f"{args.parallelism} parallel workers "
-                f"(each question is processed independently in the pool)..."
             )
         else:
             print(f"\nEvaluating {remaining_count} questions sequentially...")
@@ -1217,6 +1299,7 @@ def main() -> None:
                     executor.submit(evaluate_single_question, row): row
                     for row in remaining_rows
                 }
+                # Workers only evaluate; main thread handles all writes
                 for future in as_completed(futures):
                     updated_q, result = future.result()
                     handle_completed_question(updated_q, result)
@@ -1225,9 +1308,10 @@ def main() -> None:
     # 6. Final sort and write both output files in correct question_id order
     # =========================================================================
 
-    print(f"\nFinalizing output files...")
+    print("\nFinalizing output files (sorting and writing results)...")
 
     # Sort and write results.json
+    print(f"  Writing {args.results_file}...")
     write_results_snapshot(
         results_file=args.results_file,
         output_file=args.output_file,
@@ -1236,15 +1320,40 @@ def main() -> None:
         total_questions=total_questions,
     )
 
-    # Sort and rewrite questions_updated.jsonl in question_id order
+    # Build corrected qids from results
+    corrected_qids: set[str] = set()
+    for r in question_results:
+        if r.get("corrected"):
+            corrected_qids.add(r["question_id"])
+
+    # Write questions_updated.jsonl from original questions + updates, sorted
+    print(f"  Writing {args.output_file}...")
     all_question_rows: list[dict] = []
-    with open(args.output_file) as f:
+    with open(args.questions_file) as f:
         for line in f:
             stripped = line.strip()
-            if stripped:
-                all_question_rows.append(json.loads(stripped))
+            if not stripped:
+                continue
+            row = json.loads(stripped)
+            qid = row.get("question_id")
+            if qid and qid in updated_questions:
+                row = dict(updated_questions[qid])
+            if qid and qid in corrected_qids:
+                # Insert "corrected" as second field after question_id
+                ordered: dict = {}
+                for key, value in row.items():
+                    if key == "corrected":
+                        continue
+                    ordered[key] = value
+                    if key == "question_id":
+                        ordered["corrected"] = True
+                row = ordered
+            else:
+                row = {k: v for k, v in row.items() if k != "corrected"}
+            all_question_rows.append(row)
 
     all_question_rows.sort(key=_question_sort_key)
+    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
     with open(args.output_file, "w") as f:
         for row in all_question_rows:
             f.write(json.dumps(row) + "\n")
