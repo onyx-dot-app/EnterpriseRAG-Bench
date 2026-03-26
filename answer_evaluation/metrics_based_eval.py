@@ -8,8 +8,9 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.llm import Message, get_llm
-from src.paths import QUESTIONS_PATH, SOURCES_DIR
+from src.paths import QUESTIONS_PATH
 from src.prompts.answer_evaluation import (
+    ANSWER_CITATION_STRIPPING_PROMPT,
     ANSWER_DOC_EVALUATION_PROMPT,
     ANSWER_UPDATOR_PROMPT,
     INDIVIDUAL_FACT_VALIDATOR_PROMPT,
@@ -87,6 +88,48 @@ def load_answers(answer_path: str) -> list[dict]:
                 print(f"  [WARN] Line {i + 1}: invalid JSON, skipping")
                 continue
             answers.append(row)
+    return answers
+
+
+def strip_answer_citations(answer: str) -> str:
+    """Strip citations from an answer string using LLM."""
+    prompt = ANSWER_CITATION_STRIPPING_PROMPT.format(answer_string=answer)
+    llm = get_llm(tools=None, quiet=True)
+    messages: list[Message] = [Message(role="user", content=prompt)]
+
+    response = ""
+    for chunk in llm.generate(messages):
+        if isinstance(chunk, str):
+            response += chunk
+
+    result = response.strip()
+    return result if result else answer
+
+
+def strip_citations_from_answers(answers: list[dict]) -> list[dict]:
+    """Strip citations from all answer strings in parallel."""
+    rows_with_answers = [
+        (i, row) for i, row in enumerate(answers) if row.get("answer")
+    ]
+    if not rows_with_answers:
+        return answers
+
+    max_workers = min(len(rows_with_answers), 8)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(strip_answer_citations, row["answer"]): i
+            for i, row in rows_with_answers
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                answers[idx]["answer"] = future.result()
+            except Exception:
+                print(
+                    f"  [WARN] Citation stripping failed for row {idx + 1}, "
+                    "using original answer"
+                )
+
     return answers
 
 
@@ -299,6 +342,115 @@ def evaluate_documents(
     return (normalized, None)
 
 
+def evaluate_documents_with_consensus(
+    question: str,
+    gold_doc_ids: list[str],
+    candidate_doc_ids: list[str],
+    document_path_map: dict[str, str],
+) -> tuple[dict[str, dict[str, str]] | None, bool, str | None]:
+    """Run document evaluation 3 times and return majority-vote result.
+
+    Returns (eval_result, gold_confirmed, error_string).
+    If gold_confirmed is True, the original gold documents were validated
+    as correct and no update is needed.
+
+    Per-document tie-breaking favors the original gold set: gold docs stay
+    valid on a tie, candidate docs stay invalid on a tie.
+    """
+    num_runs = 3
+    all_results: list[dict[str, dict[str, str]]] = []
+    gold_set = set(gold_doc_ids)
+
+    for run_idx in range(num_runs):
+        eval_result, eval_error = evaluate_documents(
+            question=question,
+            gold_doc_ids=gold_doc_ids,
+            candidate_doc_ids=candidate_doc_ids,
+            document_path_map=document_path_map,
+        )
+        if eval_result is None:
+            print(
+                f"    [WARN] Consensus run {run_idx + 1}/{num_runs} "
+                f"failed: {eval_error}"
+            )
+            continue
+        all_results.append(eval_result)
+
+        # Check if this run agrees with the original gold set
+        run_valid: set[str] = set()
+        for dsid in gold_doc_ids:
+            entry = eval_result.get(dsid, {})
+            if entry.get("classification", "valid") != "invalid":
+                run_valid.add(dsid)
+        for dsid in candidate_doc_ids:
+            entry = eval_result.get(dsid, {})
+            if entry.get("classification") == "valid":
+                run_valid.add(dsid)
+        if run_valid == gold_set:
+            print(
+                f"    Consensus run {run_idx + 1}/{num_runs} "
+                f"confirmed gold documents"
+            )
+            return (eval_result, True, None)
+
+    if not all_results:
+        return (None, False, "all consensus runs failed")
+
+    # Majority vote per document with gold-biased tie-breaking
+    all_doc_ids = gold_doc_ids + candidate_doc_ids
+    majority_result: dict[str, dict[str, str]] = {}
+
+    for dsid in all_doc_ids:
+        valid_count = 0
+        invalid_count = 0
+        valid_reasons: list[str] = []
+        invalid_reasons: list[str] = []
+
+        for run_result in all_results:
+            entry = run_result.get(dsid, {})
+            cls = entry.get("classification", "valid")
+            reason = entry.get("reason", "")
+            if cls == "valid":
+                valid_count += 1
+                valid_reasons.append(reason)
+            else:
+                invalid_count += 1
+                invalid_reasons.append(reason)
+
+        # Ties favor the original gold set: keep gold docs, reject candidates
+        if dsid in gold_set:
+            majority_cls = "valid" if valid_count >= invalid_count else "invalid"
+        else:
+            majority_cls = "valid" if valid_count > invalid_count else "invalid"
+
+        reasons = valid_reasons if majority_cls == "valid" else invalid_reasons
+        majority_result[dsid] = {
+            "classification": majority_cls,
+            "reason": reasons[0] if reasons else "",
+        }
+
+    # Check if majority-voted result matches original gold set
+    majority_valid: set[str] = set()
+    for dsid in gold_doc_ids:
+        entry = majority_result.get(dsid, {})
+        if entry.get("classification", "valid") != "invalid":
+            majority_valid.add(dsid)
+    for dsid in candidate_doc_ids:
+        entry = majority_result.get(dsid, {})
+        if entry.get("classification") == "valid":
+            majority_valid.add(dsid)
+
+    if majority_valid == gold_set:
+        print("    Consensus majority vote confirmed gold documents")
+        return (majority_result, True, None)
+
+    print(
+        f"    Consensus: {len(all_results)}/{num_runs} runs completed, "
+        f"majority vote differs from gold"
+    )
+    return (majority_result, False, None)
+
+
 def update_gold_answer(
     question: str,
     previous_gold_answer: str,
@@ -425,8 +577,8 @@ def process_question_docs(
     # Find candidate docs that are not in the gold set
     candidate_only = [d for d in deduped_doc_ids if d not in gold_set]
 
-    # Evaluate all documents (gold + candidates)
-    eval_result, eval_error = evaluate_documents(
+    # Evaluate all documents (gold + candidates) with 3-run consensus
+    eval_result, gold_confirmed, eval_error = evaluate_documents_with_consensus(
         question=question_row["question"],
         gold_doc_ids=gold_doc_ids,
         candidate_doc_ids=candidate_only,
@@ -439,6 +591,9 @@ def process_question_docs(
             "using original gold set",
             None,
         )
+
+    if gold_confirmed:
+        return (f"OK {qid}: gold documents confirmed by consensus", None)
 
     # Build update_reasons from eval_result
     update_reasons: dict[str, dict[str, str]] = {}
@@ -770,6 +925,10 @@ def main() -> None:
     print(f"Loading answers from {args.answer_file}...")
     answers = load_answers(args.answer_file)
     print(f"  Loaded {len(answers)} answer rows")
+
+    print("Stripping citations from answers...")
+    answers = strip_citations_from_answers(answers)
+    print("  Done stripping citations")
 
     updated_questions = load_updated_questions(args.output_file)
     if updated_questions:
