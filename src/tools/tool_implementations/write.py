@@ -10,6 +10,7 @@ from src.tools.exceptions import ToolTerminationSignal
 from src.tools.interface import ToolInterface
 from src.utils.directory_tree import get_directory_tree
 from src.utils.document_processing import process_written_document
+from src.utils.file_io import sanitize_filename, sanitize_path
 from src.utils.json_recovery import JsonRecoveryError, try_recover_json
 from src.utils.path_resolver import (
     normalize_source_path,
@@ -239,6 +240,9 @@ class WriteTool(ToolInterface):
         if not target:
             return "Error: No file path provided"
 
+        # Sanitize non-ASCII characters in the path (e.g., Cyrillic homoglyphs)
+        target = sanitize_path(target)
+
         # Track relative path for response messages (what the LLM sees)
         response_path = target
 
@@ -318,6 +322,9 @@ class WriteTool(ToolInterface):
             return (
                 "Error: No file path provided. Please specify a valid .json file path."
             )
+
+        # Sanitize non-ASCII characters in the path (e.g., Cyrillic homoglyphs)
+        file_path = sanitize_path(file_path)
 
         # Validate path format using existing utilities
         if self._expected_source_type:

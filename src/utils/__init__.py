@@ -27,7 +27,14 @@ from src.utils.field_labeling import (
     label_single_document,
 )
 from src.utils.field_ordering import needs_reordering, reorder_document_fields
-from src.utils.file_io import delete_file, load_file, load_json_file, write_json_file
+from src.utils.file_io import (
+    delete_file,
+    load_file,
+    load_json_file,
+    sanitize_filename,
+    sanitize_path,
+    write_json_file,
+)
 from src.utils.generation_cache import (
     GenerationCache,
     completeness_cache,
@@ -111,6 +118,8 @@ __all__ = [
     "process_written_document",
     "rebuild_uuid_index",
     "reorder_document_fields",
+    "sanitize_filename",
+    "sanitize_path",
     "save_question",
     "select_random_file_hierarchical",
     "sources_resolver",

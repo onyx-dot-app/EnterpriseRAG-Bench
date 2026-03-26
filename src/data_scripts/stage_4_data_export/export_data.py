@@ -15,6 +15,7 @@ from src.utils import (
     DocumentFieldError,
     extract_document_content,
     load_json_file,
+    sanitize_filename,
 )
 
 
@@ -136,7 +137,7 @@ def get_export_filename(uuid: str, original_filename: str) -> str:
         The new filename in format: {uuid}__{original_name}.txt
     """
     base_name = os.path.splitext(original_filename)[0]
-    return f"{uuid}__{base_name}.txt"
+    return sanitize_filename(f"{uuid}__{base_name}.txt")
 
 
 def collect_source_files(config: ExportConfig) -> list[str]:
