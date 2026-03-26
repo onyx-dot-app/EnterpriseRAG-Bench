@@ -6,19 +6,7 @@ If you want to use the final dataset in the simplest format with all of the .txt
 
 ## About the dataset
 
-The dataset simulates a company called "Redwood Inference" that provides AI model inference as a service. The dataset consists of ~450,000 documents spread across the following sources:
-
-- Slack: ~225,000 docs
-- Gmail: ~120,000 docs
-- Linear: ~35,000 docs
-- Google Drive: ~25,000 docs
-- Hubspot: ~15,000 docs
-- Fireflies: ~10,000 docs
-- GitHub: ~8,000 docs
-- Jira: ~6,000 docs
-- Confluence: ~5,000 docs
-
-The corpus provides broad coverage across key areas of business activity including (but not limited to) planning, engineering, documentation, sales, customer success, internal discussions, emails, and more.
+511,857 docs exactly
 
 ## Repo Layout
 

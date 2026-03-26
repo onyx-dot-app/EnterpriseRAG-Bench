@@ -430,7 +430,6 @@ def main() -> None:
             }
 
             for future in as_completed(futures):
-                idx = futures[future]
                 completed += 1
                 try:
                     success, message, question_data = future.result()

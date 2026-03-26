@@ -1145,7 +1145,7 @@ def main() -> None:
         total_questions=total_questions,
     )
 
-    print(f"\nDone.")
+    print("\nDone.")
     print(f"  Questions scored:    {aggregate_stats['completed_questions']}")
     print(f"  Skipped rows:        {skip_count}")
     print(f"  Corrected questions: {aggregate_stats['num_corrected_questions']}")
