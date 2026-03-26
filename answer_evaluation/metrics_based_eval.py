@@ -5,10 +5,10 @@ import json
 import os
 import re
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.llm import Message, get_llm
-from src.paths import QUESTIONS_PATH
 from src.prompts.answer_evaluation import (
     ANSWER_CITATION_STRIPPING_PROMPT,
     ANSWER_DOC_EVALUATION_PROMPT,
@@ -27,7 +27,8 @@ from src.utils.file_io import load_json_file, write_json_file
 from src.utils.json_extraction import extract_json_from_response
 from src.utils.questions import extract_answer_facts, extract_anti_hallucination_facts
 
-DEFAULT_ANSWER_FILE = "answer_evaluation/answers.jsonl"
+DEFAULT_ANSWERS_FILE = "answer_evaluation/answers.jsonl"
+DEFAULT_QUESTIONS_FILE = "export_data/questions.jsonl"
 DEFAULT_OUTPUT_FILE = "generated_data/questions_updated.jsonl"
 DEFAULT_RESULTS_FILE = "answer_evaluation/results.json"
 
@@ -104,33 +105,6 @@ def strip_answer_citations(answer: str) -> str:
 
     result = response.strip()
     return result if result else answer
-
-
-def strip_citations_from_answers(answers: list[dict]) -> list[dict]:
-    """Strip citations from all answer strings in parallel."""
-    rows_with_answers = [
-        (i, row) for i, row in enumerate(answers) if row.get("answer")
-    ]
-    if not rows_with_answers:
-        return answers
-
-    max_workers = min(len(rows_with_answers), 8)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(strip_answer_citations, row["answer"]): i
-            for i, row in rows_with_answers
-        }
-        for future in as_completed(futures):
-            idx = futures[future]
-            try:
-                answers[idx]["answer"] = future.result()
-            except Exception:
-                print(
-                    f"  [WARN] Citation stripping failed for row {idx + 1}, "
-                    "using original answer"
-                )
-
-    return answers
 
 
 def normalize_document_ids(document_ids: object, context: str) -> list[str]:
@@ -717,15 +691,16 @@ def score_answer(
     expected_set = set(expected_doc_ids)
     answer_doc_set = set(deduped_doc_ids)
 
-    # Document recall
+    # Document recall and extra docs — N/A when no expected docs
     if expected_set:
         correct_docs = answer_doc_set & expected_set
-        document_recall_pct = len(correct_docs) / len(expected_set) * 100
+        document_recall_pct: float | None = (
+            len(correct_docs) / len(expected_set) * 100
+        )
+        invalid_extra_docs: int | None = len(answer_doc_set - expected_set)
     else:
-        document_recall_pct = 100.0
-
-    # Invalid extra documents
-    invalid_extra_docs = len(answer_doc_set - expected_set)
+        document_recall_pct = None
+        invalid_extra_docs = None
 
     # Answer completeness and correctness
     if answer_text and answer_facts:
@@ -748,17 +723,26 @@ def score_answer(
 
     return {
         "question_id": qid,
+        "corrected": gold_answer_updated,
         "question_type": question_type,
-        "gold_answer_updated": gold_answer_updated,
         "answer_correct": answer_correct,
         "completeness_pct": round(completeness_pct, 2),
-        "document_recall_pct": round(document_recall_pct, 2),
+        "document_recall_pct": (
+            round(document_recall_pct, 2)
+            if document_recall_pct is not None
+            else None
+        ),
         "invalid_extra_docs": invalid_extra_docs,
     }
 
 
 def compute_stats_for_group(results: list[dict]) -> dict[str, float | int]:
-    """Compute average stats for a group of question results."""
+    """Compute average stats for a group of question results.
+
+    Recall and extra_docs are only averaged over questions that have
+    expected documents (non-None values). Questions without expected docs
+    are excluded from those averages.
+    """
     n = len(results)
     if n == 0:
         return {
@@ -768,6 +752,18 @@ def compute_stats_for_group(results: list[dict]) -> dict[str, float | int]:
             "average_recall_pct": 0.0,
             "average_extra_docs": 0.0,
         }
+
+    recall_values = [
+        r["document_recall_pct"]
+        for r in results
+        if r["document_recall_pct"] is not None
+    ]
+    extra_docs_values = [
+        r["invalid_extra_docs"]
+        for r in results
+        if r["invalid_extra_docs"] is not None
+    ]
+
     return {
         "count": n,
         "average_correctness_pct": round(
@@ -779,13 +775,17 @@ def compute_stats_for_group(results: list[dict]) -> dict[str, float | int]:
             2,
         ),
         "average_recall_pct": round(
-            sum(r["document_recall_pct"] for r in results) / n,
+            sum(recall_values) / len(recall_values),
             2,
-        ),
+        )
+        if recall_values
+        else 0.0,
         "average_extra_docs": round(
-            sum(r["invalid_extra_docs"] for r in results) / n,
+            sum(extra_docs_values) / len(extra_docs_values),
             2,
-        ),
+        )
+        if extra_docs_values
+        else 0.0,
     }
 
 
@@ -807,7 +807,7 @@ def build_aggregate_stats(
 ) -> dict[str, float | int]:
     """Build aggregate stats for the current evaluation snapshot."""
     stats = compute_stats_for_group(question_results)
-    num_corrected = sum(1 for r in question_results if r.get("gold_answer_updated"))
+    num_corrected = sum(1 for r in question_results if r.get("corrected"))
     return {
         "total_questions": total_questions,
         "completed_questions": stats.pop("count"),
@@ -863,14 +863,14 @@ def main() -> None:
         description="Evaluate answer files against gold questions"
     )
     parser.add_argument(
-        "--answer-file",
-        default=DEFAULT_ANSWER_FILE,
-        help=f"Path to answers JSONL file (default: {DEFAULT_ANSWER_FILE})",
+        "--answers-file",
+        default=DEFAULT_ANSWERS_FILE,
+        help=f"Path to answers JSONL file (default: {DEFAULT_ANSWERS_FILE})",
     )
     parser.add_argument(
         "--questions-file",
-        default=QUESTIONS_PATH,
-        help=f"Path to questions JSONL file (default: {QUESTIONS_PATH})",
+        default=DEFAULT_QUESTIONS_FILE,
+        help=f"Path to questions JSONL file (default: {DEFAULT_QUESTIONS_FILE})",
     )
     parser.add_argument(
         "--output-file",
@@ -906,8 +906,8 @@ def main() -> None:
     args = parser.parse_args()
 
     # Validate input files exist
-    if not os.path.exists(args.answer_file):
-        print(f"Error: answer file not found: {args.answer_file}")
+    if not os.path.exists(args.answers_file):
+        print(f"Error: answer file not found: {args.answers_file}")
         sys.exit(1)
     if not os.path.exists(args.questions_file):
         print(f"Error: questions file not found: {args.questions_file}")
@@ -917,36 +917,17 @@ def main() -> None:
         print("  [INFO] --question-id set; forcing parallelism=1")
         args.parallelism = 1
 
-    # Load data
+    # =========================================================================
+    # 1. Load questions and answers
+    # =========================================================================
+
     print(f"Loading questions from {args.questions_file}...")
     questions = load_questions(args.questions_file)
     print(f"  Loaded {len(questions)} questions")
 
-    print(f"Loading answers from {args.answer_file}...")
-    answers = load_answers(args.answer_file)
+    print(f"Loading answers from {args.answers_file}...")
+    answers = load_answers(args.answers_file)
     print(f"  Loaded {len(answers)} answer rows")
-
-    print("Stripping citations from answers...")
-    answers = strip_citations_from_answers(answers)
-    print("  Done stripping citations")
-
-    updated_questions = load_updated_questions(args.output_file)
-    if updated_questions:
-        print(
-            f"  Loaded {len(updated_questions)} updated questions from "
-            f"{args.output_file}"
-        )
-
-    try:
-        document_path_map = resolve_document_path_map(
-            questions=questions,
-            answers=answers,
-            updated_questions=updated_questions,
-            uuid_index_cache_file=args.uuid_index_cache_file,
-        )
-    except ValueError as exc:
-        print(f"\nFATAL: {exc}")
-        sys.exit(1)
 
     # Validate answer rows and separate failures
     valid_rows: list[dict] = []
@@ -989,33 +970,83 @@ def main() -> None:
         print(f"  Targeting single question: {args.question_id}")
 
     # =========================================================================
-    # Resume from existing results if available
+    # 2. Compare with existing results to find new questions
     # =========================================================================
-
-    if args.question_id:
-        updated_questions.pop(args.question_id, None)
 
     question_results: list[dict] = []
     completed_qids: set[str] = set()
 
-    if os.path.exists(args.results_file):
+    if args.question_id:
+        # Single-question mode: keep other results, re-evaluate target
+        if os.path.exists(args.results_file):
+            try:
+                existing_results = load_json_file(args.results_file)
+                for r in existing_results.get("questions", []):
+                    qid = r.get("question_id")
+                    question_results.append(r)
+                    if qid and qid != args.question_id:
+                        completed_qids.add(qid)
+            except Exception:
+                print(
+                    f"  [WARN] Could not load existing results from "
+                    f"{args.results_file}, starting fresh"
+                )
+    elif os.path.exists(args.results_file):
         try:
             existing_results = load_json_file(args.results_file)
             for r in existing_results.get("questions", []):
                 qid = r.get("question_id")
                 question_results.append(r)
-                if qid and qid != args.question_id:
+                if qid:
                     completed_qids.add(qid)
-            if completed_qids:
-                print(
-                    f"\n  Resuming: found {len(completed_qids)} already-evaluated questions in {args.results_file}"
-                )
         except Exception:
             print(
-                f"\n  [WARN] Could not load existing results from {args.results_file}, starting fresh"
+                f"  [WARN] Could not load existing results from "
+                f"{args.results_file}, starting fresh"
             )
 
-    # Filter out already-completed questions
+    answer_qids = {row["question_id"] for row in valid_rows}
+    new_qids = answer_qids - completed_qids
+    overlapping_qids = answer_qids & completed_qids
+
+    if completed_qids:
+        print(
+            f"\n  Found {len(completed_qids)} already-evaluated questions "
+            f"in {args.results_file}"
+        )
+        print(f"  {len(overlapping_qids)} overlapping (will skip)")
+        print(f"  {len(new_qids)} new questions to evaluate")
+    else:
+        print(f"\n  {len(answer_qids)} questions to evaluate (no prior results)")
+
+    # =========================================================================
+    # 3. Build and validate UUID path map
+    # =========================================================================
+
+    updated_questions = load_updated_questions(args.output_file)
+    if updated_questions:
+        print(
+            f"  Loaded {len(updated_questions)} updated questions from "
+            f"{args.output_file}"
+        )
+    if args.question_id:
+        updated_questions.pop(args.question_id, None)
+
+    try:
+        document_path_map = resolve_document_path_map(
+            questions=questions,
+            answers=answers,
+            updated_questions=updated_questions,
+            uuid_index_cache_file=args.uuid_index_cache_file,
+        )
+    except ValueError as exc:
+        print(f"\nFATAL: {exc}")
+        sys.exit(1)
+
+    # =========================================================================
+    # 4. Prepare worker pool and incremental output state
+    # =========================================================================
+
     remaining_rows = [
         row for row in valid_rows if row["question_id"] not in completed_qids
     ]
@@ -1024,15 +1055,68 @@ def main() -> None:
     else:
         total_questions = len(valid_rows)
 
-    # =========================================================================
-    # Per-question evaluation: document eval + answer scoring
-    # =========================================================================
+    # Thread-safe lock for incremental writes
+    write_lock = threading.Lock()
+
+    # Initialize output files
+    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+    if not os.path.exists(args.output_file):
+        # Seed the output file with the original questions
+        with open(args.output_file, "w") as f:
+            with open(args.questions_file) as qf:
+                for line in qf:
+                    line = line.strip()
+                    if line:
+                        f.write(line + "\n")
+
+    write_results_snapshot(
+        results_file=args.results_file,
+        output_file=args.output_file,
+        question_results=question_results,
+        skip_count=skip_count,
+        total_questions=total_questions,
+    )
+
+    def flush_updated_question(qid: str, updated_q: dict | None) -> None:
+        """Incrementally update the output questions file for a single qid."""
+        row_to_write = updated_q if updated_q else questions[qid]
+        with open(args.output_file) as f:
+            lines = f.readlines()
+
+        new_lines: list[str] = []
+        replaced = False
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            row = json.loads(stripped)
+            if row.get("question_id") == qid:
+                new_lines.append(json.dumps(row_to_write) + "\n")
+                replaced = True
+            else:
+                new_lines.append(stripped + "\n")
+
+        if not replaced:
+            new_lines.append(json.dumps(row_to_write) + "\n")
+
+        with open(args.output_file, "w") as f:
+            f.writelines(new_lines)
 
     def evaluate_single_question(
         row: dict,
     ) -> tuple[dict | None, dict]:
-        """Evaluate a single question: doc eval then answer scoring."""
+        """Evaluate a single question: strip citations, doc eval, scoring."""
         qid = row["question_id"]
+
+        # Strip citations per-question
+        if row.get("answer"):
+            try:
+                row["answer"] = strip_answer_citations(row["answer"])
+            except Exception:
+                print(
+                    f"  [WARN] {qid}: citation stripping failed, using original"
+                )
+
         updated_q: dict | None = None
 
         if row.get("document_ids"):
@@ -1046,54 +1130,69 @@ def main() -> None:
         original_question = questions[qid]
         effective_question = updated_q if updated_q else original_question
         result = score_answer(row, effective_question, original_question)
+        recall_str = (
+            f"{result['document_recall_pct']}%"
+            if result["document_recall_pct"] is not None
+            else "N/A"
+        )
+        extra_str = (
+            str(result["invalid_extra_docs"])
+            if result["invalid_extra_docs"] is not None
+            else "N/A"
+        )
         print(
             f"  {qid} score: correct={result['answer_correct']}"
             f"  completeness={result['completeness_pct']}%"
-            f"  recall={result['document_recall_pct']}%"
-            f"  extra_docs={result['invalid_extra_docs']}"
+            f"  recall={recall_str}"
+            f"  extra_docs={extra_str}"
         )
         return updated_q, result
-
-    # Keep results.json populated as questions finish. All writes happen here
-    # on the main thread, even when evaluation itself runs in parallel.
-    print(f"\nInitializing results file at {args.results_file}...")
-    write_results_snapshot(
-        results_file=args.results_file,
-        output_file=args.output_file,
-        question_results=question_results,
-        skip_count=skip_count,
-        total_questions=total_questions,
-    )
 
     def handle_completed_question(
         updated_q: dict | None,
         result: dict,
     ) -> None:
-        """Record a completed question and flush the snapshot to disk."""
-        if updated_q:
-            updated_questions[updated_q["question_id"]] = updated_q
+        """Record a completed question and flush snapshots to disk."""
+        with write_lock:
+            qid = result["question_id"]
+            if updated_q:
+                updated_questions[qid] = updated_q
 
-        question_results[:] = [
-            existing
-            for existing in question_results
-            if existing.get("question_id") != result["question_id"]
-        ]
-        question_results.append(result)
-        write_results_snapshot(
-            results_file=args.results_file,
-            output_file=args.output_file,
-            question_results=question_results,
-            skip_count=skip_count,
-            total_questions=total_questions,
-        )
+            question_results[:] = [
+                existing
+                for existing in question_results
+                if existing.get("question_id") != qid
+            ]
+            question_results.append(result)
+
+            # Flush results.json incrementally
+            write_results_snapshot(
+                results_file=args.results_file,
+                output_file=args.output_file,
+                question_results=question_results,
+                skip_count=skip_count,
+                total_questions=total_questions,
+            )
+
+            # Flush questions_updated.jsonl incrementally
+            flush_updated_question(qid, updated_q)
+
+    # =========================================================================
+    # 5. Run evaluation
+    # =========================================================================
 
     remaining_count = len(remaining_rows)
     if remaining_count == 0:
         print("\nAll questions already evaluated, nothing to do.")
     else:
-        print(
-            f"\nEvaluating {remaining_count} remaining questions (parallelism={args.parallelism})..."
-        )
+        if args.parallelism > 1:
+            print(
+                f"\nEvaluating {remaining_count} questions with "
+                f"{args.parallelism} parallel workers "
+                f"(each question is processed independently in the pool)..."
+            )
+        else:
+            print(f"\nEvaluating {remaining_count} questions sequentially...")
 
         if args.parallelism <= 1:
             for i, row in enumerate(remaining_rows, 1):
@@ -1110,36 +1209,39 @@ def main() -> None:
                     updated_q, result = future.result()
                     handle_completed_question(updated_q, result)
 
-    # Write updated questions file
-    print(f"\nWriting updated questions to {args.output_file}...")
-    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
-    with open(args.output_file, "w") as f:
-        with open(args.questions_file) as qf:
-            for line in qf:
-                line = line.strip()
-                if not line:
-                    continue
-                row = json.loads(line)
-                qid = row.get("question_id")
-                if qid and qid in updated_questions:
-                    f.write(json.dumps(updated_questions[qid]) + "\n")
-                else:
-                    f.write(json.dumps(row) + "\n")
-
     # =========================================================================
-    # Aggregate stats and write results
+    # 6. Final sort and write both output files in correct question_id order
     # =========================================================================
 
-    aggregate_stats = build_aggregate_stats(
+    print(f"\nFinalizing output files...")
+
+    # Sort and write results.json
+    write_results_snapshot(
+        results_file=args.results_file,
+        output_file=args.output_file,
         question_results=question_results,
         skip_count=skip_count,
         total_questions=total_questions,
     )
 
-    print(f"\nFinalizing results at {args.results_file}...")
-    write_results_snapshot(
-        results_file=args.results_file,
-        output_file=args.output_file,
+    # Sort and rewrite questions_updated.jsonl in question_id order
+    all_question_rows: list[dict] = []
+    with open(args.output_file) as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped:
+                all_question_rows.append(json.loads(stripped))
+
+    all_question_rows.sort(key=_question_sort_key)
+    with open(args.output_file, "w") as f:
+        for row in all_question_rows:
+            f.write(json.dumps(row) + "\n")
+
+    # =========================================================================
+    # 7. Print aggregate stats
+    # =========================================================================
+
+    aggregate_stats = build_aggregate_stats(
         question_results=question_results,
         skip_count=skip_count,
         total_questions=total_questions,
@@ -1153,6 +1255,16 @@ def main() -> None:
     print(f"  Avg completeness:    {aggregate_stats['average_completeness_pct']}%")
     print(f"  Avg recall:          {aggregate_stats['average_recall_pct']}%")
     print(f"  Avg extra docs:      {aggregate_stats['average_extra_docs']}")
+
+
+def _question_sort_key(row: dict) -> tuple[int, str, int]:
+    """Sort key for question rows by question_id."""
+    qid = row.get("question_id", "")
+    match = re.match(r"^(.*?)(\d+)$", qid)
+    if match:
+        prefix, suffix = match.groups()
+        return (0, prefix, int(suffix))
+    return (1, qid, 0)
 
 
 if __name__ == "__main__":
