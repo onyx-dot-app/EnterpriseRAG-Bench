@@ -1,4 +1,20 @@
-Provide python cli commands to run the different steps
+What is needed for a good run/search:
+
+run(command=) with pipes
+glob
+grep
+ls
+cat
+head
+find (or fd?)
+rg (ripgrep)
+xargs?
+parallel?
+fzf?
+less?
+
+
+
 Agents.md explanations at the top of the script before starting
 Explain project enrichment, what is going on?
 Project phases explain more in detail, not super clear
