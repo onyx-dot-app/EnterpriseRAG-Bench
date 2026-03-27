@@ -1,5 +1,6 @@
 ANSWER_CITATION_STRIPPING_PROMPT = """
-Strip all citations from the provided string without modifying any other content. Citations of all forms such as [number], [number][number], [number](link), etc. should all be removed. \
+Strip all citations and reference sections from the provided string without modifying any other content. Citations of all forms such as [number], [number][number], [number](link), etc. should all be removed. \
+Anything that is clearly a citation, regardless of format should be removed. Also remove any reference footers or intermediate sections that are clearly references. \
 Output the stripped string with no additional text or formatting changes.
 
 String to strip:

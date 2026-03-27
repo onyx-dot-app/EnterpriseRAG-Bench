@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import random
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -430,6 +431,15 @@ def process_comparative_question(
 
     effective_gold_set = set(effective_doc_ids)
 
+    # Randomly swap presentation order to reduce positional bias
+    swapped = random.choice([True, False])
+    if swapped:
+        cmp_answer_1, cmp_answer_2 = answer_2, answer_1
+        cmp_only_1, cmp_only_2 = only_2, only_1
+    else:
+        cmp_answer_1, cmp_answer_2 = answer_1, answer_2
+        cmp_only_1, cmp_only_2 = only_1, only_2
+
     # Run comparison and both answer set scorings in parallel
     comparison_result: dict | None = None
     set_1_scores: dict = {}
@@ -439,11 +449,11 @@ def process_comparative_question(
         comparison_future = executor.submit(
             compare_answers_with_consensus,
             question_row["question"],
-            answer_1,
-            answer_2,
+            cmp_answer_1,
+            cmp_answer_2,
             overlapping,
-            only_1,
-            only_2,
+            cmp_only_1,
+            cmp_only_2,
             effective_gold_set,
             document_path_map,
         )
@@ -492,6 +502,11 @@ def process_comparative_question(
             "reason": "comparison failed — all consensus runs returned unusable output",
         }
 
+    # Map comparison result back to original answer file ordering
+    if swapped:
+        flipped_pref = "2" if comparison_result["preferred_system"] == "1" else "1"
+        comparison_result["preferred_system"] = flipped_pref
+
     return updated_q, {
         "question_id": qid,
         "corrected": question_corrected,
@@ -518,6 +533,8 @@ def compute_comparative_stats(
             "num_corrected_questions": 0,
             "system_1_preferred_pct": 0.0,
             "system_2_preferred_pct": 0.0,
+            "system_1_strongly_preferred_pct": 0.0,
+            "system_2_strongly_preferred_pct": 0.0,
             "tie_pct": 0.0,
             "answer_set_1": {
                 "average_completeness_pct": 0.0,
@@ -544,6 +561,20 @@ def compute_comparative_stats(
         if r.get("comparison", {}).get("effectively_equivalent") is True
     )
     num_corrected = sum(1 for r in question_results if r.get("corrected"))
+
+    # Strong preference: ties don't count toward either system
+    non_tie_sys1 = sum(
+        1
+        for r in question_results
+        if r.get("comparison", {}).get("preferred_system") == "1"
+        and r.get("comparison", {}).get("effectively_equivalent") is not True
+    )
+    non_tie_sys2 = sum(
+        1
+        for r in question_results
+        if r.get("comparison", {}).get("preferred_system") == "2"
+        and r.get("comparison", {}).get("effectively_equivalent") is not True
+    )
 
     def _avg_set_stats(set_key: str) -> dict:
         completeness_vals = [
@@ -582,6 +613,8 @@ def compute_comparative_stats(
         "num_corrected_questions": num_corrected,
         "system_1_preferred_pct": round(sys1_preferred / n * 100, 2),
         "system_2_preferred_pct": round(sys2_preferred / n * 100, 2),
+        "system_1_strongly_preferred_pct": round(non_tie_sys1 / n * 100, 2),
+        "system_2_strongly_preferred_pct": round(non_tie_sys2 / n * 100, 2),
         "tie_pct": round(ties / n * 100, 2),
         "answer_set_1": _avg_set_stats("answer_set_1"),
         "answer_set_2": _avg_set_stats("answer_set_2"),
@@ -746,14 +779,13 @@ def main() -> None:
 
     skip_count = len(only_in_1) + len(only_in_2) + len(not_in_questions)
 
-    if only_in_1:
-        print(f"  {len(only_in_1)} questions only in system 1 (skipped)")
-    if only_in_2:
-        print(f"  {len(only_in_2)} questions only in system 2 (skipped)")
+    print(f"\n  Answer file overlap summary:")
+    print(f"    Unique to system 1 (skipped):     {len(only_in_1)}")
+    print(f"    Unique to system 2 (skipped):     {len(only_in_2)}")
     if not_in_questions:
-        print(f"  {len(not_in_questions)} questions not in questions file (skipped)")
-
-    print(f"  {len(common_qids)} questions common to both systems")
+        print(f"    Not in questions file (skipped):  {len(not_in_questions)}")
+    print(f"    Common to both systems:            {len(common_qids)}")
+    print(f"    Total to process:                  {len(common_qids)}")
 
     # Sort for deterministic ordering
     valid_qids = sorted(common_qids)
@@ -1015,9 +1047,11 @@ def main() -> None:
     print(f"  Questions scored:       {stats['completed_questions']}")
     print(f"  Skipped rows:           {skip_count}")
     print(f"  Corrected questions:    {stats['num_corrected_questions']}")
-    print(f"  System 1 preferred:     {stats['system_1_preferred_pct']}%")
-    print(f"  System 2 preferred:     {stats['system_2_preferred_pct']}%")
-    print(f"  Tie percentage:         {stats['tie_pct']}%")
+    print(f"  System 1 preferred:          {stats['system_1_preferred_pct']}%")
+    print(f"  System 2 preferred:          {stats['system_2_preferred_pct']}%")
+    print(f"  System 1 strongly preferred: {stats['system_1_strongly_preferred_pct']}%")
+    print(f"  System 2 strongly preferred: {stats['system_2_strongly_preferred_pct']}%")
+    print(f"  Tie percentage:              {stats['tie_pct']}%")
     print(f"  Set 1 avg completeness: {stats['answer_set_1']['average_completeness_pct']}%")
     print(f"  Set 1 avg recall:       {stats['answer_set_1']['average_recall_pct']}%")
     print(f"  Set 1 avg extra docs:   {stats['answer_set_1']['average_extra_docs']}")
