@@ -7,7 +7,7 @@ import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from answer_evaluation.eval_utils import (
+from src.utils.eval_utils import (
     DEFAULT_QUESTIONS_FILE,
     build_type_order,
     dedupe_doc_ids,
@@ -280,9 +280,7 @@ def score_answer(
     # Document recall and extra docs — N/A when no expected docs
     if expected_set:
         correct_docs = answer_doc_set & expected_set
-        document_recall_pct: float | None = (
-            len(correct_docs) / len(expected_set) * 100
-        )
+        document_recall_pct: float | None = len(correct_docs) / len(expected_set) * 100
         invalid_extra_docs: int | None = len(answer_doc_set - expected_set)
     else:
         document_recall_pct = None
@@ -341,9 +339,7 @@ def score_answer(
                         correctness_future.result()
                     )
                     answer_correct = (
-                        correctness_result
-                        if correctness_result is not None
-                        else False
+                        correctness_result if correctness_result is not None else False
                     )
                 except Exception:
                     answer_correct = False
@@ -358,9 +354,7 @@ def score_answer(
         "correctness_reasoning": correctness_reasoning,
         "completeness_pct": round(completeness_pct, 2),
         "document_recall_pct": (
-            round(document_recall_pct, 2)
-            if document_recall_pct is not None
-            else None
+            round(document_recall_pct, 2) if document_recall_pct is not None else None
         ),
         "invalid_extra_docs": invalid_extra_docs,
     }
@@ -394,9 +388,7 @@ def compute_stats_for_group(results: list[dict]) -> dict[str, float | int]:
         if r["document_recall_pct"] is not None
     ]
     extra_docs_values = [
-        r["invalid_extra_docs"]
-        for r in results
-        if r["invalid_extra_docs"] is not None
+        r["invalid_extra_docs"] for r in results if r["invalid_extra_docs"] is not None
     ]
 
     return {
@@ -409,18 +401,22 @@ def compute_stats_for_group(results: list[dict]) -> dict[str, float | int]:
             sum(r["completeness_pct"] for r in results) / n,
             2,
         ),
-        "average_recall_pct": round(
-            sum(recall_values) / len(recall_values),
-            2,
-        )
-        if recall_values
-        else 0.0,
-        "average_extra_docs": round(
-            sum(extra_docs_values) / len(extra_docs_values),
-            2,
-        )
-        if extra_docs_values
-        else 0.0,
+        "average_recall_pct": (
+            round(
+                sum(recall_values) / len(recall_values),
+                2,
+            )
+            if recall_values
+            else 0.0
+        ),
+        "average_extra_docs": (
+            round(
+                sum(extra_docs_values) / len(extra_docs_values),
+                2,
+            )
+            if extra_docs_values
+            else 0.0
+        ),
     }
 
 
@@ -711,15 +707,14 @@ def main() -> None:
         total_questions = len(valid_rows)
 
     # When resuming, the original skip_count is not recoverable
-    if is_resuming:
-        skip_count: int | str = "N/A"
+    display_skip_count: int | str = "N/A" if is_resuming else skip_count
 
     # Initialize results file
     write_results_snapshot(
         results_file=args.results_file,
         output_file=args.updated_questions_file,
         question_results=question_results,
-        skip_count=skip_count,
+        skip_count=display_skip_count,
         total_questions=total_questions,
         type_order=type_order,
     )
@@ -735,9 +730,7 @@ def main() -> None:
             try:
                 row["answer"] = strip_answer_citations(row["answer"])
             except Exception:
-                print(
-                    f"  [WARN] {qid}: citation stripping failed, using original"
-                )
+                print(f"  [WARN] {qid}: citation stripping failed, using original")
 
         updated_q: dict | None = None
         has_expected_docs = bool(questions[qid].get("expected_doc_ids"))
@@ -791,7 +784,7 @@ def main() -> None:
             results_file=args.results_file,
             output_file=args.updated_questions_file,
             question_results=question_results,
-            skip_count=skip_count,
+            skip_count=display_skip_count,
             total_questions=total_questions,
             type_order=type_order,
         )
@@ -840,7 +833,7 @@ def main() -> None:
         results_file=args.results_file,
         output_file=args.updated_questions_file,
         question_results=question_results,
-        skip_count=skip_count,
+        skip_count=display_skip_count,
         total_questions=total_questions,
         type_order=type_order,
     )
@@ -889,13 +882,13 @@ def main() -> None:
 
     aggregate_stats = build_aggregate_stats(
         question_results=question_results,
-        skip_count=skip_count,
+        skip_count=display_skip_count,
         total_questions=total_questions,
     )
 
     print("\nDone.")
     print(f"  Questions scored:    {aggregate_stats['completed_questions']}")
-    print(f"  Skipped rows:        {skip_count}")
+    print(f"  Skipped rows:        {display_skip_count}")
     print(f"  Corrected questions: {aggregate_stats['num_corrected_questions']}")
     print(f"  Avg correctness:     {aggregate_stats['average_correctness_pct']}%")
     print(f"  Avg completeness:    {aggregate_stats['average_completeness_pct']}%")

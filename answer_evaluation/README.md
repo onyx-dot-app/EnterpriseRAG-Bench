@@ -13,7 +13,7 @@ command to run
 
 ## Answer Updating
 
-Place your answer file in this directory (defaults to looking for a file called answers.jsonl) and run src/answer_evaluation.py. Note you'll have to set up your LLM keys.
+Place your answer file in this directory (defaults to looking for a file called answers.jsonl) and run `src/scripts/answer_evaluation/metrics_based_eval.py`. Note you'll have to set up your LLM keys.
 
 The per-question entries in `answer_evaluation/results.json` include:
 - `question_type`: copied from the source question row.

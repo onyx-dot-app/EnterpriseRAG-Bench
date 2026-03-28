@@ -36,7 +36,6 @@ from tqdm import tqdm
 from src.llm.factory import get_cheap_llm
 from src.llm.interface import LLMInterface, Message, ToolCall
 from src.paths import QUESTIONS_PATH, SOURCES_DIR
-from src.tools.exceptions import ToolTerminationSignal
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -51,7 +50,7 @@ UNANSWERABLE_NOTE = (
     "Note: some questions may not have an answer in this corpus. "
     "If after thorough searching you are confident the information is not present, "
     "call `finish()` with a brief explanation as the answer "
-    "(e.g. \"This information is not available in the provided corpus\") "
+    '(e.g. "This information is not available in the provided corpus") '
     "and an empty `document_ids` list."
 )
 
@@ -92,7 +91,7 @@ def _next_overflow_path() -> str:
 # Presentation layer helpers (Technique 2 & 3 from agent_vli_instructions.md)
 # ---------------------------------------------------------------------------
 
-_PATH_LINE_RE = re.compile(r'^[./][\w/\-._]+\.(json|md|txt|yaml|yml)\s*$')
+_PATH_LINE_RE = re.compile(r"^[./][\w/\-._]+\.(json|md|txt|yaml|yml)\s*$")
 
 
 def _is_path_list(lines: list[str], sample_size: int = 50) -> bool:
@@ -129,7 +128,8 @@ def _build_subdirs_hint(sources_dir: str) -> str:
     if not os.path.isdir(sources_dir):
         return ""
     subdirs = sorted(
-        d for d in os.listdir(sources_dir)
+        d
+        for d in os.listdir(sources_dir)
         if os.path.isdir(os.path.join(sources_dir, d))
     )
     if not subdirs:
@@ -205,7 +205,8 @@ def _apply_presentation_layer(output: str, command: str = "") -> str:
     # Content-aware navigation hint: path lists need search guidance, not grep-the-list.
     if _is_path_list(lines):
         subdirs = sorted(
-            d for d in os.listdir(SOURCES_DIR)
+            d
+            for d in os.listdir(SOURCES_DIR)
             if os.path.isdir(os.path.join(SOURCES_DIR, d))
         )
         subdir_str = "  ".join(f"sources/{d}/" for d in subdirs)
@@ -217,11 +218,11 @@ def _apply_presentation_layer(output: str, command: str = "") -> str:
         nav = f"Navigate: grep '<pattern>' {tmp_path}  |  tail -n 50 {tmp_path}"
 
     return (
-        shown
-        + f"\n--- {total_lines} lines total ({total_bytes} bytes) ---\n"
+        shown + f"\n--- {total_lines} lines total ({total_bytes} bytes) ---\n"
         f"Full output saved: {tmp_path}\n"
         f"{nav}"
     )
+
 
 # Allowed command names (whitelist for the shell tool)
 ALLOWED_COMMANDS = {
@@ -325,7 +326,7 @@ def _read_agents_md(source_dir: str) -> str | None:
 
 def _extract_filename_example(agents_md: str) -> str:
     """Extract a filename example from agents.md content."""
-    match = re.search(r'e\.?g\.?\W+([a-zA-Z0-9_\-]+\.json)', agents_md)
+    match = re.search(r"e\.?g\.?\W+([a-zA-Z0-9_\-]+\.json)", agents_md)
     if match:
         return match.group(1)
     return "*.json"
@@ -336,10 +337,13 @@ def _build_source_type_section(sources_dir: str) -> str:
     if not os.path.isdir(sources_dir):
         return ""
 
-    source_types = sorted([
-        d for d in os.listdir(sources_dir)
-        if os.path.isdir(os.path.join(sources_dir, d))
-    ])
+    source_types = sorted(
+        [
+            d
+            for d in os.listdir(sources_dir)
+            if os.path.isdir(os.path.join(sources_dir, d))
+        ]
+    )
 
     if not source_types:
         return ""
@@ -363,10 +367,13 @@ def _build_source_type_map(sources_dir: str) -> str:
     if not os.path.isdir(sources_dir):
         return ""
 
-    source_types = sorted([
-        d for d in os.listdir(sources_dir)
-        if os.path.isdir(os.path.join(sources_dir, d))
-    ])
+    source_types = sorted(
+        [
+            d
+            for d in os.listdir(sources_dir)
+            if os.path.isdir(os.path.join(sources_dir, d))
+        ]
+    )
 
     if not source_types:
         return ""
@@ -620,8 +627,6 @@ def parse_chain(command_string: str) -> list[ChainSegment]:
 # ---------------------------------------------------------------------------
 
 
-
-
 def _is_binary(data: bytes) -> bool:
     return b"\x00" in data
 
@@ -645,7 +650,9 @@ def _validate_first_command(command: str) -> str | None:
     return None
 
 
-def execute_chain(command_string: str, cwd: str | None = None) -> tuple[str, int, float]:
+def execute_chain(
+    command_string: str, cwd: str | None = None
+) -> tuple[str, int, float]:
     """Execute a (potentially piped) command chain.
 
     Returns:
@@ -788,8 +795,8 @@ def make_run_tool_executor(
     """
     _t0 = session_start if session_start is not None else time.monotonic()
     _cmd_index = [0]
-    _seen: dict[str, int] = {}          # command → first cmd index
-    _zero_counts: dict[str, int] = {}   # normalised base path → consecutive zeros
+    _seen: dict[str, int] = {}  # command → first cmd index
+    _zero_counts: dict[str, int] = {}  # normalised base path → consecutive zeros
     _subdirs_hint = _build_subdirs_hint(SOURCES_DIR)
 
     def _run(command: str) -> str:
@@ -800,7 +807,9 @@ def make_run_tool_executor(
         # Exact repeat detection (Technique 2: different state → different message)
         repeat_prefix = ""
         if command in _seen:
-            repeat_prefix = f"[note: identical to cmd #{_seen[command]} — result unchanged]\n"
+            repeat_prefix = (
+                f"[note: identical to cmd #{_seen[command]} — result unchanged]\n"
+            )
         else:
             _seen[command] = idx
 
@@ -814,9 +823,7 @@ def make_run_tool_executor(
         output = _apply_presentation_layer(output, command=command)
 
         # Technique 3: consistent footer with cmd index + session elapsed
-        footer = (
-            f"[exit:{rc} | {elapsed_ms:.0f}ms | cmd #{idx} | session: {session_elapsed:.0f}s]"
-        )
+        footer = f"[exit:{rc} | {elapsed_ms:.0f}ms | cmd #{idx} | session: {session_elapsed:.0f}s]"
 
         parts: list[str] = []
         if repeat_prefix:
@@ -855,7 +862,9 @@ def _prune_messages(messages: list[Message]) -> list[Message]:
 
     while total_chars > _MAX_CONTEXT_CHARS and len(history) >= 2:
         if history[0].role == "tool_call" and history[1].role == "tool_result":
-            dropped_chars = len(history[0].content or "") + len(history[1].content or "")
+            dropped_chars = len(history[0].content or "") + len(
+                history[1].content or ""
+            )
             history = history[2:]
             total_chars -= dropped_chars
         else:
@@ -967,7 +976,9 @@ def run_agent_for_question(
                 )
 
                 if not quiet:
-                    print(f"\n[Tool: {tool_call.name}] args={json.dumps(tool_call.args)}")
+                    print(
+                        f"\n[Tool: {tool_call.name}] args={json.dumps(tool_call.args)}"
+                    )
 
                 try:
                     if tool_call.name == "run":
@@ -1156,7 +1167,9 @@ def main() -> None:
 
     use_quiet = args.parallelism > 1
 
-    output_path = args.output or f"answer_evaluation/answers_variant_{args.variant}.jsonl"
+    output_path = (
+        args.output or f"answer_evaluation/answers_variant_{args.variant}.jsonl"
+    )
 
     # Build system prompt once (discovers source types from disk)
     system_prompt = build_system_prompt(SOURCES_DIR, args.variant)
@@ -1171,7 +1184,9 @@ def main() -> None:
     if args.subset_per_type is not None:
         subset_ids = load_subset_ids(QUESTIONS_PATH, args.subset_per_type)
         if not use_quiet:
-            print(f"Subset: {len(subset_ids)} questions ({args.subset_per_type} per type)")
+            print(
+                f"Subset: {len(subset_ids)} questions ({args.subset_per_type} per type)"
+            )
 
     questions = load_questions_jsonl(
         QUESTIONS_PATH, limit=args.limit, question_ids=subset_ids

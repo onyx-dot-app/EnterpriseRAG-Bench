@@ -1,6 +1,6 @@
 # Stage 2: Add Noise -- Code Explanations
 
-This document describes the four steps in `src/data_scripts/stage_2_add_noise/`. The overall goal of Stage 2 is to inject realistic noise and complexity into the generated dataset by shuffling documents into wrong directories, creating miscellaneous clutter files, and producing near-duplicate documents with subtly updated facts.
+This document describes the four steps in `src/scripts/stage_2_add_noise/`. The overall goal of Stage 2 is to inject realistic noise and complexity into the generated dataset by shuffling documents into wrong directories, creating miscellaneous clutter files, and producing near-duplicate documents with subtly updated facts.
 
 ---
 

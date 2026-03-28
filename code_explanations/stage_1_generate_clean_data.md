@@ -1,7 +1,7 @@
 # Stage 1: Generate Clean Data -- Step-by-Step Code Overview
 
 This document provides a detailed overview of each step script (1 through 9) in
-`src/data_scripts/stage_1_generate_clean_data/`. These scripts form a sequential pipeline
+`src/scripts/stage_1_generate_clean_data/`. These scripts form a sequential pipeline
 that builds a synthetic enterprise dataset from scratch: starting with high-level company
 context and ending with thousands of individual source documents.
 

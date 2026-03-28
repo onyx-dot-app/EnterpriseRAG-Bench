@@ -8,7 +8,7 @@ import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from answer_evaluation.eval_utils import (
+from src.utils.eval_utils import (
     DEFAULT_QUESTIONS_FILE,
     _MAX_LLM_RETRIES,
     build_type_order,
@@ -229,9 +229,7 @@ def score_answer_set(
     # Document recall and extra docs
     if expected_set:
         correct_docs = answer_set & expected_set
-        document_recall_pct: float | None = (
-            len(correct_docs) / len(expected_set) * 100
-        )
+        document_recall_pct: float | None = len(correct_docs) / len(expected_set) * 100
         invalid_extra_docs: int | None = len(answer_set - expected_set)
     else:
         document_recall_pct = None
@@ -264,9 +262,7 @@ def score_answer_set(
     return {
         "completeness_pct": round(completeness_pct, 2),
         "document_recall_pct": (
-            round(document_recall_pct, 2)
-            if document_recall_pct is not None
-            else None
+            round(document_recall_pct, 2) if document_recall_pct is not None else None
         ),
         "invalid_extra_docs": invalid_extra_docs,
     }
@@ -322,13 +318,11 @@ def process_comparative_question(
         candidate_only = sorted(d for d in union_doc_ids if d not in gold_set)
 
         if candidate_only:
-            eval_result, gold_confirmed, eval_error = (
-                evaluate_documents_with_consensus(
-                    question=question_row["question"],
-                    gold_doc_ids=gold_doc_ids,
-                    candidate_doc_ids=candidate_only,
-                    document_path_map=document_path_map,
-                )
+            eval_result, gold_confirmed, eval_error = evaluate_documents_with_consensus(
+                question=question_row["question"],
+                gold_doc_ids=gold_doc_ids,
+                candidate_doc_ids=candidate_only,
+                document_path_map=document_path_map,
             )
 
             if eval_result is not None and not gold_confirmed:
@@ -375,9 +369,7 @@ def process_comparative_question(
                         # Re-extract facts
                         original_facts = question_row.get("answer_facts", [])
                         anti_hallucination_facts = (
-                            extract_anti_hallucination_facts(
-                                original_facts, quiet=True
-                            )
+                            extract_anti_hallucination_facts(original_facts, quiet=True)
                             or []
                         )
                         new_facts = (
@@ -577,9 +569,7 @@ def compute_comparative_stats(
     )
 
     def _avg_set_stats(set_key: str) -> dict:
-        completeness_vals = [
-            r[set_key]["completeness_pct"] for r in question_results
-        ]
+        completeness_vals = [r[set_key]["completeness_pct"] for r in question_results]
         recall_vals = [
             r[set_key]["document_recall_pct"]
             for r in question_results
@@ -591,21 +581,17 @@ def compute_comparative_stats(
             if r[set_key]["invalid_extra_docs"] is not None
         ]
         return {
-            "average_completeness_pct": round(
-                sum(completeness_vals) / len(completeness_vals), 2
-            )
-            if completeness_vals
-            else 0.0,
-            "average_recall_pct": round(
-                sum(recall_vals) / len(recall_vals), 2
-            )
-            if recall_vals
-            else 0.0,
-            "average_extra_docs": round(
-                sum(extra_vals) / len(extra_vals), 2
-            )
-            if extra_vals
-            else 0.0,
+            "average_completeness_pct": (
+                round(sum(completeness_vals) / len(completeness_vals), 2)
+                if completeness_vals
+                else 0.0
+            ),
+            "average_recall_pct": (
+                round(sum(recall_vals) / len(recall_vals), 2) if recall_vals else 0.0
+            ),
+            "average_extra_docs": (
+                round(sum(extra_vals) / len(extra_vals), 2) if extra_vals else 0.0
+            ),
         }
 
     return {
@@ -866,9 +852,7 @@ def main() -> None:
             question_results.clear()
             completed_qids.clear()
     else:
-        print(
-            f"\n  {len(valid_qids_set)} questions to evaluate (no prior results)"
-        )
+        print(f"\n  {len(valid_qids_set)} questions to evaluate (no prior results)")
 
     # =========================================================================
     # 3. Build and validate UUID path map
@@ -904,15 +888,14 @@ def main() -> None:
     else:
         total_questions = len(valid_qids)
 
-    if is_resuming:
-        skip_count: int | str = "N/A"
+    display_skip_count: int | str = "N/A" if is_resuming else skip_count
 
     # Initialize results file
     write_comparative_results_snapshot(
         results_file=args.results_file,
         output_file=args.updated_questions_file,
         question_results=question_results,
-        skip_count=skip_count,
+        skip_count=display_skip_count,
         total_questions=total_questions,
         type_order=type_order,
     )
@@ -948,7 +931,7 @@ def main() -> None:
             results_file=args.results_file,
             output_file=args.updated_questions_file,
             question_results=question_results,
-            skip_count=skip_count,
+            skip_count=display_skip_count,
             total_questions=total_questions,
             type_order=type_order,
         )
@@ -995,7 +978,7 @@ def main() -> None:
         results_file=args.results_file,
         output_file=args.updated_questions_file,
         question_results=question_results,
-        skip_count=skip_count,
+        skip_count=display_skip_count,
         total_questions=total_questions,
         type_order=type_order,
     )
@@ -1045,17 +1028,21 @@ def main() -> None:
 
     print("\nDone.")
     print(f"  Questions scored:       {stats['completed_questions']}")
-    print(f"  Skipped rows:           {skip_count}")
+    print(f"  Skipped rows:           {display_skip_count}")
     print(f"  Corrected questions:    {stats['num_corrected_questions']}")
     print(f"  System 1 preferred:          {stats['system_1_preferred_pct']}%")
     print(f"  System 2 preferred:          {stats['system_2_preferred_pct']}%")
     print(f"  System 1 strongly preferred: {stats['system_1_strongly_preferred_pct']}%")
     print(f"  System 2 strongly preferred: {stats['system_2_strongly_preferred_pct']}%")
     print(f"  Tie percentage:              {stats['tie_pct']}%")
-    print(f"  Set 1 avg completeness: {stats['answer_set_1']['average_completeness_pct']}%")
+    print(
+        f"  Set 1 avg completeness: {stats['answer_set_1']['average_completeness_pct']}%"
+    )
     print(f"  Set 1 avg recall:       {stats['answer_set_1']['average_recall_pct']}%")
     print(f"  Set 1 avg extra docs:   {stats['answer_set_1']['average_extra_docs']}")
-    print(f"  Set 2 avg completeness: {stats['answer_set_2']['average_completeness_pct']}%")
+    print(
+        f"  Set 2 avg completeness: {stats['answer_set_2']['average_completeness_pct']}%"
+    )
     print(f"  Set 2 avg recall:       {stats['answer_set_2']['average_recall_pct']}%")
     print(f"  Set 2 avg extra docs:   {stats['answer_set_2']['average_extra_docs']}")
 

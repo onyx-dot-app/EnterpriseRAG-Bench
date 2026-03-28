@@ -1,6 +1,6 @@
 # Utilities Scripts Overview
 
-Scripts in `src/data_scripts/utilities/` are standalone maintenance and cleanup tools for the generated data pipeline. Each operates on the `generated_data/sources/` directory (or a user-specified directory) and can be run directly from the command line.
+Scripts in `src/scripts/util_scripts/` are standalone maintenance and cleanup tools for the generated data pipeline. Each operates on the `generated_data/sources/` directory (or a user-specified directory) and can be run directly from the command line.
 
 ---
 

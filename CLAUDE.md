@@ -16,7 +16,7 @@
 - `src/utils/` - Shared utility functions
 - `src/schemas/` - Pydantic models for data validation
 - `src/prompts/` - Prompt templates for various generation steps
-- `src/data_scripts/` - Scripts for data generation pipeline stages
+- `src/scripts/` - Scripts for data generation pipeline stages
 
 ## Utilities (`src/utils/`)
 

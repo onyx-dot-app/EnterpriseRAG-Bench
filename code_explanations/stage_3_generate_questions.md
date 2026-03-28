@@ -1,6 +1,6 @@
 # Stage 3: Generate Questions -- Step-by-Step Overview
 
-This document describes each of the 10 step scripts under `src/data_scripts/stage_3_generate_questions/`. All steps append questions to the shared JSONL file at `generated_data/questions.jsonl` using the `save_question()` utility, which enforces a consistent field order (`question_id`, `source_types`, `question`, `expected_doc_ids`, `gold_answer`, `answer_facts`, `question_type`).
+This document describes each of the 10 step scripts under `src/scripts/stage_3_generate_questions/`. All steps append questions to the shared JSONL file at `generated_data/questions.jsonl` using the `save_question()` utility, which enforces a consistent field order (`question_id`, `source_types`, `question`, `expected_doc_ids`, `gold_answer`, `answer_facts`, `question_type`).
 
 ---
 

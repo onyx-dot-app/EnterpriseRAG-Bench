@@ -99,9 +99,7 @@ def normalize_document_ids(
         raise ValueError(f"{context}: expected list, got {type(document_ids).__name__}")
     for i, item in enumerate(document_ids):
         if not isinstance(item, str):
-            raise ValueError(
-                f"{context}[{i}]: expected str, got {type(item).__name__}"
-            )
+            raise ValueError(f"{context}[{i}]: expected str, got {type(item).__name__}")
     return document_ids
 
 
@@ -512,9 +510,7 @@ def validate_single_fact(answer: str, statement: str) -> bool:
                     response += chunk
 
             first_line = (
-                response.strip().splitlines()[0].strip()
-                if response.strip()
-                else ""
+                response.strip().splitlines()[0].strip() if response.strip() else ""
             )
             return re.search(r"\byes\b", first_line, re.IGNORECASE) is not None
         except Exception:

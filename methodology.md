@@ -311,3 +311,101 @@ The query is designed so that a system relying on surface-level keyword or topic
 To prevent the LLM from revisiting the same areas of the corpus, previously explored document paths are tracked in a generation cache and provided in each subsequent generation run.
 The gold answer and facts are predefined rather than generated: the expected answer states that the query is not answerable from the available documents,
 and the single evaluation fact checks that the response acknowledges this rather than presenting fabricated information.
+
+## Evaluation
+
+It is important to note that in retrieval benchmarks, a "gold" document is understood as one that was judged relevant under a specific annotation protocol — it is not a guarantee that the gold set are the absolute best document in the corpus.
+This is true of all large scale datasets however many older datasets have gone through many rounds of revisions as better sources and answers are provided for certain queries.
+Standard ways to address this challenge include:
+1. Pooling and combining results from multiple retrievers
+2. Human adjudication
+3. Trimming problematic queries
+4. Periodically refreshing the labels as new information becomes available.
+
+This code base provides two out of the box retriever solutions to help address this problem:
+- A vector search based approach in `index_document_vectors.py` and `vector_retrieval.py`
+- An LLM agent based approach where an LLM is equipped with bash commands to traverse the documents and attempt to find the answers (see `agent_retrieval.py`)
+
+The released dataset used these approaches to refine the questions however there are likely many additional corrections that can be made.
+
+### Correction Utilities
+
+It is much more feasible to verify that new candidate document(s) provided are better than the gold document than to confirm exhaustively that there is no other better match.
+We provide built-in correction mechanisms in the evaluation steps. The corrections work as follows:
+
+1. During evaluation, the user provides candidate answers along with the documents their system retrieved. The evaluation process considers both the original gold documents and any new candidate documents submitted by the user.
+2. Each document (gold and candidate) is independently evaluated by three separate LLM judges. Each judge classifies every document as either "valid" or "invalid" for the given question. A majority vote (at least 2 out of 3) determines the final classification.
+To reduce noise, ties are resolved with a gold-biased default: gold documents default to valid on a tie, while candidate documents default to invalid. If any of the three runs returns a result fully consistent with the original gold set, the evaluation exits early.
+3. If the majority vote produces a valid document set that differs from the original gold set — for example, a gold document is voted invalid or a candidate document is voted valid — the gold set is updated.
+Gold documents that were voted invalid are removed and candidate documents that were voted valid are added. Note that in practice, it is much more frequent that additional valid documents are added compared to gold documents being invalidated.
+4. When the document set changes, the gold answer and answer facts are regenerated using the updated set. The regeneration process preserves anti-hallucination facts from the original answer fact set 
+(negative statements or boundary conditions designed to catch specific hallucinations) and combines them with new facts extracted from the regenerated answer.
+In rare cases where answer regeneration fails, the original gold answer is kept but the document set is still updated.
+5. Corrected questions are written to an updated questions file and flagged as corrected in the evaluation results, allowing downstream consumers to distinguish between original and revised entries.
+
+### Metrics Based Evaluation
+
+The metrics-based evaluation scores a single system's answers against the gold question set. The evaluation produces four metrics per question:
+
+| Metric | Description |
+|--------|-------------|
+| **Correctness** | A holistic LLM-based judgment of whether the candidate answer is aligned with the gold answer. The evaluation is lenient toward stylistic differences, additional context, and extra detail, but requires that the core aspects of the question are addressed and do not conflict with the gold answer. Specific quantities mentioned in both answers must match. |
+| **Completeness** | The percentage of answer facts that the candidate answer supports. Each fact from the gold `answer_facts` list is independently validated by an LLM judge that checks whether the candidate answer contains or implies that fact. The score is simply the fraction of facts validated. |
+| **Document Recall** | The percentage of expected gold documents that appear in the candidate's retrieved document set. This is only computed for questions that have expected documents. |
+| **Invalid Extra Documents** | The count of documents in the candidate's retrieved set that are not in the expected gold set. Like recall, this is only computed for questions with expected documents. |
+
+Prior to running the evaluations, the answer is stripped of citations to avoid biasing the LLM judge.  The evaluation also applies the document correction flow described above:
+if the candidate provides documents that differ from the gold set, the three-judge consensus determines whether the gold set should be updated before scoring.
+Similarly, if the gold set of documents change, then the answer and facts will also be updated and the scoring is done on the revised ground truth.
+
+Correctness and completeness are evaluated independently — the correctness judge has no visibility into the answer facts, and each fact is validated on its own so that no single judgment leaks into another.
+
+### Comparative Evaluation
+
+The comparative evaluation scores two RAG systems head-to-head on the same question set. It takes two answer files (one per system) and produces both a per-question preference and the same per-system metrics
+(completeness, document recall, invalid extra documents) described above.
+
+For each question the flow is:
+
+1. Citations are stripped from both answers. The union of both systems' retrieved documents is passed through the same three-judge document correction process.
+If the gold set changes, the answer and facts are regenerated as before, and both systems are scored against the revised ground truth.
+2. The retrieved documents are split into three groups: documents found by both systems, documents unique to system 1, and documents unique to system 2.
+To reduce positional bias, the two systems are randomly swapped before being presented to the judge — the preference is mapped back to the original ordering afterward.
+3. Three evaluations run in parallel: a head-to-head answer comparison (using three-judge consensus) and independent scoring for each system's answer set.
+The head-to-head judge sees the query, both answers, and all three document groups. It returns a preferred system ("1" or "2") and whether the two answers are effectively equivalent.
+Majority voting across the three runs determines the final preference and equivalence classification.
+4. Each system's answer is independently scored for completeness (fact validation percentage), document recall, and invalid extra documents — identical to the metrics-based evaluation.
+
+## Known Limitations
+
+The following are known limitations of the dataset and generation process.
+
+- **Long-tail LLM errors at scale.** Even when the per-document error rate is low, generating thousands to millions of documents means rare failure modes will surface.
+For example, the initial dataset contained 7 documents whose file names included control characters; these were caught and removed manually.
+- **Synthetic randomness artifacts.** LLMs fall back on recognizable patterns when asked to produce arbitrary values. Unix timestamps that should look like `1774728005` often come out as `123456789`,
+and company names tend to include "ACME" or similar defaults even when the prompt requests realistic alternatives.
+- **Unrealistically on-topic conversations.** LLMs struggle to reproduce the noise and misunderstanding present in real discussions. 
+In a realistic Slack thread, participants frequently go off-topic, misunderstand one another, or introduce unrelated tangents, LLM-generated conversations rarely do this.
+The result is a corpus with less incidental noise than a real one, which affects retrieval difficulty in both directions: there are fewer easy-to-discard irrelevant documents, but also less realistic clutter for a system to filter through.
+- **Flat JSON representation.** All documents are stored as flattened JSON to standardize processing and export. This does not capture the nested structures that some real data types would naturally have.
+- **Document structure drift.** Despite guidance from `agents.md` files, the LLM does not always follow the specified document layout.
+At large volumes a non-trivial share of documents will deviate from the intended format. Most remain reasonable, but there is no strict schema enforcement since the process is natural-language driven.
+- **Invalid file paths.** The same scale-related drift applies to paths. Some documents end up in locations that break the expected hierarchy — for example, Slack messages placed directly under the top-level Slack directory rather than inside a channel.
+- **Limited cross-document context in high-volume generation.** To keep cost and generation time manageable, the high-volume flow restricts the context available to each document.
+Notably, it has no access to the employee directory, so many documents reference fictional people not grounded in the organization chart.
+- **Single-company representativeness.** The dataset approximates one realistic company, but companies vary significantly across stages, industries, and operational styles. The dataset will be more representative of some organizations than others.
+- **Context saturation at extreme scale.** Several generation steps feed previously generated artifacts back into the prompt — for example, each new project is created with visibility into all existing projects. At large enough scale the accumulated context overwhelms the LLM, causing it to ignore instructions and degrade the quality of the output. The current methodology has not been stress-tested beyond the scale of the released dataset.
+
+## Future Work
+
+The following are possible extensions to the question set that we leave for future exploration.
+
+- **High-volume aggregation.** Questions whose correct answer requires aggregating information across a large fraction of the corpus — for example, a question that can only be answered by consulting 5% or more of all documents.
+These would stress-test a system's ability to perform broad, recall-heavy retrieval rather than pinpoint lookups.
+- **Recency-aware retrieval.** Questions that ask for the latest document matching a loosely specified criteria, where the criteria alone does not narrow the result to a small set. These test whether a system can combine topical relevance with temporal ordering.
+- **People-centric questions.** Questions about specific individuals, their responsibilities, project involvement, expertise, relationships, and contributions —
+where the relevant information is scattered across meeting notes, discussion threads, code reviews, org charts, and other sources.
+People are referenced inconsistently (full names, first names, handles, titles) and rarely the primary subject of any single document, making retrieval particularly challenging.
+Answering well requires the system to discover and stitch together incidental mentions across many documents rather than retrieving a few directly relevant ones.
+- **True multi-hop reasoning.** Questions that require a specific chain of discovery across documents, where the answer to one retrieval step reveals what to search for next.
+These go beyond the existing multi-document questions by requiring sequential reasoning rather than parallel aggregation.

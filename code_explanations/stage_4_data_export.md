@@ -1,6 +1,6 @@
 # Stage 4: Export Data
 
-**File:** `src/data_scripts/stage_4_data_export/export_data.py`
+**File:** `src/scripts/stage_4_data_export/export_data.py`
 
 ## Purpose
 
