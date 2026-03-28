@@ -143,10 +143,12 @@ class AnthropicLLM(LLMInterface):
 
         system_message, anthropic_messages = self._build_messages(messages)
 
+        # When thinking is disabled (reasoning_level=None) use a smaller token budget.
+        max_tokens = 4096 if self.reasoning_level is None else 64000
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": anthropic_messages,
-            "max_tokens": 64000,
+            "max_tokens": max_tokens,
         }
         if system_message:
             kwargs["system"] = system_message
@@ -154,7 +156,8 @@ class AnthropicLLM(LLMInterface):
             kwargs["tools"] = self.tools
 
         # Check if model supports extended thinking (Claude 3.7+, 4.x, 4.5, 4.6)
-        if (
+        # reasoning_level=None disables thinking entirely.
+        if self.reasoning_level is not None and (
             "claude-3-7" in self.model
             or "claude-sonnet-4" in self.model
             or "claude-opus-4" in self.model
