@@ -1,4 +1,18 @@
-"""Script for generating individual project document files."""
+"""Script for generating individual project document files.
+
+Generates JSON documents for each project based on enriched project scaffolding. Each
+document is aware of the company overview, project description, agents.md guidance, and
+can read other project files for additional context. After generation, documents are
+labeled with title/content field metadata and assigned UUIDs.
+
+Usage:
+    python -m src.scripts.stage_1_generate_clean_data.step_7_generate_project_documents [OPTIONS]
+
+Args:
+    --project-parallelism       Number of projects to process in parallel (default: 5)
+    --project-file-parallelism  Number of files to generate in parallel per project (default: 5)
+    --labeling-parallelism      Number of documents to label in parallel (default: 20)
+"""
 
 import argparse
 import json

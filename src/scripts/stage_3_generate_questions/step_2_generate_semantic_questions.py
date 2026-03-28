@@ -1,4 +1,16 @@
-"""Script for generating semantic questions from documents."""
+"""Script for generating semantic questions from documents.
+
+Similar to basic questions but with guidance that steers the LLM toward challenging,
+loose-match queries that avoid keyword overlap. Tests whether retrieval systems can
+handle paraphrased or conceptually similar queries without relying on lexical matching.
+
+Usage:
+    python -m src.scripts.stage_3_generate_questions.step_2_generate_semantic_questions [OPTIONS]
+
+Args:
+    --count  Number of questions to generate (default: 50)
+    --quiet  Suppress LLM output streaming
+"""
 
 import argparse
 import os
@@ -200,7 +212,7 @@ def main() -> None:
             print(f"  ... and {len(errors) - 20} more")
 
     print(
-        "\nThis step is complete, go on to step 3 to generate single-doc multihop questions."
+        "\nThis step is complete, go on to step 3 to generate intra-doc reasoning questions."
     )
 
 

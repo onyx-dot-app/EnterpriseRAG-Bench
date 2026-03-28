@@ -1,4 +1,15 @@
-"""Interactive script for generating employee directory with validation."""
+"""Interactive script for generating an employee directory with validation.
+
+Generates a YAML employee directory grounded in the company overview and initiatives,
+with comprehensive validation (duplicate emails, manager references, cycle detection).
+Also produces a visual org chart. The directory is used later for source structure
+generation and project people assignment.
+
+Usage:
+    python -m src.scripts.stage_1_generate_clean_data.step_3_generate_employee_directory
+
+No arguments. The script is fully interactive.
+"""
 
 import os
 from io import StringIO

@@ -1,20 +1,26 @@
 """CLI agent script for answering questions by searching the document corpus.
 
-Each question is answered by an agentic loop that uses a shell `run()` tool
-and a `finish(answer, document_ids)` tool.  Results are written to a JSONL
-file compatible with the evaluation harness.
+Each question is answered by an agentic loop that uses a shell run() tool and a
+finish(answer, document_ids) tool. Results are written to a JSONL file compatible
+with the evaluation harness. Multiple system prompt variants control how much
+structural information is provided to the agent.
 
-Variants (--variant):
-  full      — source types + filename examples + prescribed search order (default)
-  structure — source types + filename examples, no prescribed order
-  minimal   — corpus path + tool descriptions only, no structural hints
-  v2        — minimal map only: corpus location + content_field_names fact +
-               tool awareness + question variety note. No procedure, no source
-               type listing. Tool layer: overflow mode + navigation error messages.
-  v3        — v2plus baseline + tool-layer improvements per agent_vli_instructions.md:
-               session cost footer (cmd #N, session elapsed), zero-result counter with
-               subdirectory map, situation-aware jq null hints, path-list overflow
-               detection, exact command repeat annotation, graceful shutdown at T-30s.
+Usage:
+    python -m src.scripts.answer_evaluation.generate_answers_cli [OPTIONS]
+
+Args:
+    --variant          System prompt variant (default: "full")
+                         full      - source types + filename examples + prescribed search order
+                         structure - source types + filename examples, no prescribed order
+                         minimal   - corpus path + tool descriptions only, no structural hints
+                         v2        - minimal map with tool awareness, no source type listing
+                         v3        - v2 baseline + tool-layer improvements (cost footer,
+                                     zero-result counter, jq hints, overflow detection)
+    --parallelism      Number of parallel workers (default: 1)
+    --limit            Maximum number of questions to process
+    --subset-per-type  Only process first N questions of each question_type
+    --output           Output JSONL path (default: answer_evaluation/answers_variant_{variant}.jsonl)
+    --resume           Skip questions already present in the output file
 """
 
 from __future__ import annotations

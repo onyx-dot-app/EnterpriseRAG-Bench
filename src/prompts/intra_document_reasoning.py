@@ -1,8 +1,8 @@
-SINGLE_DOC_MULTIHOOP_PROMPT = """
-You are an expert dataset question generation engineer. Given a single document sampled from a dataset, generate a single document multi-hop query based on that document. \
-A single document multi-hop query is a query that requires information from multiple parts of the document to answer. Specifically it should take information from the beginning and end of the document and possibly some information from the middle. \
+INTRA_DOCUMENT_REASONING_PROMPT = """
+You are an expert dataset question generation engineer. Given a single document sampled from a dataset, generate an intra-document reasoning query based on that document. \
+An intra-document reasoning query is a query that requires information from multiple parts of the document to answer. Specifically it should take information from the beginning and end of the document and possibly some information from the middle. \
 As a hypothetical example, a bottom section may talk about a particular topic like "the pricing per license per month is $100" and the top section may mention "we'll go over the pricing later which is unique to the AMEA region". \
-A good multi-hop query would be "What is the pricing per license per month for the AMEA region?". A retrieval system which is only able to fetch sections of the document would not be able to answer this question, which makes it a good multi-hop query. \
+A good intra-document reasoning query would be "What is the pricing per license per month for the AMEA region?". A retrieval system which is only able to fetch sections of the document would not be able to answer this question, which makes it a good intra-document reasoning query. \
 The query should be fully answerable from the document without any additional context or assumptions. \
 The query must include enough detail for a search system to retrieve the document, but not so much detail (or obvious giveaways like the document ID) that retrieval becomes trivial. \
 The query does not need to include every qualifiers and details (see example 1 below). It can include constraints or scoping details, but should remain short. \
@@ -34,5 +34,5 @@ Example 4 (good): For Seaside Streetwear's demo request, what latency target did
 {document_contents}
 ```
 
-CRITICAL: Output ONLY the query, do not provide any other text or explanation. Ensure that the query requires information from at least near the top and bottom of the document to answer.
+CRITICAL: Output ONLY the query, do not provide any other text or explanation. Ensure that the query requires reasoning across information from at least near the top and bottom of the document to answer.
 """.strip()

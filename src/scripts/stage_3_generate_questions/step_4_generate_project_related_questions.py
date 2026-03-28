@@ -1,4 +1,18 @@
-"""Script for generating project-related cross-document questions."""
+"""Script for generating project-related cross-document questions.
+
+Generates multi-document questions by giving the LLM a project overview and tools to
+read project documents. The LLM explores documents to craft questions requiring
+information from multiple sources (cross-cutting themes, contradictions, causal chains).
+Projects are distributed evenly across questions to prevent over-sampling.
+
+Usage:
+    python -m src.scripts.stage_3_generate_questions.step_4_generate_project_related_questions [OPTIONS]
+
+Args:
+    --count        Number of questions to generate (default: 50)
+    --parallelism  Number of parallel workers (default: 1)
+    --quiet        Suppress LLM output streaming
+"""
 
 import argparse
 import json

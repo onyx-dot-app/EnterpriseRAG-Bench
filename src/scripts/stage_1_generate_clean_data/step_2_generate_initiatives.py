@@ -1,4 +1,14 @@
-"""Interactive script for generating company initiatives and roadmap."""
+"""Interactive script for generating company initiatives and roadmap.
+
+Uses the company overview as context to collaboratively define high-level initiatives
+with the user. The resulting initiatives document guides downstream project generation,
+employee assignment, and high-volume document scaffolding.
+
+Usage:
+    python -m src.scripts.stage_1_generate_clean_data.step_2_generate_initiatives
+
+No arguments. The script is fully interactive.
+"""
 
 import os
 

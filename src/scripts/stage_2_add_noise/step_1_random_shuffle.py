@@ -1,7 +1,15 @@
 """Script to randomly shuffle a percentage of documents within each source type.
 
 Moves files to random directories within the same source type and records
-the original location in the document JSON.
+the original location in the document JSON. Documents are chosen using a random walk
+over the directory tree so selection reflects structure rather than file count per folder.
+No cross-source shuffling occurs to keep documents compliant with their source format.
+
+Usage:
+    python -m src.scripts.stage_2_add_noise.step_1_random_shuffle [OPTIONS]
+
+Args:
+    --percentage  Percentage of documents to shuffle within each source type (default: 5.0)
 """
 
 import argparse

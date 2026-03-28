@@ -1,4 +1,14 @@
-"""Ensure all JSON files in a directory have dataset_doc_uuid and correct field ordering."""
+"""Ensure all JSON files in a directory have dataset_doc_uuid and correct field ordering.
+
+Scans a directory for JSON files missing a dataset_doc_uuid, adds one, and fixes
+trailing field ordering where needed.
+
+Usage:
+    python -m src.scripts.util_scripts.ensure_files_have_uuid [DIRECTORY]
+
+Args:
+    directory  Directory to process (default: generated_data/sources)
+"""
 
 import argparse
 import os

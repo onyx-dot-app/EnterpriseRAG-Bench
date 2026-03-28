@@ -1,13 +1,13 @@
-"""Clean up volume documents and track non-volume document UUIDs.
+"""Track non-volume document UUIDs and optionally clean up orphaned volume files.
 
-Tracks UUIDs from:
-- projects: from generation_cache/projects.json
-- completeness: from generation_cache/completeness.json
-- duplication: from generation_cache/duplications.json
+Collects UUIDs from the projects, completeness, and duplications generation caches to
+identify which source files were produced by the high-fidelity pipeline. Then optionally
+deletes orphaned source files and clears stale references from volume JSON files.
 
-Also flags project files that don't have UUIDs and optionally cleans up:
-1. Orphaned source files that don't correspond to any tracked UUIDs
-2. Files mentioned in volume/*.json (and clears those references)
+Usage:
+    python -m src.scripts.util_scripts.clean_up_volume_docs
+
+No arguments. The script prompts interactively before deleting anything.
 """
 
 from pathlib import Path

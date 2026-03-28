@@ -1,10 +1,31 @@
-"""Compare two RAG systems' answers head-to-head against gold questions."""
+"""Compare two RAG systems' answers head-to-head against gold questions.
+
+Scores two answer files side-by-side, producing per-question preferences via three-judge
+consensus voting and per-system metrics (correctness, completeness, document recall,
+invalid extra documents). Applies the document correction flow to update gold sets when
+candidate documents are judged valid by majority vote.
+
+Usage:
+    python -m src.scripts.answer_evaluation.comparative_eval \\
+        --answer-file-1 path/to/system1_answers.jsonl \\
+        --answer-file-2 path/to/system2_answers.jsonl
+
+Args:
+    --answer-file-1           Path to system 1 answers JSONL (required)
+    --answer-file-2           Path to system 2 answers JSONL (required)
+    --questions-file          Path to questions JSONL file (default: export_data/questions.jsonl)
+    --results-file            Path to output results JSON (default: answer_evaluation/results-comparative.json)
+    --updated-questions-file  Path to output updated questions JSONL (default: answer_evaluation/questions_updated_comparative.jsonl)
+    --uuid-index-cache-file   Path to UUID index cache JSON
+    --parallelism             Number of parallel evaluation threads (default: 1)
+    --question-id             Evaluate a single question_id only
+    --skip-citation-stripping Skip LLM-based citation stripping from answers
+"""
 
 import argparse
 import json
 import os
 import random
-import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -41,7 +62,7 @@ from src.utils.json_extraction import extract_json_from_response
 from src.utils.questions import extract_answer_facts, extract_anti_hallucination_facts
 
 DEFAULT_RESULTS_FILE = "answer_evaluation/results-comparative.json"
-DEFAULT_UPDATED_QUESTIONS_FILE = "generated_data/questions_updated_comparative.jsonl"
+DEFAULT_UPDATED_QUESTIONS_FILE = "answer_evaluation/questions_updated_comparative.jsonl"
 
 
 # =============================================================================

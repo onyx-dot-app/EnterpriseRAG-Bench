@@ -1,4 +1,17 @@
-"""Script for generating unanswerable questions via document cluster exploration."""
+"""Script for generating unanswerable questions via document cluster exploration.
+
+Uses an LLM agent with corpus exploration tools to find clusters of topically related
+documents and craft natural-sounding queries that are related to the cluster's topic
+but not answerable from the corpus. Tests whether RAG systems can recognize when the
+needed information is absent rather than hallucinating from superficially relevant docs.
+
+Usage:
+    python -m src.scripts.stage_3_generate_questions.step_10_generate_unanswerable_questions [OPTIONS]
+
+Args:
+    --count  Number of questions to generate (default: 20)
+    --quiet  Suppress LLM output streaming
+"""
 
 import argparse
 

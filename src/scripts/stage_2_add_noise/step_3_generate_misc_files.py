@@ -1,4 +1,17 @@
-"""Script for generating miscellaneous directories and files to add noise to the dataset."""
+"""Script for generating miscellaneous directories and files to add noise to the dataset.
+
+Runs in two phases: (1) interactive LLM-guided creation of misc-type directories
+(e.g. slack/memes, google_drive/.../misc-assets), and (2) parallel generation of
+informal, off-topic documents within those directories. These peripheral documents
+create retrieval challenges for questions targeting loosely organized content.
+
+Usage:
+    python -m src.scripts.stage_2_add_noise.step_3_generate_misc_files [OPTIONS]
+
+Args:
+    --count        Total number of miscellaneous files to generate (default: 20)
+    --parallelism  Number of files to generate in parallel (default: 5)
+"""
 
 import argparse
 import os

@@ -1,8 +1,16 @@
 """Script to shuffle documents using LLM-chosen neighboring directories.
 
-Unlike step 1 (pure random), this uses an LLM to pick a plausible but
-non-ideal directory for each selected document within the same source type.
-Files are processed in parallel across all source types.
+Unlike step 1 (pure random), this uses an LLM to pick a plausible but non-ideal
+directory for each selected document within the same source type. This better matches
+real-world noise where misfiled documents are biased toward local structure (adjacent
+or parent/child directories). Files are processed in parallel across all source types.
+
+Usage:
+    python -m src.scripts.stage_2_add_noise.step_2_llm_based_shuffle [OPTIONS]
+
+Args:
+    --percentage   Percentage of documents to shuffle within each source type (default: 3.0)
+    --parallelism  Number of files to process in parallel (default: 50)
 """
 
 import argparse

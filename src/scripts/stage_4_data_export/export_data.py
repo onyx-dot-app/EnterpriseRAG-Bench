@@ -1,4 +1,22 @@
-"""Export generated data to plain text or JSON files with optional zip packaging."""
+"""Export generated data to plain text or JSON files with optional zip packaging.
+
+Converts the internal JSON source documents into plain text or JSON files suitable for
+external consumption. Supports filtering by source type, random sampling, flattening
+directory structure, and creating zip archives with optional per-source splitting.
+
+Usage:
+    python -m src.scripts.stage_4_data_export.export_data [OPTIONS]
+
+Args:
+    --max-files              Maximum total number of files to export
+    --random-sample          Randomly sample files (requires --max-files)
+    --flatten-within-sources Flatten files within each source directory
+    --sources                Source types to include (default: all)
+    --create-zip             Create zip file(s) of exported data
+    --max-files-per-zip      Maximum files per zip; creates slices when exceeded
+    --split-by-source        Create a separate zip file per source type
+    --export-format          Export format: "txt" or "json" (default: "txt")
+"""
 
 import argparse
 import json

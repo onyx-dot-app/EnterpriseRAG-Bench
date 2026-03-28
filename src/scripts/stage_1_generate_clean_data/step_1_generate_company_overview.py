@@ -1,4 +1,15 @@
-"""Interactive script for generating company overviews."""
+"""Interactive script for generating a company overview document.
+
+Guides the user through an LLM-powered conversation to define the company's name,
+mission, product surface area, business model, competitive landscape, and more.
+The resulting markdown file serves as the foundational context for all downstream
+generation steps.
+
+Usage:
+    python -m src.scripts.stage_1_generate_clean_data.step_1_generate_company_overview
+
+No arguments. The script is fully interactive.
+"""
 
 import os
 

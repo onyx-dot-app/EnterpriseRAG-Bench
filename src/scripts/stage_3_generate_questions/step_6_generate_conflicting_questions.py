@@ -1,4 +1,18 @@
-"""Script for generating conflicting/outdated information questions from document pairs."""
+"""Script for generating conflicting/outdated information questions from document pairs.
+
+Uses near-duplicate document pairs from the duplications cache (Stage 2 Step 4) to
+generate questions that test a system's ability to reconcile conflicting information.
+Typically one document supersedes the other, requiring the answer to identify the most
+current facts.
+
+Usage:
+    python -m src.scripts.stage_3_generate_questions.step_6_generate_conflicting_questions [OPTIONS]
+
+Args:
+    --count        Max number of questions to process; omit to process all available pairs
+    --parallelism  Number of parallel workers (default: 1)
+    --quiet        Suppress LLM output streaming
+"""
 
 import argparse
 import json

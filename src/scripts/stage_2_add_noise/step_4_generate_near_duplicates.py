@@ -1,4 +1,16 @@
-"""Script for generating near-duplicate files to add noise to the dataset."""
+"""Script for generating near-duplicate documents with updated facts.
+
+Samples existing documents and creates near-duplicate versions with modified key facts
+(e.g. pricing changes, status updates) at new file paths. Unlike other noise steps,
+duplicates may be placed outside their original source type. The original and duplicate
+are tracked as pairs for downstream conflicting-information question generation.
+
+Usage:
+    python -m src.scripts.stage_2_add_noise.step_4_generate_near_duplicates [OPTIONS]
+
+Args:
+    --count  Number of near-duplicate files to generate (default: 20)
+"""
 
 import argparse
 import json

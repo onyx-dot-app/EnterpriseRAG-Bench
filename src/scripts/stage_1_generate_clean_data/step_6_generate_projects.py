@@ -1,4 +1,17 @@
-"""Script for generating and enriching projects based on company context."""
+"""Script for generating and enriching projects based on company context.
+
+Runs a multi-phase pipeline: (1) interactive project list creation, (2) parallel
+enrichment of each project with file paths and descriptions, (3) deduplication of
+conflicting file paths across projects, and (4) people assignment from the employee
+directory. Projects break high-level initiatives into smaller efforts of ~100 documents.
+
+Usage:
+    python -m src.scripts.stage_1_generate_clean_data.step_6_generate_projects [OPTIONS]
+
+Args:
+    --max-parallelization  Number of projects to enrich in parallel (default: 5)
+    --dedup-parallelism    Number of parallel deduplication operations (default: 20)
+"""
 
 import argparse
 import json

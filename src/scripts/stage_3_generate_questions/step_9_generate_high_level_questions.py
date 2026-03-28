@@ -1,4 +1,21 @@
-"""Script for generating high-level questions from company overview and initiatives."""
+"""Script for generating high-level questions from company overview and initiatives.
+
+Produces questions answerable from broad organizational context rather than specific
+documents. Candidates are generated in batch, then validated by an LLM agent with
+corpus exploration tools to reject any question answerable from a single document.
+These questions carry no expected document IDs since the answer is distributed across
+the corpus.
+
+Usage:
+    python -m src.scripts.stage_3_generate_questions.step_9_generate_high_level_questions [OPTIONS]
+
+Args:
+    --count            Number of validated questions to produce (default: 10)
+    --num-candidates   Number of candidate queries to generate before filtering (default: 20)
+    --parallelism      Number of parallel workers for answer generation (default: 1)
+    --skip-validation  Skip the tool-based validation step
+    --quiet            Suppress LLM output streaming
+"""
 
 import argparse
 import json

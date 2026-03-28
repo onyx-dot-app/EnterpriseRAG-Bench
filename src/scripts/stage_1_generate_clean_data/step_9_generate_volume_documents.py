@@ -1,4 +1,20 @@
-"""Script for generating volume task documents per source type."""
+"""Script for generating high-volume documents per source type.
+
+Produces the bulk of the document corpus at lower fidelity and cost. Runs in three phases:
+(1) topic generation per source from agents.md target counts, (2) splitting large topics
+into subtopics of at most 500 documents, and (3) parallel document generation within each
+leaf topic. Documents only see global company context and sibling file paths to stay cost
+efficient.
+
+Usage:
+    python -m src.scripts.stage_1_generate_clean_data.step_9_generate_volume_documents [OPTIONS]
+
+Args:
+    --source-parallelism  Number of source types to process in parallel for topic generation (default: 5)
+    --topic-parallelism   Number of topics to expand in parallel during subtopic splitting (default: 5)
+    --doc-parallelism     Number of documents to generate in parallel (default: 10)
+    --doc-limit           Maximum total documents to generate; omit for unlimited
+"""
 
 import argparse
 import atexit

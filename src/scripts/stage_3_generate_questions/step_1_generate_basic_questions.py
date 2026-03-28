@@ -1,4 +1,16 @@
-"""Script for generating basic questions from documents."""
+"""Script for generating basic single-document questions.
+
+Samples random documents from the corpus and generates straightforward questions from
+each one. Each question is validated, a gold answer is produced, and answer facts are
+extracted. Questions use varied language and avoid trivial exact-phrase matches.
+
+Usage:
+    python -m src.scripts.stage_3_generate_questions.step_1_generate_basic_questions [OPTIONS]
+
+Args:
+    --count  Number of questions to generate (default: 50)
+    --quiet  Suppress LLM output streaming
+"""
 
 import argparse
 import os

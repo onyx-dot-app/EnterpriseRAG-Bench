@@ -1,4 +1,18 @@
-"""Script for generating completeness questions from cached completeness entries."""
+"""Script for generating completeness questions from cached completeness entries.
+
+Processes completeness document clusters from Stage 1 Step 8 into questions that require
+exhaustive retrieval of all relevant documents. For each cluster, an LLM filters out
+unnecessary documents, generates a gold answer from the required set, and extracts
+verifiable facts. Questions needing fewer than two documents are discarded.
+
+Usage:
+    python -m src.scripts.stage_3_generate_questions.step_7_generate_completeness_questions [OPTIONS]
+
+Args:
+    --count        Max number of questions to process; omit to process all available entries
+    --parallelism  Number of parallel workers (default: 1)
+    --quiet        Suppress LLM output streaming
+"""
 
 import argparse
 import json

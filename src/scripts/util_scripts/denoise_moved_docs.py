@@ -1,7 +1,13 @@
 """Revert shuffled documents back to their original locations.
 
-Finds all documents with an 'original_location' field, moves them back,
-and removes the field.
+Finds all JSON documents with an 'original_location' field (set during Stage 2 shuffle
+steps), moves them back to their original paths, and removes the field. Useful for
+undoing noise injection during debugging or dataset regeneration.
+
+Usage:
+    python -m src.scripts.util_scripts.denoise_moved_docs
+
+No arguments.
 """
 
 import os

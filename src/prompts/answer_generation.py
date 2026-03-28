@@ -27,10 +27,10 @@ CRITICAL: Output ONLY the JSON object, do not provide any other text or explanat
 """.strip()
 
 
-SINGLE_DOCUMENT_MULTIHOP_ANSWER_GENERATION = """
-You are an expert dataset engineer whose job is to validate a single document multi-hop query and generate a gold answer. The document was sampled randomly from a dataset and is provided below. \
-A single document multi-hop query is a query that requires information from multiple parts of the document to answer. Specifically it should take information from the beginning and end of the document and possibly some information from the middle. \
-Verify that the query is a valid single document multi-hop query. If the question is fully answerable from a single section of the document, then the query is not valid. \
+INTRA_DOCUMENT_REASONING_ANSWER_GENERATION = """
+You are an expert dataset engineer whose job is to validate an intra-document reasoning query and generate a gold answer. The document was sampled randomly from a dataset and is provided below. \
+An intra-document reasoning query is a query that requires information from multiple parts of the document to answer. Specifically it should take information from the beginning and end of the document and possibly some information from the middle. \
+Verify that the query is a valid intra-document reasoning query. If the question is fully answerable from a single section of the document, then the query is not valid. \
 If the query is valid, output a gold answer based on the document. The gold answer should be natural language like one produced by a precise and helpful generative AI system. \
 The answer should be straightforward and only address the query - it does not need to use all of the relevant parts of the document. \
 It should read naturally and be concise, typically 1-2 sentences unless the question requires a complicated or comprehensive answer. Avoid all unnecessary details.

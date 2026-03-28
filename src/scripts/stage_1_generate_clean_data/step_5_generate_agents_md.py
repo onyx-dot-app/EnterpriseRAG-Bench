@@ -1,4 +1,15 @@
-"""Interactive script for generating agents.md files in source directories."""
+"""Interactive script for generating agents.md files in source directories.
+
+Creates agents.md files throughout the source directory tree to guide the format and
+content of documents generated within each source type. For example, a GitHub agents.md
+might specify that all documents represent pull-requests with comments. These files are
+pulled into downstream document generation prompts.
+
+Usage:
+    python -m src.scripts.stage_1_generate_clean_data.step_5_generate_agents_md
+
+No arguments. The script is fully interactive.
+"""
 
 import os
 

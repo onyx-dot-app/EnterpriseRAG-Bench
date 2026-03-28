@@ -1,12 +1,26 @@
-"""Script for generating single-document multi-hop questions from documents."""
+"""Script for generating intra-doc reasoning questions.
+
+Generates questions that require relating information from different parts of a single
+long document. Pre-filters for documents meeting a minimum length threshold to ensure
+intra-doc reasoning is feasible. Validates that the question cannot be answered from
+any single consecutive chunk of the document.
+
+Usage:
+    python -m src.scripts.stage_3_generate_questions.step_3_generate_intra_doc_reasoning_questions [OPTIONS]
+
+Args:
+    --count           Number of questions to generate (default: 50)
+    --min-doc-length  Minimum document content length in characters (default: 3000)
+    --quiet           Suppress LLM output streaming
+"""
 
 import argparse
 import os
 import random
 
 from src.paths import QUESTIONS_PATH
-from src.prompts.answer_generation import SINGLE_DOCUMENT_MULTIHOP_ANSWER_GENERATION
-from src.prompts.single_doc_multihop import SINGLE_DOC_MULTIHOOP_PROMPT
+from src.prompts.answer_generation import INTRA_DOCUMENT_REASONING_ANSWER_GENERATION
+from src.prompts.intra_document_reasoning import INTRA_DOCUMENT_REASONING_PROMPT
 from src.utils import (
     collect_json_files_by_size,
     count_existing_questions,
@@ -28,7 +42,7 @@ FILE_SIZE_PROXY_RATIO = 0.8
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate single-document multi-hop questions from documents."
+        description="Generate intra-doc reasoning questions from documents."
     )
     parser.add_argument(
         "--count",
@@ -49,9 +63,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    print("Step 3: Generate Single-Document Multi-Hop Questions")
+    print("Step 3: Generate Intra-Doc Reasoning Questions")
     print("=" * 40)
-    print("This script generates multi-hop questions from randomly sampled documents.")
+    print(
+        "This script generates intra-doc reasoning questions from randomly sampled documents."
+    )
     print(
         "Each question requires information from multiple parts of a single document."
     )
@@ -129,7 +145,7 @@ def main() -> None:
         # Generate question
         print("\n--- Generating Question ---")
         question = generate_question(
-            title, content, SINGLE_DOC_MULTIHOOP_PROMPT, quiet=args.quiet
+            title, content, INTRA_DOCUMENT_REASONING_PROMPT, quiet=args.quiet
         )
 
         if not question:
@@ -145,7 +161,7 @@ def main() -> None:
             content,
             question,
             quiet=args.quiet,
-            answer_prompt_template=SINGLE_DOCUMENT_MULTIHOP_ANSWER_GENERATION,
+            answer_prompt_template=INTRA_DOCUMENT_REASONING_ANSWER_GENERATION,
         )
 
         if not valid or gold_answer is None:
@@ -175,7 +191,7 @@ def main() -> None:
             source_types=[extract_source_type(doc_path)],
             gold_answer=gold_answer,
             answer_facts=answer_facts,
-            question_type="single_doc_multi_hop",
+            question_type="intra_document_reasoning",
         )
         existing_uuids.add(doc_uuid)
         next_question_id += 1

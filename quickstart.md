@@ -24,7 +24,7 @@ The dataset comes with 500 questions (see [questions.jsonl](generated_data/quest
 |---|----------|-------|-------------|
 | 1 | Basic | 200 | Simple questions with a single ground truth document. |
 | 2 | Semantic | 100 | Similar to Basic but more roundabout, with less keyword/phrase overlap and without giveaway-type keywords. |
-| 3 | Single Doc Multi-hop | 50 | Requires combining information from several distant sections of a single longer document. |
+| 3 | Intra-Doc Reasoning | 50 | Requires combining information from several distant sections of a single longer document. |
 | 4 | Project Related | 40 | Aggregate knowledge from related documents from a single project/initiative within the company. |
 | 5 | Constrained | 30 | Questions with multiple relevant documents but with qualifiers that disqualify all but one answer. |
 | 6 | Conflicting Info | 20 | Questions where documents directly contradict each other. Requires the system to give a complete and correct answer. |
@@ -185,9 +185,9 @@ python -m src.scripts.stage_3_generate_questions.step_2_generate_semantic_questi
     --quiet       # Suppress LLM output streaming (optional)
 ```
 
-**Step 3 — Single-doc multi-hop questions**
+**Step 3 — Intra-doc reasoning questions**
 ```bash
-python -m src.scripts.stage_3_generate_questions.step_3_generate_single_doc_multihop_questions \
+python -m src.scripts.stage_3_generate_questions.step_3_generate_intra_doc_reasoning_questions \
     --count 50 \             # Number of questions to generate (default: 50)
     --min-doc-length 3000 \  # Minimum document content length in characters (default: 3000)
     --quiet                  # Suppress LLM output streaming (optional)

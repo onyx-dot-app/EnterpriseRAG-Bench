@@ -1,4 +1,15 @@
-"""Remove JSON files that are invalid or empty from the sources directory."""
+"""Remove JSON files that are invalid or empty from the sources directory.
+
+Scans a directory for JSON files that fail to parse, are empty, or contain empty
+objects/arrays, then deletes them after user confirmation.
+
+Usage:
+    python -m src.scripts.util_scripts.remove_failed_jsons [DIRECTORY] [OPTIONS]
+
+Args:
+    directory  Directory to process (default: generated_data/sources)
+    --yes, -y  Skip confirmation and delete automatically
+"""
 
 import argparse
 import json

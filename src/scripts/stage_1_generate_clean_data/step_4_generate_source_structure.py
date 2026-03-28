@@ -1,4 +1,15 @@
-"""Interactive script for generating source directory structure."""
+"""Interactive script for generating the source directory structure.
+
+Creates the nested directory hierarchy under generated_data/sources/ (e.g. slack/,
+confluence/, github/) through an interactive LLM conversation. The user specifies
+which source types to include and their internal folder layout. Outputs a source_tree.txt
+for reference in later steps.
+
+Usage:
+    python -m src.scripts.stage_1_generate_clean_data.step_4_generate_source_structure
+
+No arguments. The script is fully interactive.
+"""
 
 import os
 

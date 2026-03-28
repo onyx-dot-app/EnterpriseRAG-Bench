@@ -1,4 +1,15 @@
-"""Ensure all JSON files in a directory have field labels (title_field_name, content_field_names) and correct field ordering."""
+"""Ensure all JSON files in a directory have field labels and correct field ordering.
+
+Scans a directory for JSON files missing title_field_name or content_field_names, uses
+an LLM to assign labels, and fixes trailing field ordering. Runs labeling in parallel.
+
+Usage:
+    python -m src.scripts.util_scripts.ensure_files_have_labels [DIRECTORY] [OPTIONS]
+
+Args:
+    directory      Directory to process (default: generated_data/sources)
+    --parallelism  Number of parallel labeling operations (default: 20)
+"""
 
 import argparse
 import os

@@ -1,4 +1,23 @@
-"""Evaluate answer files against the gold questions dataset."""
+"""Evaluate a single system's answers against the gold questions dataset.
+
+Scores each answer for correctness, completeness (fact validation percentage), document
+recall, and invalid extra documents. Applies the three-judge document correction flow to
+update gold sets when candidate documents differ, and regenerates gold answers and facts
+when the document set changes.
+
+Usage:
+    python -m src.scripts.answer_evaluation.metrics_based_eval [OPTIONS]
+
+Args:
+    --answers-file            Path to answers JSONL file (default: answer_evaluation/answers.jsonl)
+    --questions-file          Path to questions JSONL file (default: export_data/questions.jsonl)
+    --results-file            Path to output results JSON (default: answer_evaluation/results.json)
+    --updated-questions-file  Path to output updated questions JSONL (default: answer_evaluation/questions_updated.jsonl)
+    --uuid-index-cache-file   Path to UUID index cache JSON
+    --parallelism             Number of parallel evaluation threads (default: 1)
+    --question-id             Evaluate a single question_id only
+    --skip-citation-stripping Skip LLM-based citation stripping from answers
+"""
 
 import argparse
 import json
@@ -34,7 +53,7 @@ from src.utils.questions import extract_answer_facts, extract_anti_hallucination
 _MAX_LLM_RETRIES = 3
 
 DEFAULT_ANSWERS_FILE = "answer_evaluation/answers.jsonl"
-DEFAULT_OUTPUT_FILE = "generated_data/questions_updated.jsonl"
+DEFAULT_OUTPUT_FILE = "answer_evaluation/questions_updated.jsonl"
 DEFAULT_RESULTS_FILE = "answer_evaluation/results.json"
 
 

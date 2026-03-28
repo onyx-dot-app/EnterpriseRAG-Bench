@@ -1,4 +1,18 @@
-"""Script for generating questions from miscellaneous noise documents."""
+"""Script for generating questions from miscellaneous noise documents.
+
+Generates questions from the informal, off-topic documents created in Stage 2 Step 3
+(e.g. files in slack/memes or google_drive/.../misc-assets). These documents sit outside
+the main scaffolding and present a retrieval challenge due to their peripheral topics and
+unpredictable locations.
+
+Usage:
+    python -m src.scripts.stage_3_generate_questions.step_8_generate_miscellaneous_questions [OPTIONS]
+
+Args:
+    --count        Number of questions to generate; omit to process all available misc documents
+    --parallelism  Number of parallel workers (default: 1)
+    --quiet        Suppress LLM output streaming
+"""
 
 import argparse
 import random

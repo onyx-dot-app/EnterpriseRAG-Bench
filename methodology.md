@@ -209,7 +209,7 @@ The guidance which is different include:
 
 The examples provided to the LLM on good and bad questions of this type are also more difficult and aligned with the guidance above.
 
-#### Type 3: Single Doc Multi-hop
+#### Type 3: Intra-Doc Reasoning
 
 These questions are intended to test the system for the ability to relate information from different parts of a single document. It addresses both a recall and a reasoning challenge.
 Naive chunking and embedding approaches tend to be prone to mistakes of this category.

@@ -1,4 +1,19 @@
-"""Script for generating constrained questions via corpus exploration."""
+"""Script for generating constrained questions via corpus exploration.
+
+Generates questions with qualifiers that narrow the correct answer to a small document
+subset, even though many other documents are superficially relevant. An LLM agent uses
+glob, grep, and read tools to explore the corpus, find topically related document
+clusters, identify differentiating axes, and craft constrained queries with gold and
+distractor documents.
+
+Usage:
+    python -m src.scripts.stage_3_generate_questions.step_5_generate_constrained_questions [OPTIONS]
+
+Args:
+    --count        Number of questions to generate (default: 50)
+    --parallelism  Number of parallel workers (default: 1)
+    --quiet        Suppress LLM output streaming
+"""
 
 import argparse
 import json

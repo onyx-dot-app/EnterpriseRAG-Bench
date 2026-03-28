@@ -1,4 +1,17 @@
-"""Interactive script for generating completeness document sets."""
+"""Interactive script for generating completeness document sets.
+
+Generates small clusters of 4-10 highly related documents where every document in the
+cluster is visible to the model during generation. Each cluster is anchored to a target
+question so that answer-critical facts are spread across multiple documents, enabling
+completeness-type question generation later.
+
+Usage:
+    python -m src.scripts.stage_1_generate_clean_data.step_8_generate_completeness_documents [OPTIONS]
+
+Args:
+    --count        Number of completeness traces to generate (default: 10)
+    --auto-accept  Automatically accept each trace without user confirmation
+"""
 
 import argparse
 import json

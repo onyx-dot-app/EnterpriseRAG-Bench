@@ -29,7 +29,7 @@ The [questions](generated_data/questions.jsonl) are broken up into 10 categories
 |---|----------|-------|-------------|
 | 1 | Basic | 200 | Simple questions with a single ground truth document. |
 | 2 | Semantic | 100 | Similar to Basic but more roundabout, with less keyword/phrase overlap and without giveaway-type keywords. |
-| 3 | Single Doc Multi-hop | 50 | Requires combining information from several distant sections of a single longer document. |
+| 3 | Intra-Doc Reasoning | 50 | Requires combining information from several distant sections of a single longer document. |
 | 4 | Project Related | 40 | Aggregate knowledge from related documents from a single project/initiative within the company. |
 | 5 | Constrained | 30 | Questions with multiple relevant documents but with qualifiers that disqualify all but one answer. |
 | 6 | Conflicting Info | 20 | Questions where documents directly contradict each other. Requires the system to give a complete and correct answer. |

@@ -1,4 +1,13 @@
-"""Utility script to count JSON files in the sources directory."""
+"""Utility script to count JSON files in the sources directory.
+
+Walks the generated_data/sources/ tree and displays a per-source-type breakdown of
+JSON file counts in a formatted table, sorted by count descending.
+
+Usage:
+    python -m src.scripts.util_scripts.count_total_files
+
+No arguments.
+"""
 
 import os
 from collections import Counter
