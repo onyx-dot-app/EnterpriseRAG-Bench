@@ -5,7 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel
 
 
-ReasoningLevel = Literal["low", "medium", "high"]
+ReasoningLevel = Literal["low", "medium", "high"] | None
 
 
 class ToolCall(BaseModel):
