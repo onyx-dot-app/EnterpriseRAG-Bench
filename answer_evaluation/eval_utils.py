@@ -3,7 +3,6 @@
 import json
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.llm import Message, get_llm
 from src.prompts.answer_evaluation import (
@@ -14,13 +13,11 @@ from src.prompts.answer_evaluation import (
 )
 from src.utils.cli import confirm_yes_no
 from src.utils.document_index import (
-    DEFAULT_UUID_INDEX_CACHE_FILE,
     load_document_content_by_uuid,
     load_document_json_by_uuid,
     load_or_build_uuid_index,
     rebuild_uuid_index,
 )
-from src.utils.file_io import write_json_file
 from src.utils.json_extraction import extract_json_from_response
 
 _MAX_LLM_RETRIES = 3

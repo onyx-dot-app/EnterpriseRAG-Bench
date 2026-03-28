@@ -9,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from answer_evaluation.eval_utils import (
     DEFAULT_QUESTIONS_FILE,
-    MissingDocumentIdsError,
     build_type_order,
     dedupe_doc_ids,
     evaluate_documents_with_consensus,

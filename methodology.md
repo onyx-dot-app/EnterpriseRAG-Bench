@@ -117,15 +117,13 @@ Different leaves also cover different slices of the subject matter. Together, th
 It is also significantly more cost efficient compared to the high-fidelity documents. Documents in this flow only need access to global context about the company, a minimal amount of scaffolding for the topic and subtopics,
 and the paths of other documents in the same leaf (capped at 500). This step is also per-source further reducing the amount of structural/directory context needed by the LLM.
 
-Note: there are some acknowledged drawbacks of the high volume generation approach which would be in conflict with cost savings and time needed per document.
-- To save cost, this step is given minimal flexibility/tools that the LLM can call. The documents are therefore not aware of the people in the org or information about their roles.
-Many of the documents will have made up authors, commenters, etc. which do not exist in the employee directory. Note that for the questions provided with the dataset, this is not an issue.
-- Since documents are only aware of each other at a surface level and only within leaf topics, there is no guarantee that contents within the files do not contradict each other.
-While some amount of this is desirable, it is unclear if this happens more frequently than in real world corpuses.
+Note: High-volume synthesis trades fidelity for throughput. The following limitations follow from prioritizing cost and turnaround.
+- Personnel grounding: Tooling and context are deliberately restricted, so generated documents are not grounded in the organizational chart or role definitions. Fictional contributors are expected. This is benign for the released question set.
+- Inter-document coherence: Cross-references are shallow and scoped to leaf topics, so global consistency is not enforced. Some divergence may mirror real archives; we have not quantified whether inconsistency is more or less frequent than in real corpuses.
 
 ### Stage 2 - Adding noise
 
-> Note: The documents that have been shuffled or created by noise generation steps have an additional field called "dataset_noise_document" which has a value of true.
+> Note: The documents that have been shuffled or created by noise generation steps have an additional field called "dataset_noise_document".
 
 #### Step 1 - Random shuffle
 
@@ -235,6 +233,8 @@ Some extracts from the prompt are provided below for clarity:
 During the reading process, all of the documents read are tracked for the next step. After the question is generated, it is passed along with all of the documents read to find the minimal set of documents necessary to correctly answer the question.
 That filtered set becomes the expected gold documents.
 
+> Note: Because many of these are broader more complex questions, they have a relatively higher chance of having other generated documents not in the original project also be valid or add some information of value to the answer.
+
 #### Type 5: Constrained
 
 This type of question is explained directly to the LLM in the prompt, the following is an exerpt:
@@ -266,4 +266,48 @@ Like the previous question type, the gold answer and factual elements are genera
 
 #### Type 7: Completeness
 
-These questions test recall and 
+Completeness questions test whether a RAG system can exhaustively retrieve all documents needed to answer a question, not just a relevant subset.
+A partially retrieval is insufficient for this question type, if even one of the required document is missing, aggregated counts will be wrong, lists will be incomplete, and comparisons will be skewed.
+This makes completeness questions a direct test of recall.
+
+These questions are built from the question-document sets produced in Stage 1, Step 8. During generation, each cluster is designed to avoid direct contradictions and to spread answer-critical facts across multiple documents.
+Because the question already exists, this step focuses on using an LLM to remove unnecessary documents and generate the final answer.
+Although these documents were originally created under the assumption that each one would be needed, some prove unnecessary in practice. Any query that requires fewer than two documents after filtering is discarded.
+Fact extraction here also works by breaking the gold answer into individually verifiable claims.
+
+#### Type 8: Miscellaneous
+
+Miscellaneous questions target the informal, off-topic, or loosely organized documents introduced during Stage 2 Step 3 — files in directories like `slack/memes`, `google_drive/.../misc-assets`, or `github/hackathons`.
+These documents sit outside the main scaffolding-driven generation and present a retrieval challenge: they are topically peripheral and stored in less predictable locations, so systems tuned to the corpus's dominant themes may overlook them.
+
+The generation flow is straightforward. Each miscellaneous document tracked in the generation cache is sampled and a question is generated from it using the same prompt guidance as basic questions (Type 1).
+The question is then validated against the source document to produce a gold answer, and answer facts are extracted. Each question maps to a single document.
+
+#### Type 9: High Level
+
+High-level questions are answerable from the company overview and initiatives — the top-level scaffolding documents — but should not be answerable from any single document in the corpus.
+They test whether a system can synthesize broad organizational knowledge that is spread across many documents rather than concentrated in one place.
+
+The generation process has three stages:
+1. **Candidate generation** — The LLM is given the company overview and initiatives and asked to produce a batch of candidate queries. Guidance steers the questions toward patterns and cross-cutting themes rather than point lookups, and requires varied phrasing and topic spread.
+2. **Validation** — Each candidate is checked by an LLM agent equipped with glob, grep, ls, and read tools over the source directory. The agent attempts to find a single document that directly answers the query.
+If it can, the query is rejected as too specific. Only queries that would require aggregating information across multiple documents pass validation.
+3. **Answer and fact generation** — For each validated query, a gold answer is produced from the company overview and initiatives, and answer facts are extracted.
+
+Unlike most other question types, high-level questions carry no expected document IDs or source types, since the answer derives from organizational context distributed across the corpus rather than from a specific set of retrievable files.
+
+> This question type is deliberately designed to be unanswerable without reviewing a large portion of the corpus, so there isn’t a single “gold” set of documents to cite.
+> The answers depend on cross-cutting organizational context, and a RAG system may reach the right conclusion by pulling evidence from many different places.
+> Additionally there is no strict guarantee that every synthesized question is fully answerable from the document set; the assumption is that with enough documents/questions overall, the relevant context will typically exist somewhere in the corpus.
+
+#### Type 10: Unanswerable
+
+Unanswerable questions test whether a RAG system can recognize when the corpus does not contain the information needed to answer a query, rather than hallucinating a response from superficially related documents.
+
+An LLM agent equipped with glob, grep, ls, and read tools explores the source directory to find a cluster of topically related documents.
+After reading several documents in the cluster, it identifies the dimensions along which they differ and crafts a natural-sounding query that is related to the cluster's topic but not answerable from the documents.
+The query is designed so that a system relying on surface-level keyword or topic matching would retrieve plausible-looking documents, but any answer derived from them would be incorrect or hallucinated.
+
+To prevent the LLM from revisiting the same areas of the corpus, previously explored document paths are tracked in a generation cache and provided in each subsequent generation run.
+The gold answer and facts are predefined rather than generated: the expected answer states that the query is not answerable from the available documents,
+and the single evaluation fact checks that the response acknowledges this rather than presenting fabricated information.
