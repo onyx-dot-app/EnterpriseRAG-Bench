@@ -1,25 +1,52 @@
 """CLI agent script for answering questions by searching the document corpus.
 
-Each question is answered by an agentic loop that uses a shell run() tool and a
-finish(answer, document_ids) tool. Results are written to a JSONL file compatible
-with the evaluation harness. Multiple system prompt variants control how much
-structural information is provided to the agent.
+Each question is answered by an agentic loop that uses a shell run() tool, a
+select_doc_by_dsid() tool for tracking relevant documents, and a finish(answer)
+tool.  The agent's working directory is set to the
+sources directory so all commands operate relative to the corpus root.  Results
+are written to a JSONL file compatible with the evaluation harness.
+
+Two-layer architecture
+======================
+
+The command execution pipeline is split into two layers with distinct
+responsibilities.  The separation is necessary because raw pipe data must
+flow between commands unmodified, while the LLM has context-window and
+text-only constraints that require post-processing.
+
+**Layer 1 — Execution layer** (``parse_chain`` / ``execute_chain``):
+    Runs the actual shell commands.  Pipe segments pass raw bytes between
+    each other with no truncation, no metadata injection, and no formatting.
+    This keeps pipe semantics correct — truncating ``cat`` output before it
+    reaches ``grep`` would produce incomplete search results, and injecting
+    ``[exit:0]`` into pipe data would become a spurious search hit.
+
+    The only checks that happen inside the chain are:
+    - Command allowlist validation (first token of the first segment).
+    - Binary detection on the *final* segment's stdout.
+    - Early exit when any segment produces stderr with a non-zero exit code.
+
+**Layer 2 — Presentation layer** (``_format_tool_output`` + assembly in ``_run``):
+    Runs *after* the chain completes and the final output is ready to return
+    to the LLM.  Handles everything the LLM needs but the execution layer
+    must not touch:
+    - Truncation: output exceeding ``TRUNCATION_MAX_LINES`` or
+      ``TRUNCATION_MAX_CHARS`` is cut, with the full output saved to a temp
+      file the agent can navigate with grep/tail.
+    - Context-aware hints: null-field guidance, zero-result counters,
+      repeat-command detection, subdirectory navigation hints.
+    - Metadata footer: exit code, elapsed time, command index, session time.
 
 Usage:
     python -m src.scripts.answer_generation.agent_retrieval [OPTIONS]
 
 Args:
-    --variant          System prompt variant (default: "full")
-                         full      - source types + filename examples + prescribed search order
-                         structure - source types + filename examples, no prescribed order
-                         minimal   - corpus path + tool descriptions only, no structural hints
-                         v2        - minimal map with tool awareness, no source type listing
-                         v3        - v2 baseline + tool-layer improvements (cost footer,
-                                     zero-result counter, jq hints, overflow detection)
     --parallelism      Number of parallel workers (default: 1)
     --limit            Maximum number of questions to process
     --subset-per-type  Only process first N questions of each question_type
-    --output           Output JSONL path (default: answer_evaluation/answers_variant_{variant}.jsonl)
+    --questions-file   Path to questions JSONL (default: generated_data/questions.jsonl)
+    --output           Output JSONL path (default: answer_evaluation/answers_agent.jsonl)
+    --question-id      Process only this specific question ID
     --resume           Skip questions already present in the output file
 """
 
@@ -30,6 +57,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -39,9 +67,25 @@ from typing import Any
 
 from tqdm import tqdm
 
-from src.llm.factory import get_cheap_llm
-from src.llm.interface import LLMInterface, Message, ToolCall
+from src.llm.auto_conversation import run_agent_conversation
+from src.llm.factory import get_llm
+from src.llm.interface import LLMInterface, Message
 from src.paths import QUESTIONS_PATH, SOURCES_DIR
+from src.utils.cli import confirm_yes_no
+from src.utils.document_index import load_or_build_uuid_index, rebuild_uuid_index
+from src.utils.questions import append_to_jsonl
+from src.prompts.agent_retrieval_answer_gen import (
+    AGENT_RETRIEVAL_SYSTEM_PROMPT,
+    ALLOWED_COMMANDS,
+    OUT_OF_TIME_USER_MESSAGE,
+    RUN_TOOL_NAME,
+    SELECT_DOC_TOOL_NAME,
+    SELECT_DOC_TOOL_SCHEMA,
+    SELECTED_DOC_FAILURE_RESPONSE,
+    SELECTED_DOC_REMOVAL_RESPONSE,
+    SELECTED_DOC_SUCCESS_RESPONSE,
+    build_run_tool_schema,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -49,28 +93,37 @@ from src.paths import QUESTIONS_PATH, SOURCES_DIR
 
 QUESTION_TIMEOUT_SECONDS = 300  # 5 minutes per question
 
-VARIANTS = ("full", "structure", "minimal", "v2", "v2plus", "v3")
+# Layer 2 truncation limits — output is truncated at whichever is hit first.
+TRUNCATION_MAX_LINES = 100
+TRUNCATION_MAX_CHARS = 30_000
 
-# Note added to all system prompt variants.
-UNANSWERABLE_NOTE = (
-    "Note: some questions may not have an answer in this corpus. "
-    "If after thorough searching you are confident the information is not present, "
-    "call `finish()` with a brief explanation as the answer "
-    '(e.g. "This information is not available in the provided corpus") '
-    "and an empty `document_ids` list."
-)
+# Effective command set — starts as the full allowlist and is narrowed by
+# check_available_commands() at startup so that LLM-facing prompts, tool
+# schemas, and validation errors only reference commands actually on PATH.
+_active_commands: set[str] = set(ALLOWED_COMMANDS)
+
+
+def check_available_commands() -> list[str]:
+    """Check which ALLOWED_COMMANDS are missing from the system PATH.
+
+    Also narrows ``_active_commands`` to only those that are available so
+    that system prompts, tool descriptions, and validation errors shown to
+    the LLM only reference usable commands.
+
+    Returns a list of command names that could not be found.
+    """
+    global _active_commands
+    missing = [cmd for cmd in sorted(ALLOWED_COMMANDS) if shutil.which(cmd) is None]
+    _active_commands = ALLOWED_COMMANDS - set(missing)
+    return missing
+
 
 # ---------------------------------------------------------------------------
-# Overflow mode — Layer 2 presentation (agent_vli_instructions.md)
+# Layer 2: Presentation layer helpers
 # ---------------------------------------------------------------------------
 
-# Trigger: output exceeding these thresholds is saved to a temp file rather
-# than silently discarded.  The agent receives the first OVERFLOW_SHOW_LINES
-# lines plus a navigation pointer to the full file.
-OVERFLOW_TRIGGER_LINES = 100
-OVERFLOW_TRIGGER_BYTES = 20 * 1024  # 20 KB
-OVERFLOW_SHOW_LINES = 100
-
+# Temp-file storage for full output when truncation occurs, so the agent can
+# navigate the complete result with grep/tail.
 _overflow_dir: str | None = None
 _overflow_dir_lock = threading.Lock()
 _overflow_counter: int = 0
@@ -92,10 +145,6 @@ def _next_overflow_path() -> str:
         n = _overflow_counter
     return os.path.join(_get_overflow_dir(), f"cmd-{n}.txt")
 
-
-# ---------------------------------------------------------------------------
-# Presentation layer helpers (Technique 2 & 3 from agent_vli_instructions.md)
-# ---------------------------------------------------------------------------
 
 _PATH_LINE_RE = re.compile(r"^[./][\w/\-._]+\.(json|md|txt|yaml|yml)\s*$")
 
@@ -120,12 +169,18 @@ def _extract_jq_field(command: str) -> str | None:
 
 
 def _extract_search_base_path(command: str) -> str | None:
-    """Extract the normalised base directory from an rg/grep command."""
+    """Extract the normalised base directory from an rg/grep command.
+
+    With cwd set to the sources directory, commands use relative paths like
+    ``rg "keyword" jira/`` or ``rg "keyword" .``.
+    """
     if not re.search(r"\b(rg|grep)\b", command):
         return None
-    m = re.search(r"(generated_data/sources(?:/[\w\-]+)?)", command)
+    m = re.search(r"(?:^|\s)\.?/?([\w\-]+)/", command)
     if m:
-        return os.path.normpath(m.group(1))
+        return m.group(1)
+    if re.search(r"\s\./?(?:\s|$)", command):
+        return "."
     return None
 
 
@@ -140,7 +195,7 @@ def _build_subdirs_hint(sources_dir: str) -> str:
     )
     if not subdirs:
         return ""
-    return "Available subdirectories: " + "  ".join(f"sources/{d}/" for d in subdirs)
+    return "Available subdirectories: " + "  ".join(f"{d}/" for d in subdirs)
 
 
 def _update_and_get_zero_hint(
@@ -165,397 +220,108 @@ def _update_and_get_zero_hint(
     return ""
 
 
-def _apply_presentation_layer(output: str, command: str = "") -> str:
-    """Layer 2: process raw command output for LLM consumption.
+def _format_tool_output(output: str, command: str = "") -> tuple[str, str]:
+    """Format raw command output for LLM consumption (Layer 2).
 
-    Mechanisms from agent_vli_instructions.md:
-    - Situation-aware null hint  (Technique 2: different states → different messages)
-    - Overflow mode              (map principle: preserve + pointer, don't discard)
-    - Content-aware nav hint     (path-list overflow gets search hint, not grep hint)
-    - Pass-through               (short output needs no transformation)
+    Applies truncation (``TRUNCATION_MAX_LINES`` or ``TRUNCATION_MAX_CHARS``,
+    whichever is hit first), context-aware hints for null/jq results, and
+    saves full output to a navigable temp file when truncated.
+
+    Returns:
+        (formatted_output, truncation_line) where truncation_line is empty
+        if no truncation occurred, or a ``--- output truncated ... ---``
+        string to insert before the footer.
     """
-    # Null detection: distinguish content_field_names null from any other field null.
+    # Null detection: context-aware hint for jq null results.
     if output.strip() == "null":
         field = _extract_jq_field(command) if command else None
         if field and "content_field_names" in field:
             return (
                 "null\n"
                 "[hint: content_field_names not present — this may not be a corpus "
-                "document; run jq 'keys' <file> to inspect structure]"
+                "document; run jq 'keys' <file> to inspect structure]",
+                "",
             )
         field_str = f" '{field}'" if field else ""
         return (
             "null\n"
             f"[hint: field{field_str} not found — check content_field_names for "
-            "available content fields]"
+            "available content fields]",
+            "",
         )
 
     lines = output.splitlines(keepends=True)
     total_lines = len(lines)
-    total_bytes = len(output.encode("utf-8", errors="replace"))
+    total_chars = len(output)
 
-    if total_lines <= OVERFLOW_TRIGGER_LINES and total_bytes <= OVERFLOW_TRIGGER_BYTES:
-        return output
+    # Check if truncation is needed
+    truncated_by_lines = total_lines > TRUNCATION_MAX_LINES
+    truncated_by_chars = total_chars > TRUNCATION_MAX_CHARS
 
-    # Overflow mode: save full output to a navigable temp file.
-    tmp_path = _next_overflow_path()
+    if not truncated_by_lines and not truncated_by_chars:
+        return output, ""
+
+    # Save full output to a temp file for agent navigation
+    tmp_path: str | None = None
     try:
-        with open(tmp_path, "w", encoding="utf-8", errors="replace") as fh:
+        p = _next_overflow_path()
+        with open(p, "w", encoding="utf-8", errors="replace") as fh:
             fh.write(output)
+        tmp_path = p
     except OSError:
-        truncated = "".join(lines[:OVERFLOW_SHOW_LINES])
-        return truncated + f"\n[truncated: {total_lines} lines, {total_bytes} bytes]"
+        pass
 
-    shown = "".join(lines[:OVERFLOW_SHOW_LINES])
-
-    # Content-aware navigation hint: path lists need search guidance, not grep-the-list.
-    if _is_path_list(lines):
-        subdirs = sorted(
-            d
-            for d in os.listdir(SOURCES_DIR)
-            if os.path.isdir(os.path.join(SOURCES_DIR, d))
-        )
-        subdir_str = "  ".join(f"sources/{d}/" for d in subdirs)
-        nav = (
-            f"Search file contents: rg '<pattern>' {SOURCES_DIR}/\n"
-            f"Scope by subdirectory: {subdir_str}"
-        )
+    # Truncate by whichever limit is hit first
+    if truncated_by_lines:
+        shown = "".join(lines[:TRUNCATION_MAX_LINES])
+        # Also enforce char limit on the line-truncated result
+        if len(shown) > TRUNCATION_MAX_CHARS:
+            shown = shown[:TRUNCATION_MAX_CHARS]
+        trunc_desc = f"{total_lines} lines, {total_chars} chars"
     else:
-        nav = f"Navigate: grep '<pattern>' {tmp_path}  |  tail -n 50 {tmp_path}"
+        shown = output[:TRUNCATION_MAX_CHARS]
+        trunc_desc = f"{total_chars} chars"
 
-    return (
-        shown + f"\n--- {total_lines} lines total ({total_bytes} bytes) ---\n"
-        f"Full output saved: {tmp_path}\n"
-        f"{nav}"
-    )
+    truncation_line = f"--- output truncated ({trunc_desc}) ---"
 
+    # Navigation hint for the full output
+    if tmp_path is not None:
+        if _is_path_list(lines):
+            abs_sources = os.path.abspath(SOURCES_DIR)
+            subdirs = sorted(
+                d
+                for d in os.listdir(abs_sources)
+                if os.path.isdir(os.path.join(abs_sources, d))
+            )
+            subdir_str = "  ".join(f"{d}/" for d in subdirs)
+            nav = (
+                f"Search file contents: grep '<pattern>' .\n"
+                f"Scope by subdirectory: {subdir_str}"
+            )
+        else:
+            nav = f"Full output: {tmp_path}\nNavigate: grep '<pattern>' {tmp_path}  |  tail -n 50 {tmp_path}"
+        truncation_line += f"\n{nav}"
 
-# Allowed command names (whitelist for the shell tool)
-ALLOWED_COMMANDS = {
-    "rg",
-    "grep",
-    "ls",
-    "cat",
-    "head",
-    "find",
-    "xargs",
-    "jq",
-    "wc",
-    "tail",
-    "echo",
-    "sort",
-    "uniq",
-    "cut",
-    "awk",
-    "tr",
-    "sed",
-    "printf",
-}
+    return shown, truncation_line
+
 
 # ---------------------------------------------------------------------------
-# Tool schemas
-# ---------------------------------------------------------------------------
-
-RUN_TOOL_SCHEMA: dict[str, Any] = {
-    "type": "function",
-    "name": "run",
-    "description": (
-        "Execute a shell command and return its output. "
-        "Supports piping (|), logical operators (&&, ||), and sequential execution (;). "
-        "Allowed commands: rg, grep, ls, cat, head, find, xargs, jq, wc, tail, sort, uniq, cut, awk, tr, sed. "
-        "All paths must be absolute or relative to the current working directory. "
-        "The document corpus is at the path provided in your system prompt. "
-        "Use rg for fast full-text search, jq for JSON field extraction, ls/find to explore structure."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": (
-                    "The shell command to execute. "
-                    "Pipe chaining is supported, e.g. 'rg \"keyword\" path | jq .field'. "
-                    "Keep commands targeted; avoid reading entire large directories."
-                ),
-            }
-        },
-        "required": ["command"],
-    },
-}
-
-FINISH_TOOL_SCHEMA: dict[str, Any] = {
-    "type": "function",
-    "name": "finish",
-    "description": (
-        "Submit the final answer to the question and end the research session. "
-        "Call this when you are confident in your answer. "
-        "document_ids should be the dataset_doc_uuid values from the JSON files you read."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "answer": {
-                "type": "string",
-                "description": "The complete answer to the question.",
-            },
-            "document_ids": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": (
-                    "List of dataset_doc_uuid values (format: dsid_XXXX) "
-                    "from the documents that contain the answer."
-                ),
-            },
-        },
-        "required": ["answer", "document_ids"],
-    },
-}
-
-TOOLS = [RUN_TOOL_SCHEMA, FINISH_TOOL_SCHEMA]
-
-# ---------------------------------------------------------------------------
-# System prompt builders
+# System prompt & tool schemas (built dynamically from _active_commands)
 # ---------------------------------------------------------------------------
 
 
-def _read_agents_md(source_dir: str) -> str | None:
-    """Read agents.md for a source directory, return content or None."""
-    agents_md_path = os.path.join(source_dir, "agents.md")
-    if os.path.isfile(agents_md_path):
-        try:
-            with open(agents_md_path) as f:
-                return f.read()
-        except OSError:
-            pass
-    return None
+def build_tools() -> list[dict[str, Any]]:
+    """Build the tool schema list with the current active command set."""
+    return [
+        build_run_tool_schema(_active_commands),
+        SELECT_DOC_TOOL_SCHEMA,
+    ]
 
 
-def _extract_filename_example(agents_md: str) -> str:
-    """Extract a filename example from agents.md content."""
-    match = re.search(r"e\.?g\.?\W+([a-zA-Z0-9_\-]+\.json)", agents_md)
-    if match:
-        return match.group(1)
-    return "*.json"
-
-
-def _build_source_type_section(sources_dir: str) -> str:
-    """Build a section listing available source types and their filename patterns."""
-    if not os.path.isdir(sources_dir):
-        return ""
-
-    source_types = sorted(
-        [
-            d
-            for d in os.listdir(sources_dir)
-            if os.path.isdir(os.path.join(sources_dir, d))
-        ]
-    )
-
-    if not source_types:
-        return ""
-
-    lines = ["## Available source types", ""]
-    for st in source_types:
-        source_path = os.path.join(sources_dir, st)
-        agents_md = _read_agents_md(source_path)
-        example = _extract_filename_example(agents_md) if agents_md else "*.json"
-        lines.append(f"- `{st}/`  — filenames like `{example}`")
-
-    return "\n".join(lines)
-
-
-def _build_source_type_map(sources_dir: str) -> str:
-    """Build a minimal source type listing — names only, no filename examples.
-
-    This is Level 0 map injection per agent_vli_instructions.md: tell the agent
-    what exists without prescribing how to use it.
-    """
-    if not os.path.isdir(sources_dir):
-        return ""
-
-    source_types = sorted(
-        [
-            d
-            for d in os.listdir(sources_dir)
-            if os.path.isdir(os.path.join(sources_dir, d))
-        ]
-    )
-
-    if not source_types:
-        return ""
-
-    type_list = "  ".join(f"`{st}/`" for st in source_types)
-    return f"## Source types\n{type_list}"
-
-
-def build_full_prompt(sources_dir: str) -> str:
-    """Variant A: source types + filename examples + prescribed search order."""
-    source_section = _build_source_type_section(sources_dir)
-
-    return f"""You are a research agent. Your job is to answer questions by searching \
-a document corpus stored on disk.
-
-## Corpus location
-The documents are at: {sources_dir}/
-Each document is a JSON file. The field `dataset_doc_uuid` holds the document's \
-unique ID (format: dsid_XXXX).
-
-{source_section}
-
-## Search strategy (most efficient first)
-1. **Explore structure**: `ls {sources_dir}` to see source types; \
-`ls {sources_dir}/<type>/` to see subdirectories.
-2. **Search by filename**: Many sources encode key identifiers in the filename \
-(ticket keys for jira/linear, company names for hubspot, dates for fireflies/gmail, \
-PR numbers for github). Use `find {sources_dir}/<type>/ -name "*keyword*"` before \
-full-text search.
-3. **Scoped full-text search**: `rg "keyword" {sources_dir}/<type>/` — always scope \
-to the most relevant source type first. This is much faster than searching the whole corpus.
-4. **Cross-source search as last resort**: `rg "keyword" {sources_dir}/` — only when \
-you don't know which source contains the answer.
-5. **Read files**: Use `jq '.' file.json | head -50` or `jq '.field' file.json` to \
-extract specific fields. The `dataset_doc_uuid` field contains the document ID you need.
-
-## Rules
-- `document_ids` must be `dataset_doc_uuid` values (dsid_XXXX) from files you actually read.
-- Prefer targeted `rg` searches over `cat` on large files.
-- If output is truncated, narrow with `head -n 30`, `rg <pattern>`, or `jq '.<field>'`.
-- You have {QUESTION_TIMEOUT_SECONDS} seconds per question. Be efficient.
-- Do NOT guess — find the answer in the corpus before calling finish.
-- {UNANSWERABLE_NOTE}
-"""
-
-
-def build_structure_prompt(sources_dir: str) -> str:
-    """Variant D: source types + filename examples, no prescribed search order."""
-    source_section = _build_source_type_section(sources_dir)
-
-    return f"""You are a research agent. Your job is to answer questions by searching \
-a document corpus stored on disk.
-
-## Corpus location
-The documents are at: {sources_dir}/
-Each document is a JSON file. The field `dataset_doc_uuid` holds the document's \
-unique ID (format: dsid_XXXX).
-
-{source_section}
-
-## Available search tools
-- `rg "keyword" <path>` — fast full-text search across JSON files
-- `ls <path>` / `find <path>` — explore directory structure or search by filename
-- `jq '.field' file.json` — extract specific fields from a JSON file
-- `head -n 50 file.json` — preview a file without reading it entirely
-
-## Rules
-- `document_ids` must be `dataset_doc_uuid` values (dsid_XXXX) from files you actually read.
-- Prefer targeted searches over reading entire files.
-- If output is truncated, narrow your search.
-- You have {QUESTION_TIMEOUT_SECONDS} seconds per question.
-- Do NOT guess — find the answer in the corpus before calling finish.
-- {UNANSWERABLE_NOTE}
-"""
-
-
-def build_minimal_prompt(sources_dir: str) -> str:
-    """Variant B: corpus path + tool descriptions only, no structural hints."""
-    return f"""You are a research agent. Your job is to answer questions by searching \
-a document corpus stored on disk.
-
-## Corpus location
-The documents are at: {sources_dir}/
-Each document is a JSON file. The field `dataset_doc_uuid` holds the document's \
-unique ID (format: dsid_XXXX).
-
-## Tools
-- `run(command=...)` — execute shell commands: rg, grep, ls, cat, head, find, jq, wc, \
-tail, sort, uniq, cut, awk, tr, sed
-- `finish(answer=..., document_ids=[...])` — submit your final answer
-
-## Rules
-- `document_ids` must be `dataset_doc_uuid` values (dsid_XXXX) from files you actually read.
-- Do NOT guess — find the answer in the corpus before calling finish.
-- You have {QUESTION_TIMEOUT_SECONDS} seconds per question.
-- {UNANSWERABLE_NOTE}
-"""
-
-
-def build_v2_prompt(sources_dir: str) -> str:
-    """Variant v2: minimal map following agent_vli_instructions.md.
-
-    Provides only what is map information (what exists and how it is structured),
-    not procedure (how to search).  The tool layer handles navigation via overflow
-    mode and error messages — the system prompt stays out of search strategy.
-    """
-    return f"""You are a research agent answering questions by searching a document corpus on disk.
-
-## Corpus
-Documents are at: {sources_dir}/
-Each document is a JSON file with a `dataset_doc_uuid` field (unique ID, format: dsid_XXXX).
-Each document also has a `content_field_names` array that lists which fields hold the document's text content — use this to know which fields to read.
-
-## Tools
-- `run(command=...)` — execute shell commands: rg, grep, ls, cat, head, find, jq, wc, tail, sort, uniq, cut, awk, tr, sed
-- `finish(answer=..., document_ids=[...])` — submit your final answer; `document_ids` must be `dataset_doc_uuid` values from documents you actually read
-
-## Notes
-Questions vary widely — some require a single fact, some require connecting information across multiple documents, some ask about conflicting information between sources, and some may have no answer in the corpus at all. If you are confident the answer is not present, call `finish()` with a brief explanation and an empty `document_ids` list.
-"""
-
-
-def build_v2plus_prompt(sources_dir: str) -> str:
-    """Variant v2+: v2 + source type map (Level 0 injection).
-
-    Adds the source type listing back as pure map information — what exists,
-    not how to use it.  Fixes regressions on basic/completeness where the agent
-    needs to know source types to scope searches, without reintroducing procedure.
-    """
-    source_map = _build_source_type_map(sources_dir)
-
-    return f"""You are a research agent answering questions by searching a document corpus on disk.
-
-## Corpus
-Documents are at: {sources_dir}/
-Each document is a JSON file with a `dataset_doc_uuid` field (unique ID, format: dsid_XXXX).
-Each document also has a `content_field_names` array that lists which fields hold the document's text content — use this to know which fields to read.
-
-{source_map}
-
-## Tools
-- `run(command=...)` — execute shell commands: rg, grep, ls, cat, head, find, jq, wc, tail, sort, uniq, cut, awk, tr, sed
-- `finish(answer=..., document_ids=[...])` — submit your final answer; `document_ids` must be `dataset_doc_uuid` values from documents you actually read
-
-## Notes
-Questions vary widely — some require a single fact, some require connecting information across multiple documents, some ask about conflicting information between sources, and some may have no answer in the corpus at all. If you are confident the answer is not present, call `finish()` with a brief explanation and an empty `document_ids` list.
-"""
-
-
-def build_v3_prompt(sources_dir: str) -> str:
-    """Variant v3: v2plus baseline; all improvements are in the tool layer.
-
-    System prompt is identical to v2plus — source type map as Level 0 injection,
-    no procedure.  The difference from v2plus is entirely in make_run_tool_executor:
-    session cost footer, zero-result counter, situation-aware null hints,
-    path-list overflow detection, exact repeat annotation, graceful shutdown.
-    """
-    return build_v2plus_prompt(sources_dir)
-
-
-def build_system_prompt(sources_dir: str, variant: str = "full") -> str:
-    """Build system prompt for the given variant."""
-    if variant == "full":
-        return build_full_prompt(sources_dir)
-    elif variant == "structure":
-        return build_structure_prompt(sources_dir)
-    elif variant == "minimal":
-        return build_minimal_prompt(sources_dir)
-    elif variant == "v2":
-        return build_v2_prompt(sources_dir)
-    elif variant == "v2plus":
-        return build_v2plus_prompt(sources_dir)
-    elif variant == "v3":
-        return build_v3_prompt(sources_dir)
-    else:
-        raise ValueError(f"Unknown variant '{variant}'. Choose from: {VARIANTS}")
+def build_system_prompt() -> str:
+    """Build the system prompt by formatting the template with active commands."""
+    allowed_list = ", ".join(sorted(_active_commands))
+    return AGENT_RETRIEVAL_SYSTEM_PROMPT.format(allowed_commands=allowed_list)
 
 
 # ---------------------------------------------------------------------------
@@ -646,8 +412,8 @@ def _validate_first_command(command: str) -> str | None:
     if not tokens:
         return None
     cmd_name = os.path.basename(tokens[0])
-    if cmd_name not in ALLOWED_COMMANDS:
-        allowed = ", ".join(sorted(ALLOWED_COMMANDS))
+    if cmd_name not in _active_commands:
+        allowed = ", ".join(sorted(_active_commands))
         return (
             f"[error] command '{cmd_name}' is not allowed. "
             f"Allowed commands: {allowed}. "
@@ -669,9 +435,9 @@ def execute_chain(
 
     if not segments:
         elapsed = (time.monotonic() - t0) * 1000
+        available = ", ".join(sorted(_active_commands))
         return (
-            "[error] empty command — available: rg, grep, find, ls, cat, jq, "
-            "head, tail, wc, sort, uniq, cut, awk, tr, sed",
+            f"[error] empty command — available: {available}",
             1,
             elapsed,
         )
@@ -717,7 +483,10 @@ def execute_chain(
         stderr = proc.stderr
         rc = proc.returncode
 
-        if _is_binary(stdout):
+        # Only check for binary on the final output — intermediate pipe
+        # segments may legitimately contain null bytes (e.g. find -print0).
+        is_last = seg.operator is None
+        if is_last and _is_binary(stdout):
             elapsed = (time.monotonic() - t0) * 1000
             return (
                 "[error] binary file detected. "
@@ -726,48 +495,40 @@ def execute_chain(
                 elapsed,
             )
 
+        # Early exit on real errors (non-zero rc with stderr) for any operator.
+        # A non-zero rc *without* stderr is normal (e.g. grep no-match → rc=1)
+        # and should continue through the chain.
+        if rc != 0 and stderr:
+            elapsed = (time.monotonic() - t0) * 1000
+            error_output = stderr.decode("utf-8", errors="replace").strip()
+            return (f"[stderr] {error_output}", rc, elapsed)
+
         operator = seg.operator
 
         if operator == "|":
             stdin_data = stdout
-            last_returncode = rc
-            last_stdout = stdout
-            i += 1
-            continue
-
-        if operator == "&&":
-            last_stdout = stdout
-            last_returncode = rc
+        elif operator == "&&":
             if rc != 0:
-                combined = stdout + stderr
-                elapsed = (time.monotonic() - t0) * 1000
-                output = combined.decode("utf-8", errors="replace")
-                return (output, rc, elapsed)
+                # && semantics: stop chain on any failure
+                last_stdout = stdout
+                last_returncode = rc
+                break
             stdin_data = None
-            i += 1
-            continue
-
-        if operator == "||":
-            last_stdout = stdout
-            last_returncode = rc
+        elif operator == ";":
+            stdin_data = None
+        elif operator == "||":
             if rc == 0:
                 break
             stdin_data = None
-            i += 1
-            continue
-
-        if operator == ";":
+        else:
+            # Last segment (operator is None)
             last_stdout = stdout
             last_returncode = rc
-            stdin_data = None
-            i += 1
-            continue
+            break
 
         last_stdout = stdout
         last_returncode = rc
-        if rc != 0 and stderr:
-            last_stdout = stdout + b"\n[stderr] " + stderr
-        break
+        i += 1
 
     elapsed = (time.monotonic() - t0) * 1000
     decoded = last_stdout.decode("utf-8", errors="replace")
@@ -775,17 +536,8 @@ def execute_chain(
 
 
 # ---------------------------------------------------------------------------
-# RunTool & FinishTool
+# Tool executors
 # ---------------------------------------------------------------------------
-
-
-class FinishSignal(Exception):
-    """Raised when the agent calls finish()."""
-
-    def __init__(self, answer: str, document_ids: list[str]) -> None:
-        self.answer = answer
-        self.document_ids = document_ids
-        super().__init__(answer)
 
 
 def make_run_tool_executor(
@@ -794,23 +546,28 @@ def make_run_tool_executor(
 ) -> Any:
     """Create a run tool executor with per-session state.
 
-    Tracks per-session state for Technique 2 & 3 signals:
-    - cmd index + session elapsed  → footer cost awareness
-    - exact command history        → repeat annotation
-    - zero-result counts per path  → subdirectory map hint after 5 misses
+    Tracks per-session state for Layer 2 presentation signals:
+    - cmd index + session elapsed  → metadata footer
+    - exact command history        → repeat-command annotation
+    - zero-result counts per path  → subdirectory navigation hint after 5 misses
     """
     _t0 = session_start if session_start is not None else time.monotonic()
     _cmd_index = [0]
     _seen: dict[str, int] = {}  # command → first cmd index
     _zero_counts: dict[str, int] = {}  # normalised base path → consecutive zeros
-    _subdirs_hint = _build_subdirs_hint(SOURCES_DIR)
+    _subdirs_hint = _build_subdirs_hint(os.path.abspath(SOURCES_DIR))
 
     def _run(command: str) -> str:
         _cmd_index[0] += 1
         idx = _cmd_index[0]
         session_elapsed = time.monotonic() - _t0
 
-        # Exact repeat detection (Technique 2: different state → different message)
+        # --- Layer 1: execute the command chain (raw, unmodified output) ---
+        output, rc, elapsed_ms = execute_chain(command, cwd=cwd)
+
+        # --- Layer 2: format output for LLM consumption ---
+
+        # Repeat detection
         repeat_prefix = ""
         if command in _seen:
             repeat_prefix = (
@@ -819,65 +576,54 @@ def make_run_tool_executor(
         else:
             _seen[command] = idx
 
-        output, rc, elapsed_ms = execute_chain(command, cwd=cwd)
-
-        # Zero-result counter — emit subdirectory map hint at threshold
+        # Zero-result counter
         zero_hint = _update_and_get_zero_hint(
             _zero_counts, command, output, rc, _subdirs_hint
         )
 
-        output = _apply_presentation_layer(output, command=command)
+        # Truncation, null hints, overflow file
+        output, truncation_line = _format_tool_output(output, command=command)
 
-        # Technique 3: consistent footer with cmd index + session elapsed
+        # Metadata footer
         footer = f"[exit:{rc} | {elapsed_ms:.0f}ms | cmd #{idx} | session: {session_elapsed:.0f}s]"
 
+        # Assemble final result: output → hints → truncation → footer
         parts: list[str] = []
         if repeat_prefix:
             parts.append(repeat_prefix)
         parts.append(output)
         if zero_hint:
             parts.append(zero_hint)
+        if truncation_line:
+            parts.append(truncation_line)
         parts.append(footer)
         return "\n".join(parts)
 
     return _run
 
 
-def make_finish_tool_executor() -> Any:
-    def _finish(answer: str, document_ids: list[str]) -> str:
-        raise FinishSignal(answer=answer, document_ids=document_ids)
+def make_select_doc_executor(
+    uuid_index: dict[str, str],
+    selected_ids: set[str],
+) -> Any:
+    """Create an executor for the select_doc_by_dsid tool.
 
-    return _finish
+    Validates document IDs against the UUID index and manages a shared
+    ``selected_ids`` set that the caller can read after the conversation ends.
+    """
 
+    def _select_doc(add: str | None = None, remove: str | None = None) -> str:
+        if add:
+            if add not in uuid_index:
+                return SELECTED_DOC_FAILURE_RESPONSE
+            selected_ids.add(add)
+            return SELECTED_DOC_SUCCESS_RESPONSE
+        if remove:
+            selected_ids.discard(remove)
+            return SELECTED_DOC_REMOVAL_RESPONSE
+        return SELECTED_DOC_FAILURE_RESPONSE
 
-# ---------------------------------------------------------------------------
-# Context management
-# ---------------------------------------------------------------------------
-
-_MAX_CONTEXT_CHARS = 200_000
-
-
-def _prune_messages(messages: list[Message]) -> list[Message]:
-    """Drop the oldest tool_call/tool_result pairs when context is too large."""
-    total_chars = sum(len(m.content or "") for m in messages)
-    if total_chars <= _MAX_CONTEXT_CHARS:
-        return messages
-
-    header = messages[:2]
-    history = messages[2:]
-
-    while total_chars > _MAX_CONTEXT_CHARS and len(history) >= 2:
-        if history[0].role == "tool_call" and history[1].role == "tool_result":
-            dropped_chars = len(history[0].content or "") + len(
-                history[1].content or ""
-            )
-            history = history[2:]
-            total_chars -= dropped_chars
-        else:
-            total_chars -= len(history[0].content or "")
-            history = history[1:]
-
-    return header + history
+    return _select_doc
 
 
 # ---------------------------------------------------------------------------
@@ -890,19 +636,24 @@ def run_agent_for_question(
     question: str,
     llm: LLMInterface,
     system_prompt: str,
+    uuid_index: dict[str, str],
     quiet: bool,
 ) -> dict[str, Any]:
     """Run the agentic loop for a single question.
 
-    Returns a dict with keys:
-        question_id, answer, document_ids,
-        elapsed_seconds, iterations, commands_run, timed_out, llm_retries
+    Returns a dict with keys: question_id, answer, document_ids
     """
-    start_time = time.monotonic()
-    deadline = start_time + QUESTION_TIMEOUT_SECONDS
+    selected_ids: set[str] = set()
 
-    run_executor = make_run_tool_executor(cwd=None, session_start=start_time)
-    finish_executor = make_finish_tool_executor()
+    run_executor = make_run_tool_executor(
+        cwd=os.path.abspath(SOURCES_DIR),
+    )
+    select_doc_executor = make_select_doc_executor(uuid_index, selected_ids)
+
+    executors: dict[str, Any] = {
+        RUN_TOOL_NAME: run_executor,
+        SELECT_DOC_TOOL_NAME: select_doc_executor,
+    }
 
     messages: list[Message] = [
         Message(role="system", content=system_prompt),
@@ -914,131 +665,40 @@ def run_agent_for_question(
         print(f"Question {question_id}: {question}")
         print("=" * 60)
 
-    iteration = 0
-    commands_run: list[str] = []
-    llm_retries = 0
-    _graceful_shutdown_injected = False
+    # On timeout, a toolless LLM forces a text-only answer.
+    force_finish_llm = get_llm(tools=None, quiet=True, reasoning_level=None)
 
-    def _make_result(
-        answer: str, doc_ids: list[str], timed_out: bool
-    ) -> dict[str, Any]:
-        return {
-            "question_id": question_id,
-            "answer": answer,
-            "document_ids": doc_ids,
-            "elapsed_seconds": round(time.monotonic() - start_time, 2),
-            "iterations": iteration,
-            "commands_run": commands_run,
-            "timed_out": timed_out,
-            "llm_retries": llm_retries,
-        }
+    run_agent_conversation(
+        llm=llm,
+        executors=executors,
+        messages=messages,
+        timeout_seconds=QUESTION_TIMEOUT_SECONDS,
+        shutdown_warning_seconds=30,
+        shutdown_message=OUT_OF_TIME_USER_MESSAGE,
+        force_finish_llm=force_finish_llm,
+        force_finish_message=OUT_OF_TIME_USER_MESSAGE,
+        parallel_tool_execution=True,
+        quiet=quiet,
+    )
 
-    while time.monotonic() < deadline:
-        # Graceful shutdown signal at T-30s (agent_vli_instructions.md: external mechanism,
-        # not iteration limit — lets the agent wrap up on its own terms).
-        if (
-            not _graceful_shutdown_injected
-            and (time.monotonic() - start_time) >= QUESTION_TIMEOUT_SECONDS - 30
-        ):
-            _graceful_shutdown_injected = True
-            messages.append(
-                Message(
-                    role="user",
-                    content=(
-                        "[session ending in ~30s] Summarize your best current answer "
-                        "based on what you've found so far."
-                    ),
-                )
-            )
+    # The answer is the last assistant message (text-only = conversation end).
+    answer = ""
+    for msg in reversed(messages):
+        if msg.role == "assistant" and msg.content:
+            answer = msg.content
+            break
 
-        iteration += 1
-        full_response = ""
-        tool_calls: list[ToolCall] = []
+    # Document IDs come from the select_doc executor's accumulated state.
+    document_ids = sorted(selected_ids)
 
-        messages = _prune_messages(messages)
+    if not quiet and answer:
+        print(f"\n[answer] {answer[:100]}... " f"document_ids={document_ids}")
 
-        try:
-            for chunk in llm.generate(messages):
-                if isinstance(chunk, str):
-                    full_response += chunk
-                    if not quiet:
-                        print(chunk, end="", flush=True)
-                elif isinstance(chunk, ToolCall):
-                    tool_calls.append(chunk)
-        except Exception as llm_err:
-            llm_retries += 1
-            if not quiet:
-                print(f"\n[warn] LLM error (will retry): {llm_err}", flush=True)
-            time.sleep(5)
-            continue
-
-        if not quiet and full_response:
-            print()
-
-        if tool_calls:
-            for tool_call in tool_calls:
-                messages.append(
-                    Message(role="tool_call", content="", tool_call=tool_call)
-                )
-
-                if not quiet:
-                    print(
-                        f"\n[Tool: {tool_call.name}] args={json.dumps(tool_call.args)}"
-                    )
-
-                try:
-                    if tool_call.name == "run":
-                        cmd = tool_call.args.get("command", "")
-                        commands_run.append(cmd)
-                        result = run_executor(**tool_call.args)
-                    elif tool_call.name == "finish":
-                        finish_executor(**tool_call.args)
-                        result = "Done."
-                    else:
-                        result = (
-                            f"[error] unknown tool '{tool_call.name}'. "
-                            "Available tools: run, finish."
-                        )
-                except FinishSignal as sig:
-                    if not quiet:
-                        print(
-                            f"\n[finish] answer={sig.answer[:100]}... "
-                            f"document_ids={sig.document_ids}"
-                        )
-                    return _make_result(sig.answer, sig.document_ids, timed_out=False)
-
-                if not quiet:
-                    preview = result[:300].replace("\n", " ")
-                    print(f"  -> {preview}")
-
-                messages.append(
-                    Message(
-                        role="tool_result",
-                        content=result,
-                        call_id=tool_call.call_id,
-                    )
-                )
-            continue
-
-        # No tool calls — LLM stopped without calling a tool
-        if full_response:
-            messages.append(Message(role="assistant", content=full_response))
-        break
-
-    # Time limit (or no-tool break) reached without finish()
-    timed_out = time.monotonic() >= deadline
-    if not quiet:
-        elapsed = time.monotonic() - start_time
-        if timed_out:
-            print(
-                f"\n[warn] time limit ({QUESTION_TIMEOUT_SECONDS}s) reached "
-                f"after {iteration} iteration(s) for {question_id} "
-                f"(elapsed: {elapsed:.1f}s)"
-            )
-        else:
-            print(f"\n[warn] agent stopped without finish() for {question_id}")
-
-    return _make_result("", [], timed_out=timed_out)
+    return {
+        "question_id": question_id,
+        "answer": answer,
+        "document_ids": document_ids,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1108,11 +768,9 @@ def load_existing_question_ids(path: str) -> set[str]:
 
 
 def append_result(path: str, result: dict[str, Any], lock: threading.Lock) -> None:
-    """Append a single result to the output JSONL file (thread-safe)."""
-    line = json.dumps(result, ensure_ascii=False)
+    """Thread-safe wrapper around append_to_jsonl."""
     with lock:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        append_to_jsonl(path, result)
 
 
 # ---------------------------------------------------------------------------
@@ -1123,18 +781,6 @@ def append_result(path: str, result: dict[str, Any], lock: threading.Lock) -> No
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run CLI agent to answer questions from the document corpus."
-    )
-    parser.add_argument(
-        "--variant",
-        choices=VARIANTS,
-        default="full",
-        help=(
-            "System prompt variant: "
-            "'full' (source types + filename hints + search order), "
-            "'structure' (source types + filename hints, no order), "
-            "'minimal' (corpus path + tool descriptions only). "
-            "Default: full"
-        ),
     )
     parser.add_argument(
         "--parallelism",
@@ -1156,13 +802,22 @@ def main() -> None:
         help="Only process the first N questions of each question_type",
     )
     parser.add_argument(
+        "--questions-file",
+        type=str,
+        default=QUESTIONS_PATH,
+        help=f"Path to questions JSONL (default: {QUESTIONS_PATH})",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default=None,
-        help=(
-            "Output JSONL path. "
-            "Defaults to answer_evaluation/answers_variant_{variant}.jsonl"
-        ),
+        help="Output JSONL path (default: answer_evaluation/answers_agent.jsonl)",
+    )
+    parser.add_argument(
+        "--question-id",
+        type=str,
+        default=None,
+        help="Process only this specific question ID",
     )
     parser.add_argument(
         "--resume",
@@ -1173,12 +828,31 @@ def main() -> None:
 
     use_quiet = args.parallelism > 1
 
-    output_path = (
-        args.output or f"answer_evaluation/answers_variant_{args.variant}.jsonl"
-    )
+    # Pre-flight: verify all allowed shell commands are available
+    missing = check_available_commands()
+    if missing:
+        print("Warning: the following commands are not available on this system:")
+        for cmd in missing:
+            print(f"  - {cmd}")
+        if not confirm_yes_no("Proceed anyway?", default=False):
+            return
 
-    # Build system prompt once (discovers source types from disk)
-    system_prompt = build_system_prompt(SOURCES_DIR, args.variant)
+    questions_file = args.questions_file
+    output_path = args.output or "answer_evaluation/answers_agent.jsonl"
+
+    # Load UUID index for document ID validation by select_doc_by_dsid tool
+    if os.path.exists("generation_cache/uuid_index.json"):
+        if confirm_yes_no("Regenerate UUID index from disk?", default=True):
+            uuid_index = rebuild_uuid_index()
+        else:
+            uuid_index = load_or_build_uuid_index()
+    else:
+        uuid_index = load_or_build_uuid_index()  # builds from scratch
+
+    # Build LLM-facing artefacts *after* the preflight check has narrowed
+    # _active_commands so they only reference available commands.
+    system_prompt = build_system_prompt()
+    tools = build_tools()
 
     # Ensure output directory exists
     output_dir = os.path.dirname(output_path)
@@ -1187,15 +861,17 @@ def main() -> None:
 
     # Determine which question IDs to run
     subset_ids: set[str] | None = None
-    if args.subset_per_type is not None:
-        subset_ids = load_subset_ids(QUESTIONS_PATH, args.subset_per_type)
+    if args.question_id:
+        subset_ids = {args.question_id}
+    elif args.subset_per_type is not None:
+        subset_ids = load_subset_ids(questions_file, args.subset_per_type)
         if not use_quiet:
             print(
                 f"Subset: {len(subset_ids)} questions ({args.subset_per_type} per type)"
             )
 
     questions = load_questions_jsonl(
-        QUESTIONS_PATH, limit=args.limit, question_ids=subset_ids
+        questions_file, limit=args.limit, question_ids=subset_ids
     )
 
     # Resume support
@@ -1211,7 +887,6 @@ def main() -> None:
 
     total = len(questions)
     if not use_quiet:
-        print(f"Variant: {args.variant}")
         print(f"Processing {total} question(s) with parallelism={args.parallelism}")
         print(f"Output: {output_path}")
         print(f"Time limit per question: {QUESTION_TIMEOUT_SECONDS}s")
@@ -1220,12 +895,13 @@ def main() -> None:
     write_lock = threading.Lock()
 
     def process_one(q: dict[str, Any]) -> dict[str, Any]:
-        llm = get_cheap_llm(tools=TOOLS, quiet=use_quiet, reasoning_level=None)
+        llm = get_llm(tools=tools, quiet=use_quiet, reasoning_level=None)
         result = run_agent_for_question(
             question_id=q["question_id"],
             question=q["question"],
             llm=llm,
             system_prompt=system_prompt,
+            uuid_index=uuid_index,
             quiet=use_quiet,
         )
         append_result(output_path, result, write_lock)
@@ -1238,7 +914,7 @@ def main() -> None:
         future_timeout = QUESTION_TIMEOUT_SECONDS + 60
         with ThreadPoolExecutor(max_workers=args.parallelism) as executor:
             futures = {executor.submit(process_one, q): q for q in questions}
-            with tqdm(total=total, desc=f"[{args.variant}] Answering") as pbar:
+            with tqdm(total=total, desc="Answering") as pbar:
                 for future in as_completed(futures):
                     try:
                         future.result(timeout=future_timeout)
@@ -1254,11 +930,6 @@ def main() -> None:
                                 "question_id": q["question_id"],
                                 "answer": "",
                                 "document_ids": [],
-                                "elapsed_seconds": QUESTION_TIMEOUT_SECONDS,
-                                "iterations": 0,
-                                "commands_run": [],
-                                "timed_out": True,
-                                "llm_retries": 0,
                             },
                             write_lock,
                         )

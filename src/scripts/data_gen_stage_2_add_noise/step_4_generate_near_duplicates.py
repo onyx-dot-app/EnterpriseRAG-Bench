@@ -39,6 +39,7 @@ from src.utils import (
     is_noise_document,
     JsonRecoveryError,
     load_file,
+    load_file_without_metadata,
     select_random_file_hierarchical,
     sources_resolver,
     try_recover_json,
@@ -378,9 +379,9 @@ def generate_near_duplicate(
     """
     full_path = sources_resolver.to_absolute(file_path)
 
-    # Load the original file
+    # Load the original file (strip metadata so LLM never sees programmatic fields)
     try:
-        file_contents = load_file(full_path)
+        file_contents = load_file_without_metadata(full_path)
     except Exception as e:
         return (False, f"Error loading file: {e}", None, None)
 

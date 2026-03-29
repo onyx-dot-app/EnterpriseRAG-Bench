@@ -14,6 +14,7 @@ Args:
     --max-tokens        Max tokens per document text before truncation (default: 8191)
     --parallelism       Parallel embedding batch workers (default: 4)
     --recreate          Drop and recreate collection if it exists
+    --skip-existing     Skip documents that already exist in Qdrant
 """
 
 from __future__ import annotations
@@ -45,6 +46,7 @@ from src.utils.file_io import load_json_file
 
 EMBEDDING_MODEL = "text-embedding-3-large"
 VECTOR_SIZE = 3072
+MAX_TOKENS_PER_BATCH = 250_000
 
 _encoding = tiktoken.get_encoding("cl100k_base")
 
@@ -66,9 +68,14 @@ def truncate_text(text: str, max_tokens: int) -> str:
     return truncated
 
 
-def uuid_to_point_id(dataset_doc_uuid: str) -> str:
-    """Convert a ``dsid_<hex>`` UUID to a standard UUID string for Qdrant."""
+def uuid_to_point_id(dataset_doc_uuid: str) -> str | None:
+    """Convert a ``dsid_<hex>`` UUID to a standard UUID string for Qdrant.
+
+    Returns None if the UUID does not contain exactly 32 hex characters.
+    """
     hex_str = dataset_doc_uuid.replace("dsid_", "")
+    if len(hex_str) != 32 or not all(c in "0123456789abcdef" for c in hex_str):
+        return None
     return (
         f"{hex_str[:8]}-{hex_str[8:12]}-{hex_str[12:16]}"
         f"-{hex_str[16:20]}-{hex_str[20:]}"
@@ -174,6 +181,11 @@ def main() -> None:
         action="store_true",
         help="Drop and recreate collection if it exists",
     )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip documents that already exist in Qdrant instead of overwriting",
+    )
     args = parser.parse_args()
 
     start_time = time.time()
@@ -205,9 +217,9 @@ def main() -> None:
             field_schema=PayloadSchemaType.KEYWORD,
         )
 
-    # --- Resume: get already-indexed IDs ---
+    # --- Skip existing: get already-indexed IDs ---
     existing_ids: set[str] = set()
-    if not args.recreate:
+    if args.skip_existing and not args.recreate:
         print("Checking for already-indexed documents...")
         existing_ids = _get_existing_point_ids(qdrant, args.collection_name)
         if existing_ids:
@@ -220,8 +232,13 @@ def main() -> None:
     batch: list[tuple[str, str, str]] = []
     all_batches: list[list[tuple[str, str, str]]] = []
 
+    batch_tokens = 0
     for dataset_doc_uuid, rel_path in uuid_index.items():
         point_id = uuid_to_point_id(dataset_doc_uuid)
+        if point_id is None:
+            print(f"  Skipping {rel_path}: malformed UUID '{dataset_doc_uuid}'")
+            failed += 1
+            continue
         if point_id in existing_ids:
             skipped += 1
             continue
@@ -240,11 +257,19 @@ def main() -> None:
 
         text = f"{title}\n\n{content}"
         text = truncate_text(text, args.max_tokens)
-        batch.append((dataset_doc_uuid, point_id, text))
+        text_tokens = len(_encoding.encode(text, disallowed_special=()))
 
-        if len(batch) >= args.batch_size:
+        # Flush batch if adding this doc would exceed either limit
+        if batch and (
+            len(batch) >= args.batch_size
+            or batch_tokens + text_tokens > MAX_TOKENS_PER_BATCH
+        ):
             all_batches.append(batch)
             batch = []
+            batch_tokens = 0
+
+        batch.append((dataset_doc_uuid, point_id, text))
+        batch_tokens += text_tokens
 
     if batch:
         all_batches.append(batch)

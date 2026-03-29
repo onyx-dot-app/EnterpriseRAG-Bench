@@ -786,7 +786,7 @@ def main() -> None:
 
     skip_count = len(only_in_1) + len(only_in_2) + len(not_in_questions)
 
-    print(f"\n  Answer file overlap summary:")
+    print("\n  Answer file overlap summary:")
     print(f"    Unique to system 1 (skipped):     {len(only_in_1)}")
     print(f"    Unique to system 2 (skipped):     {len(only_in_2)}")
     if not_in_questions:

@@ -23,6 +23,7 @@ from src.llm import Message, get_cheap_llm
 from src.paths import SOURCES_DIR, SOURCE_TREE_PATH
 from src.prompts.neighboring_shuffle import PATH_ERROR_RESPONSE, SHUFFLE_PROMPT
 from src.utils.directory_tree import get_directory_tree
+from src.utils.field_ordering import load_file_without_metadata
 from src.utils.file_io import load_file, load_json_file, write_json_file
 from src.utils.file_selection import is_noise_document
 from src.utils.statistics import update_statistics
@@ -273,9 +274,9 @@ def process_single_file(task: ShuffleTask) -> ShuffleResult:
     source_type_dir = os.path.join(SOURCES_DIR, task.source_type)
     rel_path = os.path.relpath(task.file_path_abs, source_type_dir)
 
-    # Load file contents for the LLM prompt
+    # Load file contents for the LLM prompt (strip metadata fields)
     try:
-        file_contents = load_file(task.file_path_abs)
+        file_contents = load_file_without_metadata(task.file_path_abs)
     except Exception as e:
         return ShuffleResult(
             source_type=task.source_type,

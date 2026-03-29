@@ -9,7 +9,11 @@ from src.schemas.field_labels import (
     validate_field_labels,
     validate_field_labels_against_document,
 )
-from src.utils.field_ordering import needs_reordering, reorder_document_fields
+from src.utils.field_ordering import (
+    needs_reordering,
+    reorder_document_fields,
+    strip_metadata_fields,
+)
 from src.utils.file_io import load_json_file, write_json_file
 from src.utils.json_extraction import extract_json_from_response
 
@@ -64,9 +68,12 @@ def label_document_fields(document: dict, quiet: bool = False) -> dict:
     Raises:
         ValueError: If field labeling fails validation.
     """
+    # Strip metadata fields so the LLM only sees actual document content
+    clean_document = strip_metadata_fields(document)
+
     # Build the prompt
     prompt = FIELD_LABELER_PROMPT.format(
-        json_document=json.dumps(document, indent=2),
+        json_document=json.dumps(clean_document, indent=2),
     )
 
     # Get LLM response (no tools needed)

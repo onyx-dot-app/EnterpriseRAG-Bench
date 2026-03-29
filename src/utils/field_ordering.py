@@ -1,9 +1,39 @@
 """Utility for ensuring correct field ordering in document JSON files."""
 
+import json
 from typing import Any
 
 # Fields that should appear at the end of the document, in this order
 TRAILING_FIELDS = ["title_field_name", "content_field_names", "dataset_doc_uuid"]
+
+# All fields added programmatically (not part of original document content).
+# These must never be shown to an LLM that is generating or reasoning about
+# document contents.
+METADATA_FIELDS = {
+    "title_field_name",
+    "content_field_names",
+    "dataset_doc_uuid",
+    "dataset_noise_document",
+}
+
+
+def strip_metadata_fields(document: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of *document* with all programmatic metadata fields removed.
+
+    This is intended for preparing document content before sending it to an LLM
+    so that metadata like ``dataset_doc_uuid`` never leaks into prompts.
+    """
+    return {k: v for k, v in document.items() if k not in METADATA_FIELDS}
+
+
+def load_file_without_metadata(file_path: str) -> str:
+    """Load a JSON document file and return it as a JSON string without metadata fields.
+
+    Convenience wrapper that loads, strips metadata, and re-serializes.
+    """
+    with open(file_path) as f:
+        document: dict[str, Any] = json.load(f)
+    return json.dumps(strip_metadata_fields(document), indent=2)
 
 
 def reorder_document_fields(document: dict[str, Any]) -> dict[str, Any]:
