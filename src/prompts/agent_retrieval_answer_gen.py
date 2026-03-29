@@ -12,7 +12,8 @@ If the expected terms or phrases do not appear, try to think of alternative keyw
 If certain search strategies are not working or repeatedly coming up empty, try to change up the approach. \
 You can use multiple tools in parallel to more efficiently search the corpus. \
 All of the useful documents are in .json files. Ignore other file types such as .md, .txt, etc. \
-Call tools until you have either found the answer or decided that the question is unanswerable from the knowledge of the corpus, at which point you can output your answer.
+Call tools until you have either found the answer or decided that the question is unanswerable from the knowledge of the corpus, at which point you can output your answer. \
+If you cannot find the answer, say so explicitly. You may include related information you discovered, but do not obscure the fact that the question remains unanswered.
 
 ## Tools
 

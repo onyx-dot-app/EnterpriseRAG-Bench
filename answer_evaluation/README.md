@@ -23,7 +23,7 @@ python -m src.scripts.answer_evaluation.metrics_based_eval \
     --answers-file answer_evaluation/answers.jsonl
 ```
 
-Results are written to `answer_evaluation/results.json` by default.
+Results are written to `answer_evaluation/results.json` by default. See `metrics_based_eval` for additional optional args.
 
 ## Comparative Evaluation
 
@@ -35,12 +35,12 @@ python -m src.scripts.answer_evaluation.comparative_eval \
     --answer-file-2 answer_evaluation/system_2.jsonl
 ```
 
-Results are written to `answer_evaluation/results-comparative.json` by default.
+Results are written to `answer_evaluation/results-comparative.json` by default. See `comparative_eval.py` for additional optional args.
 
 ## Notes
 
-- Both scripts auto-resume from existing results files. Use `--question-id qst_XXX` to re-evaluate a single question.
-- Use `--parallelism N` to run evaluations in parallel.
-- Questions that receive corrections are flagged in the results and written to a separate `questions_updated` file.
-- Run the scripts with `--help` for all options.
 - You will need to export the necessary env variables for the LLM of choice to run the evals.
+- Run the scripts with `--help` for all options.
+- Use `--parallelism N` to run evaluations in parallel.
+- Both scripts auto-resume from existing results files. Use `--question-id qst_XXX` to re-evaluate a single question.
+- Questions that receive corrections are flagged in the results and written to a separate `questions_updated` file.

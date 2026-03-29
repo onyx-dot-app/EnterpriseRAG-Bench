@@ -326,6 +326,8 @@ This code base provides two out of the box retriever solutions to help address t
 - A vector search based approach in `index_document_vectors.py` and `vector_retrieval.py`
 - An LLM agent based approach where an LLM is equipped with bash commands to traverse the documents and attempt to find the answers (see `agent_retrieval.py`)
 
+> Note: read more about these approaches in [src/scripts/answer_generation/README.md](src/scripts/answer_generation/README.md) 
+
 The released dataset used these approaches to refine the questions however there are likely many additional corrections that can be made.
 
 ### Correction Utilities

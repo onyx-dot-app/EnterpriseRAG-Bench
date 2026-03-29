@@ -91,7 +91,7 @@ from src.prompts.agent_retrieval_answer_gen import (
 # Constants
 # ---------------------------------------------------------------------------
 
-QUESTION_TIMEOUT_SECONDS = 300  # 5 minutes per question
+QUESTION_TIMEOUT_SECONDS = 600  # 10 minutes per question
 
 # Layer 2 truncation limits — output is truncated at whichever is hit first.
 TRUNCATION_MAX_LINES = 100
