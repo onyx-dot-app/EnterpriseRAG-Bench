@@ -59,10 +59,10 @@ One of the key considerations of this repository is to make it easy for teams to
 To do this, delete the directories `export_data`, `generated_data`, and `generation_cache` and run through the different data generation scripts.
 
 The stages of generation are broken down into:
-1. Generating the base data (`src/scripts/stage_1_generate_clean_data`)
-2. Adding noise (`src/scripts/stage_2_add_noise`)
-3. Generating questions (`src/scripts/stage_3_generate_questions`)
-4. Exporting the dataset (`src/scripts/stage_4_data_export`)
+1. Generating the base data (`src/scripts/data_gen_stage_1_generate_clean_data`)
+2. Adding noise (`src/scripts/data_gen_stage_2_add_noise`)
+3. Generating questions (`src/scripts/data_gen_stage_3_generate_questions`)
+4. Exporting the dataset (`src/scripts/data_gen_stage_4_data_export`)
 
 Each stage has provided scripts to be run in order to generate the data. Some steps will require interactions between the user and LLM to guide the direction of the generation.
 
@@ -90,39 +90,39 @@ export CHEAP_LLM_MODEL_NAME="gpt-5-mini"
 
 **Step 1 — Generate company overview** (interactive)
 ```bash
-python -m src.scripts.stage_1_generate_clean_data.step_1_generate_company_overview
+python -m src.scripts.data_gen_stage_1_generate_clean_data.step_1_generate_company_overview
 ```
 
 **Step 2 — Generate initiatives** (interactive)
 ```bash
-python -m src.scripts.stage_1_generate_clean_data.step_2_generate_initiatives
+python -m src.scripts.data_gen_stage_1_generate_clean_data.step_2_generate_initiatives
 ```
 
 **Step 3 — Generate employee directory** (interactive)
 ```bash
-python -m src.scripts.stage_1_generate_clean_data.step_3_generate_employee_directory
+python -m src.scripts.data_gen_stage_1_generate_clean_data.step_3_generate_employee_directory
 ```
 
 **Step 4 — Generate source structure** (interactive)
 ```bash
-python -m src.scripts.stage_1_generate_clean_data.step_4_generate_source_structure
+python -m src.scripts.data_gen_stage_1_generate_clean_data.step_4_generate_source_structure
 ```
 
 **Step 5 — Generate agents.md files** (interactive)
 ```bash
-python -m src.scripts.stage_1_generate_clean_data.step_5_generate_agents_md
+python -m src.scripts.data_gen_stage_1_generate_clean_data.step_5_generate_agents_md
 ```
 
 **Step 6 — Generate projects**
 ```bash
-python -m src.scripts.stage_1_generate_clean_data.step_6_generate_projects \
+python -m src.scripts.data_gen_stage_1_generate_clean_data.step_6_generate_projects \
     --max-parallelization 5 \  # Max parallel project enrichments (default: 5)
     --dedup-parallelism 20     # Max parallel deduplication operations (default: 20)
 ```
 
 **Step 7 — Generate project documents**
 ```bash
-python -m src.scripts.stage_1_generate_clean_data.step_7_generate_project_documents \
+python -m src.scripts.data_gen_stage_1_generate_clean_data.step_7_generate_project_documents \
     --project-parallelism 5 \       # Number of projects to process in parallel (default: 5)
     --project-file-parallelism 5 \  # Number of files per project to process in parallel (default: 5)
     --labeling-parallelism 20       # Number of documents to label in parallel (default: 20)
@@ -130,13 +130,13 @@ python -m src.scripts.stage_1_generate_clean_data.step_7_generate_project_docume
 
 **Step 8 — Generate completeness documents** (interactive)
 ```bash
-python -m src.scripts.stage_1_generate_clean_data.step_8_generate_completeness_documents \
+python -m src.scripts.data_gen_stage_1_generate_clean_data.step_8_generate_completeness_documents \
     --count 10  # Number of completeness traces to generate (default: 10)
 ```
 
 **Step 9 — Generate volume documents**
 ```bash
-python -m src.scripts.stage_1_generate_clean_data.step_9_generate_volume_documents \
+python -m src.scripts.data_gen_stage_1_generate_clean_data.step_9_generate_volume_documents \
     --max-parallelism 5 \     # Max parallel volume generation operations (default: 5)
     --project-parallelism 1   # Documents per project to generate in parallel (default: 1)
 ```
@@ -145,27 +145,27 @@ python -m src.scripts.stage_1_generate_clean_data.step_9_generate_volume_documen
 
 **Step 1 — Random shuffle**
 ```bash
-python -m src.scripts.stage_2_add_noise.step_1_random_shuffle \
+python -m src.scripts.data_gen_stage_2_add_noise.step_1_random_shuffle \
     --percentage 3.0  # Percentage of documents to shuffle within each source type (default: 3.0)
 ```
 
 **Step 2 — LLM-based shuffle**
 ```bash
-python -m src.scripts.stage_2_add_noise.step_2_llm_based_shuffle \
+python -m src.scripts.data_gen_stage_2_add_noise.step_2_llm_based_shuffle \
     --percentage 5.0 \  # Percentage of documents to shuffle within each source type (default: 5.0)
     --parallelism 50    # Number of files to process in parallel (default: 50)
 ```
 
 **Step 3 — Generate miscellaneous files** (interactive)
 ```bash
-python -m src.scripts.stage_2_add_noise.step_3_generate_misc_files \
+python -m src.scripts.data_gen_stage_2_add_noise.step_3_generate_misc_files \
     --count 20 \       # Total number of miscellaneous files to generate (default: 20)
     --parallelism 5    # Number of files to generate in parallel (default: 5)
 ```
 
 **Step 4 — Generate near-duplicate files**
 ```bash
-python -m src.scripts.stage_2_add_noise.step_4_generate_near_duplicates \
+python -m src.scripts.data_gen_stage_2_add_noise.step_4_generate_near_duplicates \
     --count 20  # Number of near-duplicate files to generate (default: 20)
 ```
 
@@ -173,21 +173,21 @@ python -m src.scripts.stage_2_add_noise.step_4_generate_near_duplicates \
 
 **Step 1 — Basic questions**
 ```bash
-python -m src.scripts.stage_3_generate_questions.step_1_generate_basic_questions \
+python -m src.scripts.data_gen_stage_3_generate_questions.step_1_generate_basic_questions \
     --count 50 \  # Number of questions to generate (default: 50)
     --quiet       # Suppress LLM output streaming (optional)
 ```
 
 **Step 2 — Semantic questions**
 ```bash
-python -m src.scripts.stage_3_generate_questions.step_2_generate_semantic_questions \
+python -m src.scripts.data_gen_stage_3_generate_questions.step_2_generate_semantic_questions \
     --count 50 \  # Number of questions to generate (default: 50)
     --quiet       # Suppress LLM output streaming (optional)
 ```
 
 **Step 3 — Intra-doc reasoning questions**
 ```bash
-python -m src.scripts.stage_3_generate_questions.step_3_generate_intra_doc_reasoning_questions \
+python -m src.scripts.data_gen_stage_3_generate_questions.step_3_generate_intra_doc_reasoning_questions \
     --count 50 \             # Number of questions to generate (default: 50)
     --min-doc-length 3000 \  # Minimum document content length in characters (default: 3000)
     --quiet                  # Suppress LLM output streaming (optional)
@@ -195,21 +195,21 @@ python -m src.scripts.stage_3_generate_questions.step_3_generate_intra_doc_reaso
 
 **Step 4 — Project-related questions**
 ```bash
-python -m src.scripts.stage_3_generate_questions.step_4_generate_project_related_questions \
+python -m src.scripts.data_gen_stage_3_generate_questions.step_4_generate_project_related_questions \
     --count 50 \  # Number of questions to generate (default: 50)
     --quiet       # Suppress LLM output streaming (optional)
 ```
 
 **Step 5 — Constrained questions**
 ```bash
-python -m src.scripts.stage_3_generate_questions.step_5_generate_constrained_questions \
+python -m src.scripts.data_gen_stage_3_generate_questions.step_5_generate_constrained_questions \
     --count 50 \  # Number of questions to generate (default: 50)
     --quiet       # Suppress LLM output streaming (optional)
 ```
 
 **Step 6 — Conflicting info questions**
 ```bash
-python -m src.scripts.stage_3_generate_questions.step_6_generate_conflicting_questions \
+python -m src.scripts.data_gen_stage_3_generate_questions.step_6_generate_conflicting_questions \
     --count 20 \      # Max number of questions to process (default: all available)
     --parallelism 1 \ # Number of parallel workers (default: 1)
     --quiet           # Suppress LLM output streaming (optional)
@@ -217,7 +217,7 @@ python -m src.scripts.stage_3_generate_questions.step_6_generate_conflicting_que
 
 **Step 7 — Completeness questions**
 ```bash
-python -m src.scripts.stage_3_generate_questions.step_7_generate_completeness_questions \
+python -m src.scripts.data_gen_stage_3_generate_questions.step_7_generate_completeness_questions \
     --count 10 \      # Max number of questions to process (default: all available)
     --parallelism 1 \ # Number of parallel workers (default: 1)
     --quiet           # Suppress LLM output streaming (optional)
@@ -225,7 +225,7 @@ python -m src.scripts.stage_3_generate_questions.step_7_generate_completeness_qu
 
 **Step 8 — Miscellaneous questions**
 ```bash
-python -m src.scripts.stage_3_generate_questions.step_8_generate_miscellaneous_questions \
+python -m src.scripts.data_gen_stage_3_generate_questions.step_8_generate_miscellaneous_questions \
     --count 20 \      # Number of questions to generate (default: all available)
     --parallelism 1 \ # Number of parallel workers (default: 1)
     --quiet           # Suppress LLM output streaming (optional)
@@ -233,7 +233,7 @@ python -m src.scripts.stage_3_generate_questions.step_8_generate_miscellaneous_q
 
 **Step 9 — High-level questions**
 ```bash
-python -m src.scripts.stage_3_generate_questions.step_9_generate_high_level_questions \
+python -m src.scripts.data_gen_stage_3_generate_questions.step_9_generate_high_level_questions \
     --count 10 \           # Number of validated questions to produce (default: 10)
     --num-candidates 20 \  # Number of candidate queries to generate before filtering (default: 20)
     --parallelism 1 \      # Number of parallel workers for answer generation (default: 1)
@@ -243,7 +243,7 @@ python -m src.scripts.stage_3_generate_questions.step_9_generate_high_level_ques
 
 **Step 10 — Unanswerable questions**
 ```bash
-python -m src.scripts.stage_3_generate_questions.step_10_generate_unanswerable_questions \
+python -m src.scripts.data_gen_stage_3_generate_questions.step_10_generate_unanswerable_questions \
     --count 20 \  # Number of questions to generate (default: 20)
     --quiet       # Suppress LLM output streaming (optional)
 ```
@@ -251,7 +251,7 @@ python -m src.scripts.stage_3_generate_questions.step_10_generate_unanswerable_q
 #### 4. Data export
 
 ```bash
-python -m src.scripts.stage_4_data_export.export_data \
+python -m src.scripts.data_gen_stage_4_data_export.export_data \
     --max-files 100 \           # Max total files to export (optional)
     --random-sample \           # Randomly sample files from the entire corpus, only applies with --max-files (optional)
     --flatten \                 # Place all files at the top level with no directory structure (optional)
@@ -265,11 +265,11 @@ python -m src.scripts.stage_4_data_export.export_data \
 The original provided dataset is exported using two approaches. The first is a single zip containing all documents with the full directory structure preserved:
 
 ```bash
-python -m src.scripts.stage_4_data_export.export_data --create-zip
+python -m src.scripts.data_gen_stage_4_data_export.export_data --create-zip
 ```
 
 The second splits by source type into flat zips of up to 5,000 files each:
 
 ```bash
-python -m src.scripts.stage_4_data_export.export_data --create-zip --split-by-source --max-files-per-zip 5000 --flatten
+python -m src.scripts.data_gen_stage_4_data_export.export_data --create-zip --split-by-source --max-files-per-zip 5000 --flatten
 ```

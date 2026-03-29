@@ -231,7 +231,7 @@ def main() -> None:
 
         total_to_delete = len(orphan_only) + len(volume_only) + len(in_both)
 
-        print(f"\nCleanup summary:")
+        print("\nCleanup summary:")
         print(f"  - Orphaned files (not in volume): {len(orphan_only)}")
         print(f"  - Volume-referenced files: {len(volume_only) + len(in_both)}")
         print(f"  - Total files to delete: {total_to_delete}")
@@ -243,7 +243,7 @@ def main() -> None:
             # Show some examples
             all_files_to_delete = list(orphan_only | volume_only | in_both)
             if all_files_to_delete:
-                print(f"\nExample files to delete:")
+                print("\nExample files to delete:")
                 for file_path in all_files_to_delete[:10]:
                     if file_path.exists():
                         try:
