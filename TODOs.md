@@ -1,18 +1,5 @@
-What is needed for a good run/search:
-
-run(command=) with pipes
-glob
-grep
-ls
-cat
-head
-find (or fd?)
-rg (ripgrep)
-xargs?
-parallel?
-fzf?
-less?
-
+Remove:
+dsid_98c317a386374ab79a6efc9f523ab6ca-gdrv-v2
 
 
 Agents.md explanations at the top of the script before starting
@@ -23,22 +10,6 @@ Paper link in quickstart
 Readme shields: license(MIT), website(onyx), dataset(huggingface), leaderboard(onyx page?), arXiv
 Give info on the question generation steps for if there are no noise docs to base them on, ask the user to run those steps
 
-
-
-
-
-Notes and known limitations:
-- Hard to avoid LLM artifacts, it likes to use things like 1234567 etc. for timestamps, ACME for company names, etc.
-- agents.md files should mention things like user can specify what is a document, such as Slack being a thread, or metadata like titles for Fireflies is what the meeting title.
-- Gmail is only for leaders, managers and sales, others are not indexed
-- Note documents are flattened jsons for ease of use and to reduce parsing for downstream tasks. This may not exactly match nested structures for all data types but the LLM can approximate it reasonably well.
-- Did not include people tool for the largest volume generation
-- The documents are too on-topic, it's very difficult to have it create realistic conversations with noise, people misunderstanding the topic, etc.
-- It's not very good at small talk, need to provide significant rails to prevent all smalltalk being the same stuff, hard to get this one realistic
-- Slack in this case contains more meaningful docs
-- At scale there will be some some number of docs that do not conform to the instructions set out for the source type, including some paths which do not make sense
-- Some places there's a limit to model output (like employee directory all at once), and some places that don't scale well
-- At scales some docs will fail, checks can catch many of the issues but some will still be conformant to json but just be empty etc.
 
 
 Possible directions for justifying the dataset validity:

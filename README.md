@@ -29,7 +29,7 @@ The [questions](generated_data/questions.jsonl) are broken up into 10 categories
 |---|----------|-------|-------------|
 | 1 | Basic | 200 | Simple questions with a single ground truth document. |
 | 2 | Semantic | 100 | Similar to Basic but more roundabout, with less keyword/phrase overlap and without giveaway-type keywords. |
-| 3 | Single Doc Multi-hop | 50 | Requires combining information from several distant sections of a single longer document. |
+| 3 | Intra-Doc Reasoning | 50 | Requires combining information from several distant sections of a single longer document. |
 | 4 | Project Related | 40 | Aggregate knowledge from related documents from a single project/initiative within the company. |
 | 5 | Constrained | 30 | Questions with multiple relevant documents but with qualifiers that disqualify all but one answer. |
 | 6 | Conflicting Info | 20 | Questions where documents directly contradict each other. Requires the system to give a complete and correct answer. |
@@ -46,12 +46,17 @@ Up until now, there hasn't been a publically accessible dataset which focuses en
 
 ## Using the dataset
 
-> [!TIP]
-> For more info on getting started refer to the [Quickstart Guide](quickstart.md)
-
-The dataset is downloadable from the release notes and also under export_data. To get the entire dataset as a single zip file, download [all_documents.zip](export_data/all_documents.zip).
+The dataset is downloadable from the release notes and also under the `export_data` directory. Two formats are provided for convenience:
+1. Individual zip files called `<source_type>_slice_<slice_number>.zip`, each containing up to 5000 docs.
+  - Note: these zip files do not contain the nested directory structure within the sources.
+2. A single zip file containing all of the documents called `all_documents.zip`.
 
 The question set can be found in [questions.jsonl](export_data/questions.jsonl).
+
+To just run answer evaluation, reference the [README.md](answer_evaluation/README.md) in `answer_evaluation`.
+
+> [!TIP]
+> For more info on all of the ways to use this dataset and code, refer to the [Quickstart Guide](quickstart.md)
 
 ## Key Considerations
 

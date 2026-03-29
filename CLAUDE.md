@@ -8,6 +8,35 @@
 - Place imports at top of file
 - Reference the utils directory to not rewrite functionality
 
+## Code Quality
+
+**Pre-commit hooks** run **black** (formatter) and **mypy** (type checker) on all files under `src/`. Both must pass before committing:
+- **black** (v24.10.0) — all code must be formatted with black defaults
+- **mypy** (v1.13.0) — strict type checking with `pydantic`, `types-PyYAML`, `types-requests` stubs
+
+All changes to `src/` must satisfy both tools. Run `pre-commit run --all-files` to check locally.
+
+## Script Docstring Convention
+
+Every runnable script under `src/scripts/` must include a module-level docstring with:
+1. A description of what the script does
+2. A `Usage:` section with the full `python -m` invocation path
+3. An `Args:` section listing CLI arguments (if any), or "No arguments." if interactive/argless
+
+Example:
+```python
+"""Short description of what the script does.
+
+Longer explanation of behavior, outputs, etc.
+
+Usage:
+    python -m src.scripts.<subpackage>.<module_name> [OPTIONS]
+
+Args:
+    --flag-name    Description of flag (default: value)
+"""
+```
+
 ## Project Structure
 
 - `src/paths.py` - Centralized path constants for all generated data directories and files
@@ -16,7 +45,14 @@
 - `src/utils/` - Shared utility functions
 - `src/schemas/` - Pydantic models for data validation
 - `src/prompts/` - Prompt templates for various generation steps
-- `src/data_scripts/` - Scripts for data generation pipeline stages
+- `src/scripts/` - All runnable scripts, organized by purpose:
+  - `data_gen_stage_1_generate_clean_data/` - Stage 1: company overview, initiatives, employees, source structure, projects, documents
+  - `data_gen_stage_2_add_noise/` - Stage 2: shuffling, misc files, near-duplicate generation
+  - `data_gen_stage_3_generate_questions/` - Stage 3: 10 question type generators (basic, semantic, intra-doc reasoning, project, constrained, conflicting, completeness, miscellaneous, high-level, unanswerable)
+  - `data_gen_stage_4_data_export/` - Stage 4: export final dataset
+  - `answer_generation/` - Answer generation pipelines (agent-based retrieval, vector retrieval, Qdrant indexing)
+  - `answer_evaluation/` - Evaluation harnesses (metrics-based eval, comparative eval)
+  - `util_scripts/` - Maintenance utilities (file counting, label/UUID enforcement, cleanup)
 
 ## Utilities (`src/utils/`)
 
@@ -36,6 +72,7 @@
 - **`field_labeling.py`** - `label_document_fields()`, `label_single_document()`, `get_documents_without_labels()` - LLM-based field labeling to identify title/content fields
 - **`field_ordering.py`** - `reorder_document_fields()`, `needs_reordering()` - Ensures trailing fields (title_field_name, content_field_names, dataset_doc_uuid) are at end of documents
 - **`dataset_id.py`** - `generate_dataset_doc_uuid()`, `add_dataset_doc_uuid()`, `get_dataset_doc_uuid()` - UUID generation and management for documents
+- **`directory_tree.py`** - `get_directory_tree()` - Pure Python directory tree representation (directories only, no `tree` command dependency)
 
 ### Question Generation
 - **`questions.py`** - Shared utilities for question generation scripts. **Always check here before writing question generation code.**
@@ -50,6 +87,14 @@
   - `ensure_uuids_resolved(needed_uuids, uuid_index=None)` - Load UUID index and **automatically rebuild once** if any needed UUIDs are missing. All question generation scripts should use this instead of `load_or_build_uuid_index()` when they have a known set of required UUIDs.
   - `rebuild_uuid_index()` - Force-rebuild the UUID index from disk
   - `load_document_content_by_uuid()`, `load_document_json_by_uuid()` - Load document data by UUID
+
+### Evaluation Utilities
+- **`eval_utils.py`** - Shared utilities for answer evaluation scripts
+  - `load_questions()`, `load_answers()`, `load_updated_questions()` - Data loading helpers
+  - `normalize_document_ids()`, `build_document_path_map()`, `resolve_document_path_map()` - Document ID validation and resolution
+  - `strip_answer_citations()`, `evaluate_documents()`, `evaluate_documents_with_consensus()` - LLM-based evaluation (three-judge consensus voting)
+  - `update_gold_answer()`, `validate_single_fact()` - Gold answer update and fact validation
+  - `dedupe_doc_ids()`, `group_results_by_type()`, `sort_question_results()`, `build_type_order()` - Result organization helpers
 
 ### Generation Cache
 - **`generation_cache.py`** - `GenerationCache` class with thread-safe `load()`, `append()`, `write_all()`, `count()` methods. Stores consolidated JSON arrays in `generation_cache/`. Four singleton instances:
@@ -66,19 +111,23 @@
 
 ## LLM Layer (`src/llm/`)
 
-- **`interface.py`** - Abstract `LLMInterface` class, `Message` and `ToolCall` pydantic models
+- **`__init__.py`** - Re-exports: `get_llm`, `get_cheap_llm`, `LLMInterface`, `Message`, `ReasoningLevel`, `ToolCall`, `run_auto_conversation`
+- **`interface.py`** - Abstract `LLMInterface` class, `Message` and `ToolCall` pydantic models, `ReasoningLevel` type
 - **`factory.py`** - `get_llm()`, `get_cheap_llm()` - Factory functions based on `LLM_PROVIDER` env var (supports "openai", "anthropic")
 - **`conversation.py`** - `Conversation` class for interactive conversation loops with tool calling support
 - **`auto_conversation.py`** - `run_auto_conversation()` - Runs LLM conversations automatically without user input until completion
 - **`openai_llm.py`** / **`anthropic_llm.py`** - Provider-specific implementations
+- **`tracing.py`** - Braintrust tracing utilities: `init_tracing()`, `traced_span()`, `log_to_span()`, `get_current_span()`, `flush_traces()`. All no-ops when `BRAINTRUST_API_KEY`/`BRAINTRUST_PROJECT` env vars are not set.
 
 ## Tools (`src/tools/tool_implementations/`)
 
 Tools that can be registered with `ToolRunner` for LLM agent use:
 
 - **`ReadTool`** - Read file contents
+- **`DocumentReadTool`** - ReadTool subclass that extracts document title/content and tracks reads
 - **`WriteTool`** - Write content to files (with optional validation, base_dir, path override)
 - **`GlobTool`** - Find files by glob pattern
+- **`GrepTool`** - Search file contents by text pattern
 - **`LsTool`** - List directory contents
 - **`TreeTool`** - Display directory tree structure
 - **`MkdirTool`** - Create directories
@@ -104,9 +153,25 @@ SOURCES_DIR = "generated_data/sources"
 COMPANY_OVERVIEW_PATH = "generated_data/company_overview.md"
 INITIATIVES_PATH = "generated_data/initiatives.md"
 EMPLOYEE_DIRECTORY_PATH = "generated_data/employee_directory.yaml"
+VISUAL_EMPLOYEE_DIRECTORY_PATH = "generated_data/visual_employee_directory.txt"
 PROJECTS_DIR = "generated_data/projects"
+PROJECT_LIST_PATH = "generated_data/project_list.txt"
+SOURCE_TREE_PATH = "generated_data/source_tree.txt"
+DEBUG_DIR = "generated_data/debug"
+AGGREGATE_STATISTICS_PATH = "generated_data/aggregate_statistics.json"
 VOLUME_DIR = "generated_data/volume"
 COMPLETENESS_DIR = "generated_data/completeness"
 QUESTIONS_PATH = "generated_data/questions.jsonl"
 EXPORT_DATA_DIR = "export_data"
 ```
+
+## Environment Variables
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `LLM_PROVIDER` | LLM backend (`"openai"` or `"anthropic"`) | `"openai"` |
+| `LLM_API_KEY` | API key for the LLM provider | — |
+| `LLM_MODEL_NAME` | Primary model name | Provider default |
+| `CHEAP_LLM_MODEL_NAME` | Cheap/fast model name | Provider default |
+| `BRAINTRUST_API_KEY` | Braintrust tracing API key (optional) | — |
+| `BRAINTRUST_PROJECT` | Braintrust project name (optional) | — |

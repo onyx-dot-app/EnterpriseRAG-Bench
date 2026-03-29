@@ -26,7 +26,12 @@ from src.utils.field_labeling import (
     label_document_fields,
     label_single_document,
 )
-from src.utils.field_ordering import needs_reordering, reorder_document_fields
+from src.utils.field_ordering import (
+    load_file_without_metadata,
+    needs_reordering,
+    reorder_document_fields,
+    strip_metadata_fields,
+)
 from src.utils.file_io import (
     delete_file,
     load_file,
@@ -108,6 +113,7 @@ __all__ = [
     "label_single_document",
     "load_document",
     "load_file",
+    "load_file_without_metadata",
     "load_document_content_by_uuid",
     "load_document_json_by_uuid",
     "load_json_file",
@@ -122,6 +128,7 @@ __all__ = [
     "sanitize_path",
     "save_question",
     "select_random_file_hierarchical",
+    "strip_metadata_fields",
     "sources_resolver",
     "try_recover_json",
     "validate_no_nested_dicts",
