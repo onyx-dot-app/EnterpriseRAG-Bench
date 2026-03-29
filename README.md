@@ -46,12 +46,17 @@ Up until now, there hasn't been a publically accessible dataset which focuses en
 
 ## Using the dataset
 
-> [!TIP]
-> For more info on getting started refer to the [Quickstart Guide](quickstart.md)
-
-The dataset is downloadable from the release notes and also under export_data. To get the entire dataset as a single zip file, download [all_documents.zip](export_data/all_documents.zip).
+The dataset is downloadable from the release notes and also under the `export_data` directory. Two formats are provided for convenience:
+1. Individual zip files called `<source_type>_slice_<slice_number>.zip`, each containing up to 5000 docs.
+  - Note: these zip files do not contain the nested directory structure within the sources.
+2. A single zip file containing all of the documents called `all_documents.zip`.
 
 The question set can be found in [questions.jsonl](export_data/questions.jsonl).
+
+To just run answer evaluation, reference the [README.md](answer_evaluation/README.md) in `answer_evaluation`.
+
+> [!TIP]
+> For more info on all of the ways to use this dataset and code, refer to the [Quickstart Guide](quickstart.md)
 
 ## Key Considerations
 
