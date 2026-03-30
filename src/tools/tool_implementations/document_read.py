@@ -18,6 +18,7 @@ class DocumentReadTool(ReadTool):
         base_dir: str,
         generated_doc_contents: bool = False,
         display_name: str | None = None,
+        include_dsid: bool = False,
     ):
         """
         Initialize the DocumentReadTool.
@@ -27,9 +28,12 @@ class DocumentReadTool(ReadTool):
             generated_doc_contents: If True, extract and return title+content
                 instead of raw JSON, and track reads.
             display_name: Name to show in schema description.
+            include_dsid: If True, append a line with the document's
+                ``dataset_doc_uuid`` to the extracted output.
         """
         super().__init__(base_dir, display_name)
         self._generated_doc_contents = generated_doc_contents
+        self._include_dsid = include_dsid
         self._read_documents: list[dict] = []
 
     @property
@@ -72,6 +76,9 @@ class DocumentReadTool(ReadTool):
                 }
             )
 
-            return f"{title}\n{content}"
+            result = f"{title}\n{content}"
+            if self._include_dsid and uuid:
+                result += f"\nDocument UUID (dataset_doc_uuid): {uuid}"
+            return result
         except (json.JSONDecodeError, DocumentFieldError):
             return raw

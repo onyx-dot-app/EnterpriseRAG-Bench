@@ -26,10 +26,23 @@ class ReadTool(ToolInterface):
 
     @property
     def schema(self) -> dict:
+        return self.get_schema()
+
+    def get_schema(self, include_display_name: bool = True) -> dict:
+        """Return the OpenAI-format tool schema.
+
+        Args:
+            include_display_name: When True the description mentions the
+                base directory display name.
+        """
+        if not include_display_name:
+            description = "Read the contents of a file."
+        else:
+            description = f"Read the contents of a file within {self._display_name}."
         return {
             "type": "function",
             "name": self.name,
-            "description": f"Read the contents of a file within {self._display_name}.",
+            "description": description,
             "parameters": {
                 "type": "object",
                 "properties": {
