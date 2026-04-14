@@ -1,0 +1,37 @@
+{
+  "title": "latency-fingerprint-across-cuda-and-cloud-variants",
+  "owner": "Ava Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/latency-fingerprint-across-cuda-and-cloud-variants.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-07",
+  "last_modified": "2026-02-10",
+  "collaborators": [
+    "Miguel Ortega",
+    "Priya Singh",
+    "Liam O'Connor"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "performance",
+    "benchmark",
+    "latency",
+    "cuda",
+    "driver",
+    "a100",
+    "h100",
+    "l40s"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/482",
+    "CONFLUENCE-1234",
+    "JIRA-INF-987"
+  ],
+  "content": "Purpose:\nQuick investigative notes on cross-cloud / cross-driver latency fingerprints for our inference runtime. This doc collects observed deviations, hypotheses, and a minimal reproducibility matrix so we can triage tail behaviors before the Dedicated rollout next quarter.\n\nHigh-level summary (TL;DR):\n- Under identical workload shapes (prefill + decode, short and long contexts) we see consistent p50/p95 ordering across SKUs but large p99 divergence tied to specific driver+CUDA combinations.\n- H100 variants (cloud-specific SKUs) give best sustained throughput for long-context streams but show higher burst tail when GPU P-states or thermal governors kick in under sustained decode.\n- A100 instances show more predictable tail latency across driver variants but higher per-token average latency for large attention windows compared to H100.\n- L40S (where available) has competitive small-batch latency and lower kernel-launch variance, making it attractive for low-latency small-scale endpoints.\n- CUDA/driver pairings matter: CUDA 12.x + driver 535-like stacks produce sporadic kernel enqueue stalls on some EC2 placements; fallback to CUDA 11.8 stacks reduced these particular stalls in our repro.\n\nTest matrix (minimal reproducibility set):\n- Models: 7B-llama-style (FP16), 13B-llama-style (FP16).\n- Sequence lengths: short (32 prefill + 32 decode), medium (128+128), long (2048 prefill + 512 decode).\n- Batch sizes: 1, 4 (microbatching), 16 (throughput mode).\n- Concurrency: 1, 8, 32 concurrent requests.\n- Cloud SKUs sampled: AWS p4d.24xlarge (A100), AWS hpc6a/h100 variants (where available), GCP a2-highgpu (A100), GCP h100 (a future preview SKU), Azure NDv5 (H100), and NVidia L40S-enabled marketplace images (where available).\n- Driver/CUDA matrix: CUDA 11.8 + driver 520, CUDA 12.0 + driver 525, CUDA 12.1/12.3 + driver 535. Also test with the OS-level nvidia-persistenced on/off.\n\nInstrumentation/measurement notes:\n- Use internal microbench harness (perf-runner v0.9) with eBPF-based kernel-launch tracing and per-token timestamping forwarded to trace collector.\n- Measure p50/p90/p95/p99/99.9 for prefill and decode phases separately.\n- Capture GPU metrics: SM utilization, power draw, clocks, NVLink utilization, PCIe counters where available.\n- Collect driver logs (dmesg, nvidia-smi -q -x) at start/end and when a tail event is observed.\n- Ensure workload pins CPUs to isolated cores so host jitter is minimized.\n\nRepresentative findings (raw-ish):\n- Short context (32+32), batch=1, concurrency=1:\n  - A100 (CUDA11.8/driver520): p50=18ms p95=25ms p99=35ms\n  - H100 (CUDA12.0/driver525): p50=16ms p95=30ms p99=60ms (sporadic long tail ~200ms on ~0.1% of calls)\n  - L40S (CUDA12.1/driver535): p50=19ms p95=26ms p99=32ms\n  Notes: H100 shows better median but heavier p99; L40S very consistent for small token counts.\n\n- Long context (2048+512), batch=4, concurrency=8:\n  - A100: sustained per-token decode throughput lower (~5%) than H100 but tail was flatter (p99 ~ 1.8x p95).\n  - H100: higher sustained throughput but p99 spikes when clocks drop under thermal pressure (p99 ~ 3.5x p95).\n\n- Driver effects observed:\n  - CUDA12.1 + driver535 on several GCP A100 placements produced intermittent kernel enqueue waits (~100-400ms). Reverting to 11.8 stack eliminated the long enqueue waits in our replay runs.\n  - Enabling nvidia-persistenced reduced startup variance on machines with cold worker pools but didn't eliminate mid-run stalls attributed to PCIe/DRAM refresh cycles.\n\nHypotheses and triage notes:\n- Hypothesis A: H100 thermal/P-state transitions under sustained decode lead to transient clock drops causing kernel hangs at the enqueue or increased queue latency.\n  - Triage: instrument GPU clocks and pstate change logs while forcing high clocks (coolbits boost) in lab to see if tails disappear.\n\n- Hypothesis B: Newer driver stacks schedule different kernel launch/stream priorities (CUDA runtime changes) which can expose race conditions in our continuous-batching layer causing occasional stall.\n  - Triage: run with CUDA_VISIBLE_DEVICES=0 and set explicit stream priorities; add extra ordering fences in a debug build to see if stalls reduce.\n\n- Hypothesis C: Some cloud placements have root complex/PCIe path differences that increase DMA latency variability (we saw correlation with specific AZs).\n  - Triage: correlate at AZ level and compare PCIe counters; repro by migrating instances to different placement groups.\n\nOpen questions / TODOs:\n- Need to confirm whether Linux kernel versions (5.x vs 6.x) correlate strongly with the enqueue stalls \u2014 gather node kernel version metadata in next runs.\n- Are any of these effects visible at application-level traces we ship to customers? Create a short alert rule to flag >150ms single-token decode events in hosted API logs.\n- Validate whether quantization (INT8) changes the tail characteristics (we only tested FP16 here).\n\nQuick action items (for next 2 weeks):\n- Miguel: create a minimal repro job that reliably triggers the ~200ms H100 tail (attach exact kernel call stack when observed). Link: JIRA-INF-987.\n- Priya: run the same matrix on a batch of instances pinned to the same AZ on AWS and GCP (n=5 each) and capture PCIe counters + driver dmesg.\n- Ava: add a debug build of runtime that inserts optional extra stream-fencing to isolate ordering-related stalls; run with CUDA12.1/driver535 to confirm impact.\n\nNotes to self (scribbles):\n- We should avoid immediately concluding \"H100 is flaky\" \u2014 need to map to placement/driver stacks. Some fast paths on H100 are clearly higher throughput at cost of susceptibility to transients.\n- Consider expanding the matrix to include mixed-tenant noise (co-located VMs) since cloud interference might amplify tail in production.\n\nAppendix: useful commands and short logs to attach when filing bugs:\n- nvidia-smi dmon -s u --interval=1\n- sudo cat /var/log/nvidia/driver.log (where present)\n- dmesg | grep -i nvrm\n- perf-runner command used: perf-runner run --model 7b --seq 2048 --batch 4 --concurrency 8 --trace eBPF --outdir /tmp/perf-a100-run1\n\nReferences / links:\n- GH PR with harness changes: https://github.com/redwood-inference/serving-runtime/pull/482\n- Slack thread: https://redwood.slack.com/archives/C01ABCDEF/p1670000000000000\n- Jira: JIRA-INF-987 (H100 tail repro)\n\nIf anything looks off or you have local placement IDs that correlate, paste them here and I'll tie them to the telemetry blobs.\n\n-- Ava\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_62688493d17448c198a314098c1cd15d"
+}

@@ -1,0 +1,21 @@
+{
+  "channel": "eng-runtime",
+  "thread_ts": "1752468132",
+  "first_message_ts": "1752468132",
+  "last_message_ts": "1752468732",
+  "participants": [
+    "omar",
+    "alisa",
+    "mike",
+    "kai",
+    "jen",
+    "tao",
+    "perf-bot"
+  ],
+  "text": "omar: Heads-up \u2014 saw a ~2.3x p50 latency spike on mixtral-mistral combo when FlashAttention was selected for a Qwen model with non-8-multiple head dim (qwen-10h, head_dim=10). Dumping kernel select logs and a tiny repro below. anyone seen this?\n\nalisa: Oof. Do you have seq len / batch details? Could be RoPE scaling hitting a special mask path.\n\nomar: repro: model=qwen-10h variant=mixtral-compat, batch=8, seq=512, head_dim=10, rope_scale=0.98. Kernel logs:\n```\n[INFO] kernel_selector: trying FlashAttention kernel: flash_attn_v2 (requires head_dim % 8 == 0)\n[WARN] kernel_selector: head_dim % 8 != 0 -> using padded kernel path\n[ERROR] triton_compiler: failed to compile flash_triton_kernel: warp_mask_mismatch (RoPE scaling mismatch)\n[INFO] kernel_selector: falling back to SDPA kernel (sdpa_cu)\n```\nlatency: p50 baseline(soft-fallover to sdpa)=38ms, observed=92ms after attempted Flash path + fallback.\n\nmike: Looks like Triton compile failing at runtime triggers the expensive fallback and extra memcopies. SDPA fallback itself is fine but we've seen masking-induced extra copies when RoPE scale != 1. Can you paste the perf profile?\n\nomar: profiler snippet (top rows):\n```\nCPU  40% - kernel_router (serialize fallback decision)\nGPU  60% - sdpa_cu: extra buffer alloc + memcpy (seq_pad to 16)\nGPU  20% - triton_compile_wait (spiky)\n```\nAlso config used: \n```json\n{\"KV_PREFETCH\": false, \"REDWOOD_KERNEL_PREFER\": \"flash,triton,sdpa\", \"AUTO_PAD_HEADS\": false}\n```\n\nkai: Quick notes: FlashAttention expects head dims aligned to 8/16 for its fastest kernels. For odd head dims we route to a padded/triton path that can hit compile-time edgecases. With non-1 RoPE scaling we sometimes take a masked warp that Triton miscompiles -> runtime compile fail -> sdpa fallback. The fallback path does extra zero-pad memcpy which kills latency.\nIf you enable KV prefetch it reduces fragmentation in KV cache and avoids a few extra memcpys. Try `REDWOOD_KV_PREFETCH=1` and also `REDWOOD_KERNEL_PREFER=sdpa,flash` to force SDPA first for odd heads.\n\nomar: tried `REDWOOD_KV_PREFETCH=1` and forcing SDPA first. p50 returns to ~40ms (nice) but host CPU rose by ~12% due to prefetch threads. KV fragmentation metric dropped (kv_frag_ratio 0.42 -> 0.07). No model quality regressions observed. Profiling snippet after change: \n```\nGPU  85% - sdpa_cu (no extra memcpys)\nCPU  25% - kv_prefetch_worker\n```\n\njen: We should add a unit/integration test that exercises head_dim %8 !=0 + rope_scale !=1 to prevent this regressing. Filed PERF-1123 and added a short repro in the ticket.\n\nperf-bot: New benchmark uploaded: run_id=2026-03-16-0543. Summary: qwen-10h (head_dim=10) p50 with flash+triton enabled=92ms -> with SDPA-first + KV_PREFETCH=1 = 41ms. Artifacts: s3://perf-artifacts/2026-03-16-0543/\n\ntao: Proposal: short-term: route odd head dims to the SDPA-optimized path explicitly (bypass Triton) until we get a safe Triton compile for the masked warp. Add a canary flag `REDWOOD_KERNEL_ROUTE=sdpa-oddheads` and a rollout to 1% of dedicated. Long-term: upstream a fix/workaround to Triton and add padded-kernel correctness tests. I'll open a PR for the canary.\n\nomar: OK, will run canary on dedicated and report results. attaching the tiny repro script (seq=512, batch=8) to the PERF-1123 ticket. thanks all :thumbsup:\n",
+  "title_field_name": "channel",
+  "content_field_names": [
+    "text"
+  ],
+  "dataset_doc_uuid": "dsid_2f999b016bba4828aa7fe18f96138b8f"
+}

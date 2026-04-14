@@ -1,0 +1,106 @@
+{
+  "key": "ENG-194321",
+  "team": "engineering",
+  "title": "Quantized KV sparse mapping with retention windows and GPU swap coordinator",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-01-20",
+  "updated_at": "2026-03-10",
+  "creator": "Maya Thompson",
+  "assignee": "Ravi Patel",
+  "project": "runtime-2.3-kv-optimizer",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-21",
+  "labels": [
+    "kv-cache",
+    "gpu-paging",
+    "quantization",
+    "perf"
+  ],
+  "release": "runtime-2.3",
+  "security_review_required": "false",
+  "customer_impact": "medium",
+  "description": "Implement a paged/blocked KV cache variant that uses a sparse mapping table for quantized KV shards plus a retention-window eviction heuristic and a GPU swap coordinator. Goal: reduce GPU DRAM footprint for long-context workloads while preserving steady-state latency during continuous batching. This ticket covers design, prototype implementation, integration with the batching layer and early rollout in canary clusters.",
+  "context": "We see two classes of tail behavior: (1) long-running chat sessions where older KV entries are cold but may be re-referenced, and (2) high-concurrency bursts where the KV working set grows transiently and triggers GPU OOM or swap storms. Current slab allocators are efficient for dense residency but suffer fragmentation and thrash when under memory pressure. Quantized model variants (int8/4) reduce per-key size but introduce misaligned placement and locality challenges. We need a controller that reasons about quantized block granularity, token-affinity, and batching-induced access patterns to avoid oscillation between host and GPU memory.",
+  "acceptance_criteria": [
+    "Prototype scheduler integrated with runtime that can mark KV blocks as resident or staged to host and perform coordinated swap without blocking foreground token generation",
+    "End-to-end latency degradation <= 12% for p50/p95 on our long-context chat benchmark compared to baseline with full residency",
+    "Memory footprint reductions >= 45% on average for 32k context jobs using mixed int8/4 KV representations",
+    "No swap-thrashing loops observed in 24-hour soak test under synthetic bursty arrival patterns",
+    "Automated e2e test and regression harness added to CI and a perf dashboard panel showing residency vs latency over time"
+  ],
+  "design_notes": [
+    "Data layout: KV storage split into fixed-size 'tiles' (256KB logical tile) aligned to page boundaries. Tiles contain quantized embeddings and a small per-tile metadata header (last_access_ts, reuse_score, residency_state).",
+    "Sparse mapping table: stores tile -> residency pointer mapping. Unmapped tiles implicitly staged on host. Mapping table is sharded by token-affinity hash to reduce contention during batching coalescing.",
+    "Retention window: each tile gets a sliding retention window (min_retain_ms, decay_rate) computed from observed reuse patterns. Tiles with retention_score below threshold become eligible for demotion.",
+    "GPU swap coordinator: centralized in the node process (not on-GPU) to orchestrate DMA coalescing and avoid scattering many small PCIe transfers. Coordinator batches demote/promote ops aligned to upcoming batch boundaries.",
+    "Hysteresis & backoff: introduce two thresholds - soft_limit and hard_limit - to avoid oscillation. Soft triggers asynchronous prefetch/demotion hints; hard triggers blocking transfer fallback with temporary batching throttling.",
+    "Batching integration: continuous-batch preflight inspects the next N tokens' KV tile set and signals the coordinator to prioritize promoting hot tiles for the imminent batches. We reuse existing batch planner token-affinity metrics.",
+    "Eviction policy: LRU+reuse_prob heuristic at tile granularity weighted by tile compression ratio (quantized tiles with higher compression are cheaper to keep on GPU).",
+    "Metadata persistence: per-request KV pinning requests are persisted in request context to guarantee that we don't evict tiles required for in-flight requests.",
+    "Observability: emit metrics (tiles_resident, tiles_promoted, tiles_demoted, avg_transfer_size_bytes, swap_latency_ms, thrash_events) and per-request fallback_reason tags.",
+    "Compatibility: falls back to existing slab allocator for models that don't expose quantized tile metadata; coordinator operates in conservative mode (larger retention windows)."
+  ],
+  "implementation_plan": [
+    "Week 1: Implement tile metadata struct, sparse mapping table with sharded locks, and persistence hooks in KV store layer.",
+    "Week 2: Implement GPU swap coordinator with batching for promote/demote ops + simple DMA coalescer (merge contiguous host blocks into single transfer when possible).",
+    "Week 3: Integrate retention window heuristic and eviction policy; add soft/hard thresholds and backoff behavior; unit tests for eviction correctness.",
+    "Week 4: Integrate with continuous batch planner for preflight hints and measure impact on microbenchmarks; iterate on heuristic parameters.",
+    "Week 5: Run soak tests and closed-canary with small traffic, collect metrics and tune hysteresis/backoff parameters.",
+    "Week 6: Add perf dashboard panels and end-to-end regression tests; prepare rollout runbook and rollback plan."
+  ],
+  "tradeoffs_and_risks": [
+    "Extra coordinator complexity increases node-process CPU usage; mitigated by sharded maps and coalescing to limit overhead.",
+    "Prefetch mistakes can waste PCIe bandwidth and raise latency; mitigate via conservative soft_limit and telemetry-driven tuning.",
+    "Quantized tile fragmentation may reduce effective compression; tile sizing (256KB) is a tunable parameter \u2014 larger tiles reduce metadata overhead but increase wasted memory when partially used.",
+    "In-air gaps: requests pinned to tiles that get demoted must be protected \u2014 we add per-request pin counters. Incorrect accounting could cause silent correctness bugs; unit tests and stress tests required.",
+    "Edge cases with heterogeneous hardware (NVLink vs PCIe) require different thresholds; system must expose machine-profile knobs.",
+    "Potential increased tail latency for worst-case eviction-induced promotions; controlled by hard_limit slow-path which trades throughput for bounded latency.",
+    "Fallback compatibility mode for older models avoids regressions but reduces memory savings for those workloads."
+  ],
+  "testing_plan": [
+    "Unit tests for tile metadata lifecycle and sparse mapping correctness (create/promote/demote/free).",
+    "Integration tests: synthetic workloads covering long-chat reuse, bursty concurrent sessions, and random reseek to validate no-thrashing property.",
+    "Performance benchmarks: compare baseline full-residency vs new coordinator for p50/p95/p99 latency and throughput across 4 model sizes (7B/13B/70B/175B) with mixed quantization profiles.",
+    "Soak test: 72-hour canary with real traffic subset, monitor thrash_events and swap_latency_ms alerts.",
+    "Chaos test: randomized host/GPU transfer failures to validate graceful fallback to blocking transfers and ensure no request corruption.",
+    "CI: regression harness that replays recorded access traces and asserts no regression in token-per-second and memory footprint metrics.",
+    "Observability verification: validate new metrics appear in runtime telemetry and dashboards, and that alerts trigger on configured thresholds."
+  ],
+  "rollout_and_mitigation": [
+    "Start in internal dev clusters with synthetic traces; then small canary (2 nodes) behind runtime-2.3 feature flag.",
+    "If thrash_events > 0.5% of requests in canary, revert to conservative retention windows and increase soft_limit by 30%.",
+    "If p95 latency increase > 20% in canary, disable preflight promotions and run again to isolate batching integration impact.",
+    "Provide automated rollback: toggle feature flag kills coordinator and reverts to slab allocator behavior within 30s.",
+    "Document runbook for on-call: commands to inspect tile residency, force-promotion of critical tiles, and to clear host-stage cache."
+  ],
+  "open_questions": [
+    "Optimal tile size for mixed quantized representation \u2014 run param sweep (64KB/128KB/256KB/512KB) in microbenchmarks.",
+    "How to expose user-level hints (pin this context) in public API without opening DOS vectors? Consider rate-limited pinning endpoints.",
+    "Default thresholds for NVLink-enabled hosts vs PCIe-only nodes.",
+    "Should we allow model-specific retention profiles (author-provided) versus inferred heuristics?",
+    "Cost model: quantify additional CPU and PCIe usage and reflect in runtime cost dashboards."
+  ],
+  "notes": [
+    "Initial prototype code lives in feature/kv-tiled-swap branch: https://github.com/redwood-inference/runtime/pull/4789",
+    "Design doc draft: https://confluence.redwood.ai/display/RUNTIME/Quantized+KV+Tiled+Swap+Coordinator",
+    "Bench harness traces uploaded: s3://redwood-ci/kv-tiling/traces/2026-02",
+    "Related tickets: ENG-172456 (kv-tile-orchestration), ENG-41234 (gpu-page-coalescing).",
+    "Owner: Ravi Patel. Reviewers: Laura Kim (storage), Jonas Eriksson (perf), Priya Sharma (reliability)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "context",
+    "acceptance_criteria",
+    "design_notes",
+    "implementation_plan",
+    "tradeoffs_and_risks",
+    "testing_plan",
+    "rollout_and_mitigation",
+    "open_questions",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_2ba1ef476fcc46e19ac0bfb6e29eb4f9"
+}

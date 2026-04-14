@@ -1,0 +1,60 @@
+{
+  "title": "OOM propagation & CNI send-queue backlog - oncall scrapbook",
+  "owner": "Ava Moreno",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/site-reliability-engineering/oom-propagation-cni-sendqueue-scrapbook.json",
+  "doc_type": "doc",
+  "created_at": "2025-09-10",
+  "last_modified": "2025-09-12",
+  "collaborators": [
+    "Ravi Patel",
+    "Maya Chen",
+    "Luca Bianchi"
+  ],
+  "team": "eng-sre",
+  "status": "draft",
+  "tags": [
+    "kubernetes",
+    "cni",
+    "oom",
+    "oncall",
+    "networking",
+    "triage"
+  ],
+  "linked_artifacts": [
+    "JIRA-OPS-2412",
+    "confluence://sre/runbooks/cni-backlog",
+    "https://github.com/redwood-inference/k8s-tools/pull/118"
+  ],
+  "summary": "During a sustained load test (synthetic traffic ramp), several worker nodes experienced repeated container OOM kills which coincided with rapid growth of the CNI send queue on those nodes. Symptoms: pod-level OOMs, high kubelet eviction events, and CNI plugin transmit-queue lengths growing until packets were dropped and higher request latencies resulted. This doc is an oncall scrapbook capturing timeline, immediate mitigations, root-cause hypotheses we exercised, and follow-ups for a more robust runbook.",
+  "incident_timeline": "2025-09-10 09:12 UTC - Alert: increased 95th p99 latency for inference-route /v1/generate; Pager fired.\n2025-09-10 09:14 UTC - Observed spike in pod restarts on three workers (ip-10-0-14-xx, ip-10-0-21-xx, ip-10-0-23-xx).\n2025-09-10 09:15 UTC - Oncall pulled node metrics: node_memory_MemAvailable trending down, oom_kill_count incrementing on containerd.\n2025-09-10 09:18 UTC - Network team flagged CNI send-queue (calico_send_queue_len) climbing on same nodes; tx drops increasing on veth interfaces.\n2025-09-10 09:22 UTC - Performed targeted cordon + drain of two worst nodes to protect control-plane and reduce noisy neighbors.\n2025-09-10 09:28 UTC - Kubelet logs show frequent kubelet eviction decisions (memory.available threshold).\n2025-09-10 09:35 UTC - Recovered baseline latency after drains and container image cache warming; alerts subdued by 09:42 UTC.\n2025-09-10 09:45 UTC - Post-incident checks: no etcd latency anomalies; API server healthy.\n2025-09-10 10:05 UTC - Postmortem brainstorming and action assignment begun.",
+  "observations": "- OOMs started inside inference containers (oom-killer logs point to processes serving model shards).\n- Kubelet evictions triggered quickly after memory spiking; eviction thresholds configured conservatively on these instance types.\n- calico_send_queue_len metric (custom exporter) shows send queues rising before OOMs in time series.\n- Interface tx_dropped and TX queue len (ethtool -S) spiked concurrently; suggests packets queued in kernel while CNI attempted to transmit.\n- No sustained etcd warnings or API server errors; control plane not root cause.\n- Node-level swap is disabled (explicit), so kernel OOM is primary reclaim pathway.\n- Worker instance family shows bursty CPU + memory pattern during synthetic load; nodes were close to memory capacity pre-test (no prewarming).",
+  "hypotheses_tested": "- Hypothesis A: Memory leak in model process -> reproduced by running the same load in staging: memory growth matches production; ruling in process memory as contributor.\n- Hypothesis B: CNI stalls cause backpressure and processes block accumulating ephemeral buffers -> tested by dumping socket queues and reading calico agent logs; found repeated \\\"send failed\\\" with EAGAIN and long queuing.\n- Hypothesis C: Kernel-level networking issue (driver bug) -> checked kernel logs, no driver oops but tx timeout counters rose. Not primary.\n- Hypothesis D: Kubelet eviction settings too aggressive causing cascading restarts -> verified thresholds; eviction occurred after kernel OOMs rather than preventing them. Partial contributor.",
+  "immediate_mitigations": "- Cordon + drain two saturating nodes to offload work (kubectl cordon/drain with --ignore-daemonsets).\n- Restarted calico-node pods on two nodes to clear stuck send-queues (kubectl delete pod calico-node on nodes).\n- Temporarily scaled inference deployment replicas down by 25% to reduce memory pressure during the test.\n- Increased pod memory requests in staging to force scheduler to place pods on larger instances for next run.\n- Ensured kubelet eviction thresholds left at defaults while we evaluate long-term change (avoid flapping).",
+  "root_causes": "- Primary: Pod memory usage growth during synthetic ramp pushed nodes to kernel OOM path; absence of swap and conservative kubelet eviction timing meant kernel OOMs occurred before graceful kubelet eviction could stabilize pods.\n- Secondary: CNI send-queue growth amplified resource pressure \u2014 when node transmit queues backed up, processes handling RPCs/ingress blocked and memory buffers accumulated.\n- Tertiary: Test environment lacked prewarmed model caches and had high pod density on smaller shapes leading to fragile margin for memory spikes.",
+  "long_term_actions": "- A1 (owner: Ravi) - Update SRE runbook: add section \\\"CNI send-queue indicators\\\" with quick PromQL checks and ip route/ethtool commands. due: 2025-09-26.\n- A2 (owner: Maya) - Introduce a canary test that warms model caches before ramping load; embed into perf harness. due: 2025-10-03.\n- A3 (owner: Luca) - Evaluate kubelet eviction vs. oom_killer ordering on our kernels and consider more proactive eviction (or system reserved memory adjustments) on inference pools. due: 2025-10-10.\n- A4 (owner: Networking) - Add monitoring alert for calico_send_queue_len > threshold for >2min. Also instrument TX backlog via node exporter. due: 2025-09-19.\n- A5 (owner: Infra) - Re-evaluate instance sizing for inference pool and pre-bake base model artifacts into images for faster warmup. due: 2025-10-01.",
+  "metrics_and_logs": "PromQL snippets used:\n- calico_send_queue_len{node=~\"ip-10-0-.*\"} > 0\n- rate(container_memory_usage_bytes{pod=~\"inference.*\"}[1m])\n- increase(node_oom_kills_total[15m])\n- sum by(node) (kube_pod_container_resource_requests_memory_bytes) / machine_memory_bytes\nLogs & commands run:\n- journalctl -u kubelet -n 100 --no-pager\n- dmesg | grep -i oom\n- sudo ss -s; sudo ss -o state established\n- sudo ethtool -S eth0 | grep tx\n- calicoctl node status && calicoctl get felixconfigurations -o yaml\n- kubectl describe pod <pod> --namespace prod-inference (OOM messages shown)\n- conntrack -L | wc -l (verified not a conntrack exhaustion event)",
+  "runbook_deltas": "- Insert new watchpoints: calico_send_queue_len and node tx_dropped thresholds.\n- Add a short checklist for oncall: 1) check calico queue, 2) check dmesg for oom-killer, 3) confirm etcd/API server health, 4) cordon/drain plan, 5) scale down noisy deployments.\n- Add safe command snippets for draining with minimal disruption (kubectl drain flags).",
+  "uncertainties_and_next_questions": "- Why did the send-queue growth precede OOMs on timeline in some nodes but not others? Is there a subtle kernel scheduling interplay causing blocked threads to accumulate memory?\n- Are we seeing any hints of packet requeues at the CNI level that amplify memory use inside calico/node? Need deeper calico internal metrics.\n- Should we move to instance types with slightly higher memory headroom for inference pools, or change packing strategy? Cost tradeoffs to be evaluated.\n- Could a different CNI (or Calico config tweak: reduce per-queue buffering) materially reduce backpressure?",
+  "notes_to_self": "- Keep a short reproducible script to drive the failing pattern in staging (link to perf harness below).\n- handy commands during triage: kubectl get events --all-namespaces --sort-by='.lastTimestamp' | tail -n 200; for node in <list>; do ssh $node 'sudo dmesg | tail -n 200'; done\n- When restarting calico-node, watch for ephemeral routing flaps; prefer rolling restarts one node at a time.\n- Don't immediately change eviction thresholds in prod during an ongoing incident; prefer cordon/drain and scaling adjustments first.",
+  "attachments": [
+    "perf-harness/run-sustained-warmup.sh",
+    "supporting-graphs/calico_send_queue_2025-09-10.png",
+    "oom-killer-dmesg-snippets.txt"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "incident_timeline",
+    "observations",
+    "hypotheses_tested",
+    "immediate_mitigations",
+    "root_causes",
+    "long_term_actions",
+    "metrics_and_logs",
+    "runbook_deltas",
+    "uncertainties_and_next_questions",
+    "notes_to_self"
+  ],
+  "dataset_doc_uuid": "dsid_b842dc2747cd442b825dd38208b538d8"
+}

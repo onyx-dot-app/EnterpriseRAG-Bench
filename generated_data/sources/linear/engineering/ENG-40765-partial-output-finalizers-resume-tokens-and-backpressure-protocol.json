@@ -1,0 +1,47 @@
+{
+  "key": "ENG-40765",
+  "team": "engineering",
+  "title": "Partial output finalizers, resumable tokens, and backpressure protocol for disconnected clients",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-02-10",
+  "updated_at": "2025-02-18",
+  "creator": "Asha Patel",
+  "assignee": "Daniel Kim",
+  "project": "streaming-reliability",
+  "cycle": "2025-W07",
+  "estimate": "5",
+  "due_date": "2025-02-28",
+  "labels": [
+    "streaming",
+    "backpressure",
+    "client-reconnect",
+    "slo",
+    "eviction-policy"
+  ],
+  "parent_issue": [
+    "ENG-44610"
+  ],
+  "dependencies": [
+    "ENG-31822",
+    "ENG-36211"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.20",
+  "security_review_required": "true",
+  "body": "Summary:\nWe need a robust protocol and server-side finalization/cleanup model for streaming generations when clients disconnect, exceed timeouts, or partially consume output. Current behavior leaves ephemeral partial outputs in the cache and can result in stale/inaccessible artifacts, uneven resource usage, and customer-facing surprise (partial tool calls or incomplete structured outputs). This ticket proposes: 1) a resumable resume-token model for reconnects, 2) a server-side 'finalizer' event that collapses partial generations into a compact tombstone or persisted artifact, and 3) a credit-based backpressure upgrade to reduce orphaned in-flight work.\n\nProblem statement and pain points:\n- Clients disconnect mid-stream (network flaps, mobile suspend) and may reconnect expecting to resume but current resume semantics are ad-hoc and inconsistent across clients.\n- Partial tool/function calls risk being left halfway (e.g., tool invoked but callback never attached), leading to side-effect confusion.\n- Long-lived partial KV cache state increases memory/GPU residency and skews batching heuristics.\n- Operators see spikes in 'orphan generations' and higher than expected token billings without corresponding completed responses.\n\nGoals:\n- Provide a deterministic reconnect/resume flow with a short-lived resume token that guarantees idempotent resume or clear finalization.\n- Emit a server finalizer artifact on disconnect or timeout that is safe for downstream evaluation, tooling, and audit logs.\n- Enforce backpressure via a credit window per-client and per-session to bound outstanding tokens and prevent runaway resource retention.\n- Make behavior observable in Console (orphaned_count, avg_orphan_lifetime, resume_success_rate) and alertable when thresholds crossed.\n\nProposed design (high level):\n1) Resume tokens and session leases:\n   - Every streaming session issues a resume_token in the initial response metadata. Token TTL = 90s (configurable per-customer).\n   - Resume uses a Resume-Token header + last-ack-offset to reattach. If token expired, client gets HTTP 410 with guidance to re-issue request.\n   - Tokens are single-resume (one successful resume) to avoid concurrent resumes; second attempt returns 409 Conflict.\n\n2) Finalizers and tombstones:\n   - On explicit client close (well-formed close frame) server attempts graceful finalization: run structured-output validation and produce a compact final artifact stored in ephemeral store with TTL 24h.\n   - On abrupt disconnect or token expiry, server runs a deterministic finalizer: summarize last delta, annotate tool calls as 'aborted' and generate a tombstone JSON capturing last-valid-state + reason (client_disconnect, timeout, reclaim).\n   - Finalizer artifacts surface to Console under request trace and are linkable to PRDs/incident pages.\n\n3) Credit-based backpressure (per-session):\n   - Implement a token-credit window: client may request up to N outstanding tokens (default 4) per streaming session. Server will queue/hold further tokens at ingress until downstream batch/execution resources free up.\n   - Credits decrement when server begins work on a response chunk and increment when an ACK or finalizer runs.\n   - For long-running chains with tool calls, we add an additional 'side-effect credit' that must be consumed before invoking irreversible operations; if absent, server returns a 429-streaming-credit-exhausted code prompting client to throttle or convert to non-streaming request.\n\n4) Tool/function calling semantics on disconnect:\n   - Tool invocations enter a two-phase state: invoked -> awaiting-callback. If client disconnects before callback attachment, the finalizer either: (a) re-run the tool under a 'dry-run' cap and attach a neutral result, or (b) mark the invocation as 'aborted' and emit structured placeholder. Determination made by tool idempotency metadata provided at model onboarding.\n\n5) Observability and telemetry:\n   - New metrics: orphaned_generations_count, orphaned_generation_duration_seconds (histogram), resume_tokens_issued, resume_success_rate, credits_blocked_total.\n   - Console: per-model and per-key dashboard panels, alerts for orphaned_generation_rate > 1% sustained and resume_success_rate < 80% across 5m.\n\n6) UX and API surface changes:\n   - Resume-Token header returned in initial stream and finalizer events include finalizer_url.\n   - Error codes: 410 ResumeTokenExpired, 409 ResumeConflict, 429 StreamingCreditExhausted, 424 FinalizerPending (for clients awaiting finalization).\n\nAcceptance criteria:\n- reconnect/resume flow covered by e2e tests (simulated disconnect, resume within TTL, assert state continuation).\n- finalizer artifacts generated for abrupt disconnects and visible in Console traces.\n- credit window prevents >N active generation tasks per-session in stress tests.\n- automated migration runbook and a failing-on-high-orphan alert created in PagerDuty.\n\nRollout plan:\n- Phase 1 (canary): runtime-1.20-canary with credit window default disabled and resume-token support enabled (server logs resume token events). 1-week canary on internal org + selected beta customers.\n- Phase 2: enable credit window default for new keys; console telemetry added. Monitor metrics for 2 weeks.\n- Phase 3: enforce tokens TTL and tombstone finalizers; notify customers via console and changelog.\n\nTesting plan:\n- Unit tests for token lifecycle, credit accounting, and finalizer generation.\n- Integration test matrix: abrupt TCP disconnect, HTTP/2 GOAWAY, mobile suspend (app background), and client forced 429 handling.\n- Load test with synthetic clients to validate memory/GPU residency under high churn.\n\nArtifacts:\n- Confluence design: https://redwood.atlassian.net/wiki/spaces/RT/pages/22440123/partial-output-finalizers (draft)\n- Reference PR (runtime): https://github.com/redwood-inference/runtime/pull/7124 (WIP)\n- Test harness (internal): gs://redwood-test-harness/streaming-resume/2025-02\n\nOpen questions / trade-offs:\n- TTL values: 90s token TTL vs. user convenience for mobile reconnections (trade-off between resource holding and UX).\n- Tool re-run policy: safe for purely functional tools but risky for side-effectful tools; need tooling metadata to mark tool idempotency.\n- Persistence boundary: keep finalizers in ephemeral store (24h) vs. writing to longer-term audit logs for compliance customers.\n\nNext steps:\n- Finalize API error codes and header names (deadline 2025-02-14).\n- Engineering spike to prototype credit window (2d) and finalize metric names (2025-02-12 to 2025-02-14).\n- Submit PR for resume-token plumbing and a simple tombstone generator (target PR by 2025-02-18).\n",
+  "comments": [
+    "2025-02-11 - Daniel Kim: Started spike on credit window accounting. Found that current txn layer doesn't expose per-session counters; planning to add lightweight in-memory counters sharded by worker. Draft PR link will follow.",
+    "2025-02-12 - Priya Rao (PM): Reviewed goals and asked to surface mobile reconnection UX trade-offs in the public changelog. Added 'mobile-ux' label.",
+    "2025-02-14 - Security review (Marta Li): flagged tool re-run policy as high risk for side effects. Suggests gating auto re-run behind tool metadata and a customer-level opt-in for side-effectful tools.",
+    "2025-02-15 - Daniel Kim: Implemented prototype credit window in the canary runtime branch. Benchmarks look promising: orphan memory reduced by ~37% under churn workload. Preparing PR.",
+    "2025-02-17 - Asha Patel: Updated acceptance criteria to include Console visibility and PagerDuty alerting. Scheduled canary rollout for 2025-02-20 for internal org.",
+    "2025-02-18 - Design review (Evan Wu): Approved finalizer artifact schema with one change: add 'finalizer_reason' enum. Updated body to reflect this."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_1fd1f48f872d424a909ed5b23acebd73"
+}

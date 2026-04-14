@@ -1,0 +1,76 @@
+{
+  "key": "SUP-2084043",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Unexpected GPU scarcity during high fanout; prefetch locks and allocator throttling",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Priya Shah",
+  "assignee": "Ethan Bernstein",
+  "customer_company": "VertexHealth",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "allocator",
+    "scheduler",
+    "api-gateway"
+  ],
+  "labels": [
+    "noisy-neighbor",
+    "autoscale",
+    "prefetch-lock",
+    "gpu-shortage",
+    "dedicated-pool"
+  ],
+  "environment": "prod-us-west",
+  "affected_models": [
+    "redwood/gpt-13b-v2-quant",
+    "redwood/gpt-7b-quant"
+  ],
+  "affected_regions": [
+    "us-west"
+  ],
+  "sla_due_at": "2026-03-10T13:30:00Z",
+  "first_response_due_at": "2026-03-10T09:00:00Z",
+  "linked_issues": [
+    "SUP-312580",
+    "SUP-403210"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/allocator/pull/548",
+    "github.com/redwood-inference/prefetcher/pull/131"
+  ],
+  "related_confluence_pages": [
+    "Confluence:Runbooks/DedicatedPool-GPUShortage",
+    "Confluence:Postmortems/2026-03-prefetch-locks"
+  ],
+  "description": "Issue summary:\nCustomer VertexHealth experienced sudden throughput collapse on their dedicated pool during midday traffic spike with many short chat fanouts. Traffic profile: high fanout of short streams (avg tokens/stream ~40) with a metadata-heavy prefetch pattern.\n\nImpact:\n- Customer observed p99 token latency spike from ~120ms to ~2.4s across routed model variants.\n- Requests began receiving allocator attach delays (attach_time spikes) and a subset of short streams failed with 504s on the client side.\n- Customer reported visible increased costs due to retries and fallback to hosted tier.\n\nEnvironment:\n- Dedicated pool: pool-id d-pool-vertex-03 (prod-us-west)\n- Models: redwood/gpt-13b-v2-quant pinned for customer routes; fallback to 7b quant during capacity fallbacks\n- Infra: nvidia-A100 heterogeneous mix; allocator version: v2.8.1; prefetcher: v1.4.0\n\nSteps to reproduce (customer-provided):\n1) Run high fanout load: 60k short streams over 10 minutes with average concurrency ~120 per tenant shard.\n2) Enable prefix prefetch with aggressive TTL refresh (~30s) and small kv-cache budget per stream.\n3) Observe attach_time and p99 token latency across the pool.\n\nObserved logs / snippets:\n- allocator: \"attach_delay=1123ms attach_retry=3 slot_wait=87ms reason=allocator-throttle\"\n- prefetcher: \"prefetch_lock_acquired stream_id=xxxx duration=1450ms kv_growth=+40MB\"\n- runtime kernel: \"nvlink_io_wait=high pci_stall=intermittent kernel_queue_depth=low\"\n\nNotes: this is not the usual long-lived-ephemeral-snapshotter pattern; noise appears tied to many concurrent short sessions and aggressive prefetch TTLs that are causing transient kv-cache growth and prefetch locks which in turn starve allocator attach bandwidth for new attaches.",
+  "comments": [
+    "2026-03-10 08:42 - Support (Priya): Customer opened after noticing p99 jump at 08:30 UTC. Provided load profile and sample request IDs.",
+    "2026-03-10 09:05 - Oncall SRE (Ethan): Replicated a small-scale fanout locally; saw attach_time jitter under synthetic prefetch activity. Escalating to infra team. Linking related allocator PRs.",
+    "2026-03-10 11:20 - Infra Eng (Maya Rodriguez): Kernel metrics show intermittent PCIe stalls coincident with nvlink_io_wait. Suspect IO amplification from prefetch writes to NVMe causing contention on the node. Will trigger node-level I/O tracing.",
+    "2026-03-11 02:34 - Support (Priya): Customer confirmed increased client retries and some timeouts. Requested ETA for mitigation; asked for a short-term workaround.",
+    "2026-03-11 09:12 - SRE (Ethan): Rolled patch to allocator to increase ephemeral attach concurrency and added soft backpressure on prefetcher TTL refresh for this pool. Monitoring effects.",
+    "2026-03-12 07:58 - Customer Success (Jonah Kim): Customer reports partial recovery: p99 dropped to ~350ms but intermittent 5xx still observed for a small percentage of streams."
+  ],
+  "investigation_notes": "Hypothesis: aggressive per-stream prefetch TTLs + high fanout produce rapid kv-cache growth and frequent lock acquisition. Prefetcher holds locks while performing NVMe reads/writes to populate KV pagefiles; at peak concurrency this generates IO bursts causing node-level PCIe/NVMe backpressure. Backpressure delays runtime kernel io and allocator attach flows, causing attach_time spikes and effective GPU scarcity.\n\nTelemetry checked:\n- allocator attach histogram (pool d-pool-vertex-03): saw 90th->99th percentile jump coincident with prefetcher lock durations >800ms.\n- node io wait: elevated during incident window (iostat, blktrace attached in confluence).\n- kernel_queue_depth: low while io_wait high -> suggests compute waiting on IO.\n\nReproduced locally by: synthetic short-stream fanout + enabling prefetch TTL=30s; reproduced attach spikes and nvlink_io_wait.\n\nTemporary mitigations tried:\n- Reduced prefetch TTL to 120s across pool (soft config) \u2014 decreased lock churn but did not fully eliminate p99 spikes.\n- Increased allocator concurrent attaches by +25% (hotfix) \u2014 improved attach tail once prefetch flush reduced.",
+  "resolution": "Short-term workaround (applied 2026-03-11):\n- Rolled soft-config to VertexHealth pool: prefetch TTL increased to 120s and aggressive refresh disabled.\n- Applied allocator hotfix to increase attach concurrency and to throttle prefetcher when node IO exceeds threshold.\n\nObserved result: p99 improved from ~2.4s -> ~350ms; customer retries and timeouts reduced by ~92%.\n\nLong-term action items (tracking):\n- Infra: add NVMe IO reservation / QoS for dedicated pools to prevent tenant prefetch IO from impacting attach path (owner: Maya Rodriguez, ETA 2026-04-01).\n- Runtime: implement non-blocking prefetch locks or lock-free KV staging to avoid long critical sections (owner: Alejandro Cruz, RFC due 2026-03-20).\n- Allocator: enhance attach prioritization to favor short streams under high-fanout scenarios (owner: Ethan Bernstein, PR in review).\n- Product: add documentation & console toggle for per-pool prefetch aggressiveness; recommended defaults for dedicated customers with high short-stream fanout.\n\nFollow-up: schedule a post-incident review with VertexHealth and cross-team stakeholders; planned for 2026-03-18.",
+  "root_cause_summary": "Transient node-level IO backpressure caused by aggressive per-stream prefetch behavior under high short-stream fanout. Prefetch locks and NVMe activity created IO stalls that delayed allocator attach and runtime IO, producing an apparent GPU scarcity (attach_time spikes) and throughput degradation.",
+  "resolution_status": "Partial mitigation applied; monitoring continues. Permanent fixes are in roadmap and owners assigned.",
+  "customer_communication": "2026-03-11 14:05 - Support (Priya) sent interim mitigation steps and advised customer to keep prefetch conservative for short-stream workloads. 2026-03-12 10:00 - Follow-up note: acknowledging partial recovery and sharing roadmap items. Customer asked for notification when NVMe QoS is available.",
+  "postmortem_link": "Confluence:Postmortems/2026-03-vertexhealth-prefetch-incident",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution",
+    "root_cause_summary",
+    "resolution_status",
+    "customer_communication"
+  ],
+  "dataset_doc_uuid": "dsid_fbe13f4e08924972b49806806025f5ff"
+}

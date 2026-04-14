@@ -1,0 +1,39 @@
+{
+  "title": "Capacity postmortem extract - regional queueing & throttle breakdown",
+  "owner": "Maya Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/infrastructure/capacity-postmortem-extract-2026-03-20.json",
+  "doc_type": "sheet",
+  "created_at": "2026-03-15",
+  "last_modified": "2026-03-20",
+  "collaborators": [
+    "Luis Ortega",
+    "Priya Nair",
+    "Ben Hollis"
+  ],
+  "team": "eng-infrastructure",
+  "status": "in_review",
+  "tags": [
+    "postmortem",
+    "capacity",
+    "gpu",
+    "queueing",
+    "throttling",
+    "regional",
+    "autoscaler"
+  ],
+  "linked_artifacts": [
+    "jira://INFRA-1247",
+    "https://console.cloud.google.com/bigquery?project=redwood-prod&ws=!1m5...sample-query-id",
+    "https://redwood.atlassian.net/browse/INFRA-1248",
+    "https://redwood.slack.com/archives/C0123ABCD/message/1679000000.000000",
+    "https://confluence.redwood.ai/display/INF/2026-03-12+Capacity+Incident+Postmortem",
+    "https://github.com/redwood-inference/infra-config/pull/298"
+  ],
+  "content": "Purpose:\\nThis sheet is an extract used by infra + SRE to validate the Capacity Incident postmortem hypotheses (Mar 12-14 2026): specifically to quantify regional GPU saturation, per-request queueing distribution, and which throttle classes triggered during the incident windows.\\n\\nTime window and granularity:\\n- Primary window: 2026-03-12T04:00:00Z -> 2026-03-14T12:00:00Z\\n- Granularity: 5m rollups per region / AZ / GPU sku / queue-class\\n\\nData sources (tables queried):\\n- bigquery:prod_infra.usage.gpu_allocation_rollups_5m\\n- bigquery:prod_infra.telemetry.request_queues_5m\\n- bigquery:prod_infra.policy.throttle_events\\n- bigquery:prod_infra.autoscaler.events\\n\\nColumns included in this extract (CSV below):\\nregion,availability_zone,gpu_type,timestamp_start,timestamp_end,total_gpus,reserved_gpus,free_gpus,avg_gpu_util_pct,p50_queue_ms,p95_queue_ms,p99_queue_ms,throttled_reqs,throttle_pct,throttle_class,autoscaler_events,primary_cause_notes\\n\\nSample rows (derived from rollups):\\nus-west1,us-west1-a,A100-80GB,2026-03-12T04:00:00Z,2026-03-12T04:05:00Z,120,20,0,93.4,12,240,980,2120,12.1%,rate-limit-tiering,scale_up_delayed:cooldown_stuck,observed steady high sustained seq-length workloads + no prefix cache hit\\nus-west1,us-west1-a,A100-80GB,2026-03-12T20:10:00Z,2026-03-12T20:15:00Z,120,20,0,98.8,18,820,2800,7450,32.4%,global-burst-throttle,scale_up_failed:max_nodes,large PLs from a single customer causing queueing and local saturation\\neurope-west1,europe-west1-b,A100-40GB,2026-03-13T02:00:00Z,2026-03-13T02:05:00Z,64,8,4,67.1,6,42,90,0,0.0%,none,scale_up_normal,brief localized spike (traffic rerouted from us-west during incident)\\nap-southeast1,ap-southeast1-c,A40-80GB,2026-03-14T09:25:00Z,2026-03-14T09:30:00Z,48,4,0,88.2,10,360,1500,430,6.8%,quota-throttle,scale_up_delayed:insufficient_quota,autoscaler not allowed to request more instances due to project quota\\n\\nDerived metrics notes:\\n- \\\"free_gpus\\\" = total_gpus - reserved_gpus - allocated_gpus (allocated inferred from avg_utilization model). Some rows use approximate allocation for labelled best-effort pools.\\n- throttle_pct = throttled_reqs / (throttled_reqs + served_reqs) aggregated per rollup window.\\n\\nKey SQL snippets used to produce this sheet (sanitized):\\n-- rollup GPU allocation + utilization\\nSELECT region,az,gpu_sku,window_start,window_end, SUM(total_gpus) as total_gpus, SUM(reserved) as reserved_gpus, AVG(avg_gpu_util_pct) as avg_gpu_util_pct\\nFROM `prod_infra.usage.gpu_allocation_rollups_5m`\\nWHERE window_start BETWEEN TIMESTAMP('2026-03-12') AND TIMESTAMP('2026-03-14 23:59:59')\\nGROUP BY region,az,gpu_sku,window_start,window_end\\n\\n-- queue distribution per request class\\nSELECT region,az,queue_class,window_start,quantiles(queue_latency_ms, [0.5,0.95,0.99]) as q\\nFROM `prod_infra.telemetry.request_queues_5m`\\nWHERE window_start BETWEEN ...\\n\\n-- throttle events join to map classes to counts\\nSELECT t.region,t.az,t.window_start, SUM(t.count) as throttled_reqs, ANY_VALUE(t.throttle_class) as throttle_class\\nFROM `prod_infra.policy.throttle_events` t\\nGROUP BY t.region,t.az,t.window_start\\n\\nObservations & rapid conclusions (data-backed):\\n1) High-latency queueing coincides with windows where free_gpus==0 and avg_gpu_util_pct >= 90% for >= 30 minutes in us-west1 primary AZs. p95 queue latency > 700ms in those windows.\\n2) Two distinct throttle modes contributed: (a) global-burst safety throttle (applied to cross-customer traffic during sustained spike) and (b) per-account rate-tier throttles for the affected customer. Global-burst accounted for ~60% of throttled_reqs during peak windows.\\n3) Autoscaler signals were generated but the scale-up actions either failed (quota) or were delayed due to cooldown rules and a recent controller config change that increased the evaluation window.\\n4) Traffic spillover to europe-west1 happened but those regions had lower utilization and acted as partial pressure relief; however cross-region routing lag meant relief came late.\\n\\nData quality caveats:\\n- Some A/B test clusters report 'gpu_sku' as NULL in older rollups; rows flagged when gpu_sku is NULL were backfilled heuristically.\\n- Reserved capacity reported by dedicated pools sometimes counts warm standby nodes; we mark those with reserved_gpus > 0 and note in primary_cause_notes.\\n\\nSuggested next actions (owner + ETA):\\n- [ACTION] Short-term: Increase emergency reserved capacity in us-west1 by +16 A100 nodes for 72h to stabilize (owner: Priya Nair, ETA: 2026-03-22).\\n- [ACTION] Medium-term: Revert autoscaler evaluation window change and set cooldown to 30s (owner: Luis Ortega, ETA: 2026-04-01).\\n- [ACTION] Instrument per-request prefix cache hit ratio in the rollups (owner: Ben Hollis, ETA: 2026-03-28).\\n- [ACTION] Add synthetic traffic and canary for cross-region routing logic to detect lag earlier (owner: eng-sre, ETA: 2026-04-05).\\n\\nOpen questions for follow-up:\\n- Was the global-burst throttle threshold too aggressive for sustained but legitimate traffic patterns? (ask policy team).\\n- Can we make autoscaler quota fallback path more transparent in alerts?\\n\\nPointer to complete raw exports:\\n- BigQuery job ids and exported CSVs are attached to Jira INFRA-1247. Use the bq export job ids in linked artifacts.\\n\\nSheet maintenance notes:\\n- This extract is intended to be an immutable snapshot for the incident. For daily ops, use monitoring dashboards under infra -> capacity -> gpu-rollups.\\n\\nEnd of extract.\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_aa95a99fb8fe4420b0c5c8affea073b0"
+}

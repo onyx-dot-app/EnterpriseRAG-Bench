@@ -1,0 +1,81 @@
+{
+  "key": "SUP-451321",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Confusing retry window semantics cause reordered tool/function calls after client reconnect (Python/TS/Go)",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Ethan Chen",
+  "assignee": "Maya Patel",
+  "customer_company": "Lumina Health",
+  "customer_tier": "dedicated",
+  "components": [
+    "sdk-python",
+    "sdk-typescript",
+    "sdk-go",
+    "serving-runtime",
+    "api-gateway"
+  ],
+  "labels": [
+    "idempotency",
+    "retry-behavior",
+    "streaming",
+    "investigation"
+  ],
+  "environment": "prod/us-east",
+  "affected_models": [
+    "redwood-llama-13b-q4",
+    "gpt-neox-20b"
+  ],
+  "affected_regions": [
+    "us-east",
+    "eu-west"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-314159",
+    "SUP-224466"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/sdk-python/pull/482",
+    "https://github.com/redwood-inference/serving-runtime/pull/210"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/SUPPORT/pages/Retry+Window+Behavior+Notes"
+  ],
+  "description": "Issue summary:\nCustomer using Dedicated (reserved) capacity reports that after a client resume (network reconnect + SDK auto-retry) a sequence of tool/function calls executed by the model surface are observed out-of-order and in some cases duplicated. The customer uses per-action idempotency tokens and short-lived retry windows but is seeing side-effects like duplicate downstream webhook posts and replayed background jobs.\n\nImpact:\n- Production traffic for Lumina Health (dedicated tenant) has intermittent duplicated side-effects leading to duplicate patient-notification jobs (non-sensitive content, but duplicate deliveries are unacceptable).\n- Observed in ~0.4% of streaming sessions for this customer during afternoon peak; spikes correlated with transient network events in us-east region.\n\nEnvironment:\n- Dedicated pool in prod/us-east, autoscaling enabled, traffic routed through api-gateway v1.14.\n- SDKs: python v1.6.3 (aio streaming), ts v2.1.0 (fetch streaming), go v0.9.5 (http2 multiplex).\n\nObserved behavior vs expectation:\n- Expected: client reconnection + retry should preserve per-action ordering and idempotency semantics; server should deduplicate exact idempotency tokens and respect ordering within a session.\n- Actual: in several repro traces, a later function call was processed before an earlier one after reconnect; in other traces the same idempotency token appears to be accepted twice when replayed shortly after reconnect (tokens TTL ~30s).\n",
+  "steps_to_reproduce": "1) Customer opens a multiplexed streaming session and sends a sequence of messages that trigger 3 function/tool invocations (A -> B -> C). Each invocation includes action_id and idempotency_key with a 30s TTL.\n2) During the stream, client deliberately drops network for ~3s and then reconnects; SDK auto-retries and resumes the stream.\n3) On resume, client re-sends the last two messages to ensure they were received.\n4) Observe ordering/timestamps of function executions in serving logs and downstream webhook receipts.\n\nNotes: Reproducible across Python async streaming, TS fetch-based reconnect, and Go http2 multiplex. Variations in backoff schedule or idempotency TTL change occurrence rate but do not eliminate it.",
+  "logs": "Excerpt from serving-runtime trace (timestamps normalized):\n- 2026-03-09T15:21:02.120Z request-id=bb12: recv msg(1) -> schedule func A (id=act-101, key=k-abc)\n- 2026-03-09T15:21:03.045Z network drop detected for client connection\n- 2026-03-09T15:21:06.210Z client reconnects, resumes stream, re-sends msg(1) and msg(2)\n- 2026-03-09T15:21:06.540Z request-id=bb12: recv resume msg(1) -> accept; dispatch func B (id=act-102, key=k-def)\n- 2026-03-09T15:21:06.860Z request-id=bb12: dispatch func A (id=act-101, key=k-abc)  <-- executed after B\n- 2026-03-09T15:21:07.100Z webhook POST downstream for B received at customer queue\n- 2026-03-09T15:21:07.420Z webhook POST downstream for A received at customer queue\n\nCustomer webhook logs: two POSTs for act-101 and act-102 but ordering reversed; some cases show duplicate POST for act-101 when idempotency key reappears within 10s window.",
+  "investigation_notes": [
+    "Initial hypothesis: client-side reordering because of multiplexed stream replay semantics; verified client SDKs re-send frames in same original order, so unlikely sole cause.",
+    "Found evidence in serving runtime that on resume we merge in-flight requests from the reconnecting session into an active scheduling queue without preserving per-session sequence numbers when there are pending dispatches from the pre-drop state.",
+    "Scheduler uses per-connection inbound queue + global worker pool; when reconnect occurs, connection ID changes and we append resumed messages to a different per-connection queue which the dispatcher may drain independently, allowing reordering relative to messages still queued on the old connection context.",
+    "Idempotency TTL is short (30s). Duplicate acceptance appears when token normalization transforms keys (some SDKs URL-encode metadata differently) causing server-side dedupe to miss exact match; later exact token is treated as new if normalization differs.",
+    "Reproduced locally by simulating connection swap with overlapping message windows; ordering anomaly occurs when worker pool schedules resumed connection queue before previous connection's queued tasks finish.",
+    "Cross-check with go-sdk: http2 multiplexing exposes race where stream-level sequence numbers are preserved but connection-level queue merging logic didn't handle stream swap correctly.",
+    "Related PR linked that updates scheduler queue merge semantics: serving-runtime PR #210 changes queue merge to preserve session sequence pointers. Preliminary benchmark shows negligible latency regression.\n"
+  ],
+  "comments": [
+    "2026-03-10 09:12 - Support (Ethan): Customer reported duplicate notifications after a planned network bounce. Collecting traces and webhook receipts.",
+    "2026-03-10 12:45 - Customer (Lumina engineer, Priya): We can provide sample request ids and replay the incident window; duplicates impacted non-critical notifications but must be fixed.",
+    "2026-03-11 08:05 - SRE (Maya): Initial triage points to scheduler queue merge bug; created a small repro harness and confirmed ordering inversion locally.",
+    "2026-03-11 14:30 - SDK Eng (Luis): Found SDKs sending idempotency metadata header using different charset normalization; will add a normalization pass to TS and Go SDKs to match server canonicalization.",
+    "2026-03-12 10:00 - Support (Ethan): Coordinating rollout: serving-runtime fix staged on canary (us-east-a) and SDK patch drafts ready. Notifying customer of planned fix window.",
+    "2026-03-12 16:20 - Customer (Priya): Appreciates the plan; will monitor canary and confirm if duplicates stop in their afternoon peak next week."
+  ],
+  "resolution": "Workaround: Increase idempotency token TTL to 120s and add an application-level dedupe on the webhook consumer to filter duplicate action_ids for now.\n\nPlanned fix: 1) Deploy serving-runtime PR #210 to canary to preserve per-session sequence ordering when merging queue state on reconnect. 2) Release SDK normalization patches for python/ts/go to ensure idempotency_key canonicalization (PRs: sdk-python#482, sdk-ts#119, sdk-go#55). 3) Add server-side tolerant dedupe that attempts a normalized match of tokens (short-term) and improved logging for any token normalization mismatches.\n\nPost-fix verification: Run replay harness across multiplexed clients and coordinate with Lumina for a monitored production canary window.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_7e43a958ddcf46f187531fd3775a140f"
+}

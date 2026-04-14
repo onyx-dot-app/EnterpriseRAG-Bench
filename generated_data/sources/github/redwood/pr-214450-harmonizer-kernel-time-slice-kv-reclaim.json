@@ -1,0 +1,92 @@
+{
+  "repo": "redwood",
+  "pr_number": "214450",
+  "title": "Introduce prefill-decode concurrency harmonizer with kernel time-slicing and opportunistic KV reclaim",
+  "author": "Nina Park",
+  "created_at": "2025-11-06",
+  "updated_at": "2025-11-18",
+  "merged_at": "2025-11-18",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/harmonizer/time-slice-kv-reclaim",
+  "reviewers": [
+    "Ethan Zhao",
+    "Priya Sinha",
+    "Marco Valdez"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kvcache",
+    "scheduler",
+    "testing"
+  ],
+  "linked_linear": [
+    "ENG-7543",
+    "ENG-7612"
+  ],
+  "linked_jira": [
+    "SUP-1422"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "820",
+  "deletions": "130",
+  "breaking_change": "false",
+  "body": "Summary: This PR implements a \"harmonizer\" layer in the serving scheduler that time-slices GPU kernel execution between prefill and decode stages, introduces microburst quotas, and adds an opportunistic KV-cache reclaim path during decode idle windows. Motivation: In mixed workloads (large prefill bursts followed by many short decodes) we observed priority inversion and tail-latency spikes when prefill kernels monopolize compute for long slices. Existing chunked-prefill and speculative prefill approaches reduce some tail effects but either increase decode stall frequency or over-fragment work. Harmonizer goal: provide deterministic, low-latency decode windows while preserving aggregate throughput by slicing long prefill kernels into bounded time quanta and reclaiming KV-cache slots opportunistically during decode-dominated micro-windows. Key changes and rationale: 1) Kernel time-slicing: the scheduler now enforces a per-kernel timeslice (default 8ms, adaptive) for prefill kernels above a configured duration threshold. Long prefill work is split into logical continuations; the runtime kernel adapter exposes a continuation token so the GPU kernel can resume without extra host-side model reinitialization cost. This reduces blocking time for decode kernels and reduces tail latency. 2) Adaptive timeslice estimator: a lightweight moving-window estimator adjusts timeslice size based on recent decode tail P95/P99 and prefill throughput. The estimator biases toward smaller slices when decode tail is increasing and toward larger slices when decode latency is healthy. 3) Microburst quotas: decode requests are granted short-run quotas (number of tokens or microseconds) that guarantee a minimum execution window before prefill resumptions. This prevents tiny decodes from being starved. 4) Opportunistic KV reclaim: when the harmonizer detects decode idle intervals inside a timeslice boundary (e.g., waiting on network/IO), the runtime performs a soft-evict hint on cold KV entries and background-prefetch low-cost priming for imminent prefill continuations. This reduces cold-KV misses when prefill resumes. 5) Metrics & observability: new metrics harmonizer.timeslice_ms, harmonizer.prefill_splits, harmonizer.decode_quota_acquired, kvcache.soft_evictions, and harmonic.prefill_continuations were added. Tracing hooks mark harmonizer decisions so we can correlate decisions with latency outcomes. 6) API/Config: exposed config knobs in runtime config: harmonizer.enabled, harmonizer.base_timeslice_ms, harmonizer.max_splits, harmonizer.decode_quota_us. These are gated behind an opt-in feature flag for staged rollout. Performance summary (internal bench): - Mixed workload (50% large prefill 50% small decodes): p99 decode latency reduced by ~12% (from 310ms to 275ms), p95 by ~9%. - Aggregate token throughput for prefill-heavy runs decreased by ~3% worst-case; in practical settings we saw throughput flat or +2% due to reduced KV thrashing. - For steady-state decode-only workloads, no measurable regressions. Compatibility and risk: The continuation token requires small changes to the kernel entry path but keeps ABI stable; fallbacks in place for older kernels (no splitting). KV soft-evict is conservative and uses a background thread with rate limits to avoid noisy eviction. Testing and rollout: Unit and integration tests added for scheduler behavior and continuation correctness. Microbench harness extended to validate timeslice adaptation. Canary rollout plan: opt-in flag -> small fleet in europe region (low RPS) -> ramp to all hosted runs over 2 weeks while monitoring new metrics and regressions. Checklist: - [x] Scheduler time-slice implementation - [x] Kernel adapter continuation token - [x] Adaptive timeslice estimator - [x] Microburst decode quota enforcement - [x] Opportunistic KV reclaim path - [x] Metrics + tracing hooks - [x] Unit/integration tests - [x] Benchmarks and perf report - [x] Feature-flag gate and config knobs Commits: (summary) - a1bf3d4: harmonizer: core scheduler loop & timeslice enforcement - c2d9e01: kernel-adapter: continuation token & split/merge helpers - e4f7ab2: kvcache: soft-evict hint and background reclaim worker - 9b2c7d1: config: harmonizer feature flags and runtime knobs - 5d7a9ef: metrics + tracing for harmonizer decisions - 3f8bd44: tests: unit and microbench harness updates - 7ea5d2c: docs: runtime config reference and migration notes Files changed (high level): - runtime/scheduler/harmonizer.cpp (new) - runtime/scheduler/harmonizer.h (new) - runtime/kernel/adapter.cc (continuation token + resume interface) - runtime/kernel/kernel_entry.S (small glue changes for continuation fast-path) - runtime/kv/soft_reclaim.cc (new) - runtime/config/feature_flags.yaml (opt-in knobs) - runtime/metrics/harmonizer_metrics.cc - tests/harmonizer_scheduler_test.cc - benchmarks/microbench/harmonizer_mixed_workload.py - docs/runtime/harmonizer.md - docs/config/runtime_flags.md - scripts/canary_rollout.md Review summary and decisions: Reviewer Ethan Zhao: \"High level: this direction looks promising. Two immediate concerns: (1) contiguity of KV eviction \u2014 we must not evict hot KV while prefill is mid-continuation; (2) timeslice tuning defaults may need to vary by GPU architecture.\" Author reply (Nina): \"Both addressed: soft-evict respects 'do-not-evict' tags set at prefill slice boundaries and rate-limits are per-GPU; added arch-weighted default table (A100=8ms, H100=10ms, V100=6ms) and config override.\" Reviewer Priya Sinha: \"We need signal / guardrail alerts for when harmonizer is throttling prefill heavily (throughput regression).\" Author response: \"Added metric harmonizer.prefill_throttle_ratio and alert playbook entries in scripts/canary_rollout.md.\" Reviewer Marco Valdez: \"Edge case: extremely long single-token prefill ( > 300ms ) \u2014 splitting might add visible overhead due to repeated kernel launches.\" Author: \"We added a threshold to only split kernels above 32ms and a fast-resume path that avoids host-side model re-setup; microbench shows overhead < 1% for this case.\" CI / checks: - unit-tests: pass - integration-tests: pass - lint: initial run flagged style in harmonizer.h -> fixed - benchmarks/regression: pass (bench harness comparisons attached) - canary-sanity: pending during initial PR, green pre-merge Performance artifacts: attached benchmark output (benchmarks/microbench/results/214450-mixed.json) and flamegraph samples (benchmarks/microbench/flamegraphs/214450-prefill-slice.svg) Merge: PR was squashed and merged by Priya Sinha after CI turned green and a 48-hour canary in eu-west. Merge method: squash. Post-merge actions: - release_notes: \"Add harmonizer scheduler to reduce decode tail latency in mixed prefill/decode workloads; opt-in via harmonizer.enabled; see runtime/harmonizer.md for tuning.\" - Incremental rollout scheduled and post-release metric dashboards created (runtime/harmonizer-dashboard). Known limitations and follow-ups: - Follow-up ENG-7612 will add model-aware timeslice (longer slices for transformer configurations that pay high resume cost). - Experiment ENG-7688 will evaluate merging harmonizer with the speculative prefill controller for further gains. Overall notes: This PR trades bounded prefill kernel slices for improved tail decode latency and steadier decode QoS. Implementation favors conservative defaults and is gated by feature flag to allow observational rollout.",
+  "commits": [
+    "a1bf3d4: harmonizer: core scheduler loop & timeslice enforcement",
+    "c2d9e01: kernel-adapter: continuation token & split/merge helpers",
+    "e4f7ab2: kvcache: soft-evict hint and background reclaim worker",
+    "9b2c7d1: config: harmonizer feature flags and runtime knobs",
+    "5d7a9ef: metrics + tracing for harmonizer decisions",
+    "3f8bd44: tests: unit and microbench harness updates",
+    "7ea5d2c: docs: runtime config reference and migration notes"
+  ],
+  "files_changed": [
+    "runtime/scheduler/harmonizer.cpp",
+    "runtime/scheduler/harmonizer.h",
+    "runtime/kernel/adapter.cc",
+    "runtime/kernel/kernel_entry.S",
+    "runtime/kv/soft_reclaim.cc",
+    "runtime/config/feature_flags.yaml",
+    "runtime/metrics/harmonizer_metrics.cc",
+    "tests/harmonizer_scheduler_test.cc",
+    "benchmarks/microbench/harmonizer_mixed_workload.py",
+    "docs/runtime/harmonizer.md",
+    "docs/config/runtime_flags.md",
+    "scripts/canary_rollout.md"
+  ],
+  "review_comments": [
+    "Ethan Zhao: High level: this direction looks promising. Two immediate concerns: (1) contiguity of KV eviction \u2014 we must not evict hot KV while prefill is mid-continuation; (2) timeslice tuning defaults may need to vary by GPU architecture.",
+    "Nina Park: Both addressed: soft-evict respects 'do-not-evict' tags set at prefill slice boundaries and rate-limits are per-GPU; added arch-weighted default table (A100=8ms, H100=10ms, V100=6ms) and config override.",
+    "Priya Sinha: We need signal / guardrail alerts for when harmonizer is throttling prefill heavily (throughput regression).",
+    "Nina Park: Added metric harmonizer.prefill_throttle_ratio and alert playbook entries in scripts/canary_rollout.md.",
+    "Marco Valdez: Edge case: extremely long single-token prefill ( > 300ms ) \u2014 splitting might add visible overhead due to repeated kernel launches.",
+    "Nina Park: Added threshold to only split kernels above 32ms and a fast-resume path that avoids host-side model re-setup; microbench shows overhead < 1% for this case.",
+    "CI Bot: lint: style issue in harmonizer.h (fixed in c2d9e01).",
+    "Bench Reviewer: Please add a comparison vs chunked-prefill baseline; initial bench attached shows harmonizer improves p99 decode vs chunked-prefill by ~6% for our mixed scenario."
+  ],
+  "ci_checks": [
+    "unit-tests: pass",
+    "integration-tests: pass",
+    "lint: pass (initial failure fixed)",
+    "benchmarks/regression: pass (attached microbench results)",
+    "canary-sanity: pass (eu-west small fleet)"
+  ],
+  "merge_summary": "Merged via squash by Priya Sinha after canary and CI green. Feature gated behind harmonizer.enabled; docs and playbook updated.",
+  "release_notes": "Add harmonizer scheduler to reduce decode tail latency in mixed prefill/decode workloads. Opt-in via runtime config harmonizer.enabled. Default timeslice tuned per GPU architecture. Follow-up work planned for model-aware timeslicing.",
+  "extras": [
+    "benchmarks/microbench/results/214450-mixed.json",
+    "benchmarks/microbench/flamegraphs/214450-prefill-slice.svg",
+    "docs/runtime/harmonizer.md"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "review_comments",
+    "merge_summary",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_70f0e381c0584253a5a199cc66d02b3c"
+}

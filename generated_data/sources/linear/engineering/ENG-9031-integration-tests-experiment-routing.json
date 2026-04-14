@@ -1,0 +1,50 @@
+{
+  "key": "ENG-9031",
+  "team": "engineering",
+  "title": "Integration tests: route experiment routing (determinism, split accuracy, fallback precedence, metrics attribution)",
+  "status": "Done",
+  "priority": "P1",
+  "created_at": "2025-02-19",
+  "updated_at": "2025-03-28",
+  "creator": "Sahana Iyer",
+  "assignee": "Leila Farouk",
+  "project": "Route-level A/B testing framework",
+  "cycle": "2025-W09",
+  "estimate": "8",
+  "due_date": "2025-03-14",
+  "labels": [
+    "route-experiments",
+    "e2e-tests",
+    "policy-engine",
+    "routing",
+    "telemetry",
+    "ga-gate"
+  ],
+  "dependencies": [
+    "ENG-9022",
+    "ENG-9023",
+    "ENG-9026",
+    "ENG-9027",
+    "ENG-9028"
+  ],
+  "customer_impact": "medium",
+  "release": "console-2025.04",
+  "security_review_required": "false",
+  "content": "Overview\nThis ticket adds end-to-end coverage for the Route-level Experiments routing path. The goal is to catch the failure modes we\u2019ve already seen in staging/beta (variant skew when sticky key missing; fallback overriding experiment; missing attribution in streaming retries) before GA.\n\nScope\n- Deterministic assignment: same request + same stickiness inputs => same variant across process restarts and across regions.\n- Split accuracy: allocation roughly matches configured traffic splits within tolerance.\n- Precedence: experiment selection must be applied before fallback policy evaluation (and must not be silently bypassed by fallback/canary).\n- Metrics attribution: request context + OTel spans contain experiment_id + variant_id; aggregator/rollup tables include {route_id, experiment_id, variant_id} dimensions.\n\nTest strategy (what we actually run in CI)\nWe split tests into two layers to keep runtime/cost manageable:\n\nA) Router-level integration tests (fast, deterministic; runs on every PR)\n- Boot policy engine + router in-process with an in-memory experiment config cache.\n- Exercise evaluateRoute(route_id, request_context) for N synthetic requests.\n- Assert invariants on variant distribution, determinism, and evaluation order.\n\nB) End-to-end smoke tests in ephemeral env (slower; runs on merge to main + nightly)\n- Deploy minimal stack: experiment service + policy engine + router + OTel collector + metrics ingestion stub.\n- Configure an experiment via the public-ish control plane API (same Console backend endpoints used by UI) and send real HTTP requests through gateway.\n- Assert response headers + debug endpoint output + trace tags.\n\nTest matrix\n1) Determinism / stickiness key precedence\n- Inputs tested:\n  - explicit sticky_key (SDK option) present\n  - customer_id present\n  - session_id present\n  - none present (expect: safe default path + warning + constrained behavior)\n- Expectations:\n  - When sticky_key present: assignment stable and independent of other IDs.\n  - When sticky_key missing but customer_id present: stable on customer_id.\n  - When no identifiers present: must not default to low-entropy key; assignment should fall back to per-request random bucket (non-sticky) OR \u201ccontrol-only\u201d depending on config flag. Current expected behavior for GA: allow non-sticky assignment but emit attribution + warning; Console UI should show a validation warning and recommend configuring stickiness. (See ENG-28705 fix.)\n- Implementation: In router integration tests we run 10,000 evaluations twice with a forced \u201crestart\u201d (reinitialize router + cache) and assert identical variant for each synthetic user.\n\n2) Split accuracy\n- Configs covered:\n  - A/B 50/50\n  - A/B 90/10\n  - A/B/C 34/33/33\n  - Edge: tiny split 99/1 (still should assign some traffic; guard against rounding-to-zero bugs)\n- Method:\n  - Generate 100k synthetic stable stickiness keys (UUIDv4) for each config.\n  - Evaluate assignment and compute proportions.\n- Acceptance criteria:\n  - For each variant i, |observed_i - expected_i| <= max(0.5%, 5 * sqrt(p*(1-p)/N)).\n  - Also assert no variant receives exactly 0 assignments unless expected split is 0.\n\n3) Precedence & interactions (experiment vs fallback vs canary)\nWe\u2019ve had regressions where fallback policy evaluation happened first, resulting in the experiment never being applied.\n\nExpected evaluation order (validated by tests)\n- Order in data plane routing:\n  1) Normalize route_id (templated route, not raw path) for consistent bucketing + metrics.\n  2) Evaluate experiment eligibility and deterministic assignment; select variant policy.\n  3) Apply canary rollout policy (within the selected variant\u2019s target policy/model set).\n  4) Only then apply fallback (region/capacity/model variant fallback) if the chosen target is unavailable.\n\nScenarios covered:\n- Experiment + fallback enabled, primary target unhealthy:\n  - Expect: assignment picks a variant, then fallback triggers within that variant\u2019s policy.\n  - Assert: experiment attribution preserved even when fallback occurs.\n- Route under canary rollout + experiment enabled:\n  - Expect: experiment assignment first, then canary decision. (Canary remains about model version selection; experiment is about variant selection.)\n  - Assert: canary does not \u201cwash out\u201d experiment attribution.\n- Overlapping experiment config should be blocked by control plane validation (covered elsewhere); here we assert router behavior is deterministic given a single active experiment.\n\n4) Metrics attribution (request context + OTel tags)\n- For non-streaming request:\n  - Assert response headers include:\n    - x-redwood-experiment-id\n    - x-redwood-experiment-variant\n    - x-redwood-route-id (normalized)\n  - Assert trace/span attributes include:\n    - redwood.experiment_id\n    - redwood.experiment_variant_id\n    - redwood.route_id\n- For streaming request + retry path:\n  - Force a retry by injecting a synthetic mid-stream failure in the upstream model stub.\n  - Assert attribution persists across the retry span and final response.\n  - This specifically covers the regression fixed in PR-28622.\n\nTest harness notes\n- Repo location: redwood/tests/route_experiments/\n- Main entrypoints:\n  - TestDeterministicBucketing_* (router integration)\n  - TestSplitAccuracy_* (router integration)\n  - TestExperimentPrecedence_* (router integration)\n  - TestE2EAttribution_* (ephemeral env)\n- Determinism: all tests set a fixed hash salt in config; we explicitly assert that salt changes result in expected assignment churn (guardrail against accidental salt drift).\n- Runtime: router integration suite ~2\u20133 minutes; e2e smoke ~8\u201312 minutes (runs nightly + post-merge).\n\nAcceptance criteria\n- CI gates:\n  - Router integration suite must pass on PR.\n  - Nightly e2e smoke must pass for 7 consecutive days prior to beta expansion.\n- Coverage:\n  - At least one test covering: determinism across restart, 90/10 split, fallback precedence, streaming retry attribution.\n- Signal quality:\n  - When failures occur, output must include the assignment debug explanation (hash inputs + selected variant + config version) to reduce oncall time.\n\nLinks / related work\n- ADR-047 Deterministic experiment bucketing\n- ADR-048 Experiment metrics attribution schema\n- PR-28433 policy engine bucketing evaluator\n- PR-28457 apply experiment selection before fallback\n- PR-28622 fix attribution missing on streaming retries\n- PR-28610 split accuracy tests (initial draft)\n\nResults\n- Added router integration tests for all core invariants.\n- Added nightly e2e attribution smoke (streaming + retry path).\n- Found + fixed one additional issue during implementation: route_id normalization mismatch between router and telemetry tags (fixed in follow-up PR; see comments).\n\nFollow-ups (not in this ticket)\n- Add a dedicated test for config propagation staleness bounds (ties to SLO doc; likely belongs in ENG-9023/ENG-9033).\n- Consider adding a \u201ccardinality budget\u201d regression test for metrics tags (to catch accidental dimension explosion; see PR-28741).",
+  "comments": [
+    "2025-02-20 (Leila Farouk): Started harness work. Plan is two-tier: fast in-process router tests on every PR + nightly ephemeral env smoke for attribution/streaming. Will keep N=100k for split accuracy to get tight tolerance without flaking.",
+    "2025-02-27 (Jordan Lee): Confirmed expected stickiness precedence: explicit sticky_key > customer_id > session_id. If none present, we should avoid low-entropy defaults; either non-sticky per-request bucketing or control-only depending on config. Please ensure tests lock this in (we\u2019ve seen skew from defaulting to IP hash).",
+    "2025-03-04 (Leila Farouk): Implemented determinism + split tests. Added restart simulation (re-init router + cache). Split tolerance set to max(0.5%, 5*sigma). All green locally.",
+    "2025-03-08 (Vikram Singh): Precedence test added for experiment-before-fallback. Also add a scenario where fallback occurs and we still preserve experiment attribution; this was part of the beta incident triage.",
+    "2025-03-12 (Caleb Johnson): For attribution assertions, please check both response headers and span attrs. OTel naming convention is redwood.experiment_id / redwood.experiment_variant_id per thread 1737750121.",
+    "2025-03-17 (Leila Farouk): Built initial e2e smoke for streaming + forced retry. Caught route_id normalization mismatch (router was tagging raw path in one codepath). Filed follow-up and patched; tests now assert normalized route template.",
+    "2025-03-22 (Sean Gallagher): Reviewed for GA gate. Request: on failure, dump assignment debug explanation (hash inputs + config version) to test logs so oncall can quickly see whether it\u2019s skew vs propagation vs missing headers. Approved once added.",
+    "2025-03-28 (Leila Farouk): Added debug dump on assertion failure. Nightly e2e has been stable for the last week; marking Done."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "content",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_a8b49972935547a39f0bfc3c09aab043"
+}

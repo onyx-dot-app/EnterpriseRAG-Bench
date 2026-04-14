@@ -1,0 +1,61 @@
+{
+  "key": "SUP-604910",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "0-RTT TLS rebind causes duplicated embedding chunks and missing terminal event on SSE sessions",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Kapoor",
+  "assignee": "Liam Chen",
+  "customer_company": "Notelex Labs",
+  "customer_tier": "dedicated",
+  "environment": "prod | us-east",
+  "components": [
+    "serving-runtime",
+    "api-gateway",
+    "edge-proxy",
+    "sse-streaming"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "reconnect",
+    "0rtt",
+    "embeddings"
+  ],
+  "affected_models": [
+    "open-embedding-3-small",
+    "open-chat-2"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-11T12:00:00Z",
+  "first_response_due_at": "2026-03-10T16:00:00Z",
+  "linked_issues": [
+    "INT-3321"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/3291"
+  ],
+  "description": "Issue summary:\nNotelex Labs reports SSE streams that deliver partial embedding payloads, then abruptly terminate with an Early EOF on our edge. When the client reconnects (their client and their corporate proxy are using TLS 0-RTT resumption), the resumed stream sends a replay of the last embedding chunk and never emits the terminal `event: done`/end marker. Impact:\n- Customer ingestion pipeline receives duplicate embedding vectors and no explicit completion marker, causing downstream dedupe to treat the duplicate as a new record and leaving the operation in an indeterminate state.\n- Affects production traffic for a single dedicated tenant (Notelex) in us-east. Intermittent but reproducible for this customer's environment.\nEnvironment:\n- Dedicated Redwood tenant on prod (us-east) behind customer corp proxy with TLS 0-RTT enabled.\n- Client: in-house Go service using eventsource-like SSE client (long-lived connection + reconnect), runs behind corporate HTTP/2 proxy that performs connection pooling and 0-RTT resumption.\nSteps to reproduce (observed by customer):\n1) Start a long-lived SSE request to /v1/stream/embeddings with model=open-embedding-3-small and large input set.\n2) During the stream, trigger a short network path migration (mobile to wifi or proxy restart) while proxy is configured for TLS 0-RTT.\n3) The client detects a connection close (Early EOF), reconnects and resumes via normal client replay logic.\n4) The resumed stream includes the last embedding chunk again (duplicate) and never emits the terminal `event: done` or final metadata.\nRepresentative logs from customer (sanitized):\n[2026-03-10T09:41:12Z] SSE: chunk: {\"embeddings\":[...], \"chunk_id\":\"abc-122\"}\n[2026-03-10T09:41:15Z] proxy: TLS0RTT-reuse conn=492 closed-gracefully early_eof=true\n[2026-03-10T09:41:15Z] client: reconnecting, resume_offset=12345\n[2026-03-10T09:41:15Z] SSE: chunk: {\"embeddings\":[...], \"chunk_id\":\"abc-122\"}  <-- duplicate\n[2026-03-10T09:41:16Z] SSE: (no terminal event received)\n\nObserved behaviour summary:\n- Early EOF at edge/proxy boundary.\n- Resume yields duplicate payloads (same chunk_id in customer logs).\n- No terminal/end event after resume (client waits indefinitely or times out).\n\nNotes: This differs from common resume-misordering issues because the duplicate chunk_id matches the pre-drop chunk (not a reordering of different chunks). The customer has strict dedup by chunk_id, so duplication leads to incorrect ingestion counts when de-dupe fails (sometimes duplicate has slightly different metadata causing de-dupe to miss it).",
+  "comments": [
+    "2026-03-10 10:05 \u2014 Support (Aisha): Logged initial ticket after reproducer from Notelex. Asked for raw edge logs and kernel-level socket close reasons.",
+    "2026-03-10 13:22 \u2014 SRE (Liam): Confirmed related early_eof signatures in edge logs for customer tenant. Collected tcpdump and edge-proxy logs (s3://redwood-logs/notelex/604910/).",
+    "2026-03-11 09:40 \u2014 Customer (Notelex): Provided additional traces showing proxy advertises 0-RTT and reuses connection IDs. Noted that disabling 0-RTT in their proxy makes the issue disappear in two test runs.",
+    "2026-03-12 08:12 \u2014 Eng (Maya): Reproduced locally with mitmproxy configured for 0-RTT handshake reuse and a streaming client; saw duplicate chunk and no end marker on resume. Added tracepoints to serving-runtime to capture resume token mapping."
+  ],
+  "investigation_notes": "Hypotheses:\n1) Edge/proxy 0-RTT resumption path is terminating the upstream stream before the final terminal event is flushed; because the client resumes using a new session id, the runtime treats the resumed connection as a new stream but replays the last buffered fragment, emitting duplicate chunk_id.\n2) Session-affinity metadata (session_id -> stream_token) is lost or re-bound to a different worker during a 0-RTT handoff; terminal marker was emitted but dropped at the proxy during a half-close race.\nWhat we checked so far:\n- Edge logs show 'upstream half-close' packages followed by TLS0RTT reuse messages.\n- Serving runtime did not record a final \"stream_closed_by_runtime\" event for this session.\n- Reproducer with 0-RTT disabled reproduces no duplication and includes terminal event.\nNext steps:\n- Add additional tracing of stream lifecycle across edge/proxy and runtime boundary.\n- Add guard in serving-runtime: when resuming a session, verify idempotency tokens and avoid re-emitting chunks if finalization is recorded.\n- Coordinate with Notelex to run controlled A/B test toggling 0-RTT on their proxy.\nRelated artifacts:\n- Kibana dashboard: https://kibana.internal.redwood/search?sid=notelex-604910\n- Internal runbook reference: https://confluence.redwood.ai/runbooks/stream-resume-troubleshooting",
+  "resolution_notes": "Workaround (applied with Notelex):\n- Instructed customer to disable TLS 0-RTT on their corporate proxy; tests showed no duplicates and terminal event delivered reliably.\n- Temporary server-side mitigation: rate-limited re-emit suppression added to canary edge (edge-canary-3) that checks last-chunk hash and suppresses immediate re-emit on exact match while awaiting finalization. Deployed 2026-03-12 21:00 UTC to canary tenants.\nPermanent fix plan:\n- Implement server-side resume token verification to detect resumed connections that would replay already-delivered fragments and ensure final terminal event is forwarded or retried reliably.\n- Tighten edge -> runtime handshake to ensure half-close flushing is signaled across the hop.\n- Postmortem: schedule deeper root-cause analysis with edge-proxy owners and Notelex for March 19.\nFollow-ups:\n- ENG-6129 implement resume token idempotency (owner: Maya).\n- SRE-447 ensure tcp socket close reason is logged at higher verbosity for resume cases.\n- Notify Customer Success to coordinate next-week patch test with Notelex.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_26027c8a012f4f6184d3b0f8bff28322"
+}

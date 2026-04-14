@@ -1,0 +1,140 @@
+{
+  "title": "Evidence collector rate limits and priority queueing patterns",
+  "owner": "Evelyn Park",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/security-and-compliance/evidence-collector-rate-limits-and-priority-queueing.json",
+  "doc_type": "doc",
+  "created_at": "2025-10-15",
+  "last_modified": "2026-02-20",
+  "collaborators": [
+    "Omar Ruiz",
+    "Leah Chen",
+    "Samir Patel"
+  ],
+  "team": "security-and-compliance",
+  "status": "draft",
+  "tags": [
+    "evidence-collector",
+    "rate-limiting",
+    "queueing",
+    "siem-export",
+    "operational-playbook"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-SEC-5723",
+    "JIRA-SEC-2141",
+    "https://github.com/redwood-inference/evidence-collector/pull/88"
+  ],
+  "summary": "Working spec for soft/hard rate limits, multi-priority queueing, and backpressure behaviors for evidence collectors that feed the SIEM export pipeline. Includes operational knobs, auth rotation notes, and a lightweight signed-envelope export mode for downstream archive and forensics.",
+  "goals": [
+    "Ensure collectors can operate across varied customer environments (VPC, on-prem, hosted) without causing downstream SIEM overloads.",
+    "Define priority classes so high-trust control evidence (RBAC changes, attestations) is exported ahead of lower-value telemetry while preserving fairness.",
+    "Provide concrete failure/slowdown modes and mitigation steps for on-call teams.",
+    "Standardize a compact envelope format for exports that preserves provenance and supports rehydration for audits."
+  ],
+  "background": "We currently observe bursty audit streams from some customers leading to SIEM ingestion spikes. Existing collectors either drop or buffer arbitrarily, causing gaps in audit chains. This doc sketches a pragmatic rate-limit + priority queue design tailored to evidence (not generic logs) and aligns operator expectations with alerting and recovery steps.",
+  "scope": [
+    "Applies to all collector variants (edge-side agent, sidecar, lambda harvesters).",
+    "Focus on emit-side controls (before network/send) \u2014 not downstream SIEM ingestion throttles.",
+    "Does not redesign the evidence schema; assumes minimal envelope fields (id, ts, origin, signature, type, payload_ref)."
+  ],
+  "constraints": [
+    "Collectors run in constrained environments (1-2 CPU, limited RAM) on customer infra \u2014 computational overhead must be minimal.",
+    "Cannot rely on central coordination for short-term burst smoothing (network partitions).",
+    "Must support stateless restart without losing priority semantics where possible."
+  ],
+  "design_overview": "Each collector implements a small local queueing layer with three priority bands (P0, P1, P2). A token-bucket rate limiter governs egress per destination (e.g., siem-ingest.example.com). If the bucket is empty, P0 items are allowed a small emergency bypass budget; P1/P2 are buffered to disk-based spillover or dropped according to policy. Export envelopes are serialized compactly (newline-delimited JSON) and signed/HMACed before send. Metadata about dropped/held events is emitted to a local health endpoint for scraping.",
+  "queueing_policy": [
+    "Priority bands: P0 = control-evidence (RBAC, attestations, chain-of-custody), P1 = user-audit (login, config changes), P2 = noisy telemetry/metrics exports.",
+    "In-memory queue depth defaults: P0=500, P1=2000, P2=5000. These are tunable by config and scaled down for tiny agents.",
+    "Spillover: when in-memory queue >75% full, move oldest P2 items to compressed local spill file (gzip newline JSON).",
+    "Eviction: P2 oldest-first eviction when total disk + mem > configured cap. P1 is only evicted as last resort after disk saturates. P0 never evicted unless explicitly operator-forced."
+  ],
+  "rate_limit_strategy": [
+    "Token-bucket per-destination with configurable capacity and refill rate. Default: capacity=1000 tokens, refill=100 tokens/sec (one token ~= one 1KB envelope).",
+    "Burst window: allow short bursts up to 3x capacity if a signed emergency token (rotatable key) is presented by control-plane for prioritized exports.",
+    "Backpressure signal: when limiter is <10% tokens, collector marks health endpoint status=degraded and sets metric collector.rate_limited=true for scraping.",
+    "Soft vs hard limits: soft limits trigger buffering; hard limits trigger policy-driven drops and emit a 'dropped-summary' control envelope (aggregated counts per minute)."
+  ],
+  "priority_keying": [
+    "Default keying rules: RBAC-change events (type=rback_change|rbac_v2) => P0; attestation/chain-of-custody => P0; API-key rotations and KMS events => P0.",
+    "Configurable overrides: customers can add regex matchers on event.path or event.meta to bump/demote priority locally.",
+    "Sticky ordering: within the same priority and same origin-session, preserve FIFO ordering to maintain causality where possible."
+  ],
+  "auth_and_rotation": [
+    "Collectors authenticate to our export endpoint using short-lived client certs or signed JWTs depending on deployment mode.",
+    "Rotate HMAC keys every 24 hours by default; allow rotation window of 72 hours for staggered fleets. Collectors must accept previous key for replay verification for the window period.",
+    "Emergency key/bypass: control-plane can issue single-use bypass tokens (JWT with 'bypass':true) to drain critical queues during incidents. Tokens logged centrally for audit."
+  ],
+  "export_format_and_siem": [
+    "Envelope fields (required): id, ts_utc, origin_id, origin_type, priority, type, payload_ref (s3:// or inline base64), signature_scheme, signature, schema_version.",
+    "Compact export is newline-delimited JSON. For large payloads (>128KB) collectors upload object to configured archive (S3-compatible) and put payload_ref rather than inline payload.",
+    "SIEM shim: a lightweight adapter handles mapping envelope.type -> siem index/stream. Adapter includes dedupe by id and will accept resends with identical id up to 7 days (idempotency window).",
+    "Support for alternate sinks: kube event API, syslog gateway, and direct Kafka topic 'evidence-archive' for high-throughput customers."
+  ],
+  "data_retention_and_ttl": [
+    "Local spill files TTL: default 72 hours. Older spillovers are purged by background sweeper.\n",
+    "Signed envelope TTL: included ts_utc + ttl_seconds field. Downstream systems must respect and honor TTL for archival vs delete decisions.",
+    "Reingestion window: collector exposes reingest endpoint for spill files within 14 days if operator requests backfill."
+  ],
+  "error_modes_and_retries": [
+    "Network transient: exponential backoff with jitter (base 100ms, max 30s) up to 12 retries, then escalate to spillover to disk and mark health degraded.",
+    "Permanent 4xx: drop if unrecoverable (e.g., schema mismatch). Emit a control-envelope describing last error and sample payload id for offline analysis.",
+    "Partial success: if batch endpoint returns per-item status, mark successes as sent, retry failures according to retry policy. No duplicate acking of successful ids.",
+    "Corruption detection: signature verification failure triggers quarantine of item to quarantine directory and alert to security triage."
+  ],
+  "observability_metrics": [
+    "collector.queue_depth.p0|p1|p2 (gauge)",
+    "collector.spill_files.count (gauge)",
+    "collector.rate_limited.total (counter)",
+    "collector.sent.bytes (counter)",
+    "collector.dropped.by_policy (counter with label reason)",
+    "collector.last_health_state (gauge: 0=ok,1=degraded,2=down)"
+  ],
+  "rollout_checklist": [
+    "Feature-flag gating in edge agents for initial 10% of fleet.",
+    "Simulated burst tests using local load harness (script: tools/collector-load-test.sh).",
+    "Enable verbose audit logging for first 72 hours after rollout to capture misclassification of priorities.",
+    "Ops runbook updated with runbook id RR-collector-queue-01 and escalation matrix.",
+    "Post-rollout retrospective scheduled (2 weeks after rollout) to capture tuning values."
+  ],
+  "migration_and_backfill_plan": [
+    "When enabling new priority mapping, run a dry-run mode where events are tagged with new_priority but still sent with old behaviour for 48 hours, log mismatches.",
+    "Backfill spilled events: provide a controlled reingest CLI (reingest-spill --limit N --priority X) that honors current rate limits and writes to 'reingest' topic with an audit header.",
+    "Record mapping changes in a changelog stored in S3 prefix s3://redwood-evidence-changelog/priority-mappings/ for auditors."
+  ],
+  "open_questions": [
+    "What should default capacity be for very small on-prem appliances (1 vCPU)? Proposal: scale down capacities by factor 10.",
+    "Do we support encrypt-then-sign for large payloads or rely on transport TLS + HMAC? Need security signoff.",
+    "Should the control-plane have the ability to remotely purge local spill files for legal/compliance requests? Privacy/legal input required."
+  ],
+  "notes_to_self": "Next steps: prototype limiter in Go runtime, get perf numbers, draft RFC for security review (owner: evelyn). Put validation tests behind CI gate and link to JIRA-SEC-2141.",
+  "operational_tips": [
+    "Use metrics to tune refill rate; watch collector.rate_limited.total spike as early indicator.",
+    "During incident, issue single-use bypass token and monitor for duplicate ids downstream.",
+    "If spill files accumulate, check network egress and DNS resolution to siem endpoint before raising infrastructure pager."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "goals",
+    "background",
+    "scope",
+    "constraints",
+    "design_overview",
+    "queueing_policy",
+    "rate_limit_strategy",
+    "priority_keying",
+    "auth_and_rotation",
+    "export_format_and_siem",
+    "data_retention_and_ttl",
+    "error_modes_and_retries",
+    "observability_metrics",
+    "rollout_checklist",
+    "migration_and_backfill_plan",
+    "open_questions",
+    "operational_tips",
+    "notes_to_self"
+  ],
+  "dataset_doc_uuid": "dsid_1eeab91b31e640c8be5d9eef038f742d"
+}

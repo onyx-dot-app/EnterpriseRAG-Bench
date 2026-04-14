@@ -1,0 +1,88 @@
+{
+  "key": "ENG-100112",
+  "team": "engineering",
+  "title": "Epoch-based allocator drift with KV prefetch windows: memory growth analysis",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-25",
+  "updated_at": "2026-03-13",
+  "creator": "Aria Chen",
+  "assignee": "Mateo Rivera",
+  "project": "serving-runtime-memory-stability",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "kv-cache",
+    "cudaMallocAsync",
+    "allocator",
+    "investigation",
+    "priority-hot"
+  ],
+  "description": "We observe sustained GPU memory growth on continuous-batching inference workloads when KV prefetch is enabled. Growth is not reclaimed over long tails (hours) despite apparent async free activity. This ticket tracks root-cause analysis, instrumentation additions, experiments, and a safe incremental fix path to avoid customer impact during rollout.",
+  "steps_to_reproduce": [
+    "Start dedicated runtime with kv_prefetch_window=8 and continuous batching enabled (mix of short/long sequences).",
+    "Warm model KV cache by sending 1000 distinct prompts to populate cached keys, then run steady-state load at 400 req/s for 3+ hours.",
+    "Observe GPU resident memory via nvidia-smi and allocator metrics exported to grafana (allocator.resident_bytes, allocator.free_queue_len).",
+    "Capture periodic heap dumps using our allocator debug endpoint (POST /debug/allocator/dump) and nvtx traces around batch boundaries."
+  ],
+  "observations": [
+    "Resident memory increases ~0.9-1.3GB/hour under mixed-batch traffic when kv_prefetch_window > 4.",
+    "Allocator free-queue length grows intermittently; async free counters show backlog on non-default CUDA streams.",
+    "Heap dumps show many small extents in 'stale' slab bins not being coalesced for long periods (epoch mismatch signature).",
+    "KV cache key residency increases faster than expected; evictions happen but memory not returned to OS / cudamempool for ~10+ minutes.",
+    "When we force a cudaDeviceSynchronize, a large portion of memory is reclaimed (suggests pending async frees completion is part of the problem)."
+  ],
+  "hypothesis": "Combination of (1) prefetch-induced hot-slicing of KV allocations creating many short-lived small slabs, (2) cudaMallocAsync's delayed physical free semantics on non-default streams, and (3) our epoch counter for slab reclamation not advancing on certain batching paths leads to freelist fragments not being consolidated, causing apparent leak-like growth.",
+  "proposed_fixes": [
+    "Add explicit async-free draining on a dedicated 'reclaim' stream: funnel frees there and add lightweight host callbacks to kick background defragmentation when backlog exceeds threshold.",
+    "Advance allocator epoch during batch-merge operations and on the KV prefetch completion callback so slab reclamation runs even if the primary request stream is busy.",
+    "Introduce a periodic reclaim task (configurable, off by default) that performs batch coalescence and attempts cudaFreeAsync completions with a tightened timeout heuristic.",
+    "Temporarily reduce default kv_prefetch_window to 4 for Dedicated until fix is validated in canary.",
+    "Add a monitoring alarm in Grafana for allocator.resident_bytes growth > 500MB in 30m for any host."
+  ],
+  "experiments": [
+    "Experiment A: Route all small-slab frees to a single reclaim stream + add host callback. Measure backlog and resident trend for 6 hours. (PR: github.com/redwood-inference/serving/pull/7123)",
+    "Experiment B: Advance epoch in KV prefetch completion path without changing free stream. Compare coalescence rate vs baseline.",
+    "Experiment C: Disable kv_prefetch_window for a canary pod and compare memory slope; validates signal is tied to prefetch workload pattern.",
+    "Experiment D: Introduce a lightweight periodic cudaDeviceSynchronize in background (metric gated) to force pending frees; only for internal canaries to measure reclamation latency change."
+  ],
+  "test_plan": [
+    "Run each experiment on a 3-pod canary (g4dn.12x or similar) for 12 hours with production-like query mixes.",
+    "Measure allocator.histogram(bin_size=64KB) over time, resident_bytes, cudaMallocAsync backlog metrics, and KV hit/eviction rates.",
+    "Run regression test suite for latency tail (p99) to ensure reclaim tasks do not add scheduling jitter that increases serving latency beyond SLO.",
+    "Post-fix: run 72-hour soak on dedicated cluster with kv_prefetch_window=8 to validate no long-term drift."
+  ],
+  "links": [
+    "https://github.com/redwood-inference/serving/pull/7123",
+    "https://grafana.redwood-inference.internal/d/allocator/allocator-memory-trends?orgId=1",
+    "https://confluence.redwood-inference.internal/display/INF/KV+Prefetch+Design",
+    "https://github.com/redwood-inference/serving/compare/allocator-epoch-fix",
+    "https://internal-logs.redwood-inference/sessions/2026-02-23-allocator-trace"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "comments": [
+    "2026-02-25 10:14 - Aria Chen: Initial triage \u2014 reproduced memory slope on canary. Attached allocator heaps and nvtx trace. Marking as high priority since Dedicated customers observed increased unit costs.",
+    "2026-02-27 15:02 - Mateo Rivera: Added finer-grained allocator histograms and stream-level async-free counters. Confirmed large number of pending frees on stream id 7 during heavy prefetch periods.",
+    "2026-03-01 09:44 - Priya Kapoor (review): Consider the behavioral differences across CUDA versions (11.8 vs 12.x). If cudaMallocAsync semantics differ, add a runtime guard to avoid regression on older clusters.",
+    "2026-03-04 17:20 - Mateo Rivera: Ran Experiment A on canary cluster. Immediate reduction in resident growth by ~65% over 8 hours. Backlog moved to reclaim stream but free latency slightly increased \u2014 p99 latency unchanged in serving path.",
+    "2026-03-06 11:06 - Drew Hernandez (SRE): Observed spike in host CPU during reclaim host callbacks; need to throttle callback frequency to avoid scheduler pressure. Suggested exponential backoff when reclaim work is heavy.",
+    "2026-03-09 14:30 - Mateo Rivera: Implemented epoch advancement in KV prefetch completion (Experiment B). Coalescence rate improved; smaller bin counts merged more frequently. Memory slope reduced to ~0.15GB/hour in early runs.",
+    "2026-03-11 10:50 - QA Team: Running 48h soak with combined fixes (reclaim stream + epoch advancement) \u2014 preliminary pass, no p99 regressions. Will extend to 72h.",
+    "2026-03-13 16:05 - Aria Chen: Plan for staged rollout: enable reclaim stream + epoch advance behind a runtime flag. Canary 5% for 24h, evaluate metrics, then gradual increase. Drafted rollout playbook and rollback steps (links above)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observations",
+    "hypothesis",
+    "proposed_fixes",
+    "experiments",
+    "test_plan",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_668731f3db1b45fdacae3d426f95d835"
+}

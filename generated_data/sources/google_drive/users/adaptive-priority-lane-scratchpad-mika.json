@@ -1,0 +1,35 @@
+{
+  "title": "Adaptive priority lane surge scratchpad",
+  "owner": "Mika Tanaka",
+  "drive_area": "users",
+  "path": "users/adaptive-priority-lane-scratchpad-mika.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-12",
+  "last_modified": "2026-02-28",
+  "collaborators": [
+    "Carlos Rivera",
+    "Leah Park",
+    "Ethan Zhou"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "priority-lanes",
+    "surge",
+    "p99",
+    "kv-cache",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "JIRA-INF-8421",
+    "https://github.com/redwood-inference/inference/pull/1234",
+    "slack://channel/eng-serving-runtime/C12345"
+  ],
+  "content": "Context:\\nPersonal lab notes for a quick exploration of priority lanes + adaptive admission during short, high-intensity ingress spikes. Want to capture setup, raw results, oddities, and concrete next actions. Keep this informal \u2014 iterative log.\\n\\nHypothesis:\\n- Priority lanes (fast-path for high-tier tokens) + adaptive admission (reject/backoff based on instant qps) will reduce p99 of high-priority requests during microbursts without catastrophically hurting lower-priority throughput.\\n- Warm KV-cache interactions: priming high-priority lane first should amplify benefits; cold-cache spikes may dominate cost.\\n\\nEnvironment:\\n- Fleet: 4x A100-80GB (dedicated pool) behind ingress routing sim.\\n- Runtime: redwood-inference-runtime v0.76 (local dev build with microbatching fix)\\n- Model: redwood-mini-6b-8bit (seq len 512 test configuration)\\n- Orchestration: local k8s single-az, autoscaler disabled for these runs\\n- Observability: per-request traces + tesla-agent GPU util / cgroup metrics, bucketed into 1s windows\\n\\nTraffic patterns and scenarios:\\n1) Poisson baseline: 150 qps lambda, 10% high-priority (HP). 20m run.\\n2) Microburst: steady 100 qps, then 600 qps spike for 30s, HP fraction ramps 10% -> 40% during spike.\\n3) Stair-step multi-burst: three spikes (60s each) with 3x tiers of HP concentration.\\n4) Cold-cache variant: flush KV-cache across nodes immediately before spike.\\n\\nAdmission policies tested (A/B matrix):\\nA: FIFO (no lanes), simple queue cap=200\\nB: Static priority lanes (HP lane weight 0.6), queue cap HP=120, LP=80\\nC: Adaptive admission - measured instant qps + tail latency feedback, drops LP first when GPU util > 78% or p95(HP) > 250ms\\nD: Adaptive w/ preemptive KV-priming: preferentially dispatch HP requests to warmed shards during spike window\\n\\nKey runtime knobs recorded: concurrency target (1,2,4), microbatch window (10ms / 50ms), max_batch_tokens (2048 / 4096).\\n\\nRaw snapshot (selected) - microburst scenario, 30s spike, cold-cache:\\n- A (FIFO): p50=120ms, p90=340ms, p95=490ms, p99=1.4s, throughput during spike ~ 520 qps accepted, GPU util spiky 35->95%\\n- B (Static lanes): p50(HP)=110ms, p90(HP)=280ms, p99(HP)=950ms; p99(LP)=1.6s; overall accepted qps ~ 510 (LP starved)\\n- C (Adaptive): p50(HP)=105ms, p90(HP)=220ms, p99(HP)=420ms; LP p99 bumped to 2.1s but many LP requests dropped (5% drop) to keep HP SLOs; accepted qps ~ 480 (with ~7% drops across both tiers)\\n- D (Adaptive + priming): p50(HP)=98ms, p90(HP)=190ms, p99(HP)=360ms; drop rate 2% LP; throughput accepted ~ 495; GPU util smoother, fewer tail spikes\\n\\nSmall ASCII p99 over time (D run, 60s window, numbers in ms):\\nTime(s) | p99(HP)\\n0-10    | 120  135  140  150  160  170  180  190  200  210\\n10-20   | 220  230  240  260  280  300  340  360  350  330\\n20-30   | 310  300  280  260  240  220  210  200  195  190\\n(rough - each value is 1s bucket)\\n\\nObservations / oddities:\\n- Cold KV-cache dominated first 8s of spike; priming reduced that tail significantly. Even with identical accepted qps, warmed shards drop p99 by ~2x in first 10s.\\n- Adaptive policy can be tuned aggressively to protect HP SLOs with modest global drop rates (~3\u20137%). We observed diminishing returns when using microbatch window >20ms (adds 30\u201350ms to p50).\\n- Preemptive priming requires a fast shard map; slight staleness (200ms) can cause misrouting and transient 5\u201310% extra latency on HP. Need to quantify map staleness tolerance.\\n- When GPU util oscillates quickly, admission decisions chase the metric and cause small oscillations in accepted qps. Adding 1s exponential smoothing to util input stabilizes behavior.\\n\\nQuick cost/efficiency note:\\n- Static lanes improved HP metrics but effectively reduced total accepted throughput (LP starvation). Adaptive approach preserved more overall throughput at the expense of some LP drops \u2014 net token-per-second accepted across fleet was ~95% of FIFO but with HP p99 improved by ~2\u20133x.\\n\\nImmediate next steps (actionable):\\n- Re-run D with varying shard-map staleness knobs (0ms, 50ms, 200ms) and capture misroute rate and HP p99. (JIRA-INF-8421)\\n- Add a short test to simulate very short microbursts (10s) to see if priming overhead is worth it for brief spikes.\\n- Build lightweight synthetic priming: sample small prefixes from live workload and precompute KV blocks for top-20 tokens.\\n- Surface a dashboard: per-lane drop rate, p99, and priming hit-rate (1s granularity).\\n\\nNotes to self / heuristics:\\n- If expected spike < 15s, priming might not pay unless KV warmup latency > 200ms for first tokens.\\n- Prefer smoothing on GPU util; avoid reacting to single 1s buckets.\\n- Default microbatch window to 10ms for latency-sensitive HP lane; allow LP lane to use 50ms to optimize throughput.\\n\\nRandom loose thoughts (for later):\\n- Could use probabilistic admission rather than hard drops for LP, tuned by real-time gradient descent on p95(target)-observed.\\n- Consider hybrid: reserve small always-on capacity for HP (like 10% of nodes) during predictable spike windows (calendar-based).\\n\\nReferences & quick links:\\n- Load generator config: git://perfgen/configs/mika/priority-lane.json\\n- Notebook: https://notebooks.internal.redwood.ai/mika/priority-lane-analysis.ipynb\\n\\nTimestamped quick log:\\n2026-02-14 09:12 UTC - kicked off Poisson baseline, everything green\\n2026-02-14 09:55 UTC - ran microburst cold-cache (A,B,C,D) - collected traces\\n2026-02-14 10:40 UTC - initial parsing & small table above\\n2026-02-20 16:03 UTC - added priming variant (D) and re-ran; much better first-10s tail\\n\\nEnd of scratchpad. Will extract a short one-pager for the team if results hold on more runs.\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_62ff8961614e42e4bd17276a3c189f29"
+}

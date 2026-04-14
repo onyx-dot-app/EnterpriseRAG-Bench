@@ -1,0 +1,97 @@
+{
+  "key": "ENG-524889",
+  "team": "engineering",
+  "title": "Client socket-close protocol, resumable slices, and soft-drop cleanup",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-03-10",
+  "creator": "Aisha Patel",
+  "assignee": "Marco Liu",
+  "description": "Background: Production telemetry in Q1 uncovered a class of failures where client sockets close mid-generation (mobile app backgrounding, flaky proxies, or abrupt network handoffs). Current heuristics either retain large partial KV caches indefinitely or aggressively drop work, causing customer-visible hallucinations, duplicate tokens, or wasted GPU cycles. This ticket introduces a formal socket-close protocol plus a resumable-slices abstraction and a \"soft-drop\" cleanup policy to balance correctness, cost, and latency.\n\nGoals:\n- Define a minimal wire-level handshake and server-side epoch semantics for abrupt client disconnects.\n- Implement resumable slices (bounded partial-generation checkpoints) that can be reattached by returning clients or retired safely after TTL.\n- Introduce soft-drop cleanup: allow graceful eviction of partial work with a short quiesce window to enable fast reclamation under load while minimizing correctness regressions.\n\nNon-goals: full migration of legacy SDKs in this ticket (compat shims will be added separately), or changes to persistent storage layer beyond checkpoint metadata and eviction markers.",
+  "acceptance_criteria": [
+    "Wire protocol: server accepts a socket-close frame (close_hint) that optionally carries the resume_token and last_known_epoch; if absent, server will treat as ephemeral disconnect",
+    "Resumable slices implemented: server writes slice metadata (slice_id, epoch, prefix_kv_hash, token_offset) to lightweight checkpoint store within 10ms write path",
+    "Soft-drop TTL policy: default quiesce window = 45s; under memory pressure, soft-drop policy allows immediate soft-invalidations followed by background compaction within 5m",
+    "Safety: no resumed client can observe duplicate token emissions or token order regressions for resumed slices in 99.99% of tests",
+    "Cost: partial checkpointing should not increase median token CPU overhead by >3% on p4d test rig",
+    "Metrics: new metrics export and dashboard validated (slice_created, slice_resumed, slice_evicted_softdrop, resume_conflict_count) and alerts wired for resume_conflict_count > 1/day for a customer",
+    "Compatibility: legacy SDKs without close_hint fallback to current best-effort behavior (no silent failures) and log a warning client-side"
+  ],
+  "implementation_notes": [
+    "Server: add frame handler for CLOSE_HINT (HTTP/2 custom frame or gRPC trailer key). CLOSE_HINT carries: resume_token (opaque), epoch_id (int), slice_summary (kv_hash, token_offset)",
+    "Checkpoint store: bounded in-memory metadata with optional persistence to local SSD index; metadata size per slice < 1KB. Fast path: memtable append; background worker persists/compacts to local index blobstore",
+    "Epoch lease: when CLOSE_HINT received server allocates ephemeral epoch lease (lease_ttl=60s). If client reconnects with same resume_token within lease_ttl, allow resume. If lease expired, reject resume and mark slice for soft-drop",
+    "Resume merge: attempt fuzzy merge of cached KV prefixes using prefix_kv_hash to verify compatibility; if mismatch, escalate to resume_conflict_count and prefer replay from last safe token offset",
+    "Soft-drop policy: two-step eviction: (1) soft-invalidated - mark slice inaccessible for resumption but keep cached data for background compaction (soft window 5m) ; (2) hard-evicted - free memory and delete metadata after compaction",
+    "Backpressure integration: when server memory pressure or batch queue depth exceeds thresholds, prefer soft-drop of oldest slices with least recent heartbeat. Implement priority boost for enterprise tenants tagged as 'dedicated'",
+    "Compatibility layer: SDKs will get an opt-in 'close_and_resume' flag; older clients that send no CLOSE_HINT get a short default lease (10s) on server to avoid state accumulation",
+    "Observability: emit structured events with correlation_id, client_sdk_version, region, tenant_id for every slice lifecycle transition"
+  ],
+  "rollout_plan": [
+    "Feature flag gate: runtime feature 'resumable_slices_v1' default off",
+    "Canary: enable feature for internal-staging, then 5% of Hosted API traffic for non-critical tenants for 48h",
+    "Monitor: watch resume_conflict_count, slice_evicted_softdrop, memory_pressure_evictions. Rollback on >5% increase in client 5xx or >20% increase in median latency for streaming endpoints",
+    "Gradual: after canary success, increase to 25% for 72h, then 100% for non-enterprise. Dedicated clusters will get admin toggle; Private customers can opt-in via upgrade guide",
+    "SDKs: publish SDK opt-in flag and RFC doc; include migration checklist for mobile/web teams to add close_and_resume on backgrounding hooks"
+  ],
+  "metrics": [
+    "stream.slice_created: counter by region, tenant, model",
+    "stream.slice_resumed: counter by resume_result (success, conflict, expired)",
+    "stream.slice_evicted_softdrop: counter and gauge for bytes reclaimed",
+    "stream.resume_conflict_count: counter and alert threshold",
+    "stream.resume_latency_ms: histogram (time between reconnect and resume complete)",
+    "infra.memory_pressure_evictions: gauge correlated with slice evictions"
+  ],
+  "dependencies": [
+    "ENG-412908 (streaming-session-eviction-and-soft-abort-protocol) - coordination for eviction knobs",
+    "ENG-101234 (incremental-output-ttl-and-resume-handshake) - reuse resume token format",
+    "runtime/pull/12345 - PR adding CloseHint frame handler",
+    "sdk/issue#78 - SDK flag for close_and_resume"
+  ],
+  "test_plan": [
+    "Unit: frame encoding/decoding tests for CLOSE_HINT including malformed tokens",
+    "Integration: simulate client abrupt socket close then reconnect within lease_ttl with resumed tokens; validate token order and no duplicates",
+    "Chaos: randomized network flakiness test for 1000 concurrent streaming sessions with soft-drop enabled; assert memory growth bounded",
+    "Perf: measure p99 latency and token CPU overhead on p4d with load test harness before/after enabling resumable slices",
+    "Compatibility: test with legacy SDK versions (v0.9.x) to ensure default behavior unchanged"
+  ],
+  "docs_and_links": [
+    "PRD: https://drive.google.com/file/d/1PRD-Stream-Backpressure-ResumableSlices",
+    "Design notes: https://docs.internal.redwood/streaming/resumable-slices-design",
+    "Github PR runtime: https://github.com/redwood-inference/runtime/pull/12345",
+    "SDK issue: https://github.com/redwood-inference/sdk/issues/78",
+    "Perf dashboard: https://grafana.redwood/internal/d/streaming-resume"
+  ],
+  "comments": [
+    "2026-02-21 - Aisha Patel: Spiked protocol variants with CloseHint as HTTP/2 custom meta; gRPC trailer option also viable. Chose custom frame for lower jitter.",
+    "2026-02-25 - Marco Liu: Implemented in-memory metadata append and basic lease logic. Observed 0.8% CPU overhead in microbench; need larger rig perf tests.",
+    "2026-03-02 - Natalia Gomez (SRE): Concern: initial soft-drop TTL 45s may be too long under memory pressure. Proposed dynamic TTL reduction under sustained pressure; added to implementation notes.",
+    "2026-03-05 - Priya Shah (SDK lead): Will add opt-in close_and_resume flag to mobile SDK; landing PR ETA 2026-03-18. Legacy clients will log warning when resumable slices are enabled.",
+    "2026-03-09 - Marco Liu: Added metrics and dashboard panels to staging Grafana. Small number of resume_conflict_count events in staging tied to edge proxy rewriting token header. Need compatibility shim for proxies."
+  ],
+  "labels": [
+    "streaming",
+    "backpressure",
+    "kv-cache",
+    "compatibility",
+    "p1"
+  ],
+  "estimate": "8",
+  "project": "runtime-inference-ops",
+  "cycle": "2026-W10",
+  "due_date": "2026-03-31",
+  "customer_impact": "medium",
+  "release": "runtime-2026.04",
+  "security_review_required": "true",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "implementation_notes",
+    "rollout_plan",
+    "test_plan",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_27468ccc47ad4b8d8cc4d88c202f1434"
+}

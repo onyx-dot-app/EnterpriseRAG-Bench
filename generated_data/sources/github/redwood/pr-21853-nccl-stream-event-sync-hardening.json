@@ -1,0 +1,74 @@
+{
+  "repo": "redwood",
+  "pr_number": "21853",
+  "title": "TP: harden NCCL collective stream/event synchronization (graph-safe, feature-flagged)",
+  "author": "Grace Kim",
+  "created_at": "2025-02-20",
+  "updated_at": "2025-02-27",
+  "merged_at": "2025-02-27",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "bugfix/tp-nccl-stream-event-sync-hardening",
+  "reviewers": [
+    "Hiro Tanaka",
+    "Yuki Sato",
+    "Noah Patel",
+    "Allison Grant",
+    "Rafael Mendes"
+  ],
+  "labels": [
+    "runtime",
+    "kernels",
+    "tp",
+    "nccl",
+    "stability",
+    "observability"
+  ],
+  "linked_linear": [
+    "ENG-4825",
+    "ENG-4821"
+  ],
+  "linked_jira": [
+    "SUP-48377",
+    "INT-2219"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "326",
+  "deletions": "141",
+  "breaking_change": "false",
+  "description": "Context: We have recurring TP hangs under sustained mixed prefill/decode load where one or more ranks appear to block indefinitely in/around NCCL collectives. In incident traces and NCCL debug logs (see SUP-48377), we consistently see patterns consistent with stream ordering/synchronization assumptions being violated across compute/comm streams when prefill and decode interleave and when CUDA Graph capture is enabled for steady-state decode. This PR adds explicit stream/event synchronization around NCCL collectives to make the ordering guarantees deterministic and to prevent silent stalls caused by missing dependencies.\n\nWhat this changes: 1) Introduces a dedicated NCCL stream per TP replica (existing) but enforces a consistent dependency contract: compute -> (record event) -> NCCL stream waits -> launch collective -> (record event) -> compute stream waits. 2) Adds a small helper (NcclSyncGuard) used at all collective callsites (all-reduce, all-gather, reduce-scatter) to avoid ad-hoc event wiring and ensure we do not accidentally skip a wait under certain scheduler paths. 3) Makes behavior conditional for CUDA Graph capture: during capture, we avoid calling cudaEventRecord/cudaStreamWaitEvent in ways that break capture or introduce illegal dependencies. Instead, we (a) pre-create capture-safe events and (b) fall back to a conservative single-stream path for collectives in graph mode when the runtime determines the capture would otherwise include cross-stream dependencies. 4) Adds structured debug logging (rate-limited) when the sync guard takes the conservative path so we can correlate any performance regressions to graph-mode fallbacks.\n\nWhy this fixes the hang class: NCCL collectives are launched on the NCCL stream, but upstream compute that produces input buffers and downstream compute that consumes outputs were occasionally scheduled on different streams without a strict event edge. Under load, the scheduler can reorder work such that a rank enters a collective with incomplete inputs or a different collective ordering, producing stalls that look like \"NCCL waiting\" with no explicit error. The explicit event edges ensure every rank sees the same dependency ordering from compute to NCCL and back.\n\nPerf considerations: This adds two events and two waits per collective in the non-graph path. Microbench results on A100-80GB show +0.4\u20130.9% median decode latency overhead at 4-way TP for typical batch sizes; p99 impact in stress runs was within noise once stalls were eliminated. In graph mode, we prefer keeping capture intact; if we must fall back to a conservative path, we log it and increment a counter so we can quantify how often we lose graph benefits.\n\nRollout plan: Feature-flagged behind runtime.tp.nccl_sync_hardening (default ON in canary, OFF in general until validated). SRE requested a guard to disable quickly if perf regressions show up; this is wired to the dynamic config system and also supports env override REDWOOD_TP_NCCL_SYNC_HARDENING=0 for emergency rollback.\n\nTesting: Added unit coverage for dependency wiring (mock stream/event API) and an integration smoke test that runs a short multi-rank decode loop with forced stream interleaving. Also validated with benchmark-lab repro harness and the mixed prefill/decode scenario from ENG-4822 (local).\n\nSnippet (illustrative): In the collective wrapper we now do: compute_event.record(compute_stream); nccl_stream.wait(compute_event); ncclAllReduce(..., nccl_stream); nccl_done.record(nccl_stream); compute_stream.wait(nccl_done). Graph mode uses capture-safe event objects and may switch to a single stream if cross-stream waits would invalidate capture.\n\nFollow-ups: We still need better surfacing when NCCL stalls (ENG-4823/PR-21872) and a watchdog/abort path (ENG-4826). This PR is intentionally focused on hardening the ordering contract at the kernel/comms boundary (ENG-4825).",
+  "commits": [
+    "runtime/tp: add NcclSyncGuard helper for collective callsites",
+    "runtime/tp: enforce compute<->nccl event edges for all-reduce/all-gather/reduce-scatter",
+    "runtime/tp: graph-mode handling for stream/event dependencies (capture-safe events, conservative fallback)",
+    "runtime/config: add tp.nccl_sync_hardening flag + env override",
+    "tests: add mock stream/event unit tests and tp_collective_smoke integration test",
+    "logging: add rate-limited debug logs + counters for conservative path usage"
+  ],
+  "changed_files": [
+    "runtime/tp/collectives/nccl_collectives.cc",
+    "runtime/tp/collectives/nccl_collectives.h",
+    "runtime/tp/collectives/nccl_sync_guard.cc",
+    "runtime/tp/collectives/nccl_sync_guard.h",
+    "runtime/tp/graph/tp_graph_capture.cc",
+    "runtime/tp/graph/tp_graph_capture.h",
+    "runtime/tp/executor/tp_executor.cc",
+    "runtime/config/runtime_flags.cc",
+    "runtime/config/runtime_flags.h",
+    "runtime/observability/metrics/runtime_tp_metrics.cc",
+    "runtime/observability/logging/runtime_log_rate_limit.cc",
+    "tests/runtime/tp/test_nccl_sync_guard.cc",
+    "tests/runtime/tp/tp_collective_smoke_test.cc",
+    "docs/internal/runtime/flags.md"
+  ],
+  "conversation": "Hiro Tanaka (review): Can you confirm the event lifetime story? We\u2019ve been bitten by per-iteration event allocs showing up in Nsight + causing allocator contention.\nGrace Kim (author): Yep. Events are created once per replica (and per capture epoch in graph mode) and reused. No per-token allocs. I added a comment + a small assertion in debug builds to ensure we don\u2019t create events in the hot path.\n\nYuki Sato (review): Concerned about CUDA Graph capture. StreamWaitEvent across streams is generally capture-able, but only if the event is created with the right flags and the streams are within the capture. Are we sure we\u2019re not creating cross-capture dependencies?\nGrace Kim: Good call. The logic checks capture state; if the NCCL stream isn\u2019t part of the same capture set, we take the conservative single-stream path for collectives during capture. Also using capture-safe events (no timing) and pre-creating them before capture begins. Added a counter runtime_tp_nccl_graph_fallback_total so we can track how often this happens.\n\nAllison Grant (observability): Can we tag logs so SRE can correlate perf regressions to the fallback path?\nGrace Kim: Added structured log fields {tp_replica_id, tp_rank, collective_type, graph_capture_state, took_conservative_path}. Also made it rate-limited.\n\nRafael Mendes (SRE): Please ensure the feature flag can be flipped without restart for Dedicated canary.\nGrace Kim: Wired into dynamic config; also left env override for emergency.\n\nNoah Patel (review): The helper is nice, but make sure we keep collective ordering consistent with scheduler (ENG-4824). This PR should not change ordering.\nGrace Kim: Agreed. This only adds dependencies around existing launches; ordering is unchanged. I added a short note in the PR description and verified against the repro harness that the call sequence matches pre-change.\n\nCI note: Initial GPU smoke failed due to a flaky multi-rank test timeout on shared runners; reran with isolated runner and passed. Marked the test with a slightly higher timeout and added a retry annotation.\n\nFinal: Approved by Hiro/Yuki/Noah. Merged via squash after green CI.",
+  "release_notes": "Runtime: harden TP NCCL collective synchronization via explicit stream/event dependencies; feature-flagged (tp.nccl_sync_hardening) with CUDA Graph capture-safe behavior and conservative fallback logging/counters.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "conversation",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_a7b0f840f9ad42469607844e3218440a"
+}

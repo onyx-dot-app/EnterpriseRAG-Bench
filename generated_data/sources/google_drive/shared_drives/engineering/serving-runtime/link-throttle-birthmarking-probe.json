@@ -1,0 +1,56 @@
+{
+  "title": "Link-throttle birthmarking probe: intermittent NVLink/NCCL throughput drops and clock-domain correlation",
+  "owner": "Maya Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/link-throttle-birthmarking-probe.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-14",
+  "last_modified": "2025-03-01",
+  "collaborators": [
+    "Ethan Park",
+    "Leah Gupta"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "nccl",
+    "nvlink",
+    "profiling",
+    "tail-latency",
+    "multi-gpu",
+    "investigation"
+  ],
+  "linked_artifacts": [
+    "JIRA-RI-2418",
+    "github.com/redwood-inference/serving-runtime/pull/736",
+    "confluence:multigpu-birthmarking-notes"
+  ],
+  "body": "Summary:\n\nWe observed sporadic 15\u201345% dropouts in inter-GPU aggregate bandwidth during pipeline+tensor parallel runs on a 4x-H100 node cluster. The drops are short-lived (20\u2013200ms) but correlate with increased token latency tails and NCCL retries on collective ops. This doc records a reproducible birthmarking test and early root-cause hypotheses (clock-domain transitions and link-level throttling), measurement techniques, quick mitigations we validated, and next tests to isolate HW vs SW.",
+  "body_2": "Context and why this matters:\n\n- Production inference workloads with interleaved micro-batches are sensitive to short hits in cross-GPU bandwidth. Even sub-200ms bandwidth dips cause KV-cache refill stalls and token tail spikes.\n- Existing NCCL perf baselines looked fine in steady-state; the transient nature means standard large-scale throughput tests miss it.\n- We need a lightweight birthmarking harness that intentionally stresses link-level behavior while being easy to run in CI and on Dedicated clusters.",
+  "body_3": "Hardware and software baseline:\n\n- Node: 4x NVIDIA H100 SXM, DGX-like backplane (NVLink fabric + PCIe host).\n- OS: Ubuntu 22.04, kernel 5.15 with our production kernel tweaks.\n- Driver/CUDA/NCCL: NVIDIA driver 545.xx, CUDA 12.1, NCCL 2.17.\n- Serving runtime: runtime v0.42.1 (collector hooks enabled).\n- Observed on mixed rack-level placements and also when all GPUs are local to the same host.\n\nCommands to gather baseline topology and clocks:\n- nvidia-smi topo -m\n- nvidia-smi --query-gpu=name,index,clocks.gr,clocks.sm,clocks.mem,pstate --format=csv\n- nvlinkstat (internal shim) to sample per-link throughput (traces to /tmp/nvlink.log)\n- perf counters via nvidia-smi dmon and nvprof for early correlation\n\nNote: we captured synchronized timestamps (host-clock NTP + GPU monotonic) to align traces across nodes where applicable.",
+  "body_4": "Birthmarking harness (how to reproduce):\n\n- Purpose: create deterministic short-window heavy allreduce/alltoall traffic with intermittent host/CPU activity to try and trigger link gating.\n- Steps (shell pseudocode):\n  1) build small NCCL microbench (modified simpleAllReduce) with configurable message sizes and random inter-burst jitter.\n  2) run under controlled P2P placement: ranks pinned to GPUs 0..3, CPU cores isolated.\n  3) concurrently run a lightweight host driver poll loop that intentionally toggles low-power features (simulate powermgr events): a loop that runs cpufreq-set between two governors at 100ms intervals.\n  4) collect nvlinkstat and nvidia-smi dmon logs.\n\n- Example run: ./nccl_microbench --algo=allreduce --msg=256KB --iters=5000 --burst-interval=50ms --jitter=10ms > run.log 2>&1 &\n- Start nvlinkstat recorder: ./nvlinkstat --sample-ms=10 --out=/tmp/nvlink.log\n\nWe observed consistent dips when the host poll loop toggled power/clock hints. Remarkably, similar dips occurred without the host toggler but with synthetic host DMA bursts (fio staged reads) that coincide with PCIe activity; suggests a host-to-fabric interaction is possible.",
+  "body_5": "What we measured (high-level):\n\n- nvlinkstat timeseries shows per-link bandwidth drop from ~180 GB/s aggregate down to 110\u2013140 GB/s in windows of 30\u2013180ms.\n- NCCL logs show retries and increased kernel launch latency co-occurring with the link dip windows.\n- GPU clocks (sm, mem) sometimes transiently drop 10\u201320% during the event.\n- Host PCIe counters show bursts of DMA read/write at start of events.\n- No consistent thermal spikes were observed (junction temps steady).\n\nRepresentative excerpt (timeline):\n- t0: steady state allreduce throughput.\n- t0+1.2s: host DMA bursts appear (fio).\n- t0+1.25s -> t0+1.4s: nvlink aggregate drops ~35%. NCCL reports 2x retry on ring transfer.\n- t0+1.45s: throughput recovers; GPU clocks restore.\n\nThis pattern was reproducible across two different chassis and GPU batches, reducing likelihood of single-card defect.",
+  "body_6": "Hypotheses (ranked):\n\n1) Link gating due to clock-domain transitions: host activity triggers a transient reassignment or gating of NVLink lanes to/from PCIe (fabric arbitration), reducing effective link width briefly.\n2) Driver power-management interactions: driver or NVLink firmware enters a low-power microstate when it detects host interrupts; the transition/resume has non-trivial latency.\n3) NCCL scheduling + kernel launch contention: bursts of host activity saturate the host staging path causing queuing/serialization that appears as link slowdown at GPU side.\n4) Microcode/fabric bug: less likely but plausible given specific driver/firmware combo.",
+  "body_7": "Quick mitigations tested (results):\n\n- Pinning GPUs to keep PCIe DMA paths stable: small improvement (~5\u20138% fewer events).\n- Disabling CPU governor toggling in the experiment (simulate customer config): event rate drops markedly.\n- Forcing persistent kernels / keepalive traffic (small periodic NVLink traffic) helped reduce event magnitude \u2014 suggests cold-start of some link microstate contributes.\n- NCCL env tweaks (NCCL_NET_GDR_LEVEL, NCCL_P2P_LEVEL) temporarily reduced retries but didn't eliminate dips.\n\nActionable short-term: document recommended host config for Dedicated fleet: set cpufreq governor to performance, disable aggressive PCI ASPM, set driver parameters to prefer persistent NVLink. We'll add these to the node bootstrap profile and validate across 10 nodes.",
+  "body_8": "Deeper isolation experiments (next steps):\n\n1) Firmware/driver matrix: test across 3 driver versions and 2 firmware revs to look for regression boundaries.\n2) Fabric-only probe: run identical workload with GPU->GPU transfers bypassing host staging (if possible) to see if host DMA is causal.\n3) Per-link microbench: use a microbench that exercises single NVLink pairs while monitoring lane-level error counters.\n4) Trace NCCL internals: enable NCCL debug trace to see exact coll op boundary timings.\n5) Kernel-level capture: use NVIDIA's nvtx ranges + our perf collector to map kernel launch->complete times to link dips.\n6) Try H-to-H (host-to-host) heavy DMA to see if identical dips happen without GPUs (indicates PCIe link arbitration issue).\n\nI'll schedule the above across the staging cluster over the next 2 weeks and capture a matrix of runs.",
+  "body_9": "Hypothesis tests we consider decisive:\n\n- If fabric-only probe (peer-to-peer, no host staging) still triggers dips: hardware fabric arbitration or NVLink microstate bug likely.\n- If older driver avoids dips: driver regression -> coordinate with NVIDIA.\n- If forcing persistent tiny NVLink traffic eliminates dips: cold-link resumption latency is root cause and we can mitigate by runtime-level keepalives or NCCL tweaks.",
+  "body_10": "Logging & observability improvements to add to runtime:\n\n- Add lightweight nvlinkstat integration into our runtime trace pipeline (sample every 50ms) for production nodes behind dedicated pools.\n- Emit NCCL op-level events to our tracing backend so we can fuse NCCL retry windows with link-level traces.\n- Add an anomaly detector alert for short-duration >20% drop in aggregate link throughput correlated with >10ms increase in token tail latency.\n\nThis will help accelerate detection in customer clusters and avoid chasing noisy signals in ad-hoc experiments.",
+  "body_11": "Notes to self / informal observations:\n\n- This problem is subtle: steady-state probes look fine. Need short-sample high-resolution traces.\n- Customer call last month reported similar tail spikes; might be the same root cause.\n- Consider adding microbench to our CI (nightly on a small lab node) to catch regressions if driver/firmware causes reappearance.\n\nLogged by: Maya (primary), Ethan (trace analysis), Leah (kernel-level debugging).\n\nNext-sync: 2025-03-03 10:00 PST (quick run status + firmware test scheduling).",
+  "notes": "References to other docs: see /shared_drives/engineering/serving-runtime/pcie-nvlink-host-staging-tail-latency-notes.json (related) but this probe focuses on brief link gating and birthmarking methodology, not steady-state saturation experiments.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "body_2",
+    "body_3",
+    "body_4",
+    "body_5",
+    "body_6",
+    "body_7",
+    "body_8",
+    "body_9",
+    "body_10",
+    "body_11",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_6d334ceefde546f9800ef3cb161d3406"
+}

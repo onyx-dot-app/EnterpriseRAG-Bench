@@ -1,0 +1,95 @@
+{
+  "key": "SUP-524681",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Multi-NAT translation ordering causes SYN/ACK rewrite leading to gRPC KV-cache invalidation and intermittent 401s on artifact fetch",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Ava Chen",
+  "assignee": "Marcus Lee",
+  "customer_company": "HyperBank",
+  "customer_tier": "private",
+  "components": [
+    "networking",
+    "control-plane",
+    "serving-runtime"
+  ],
+  "labels": [
+    "vpc-peering",
+    "nat-translation",
+    "grpc",
+    "kv-cache",
+    "artifact-fetch",
+    "private-deploy"
+  ],
+  "environment": "prod us-east-1",
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "affected_models": [
+    "gpt-open-6B-v2"
+  ],
+  "sla_due_at": "2026-03-14",
+  "related_github_prs": [
+    "github.com/redwood-inference/runtime/pull/2598"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SUP/kv-cache-invalidation-runbook"
+  ],
+  "linked_issues": [
+    "INT-4410",
+    "SUP-210401"
+  ],
+  "description": "Issue summary: Customer reports intermittent 401 Unauthorized when Redwood control plane requests pre-signed model shards. Failures started after customer enabled a secondary corporate NAT appliance in front of their TGW and peering route policy changes.\n\nImpact: Model downloads for HyperBank private deployment fail ~5-10% of range download attempts, causing failed warm starts and increased latency for customer inference. No full site outage but degraded success rate and increased retries in serving nodes.\n\nObserved failure mode: Control plane authenticated requests to S3 presigned URLs return 401; serving nodes report gRPC connection resets and kv-cache invalidation (cache miss followed by successful refetch) correlated with NAT churn.\n\nEnvironment: Private deployment (VPC peering to HyperBank transit), prod us-east-1, peered TGW -> corporate NAT appliance -> internet egress. Redwood serving nodes in private subnet, control-plane traffic routed via customer egress during certain peering paths.\n\nCustomer-provided sequence: After adding secondary NAT appliance the customer saw a spike in failed shard fetches; failures are transient and often recover without action.\n\nAdditional notes: Not an SDK or application-layer bug; signatures are valid when retried. Timing suggests a stateful middlebox rewriting source port mapping after SYN/ACK reorder which results in a short-lived connection path rewrite and session attribution mismatch at the origin (S3/CDN).",
+  "steps_to_reproduce": [
+    "1) Use private deployment with peered TGW and add an upstream NAT appliance that performs symmetric NAT with connection re-mapping.",
+    "2) Trigger multiple concurrent model shard downloads (large model, >100 concurrent range requests).",
+    "3) Observe intermittent 401s on presigned object range fetches and gRPC stream resets on serving nodes.",
+    "4) Correlate timestamps with NAT appliance logs and conntrack counters showing late SYN/ACK path rewrite."
+  ],
+  "logs": [
+    "2026-03-12T22:41:12Z serving-node-7 ERROR s3_fetch.go:241 presigned GET 401 x-amzn-err: SignatureDoesNotMatch (attempt 1)",
+    "2026-03-12T22:41:12Z serving-node-7 WARN kv_cache.go:132 eviction triggered after conn reset",
+    "2026-03-12T22:41:12Z control-plane-proxy INFO tcpdump: client 10.20.3.45:53104 -> s3.amazonaws.com:443 SYN, server reply appears from 3rd-party NAT path with different src port on SYN/ACK",
+    "Customer NAT logs: 2026-03-12T22:41:12 NAT: conn_rewrite original(10.20.3.45:53104) -> rewrite(52.14.23.9:33105) after SYN/ACK reorder"
+  ],
+  "investigation_notes": [
+    "Hypothesis: Multi-NAT ordering and asymmetric path causes source-port remapping mid-handshake leading to origin (CDN/S3) attributing request to different connection and failing signature validation occasionally.",
+    "Checked control-plane and serving-node TLS sessions: session resumption not primary factor; mismatch happens at TCP 3-way handshake level (observed SYN then SYN/ACK from alternate egress IP).",
+    "Conntrack metrics on serving subnet show high NAT TIME_WAIT reuse and ephemeral port collisions during peak burst downloads.",
+    "Reproduced at small scale by toggling a test NAT appliance simulating symmetric NAT+hairpin; observed same 401 pattern at synthetic S3 endpoint.",
+    "CDN logs show requests from different source IP/port within 200ms window for the same logical client session, triggering signature verification failures on a small fraction of requests."
+  ],
+  "comments": [
+    "Ava Chen (Support): Initial report received from HyperBank on 2026-03-12 22:50 UTC. Captured retry histogram and gave immediate guidance to reduce parallel fetch concurrency as a temporary mitigation.",
+    "Marcus Lee (SRE): Confirmed SYN/ACK reorder seen in packet captures. Reproduced locally with a NAT appliance VM. Assigned INT-4410 to investigate NAT sequence handling in serving subnet routing.",
+    "HyperBank Network (customer): We added a secondary NAT as part of egress hardening change window. We saw spikes exactly during our nightly prewarm job. We'll keep the old NAT active for rollback and provide detailed conntrack logs.",
+    "Marcus Lee (SRE): Requested packet captures from 3 hops (serving node, TGW, corporate NAT) and a pcap from origin-facing edge. Also suggested enabling ephemeral-port-randomization on NATs and increasing conntrack_table_size temporarily.",
+    "Ava Chen (Support): Raised customer expectation and updated SLA timer. Marked as P1 due to production impact on inference warm starts."
+  ],
+  "root_cause": "Asymmetric/mid-handshake NAT remapping introduced by a recently added corporate NAT appliance combined with peering route changes. The remap sometimes changed source port/IP between initial SYN and subsequent SYN/ACK path, causing CDN/S3 to see a different 5-tuple than the one used to sign presigned URLs; this produced sporadic SignatureDoesNotMatch/401s and triggered serving-node kv-cache invalidations when downloads failed.",
+  "resolution_notes": "Short-term mitigations applied: (1) Advised customer to temporarily route control-plane artifact fetches via Redwood-managed egress (bypass customer NAT) OR reduce parallel shard concurrency in prewarm jobs. (2) Customer rolled back the secondary NAT while we validated fixes. (3) Redwood SRE adjusted serving-node retry logic to back off and revalidate signatures on mismatch and added an extra verification step before kv-cache purge to avoid cascading evictions.\n\nLong-term actions (follow-ups):\n- INT action (INT-4410): Add detection for mid-handshake source-mapping changes in our edge TCP stack and surface alerts if observed.\n- Network design doc update: Recommend explicit egress path for artifact fetches in private deployments (constrain to single NAT or use VPC endpoint).\n- Engineer PR planned: runtime change to treat signature mismatch as transient and attempt a deterministic rebind before purge (tracked in github.com/redwood-inference/runtime/pull/2598).",
+  "postmortem_followup_items": [
+    "INT-4410: Instrument conntrack anomaly metric and alert at 0.1% of artifact fetches failing with signature mismatch.",
+    "DOC-707: Update private-deploy network hardening guidance to include ephemeral port capacity recommendations and NAT ordering constraints.",
+    "SRE: Deploy runtime PR to soften kv-cache purge on single-range signature mismatch (target: 2026-03-21).",
+    "Customer action: Validate NAT appliance configuration for symmetric NAT behavior and enable ephemeral-port-randomization."
+  ],
+  "resolution_status": "Mitigation applied; customer rolled back secondary NAT. Engineering changes scheduled; monitoring in place. Awaiting INT ticket completion and runtime PR merge.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "root_cause",
+    "resolution_notes",
+    "postmortem_followup_items",
+    "resolution_status"
+  ],
+  "dataset_doc_uuid": "dsid_858278894f7d4ad49acc78923d0c763c"
+}

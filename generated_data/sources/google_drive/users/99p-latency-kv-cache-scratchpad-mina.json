@@ -1,0 +1,33 @@
+{
+  "title": "99p latency + KV cache scratchpad",
+  "owner": "Mina Patel",
+  "drive_area": "users",
+  "path": "users/mina.patel/serving-runtime/99p-latency-kv-cache-scratchpad",
+  "doc_type": "doc",
+  "created_at": "2025-03-10",
+  "last_modified": "2025-03-12",
+  "collaborators": [
+    "Diego Marquez",
+    "Samira Johnson"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "kv-cache",
+    "99p",
+    "batching",
+    "investigation"
+  ],
+  "linked_artifacts": [
+    "JIRA-INF-4321",
+    "github.com/redwood-inference/runtime/pull/1289",
+    "slack://channels/C01ABCD2E3F/p1637282190000"
+  ],
+  "content": "Daily scratchpad - focused on recurring 99th-percentile latency spikes for short prompts (len <= 64) on the avx2/ampere pools. Dumping notes, quick repros, and action items.\n\nContext:\n- Symptoms: intermittent 99p spikes (~2-4x baseline) for small prompt traffic during moderate QPS (40-120 qps per GPU). Median and p50 stable. Root-cause not obvious from single-request traces.\n- Hypothesis threads: KV cache eviction thrashing when concurrent batched requests mix prefix lengths; batching decisions + kernel selection causing tail latency; slow GPU memcpy when KV cache size crosses quantized threshold; fallback to fp32 kernels under certain model variants.\n\nQuick repro attempts (local kube cluster):\n- Image/tag: runtime:canary-2025-03-06\n- Model: openlm-13b-8bit (quantized) pinned to v2025-03-05\n- Driver: nvidia 525.105\n\nCommands used: \n- burst generator: scripts/loadgen/small_prompts_burst.py --qps 80 --burst 200 --prompt-len 20 --concurrency 16\n- perf capture: ./observe/trace-collect.sh --pod runtime-worker-0 --duration 180 --type perf_events\n\nObserved: \n- Under burst runs, tail latency exhibits spikes at ~120ms -> ~450ms. Heatmap shows KV-cache eviction count correlating with spike windows.\n- Flamegraph: expensive memcpy and occasional lock contention in kv_cache_manager::insert() when batch size > 8.\n- Kernel selection logs: occasionally falling back to generic attention kernel for seq_len=64 even though the optimized kernel should apply. Need to check kernel selector thresholds.\n\nNotes from logs (grep snippets):\n- \"kv_cache_manager.cpp: insert: eviction_count=27, current_kv_size=5.2MB, threshold=5MB\"\n- \"batch_scheduler.cpp: dispatch: final_batch=12, adaptive_batching=true, prefix_cache_hit=0.12\"\n- \"kernel_selector.cpp: chosen_kernel=generic_attention, reason=missing_fastpath_for_qkv_layout\"\n\nImmediate checks to run (small, fast):\n- [ ] Add instrumentation to kv_cache_manager: record insert latency histogram (ms) and lock hold time. (PR idea: add small scoped_timer + counters, tag by model_id and batch_size).\n- [ ] Re-run burst with env DEBUG_KERNEL_SELECTION=1 to capture why chosen_kernel falls back. Capture selector decisions and input shapes.\n- [ ] Verify quantization path: ensure model loaded with expected QKV layout flag (qkv_layout=packed) \u2014 mismatch could force generic kernels.\n- [ ] Query NIC stats around spike windows to rule out ephemeral network hiccups between worker and model shard.\n\nLonger experiments (next 48 hrs):\n- A: Controlled microbenchmark that varies batch size and interleaved prefix lengths to reproduce lock contention. Use synthetic driver that calls runtime predict loop with artificial KV insert patterns.\n- B: Run candidate patch: change kv_cache_manager to use sharded locks (8 shards) and measure tail latency in canary. Risk: more complex concurrency bugs -> do in canary only.\n- C: Try disabling adaptive batching for short prompts to see if that reduces 99p. Might reduce throughput but isolates batching effect.\n\nData to collect for RCA (add to ticket JIRA-INF-4321):\n- Per-request trace with tag: prefix_len, final_batch, chosen_kernel, kv_eviction_count, kv_insert_ms, lock_hold_ms, pod_cpu/mem, gpu_util, memcpy_ms.\n- Aggregated 99/95/50 over sliding 5m windows during experiments.\n- Kernel selection logs for last 24h (grep for kernel_selector entries).\n\nTemporary mitigations to try (low-risk):\n- Force pinned kernel path via config: runtime.config.kernel_override[\"openlm-13b\"] = \"fast_attention_v2\". Test on staging only.\n- Increase kv_cache capacity threshold by +25% for a cluster to reduce evictions (but watch memory).\n- Add circuit-breaker: if eviction_rate > X, route small prompts to a low-latency model variant with smaller KV footprint.\n\nMeeting notes (standup 2025-03-11 with Diego & Samira):\n- Diego: saw similar spikes on Dedicated pool last week; suspected batch coalescing mis-scheduling. Will share scheduler logs (GH PR 1289)\n- Samira: suggested looking at the new kernel microbenchmarks; will run quantized attention profile on ampere/rocm stacks.\n- Action: we pair on sharded lock patch + selector debug next Tue.\n\nOpen questions / unknowns:\n- Are spikes correlated with autoscaler events (pods created/destroyed)? Need to overlay cluster events with latency timeline.\n- Does model warming (cold KV cache) cause first few requests per model shard to spike? If so, cache warmup strategy could help.\n- Are we seeing any host page faults or GPU thrashing when multiple models loaded on same node? Check dmesg and nvidia-smi --query for ECC errors.\n\nSmall TODO list (checkboxes for my day):\n- [ ] Drop kernel-selector debug flag into canary and collect full selector traces (today)\n- [ ] Add basic kv_cache insert timing metrics (scoped timer) and expose as prometheus metric (this afternoon)\n- [ ] Start microbenchmark script (A) with 4 variants: shard-lock, global-lock, no-lock (safe sim), sharded-8 (tomorrow morning)\n- [ ] Annotate JIRA-INF-4321 with collected data and a proposed mitigations plan (by EOD Wed)\n- [ ] Sync with SRE to get cluster event timeline for last 48h (Slack: @sre-oncall)\n\nNotes-to-self: keep the patch small and feature-flagged; prefer observability-first approach rather than immediate risky concurrency changes. Aim for canary results before wider rollout.\n\nUseful commands / snippets:\n- kubectl logs -n runtime -l app=worker --since=2h | grep kernel_selector | sed -n '1,200p' > /tmp/kernel_sel.log\n- python tools/trace_aggregator.py --input /traces/canary-03-11 --out /tmp/agg.csv --cols prefix_len,final_batch,kv_eviction_count,latency_ms\n- perf top -p $(pidof runtime_worker) --call-graph\n\nEnd of today's notes. Will update after kernel debug run (planned 2025-03-12 10:00 PST).\n\n-- Mina\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_e3fedd9826cf43a5b57a24d80798aac4"
+}

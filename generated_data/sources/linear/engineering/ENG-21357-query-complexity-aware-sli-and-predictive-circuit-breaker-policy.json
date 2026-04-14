@@ -1,0 +1,44 @@
+{
+  "key": "ENG-21357",
+  "team": "engineering",
+  "title": "Query-complexity-aware SLI and predictive circuit-breaker policy",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-03-05",
+  "creator": "Lena Chen",
+  "assignee": "Marco Rios",
+  "project": "resilience-fx",
+  "cycle": "2026-W09",
+  "estimate": "5",
+  "due_date": "2026-04-01",
+  "labels": [
+    "sli",
+    "slo",
+    "load-shedding",
+    "circuit-breaker",
+    "regional-failover",
+    "runtime"
+  ],
+  "dependencies": [
+    "ENG-37456",
+    "ENG-271900"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Context:\nRedwood currently defines SLIs primarily by endpoint and model-variant without accounting for request complexity. This causes two operational problems: (1) high-complexity requests (long contexts, multimodal payloads, code-generation) systematically burn SLOs and error budgets faster than short text requests, and (2) fixed circuit-breaker thresholds either overreact to short bursts of cheap requests or underreact to heavy expensive workloads.\n\nGoal:\nDefine a per-endpoint, per-model SLI taxonomy that is query-complexity aware, add a predictive circuit-breaker policy that uses short-term load forecasting and complexity-weighted capacity accounting, and codify an error-budget burn/recovery policy tied to complexity buckets and multi-region failover. The aim is to improve fairness across tenants, reduce unnecessary failovers, and provide clearer operational levers for CapacityOps.\n\nKey definitions proposed:\n- Complexity Score (CS): single numeric score computed at request admission. CS = w1*token_count_normalized + w2*multimodal_flag + w3*structured_output_flag + w4*avg_generation_temp_factor + w5*specialized_op_flag (e.g., code, embeddings + gen). Initial weights: w1=0.6, w2=0.15, w3=0.1, w4=0.1, w5=0.05. Values normalized to [0,1].\n- Complexity Buckets: LOW (CS <= 0.25), MEDIUM (0.25 < CS <= 0.6), HIGH (CS > 0.6).\n- Composite SLI: a request is counted as SLI-success if BOTH: (a) latency requirement met for the bucket AND (b) model-quality sentinel passes (see Quality SLI below).\n- Latency targets (initial): LOW p95 < 60ms, MEDIUM p95 < 180ms, HIGH p95 < 450ms.\n- Quality SLI: measured via live lightweight heuristics (e.g., hallucination-detector score, truncated embedding-similarity to reference prompts when available, and model self-consistency checks) as a pass/fail signal. Initial target: quality-pass-rate >= 99% for LOW, 97% MEDIUM, 95% HIGH.\n\nCircuit-breaker / predictive load-shedding policy:\n1) Admission control uses Complexity-Weighted QPS (CWQ): CWQ = sum over active requests of CS * model_cost_factor. Model_cost_factor is per-variant (e.g., 1 for base-7B, 3 for 13B quantized, 8 for 70B float).\n2) Per-region soft thresholds: region_capacity_score computed from active GPU slots and recent per-GPU throughput. If CWQ > 0.8 * provisioned_capacity -> enter Degraded Mode (apply gentle shedding: 10-30% tail-drop on LOW priority tokens and deprioritize background batch jobs). If CWQ > 1.05 * provisioned_capacity -> Hard Tripped (invoke circuit breaker).\n3) Predictive component: 1-min EWMA forecast of CWQ and a 30s anomaly detector (z-score over rolling 2-min window). If forecast shows >15% increase in next minute AND current utilization >65%, pre-emptively reduce admitted low-priority traffic by X% and notify CapacityOps.\n4) Graceful fallback: circuit breaker first attempts model-variant fallback (to cheaper quantized variant) if quality SLI forecast indicates degradation < quality tolerance. If no suitable fallback, route to warm-standby region per regional-failover matrix.\n\nError budget accounting and burn policy:\n- Error budget units are tracked separately per complexity-bucket for each endpoint-model. That is, we maintain 3 parallel error budgets: EB_LOW, EB_MED, EB_HIGH. This prevents cheap requests from consuming budgets needed for heavy requests.\n- Burn rate calculation uses complexity-weighted failures: each failed request consumes CS units from bucket budget instead of 1. Time-windowed burn-rate alerts (1h and 24h windows) trigger mitigation steps.\n- Cross-region borrowing: if a region exhausts EB_HIGH for a critical endpoint, it can borrow up to 20% of another region's EB_HIGH subject to global reserve. Borrowing requires: (a) customer has multi-region allowance, (b) borrower not in immediate emergency. Borrow transactions are logged and periodically reconciled.\n\nInstrumentation & telemetry changes required:\n- Admission path must emit CS and chosen model_cost_factor per request (new fields: admission.cs, admission.variant_cost_factor).\n- SLIs must be recorded with complexity_bucket tag and quality_pass boolean. Logs and prom metrics: slo.success{endpoint,model,complexity_bucket}, slo.latency_ms{quantiles,endpoint,model,complexity_bucket}, slo.quality_pass_rate{...}.\n- Circuit-breaker decisions emitted as events with reason and pre/post CWQ.\n\nDashboards & Alerts:\n- New dashboard: \"Complexity SLI & Capacity\" with per-endpoint heatmap of EB consumption by bucket, per-region CWQ, predictive_trend, and circuit status.\n- Alerting: EB burn-rate (1h) on any bucket > 3x expected triggers throttled mitigations; EB exhaustion triggers PagerDuty to CapacityOps for P1 endpoints only.\n\nRollout plan / migration strategy:\n1) Beta on internal endpoints: enable CS emission and bucketized SLIs for a small set of endpoints (metrics-only, no enforcement) for 2 weeks.\n2) Canary enforcement: apply soft shedding rules in one non-critical region for 72h. Observe impact on latency & quality.\n3) Full enforcement: enable across all regions with predictive breakers and regional borrowing.\n\nOpen trade-offs / questions:\n- We are introducing complexity into SLI definition which increases alerting and interpretation cost. Need to verify if teams prefer bucketed SLIs vs per-request weighting in a single SLI.\n- Quality SLI heuristics are approximate; we must guard against false positives causing budget burns. Consider a slow path to compute higher fidelity quality signals for a subset of requests.\n- Borrowing policy edge cases (simultaneous exhaustion) \u2014 need global reserve sizing. Recommend initial reserve = 5% of global EB per critical product.\n\nArtifacts & links:\n- Design doc (internal): https://confluence.redwood.ai/resilience/query-complexity-sli (design draft)\n- Prototype PR (admission + metrics): https://github.com/redwood-inference/runtime/pull/4132\n- Dashboard mock: https://grafana.redwood.ai/d/abcd123/complexity-sli\n- Load-shedding simulator (notebooks): https://drive.redwood.ai/drive/folders/1Qw-shed-sim\n\nAcceptance criteria:\n- Complexity score emitted for 99% of traffic in beta endpoints with <1% overhead added to admission latency.\n- Per-bucket SLI metrics available in Prometheus/Grafana and historical EB burn plots for last 30 days.\n- Circuit-breaker predictive rule correctly reduces admissions for synthetic spike in simulator in 3/5 runs with no quality-regression when fallback to cheaper variant is applied.\n\nNext steps (owner: Marco Rios):\n- (Week 1) Implement admission.cs emission and add metrics counters (PR #4132 review feedback).\n- (Week 2) Wire up Prom rules and create dashboard. Run internal beta for 2 weeks.\n- (Week 4) Evaluate results and iterate on weights for CS; prepare canary enforcement.\n\nLong-term: consider integrating a learned Complexity predictor (small model) in admission path to better classify expensive requests (defer to 2H 2026 roadmap).",
+  "comments": [
+    "2026-02-18 - Lena Chen: Created ticket and initial spec. Added design doc link. Requested CapacityOps feedback on region borrowing rules.",
+    "2026-02-22 - Marco Rios: Implemented initial CS emission into admission path (metrics-only). Opened PR #4132. Noted ~0.8ms median overhead in admission during stress test.",
+    "2026-02-25 - Priya Nandakumar (CapacityOps): Reviewed borrowing policy; requested explicit global reserve and stricter conditions for P0 customers. Suggested reserve = 5% and notify sales on borrow.",
+    "2026-03-01 - Marco Rios: Rolled out metrics-only beta to internal endpoints in us-west-2. Dashboard showing initial EB consumption by bucket is live. Observed that HIGH bucket accounts for 12% of traffic but 46% of EB burn.",
+    "2026-03-05 - Lena Chen: Updated spec to include predictive EWMA threshold and sample latency targets after reviewing telemetry. Scheduled canary region testing for 2026-03-10."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_4f8a671ca2e848b59cfef8fad28c36d2"
+}

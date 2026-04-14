@@ -1,0 +1,98 @@
+{
+  "key": "ENG-63107",
+  "team": "engineering",
+  "title": "Investigate intermittent GPU resident-set growth during continuous-batch KV hot-slice migration",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-28",
+  "updated_at": "2026-03-12",
+  "creator": "Ava Martinez",
+  "assignee": "Noah Chen",
+  "project": "runtime-memory-stability",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "labels": [
+    "kv-cache",
+    "continuous-batching",
+    "cudaMallocAsync",
+    "memory-fragmentation",
+    "investigation",
+    "regression"
+  ],
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Production signals show intermittent steady growth in GPU resident memory (RSS) on servers running continuous batching with KV cache warmup. The growth is correlated with a specific traffic pattern where many short-context requests trigger repeated partial KV 'hot-slice' materialization and then partial eviction. We need to root-cause whether the allocator (cudaMallocAsync / mempool) is holding onto fragments, whether KV prefetching leaves pinned staging allocations, or whether stream synchronization barriers are preventing frees from releasing residency.",
+  "acceptance_criteria": [
+    "Root cause hypothesis documented and validated with repro artifacts or eliminated",
+    "A mitigation implemented (config change, allocator tweak, or KV eviction fix) that stops steady RSS growth in the reproducible test",
+    "Perf dashboard: 7-day rollout showing no >5% regression in p50 latency or token throughput and stable RSS under the same traffic profile",
+    "Follow-up ticket(s) created for any longer-term allocator or runtime changes"
+  ],
+  "repro_steps": [
+    "Create a continuous-batching workload of short sequences (8-32 tokens) at medium QPS with synthetic KV keys: 80% hits but hot-slice accesses distributed across many keys",
+    "Enable advanced KV prefetching (prefetch: slice-level, staggered=true) and persistent pooling: staging_pool=enabled",
+    "Run for 4 hours with GPU resident sampling every 30s (nvidia-smi, perf counters) and track cudaMallocAsync call counts via profiling agent",
+    "Observe resident set growth and correlate to outstanding stream events and pending frees via runtime logs",
+    "Capture heap summary from mempool (if available) and collect stack traces for long-lived allocations"
+  ],
+  "investigation_notes": [
+    "2026-03-01 \u2014 Initial triage: replicated growth in local stress cluster using same binary as prod. Growth slower than previous KV-prefetch incidents, but steady ~150MB/hour increase on T4-equivalent nodes.",
+    "2026-03-02 \u2014 Profiling: cudaMallocAsync allocation counts spike during warmup and then plateau; however resident bytes continue to climb. Observed pending frees sitting on non-default streams in runtime logs (stream ids 42/43 frequently).",
+    "2026-03-03 \u2014 Hypothesis A: frees are being enqueued to non-blocking streams and not observed by the CUDA async free background service due to stream lifetime / stream-quarantine timing causing delayed release back to pool.",
+    "2026-03-04 \u2014 Hypothesis B: KV partial-slice allocations are being promoted to pinned staging buffers for fast reuse but not returned to the LIFO slab due to slab-hysteresis thresholds tuned for large batches. The threshold prevents returning small fragments, increasing fragmentation over time.",
+    "2026-03-05 \u2014 Heap dump: mempool slab map shows many small resident chunks (~4-32KB) marked as staging in use=false but residency=true. Suggests unmap/unpin not happening even though CPU-side references were dropped.",
+    "2026-03-07 \u2014 Experiment: force stream synchronization at KV prefetch completion reduced accumulation rate by ~70% in the repro cluster, supporting Hypothesis A (stream sync delaying background unmap/frees).",
+    "2026-03-09 \u2014 Kernel-level check: observed kernel 'cuMemFreeAsync' returns queued, but eviction scheduler didn't drain because the quarantine window was set to 10s; repeated rapid prefetched staging caused quarantine to pile up. Lowering quarantine to 1s eliminated most of the observed residency growth in short runs.",
+    "2026-03-11 \u2014 Regression check: the quarantine window was increased in runtime-1.20 to reduce CPU/GPU thrash for large-batch workloads\u2014this change explains why the issue surfaced with recent customer traffic skewing towards many small batches.",
+    "2026-03-12 \u2014 Conclusion: combination of (1) asynchronous frees tied to non-default streams + (2) conservative slab/quarantine thresholds that keep small staging fragments resident leads to gradual resident-size growth under continuous small-batch KV-hot-slice patterns."
+  ],
+  "mitigations_applied": [
+    "Temporarily reverted quarantine window to 1s on canary hosts (config runtime.quarantine_window_s=1) \u2014 validated on canary cluster with negative RSS slope",
+    "Added an optional KV prefetch config 'staggered_prefetch=false' to reduce concurrent staging churn for customers running many short requests",
+    "Introduced runtime logging to emit 'pending_free_high_water_mark' events when pending frees > 1000 within 10s \u2014 for rapid detection"
+  ],
+  "code_changes_and_prs": [
+    "https://github.com/redwood-inference/runtime/pull/4298 \u2014 add configurable async-free quarantine window and runtime flag (WIP)",
+    "https://github.com/redwood-inference/runtime/pull/4310 \u2014 add diagnostic histogram for pending-free latencies to /metrics (merged)",
+    "https://github.com/redwood-inference/kv-cache/pull/214 \u2014 optional staggered_prefetch toggle exposed in config (in review)"
+  ],
+  "perf_links": [
+    "https://dashboards.redwood.ai/runtime/memory/ENG-63107-repro-2026-03-08",
+    "https://dashboards.redwood.ai/alloc-traces/ENG-63107/2026-03-03",
+    "https://grafana.redwood.ai/d/jzY8k/kv-prefetch-canary?orgId=1"
+  ],
+  "artifacts": [
+    "confluence: https://redwood.atlassian.net/wiki/spaces/RUN/pages/987654321/KV+hot-slice+resident+set+investigation",
+    "gists: https://gist.github.com/noahchen/0a1b2c3d4e5f6 (heap-summaries and sample backtraces)",
+    "repro-run: s3://redwood-repro/ENG-63107/repro-2026-03-04.tar.gz"
+  ],
+  "next_steps": [
+    "Finalize PR 4298 with a safe default quarantine of 1s and a telemetry guardrail that flips quarantine back to 10s only when large-batch throughput and low fragmentation are detected",
+    "Roll the config change to 10% of hosts across regions for 48h, watch resident growth and p50 latency",
+    "Postmortem note and runbook: add check to detect continuous small-batch traffic patterns and auto-tune quarantine/prefetch settings",
+    "Follow-up long-term work: evaluate slab rebalancer that compacts small staging fragments into reusable LIFO buckets and improve stream-agnostic free draining logic (new ticket planned)"
+  ],
+  "followups": [
+    "ENG-64210 \u2014 slab-rebalancer-design-and-simulation",
+    "ENG-64401 \u2014 stream-quarantine-refactor-and-async-free-drain",
+    "PM-412 \u2014 add KV prefetch safe-mode to Console feature flags"
+  ],
+  "comments": [
+    "2026-03-01 \u2014 Ava Martinez: Started repro in stress cluster. Logging added for stream ids and pending-free counters. Assigning to Noah for allocator deep-dive.",
+    "2026-03-04 \u2014 Noah Chen: Heap dump and mempool maps attached to artifacts. Observed 'resident=true' fragments without CPU references. Hypotheses added to investigation_notes.",
+    "2026-03-07 \u2014 Priya Singh (SRE): Canary rollout with forced stream-sync caused reduced RSS growth. Suggests stream-lifetime interaction. Will run longer 24h canary.",
+    "2026-03-09 \u2014 Marco Silva (Runtime Eng): Found quarantine-window bump in 1.20 change set (PR 3880). That explains regression; preparing toggle in PR 4298.",
+    "2026-03-11 \u2014 QA: Smoke tests with the quarantine=1s flag show no functional regressions for our internal microbench suites. Monitoring enabled.",
+    "2026-03-12 \u2014 Noah Chen: Pushed diagnostic histogram to metrics; proceeding with 10% canary rollout. Will create follow-up tickets for slab rebalancer architecture."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "repro_steps",
+    "investigation_notes",
+    "mitigations_applied",
+    "next_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_037befbd4548454dac65c8281d44f93c"
+}

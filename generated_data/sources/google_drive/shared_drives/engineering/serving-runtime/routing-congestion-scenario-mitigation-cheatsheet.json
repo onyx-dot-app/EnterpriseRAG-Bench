@@ -1,0 +1,39 @@
+{
+  "title": "Routing congestion scenario mitigation cheatsheet",
+  "owner": "Asha Menon",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/routing-congestion-scenario-mitigation-cheatsheet.json",
+  "doc_type": "doc",
+  "created_at": "2024-10-12",
+  "last_modified": "2025-02-14",
+  "collaborators": [
+    "Carlos Rivera",
+    "Elena Karpova",
+    "Samir Patel"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "moe",
+    "routing",
+    "latency",
+    "profiling",
+    "llama",
+    "mistral",
+    "qwen",
+    "long-context",
+    "playbook"
+  ],
+  "linked_artifacts": [
+    "JIRA:INFR-3421",
+    "github.com/redwood-inference/serving-runtime/pull/987",
+    "slack:#runtime-ops:message-6f7a2b",
+    "confluence:serving-runtime/multi-arch-routing-ops"
+  ],
+  "body": "Summary:\nThis is a compact investigative playbook for diagnosing and mitigating routing-congestion symptoms we see when serving MoE-enabled variants of Llama/Mistral/Qwen at long contexts (16k\u201364k). It collects quick repro steps, lightweight profiling commands, heuristics that worked in staging, and an operational runbook for emergency mitigation. The objective: minimize SLO impact (p95/p99 tail latency) while preserving throughput and model quality.\n\nSymptoms observed (representative):\n- Latency spikes at tail for requests with long prefix + dense routing fanout (p99 increases 2\u20136x).\n- High GPU-side stall cycles with low SM utilization but high PCIe DMA / host->GPU memcpy activity.\n- Per-request expert fanout skew: small subset of experts receive >70% of tokens.\n- Queueing/backpressure in worker threads; RPC latency variance across NUMA domains.\n\nEnvironment notes to capture when reproducing: model name + size (eg llm-llama-70b-moe, mistral-large-experts), seq length distribution, batch window target, hardware (A100-80GB, H100), NIC/PCIe topology, and kernel build (cuda/cudnn/driver). Always capture peak active experts count and per-expert memory usage.\n\nRepro recipe (fast local):\n1) Use scripted generator that emits mixed-length requests: 20% long (>=32k), 80% short (<=512).\n2) Pin to single server with deterministic routing seed.\n3) Run at 60\u201380% client qps and capture traces.\n\nSuggested lightweight profiling commands: (start here before heavy profiling)\n- Collect runtime traces: RUNTIME_TRACE=1 ./serving_binary --trace-file traces.pb\n- GPU utilization and memcpy hotspots: nvidia-smi dmon + nvprof sampling for 1 minute window.\n- Python/Torch stack: python -m torch.profiler (with record_shapes=False to reduce overhead).\n- Kernel scheduling: perf record -g -p <pid> for host-side locks and thread stalls.\n\nKey diagnostics to extract:\n- Per-token routing table: fraction of tokens that hit top-10 experts.\n- Inter-expert message sizes and number of DMA submissions per forward pass.\n- Time split: gating computation, routing serialization, collective/expert compute, memcpy.\n- Queue depth histogram for each expert worker thread.\n- NUMA-locality of input tensors and resulting PCIe hops.\n\nCommon causal patterns (ranked by frequency in our runs):\n1) Skewed gating distribution + dense long prefixes -> very uneven expert load, causing hot experts and increased queuing/serialization cost.\n2) Small request fragmentation: many small fragments cause many small DMA ops (high overhead) instead of fewer big transfers.\n3) Cross-NUMA traffic: host staging buffers live on a different NUMA node than the worker thread, causing PCIe hops and odd memcpy stalls.\n4) Synchronous prefetch/handshake that blocks worker threads waiting for KV cache availability.\n5) Aggressive batching heuristics that increase latency variance when a hot expert appears.\n\nMitigation strategies (fast to try in order):\n- Short-term emergency: enable model fallback to dense variant for requests longer than threshold (e.g., >24k) or when active-expert-skew > threshold. This preserves latency at cost of compute.\n- Smooth gating: apply temporary temperature or top-k gating cap so no more than N experts are chosen per token (N=2\u20134). This reduces fanout.\n- Fragment coalescing: increase minimum fragment size / aggregate fragments per-request to reduce DMA op count.\n- Soft admission control: limit per-request expert tokens inflight; queue earlier at ingress and shed lower-priority requests.\n- NUMA affinity: bind expert worker threads to NUMA node of prefetch buffers; pin host staging buffers accordingly.\n- Backpressure tuning: lower max_batch_window_ms for suspected hot-expert endpoints to reduce queueing.\n\nLonger-term engineering fixes:\n- Dynamic expert rebalancer: periodic small-weight transfers to pull load off hot experts (background, low-overhead).\n- Asynchronous prefetch pipeline decoupled from synchronous handshakes; prefetch uses bounded worker pool with token priority.\n- Coarse-grained expert coalescing on-device: group small expert tensors into larger contiguous blobs to reduce transfer count.\n- Routing-aware scheduler: prefer colocated experts in the same GPU/node for a request when possible.\n\nMicrobench results that motivated fixes (example runs):\n- Baseline: llm-llama-70b-moe, 32k context, 8 servers (A100): p95=420ms, p99=2.1s, hot-expert share=78%.\n- After gating-cap N=3 + fragment coalescing: p95=180ms, p99=470ms, throughput -10%. Quality delta (perplexity): +0.8% measured on small eval set.\n- After NUMA affinity + async prefetch prototype: p99 down to 320ms, hot-expert share reduced to 55%.\n\nChecklist for an incident (rapid runbook):\n1) Toggle dense fallback for the affected deployment and observe SLOs for 2 minutes.\n2) If fallback not acceptable, apply gating-cap and coalescing flags (runtime flags feature-flag/gating-cap).\n3) Move ingress traffic to another region/cluster if capacity headroom exists.\n4) Collect traces (runtime traces, nvprof) and attach to JIRA.\n5) Notify oncall (runtime-ops) and schedule a follow-up postmortem.\n\nWhen to escalate to infra/research:\n- If p99 remains >2x pre-incident after emergency mitigations.\n- If root cause indicates a hardware-level DMA serialization defect or driver-level bug (capture driver versions and open a ticket).\n\nOpen questions / experiments to validate:\n- Does gating temperature scheduling per-session (not per-token) reduce oscillation?\n- Can we use a cheap Learned Routing Prior (LRP) to bias tokens away from hot experts dynamically with negligible quality impact?\n- Quantify trade-offs of fallback to dense at different context lengths \u2014 run A/B with real traffic.\n\nNotes to reviewers: this doc is deliberately pragmatic; it is an ops-first playbook intended for SREs and runtime engineers. Add any quick flags, script snippets, or command shortcuts you used during incident triage to the linked_artifacts list.\n\nAppendix: quick flags we use in staging (examples):\n--routing-gating-cap=3\n--enable-fragment-coalesce=true\n--fragment-coalesce-min-bytes=262144\n--dense-fallback-context-threshold=24576\n--prefetch-async-worker-pool=8\n\n(End of cheatsheet)",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_5a3c234c1a2444d39891d5814dd446c8"
+}

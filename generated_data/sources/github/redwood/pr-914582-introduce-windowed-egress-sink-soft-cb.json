@@ -1,0 +1,65 @@
+{
+  "repo": "redwood",
+  "pr_number": "914582",
+  "title": "Introduce windowed-egress-sink and soft-circuit rate limiter",
+  "author": "Maya Patel",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-02-16",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/windowed-egress-sink-soft-cb",
+  "reviewers": [
+    "Liam O'Connor",
+    "Rina Sato",
+    "Diego Morales"
+  ],
+  "labels": [
+    "sre",
+    "reliability",
+    "hotfix",
+    "perf"
+  ],
+  "linked_linear": [
+    "ENG-7842"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "7",
+  "additions": "412",
+  "deletions": "87",
+  "merge_method": "squash",
+  "merged_at": "2026-02-16",
+  "merge_commit": "b9f3c4a1e0f7d7c2a6a9b1c3d5e4f0a12b345678",
+  "release_notes": "Adds a windowed regional egress sink to provide a short-duration safety net for bursty cross-region egress surges and a soft circuit rate limiter that throttles non-critical traffic early to protect SLO-critical paths.",
+  "breaking_change": "false",
+  "description": "Motivation: We observed several incidents where sudden cross-region egress spikes (large batch inference jobs or misconfigured clients) saturated downstream egress quotas and caused noisy evictions that then cascaded into SLO violations for latency-sensitive routes. This PR implements a conservative, temporary 'egress sink' window and a soft circuit-style rate limiter to give the control plane a deterministic short-duration buffer to rehydrate KV caches, avoid mass evictions, and maintain tail latency for critical routes.\\n\\nWhat this changes (summary): - Windowed egress sink: per-region ephemeral sink queue that accepts a bounded amount of outgoing traffic for a configurable window (default 45s). The sink is non-dropping for high-priority requests and acts as a spill buffer for lower-priority traffic. If the sink fills, older low-priority items are gently delayed/retried with backoff. - Soft circuit rate limiter: a lightweight token-based soft circuit that reduces admitted qps for non-SLO critical tiers (e.g., background embeddings, bulk-embedding jobs) when egress utilization exceeds a soft threshold. The limiter emits rich telemetry and a short-lived circuit-open signal that does not orphan requests; it prefers throttling+retry hints to hard rejects. - Topology-aware routing adjustments: during sink windows we steer best-effort traffic to regions with spare egress headroom before opening the sink to minimize cross-region cost. - Config + runtime flags: new runtime knobs (region.sink.enabled, region.sink.size_mb, region.sink.window_s, region.soft_cb.threshold_pct, region.soft_cb.cooldown_s) with safe defaults.\\n\\nChecklist: - [x] Design doc (internal) linked: LIN-7842 - [x] Unit tests for sink queue and limiter logic - [x] Integration test with regional egress simulator - [x] Metrics + tracing added (egress.sink_fill_ratio, softcb.open_events, softcb.throttle_rate) - [x] Feature-flag rollout via runtime flags - [x] Docs snippet for on-call playbook\\n\\nCommits (high-level): - 9a1b2c add sink queue data structure and persistence hook - 2b3c4d integrate sink admission controller into egress pipeline - 4d5e6f soft-circuit limiter implementation and tests - 7e8f90 add topology-aware steering and config - a1b2c3 telemetry, tracing, and docs snippet - d4e5f6 revert tweaks after reviewer feedback\\n\\nFiles changed (high-level): - src/egress/sink_queue.go: new sink queue implementation and bounded eviction policy - src/egress/admit_controller.go: admission flow with sink checks and priority decisions - src/egress/soft_cb.go: soft circuit limiter, token accounting, cooldown logic - src/config/runtime_defaults.yaml: new runtime knobs and docs - tests/egress/sink_simulator_test.go: integration test that simulates cross-region egress pressure - docs/oncall/egress-sink-playbook.md: short runbook for on-call when sink triggers - pkg/telemetry/metrics_registry.go: new metrics registration\\n\\nDesign notes and algorithm: - Sink sizing: default size is 200MB per-region, window 45s. Sizing picked to cover typical 95th-percentile burst sizes observed in telemetry while keeping memory footprint bounded. - Admission logic: requests are assigned a priority tag (critical, interactive, best-effort). Critical always bypasses sink and soft-cb. Interactive will go to sink if sink has capacity; best-effort is steered or admitted to sink. - Soft-cb algorithm: moving-window utilization estimate U(t). If U(t) > threshold (default 78%), we open soft-cb for low-priority tiers and compute throttle fraction f = clamp((U - threshold) / (100 - threshold), 0, 0.9). We then sample admission for best-effort requests with probability 1 - f and emit telemetry. Cooldown uses exponential backoff with jitter to avoid synchronized reopen storms. - Observability: every sink admission emits a trace event with sink_fill_ratio and route_hint. softcb emits open/close events and per-tier throttle_rate gauge.\\n\\nReview conversation (highlights): - Liam: \"Can we ensure that sink state does not persist across node restarts and therefore cause stale admission?\" -> Maya: \"Sink queue is in-memory per node with optional transient persistence only for graceful restarts; default disabled. Added docs and tests to ensure restart clears queues unless feature is explicitly configured.\" - Rina: \"Telemetry cardinality concern \u2014 don't emit per-request tags in metrics.\" -> Maya: \"Adjusted traces to sample 1% and added aggregated metrics only (fill_ratio by region).\" - Diego: \"What happens if the sink fills and clients retry aggressively?\" -> Maya: \"Added backoff-on-retry guidance in docs and the admission controller now annotates responses with Retry-After headers for best-effort lanes.\" - Liam (post-approval): \"Small nit: rename SoftCB::threshold to soft_threshold_pct for clarity.\" -> fixed in commit d4e5f6.\\n\\nCI and verification: - Unit: passed (all tests green) - Integration: egress-simulation matrix passed in 3/4 topologies; one flaky topology retried and green on re-run - Lint: warnings fixed - Load test: local perf run shows sub-1% SLO regression on interactive latency under burst; best-effort qps reduced as expected.\\n\\nFallback and rollout plan: - Feature gated behind runtime flag region.sink.enabled=false by default - Canary rollout to region-us-west-2 (20% of nodes) for 48h, monitor egress.sink_fill_ratio, interactive p99 latency, softcb.open_events - If softcb.open_events > 0.5/min for more than 30m or interactive p99 regresses > 5%, auto-disable via ops playbook.\\n\\nPost-merge actions: - Follow-up PR to add per-tenant policies in sink admission (next; ENG-7843) - Ops runbook added to docs but will be extended with run frequency graphs and alert thresholds (ENG-7844)\\n\\nWhy this is different: Unlike previous hard-circuit or blunt eviction strategies, the windowed egress sink acts as a short-duration pressure-relief buffer that preserves critical request paths and gives the control plane a deterministic time window to react. The soft circuit introduces probabilistic throttling for non-critical tiers (favoring graceful retry and observability over silent drops). This pattern reduces oscillation and mass-eviction cascades observed in recent incidents.",
+  "commits": [
+    "9a1b2c add sink queue data structure and persistence hook",
+    "2b3c4d integrate sink admission controller into egress pipeline",
+    "4d5e6f soft-circuit limiter implementation and tests",
+    "7e8f90 add topology-aware steering and config",
+    "a1b2c3 telemetry, tracing, and docs snippet",
+    "d4e5f6 revert tweaks after reviewer feedback"
+  ],
+  "files_changed": [
+    "src/egress/sink_queue.go",
+    "src/egress/admit_controller.go",
+    "src/egress/soft_cb.go",
+    "src/config/runtime_defaults.yaml",
+    "tests/egress/sink_simulator_test.go",
+    "docs/oncall/egress-sink-playbook.md",
+    "pkg/telemetry/metrics_registry.go"
+  ],
+  "review_comments": [
+    "Liam O'Connor: Can we ensure that sink state does not persist across node restarts and therefore cause stale admission?",
+    "Rina Sato: Telemetry cardinality concern \u2014 don't emit per-request tags in metrics.",
+    "Diego Morales: What happens if the sink fills and clients retry aggressively?",
+    "Liam O'Connor: Small nit: rename SoftCB::threshold to soft_threshold_pct for clarity."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "release_notes",
+    "description",
+    "review_comments"
+  ],
+  "dataset_doc_uuid": "dsid_075160d3095a44f1ba40bcfa408f839e"
+}

@@ -1,0 +1,78 @@
+{
+  "key": "SUP-100271",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Out-of-order retries on HTTP/2 multiplexed connections cause partial multi-tool chains (duplicate later-step without prior-step)",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Maya Chen",
+  "assignee": "Rafael Ortiz",
+  "customer_company": "DocuVision",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "sdk-python",
+    "sdk-ts",
+    "http-proxy"
+  ],
+  "labels": [
+    "idempotency",
+    "http2",
+    "multiplexing",
+    "retries",
+    "tool-calling"
+  ],
+  "environment": "prod - us-west",
+  "affected_models": [
+    "gptj-instruct-7B"
+  ],
+  "affected_regions": [
+    "us-west"
+  ],
+  "linked_issues": [
+    "SUP-821777",
+    "SUP-531407"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/runtime/pull/1124"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood/internal/runbooks/http2-multiplexing"
+  ],
+  "sla_due_at": "2026-03-11",
+  "description": "Customer reports sporadic duplication of the second step in a user-defined two-step tool chain (ToolA -> ToolB). Issue only appears when their service uses HTTP/2 multiplexed connections through an edge proxy. Symptoms: ToolB executes twice or without ToolA completing first, causing data inconsistency and duplicate downstream side-effects. Occurs under high concurrency and when client SDK performs retries for idempotent RPCs.\n\nHypothesis: reuse of HTTP/2 streams / connection-level multiplexing + in-flight retry window causes reordering at the proxy or edge layer. The server dedup logic is per-idempotency-key and per-request-sequence, but when requests take different HTTP/2 stream IDs and are retried on a different stream, the ordering guarantees expected by the customer's orchestration break, leading to ToolB being applied to stale state or re-executed after an unobserved retry of ToolA.",
+  "impact": "Customer data pipeline experiences duplicate downstream webhooks and doubled billing for affected operations. A small percent of requests (estimated 0.6% under load) result in visible user-facing corruption. Customer is on Dedicated plan and needs a reliable mitigation while a fix is developed.",
+  "steps_to_reproduce": "1) Deploy a simple two-step tool chain: ToolA (writes a transaction log entry) -> ToolB (consumes the log entry and posts to external webhook).\n2) Use Redwood Python SDK to open an HTTP/2 multiplexed session with default connection pooling.\n3) Fire >200 concurrent requests at sustained qps while enabling client retry with exponential backoff (max_retries=3) and jitter.\n4) Introduce intermittent 5xx at the serving-runtime for a short window to trigger client-side retries.\n5) Observe out-of-order deliveries or duplicate ToolB executions in customer webhook endpoint.\n\nMinimal repro snippet (Python):\n```python\nfrom redwood import RedwoodClient\nclient = RedwoodClient(api_key=..., connection_pooling=True, http2=True)\n# pseudo-code: use same idempotency key generation per logical request\nfor i in range(300):\n    client.call_toolchain(idempotency_key=f\"txn-{i}\", steps=[\"ToolA\",\"ToolB\"])\n```\n(Notes: repro depends on proxy/edge that multiplexes streams; TS variant shows similar symptoms when using fetch with keepalive and http2 multiplexing through their edge.)",
+  "observed_behavior": "- ToolB sometimes appears in external webhook logs without a preceding successful ToolA write.\n- ToolB occasionally fires twice for the same logical idempotency_key.\n- Server logs show retries on different HTTP/2 stream IDs for the same logical request.\n- Problem frequency increases with qps and when proxy introduces transient 500s.",
+  "expected_behavior": "Retries should not lead to reordering visible to the toolchain: either a later-step should be deduplicated until prior-step is confirmed, or the platform should preserve causal ordering when routing retried sub-requests across multiplexed streams.",
+  "logs": "Excerpt from serving logs (timestamps and stream ids redacted):\n[2026-03-10T14:02:11Z] stream=5 req=txn-421 step=ToolA status=RETRY cause=502\n[2026-03-10T14:02:12Z] stream=7 req=txn-421 step=ToolA status=OK\n[2026-03-10T14:02:12Z] stream=6 req=txn-421 step=ToolB status=OK\n-- Note: ToolB (stream=6) completed before ToolA OK (stream=7) in the trace, indicating reordering.\nProxy trace: retransmit: original stream dropped, retry assigned to new stream id; per-stream sequencing lost at proxy layer.",
+  "investigation_notes": "- Confirmed repro in staging with customer's traffic profile when routing through our HTTP/2 edge.\n- SDKs sending retries on connection error create new HTTP/2 streams; edge proxy (FastEdge v2) maps retries to different streams and may reorder delivery to backend.\n- Our dedup key is attached to individual tool call payloads, not to the higher-level toolchain transaction. When ToolB arrives on a backend before ToolA's final success record, dedup logic sees ToolB as first occurrence and executes.\n- Similar but distinct from SUP-912345 and SUP-821777 (those deal with nonce drift and multiplexed ack windows). This is specifically about cross-stream reordering under retries.\n- Reproduced with both Python and TS SDKs; Go SDK less affected because their client keeps a per-request stream affinity by default.",
+  "workaround": "Short-term mitigations provided to customer: \n1) Turn off HTTP/2 multiplexing in the SDK (disable connection pooling / force per-request connections) \u2014 reduces qps but prevents stream-level reordering.\n2) Switch to per-request composite idempotency key that encodes explicit sequence (e.g., txn-123:step-1) and have customer enforce server-side checks that later steps are gated on prior-step confirmation.\n3) Add server-side short lock for tool-chain transactions (optimistic locking) to reject ToolB until ToolA processed; recommended when throughput allows.\nWe documented SDK flag and provided code snippet to disable pooling for immediate mitigation.",
+  "resolution": "Work in progress. Engineering tasks:\n- Short term (days): update SDK docs with guidance for connection_pooling/http2 flags and recommended idempotency key patterns for multi-step tool chains.\n- Medium term (weeks): implement server-side causal gating that can detect out-of-order tool arrivals for the same logical transaction id and queue or re-order them before execution.\n- Long term: coordinate with edge/proxy team to ensure retry-to-stream mapping preserves per-transaction ordering or include sequence metadata propagated across retries.\nOwner: Rafael Ortiz (serving-runtime). Next milestone: design doc due 2026-03-18.\nStatus: mitigation accepted by customer; engineering PR for docs + SDK guidance being drafted (see related_pr).",
+  "comments": [
+    "2026-03-10 - Maya Chen (Support): Received initial report from DocuVision; asked for webhook examples and traffic profile. Customer provided samples and allowed staging capture.",
+    "2026-03-10 - DocuVision (Customer): We see duplicated webhook posts and out-of-order processing. This started after we enabled connection pooling to improve latency at scale.",
+    "2026-03-11 - Rafael Ortiz (Eng): Reproduced in staging under load. Confirmed edge multiplexing + retry mapping leads to stream reordering. Creating follow-up engineering tasks.",
+    "2026-03-11 - SRE (Triaging): Temporary rule added at edge to reduce aggressive retry assignment for client-errors while fix is designed. Observed drop in occurrence from ~0.6% -> ~0.05% for replicated test.",
+    "2026-03-12 - Support (Maya): Shared workaround docs with customer (disable http2 multiplexing, per-step sequencing keys). Customer applied workaround and reported reduction in incidents; still wants platform-level fix.",
+    "2026-03-12 - Rafael Ortiz (Eng): Opening design doc to evaluate ordered-processing queue for per-transaction sequences. Will link PR and timeline here."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "impact",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "logs",
+    "investigation_notes",
+    "workaround",
+    "resolution",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_824394aa527f41029f72fcc43f47285c"
+}

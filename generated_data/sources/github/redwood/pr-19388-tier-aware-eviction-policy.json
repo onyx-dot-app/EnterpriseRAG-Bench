@@ -1,0 +1,79 @@
+{
+  "repo": "redwood",
+  "pr_number": "19388",
+  "title": "runtime: tier-aware LRU eviction policy for KV cache (pinned sessions + tests)",
+  "author": "Samir Qureshi",
+  "created_at": "2026-01-27",
+  "updated_at": "2026-02-03",
+  "merged_at": "2026-02-03",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/kv-eviction-tier-aware-lru",
+  "reviewers": [
+    "Omar El-Sayed",
+    "Noah Patel",
+    "Sofia Ivanova",
+    "Allison Grant",
+    "Sean Gallagher"
+  ],
+  "labels": [
+    "runtime",
+    "kv-cache",
+    "reliability",
+    "perf",
+    "observability"
+  ],
+  "linked_linear": [
+    "ENG-4825",
+    "ENG-4827"
+  ],
+  "linked_jira": [
+    "SUP-28433"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "19",
+  "additions": "612",
+  "deletions": "188",
+  "merge_method": "squash",
+  "breaking_change": "false",
+  "release_notes": "Adds tier-aware LRU eviction for KV cache under memory pressure; respects pinned sessions; exports eviction metrics by tier/cause.",
+  "commits": [
+    "runtime/kv: add eviction candidate index (tier + LRU timestamp)",
+    "runtime/kv: implement tier-aware eviction selection + pinned session guards",
+    "runtime/kv: wire eviction into allocator pressure path + backpressure signals",
+    "runtime/metrics: export kv_evictions_total + kv_eviction_scan_* counters",
+    "tests: unit coverage for selection ordering + pinned behavior",
+    "tests: integration scenario w/ mixed churn + pinned sessions (no correctness regressions)"
+  ],
+  "changed_files": [
+    "runtime/kv/eviction_policy.h",
+    "runtime/kv/eviction_policy.cc",
+    "runtime/kv/kv_cache_arena.cc",
+    "runtime/kv/kv_cache_arena.h",
+    "runtime/scheduler/scheduler_loop.cc",
+    "runtime/metrics/kv_cache_metrics.cc",
+    "runtime/metrics/kv_cache_metrics.h",
+    "runtime/config/runtime_flags.yaml",
+    "runtime/tests/kv/eviction_policy_test.cc",
+    "runtime/tests/kv/kv_cache_integration_eviction_test.cc",
+    "runtime/tests/fixtures/session_factory.cc",
+    "docs/internal/runtime/flags.md"
+  ],
+  "ci_checks": [
+    "buildkite/redwood-linux-gpu (A100): PASS",
+    "buildkite/redwood-linux-cpu: PASS",
+    "unit-tests (runtime): PASS",
+    "integration-tests (runtime): PASS (rerun; initial flaky timeout fixed)",
+    "lint/clang-tidy: PASS",
+    "perf-smoke (decode): PASS"
+  ],
+  "description": "Summary: Implements tier-aware LRU eviction for the serving runtime KV cache to make allocator behavior predictable under memory pressure and to reduce burst-driven tail latency caused by opportunistic/late evictions. The policy prefers evicting low-priority tiers first (e.g., free/trial) while preserving higher tiers (hosted paid / dedicated) and always respecting pinned sessions. This PR includes correctness-focused unit + integration tests and adds basic observability counters needed for rollout guardrails.\n\nMotivation: During high churn with mixed sequence lengths, the KV arena frequently hits soft pressure and the existing eviction path behaves effectively FIFO-ish (depends on free-list ordering), which can evict recently-active sequences and trigger retries / cancellations at bad times. We also had a support report (SUP-28433) where pinned long-lived sessions were disproportionately impacted during bursts.\n\nDesign: 1) Tier-aware ordering: each active sequence is assigned an eviction tier based on request context (tier enum sourced from auth/customer routing). Eviction scans tiers from lowest to highest. Within a tier we evict LRU based on last_kv_access_step (monotonic scheduler step). 2) Pinned session guard: sequences marked pinned (explicit customer pin / long-lived session) are non-evictable unless we cross the hard OOM guardrail. In this PR we treat pinned as absolute non-evictable and let the allocator return PRESSURE_HARD -> scheduler backpressure (the follow-up compaction work will reduce how often we reach this). 3) Safety constraints: we never evict a sequence that is currently in an in-flight decode microbatch or mid-relocation; eviction operates only on sequences in a stable state. If a candidate becomes ineligible (state changes) we rescan with a bounded attempt budget.\n\nImplementation notes: - Added EvictionIndex that maintains per-tier min-heaps keyed by last_access_step (LRU). Updates happen on decode step boundaries and on request state transitions (prefill->decode, end-of-sequence, cancellation). - Added configurable knobs (behind feature flag) in runtime_flags.yaml: kv_eviction_enabled, kv_eviction_scan_budget, kv_eviction_soft_pressure_bytes, kv_eviction_tier_weights (initially simple tier ordering; weights reserved for follow-up). - Integrated into kv_cache_arena pressure handling: on SOFT_PRESSURE we attempt eviction up to scan_budget candidates (bounded). If eviction frees enough pages, allocations proceed; otherwise we bubble PRESSURE_SOFT to scheduler for backpressure / admission control. - Observability: exported kv_evictions_total{tier,cause}, kv_eviction_scan_candidates_total, kv_eviction_pinned_skips_total, kv_eviction_ineligible_skips_total. Cause is one of: soft_pressure, hard_pressure, admin (future).\n\nTests: - Unit tests cover ordering (tier then LRU), monotonic step update behavior, pinned non-evictable behavior, and scan budget enforcement. - Integration test constructs a mixed-churn workload with a small arena and verifies: (a) pinned sequences remain alive, (b) low-tier sequences are preferentially evicted, (c) no token mismatch / stream corruption under repeated eviction, (d) allocator returns PRESSURE_SOFT (not crash/oom) when only pinned remain.\n\nPerf impact: On microbench (single worker, 4k seqs), eviction index maintenance added ~0.15% CPU in scheduler loop; no measurable GPU throughput change. The eviction scan is bounded and only runs under pressure.\n\nRollout: Feature-flagged (kv_eviction_enabled default false). Intended to turn on first in internal canary after fragmentation metrics are live (see PR-19342) and before compaction is defaulted. This PR is a dependency for ENG-4826 kill-switch plumbing.\n\nKnown limitations / follow-ups: - Pinned-as-absolute may increase backpressure frequency in pathological workloads; compaction should reduce this, but we may also want a \"pinned soft-evict\" mode for internal tiers only (ADR discussion). - Prefix-cache interaction is limited to respecting pinned prefixes; we do not yet preferentially evict cold prefixes vs active decode sequences (follow-up ADR item).\n\nReview discussion highlights (selected): Omar El-Sayed: \"Please ensure pinned sequences are excluded before heap push, not after pop; otherwise scan_budget burns quickly.\" -> Updated EvictionIndex to avoid inserting pinned sequences and added kv_eviction_pinned_skips_total when encountering legacy registrations. Noah Patel: \"I want an explicit invariant about not evicting in-flight decode.\" -> Added SequenceState::kEvictable check (covers not in batch, not relocating, not holding kv_write_lock) + unit tests for state transition race. Sofia Ivanova: \"We should only update last_access_step at decode step boundary; per-token updates will be too hot.\" -> Changed update site to scheduler boundary (end of decode iteration) and added a perf-smoke guard in CI. Allison Grant: \"Metric names need to match the standards draft; include tier label and cause label.\" -> Renamed counters to kv_evictions_total and added required labels.\n\nCI: Initial integration run failed due to a flaky timeout in kv_cache_integration_eviction_test when GPU was heavily loaded. Adjusted the test harness to use deterministic step advancement and increased the per-test deadline from 5s to 12s; subsequent reruns passed.\n\nChecklist: - [x] Feature-flagged, default off - [x] Metrics exported (prom + tracing hook points reserved) - [x] Unit + integration tests - [x] Updated internal flags doc - [x] Linked Linear issues\n\nCo-authored-by: Julian Moore (test harness adjustments) / Anika Gupta (integration test cases)",
+  "notes": "Merged as part of KV cache compaction/eviction project; enablement requires runtime config rollout + dashboard wiring (ENG-4830).",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_c5d3c1b361454adaa5d05cbf6d603233"
+}

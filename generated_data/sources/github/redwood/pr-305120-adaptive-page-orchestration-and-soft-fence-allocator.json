@@ -1,0 +1,95 @@
+{
+  "repo": "redwood",
+  "pr_number": "305120",
+  "title": "Adaptive page orchestration and soft-fence allocator for tenant-aware spillback",
+  "author": "Ava Martinez",
+  "created_at": "2024-11-13",
+  "updated_at": "2024-11-20",
+  "merged_at": "2024-11-20",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/cache/soft-fence-orchestrator",
+  "reviewers": [
+    "Kenji Sato",
+    "Priya Nambiar",
+    "Liam O'Connor"
+  ],
+  "labels": [
+    "runtime",
+    "kv-cache",
+    "perf",
+    "scheduling",
+    "regression-tested"
+  ],
+  "linked_linear": [
+    "ENG-2122",
+    "ENG-2140"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "732",
+  "deletions": "184",
+  "breaking_change": "false",
+  "release_notes": "Introduces a tenant-aware page orchestration layer and a 'soft-fence' allocator that reduces fragmentation and smooths spillover/eviction during bursty workloads. Improves median tail latency for small requests and reduces spill I/O by delaying hard spills under short-lived pressure. Backwards-compatible; rollout via canary then gradual tenant weighting.",
+  "description": "Context: We continue to see costly hard spill events and high fragmentation on multi-tenant hosts when short-lived spikes force aggressive eviction. Existing heuristics were either too eager (triggering frequent paging) or too lazy (allowing fragmentation to grow and causing large later spills). Motivation: reduce end-to-end tail latency and I/O overhead without increasing steady-state memory usage. Goal: introduce a lightweight orchestration layer that coordinates per-tenant reservations, background reshuffle work, and a 'soft-fence' allocator that places transient allocations into a deferrable bucket so we can delay hard spill to disk for short windows of pressure.\n\nWhat this PR does: Implements an Adaptive Page Orchestrator (APO) plus Soft-Fence Allocator (SFA). Key pieces: 1) Per-tenant soft-reservations that are metered and can be preemptively relaxed when higher-priority tenants need space. 2) Soft-fence bucket for transient small KV allocations; entries in the bucket are eligible for fast in-memory coalescing or lazy rewrite instead of immediate eviction to spill. 3) Background reshuffle worker that compacts fragmented pages incrementally during low-load windows. 4) Scheduling hook to prioritize reshuffle work based on observed fragmentation score and recent spill events. 5) Telemetry (new metrics) to track soft-fence occupancy, delayed-spill counts, compaction latency, and tenant preemption events.\n\nCompatibility: Fallthroughs keep current eviction path; SFA toggles off via runtime flag to allow rollout and rollback. No schema changes.\n\nBenchmarks: On our perf-canary cluster with mixed-size request streams (70% small, 30% large) and 12 tenants: - Median application latency improved by ~9% (from 45ms to 41ms) for small requests. - 95th percentile latency improved by ~18% for small requests. - Total spill I/O (MB/min) reduced by ~34% during 10min spike tests. - Background compaction added ~3% CPU overhead but reduced long-tail spill events significantly.\n\nFiles touched (high-level): runtime/cache/orchestrator.{h,cc}, runtime/cache/soft_fence_allocator.{cc,h}, runtime/cache/reshuffle_worker.cc, runtime/scheduler/compaction_scheduler.cc, telemetry/metrics_registry.cc, tests/cache/soft_fence_integration_test.cc, docs/ops/cache-operator-guide.md.\n\nRollout plan: feature gate on startup config. Canary to 10% of nodes for 48 hours, monitor new metrics and spill I/O. If stable, ramp to 50% then full rollout. If regressions observed, rollback by disabling the gate.\n\nChecklist:\n- [x] Design doc reviewed (ENG-2122)\n- [x] Unit + integration tests added\n- [x] Perf canary runs attached\n- [x] Telemetry emitted for all key signals\n- [x] Backwards-compatible flags and safe rollback\n\nNotes: I intentionally kept reshuffle work cooperative and incremental to avoid CPU cliffs. The soft-fence bucket has an eviction age threshold to ensure we don't defer forever (default 30s). This threshold is configurable per-deployment.\n\nLinks: design doc: https://linear.app/redwood/issue/ENG-2122/soft-fence-cache-orchestrator , perf dash: internal/perf/canaries/305120\n",
+  "commits": [
+    "add orchestrator core and header - initial implementation",
+    "implement soft-fence allocator and integration with eviction path",
+    "background reshuffle worker and scheduler hooks",
+    "add telemetry metrics and dashboard wiring",
+    "integration tests and perf harness updates",
+    "fix race in reshuffle worker and add unit tests",
+    "tweak reservation preemption policy and thresholds"
+  ],
+  "files_changed": [
+    "runtime/cache/orchestrator.h - public APIs for tenant reservations and fragmentation scoring",
+    "runtime/cache/orchestrator.cc - orchestration loop, decision heuristics and thresholds",
+    "runtime/cache/soft_fence_allocator.h - allocator interface and runtime flag checks",
+    "runtime/cache/soft_fence_allocator.cc - allocation path, bucket management, fast coalesce path",
+    "runtime/cache/reshuffle_worker.cc - background compaction loop (cooperative yield points)",
+    "runtime/scheduler/compaction_scheduler.cc - integrates reshuffle prioritization with scheduler",
+    "telemetry/metrics_registry.cc - new metrics: soft_fence_occupancy, delayed_spill_events, compaction_cycles",
+    "tests/cache/soft_fence_integration_test.cc - end-to-end scenarios for defer vs hard spill",
+    "docs/ops/cache-operator-guide.md - operational playbook and rollout steps",
+    "tools/perf/canary/cluster-config.yaml - canary config with feature gate",
+    "runtime/cache/alloc_backwards_compat.cc - fallthrough path and feature gate checks"
+  ],
+  "patch_snippets": [
+    "// runtime/cache/soft_fence_allocator.cc\n    // insert into soft-fence bucket instead of immediate eviction when size < SMALL_THRESHOLD\n    if (is_small_allocation(size) && soft_fence_enabled()) {\n      soft_fence_bucket_.emplace_back(ptr, size, now);\n      return ALLOC_OK;\n    }",
+    "// runtime/cache/reshuffle_worker.cc\n    // cooperative yield to avoid CPU spikes\n    for (auto &page : candidates) {\n      compact_page(page);\n      if (++work_units % YIELD_INTERVAL == 0) \n        std::this_thread::sleep_for(std::chrono::milliseconds(1));\n    }"
+  ],
+  "review_conversation": [
+    "Kenji Sato (review): Nice direction. Can you explain how preemption interacts with Dedicated tenant guarantees? We should not violate reserved capacity contracts.",
+    "Ava Martinez (author): Good point. Preemption is soft by default; for tenants with reserved capacity we bypass SFA via config. The orchestrator checks tenant_tier and honor_reservations flag before relaxing allocations.",
+    "Priya Nambiar (review): The reshuffle worker is CPU-bound in the canary. We need a circuit to back off more aggressively when host CPU > 70%.",
+    "Ava Martinez (author): Added a backoff that scales reshuffle cycles with host CPU headroom. See latest commit that samples scheduler headroom and reduces candidate window when high.",
+    "Liam O'Connor (review): Tests look good but I got flaky failure in 'soft_fence_integration_test:DeferredEvictRace'. Can you add more determinism?",
+    "Ava Martinez (author): Reworked the test to use a simulated clock and explicit yield points to remove timing-dependent flakes. Reran and green."
+  ],
+  "ci_checks": [
+    "linux-unit: passed",
+    "mac-unit: passed",
+    "integration-smoke: initially failed (flaky test), rerun passed",
+    "perf-canary: completed - metrics attached",
+    "lint: passed",
+    "security-scan: passed"
+  ],
+  "perf_results": [
+    "median small-request latency: 45ms -> 41ms (9% improvement)",
+    "p95 small-request latency: reduced by 18%",
+    "spill I/O (MB/min) during spike: -34%",
+    "background CPU overhead: +3% on heavy compaction schedule (tunable)"
+  ],
+  "merge_outcome": "merged via squash on 2024-11-20 by Priya Nambiar. Merge commit: squash of 7 commits. Rollout started to canary pool as planned.",
+  "notes_for_ops": "Monitor metrics: telemetry.soft_fence_occupancy, telemetry.delayed_spill_events, host.cpu_headroom. Default soft-fence age = 30s. If delayed_spill_events grows without reduction in spill I/O, revert gate and open ENG ticket.",
+  "backports": "none planned",
+  "testing_instructions": "Start canary with feature_gate: enable_soft_fence=true in runtime config. Run tests: bazel test //tests/cache:soft_fence_integration_test --test_output=all. Watch perf dashboard for spill_io and compaction_cycles.",
+  "acknowledgements": "Thanks to SRE (Kenji) for cluster canary setup and Perf (Liam) for designing the load mix.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes",
+    "review_conversation"
+  ],
+  "dataset_doc_uuid": "dsid_bd7c4f3f1e294139901792687b5c3518"
+}

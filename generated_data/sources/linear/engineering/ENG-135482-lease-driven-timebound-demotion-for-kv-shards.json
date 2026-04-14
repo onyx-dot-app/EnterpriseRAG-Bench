@@ -1,0 +1,105 @@
+{
+  "key": "ENG-135482",
+  "team": "engineering",
+  "title": "Lease-driven timebound demotion for KV shards to optimize GPU memory and correctness",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-03-10",
+  "creator": "Asha Patel",
+  "assignee": "Miguel Torres",
+  "project": "runtime-memory-efficiency",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-04-15",
+  "labels": [
+    "kv-cache",
+    "eviction",
+    "gpu-memory",
+    "continuous-batching",
+    "correctness",
+    "prefetch"
+  ],
+  "dependencies": [
+    "ENG-61234",
+    "ENG-21488"
+  ],
+  "release": "runtime-1.24",
+  "customer_impact": "medium",
+  "security_review_required": "true",
+  "description": "Problem: GPU memory fragmentation from KV cache entries and uncoordinated evictions causes tail latency spikes and correctness edge cases during continuous batching. Existing LRU/TTL-only strategies either over-evict hot prefixes or leave stale allocations reserved, increasing OOM risk on multi-tenant Dedicated pools.\n\nGoal: Implement a lease-driven, timebound demotion pipeline for KV shards that (1) reduces noisy eviction-driven batch latency, (2) preserves per-prefix correctness invariants during demotion/eviction, and (3) minimizes peak GPU memory usage via shard-aware demotion tiers and compaction-friendly alignment. The solution must present formal correctness guarantees (no stale reads, no double-free) for interplay with continuous batching and prefetch flows.",
+  "design_decisions": [
+    "Introduce a 3-state lifecycle per KV slice: ACTIVE -> DEMOTED (soft-freed) -> EVICTED (physical free).",
+    "Lease token: borrowers (inflight batches / prefetch workers) take ephemeral leases with expiry timestamps; leases are coarse-grained to shard-level to avoid per-entry contention.",
+    "Demotion vs eviction: DEMOTED retains metadata on host but releases GPU slab pointers; EVICTED clears metadata and decrements accounting. This allows warm rehydration without immediate reclaim cost.",
+    "Shard scoring: eviction candidate ranking blends LRU score, TTL score, prefix-affinity penalty, and fragmentation heuristics to favor contiguous slab reclamation.",
+    "Atomic transition guarantees: use epoched CAS across metadata+lease counters so a race between batch pin and demotion results in one of deterministic outcomes (batch wins -> lease extends, demotion wins -> caller receives a retry signal).",
+    "Integration with continuous batching: batches consult a lease-check API before finalizing KV pins. If a demotion is in-flight, the batch either waits up to lease_timeout or routes to fallback model variant.",
+    "Auditability: snapshot log of demotion/eviction events with per-prefix tags for postmortem correctness checks and provenance in Console.",
+    "Backwards compatibility: feature gated behind runtime-1.24 and toggled by per-customer mem-pressure policies for Dedicated/Private tiers.",
+    "Fallbacks: fall back to strict LRU single-phase evictions if the epoch CAS implementation proves unstable under stress.",
+    "Security/ownership: lease tokens are tied to worker IDs and cannot be forged; audit logs record lease grants/renewals/releases.",
+    "Safety margins: enforce per-shard reserved floor to avoid full depletion during compaction anomalies (configurable as percent of shard capacity)."
+  ],
+  "acceptance_criteria": [
+    "Correctness: under unit/integration tests and fuzz harnesses, no stale read is ever observed after a successful pin (assert linearizability of pin/get semantics).",
+    "Performance: under benchmark 50/50 read/write continuous-batching workload, 95th percentile request latency increases by <= 5% compared to baseline and eviction churn decreases by >= 25%.",
+    "Memory: peak GPU memory usage for multi-tenant Dedicated sim scenario reduced by >= 12% due to compaction-friendly demotions.",
+    "Observability: Console exposes demotion/ejection rate, per-prefix demotion counts, and a demotion-to-eviction latency histogram.",
+    "Rollback: ability to toggle feature at runtime with safe draining (no in-flight lease loss leading to incorrect reads).",
+    "Security: security review completed and signed-off prior to runtime-1.24 rollout.",
+    "Test coverage: end-to-end tests including: lease expiry race, batch pin during demotion, forced crash during demotion, and cross-shard compaction concurrency.",
+    "Docs: design doc and runbook published in Confluence; Console docs updated for new metrics and troubleshooting steps."
+  ],
+  "tasks": [
+    "Design doc: finalize demotion state machine and epoch CAS protocol (owner: Miguel)",
+    "Proto: implement lease token API + shim layer for continuous batching to call (owner: Priya Rao)",
+    "Eviction scorer: implement shard scorer with fragmentation heuristics (owner: Danilo Martins)",
+    "GPU slab adjustments: add demotion path to free slab ranges and align compaction (owner: Elena Park)",
+    "Test harness: extend fuzzing harness with lease expiry scenarios and randomized batch interleavings (owner: Rafal Kowalski)",
+    "Metrics + Console: add demotion/eject metrics and per-prefix tagging (owner: Simone Li)",
+    "PRs + Code review: create PRs and implement feedback (owner: Miguel)",
+    "Staged rollout: dogfood on internal Dedicated, then limited-customer ramp (owner: SRE team)",
+    "Security review: coordinate with security for token model review (owner: Asha)"
+  ],
+  "linked_prs": [
+    "https://github.com/redwood-inference/runtime/pull/4127",
+    "https://github.com/redwood-inference/console/pull/289",
+    "https://github.com/redwood-inference/benchmarks/pull/78"
+  ],
+  "metrics": [
+    "demotion_to_eviction_latency_ms (histogram)",
+    "demotions_per_minute_per_shard",
+    "eviction_churn_ratio (evictions / unique_shards_reclaimed)",
+    "pin_retry_rate (percent of pins that observe demotion and must retry)",
+    "gpu_peak_memory_mb",
+    "95th_latency_ms_continuous_batching"
+  ],
+  "risk_and_mitigation": [
+    "Race between batch pin and demotion leading to potential double-free: mitigated by epoched CAS and lease extension path; add integration test that asserts no double-free under adversarial scheduler.",
+    "Lease storm: many workers repeatedly renewing leases could block eviction; introduce exponential backoff + jitter and shard-level lease caps to bound renewals.",
+    "Fragmentation regression: demotions could create small islands of free memory; enforce compaction trigger when fragmentation ratio > threshold.",
+    "Telemetry overload: high-cardinality prefix tags could stress metrics pipeline; sample prefix tags above a cardinality threshold and surface top offenders instead.",
+    "Incorrect fallback behavior during toggle: add a draining step that refuses new demotions and waits for leases to expire before toggling off.",
+    "Security: forged lease tokens - mitigate by signing tokens and enforcing worker ID checks and KMS-backed signing keys."
+  ],
+  "comments": [
+    "2026-02-11 - Asha Patel: Kicked off discovery session. Confirmed memory fragmentation reports from Dedicated test cluster A. Requested fragmentation heatmap from telemetry.",
+    "2026-02-18 - Danilo Martins: Prototype scorer added to branch feature/demotion-scorer. Early results show 18% fewer scattered frees in synthetic workload.",
+    "2026-02-22 - Priya Rao: Continuous batching integration shim ready; tested in local harness. Observed occasional pin_retry spikes tied to short lease_timeout setting; increasing default to 40ms.",
+    "2026-03-01 - Security (Sofia Nguyen): Initial token model review complete, recommended signed tokens and audit log retention policy. Marked security review required.",
+    "2026-03-05 - Miguel Torres: Implemented epoch CAS and unit tests for atomic transitions. Added rollback toggle and draining sequence to runtime flags.",
+    "2026-03-09 - Rafal Kowalski: Ran fuzz harness with 1M randomized interleavings; found a rare race where lease renewal lost to a concurrent compaction; created a follow-up fix branch.",
+    "2026-03-10 - Simone Li: Console metrics PR opened. Need to confirm sampling for high-cardinality prefixes before merge."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "design_decisions",
+    "acceptance_criteria",
+    "tasks",
+    "risk_and_mitigation",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_08e17733f5e14b24a8acfea5090017d0"
+}

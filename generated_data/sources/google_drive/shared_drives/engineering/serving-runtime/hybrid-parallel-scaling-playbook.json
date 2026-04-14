@@ -1,0 +1,125 @@
+{
+  "title": "Hybrid Parallel Scaling Playbook \u2014 tensor/pipeline handoff experiments",
+  "owner": "Aisha Kapoor",
+  "summary": "This is a working playbook for investigating performance characteristics when we run hybrid model parallelism (tensor + pipeline) on multi-GPU hosts and across nodes. Goal is to produce repeatable microbenchmarks, a small corpus of root-cause hypotheses for observed non\u2011scaling behavior, and pragmatic mitigations we can surface to the runtime and model-onboarding teams.",
+  "context": [
+    "Related to several tickets: INF-4278 (pipline stalls at 4+ GPUs), INF-4321 (poor scaling with TP>1), and ENG-rt/PR#1123 (hybrid scheduling changes). Links and logs are in linked_artifacts.",
+    "Hardware target: 8xA100-40GB per host (NVLink mesh), 4-host cluster connected via HDR200 (100GB/s) InfiniBand switches. We also run sample tests on 4xA100 with mixed PCIe / NVLink topologies."
+  ],
+  "hypotheses we want to test": [
+    "NCCL allreduce/internals are being serialized by rendezvous under certain chunk sizes causing pipeline bubble growth.",
+    "Host-to-device and device-to-host staging for micro-batching before pipeline hand-off adds jitter when host CPU is saturated.",
+    "Small tensor-parallel group sizes (TP=2) with deep pipeline stages amplify kernel launch/serialization overheads.",
+    "NVLink saturation across GPUs in the same node leads to worse-than-expected cross-node scaling due to contention and fallback to PCIe for some copies."
+  ],
+  "hardware & software stack (current baseline)": [
+    "GPUs: NVIDIA A100-SXM4 40GB, driver 535.107, CUDA 11.8",
+    "NCCL: 2.14.3, ibverbs userspace via OpenMPI v4 shim",
+    "PyTorch 1.13 with custom kernels (fusion disabled for these runs)",
+    "Serving runtime build: eng-serving-runtime@commit 9f2c84a (PR#1123)",
+    "Benchmark harness: scripts/hybrid_scale_runner.py (simple JSON config per run)"
+  ],
+  "test matrix (short)": [
+    "TP groups: 1, 2, 4",
+    "PP stages: 1, 2, 4",
+    "Microbatch size (tokens): 1, 4, 16",
+    "Seq len: 128, 512",
+    "Batch size (samples): 1, 8",
+    "Cross-node: 1 node / 2 nodes / 4 nodes",
+    "Communication backend: NCCL (default) vs NCCL with tuned thresholds vs gloo (debug only)"
+  ],
+  "measurement plan / metrics captured": [
+    "end-to-end latency (ms) per request and p50/p95/p99",
+    "throughput (tokens/s) and tokens/GPU-second",
+    "GPU kernel occupancy and SM utilization (from nsys / nvprof)",
+    "NCCL bandwidth and time breakdown (from NCCL debug logging)",
+    "PCIe vs NVLink copy bytes/time (nvprof / Nsight traces)",
+    "host CPU steal / runqueue length (top/htop sampling) and page faults",
+    "per-stage idle/busy time (instrumented timers in runtime)"
+  ],
+  "quick run recipe (to reproduce one data point)": [
+    "1) provision 2 hosts of 4xA100 (nvlink chain) with OFED 5.6",
+    "2) sync build: ./deploy/release_sync.sh 9f2c84a",
+    "3) config: hybrid_config.json (TP=2, PP=2, microbatch=4, seq=512)",
+    "4) start ncntrl: ./bin/serving-runtime --config hybrid_config.json &> /tmp/run.log",
+    "5) collect: nsys profile --output run1.nsys --trace=cuda,nvtx ./bin/harness --config ...",
+    "6) capture NCCL logs: export NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=ALL; run"
+  ],
+  "representative results (trimmed notes)": [
+    "TP=1, PP=4, microbatch=1: high pipeline bubble (~35% idle). GPU kernels high occupancy but low sustained inter-GPU bandwidth.",
+    "TP=2, PP=2, microbatch=4: best p95 latency/throughput tradeoff on single-host. Adding a second host saw ~24% throughput drop vs expected linear scaling.",
+    "TP=4 across nodes: NCCL shows repeated small allreduce calls; bandwidth graphs show bursts and long tail \u2014 suspect wrong chunking thresholds.",
+    "With microbatch=16 we hit host CPU jitter (raised syscalls and page faults) \u2014 host-side batching logic should be offloaded more to device or fused."
+  ],
+  "root-cause candidates & evidence": [
+    "small collectives: tracing shows >2000 NCCL collectives per request for TP=4/PP=2 configuration. Overhead of each collective (~30\u201380us) accumulates.",
+    "rendezvous serialization: NCCL log timestamps show group creation/teardown happening frequently instead of reusing communicators per sequence length; consequence: extra setup time.",
+    "interconnect fallback: in hybrid runs, some P2P copies are using PCIe (trace markers), probably when NVSwitch paths are chosen suboptimally; may be affected by CUDA IPC and driver versions.",
+    "host CPU hot paths: python GC and logging on host thread cause jitter \u2014 some runs show host-side lock contention in the runtime input queue."
+  ],
+  "quick mitigations to try (short experiments)": [
+    "increase chunk size for NCCL collectives (reduce number of allreduces) \u2014 experiment with NCCL_BUFF SIZE / fusion thresholds in runtime.",
+    "reuse communicators across microbatches & sequences (avoid repeated group create/teardown).",
+    "enable kernel fusion (experiment in PyTorch) for small kernels when TP>1 to reduce launch overhead.",
+    "move microbatch merging off the host: pre-stage larger batches on GPU where possible.",
+    "tune IB parameters (GID, MTU) and upgrade NCCL to 2.15 candidate (next-week job) for improved rendezvous behavior."
+  ],
+  "instrumentation notes (how we look)": [
+    "nsys capture points: before first host-device copy, after last kernel for each stage, and at NCCL collectives; use NVTX ranges instrumented inside the runtime (runtime/nvtx_hooks.cu)",
+    "NCCL logging: run with NCCL_DEBUG=INFO and parse with nccl-trace-parser.py (scripts/) to get per-call latency distribution",
+    "Nsight timeline: good for seeing when host staging blocks GPU kernels \u2014 look at CPU/GPU lanes overlap",
+    "perf + bpftrace: identify host syscalls that spike during microbatch assembly"
+  ],
+  "open experiments (next 2 weeks)": [
+    "run full TP=2/4, PP=2/4 matrix across 1/2/4 nodes with 10k requests each, collect nsys traces for 10 representative runs (INF-4278 child job)",
+    "prototype communicator pool in runtime that caches NCCL communicators keyed by (group, dtype, chunk_size)",
+    "A/B test enabling kernel fusion on a flagged branch; measure p99 regression vs p50",
+    "test NCCL 2.15 nightly (with safety guard) and compare collectives/per-call overhead"
+  ],
+  "notes-to-self / messy log snippets": [
+    "run-2024-04-02-15:23: saw sudden 40% throughput drop when another team started a bandwidth-heavy job on same rack switch \u2014 need isolation measurement",
+    "possible flaky: when sequence len=128 we get better scaling than 512 \u2014 surprising. Hypothesis: longer seq increases KV cache size causing extra PCIe copies.",
+    "TODO: add per-collective size histogram to runtime telemetry (key: collective_bytes, count)",
+    "Slack: #eng-serving-runtime thread \"hybrid-scaling\" has discussion refs; See https://redwood-internal.slack.com/archives/C02EXAMPLE/p168..."
+  ],
+  "questions for runtime/infra teams": [
+    "can we expose communicator lifetime policy via config? (recreate per request vs persistent pool)",
+    "how much of microbatch merging is safe to move to GPU for all models (memory constraints)?",
+    "should we schedule hybrid runs on NVSwitch-isolated nodes only to get a clean baseline before cross-node tests?"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/1123",
+    "https://redwood.atlassian.net/browse/INF-4278",
+    "scripts/hybrid_scale_runner.py (internal repo path)",
+    "scripts/nccl-trace-parser.py (internal repo path)"
+  ],
+  "status": "in_review",
+  "team": "eng-serving-runtime",
+  "tags": [
+    "hybrid-parallel",
+    "nvidia",
+    "nsys",
+    "nccl",
+    "scaling"
+  ],
+  "created_at": "2024-03-15",
+  "last_modified": "2024-05-02",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "context",
+    "hypotheses we want to test",
+    "hardware & software stack (current baseline)",
+    "test matrix (short)",
+    "measurement plan / metrics captured",
+    "quick run recipe (to reproduce one data point)",
+    "representative results (trimmed notes)",
+    "root-cause candidates & evidence",
+    "quick mitigations to try (short experiments)",
+    "instrumentation notes (how we look)",
+    "open experiments (next 2 weeks)",
+    "notes-to-self / messy log snippets",
+    "questions for runtime/infra teams"
+  ],
+  "dataset_doc_uuid": "dsid_ca1ecc8a1f1544ce913aea9cba896d9e"
+}

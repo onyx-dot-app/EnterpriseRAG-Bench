@@ -1,0 +1,106 @@
+{
+  "key": "SUP-118888",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Persistent pinned-session divergence after asynchronous prewarm causes repeated fallback loop",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Aisha Kapoor",
+  "assignee": "Diego Morales",
+  "customer_company": "Lumina Health",
+  "customer_tier": "dedicated",
+  "environment": "prod (us-east)",
+  "components": [
+    "serving-runtime",
+    "orchestrator",
+    "edge-proxy"
+  ],
+  "labels": [
+    "canary",
+    "pinning",
+    "fallback-loop",
+    "prewarm",
+    "billing-impact"
+  ],
+  "affected_models": [
+    "redwood/open-7b-v2",
+    "redwood/decoder-compat-legacy-6b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "first_response_due_at": "2026-03-12",
+  "linked_issues": [
+    "SUP-631223",
+    "SUP-482999"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/2891"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/runbooks/pin-reconcile"
+  ],
+  "related_incident_id": "INC-20260312-01",
+  "description": "Issue summary: Customer reports repeated requests routed to a legacy model variant despite an explicit tenant pin to a new canary variant. Traffic exhibits a repeated fallback loop: request -> pinned variant mismatch -> orchestrator fallback -> edge retry selecting legacy variant -> client reports mixed outputs.\n\nImpact: Multiple production endpoints for Lumina Health are returning inconsistent model outputs for the same session (affecting user-facing clinical summarization). Observed token-level quality regressions and a billing spike due to duplicated attempts. Estimated 12% of requests for the tenant in us-east experienced diverged model responses over the last 2 hours.\n\nEnvironment: Dedicated pool for Lumina Health in prod (us-east). Canary rollout started at 2026-03-12T22:00Z with a progressive weight increase and asynchronous prewarm of the canary instances (prewarm completed at varying times across nodes).\n\nObserved behaviour: 1) Tenant pinned via API to model redwood/open-7b-v2. 2) Edge cookie and orchestrator affinity appear to favor legacy variant redwood/decoder-compat-legacy-6b after orchestrator fallback. 3) Pin state in control plane indicates tenant pinned, but edge-layer routing uses stale cohort fingerprint for a subset of requests, reintroducing legacy variant. 4) When fallback happens, orchestrator issues a retry that sometimes arrives back at edge with older routing metadata causing another fallback -> loop.\n",
+  "steps_to_reproduce": [
+    "1) Use tenant with pinned model: call PUT /v1/tenants/<tenant>/pin {model: 'redwood/open-7b-v2'}",
+    "2) Trigger progressive canary rollout (weight ramp 1% -> 50% over 30 minutes) with asynchronous prewarm enabled for canary nodes",
+    "3) Generate session traffic with persistent session cookie; observe decisions at the edge and orchestrator traces",
+    "4) Inspect requests that receive model outputs from redwood/decoder-compat-legacy-6b and follow header X-RW-Route-ID and X-RW-Pin-Fingerprint across hops",
+    "5) Repeat during a small burst (traffic surge) to reveal retry/fallback loop behavior"
+  ],
+  "logs_snippets": [
+    "[2026-03-13T00:14:02Z] edge-01 TRACE tenant=lumina session=abc123 RouteFingerprint=0x7f4 fallback_reason=variant_unavailable -> ORCH_RETRY",
+    "[2026-03-13T00:14:02Z] orch-07 WARN tenant=lumina selected_variant=redwood/decoder-compat-legacy-6b decision=FALLBACK source=slot_eviction",
+    "[2026-03-13T00:14:02Z] edge-01 INFO tenant=lumina incoming_retry session=abc123 RouteFingerprint=0x7f4 resolved_variant=redwood/decoder-compat-legacy-6b note=pin_state=confirmed",
+    "[2026-03-13T00:14:03Z] svc-prewarm-03 INFO canary_prewarm_complete node=canary-03 latency_smooth=0.08s prewarm_finish=2026-03-13T00:12:58Z"
+  ],
+  "investigation_notes": [
+    "Initial triage by Support: customer shows consistent API-level pin; edge returns inconsistent variants for ~1 in 8 requests.",
+    "SRE attached distributed traces from edge -> orchestrator -> runtime. Observed that RouteFingerprint used by edge for cohort routing was stale on some edge nodes immediately after canary prewarm finishes.",
+    "Hypothesis 1: Asynchronous prewarm completes after canary weight change; some edge nodes update routing metadata earlier/later producing mismatch between edge fingerprint and orchestrator's pin mapping.",
+    "Hypothesis 2: Retry path sets a reduced metadata set (missing X-RW-Pin-Fingerprint) causing orchestrator to fall back to a default variant; the retry then returns to the edge which still believes tenant is pinned, creating oscillation.",
+    "Checked config: TTLs for route fingerprint caching: edge-cache-ttl=30s, control-plane-snapshot-apply=5s \u2014 found a window where edge-cached fingerprint could be older than new snapshot.",
+    "Found evidence of header sanitizer sidecar rewriting cookie Domain/Path on retries (see edge logs) which can break cohort cookie matching and unstick session affinity.",
+    "SRE reproduced locally by simulating staggered prewarm finishing times across 10 edge nodes; reproduced a 10-15% divergence rate when prewarm finishing was non-uniform and retry enabled."
+  ],
+  "root_cause": "Race between asynchronous canary prewarm completion and progressive weight change combined with edge route-fingerprint cache TTL + missing pin fingerprint on orchestrator retry. Sidecar header sanitizer mutated retry cookies, breaking cohort affinity and causing orchestrator to select legacy variant on fallback leading to repeated loop.",
+  "mitigation_taken": [
+    "Immediate: Disabled automatic retry path for pinned tenant lumina until routing metadata reconciliation completed (edge config override applied at 2026-03-13T01:10Z).",
+    "Applied temporary edge-cache-ttl reduction to 5s for affected edge shard to reduce stale fingerprint window.",
+    "Coordination: Asked client to pause traffic surge and routing to avoid further fallback churn; Lumina applied temporary rate-limit until mid-rollout.",
+    "Added temporary policy to preserve X-RW-Pin-Fingerprint on orchestrator retry path (hotfix PR created: see related_github_prs)"
+  ],
+  "next_steps": [
+    "1) Deploy orchestrator hotfix to always forward pin fingerprint on retry (PR #2891 staged to canary on 2026-03-14).",
+    "2) Implement deterministic prewarm completion handshake so snapshot apply and edge fingerprint bump are coordinated (design doc link to be added to confluence runbook).",
+    "3) Reconcile cookie sanitizer behavior: prevent mutation of pin/cohort cookie during retries; add integration test.",
+    "4) Postmortem: capture timeline, add alert on >5% tenant-diverged-responses over 10 minutes during canary windows.",
+    "5) Follow-up with Lumina Health CS: confirm client didn't observe persistent data leakage and issue customer-facing summary and credits if billing impact confirmed."
+  ],
+  "resolution_notes": "Work in progress: temporary mitigations applied and orchestrator fingerprint-preservation hotfix under canary testing. Once hotfix is verified we will re-run a controlled canary for Lumina with synchronous prewarm handshake and monitor for divergence for 2 hours. Plan to issue a detailed postmortem and any credits if billing overage attributable to retries is confirmed.",
+  "comments": [
+    "2026-03-12 23:02 - <lumina-support@luminahc.com>: We started seeing different outputs in live sessions after the 22:00 canary. Some summaries look truncated compared to yesterday.",
+    "2026-03-12 23:18 - Aisha Kapoor (Support): Acknowledged, escalated to SRE. Asking for request IDs and session cookie example.",
+    "2026-03-13 00:45 - Diego Morales (SRE): Reproduced in staging with staggered prewarm finishes. Filing for orchestrator + edge changes. Pin fingerprint missing on retry observed.",
+    "2026-03-13 01:12 - Diego Morales (SRE): Temporary edge-cache-ttl change applied to shard; disabled retry for lumina. Monitoring metrics.",
+    "2026-03-13 05:34 - Lumina support: Confirmed reduced divergence after mitigation but still seeing rare mismatches during small bursts.",
+    "2026-03-14 09:21 - Diego Morales (SRE): Hotfix PR created and pushed to internal canary; awaiting verification window. Will update ticket after 2h stable run."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs_snippets",
+    "investigation_notes",
+    "root_cause",
+    "mitigation_taken",
+    "next_steps",
+    "resolution_notes",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_2c059b666281451892bc32ab5c850894"
+}

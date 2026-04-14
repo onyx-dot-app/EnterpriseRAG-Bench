@@ -1,0 +1,51 @@
+{
+  "key": "ENG-4825",
+  "team": "engineering",
+  "title": "NCCL stream/event sync hardening at kernel/comms boundary (TP)",
+  "status": "In Review",
+  "priority": "P0",
+  "created_at": "2025-02-19",
+  "updated_at": "2025-03-04",
+  "creator": "Noah Patel",
+  "assignee": "Grace Kim",
+  "project": "Multi-GPU (TP) stability fixes",
+  "cycle": "2025-W09",
+  "estimate": "8",
+  "due_date": "2025-03-01",
+  "labels": [
+    "runtime",
+    "kernels",
+    "tp",
+    "nccl",
+    "stability",
+    "cuda-graphs",
+    "a100",
+    "perf-risk"
+  ],
+  "parent_issue": "ENG-4821",
+  "dependencies": [
+    "ENG-4822",
+    "ENG-4823"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.19",
+  "security_review_required": "false",
+  "description": "Context\n- We have recurring TP stalls/hangs under sustained mixed prefill/decode load (see incident + support escalations). One strong hypothesis: stream ordering + event sync around NCCL collectives is not sufficiently enforced in some execution paths, leading to ranks diverging in collective ordering or waiting on work that is never made visible on the expected stream.\n- This ticket focuses on kernel/comms boundary correctness: explicitly encode stream/event dependencies so that:\n  (a) inputs to a collective are complete/visible before NCCL reads them,\n  (b) downstream compute doesn\u2019t consume outputs before NCCL writes are complete,\n  (c) ordering is consistent between prefill/decode streams and any aux streams (memcpy/kv/compact),\n  (d) behavior is well-defined under CUDA Graph capture (no illegal sync calls during capture).\n\nProblem statement / suspected failure mode\n- Current TP runtime uses multiple CUDA streams (compute stream(s), NCCL stream, occasional memcpy/allocator streams). In some paths we rely on implicit ordering assumptions (same stream submission) or best-effort barriers.\n- Under mixed workloads, we have cases where:\n  - compute enqueues ops on stream A, collective enqueues on stream B without a hard dependency between them,\n  - stream A later blocks waiting on collective completion, but collective never launches correctly or reads stale/partial buffers,\n  - or different ranks observe different relative ordering (especially when scheduler interleaves prefill and decode), producing a silent stall.\n\nScope\n- Add explicit cudaEventRecord/cudaStreamWaitEvent (or equivalent abstraction in runtime) around each NCCL collective boundary.\n- Ensure the NCCL stream is consistently used for all collectives and not accidentally changed by call-site.\n- Preserve performance by minimizing global device sync and using lightweight events; no cudaDeviceSynchronize.\n- CUDA Graphs constraints:\n  - During graph capture, event APIs are allowed in many cases but must be used carefully; certain NCCL patterns or stream waits can break capture or lead to unsupported graphs.\n  - We must detect capture mode and either (1) use a capture-safe path, or (2) disable graph capture for the specific path with a clear reason + metric so we can quantify impact.\n\nNon-goals\n- Rewriting TP collective scheduling policy (that\u2019s ENG-4824).\n- Changing the collective algorithm selection or NCCL tuning knobs.\n\nProposed approach\n1) Introduce a single, shared helper at the boundary:\n   - before_collective(stream_compute, stream_nccl, tag): record event on compute stream, wait on nccl stream\n   - after_collective(stream_nccl, stream_compute, tag): record event on nccl stream, wait on compute stream\n   - tag is used for tracing/structured logs; event pooling to avoid per-step allocations.\n2) Apply the helper to:\n   - all_reduce (main TP activation reductions)\n   - all_gather / reduce_scatter (model-arch dependent)\n   - any point-to-point ops used for KV sharding paths (if present)\n3) CUDA Graph capture handling:\n   - If graph capture is active:\n     - prefer capture-compatible event waits where supported\n     - otherwise: fall back to non-graph execution for the request (feature-flagged) and increment metric tp_graph_fallback_reason=\"nccl_sync\"\n4) Add diagnostics:\n   - Emit a trace span attribute for every collective: stream ids, collective type, seqno, event wait duration (sampled).\n   - If event wait exceeds threshold, log structured warning with rank + last completed seqno.\n\nAcceptance criteria\n- No regressions in correctness: stress repro from ENG-4822 no longer hangs for 6h on A100 80GB (baseline workload) with watchdog disabled.\n- With watchdog enabled (ENG-4826), any induced stall results in controlled abort/drain and does not wedge the GPU.\n- Perf impact: <= 1.5% throughput regression on decode-heavy workload; <= 3% on mixed workload (A100 + H100). If higher, must justify and/or make sync conditional behind flag.\n- Graph capture: does not crash; if fallback occurs, is measurable and defaults remain unchanged until rollout.\n\nRollout / risk\n- Risk: added stream waits can reduce overlap (compute <-> comms) and increase tail latency. We will:\n  - gate behind feature flag runtime.tp.nccl_stream_sync_hardening (default OFF initially)\n  - enable only in canary clusters first (Dedicated A100) and compare p50/p99 + throughput\n  - pair with additional metrics from ENG-4823 to attribute changes to comms waits\n\nReferences / links\n- Initiative: ENG-4821\n- Related: ENG-4824 (scheduler ordering guardrails), ENG-4826 (watchdog)\n- PR (implementation): https://github.com/redwood/redwood/pull/21853\n- Slack thread: sources/slack/eng-runtime/1739812205-nccl-collective-ordering-suspected-mismatch.json\n- Perf discussion: sources/slack/eng-runtime/1740251033-perf-impact-of-extra-stream-sync.json\n\nOpen questions\n- Do we need per-collective unique seqno enforcement at runtime boundary (debug-only) to catch ordering drift earlier?\n- For CUDA graphs: confirm which exact capture modes we use in production (per-request vs per-batch) and whether NCCL is already in graph-safe mode for those paths.\n\nImplementation notes (draft)\n- Use pooled cudaEvent_t with cudaEventDisableTiming to reduce overhead.\n- Avoid calling into NCCL from multiple streams per rank; enforce one NCCL stream per TP group.\n- Ensure event record happens after all input writes (including any async memcpy) by chaining upstream waits (allocator/memcpy stream -> compute stream) where applicable.\n\nTest plan\n- Unit-ish: add a small multi-stream ordering test in runtime GPU tests (2 streams + synthetic kernel + NCCL all_reduce; validate deterministic result).\n- Integration: benchmark-lab mixed prefill/decode (ENG-4822 harness) with flag ON/OFF; collect hang rate, NCCL debug logs sampled.\n- Canary: enable in 1 Dedicated canary cluster for 24h; monitor tp_collective_wait_ms, request timeouts, replica drains.\n",
+  "comments": [
+    "2025-02-19 \u2014 Noah Patel: Creating as P0 given correlation with silent stalls. Please coordinate with Sofia on any stream usage assumptions in scheduler; we\u2019ve seen ordering drift when prefill and decode are interleaved.",
+    "2025-02-20 \u2014 Grace Kim: Investigated current call-sites. We currently assume compute stream == nccl stream in decode fast-path, but prefill path uses separate comm stream. There are also a couple of memcpy-on-aux-stream writes into the reduce buffers without explicit dependency. Plan: centralize into a helper and apply at boundary for all collectives.",
+    "2025-02-21 \u2014 Yuki Sato: Watch for CUDA graphs. Some of our capture logic wraps decode iterations; stream waits might force us to disable capture. Suggest metric + sampled logs for fallback so we can quantify how often it happens.",
+    "2025-02-23 \u2014 Grace Kim: Draft PR up (21853). Using pooled cudaEventDisableTiming events. Added before/after hooks around all_reduce and all_gather. For capture: detect cudaStreamIsCapturing on compute stream; if active, use the same event waits (seems capture-safe in local test) but avoid creating events during capture by pre-allocating pool.",
+    "2025-02-24 \u2014 Isabella Rossi: Microbench on A100: +0.7% decode-only TPS impact, +2.4% mixed workload; p99 slightly up (~1.8%) but hang signature eliminated in 90min stress. Need longer run + H100 numbers.",
+    "2025-02-26 \u2014 Omar El-Sayed: Please ensure structured logs include rank, tp_group_id, collective_seqno. This will help correlate with heartbeat gaps (ENG-4823). Also consider adding an opt-in debug assert that collective seqno increments monotonically.",
+    "2025-02-28 \u2014 Grace Kim: Addressed review notes: event pool init at worker start (not per request), added seqno to tracing span (sampled). Still debating whether to make this default ON; I recommend flag default OFF until canary confirms no unacceptable tail impact.",
+    "2025-03-03 \u2014 Samir Qureshi: One more edge: KV compaction can enqueue memmoves on a separate stream touching buffers that feed collectives. If those buffers overlap, we need to ensure those writes are on the compute stream before before_collective. Might be covered by the upstream \"memcpy_stream -> compute\" barrier; please double-check.",
+    "2025-03-04 \u2014 Grace Kim: PR 21853 ready for merge pending final perf canary sign-off. Added additional barrier when reduce buffers are produced by async memcpy path. Next: run 6h repro on A100 and short H100 check; then coordinate with Connor for canary flag enable."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_c3071d0bc33d480d8728af49e7afa75e"
+}

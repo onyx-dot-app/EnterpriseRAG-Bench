@@ -1,0 +1,84 @@
+{
+  "key": "SUP-324999",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Intermittent 403 on presigned artifact range downloads caused by egress appliance header rewrite + source-NAT pool",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Priya Nair",
+  "assignee": "Liam O'Connor",
+  "customer_company": "BrightCart Inc.",
+  "customer_tier": "private",
+  "components": [
+    "control-plane",
+    "artifact-downloads",
+    "vpc-egress",
+    "networking"
+  ],
+  "labels": [
+    "private-deploy",
+    "egress-proxy",
+    "presigned-urls",
+    "range-requests"
+  ],
+  "environment": "prod-us-east",
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "description": "Issue summary: BrightCart reports intermittent 403 errors when Redwood-serving nodes attempt to fetch model artifact range downloads (HTTP 206 range requests) using presigned S3 URLs. Errors started after a network change on BrightCart side (new egress inspection appliance rollout). Impact: model pulls fail ~2-8% of range requests, causing streaming stalls and increased retries; customer sees elevated tail latency and occasional model load failures. Hypothesis: egress appliance is performing a combination of source-NAT to a limited EIP pool and HTTP header/SNI rewrite for caching/inspection; this is altering the request seen by S3 (Host/SNI/ALPN or range semantics), causing SigV4 / signature validation or range handling to fail intermittently.",
+  "steps_to_reproduce": [
+    "1) Deploy private Redwood deployment in BrightCart VPC (prod-us-east).",
+    "2) Trigger a large model artifact fetch that results in ranged GETs (>20MB) from serving node behind corporate egress appliance.",
+    "3) Observe intermittent 403 responses on range requests from the artifact URL while full GETs sometimes succeed.",
+    "4) Repeat under controlled lab with appliance in-passive/active mode to correlate failure rate."
+  ],
+  "logs": [
+    "[2026-03-09T15:12:07Z] artifact-fetch node-a /range 206 -> 403 from s3.amazonaws.com (x-amz-request-id: ABCDEFG)",
+    "[2026-03-09T15:12:07Z] http-outbound: Host header changed from 'redwood-artifacts-us-east.s3.amazonaws.com' to 'corp-cache.local' (observed in tcpdump on node)",
+    "[2026-03-09T15:12:07Z] aws-sigv4: string-to-sign verification failed for chunked/ranged GET (client-ip: 198.51.100.45 -> seen-by-s3: 203.0.113.12)",
+    "VPC Flow Log sample (node egress): version=2 srcaddr=10.10.3.12 dstaddr=52.216.0.1 srcport=45910 dstport=443 protocol=6 packets=12 bytes=16384 action=ACCEPT log-status=OK",
+    "Egress appliance NAT log: original-src=10.10.3.12 translated-src=198.51.100.45 pool-id=egress-pool-7 cache-hit=true host-rewrite=true"
+  ],
+  "investigation_notes": [
+    "Mar 10 09:10 - Triage call with BrightCart (#support-brightcart). Customer confirmed new egress appliance (vendor: NetGuardEdge v4.2) rolled out on 2026-03-08 across prod subnets.",
+    "Mar 10 10:05 - Captured tcpdump on serving node during reproducer: observed TLS ClientHello SNI 'redwood-artifacts-us-east.s3.amazonaws.com' in some flows, but in failing flows the SNI was rewritten to 'corp-cache.local' and Host header inside decrypted HTTP/2 stream (post-mitm) was 'corp-cache.local'.",
+    "Mar 10 11:20 - Correlated failure windows with egress NAT pool exhaustion: NAT pool rotates translated-src among ~8 EIPs; S3 observed requests from multiple EIPs but some EIPs were also used by corporate cache, causing cached 403 responses to be returned upstream for ranged GETs.",
+    "Mar 10 12:45 - Reproduced in lab by enabling 'http host-rewrite for cache' in appliance \u2013 observed same 403s on ranged requests; full-file downloads succeeded more often because cache returned 200 for full object but range requests relied on correct SigV4/headers and were rejected.",
+    "Mar 10 14:00 - SRE ran 'curl -I --range 0-1023 <presigned-url>' from node with and without HTTP/CONNECT tunneling: when CONNECT bypassed inspection, 206 returned consistently; when proxied and host-rewrite enabled, 403 returned rapidly with x-amz-error-code=SignatureDoesNotMatch.",
+    "Mar 11 08:30 - Opened ticket with appliance vendor (TICKET-NGE-1129) and AWS Support (SR-987654321) to validate whether host/SNI rewrite + client IP translation could cause signature verification failures for ranged GETs.",
+    "Mar 11 13:15 - AWS confirmed that altering Host header/SNI for signed URL requests will invalidate SigV4 verification; caching appliances that rewrite Host for internal cache keys can therefore return stale/incorrect responses for presigned URLs."
+  ],
+  "comments": [
+    "Priya Nair (Support) 2026-03-10: Received initial report from BrightCart: intermittent model load timeouts. Created ticket and scheduled triage.",
+    "BrightCart-ops (customer) 2026-03-10: We deployed NetGuardEdge across all egress subnets on 2026-03-08. Rolling back is expensive; looking for mitigations.",
+    "Liam O'Connor (SRE) 2026-03-10: Captured tcpdump and vpc flow logs; see investigation_notes. Suspect host-rewrite + NAT translation interplay. Requesting customer's firewall team to disable Host header rewrite for s3.amazonaws.com domains as a temporary mitigation.",
+    "NetGuardEdge support 2026-03-11: Confirmed appliance has 'cache key normalization' feature that rewrites Host; provided config flags to disable host rewrite for a domain whitelist.",
+    "Liam O'Connor (SRE) 2026-03-11: Pushed config change on customer's test subnet to whitelist *.s3.amazonaws.com -> host-rewrite disabled. Observed 0% 403 on range requests for 4-hour window. Customer to schedule prod rollout.",
+    "Engineering (Artifact Service) 2026-03-12: Raised GH PR to add resilient retry for transient 403 on ranged artifact downloads with stricter validation for 206 vs 403 (github.com/redwood-inference/platform/pull/8291)."
+  ],
+  "resolution": "Workaround applied: BrightCart disabled Host header rewrite/caching for *.s3.amazonaws.com on NetGuardEdge and expanded NAT pool allocation to avoid pool exhaustion. After change, ranged artifact failures dropped to <0.1%. Permanent fix: customer to deploy appliance whitelist for Redwood artifact domains and enable pass-through (no host/SNI rewrite) for signed URLs. Engineering added a conservative retry on 403 for range downloads (PR 8291) while we recommend customer changes. Close plan: monitor for 72 hours then move to 'Resolved' if stable.",
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/runbooks/egress-proxy-host-rewrite"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/platform/pull/8291"
+  ],
+  "linked_issues": [
+    "SUP-714990",
+    "SUP-431999"
+  ],
+  "sla_due_at": "2026-03-11",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_fb7126d1b7b043a2b020e189bf1d5503"
+}

@@ -1,0 +1,21 @@
+{
+  "channel": "eng-runtime",
+  "thread_ts": "2955551234",
+  "first_message_ts": "2955551234",
+  "last_message_ts": "2955554567",
+  "participants": [
+    "alex",
+    "maria",
+    "sai",
+    "samir",
+    "deploy-bot",
+    "infra-bot",
+    "ops-oncall"
+  ],
+  "text": "alex: hit an OOM on prod node a100-04 serving a very long convo (~120k tokens). stack: alloc failed -> \\\"KV slab pinned\\\" repeated, then hard OOM. Not a typical fragmentation trace. cc @maria @sai\n\nmaria: rough. any recent kernel-selection changes or batching heuristics rolled in? sounds like reuse path didn't free prefixes.\n\nsai: saw a similar symptom in canary but it was intermittent. quick sanity: is the kernel switcher toggling to a different kernel mid-request? that can leave KV refs sticky.\n\nalex: logs show kernel switch around 2026-03-17T14:02:10Z then immediate growth of kv_bytes in metrics. snippet:```[INFO] kernel-switch: from=int8-fast to=qkv-fast seq_len=8192 request_id=xyz\n[WARN] kv_alloc: slab=0x7f2c pinned=true refcount=3 request_id=xyz\n[ERROR] alloc_failed: wanted=48MB avail=2MB pid=9876\n```\n\nmaria: ok that's useful. can you grab a short heap profile and the kv slab map? `curl http://a100-04:6060/debug/heap` and `rdctl kv slab-map --host a100-04`\n\nalex: pasted results in gist: https://gists.example/kv-heap-wobble, immediate observations: several medium slabs (32MB) marked non-evictable and refcount 3 for >2 minutes, while new allocations spike.\n\nsai: likely cause: kernel-selection fastpath didn't set `evict_hint=false` correctly when switching back, so reuse path thinks slab is pinned. Also batching heuristic bumped to 128 streams which caused simultaneous allocations. two bad interactions.\n\nsamir: adding to investigation. quick mitigations to avoid further incidents: 1) reduce `serving.max_concurrent_streams` from 128 -> 64 2) enable `kv.soft_evict=true` to allow reclaim of lightly-referenced slabs 3) short-term: add a guarded fallback to model-variant `redwood-small-q4` on OOM so requests succeed albeit slower. anyone object?\n\nmaria: sounds good. can we instead set `kv.drain_ms=300` (was 2000) so we proactively drain KV reuse on kernel switch? that would reduce pinned window.\n\nsamir: +1 for drain_ms change. combine with soft_evict and stream cap. I'll prepare a patch to kernel-switcher to ensure `mark_evictable()` before toggling kernels.\n\nops-oncall: flagged hosts a100-04, a100-05 for immediate conservative config. will throttle ingress for affected clusters.\n\ndeploy-bot: rolling config change: cluster=prod-inference, patch_id=cfg-2026-03-17-01, params={\"serving.max_concurrent_streams\":\"64\",\"kv.soft_evict\":\"true\",\"kv.drain_ms\":\"300\"} scheduled in 5m.\n\nalex: after applying config we saw reduced pressure. one request still hit a soft OOM but retried successfully with fallback. logs:```[WARN] kv_soft_evict: reclaimed=24MB freed_slabs=1 request_id=abc123\n[INFO] fallback: model=redwood-small-q4 used after oom; latency+120ms request_id=abc123\n```\n\nmaria: good sign. follow-ups: - samir to land kernel-switcher patch (add mark_evictable + unit tests) - infra to add a metric for \"pinned_slab_count\" and an alert threshold - devex to update best-practices doc about kernel switches and long-context serving - add canary with long-context heater (simulate 100k token dialog)\n\nsamir: patch ready, pushing in 30m. quick diff note: ensure transition does not flip `evictable` during active reuse window, use CAS on refcount. also add telemetry event `kernel_switch_evict_hint` so we can correlate in future.\n\ninfra-bot: created ticket INF-4421 \"pinned-slab metric + alert\" and dashboard panel.\n\nmaria: adding to postmortem draft. root cause: kernel-selection + aggressive batching -> KV reuse not drained -> pinned slabs accumulate -> memory cliff. mitigation: config roll, kernel-switcher patch, metric+alert, fallback model.\n\nalex: thanks everyone. will keep thread updated if we see recurrence. :thumbsup:",
+  "title_field_name": "channel",
+  "content_field_names": [
+    "text"
+  ],
+  "dataset_doc_uuid": "dsid_253623d4b8384e7c92a56f0d6d549559"
+}

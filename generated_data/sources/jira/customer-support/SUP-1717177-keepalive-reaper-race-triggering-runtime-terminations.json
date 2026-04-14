@@ -1,0 +1,92 @@
+{
+  "key": "SUP-1717177",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "High error-rate: API gateway keepalive-reaper race causing runtime process terminations and elevated 5xx",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-13",
+  "updated_at": "2026-03-14",
+  "reporter": "Aisha Patel",
+  "assignee": "Liam Chen",
+  "severity": "Sev1",
+  "customer_company": "AcmeHealth",
+  "customer_tier": "enterprise",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "keepalive-manager",
+    "scheduler"
+  ],
+  "labels": [
+    "5xx",
+    "keepalive-reaper",
+    "runtime-crash",
+    "urgent",
+    "evening-surge"
+  ],
+  "environment": "prod us-east-1",
+  "affected_models": [
+    "redwood/opt-13b",
+    "open-llama-7b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-14",
+  "first_response_due_at": "2026-03-13",
+  "linked_issues": [
+    "SUP-472901",
+    "SUP-813246"
+  ],
+  "related_incident_id": "INC-20260313-01",
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/5421"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/Keepalive+Reaper+Runbook"
+  ],
+  "description": "Issue summary: Starting ~2026-03-13 19:05 UTC we observed a sharp increase in 5xx responses for AcmeHealth tenant routes in us-east-1. API gateway returned 502/503 for ~8 minutes with sustained error-rate ~18% for affected endpoints. Impact: customer-facing APIs intermittently failing for chat and embeddings; several Sev1 alerts fired (api-gw 5xx rate and runtime-exit alerts). Environment: prod us-east-1, dedicated tenant slices for enterprise customers. Observed at the same time: a surge of runtime process terminations in the serving-runtime cluster correlated with a keepalive-reaper job that reclaims idle connections. This ticket tracks investigation and remediation.",
+  "steps_to_reproduce": "1) Provision a tenant with long-lived keepalive connections (streaming chat sessions) and low request rate for 10+ minutes.\n2) Ensure api-gateway keepalive timeout configured at 90s and runtime keepalive reaper at 60s (non-ideal mismatch).\n3) Wait for reaper job to run and reclaim sockets while runtime is still performing an async write to client socket.\n4) Observe runtime process receiving EPIPE/EOWNERDEAD and hitting path that triggers fast exit in current runtime versions.\nNote: lab repro requires load shaping to emulate many long-lived, lightly active streams.",
+  "logs": "-- extracted snippets from runtime and api-gateway --\n[2026-03-13T19:05:12Z] apigw: upstream response=502, upstream_err=broken pipe, tenant=acmehealth, path=/v1/chat/stream\n[2026-03-13T19:05:13Z] runtime[pid=8421]: fatal: unhandled write error: EPIPE while flushing stream; aborting process\n[2026-03-13T19:05:13Z] kernel: socket: fd 1024: epoll_ctl on closed fd\n[2026-03-13T19:05:14Z] keepalive-manager: reaper ran: reclaimed 12k idle fds in slice-17\n[2026-03-13T19:05:15Z] autoscaler: detected runtime exit spike; scaled up ephemeral workers but errors continued\nMetric snapshots: 5xx_rate: baseline 0.3% -> peak 18% (19:05-19:13 UTC), runtime_exit_rate: 0.02/min -> 4/min during window.",
+  "investigation_notes": "Initial hypothesis: keepalive reaper reclaimed sockets that the runtime still considered valid leading to EPIPE during writes; runtime did not handle that path gracefully and exited.\nWhat we checked:\n- Correlated timestamps between keepalive-manager logs and runtime exits (matches to second).\n- No NVML GPU resets observed; GPU health metrics normal.\n- Accept queue depth spiked for a subset of runtimes immediately prior to exits.\n- Packet captures show RSTs originating from proxy side immediately before runtime write attempts.\n- Configuration mismatch: api-gateway idle_keepalive=90s, keepalive-reaper=60s on some runtime hosts (legacy config drift).\nHypotheses considered:\n- Kernel-level fd reuse race exposing double-close in runtime;\n- Keepalive reaper incorrectly shared across multiple proxies causing premature RSTs;\n- Runtime code path handling EPIPE triggers fast fail instead of graceful stream termination.\nEvidence supports: config mismatch + unhandled EPIPE path in runtime binary.\nNext steps: patch runtime to swallow EPIPE on flush, add guard to accept()/write() path; align keepalive configs; roll out reaper pause and runtime patch canary.",
+  "comments": [
+    "2026-03-13 19:20 UTC - Aisha Patel (Support): Notified customer (AcmeHealth) and opened ticket. Customer reports chat sessions failing for few users during evening period. Collected request IDs and sample session traces.",
+    "2026-03-13 19:30 UTC - Liam Chen (SRE): Correlated apigw logs with runtime exits; briefed runtime team in #sre-runtime. Reproducer attempt in staging started.",
+    "2026-03-13 20:05 UTC - Priya Rao (Runtime Eng): Confirmed runtime handles EPIPE by calling abort() on current build (v2.3.7). Preparing minimal patch to convert abort->graceful close in write failure path. PR opened: https://github.com/redwood-inference/runtime/pull/5421.",
+    "2026-03-13 20:30 UTC - Operations (oncall): Deployed temporary mitigation: paused keepalive-reaper for us-east-1 tenant slices and increased api-gateway keepalive timer to 120s for affected routes. Observed 5xx drop to under 1% within 4 minutes.",
+    "2026-03-13 21:10 UTC - Customer Success (Nina Alvarez): AcmeHealth confirmed service restored for their production users; they are asking for root-cause summary and timeline.",
+    "2026-03-14 09:00 UTC - Liam Chen (SRE): Canary rollout of runtime patch in 3 nodes for us-east-1 completed; no regressions observed for 24h. Preparing full rollout plan and postmortem draft."
+  ],
+  "resolution": "Mitigation applied: paused keepalive reaper on affected host pool and temporarily increased api-gateway keepalive timeout to reduce premature socket reclamation. Patch merged to runtime to handle EPIPE without process abort (PR #5421). Canary rollout validated; full rollout scheduled for 2026-03-15 03:00 UTC with rollback plan. Customer notified and confirmed symptoms resolved.",
+  "workaround": "For impacted customers: request them to set shorter client-side TCP keepalive probes or re-establish long-lived stream logic to send periodic heartbeats. Platform-side workaround applied (pause reaper and extend api-gw keepalive).",
+  "root_cause": "A configuration drift between api-gateway and runtime host keepalive timers (gateway 90s vs reaper 60s) allowed the keepalive-manager to reclaim sockets while the runtime still attempted writes. The runtime binary in v2.3.7 had a code path that treated EPIPE during async flush as fatal and invoked an abort sequence, causing process termination and upstream 5xx responses. The combination of premature socket reclamation and an ungraceful runtime failure produced the elevated error-rate.",
+  "follow_up_actions": "1) Deploy runtime patch to all clusters (GRACEFUL EPIPE handling) - owner: Runtime Eng (Priya Rao) - target 2026-03-15.\n2) Audit keepalive-related config across fleets and implement a config drift check in infra-policy - owner: SRE (Liam Chen) - target 2026-03-21.\n3) Update Keepalive Reaper Runbook to include safe ordering with gateway timers and add canary gating - owner: Ops - target 2026-03-18.\n4) Postmortem write-up and customer-facing RCA for AcmeHealth - owner: CS (Nina Alvarez) - target 2026-03-17.",
+  "attachments": [
+    "/var/log/apigw/2026-03-13-us-east-keepalive-window.log",
+    "s3://redwood-support-dumps/SUP-1717177/pcap-190513.pcap.gz"
+  ],
+  "public_notes": "Customer-facing summary prepared and shared with AcmeHealth: short timeline, root cause (config drift + runtime behavior), actions taken, and planned fixes. Will publish sanitized postmortem once rollout completes.",
+  "estimated_customer_impact": "~8 minutes of elevated 5xx for a subset of chat/streaming endpoints in us-east-1 affecting ~0.7% of total customer traffic during window; AcmeHealth reported multiple user errors but no data loss.",
+  "related_runbooks": [
+    "Keepalive Reaper Runbook",
+    "Runtime Process Failure Handling"
+  ],
+  "notes_for_engineering": "When rolling out the runtime patch, ensure canary nodes are isolated from high-priority tenants and monitor accept-queue depth and runtime_exit_rate metrics closely. Add unit tests for EPIPE handling and a fuzz test for simultaneous close/write races.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "resolution",
+    "root_cause",
+    "follow_up_actions",
+    "workaround",
+    "public_notes",
+    "estimated_customer_impact",
+    "notes_for_engineering"
+  ],
+  "dataset_doc_uuid": "dsid_eba3e80ca1d842d59acce61b605dcf8a"
+}

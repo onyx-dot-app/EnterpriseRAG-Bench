@@ -1,0 +1,104 @@
+{
+  "key": "ENG-52345",
+  "team": "engineering",
+  "title": "Resolve KV-handoff livelock causing multi-tenant queue starvation and long-context tail",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-14",
+  "creator": "Ava Martinez",
+  "assignee": "Ravi Patel",
+  "project": "Serving Runtime: Scheduler Stability",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-21",
+  "labels": [
+    "continuous-batching",
+    "kv-cache",
+    "scheduler",
+    "prod-incident",
+    "customer-escalation"
+  ],
+  "description": "Multiple customer escalations across Hosted, Dedicated, and Private deployments reported sustained p99/p999 tail latency increases and intermittent API errors. Rooted in a rare scheduler livelock during KV-cache handoff and dequeue ordering under mixed short/very-long context workloads, causing queue starvation for latency-sensitive tenants.",
+  "background": "Over the past three weeks we've seen repeat escalations from three customers (Hosted-Public API, Dedicated-cluster A, Private-onprem customer X) where the platform briefly stops serving low-latency requests while long-context requests dominate GPU streams. Alerts triggered by latency SLO breaches and token-rate deviations. Several existing fixes for adaptive batching reduced but did not eliminate these events. This issue differs from previous 'head-of-line' bugs because it manifests only when KV cache eviction aligns with scheduler preemption windows, producing a livelock between the dispatcher and worker handoff logic.",
+  "reproduction_steps": [
+    "1) Simulate mixed workload with tenants A (short prompts, high QPS) and B (infrequent >32k tokens continuations).",
+    "2) Enable continuous-batching with adaptive_floodgate and enable_kv_prefetch=true in runtime config.",
+    "3) Drive a sudden microburst of long-context requests to saturate KV cache and trigger eviction while short-requests are enqueued.",
+    "4) Observe worker threads repeatedly yielding during KV handoff; dispatcher backoff increments but failing to drain priority_short queue, producing p99 spike and 429s for short-tenant.",
+    "5) Capture scheduler traces and worker flame graphs (attached in related_links) to reproduce livelock.",
+    "Note: requires deterministic seed harness used in QA harness/long-tail-sim (see related_links)."
+  ],
+  "root_cause": "A race between the KV eviction/handoff path and the scheduler's preemptive dequeue logic. When eviction path holds the worker lock while performing multi-shard KV operations, dispatcher preemption timers intersect and the worker yields without enqueueing pending short-requests, repeatedly reacquiring the worker with a different token set. This sequence forms a livelock: long requests make progress but never commit cache state fast enough to allow short-requests to be routed to idle execution lanes, amplifying backlog and producing queue starvation.",
+  "fix_summary": "Primary fix: introduce bounded handoff window and cooperative yield point during KV operations; add fast-path bypass for latency-sensitive short requests so they can be routed to warm workers even if full KV handoff is pending. Also add preemption accounting to the dispatcher to avoid repeated yield-reacquire cycles. Secondary fixes: improved metrics, additional locks' timeouts, and safety fallback to force dispatch when short-queue depth > threshold.",
+  "code_changes": [
+    "PR: https://github.com/redwood-inference/serving/pull/7142 - scheduler: bounded_kv_handoff_window + preemption_accounting",
+    "PR: https://github.com/redwood-inference/serving/pull/7159 - kv-cache: cooperative_yield_point and handoff-timeout",
+    "PR: https://github.com/redwood-inference/serving/pull/7190 - dispatcher: short-path-bypass for latency_tier=low",
+    "PR: https://github.com/redwood-inference/serving/pull/7214 - tests: long-tail-sim deterministic harness and regression cases"
+  ],
+  "rollout_plan": [
+    "1) Merge PRs to canary branch and run full CI + long-tail-sim suite on x86+NVIDIA A100 and AMD MI250 ephemeral QA clusters (2 days).",
+    "2) Canary rollout to 3 Hosted clusters with telemetry flags enabled for preemption_accounting and handoff_timeout (48h), monitor p50/p95/p99 and token-throughput.",
+    "3) Gradual promotion to Dedicated pools with controlled tenant selection (customers consenting to early patch) and Private customers via upgrade bundle (patch notes & runbook).",
+    "4) If regressions found, auto-revert via release manager and open follow-up hotfix (fast rollback path documented).",
+    "5) Full rollout after 7 days of stable canary metrics and sign-off from Reliability and Product on customer impact reduction."
+  ],
+  "test_plan": [
+    "- Unit tests for scheduler handoff boundary conditions (added 12 tests)",
+    "- Integration long-tail-sim: deterministic seed harness to reproduce livelock (run in CI nightly)",
+    "- Chaos test: inject artificial KV latency and worker preemption at random points to verify no queue starvation",
+    "- Performance regression: benchmark p50/p95/p99 across mixed short/long workloads pre/post patch with same seed",
+    "- Staging soak: 72h soak with production-like traffic generator per region"
+  ],
+  "monitoring_queries": [
+    "- Query: SELECT percentile(latency_ms, 99) FROM requests WHERE scheduler_event='handoff' BY deployment",
+    "- Alert: short_queue_depth > 1000 for > 30s => PagerDuty P0",
+    "- Metric: handoff_duration_ms histogram (new) \u2014 track p50/p95/p99",
+    "- Dashboards: add 'kv_handoff_livelock' visualization and annotate deploy windows",
+    "- SLI: % of short-requests served within 200ms; target >= 99.5%"
+  ],
+  "postmortem_link": "https://confluence.redwood.ai/display/SERV/ENG-52345+-+KV+handoff+livelock+postmortem",
+  "customer_reports": [
+    "Hosted: Customer HID-091 (AI-saas) reported 15-minute p99 spike and 1200 429s on 2026-02-24; debug traces attached.",
+    "Dedicated: Customer DED-ALPHA cluster experienced periodic latency regressions during batch migrations on 2026-02-27.",
+    "Private: Onprem Customer X filed escalation 8472 and had to toggle routing-policy to fallback model to regain low-latency paths."
+  ],
+  "related_issues": [
+    "ENG-4821",
+    "ENG-31200",
+    "ENG-42100",
+    "ENG-35821"
+  ],
+  "dependencies": [
+    "infra-ops: need ephemeral QA GPUs scheduled (req #QA-342)",
+    "sdk-team: minor client-side retry change to honor server-side 429->retry-after mapping"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.23.0",
+  "security_review_required": "false",
+  "notes": "We intentionally keep the handoff-timeout conservative to avoid state corruption under Private/offline upgrade scenarios. Design doc for the cooperative handoff is in related_links. Notify customers with scheduled Dedicated or Private upgrades about potential short maintenance window when applying upgrade bundle. Follow-up ticket planned to explore auto-scaling heuristics that proactively prevent KV eviction storms.",
+  "related_links": [
+    "Confluence design: https://confluence.redwood.ai/display/SERV/KV+cooperative+handoff+design",
+    "QA harness: git+ssh://git.redwood.ai/qa/long-tail-sim (branch: eng-52345-repro)",
+    "Flame graphs and trace set: gs://redwood-prod-traces/2026/02/hand-off-livelock-archive.tar.gz",
+    "Incident dashboard snapshot: https://grafana.redwood.ai/d/hand-off/ENG-52345"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "background",
+    "reproduction_steps",
+    "root_cause",
+    "fix_summary",
+    "code_changes",
+    "rollout_plan",
+    "test_plan",
+    "monitoring_queries",
+    "customer_reports",
+    "notes",
+    "related_links",
+    "postmortem_link"
+  ],
+  "dataset_doc_uuid": "dsid_d0a51c093be442b781e21f4122382473"
+}

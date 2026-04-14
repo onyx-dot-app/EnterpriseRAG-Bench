@@ -1,0 +1,54 @@
+{
+  "repo": "redwood",
+  "pr_number": "19815",
+  "title": "Failover controller: rollback safety, anti-flap timers, and per-tenant limits",
+  "author": "Benji Okafor",
+  "created_at": "2026-01-06",
+  "updated_at": "2026-01-12",
+  "merged_at": "2026-01-12",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/failover-rollback-safety",
+  "reviewers": [
+    "Miles Thornton",
+    "Ravi Menon",
+    "Ethan Park",
+    "Tom\u00e1\u0161 Nov\u00e1k",
+    "Allison Grant"
+  ],
+  "labels": [
+    "sre",
+    "routing",
+    "reliability",
+    "failover",
+    "control-plane",
+    "observability"
+  ],
+  "linked_linear": [
+    "ENG-2416",
+    "ENG-2411"
+  ],
+  "linked_jira": [
+    "INT-1142"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "37",
+  "additions": "1248",
+  "deletions": "289",
+  "breaking_change": "false",
+  "release_notes": "Adds guardrails to automated routing policy rollback to prevent oscillation during regional impairments: hold-down timers, bounded revert conditions, and per-tenant safety limits with audit events.",
+  "body": "## Summary\nThis PR implements the rollback/anti-flap safety layer for automated routing policy changes executed by the Failover Controller.\n\nIt introduces:\n- Hold-down (anti-flap) timers to prevent rapid oscillation between regions when signals are noisy.\n- Deterministic rollback conditions (what evidence is required to revert vs. hold state).\n- Per-tenant safety limits (max flips per hour, blast-radius constraints) to prevent a single tenant/tier from driving excessive automation.\n- Structured audit events for every recommendation/execution/rollback decision (including \"why not\" when blocked).\n\nThis is a prerequisite for enabling automation beyond dry-run in production and aligns with ADR-043.\n\n## Motivation\nDuring rehearsals we saw failure modes where:\n- Partial recovery caused the controller to immediately revert, then re-trigger as tail latency/error burn bounced.\n- A single large tenant\u2019s canary route could repeatedly flip due to localized retry storms.\n- On-call had difficulty explaining why the controller did or did not roll back because decisions weren\u2019t consistently logged/audited.\n\nThe goal is to make the controller conservative and predictable under uncertainty:\n- Prefer *hold* over *flip* when signals are ambiguous.\n- Allow rollback only when recovery is corroborated and stable.\n- Cap automation actions per tenant and per route to contain blast radius.\n\n## Design notes (ADR-043)\nThis PR follows the semantics in ADR-043:\n- **State model**: policy state is evaluated per (route, tenant_tier, region_pair) with an explicit last_action timestamp.\n- **Hold-down**: after any action (execute or rollback), a minimum hold period must elapse before the next action is eligible.\n- **Rollback requires recovery evidence**:\n  - Recovery must be observed for a continuous window (recovery_stable_for).\n  - Recovery must be corroborated by at least one secondary signal (e.g., reachability + error burn improvement).\n  - Rollback is blocked if destination capacity is below configured headroom thresholds.\n- **Anti-oscillation**: once a route is failed over, we require a stronger recovery signal than the initial failover threshold (hysteresis).\n- **Safety limits**:\n  - max_actions_per_tenant_per_hour\n  - max_actions_per_route_per_hour\n  - optional \u201cblast radius\u201d caps (e.g., max % of tenant traffic eligible for automated flips)\n\n## What changed\n### Controller behavior\n- Added `ActionGate` that evaluates:\n  - hold-down timers\n  - per-tenant and per-route rate limits\n  - required corroboration signals for rollback\n  - hysteresis thresholds\n- Implemented explicit outcomes for decisioning:\n  - EXECUTE_FAILOVER\n  - EXECUTE_ROLLBACK\n  - HOLD (with reason codes)\n  - BLOCKED (with reason codes)\n\n### Config/schema\n- Extended controller config (YAML) with:\n  - `hold_down.after_any_action`\n  - `rollback.recovery_stable_for`\n  - `rollback.require_corroboration`\n  - `limits.max_actions_per_tenant_per_hour`\n  - `limits.max_actions_per_route_per_hour`\n  - `hysteresis.multiplier`\n- Added schema validation and defaults that are intentionally conservative.\n\n### Observability\n- Added metrics:\n  - `failover_controller_actions_total{action_type, result}`\n  - `failover_controller_blocks_total{block_reason}`\n  - `failover_controller_hold_seconds{route, tier}` (sampled; no tenant-id label)\n- Added structured log fields:\n  - `decision_id`, `route_id`, `tier`, `from_region`, `to_region`, `evidence` (summary), `block_reason`, `hold_until`\n- Added audit event emission on:\n  - recommendation produced\n  - action executed\n  - action blocked (includes reason)\n  - rollback executed\n\n### Testing\n- Unit tests for gate behavior (hold-down, hysteresis, rate limits, recovery windows).\n- Integration tests with recorded signal streams to verify deterministic behavior.\n\n## Rollout plan\n- Land behind feature flag `failover_controller.rollback_guardrails`.\n- Enable in staging immediately.\n- Production: enable for a single Hosted API route + internal tenants first, then expand.\n\n## Risks / mitigations\n- Risk: overly conservative rollback could keep traffic on secondary region longer than needed.\n  - Mitigation: tune `recovery_stable_for` and corroboration requirements after first game day; audit events make this visible.\n- Risk: config complexity.\n  - Mitigation: schema defaults + docs in-code; validation errors are explicit.\n\n## References\n- Linear: ENG-2416\n- ADR: ADR-043 Automated routing policy rollback\n- Related PRs: pr-19814 (dry-run), pr-19812 (signal priority)\n\n---\n\n## Commits (squash summary)\n1. controller: add action gate + decision outcomes\n2. controller: implement hold-down and hysteresis for rollback\n3. limits: per-tenant and per-route action rate limits\n4. audit: emit structured events for action/blocked/hold\n5. metrics: add controller action/block counters (cardinality-safe)\n6. tests: unit + recorded-signal integration suite\n7. docs: config comments + example values\n\n## Changed areas (high level)\n- `controlplane/failover/controller/*`\n- `controlplane/failover/config/schema/*`\n- `routing/policy/audit/*`\n- `observability/metrics/failover_controller.go`\n- `tests/failover/recorded_signals/*`\n\n### Illustrative snippet\n```go\n// action_gate.go\nif now.Before(state.HoldUntil) {\n  return Decision{Result: HOLD, Reason: \"hold_down_active\", HoldUntil: state.HoldUntil}\n}\n\nif limits.Exceeded(tenantKey, now) {\n  return Decision{Result: BLOCKED, Reason: \"tenant_rate_limit\"}\n}\n\nif candidate == ROLLBACK && !recovery.Corroborated(signals) {\n  return Decision{Result: HOLD, Reason: \"recovery_not_corroborated\"}\n}\n```\n\n---\n\n## Review conversation (highlights)\n**Miles Thornton** (requested changes):\n- \"Hold-down should apply to *any* action, not just failover, otherwise rollback->failover oscillation is still possible.\" \n- \"Rollback should require stronger evidence than failover (hysteresis). Please document the multiplier default and reasoning.\" \n\n**Benji Okafor**:\n- Updated gate to set `HoldUntil` after both execute and rollback. Added `hysteresis.multiplier` with default 1.25 and comments.\n\n**Ravi Menon** (comment):\n- \"We need deterministic reason codes for HOLD/BLOCKED so on-call can triage quickly. Also ensure no tenant-id labels in metrics.\" \n\n**Benji Okafor**:\n- Added enum reason codes and ensured metrics are keyed by tier/route with sampling; audit logs carry tenant hash only in the audit pipeline (not metrics).\n\n**Allison Grant** (comment):\n- \"Please add an annotation field in logs for 'evidence summary' to make Kibana queries easier.\" \n\n**Benji Okafor**:\n- Added `evidence` object summary serialized to a short string (bounded length), and ensured it\u2019s included in audit events.\n\n**Tom\u00e1\u0161 Nov\u00e1k** (comment):\n- \"Rate limit values: can we set very conservative defaults and require explicit overrides per tier?\" \n\n**Benji Okafor**:\n- Defaults set to 2 actions/tenant/hour and 3 actions/route/hour. Overrides can be set per tier; schema enforces upper bounds.\n\n**Ethan Park** (approval):\n- \"Looks good. Please confirm controller continues to compute recommendations even when blocked so dry-run remains informative.\" \n\n**Benji Okafor**:\n- Confirmed: recommendation is produced, but execution is blocked with reason; audit event captures both.\n\nApprovals:\n- Miles Thornton \u2705\n- Ravi Menon \u2705\n- Ethan Park \u2705\n- Allison Grant \u2705\n\n---\n\n## CI\n- build: \u2705\n- unit-tests: \u2705\n- integration-tests (failover-recorded-signals): \u2705\n- lint: \u2705\n- security-scan: \u2705\n\n## Merge\nMerged via squash to `main`.",
+  "merge_method": "squash",
+  "checks": [
+    "build (linux/amd64) - pass",
+    "unit-tests - pass",
+    "integration-tests:failover-recorded-signals - pass",
+    "lint - pass",
+    "security-scan - pass"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_0ed75b699f5243c5b86780761d718d04"
+}

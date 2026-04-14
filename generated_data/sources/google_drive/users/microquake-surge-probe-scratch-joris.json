@@ -1,0 +1,35 @@
+{
+  "title": "Microquake surge probe \u2014 scratch notes",
+  "owner": "Joris van den Berg",
+  "drive_area": "users",
+  "path": "users/microquake-surge-probe-scratch-joris.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-18",
+  "last_modified": "2025-03-05",
+  "collaborators": [
+    "Maya Patel",
+    "Lena Ortiz"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "throughput",
+    "microburst",
+    "kv-cache",
+    "batching",
+    "gpu",
+    "probe"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-7421",
+    "GH: redwood/inference#1887",
+    "JIRA: INFR-325"
+  ],
+  "content": "Purpose:\nQuick exploratory log for a new microburst pattern we dubbed 'microquake' \u2014 many tiny bursts (5\u201320 reqs) with very short inter-burst gaps (2\u201320ms) that produce a resonant effect on the KV cache warmup and kernel selection. Goal: identify whether small, high-frequency bursts cause a persistent p99 inflation and whether fractional batching + aggressive KV priming helps.\n\nContext / Motivation:\n- We see customers with chat UI autopredict that issue many tiny requests while a user is typing. Conventional burst tests (burst sizes 50+) don't capture the microquake behavior.\n- Hypothesis: microquake causes repeated kernel cold-starts or inefficient batch packing which increases tail latency (p95/p99) despite acceptable p50.\n\nExperiment hardware / service config:\n- Cluster: dedicated pool (A100-s), 4 GPUs/pod, 2 pods used.\n- Model: open-llama-13b (quantized int8 path), kv-cache enabled.\n- Serving runtime: runtime v3.9.2 with default kernel-picker.\n- Ingress: local load generator on same region, jitter disabled, accurate inter-arrival timing.\n- Observability: token-level tracing, per-request trace id, sampling 100% for this run.\n\nTraffic pattern definition (microquake):\n- Burst: sequences of 5, 8, 12, or 20 concurrent single-token requests (simulate streaming token-by-token).\n- Inter-burst gap: uniformly sampled 2\u201320 ms.\n- Run length: 30 minutes per config.\n- Concurrency cap: per-client 64.\n\nExperiment matrix:\n1) Baseline: runtime default batching, no priming, batch_timeout=4ms\n2) Fractional batching: enabled fractional packing (pack small requests into soft batches), batch_timeout=2ms\n3) KV priming: prefill heuristics (prime last-kv slice for context=64) + fractional batching\n4) Kernel pin: force 'fast-attn' kernel even for small seq lengths (stress test)\n\nMetrics collected:\n- p50/p90/p95/p99 latency (ms) measured per-request (server processing time excluding ingress network)\n- overall QPS (requests/sec)\n- KV cache hit-rate (per-request), cache-priming latency contribution\n- GPU utilization and kernel-switch counts (inferred from traces)\n\nRaw highlights (aggregated after 30m runs):\n- Baseline: QPS ~ 1,100; p50 28ms; p95 110ms; p99 230ms; KV-hit 45%\n- Fractional batching: QPS ~ 1,250; p50 30ms; p95 95ms; p99 170ms; KV-hit 48%\n- KV priming + fractional: QPS ~ 1,200; p50 34ms; p95 80ms; p99 120ms; KV-hit 76%\n- Kernel pin: QPS ~ 1,050; p50 26ms; p95 140ms; p99 310ms; KV-hit 43%\n\nQuick interpretations:\n- Fractional batching improves packing of micro-requests, raises throughput slightly and reduces mid-tail, but doesn't fully address p99.\n- KV priming is the most effective single lever for p99 in this pattern \u2014 large jump in KV-hit and dramatic p99 improvement. Suggests much of the tail was due to repeated KV cache misses and repeated attention recomputation.\n- Forcing a single kernel (kernel pin) backfired: while p50 remained low, p95/p99 got worse \u2014 likely because kernel implementations optimized for long sequences are suboptimal for tiny bursts, and runtime lost dynamic kernel-selection benefits.\n\nObserved behavioral trace examples (anecdotal):\n- Pattern: many requests hit empty slot in GPU L2 / KV slice -> runtime blocks while migrating KV pages -> subsequent burst sees eviction penalties.\n- I saw repeating sequence where a request would get 10ms extra stall precisely when a small background housekeeping eviction started. Reproducible in ~70% of KV-miss traces.\n\nASCII sparkline of p99 across configs (30m windows, lower is better):\nBaseline:  \u2587\u2586\u2587\u2587\u2586\u2587\u2587\u2586\u2587\u2587\u2586\u2587\u2587\u2586\u2587  (avg 230ms)\nFractional batching: \u2587\u2586\u2586\u2585\u2587\u2586\u2585\u2587\u2586\u2585\u2587\u2585\u2586  (avg 170ms)\nKV priming: \u2585\u2585\u2585\u2585\u2585\u2585\u2585\u2585\u2585\u2585\u2585\u2585\u2585  (avg 120ms)\nKernel pin: \u2587\u2587\u2587\u2587\u2587\u2587\u2587\u2587\u2587\u2587\u2587\u2587\u2587  (avg 310ms)\n\nImmediate takeaways and action items:\n- Short term (prod-safe): enable fractional batching for small-payload endpoints by default (feature flag + telemetry). Rollout plan: canary 5% -> 25% -> 100% (monitor p50/p95/p99).\n- Medium term: add a KV priming policy for streaming/small-token workloads (heuristic: if average burst size < 25 and inter-burst gap < 50ms, prefill last N KV slices). Needs work to avoid wasted priming on purely sporadic traffic.\n- Avoid kernel pinning as a general policy \u2014 keep dynamic kernel selection but add better metrics to detect mis-selection.\n- Instrument kernel-switch counts in the console (already added GH PR to trace exporter).\n\nOpen questions / follow-ups:\n- How sensitive is the benefit of KV priming to sequence length? I tested for context=64; need runs for 32 and 128.\n- Cost tradeoffs: priming increases token work \u2014 quantify per-token cost increase vs tail reduction to inform Optimize recommendations.\n- Check interaction with different quantization paths (int4 vs int8). We used int8.\n- How does this behavior change when bursts are multi-token requests (instead of single-token streaming)?\n\nPlanned next experiments:\n- Sweep: context lengths [32,64,128], burst sizes [5,12,20], inter-gap [2,20,50ms], run length 20m each. Aim: heatmap of p99 delta for priming vs no priming.\n- Simulate multi-client scenario (N clients 10\u2013100) to see collision effects on KV slices.\n- Try lightweight priming (only prime top-2 KV slices) to test marginal benefit per-cost.\n\nNotes to self:\n- Save traces with tag microquake-2025-02-18 (done).\n- Blog idea: \"Why tiny bursts are a different beast \u2014 microquake patterns and production mitigations\" \u2014 short internal draft after sweep.\n\nAppendix: quick run commands (local loadgen)\n- baseline: ./loadgen --pattern microquake --burst 8 --gap 2-20ms --duration 1800 --batch_timeout 4\n- fractional: same with --enable-fractional --batch_timeout 2\n- kv-priming: add --kv-prime=64 --prefill=true\n\nEnd of scratch.\n\n-- Joris\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_84c8c0986309461f88219a1c4f64d017"
+}

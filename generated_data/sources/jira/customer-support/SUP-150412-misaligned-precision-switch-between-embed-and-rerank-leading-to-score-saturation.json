@@ -1,0 +1,68 @@
+{
+  "key": "SUP-150412",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Misaligned precision between embeddings producer and reranker causing score saturation and p99 latency spikes",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-02-25",
+  "reporter": "Asha Patel",
+  "assignee": "Diego Morales",
+  "customer_company": "ClariSearch Labs",
+  "customer_tier": "dedicated",
+  "components": [
+    "embeddings-service",
+    "reranker",
+    "api-gateway",
+    "serving-runtime"
+  ],
+  "labels": [
+    "precision-mismatch",
+    "rerank-quality",
+    "latency-spike",
+    "regression-test-needed"
+  ],
+  "environment": "prod us-east-1",
+  "affected_models": [
+    "text-embed-large-v2",
+    "reranker-compact-v1"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-02-21",
+  "first_response_due_at": "2026-02-20",
+  "linked_issues": [
+    "SUP-91455",
+    "SUP-73291"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/re-ranker/pull/428",
+    "github.com/redwood-inference/embeddings-service/pull/902"
+  ],
+  "related_confluence_pages": [
+    "https://redwood-internal.atlassian.net/wiki/spaces/ENG/pages/9823/Reranker+Precision+Handling+Runbook"
+  ],
+  "description": "Issue summary: Customer reports that after switching their embedding producer to a low-precision path (int8 quantized embeddings) the /rerank endpoint returns near-identical top-k scores (score saturation) across distinct queries and p99 latency increases from ~120ms to >2s. Impact: Queries that previously returned meaningful re-rank order are now effectively random or identical in order; downstream UX shows repeated top result and customers are throttling traffic. Environment: Dedicated account in prod (ClariSearch Labs); embeddings produced by customer integration with embeddings endpoint specifying precision=int8. Steps to reproduce:\\n1) POST /v1/embeddings with model=text-embed-large-v2 and body {\"input\": [..], \"precision\": \"int8\", \"namespace\": \"cs-search-2026\"}\\n2) POST /v1/rerank with same namespace and top_k=10 using reranker-compact-v1\\n3) Observe rerank scores are clustered near 1.0 and top-k ordering is unstable between identical queries.\\nExpected behavior: Rerank should accept embeddings in supported formats or convert/dequantize appropriately and return discriminative scores.\\nObserved behavior: Score saturation (many scores ~0.98-1.0), repeated identical ordering across different queries, and intermittent p99 latency spikes focused on rerank service.\\nRelevant logs/snippets:\\n- Embeddings call returns header: \"embedding-format: int8;scale=0.0078125\"\\n- Rerank request shows no precision header forwarded in service logs; path triggers fallback conversion in CPU path with repeated memcopies.\\n- Grafana: reranker.p99_latency_us spiked from 120000 to 2500000 around 2026-02-19T15:10:00Z.\\n- Kibana trace: trace_id=tr-8f3a2f -> time spent in reranker.dequantize: ~1.4s per request.\\nAttachments: customer-supplied sample request IDs: EMB-cc-20260219-9734, RER-cc-20260219-9735.\\nCustomer impact level: High (search relevance broken; business users reporting regressions)",
+  "comments": [
+    "2026-02-20 09:12 - Asha Patel: Initial triage - requested sample request IDs, timestamps, and whether customer enabled any experimental flags. Asked customer to keep traffic low until we have mitigation.",
+    "2026-02-20 10:05 - ClariSearch Support Engineer (customer): Provided sample IDs EMB-cc-20260219-9734 and RER-cc-20260219-9735. Confirmed they toggled embedding precision to 'int8' last night only for A/B tests.",
+    "2026-02-20 11:30 - Diego Morales (oncall-rerank): Reproduced locally in staging by simulating int8 embeddings with scale header. Observed reranker treats input as raw bytes and falls back to a slow dequantize CPU path. Hypothesis: header omission during namespace/metadata propagation and missing dequantization fast-path for this codepath.",
+    "2026-02-21 08:45 - SRE Pager (automated): Linked Grafana alert ran; incident page created INC-20260221-04.",
+    "2026-02-22 14:20 - Diego Morales: Applied hotfix to accept embedding-format header in reranker input validation and added a guarded fast-path dequantize kernel using GPU where available. Deployed to canary in us-east-1-prod-dedicated. Requesting customer to rerun sample requests.",
+    "2026-02-23 09:10 - ClariSearch Support Engineer (customer): Confirmed immediate improvement for A/B traffic using new canary; scores are now discriminative. Still seeing occasional latency blips for large batch sizes (~>1024 embeddings).",
+    "2026-02-25 16:30 - Diego Morales: Rollout to all dedicated nodes in us-east-1 completed. Follow-ups added to backlog for batch-size tuning and e2e tests. Moving ticket to In Progress until follow-ups are closed."
+  ],
+  "investigation_notes": "Reproduction: Diego reproduced with a small script that generated int8 quantized vectors (scale 0.0078125). The reranker service previously relied on caller-conveyed float32 embeddings or an explicit 'float32' header. When presented with an 'embedding-format: int8;scale=...' header the header was dropped during namespace routing in api-gateway due to an older proxy rule. Result: reranker interpreted payload as Base64-encoded float32, then triggered an error path that attempted to convert via CPU fallback. Findings: 1) Missing header propagation between embeddings-service -> metadata-store -> reranker. 2) No GPU fast-path for int8->float32 dequantize in reranker; conversion was memory-bound on CPU and took ~1.2-1.6s per request for medium batches. 3) Normalization/scaling mismatch: dequantize used an incorrect scale when header absent leading to near-equal vectors after L2-normalize which produced score saturation. Tests performed: A) Reproduced locally with explicit header injection and observed normal behavior. B) Forced header drop and observed saturation and latency spike. C) Implemented unit test that fails on missing header propagation and added integration test for precision variants. Observability: Added temporary telemetry to count requests where embedding-format header is absent but payload length matches int8 pattern. Current hypothesis confirmed: header drop + incorrect fallback dequantize cause both quality and latency regression.",
+  "resolution": "Short-term mitigation: deployed canary patch to reranker to accept int8 payloads by reading scale from payload metadata and apply correct dequantization fast-path when possible. Also updated API-gateway rule to propagate 'embedding-format' and 'embedding-scale' headers through namespace routing. Provided customer workaround: set precision=float32 or enable 'compat_mixed_precision' flag in their client to force on-the-fly dequantize at production embedding time.\\nLong-term fix & follow-ups (backlog): 1) Add GPU-accelerated dequantize kernel to reranker for dedicated/private clusters (PR #428 merged). 2) Add end-to-end test for precision header propagation and scoring stability. 3) Add alert that fires when >1% of rerank requests have missing precision header for a namespace. 4) Documentation update: explicitly call out supported embedding serialization formats and interaction with reranker.\\nCustomer communication: Informed ClariSearch that hotfix rolled to canary and then to full fleet; they validated improved ranking and reduced p99 latencies. Next steps: schedule a short postmortem with Eng + SRE + Support and deliver a follow-up note to the customer with recommended client settings.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_f1f6ddde907b4c70bc134a7feed13dfb"
+}

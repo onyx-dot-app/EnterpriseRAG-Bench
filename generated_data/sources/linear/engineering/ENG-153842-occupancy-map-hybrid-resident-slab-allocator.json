@@ -1,0 +1,98 @@
+{
+  "key": "ENG-153842",
+  "team": "engineering",
+  "title": "Occupancy-map + hybrid resident-slab allocator for blocked KV paging",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-03-05",
+  "creator": "Riley Kapoor",
+  "assignee": "Avery Chen",
+  "description": "Goal: Implement a blocked/paged KV residency layer that uses a compact occupancy bitmap and a hybrid slab allocator to reduce GPU OOMs, minimize host<->GPU transfer spikes, and preserve tail latency under continuous batching. This ticket captures implementation details, API knobs, trade-offs, rollout path, and observability we need to ship a safe default in runtime-1.20.",
+  "acceptance_criteria": [
+    "1) New resident allocator implements occupancy bitmap with 8KB granularity and supports atomic slot leases",
+    "2) Host spill/restore path avoids synchronous page faults during generation; p95 additional token latency from spill/restore must be < 60ms under mixed load",
+    "3) Continuous-batching latency SLOs (p50/p95/p99) for 1k token sequences do not regress by more than 8% on representative traces",
+    "4) Eviction rate metrics (evictions/sec) are available per model and per shard in Console and correlate with host transfer bytes",
+    "5) Automated canary (10% traffic) shows no increase in error rates or OOM incidents for 72 hours",
+    "6) Rollback feature (prefer-host-variant policy) is implemented and exercised in canary plan"
+  ],
+  "design_decisions": [
+    "Occupancy bitmap: use a compact bitset per KV slab to track per-extent residency (default extent=8KB). Bitmap fits in L2 cache for small slabs to allow fast in-band checks during KV lookup.",
+    "Hybrid slab allocator: combine fast fixed-size slot allocation for small KV entries (<64KB) with segmented extents for large values. This reduces fragmentation compared to pure slab-only designs.",
+    "Lease tokens: each allocation issues a short-lived lease token that pins extent residency during active batch processing. Leases are renewed by runtime when request affinity continues, otherwise expire to allow eviction.",
+    "Async host spill: eviction writes extents to host-staging with async DMA and publishes a tombstone in bitmap. Restores are performed with background prefetch triggered by batch planner's hinting (see batching integration).",
+    "Backpressure layering: integrate with admission controller\u2014when host-staging throughput exceeds threshold, admissions are slowed and the runtime prefers fallbacks (cheaper models or host-only inference) to avoid cascading OOMs.",
+    "Batch-aware prefetch hints: batch scheduler emits prefetch windows computed from token offsets and token affinity scores so restore happens ahead of KV access window without blocking critical-path token generation.",
+    "Graceful degradation: provide a runtime policy to fall back to a compact model variant (lower memory) when residency budget is exhausted rather than hard OOMs.",
+    "Telemetry-first: expose per-model, per-shard residency percent, host-spill-bytes, avg-restore-latency-ms, lease-renewals, and failed-restore counts to Console for triage."
+  ],
+  "tradeoffs": [
+    "8KB extent vs 4KB: 8KB reduces bitmap overhead and amortizes DMA payloads but increases restore bytes for sparse hotsets. Chosen 8KB as baseline and expose knob for tuning per-customer workloads.",
+    "Lease complexity: short leases reduce unnecessary pinning but add bookkeeping and slightly increase CPU overhead. We accept modest CPU overhead to prevent tail latency spikes caused by stale pins.",
+    "Async spill consistency: the design accepts eventual consistency for residency state (bitmap tombstones) to avoid synchronous stalls. This complicates correctness when multiple replicas access same KV; we document invariant and add safety checks for multi-replica scenarios.",
+    "Prefetch heuristics vs correctness: aggressive prefetch reduces restore latency but increases host bandwidth; we default conservative heuristics and instrument to iterate with real workloads."
+  ],
+  "rollout_plan": [
+    "Phase 0 (dev): unit tests for bitmap operations, slot leasing, and async spill/restore in local simulator",
+    "Phase 1 (internal): feature gated runtime build deployed to internal cluster with synthetic mixes (chatty short requests, single long-sequence traces)",
+    "Phase 2 (canary): enable for 10% traffic on lower criticality models with monitoring dashboards and automatic rollback if OOMs increase or restore latency > 120ms",
+    "Phase 3 (gradual): incrementally increase traffic and enable knob exposures in Console for Dedicated customers to tune extent size and lease timeout",
+    "Rollback: runtime flag prefer-host-variant and force-disable-resident-allocator for emergency mitigation"
+  ],
+  "test_plan": [
+    "Unit: bitmap correctness (set/clear/test), lease renewal/expiration semantics, multi-threaded concurrent allocation stress test",
+    "Integration: end-to-end restore path using host-staging with simulated DMA delays, verify generation continues under eviction",
+    "Perf: identify p50/p95/p99 delta for token generation across representative workloads (search, summarization, chat) with and without resident allocator",
+    "Fault injections: host-staging IO stalls, partial restore failures, lease leak simulation",
+    "Scale: run on fleet-sized simulation reproducing typical shard counts (64, 128) to validate centralized metrics aggregation"
+  ],
+  "metrics_and_observability": [
+    "kv.residency.percent (gauge) per model/shard",
+    "kv.evictions.count (counter) with eviction_reason label (age, pressure, manual)",
+    "kv.host_transfer_bytes (counter) direction=spill|restore",
+    "kv.restore.latency_ms (histogram) buckets: 1ms,5ms,20ms,50ms,200ms,1s",
+    "kv.lease.renewals (counter) and kv.lease.expirations (counter)",
+    "runtime.batch_admissions.dropped (counter) when backpressure triggered",
+    "runtime.oom_incidents (counter) filtered by allocator_version"
+  ],
+  "linked_artifacts": [
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/INF/pages/KB-Blocked+KV+occupancy+design",
+    "Design doc (internal): drive.google.com/drive/fake-design-doc-occupancy-map",
+    "Prototype PR: https://github.com/redwood-inference/runtime/pull/4821",
+    "Benchmark results: drive.google.com/drive/fake-benchmarks-kv-occupancy-2026-02",
+    "Related Linear: ENG-121345-graded-prefetch-adaptive-slab-pacing (dependency)"
+  ],
+  "labels": [
+    "kv-cache",
+    "gpu",
+    "memory",
+    "continuous-batching",
+    "eviction",
+    "observability"
+  ],
+  "estimate": "8",
+  "project": "runtime-inference-residency",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "comments": [
+    "2026-02-19 - Riley Kapoor: Prototype bitmap backed slab allocator implemented in local simulator. Basic unit tests passing.",
+    "2026-02-22 - Avery Chen: Added atomic lease tokens and integrated with batch scheduler hooks. Observed fewer mid-tail stalls in microbenchmarks.",
+    "2026-02-26 - QA: Integration test showed restore latency spike when host-staging was saturated. Added backpressure plan and admission control integration.",
+    "2026-03-01 - PM (Samira Patel): Confirm scope for canary and customers to target initially (non-critical chat models). Ensure docs explain extent-size tradeoffs.",
+    "2026-03-04 - Eng Lead (Diego Martinez): Approve canary plan. Request additional dashboards for failed-restore counts before canary rollout."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "design_decisions",
+    "tradeoffs",
+    "rollout_plan",
+    "test_plan",
+    "metrics_and_observability",
+    "linked_artifacts",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_3db860ef92a44ce0aa3cbfa260381dd7"
+}

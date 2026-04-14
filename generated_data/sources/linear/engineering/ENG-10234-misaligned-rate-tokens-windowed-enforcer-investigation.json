@@ -1,0 +1,95 @@
+{
+  "key": "ENG-10234",
+  "team": "engineering",
+  "title": "Misaligned token windows causing per-key enforcement divergence and meter drift",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-25",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Kapoor",
+  "assignee": "Marcelo Ruiz",
+  "project": "billing-consistency",
+  "cycle": "2026-W09",
+  "estimate": "5",
+  "labels": [
+    "rate-limiting",
+    "billing",
+    "pager-signal",
+    "high-priority"
+  ],
+  "description": "Several customers reported sudden request rejections even though their dashboards show unused quota. Our initial telemetry shows per-key/enforcer rate limits diverging and the central metering later reconciling to a different usage number, causing both incorrect enforcement and billing confusion. This ticket tracks the investigation and fix for misaligned window boundaries and token accounting across the distributed rate-policy evaluator and enforcer fleet.",
+  "steps_to_reproduce": [
+    "1) Use curl to send a steady stream of requests (X-API-Key header) at ~95% of allowed per-minute throughput to a specific route that has per-key and per-route policies configured.",
+    "2) Observe 429s begin to appear intermittently and then spike in some zones while other zones accept traffic.",
+    "3) Compare local enforcer counters (via /debug/counters) and the central metering snapshot (billing-aggregator) timestamps around the events.",
+    "4) Reproduce deterministically by running the same traffic profile from two AZs with ~200ms clock skew emulated on one host.",
+    "5) Reproduce fails when enforcers are aligned to the same epoch boundary (simulated with ntp sync) which suggests timing/alignment as a factor."
+  ],
+  "investigation_notes": [
+    "2026-02-26 - Initial pager: SLO alert on frontdoor-429-rate triggered by multiple customers; triaged by oncall (Marcelo).",
+    "2026-02-27 - Added debug endpoints to edge enforcers to dump per-window token counts; observed windows with overlapping timestamps and duplicate deduction events.",
+    "2026-03-01 - Correlated occurrences with a recent rollout of the shard-aware sliding-window enforcer (runtime-1.21 change) that introduced local buffering for latency improvements.",
+    "2026-03-03 - Reproduced locally with a fault injection script that simulates 120-250ms monotonic clock skew; when skew present, per-shard windows computed different 'current_window' indices leading to double-counting across boundary transitions.",
+    "2026-03-05 - Confirmed replication of meter drift: central batch reconciler sees two near-identical delta events for the same logical token spend when shards disagree on boundary, causing billed tokens > actual successful responses.",
+    "2026-03-08 - Safety rollback to disable the shard-local buffered transition path reduced 429 spikes but did not fully eliminate discrepancy in historical accounting; we need a deterministic fix and backwards-compatible reconciliation path."
+  ],
+  "reproduction_results": [
+    "- With shard-local buffering enabled + clock skew >= 150ms, 429 rate increased by 3.8x for affected keys.",
+    "- Central billing-aggregator recorded ~1.15x tokens compared to the number of accepted responses in the same period when skew was present.",
+    "- Rolling ntp/clock fixes on one region immediately reduced 429s to expected baseline, confirming timing as primary contributor."
+  ],
+  "root_cause": "The shard-aware sliding-window enforcer computes local window indices based on host clocks and a small buffered transition window to reduce tail latency. When host clocks are sufficiently unsynchronized, adjacent shards assign different windows for the same logical time boundary and both perform deductions for edge requests that cross the boundary, producing double-counting and premature enforcement. The central reconciler doesn't detect and dedupe these transient duplicate deltas because dedupe keys used epoch+shard-local-window which differed across hosts.",
+  "workaround": "Rollback the shard-local buffered transition path (already deployed as emergency mitigation). Force enforcers to operate in conservative fixed-window mode until a robust fix is rolled out. Ensure all enforcers have ntp/chrony enforced and monitor clock skew alerts in infra.",
+  "proposed_fix": [
+    "1) Change the dedupe key schema for reconciler to use a monotonic global epoch identifier (policy_epoch) issued by policy-evaluator rather than host-local window indices.",
+    "2) Add a commit-step handshake where enforcers publish a 'precommit' delta with a policy_epoch, then a single reconciler commit operation reconciles precommit entries within a bounded time window, deduping by policy_epoch+request_id where available.",
+    "3) Keep optimistic sliding-window performance path but fall back to coordinator-assigned epochs when clock skew > threshold.",
+    "4) Add unit + integration tests that simulate clock skew and validate correctness under high concurrency.",
+    "5) Provide a reconciliation job to correct historical double-counted deltas for the last 48 hours and issue customer-visible correction if billing was impacted."
+  ],
+  "pull_requests": [
+    "https://github.com/redwood-inference/runtime/pull/2345 - enforcer: use policy_epoch in dedupe key",
+    "https://github.com/redwood-inference/runtime/pull/2347 - reconciler: precommit/commit protocol + tests",
+    "https://github.com/redwood-inference/infra/pull/892 - enforce ntp/chrony across enforcer autoscaling groups"
+  ],
+  "dashboards": [
+    "https://grafana.redwood.com/d/rl-ops/edge-429s?orgId=1&from=now-6h",
+    "https://grafana.redwood.com/d/rl-billing/duplicate-deltas?orgId=1",
+    "https://grafana.redwood.com/d/rl-telemetry/enforcer-clock-skew?orgId=1"
+  ],
+  "next_steps": [
+    "A) Iterate on PRs: get runtime PRs reviewed and merged (owners: Marcelo, Evelyn Park).",
+    "B) Run integration canary in staging with synthetic clock skew scenarios (env: staging-shard-2).",
+    "C) After canary success, deploy to one low-traffic region with enhanced telemetry and a 4-hour alert window before full rollout.",
+    "D) Run reconciliation job for last 48 hours; coordinate with billing to validate any customer invoice adjustments; draft customer comms if corrections are material.",
+    "E) Add permanent clock-skew alerting to infra runbook and add explicit test case in CI for dedupe invariants."
+  ],
+  "dependencies": [
+    "ENG-10098",
+    "INF-401"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.21.2",
+  "security_review_required": "false",
+  "comments": [
+    "2026-02-26 - Marcelo Ruiz: Pager received at 02:14 UTC. Kicked off immediate triage, added debug dump to edge enforcers. (linked incident notes: https://confluence.redwood.com/display/INC/2026-02-26-rate-429s)",
+    "2026-02-27 - Aisha Kapoor: Confirmed customers A and B affected; opened Slack thread #prod-rate-issues. Added temporary alert to block noisy keys.",
+    "2026-03-01 - Evelyn Park: Found correlation with runtime-1.21 rollout. Reverted the buffered-transition flag in canary fleet; questions about compatibility with dedicated deployments.",
+    "2026-03-04 - Marcelo Ruiz: Ran local reproducer with clock-skew fault injection; pushing change to dedupe key in runtime PR draft.",
+    "2026-03-09 - Reconciliation lead (Samir Patel): Drafted migration plan for historical correction; will sync with billing and legal before any customer credits.",
+    "2026-03-12 - Aisha Kapoor: Runtime PRs merged to main; staging canary scheduled for 2026-03-14. Leaving ticket In Progress until rollout completes and reconciliation job validated."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "investigation_notes",
+    "reproduction_results",
+    "root_cause",
+    "workaround",
+    "proposed_fix",
+    "next_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_c70e9f13417f427b9fd8ab17ff5fc961"
+}

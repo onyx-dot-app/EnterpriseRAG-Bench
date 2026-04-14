@@ -1,0 +1,36 @@
+{
+  "title": "Request fanout sampler + tokenizer triage",
+  "owner": "Elena Kozlov",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/py-request-fanout-sampler-and-tokenizer-triage.json",
+  "doc_type": "doc",
+  "created_at": "2024-02-17",
+  "last_modified": "2024-03-02",
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "collaborators": [
+    "Marcus Nguyen",
+    "Priya Desai",
+    "Rafael G\u00f3mez"
+  ],
+  "tags": [
+    "profiling",
+    "sampling",
+    "tokenizer",
+    "threadpool",
+    "python",
+    "latency",
+    "fanout"
+  ],
+  "linked_artifacts": [
+    "GH:serving-runtime#412",
+    "JIRA:RED-2341",
+    "confluence:serving-runtime/tokenizer-offload"
+  ],
+  "content": "Summary:\nThis note captures a focused triage we ran on CPU-side tail latency spikes during multi-request fanout (1 request triggering N downstream tokenization tasks). The pattern shows: moderate mean latency but elevated 95/99p under bursty arrival. We suspected a mixture of Python GIL contention, excessive request parsing/tokenization calls, and inefficient threadpool sizing.\n\nHypotheses:\n- High fanout multiplies short-lived Python work (parsing + tokenization) causing frequent GIL grabs and scheduler churn.\n- Tokenizer implementation does a lot of small allocations and codec conversions (utf8 decode, detokenizer heuristics), making it CPU-bound in userspace (not syscalls) for typical inputs.\n- Threadpool size vs. core count mismatch causes context-switching and queuing; default pool too small for burst concurrency so requests pile up, then many wake up and contend.\n\nMethodology / Tools used:\n- Sampling profiler (py-spy) on live replica during controlled burst replay.\n- perf top to get kernel vs user percentages.\n- eBPF stack traces for latency-correlated request IDs (bcc/tethered).\n- Lightweight synthetic harness: replayed production-like traces (p90 interarrival) against single replica with constant QPS.\n- Instrumented tokenization to report microsecond-level timings and allocation counts.\n- End-to-end latency histogram collection (Prometheus summaries) with trace ids.\n\nKey Observations:\n- py-spy samples: ~40% time in tokenize() path, 18% in request parsing (json.loads), 12% in await scheduling/gc. Small but frequent frames in unicode decoding.\n- perf: user-space dominated (~92% user), syscall overhead negligible.\n- eBPF traces: large fanout cases show many greenlet/async-wakeup events clustered when bursts end -> wake storms.\n- Threadpool sizing: default pool(8) on 16-core machine led to queuing; bumping to 32 reduced queueing but increased context switch rates.\n\nMicrobenchmarks (single-request CPU cost, median of 10k runs):\n- json.loads(request) + header parsing: 120-180us (varies with metadata size)\n- tokenizer.encode(text) (py tokenizer): 250-700us (200 chars -> ~320us; 1k chars -> ~710us)\n- utf8 decoding + normalization: ~40-80us per call\n- subprocess RPC roundtrip (local unix socket) to rust-tokenizer daemon: ~90-130us (includes serialization)\n\nExperiments and results:\n1) Offload tokenizer to a small persistent process pool (Rust tokenizer via unix socket, 4 procs):\n   - Result: per-request tokenization CPU reduces ~60% in Python heap; overall 95p latency improved ~18% under 200rps bursts.\n   - Tradeoffs: small serialization cost, need for process supervision + backpressure.\n2) Pre-parse JSON in C extension (ujson) for common routes:\n   - Result: ~30% reduction in request parsing time; 95p improved marginally when parsing was dominant.\n   - Risk: behavior differences, edge-case inputs require testing.\n3) Increase threadpool to core*2 and use affinity pinning:\n   - Result: lower queue lengths but CPU context-switch rate increased; best tradeoff at pool=cores*1.25 on our machines.\n4) Python subinterpreters (py 3.11) prototype for tokenizer island:\n   - Result: promising lower GIL interference in microbench; engineering cost high and some C-extensions incompatible.\n5) Prefix cache for popular prompts (LRU, TTL 60s):\n   - Result: cache hit reduces tokenization to near-zero; reduced tokens generated and saved ~35% CPU overall for tested workloads.\n\nInterim Recommendations (practical, low-risk first):\n- Short-term (1\u20132 sprints):\n  - Deploy rust-tokenizer daemon as opt-in: 2-4 per replica behind local unix socket; adapt worker_count via autoscaler.\n  - Switch latency-sensitive routes to ujson for request parsing where schema is stable.\n  - Implement prefix/LRU cache for top N prompts (configurable per route).\n  - Tune threadpool: set default to min(max(cores, 8), cores*1.5) and enable optional pinning per replica.\n\n- Medium-term (2\u20133 sprints):\n  - Prototype Python subinterpreters for pure-Python tokenizer to measure real-world gains.\n  - Add lightweight in-process instrumentation to emit per-request microtimes (parsing, tokenization, scheduling) to correlate with traces.\n  - Add backpressure at ingress to limit instantaneous fanout; graceful degrade with queued hints.\n\n- Long-term:\n  - Consider shipping a small Rust tokenizer extension (pyO3) to avoid IPC costs and bypass frequent allocations; must audit for API compatibility.\n  - Rework WANing of per-token allocations (reuse buffers, arena allocator for tokenization) in Python code-path.\n\nOpen questions / unknowns:\n- How much of the tokenizer cost is language-model dependent (tokenization rules vary by model)? Need per-model profiling.\n- How do multi-tenant noisy neighbors affect observed gains with offload? Run stress tests with mixed workloads.\n- Safety: ujson behavior differences may cause subtle failures in malformed inputs; need fuzz tests.\n\nAction items / owners:\n- Rafael: spin up rust-tokenizer daemon prototype and perf harness (due 2024-02-28).\n- Marcus: add ujson alternative route config and run canary (due 2024-03-05).\n- Priya: implement per-route prefix LRU cache and dashboard (due 2024-03-12).\n- Elena: run cross-model tokenization matrix and produce perf table + recommended defaults (due 2024-03-08).\n\nNotes to self / rough logs:\n- Replays used request sample set from 2024-01-21 spike window (trace id: replay-20240121-3).\n- py-spy flamegraph: s3://perf-artifacts/2024-02/pyfanout-replay-flame.svg (large tokenize() wedge).\n- Remember to test with GC tuning (PYTHONMALLOC=malloc vs arenas) \u2014 small wins on allocation-heavy tokenizer.\n\nAppendix (commands used):\n- py-spy record -o out.svg --pid <pid> --native --rate 200\n- perf record -F 99 -p <pid> -- sleep 10 && perf script | stackcollapse-perf.pl > out.folded\n- golang harness: ./replay --trace replay-20240121-3 --qps 150 --burst 250\n\nIf reviewers want, I can split this into three small PRD-style docs: 1) tokenizer offload plan, 2) threadpool tuning guide, 3) instrumentation additions.\n\n-- Elena",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_7286f9daba5b4bc491bf5ff18d1c0659"
+}

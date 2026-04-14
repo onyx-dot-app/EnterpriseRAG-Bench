@@ -1,0 +1,38 @@
+{
+  "title": "perf-sync-diagnostics-2025-02-10",
+  "owner": "Riley Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime",
+  "doc_type": "doc",
+  "created_at": "2025-02-10",
+  "last_modified": "2025-02-10",
+  "collaborators": [
+    "Maya Patel",
+    "Ethan Gomez",
+    "Priya Narayanan",
+    "Samir Desai"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "perf-sync",
+    "latency",
+    "throughput",
+    "regression-hunt",
+    "benchmarks",
+    "A100",
+    "kv-cache"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/4821",
+    "JIRA-RT-1274",
+    "https://grafana.redwood.ai/d/serving/perf-overview?from=now-7d&to=now",
+    "gs://redwood-bench/2025-02-09/runner-v0.9.3/results-summary.json"
+  ],
+  "content": "Perf sync notes \u2014 Monday 2025-02-10\n\nAttendees: Riley Chen (owner), Maya Patel, Ethan Gomez, Priya Narayanan, Samir Desai, notes by Riley\n\nPurpose: Triage recent p95 latency regressions observed on hosted clusters and reconcile with Dedicated smoke test changes. This doc captures the test runs we executed, noisy signals, working hypotheses, and immediate action items.\n\nTL;DR:\n- New CI run (runner v0.9.3) shows a reproducible ~18% p95 latency increase for conversational traffic on model variant rwd-7b-q4f16 when compared to baseline runner v0.9.1. p50 impact is <5%.\n- Throughput (tokens/s) under sustained 64-conversation load drops ~12% on A100-40GB instances when batch_size>8 is used. Single-request latency stable.\n- Suspected contributors: batching scheduler change in v0.9.3 (PR #4821), and an interaction with prefix KV caching warmup for longer histories.\n- Short term mitigation: pin runner to v0.9.1 for Dedicated pools serving rwd-7b-q4f16; rollback scheduled as a canary policy in prod tomorrow if no blocker found.\n\nTest matrix run summary (high level):\n- Baseline: runner v0.9.1 (commit a3f9d2c), model rwd-7b-q4f16, config: seq_len=1024, batch_target=auto, kv_cache=enabled, hw=A100-40GB.\n- Candidate: runner v0.9.3 (commit b5c1e7f), same model/config.\n- Stress: 64 concurrent chats, mean user prompt length 48 tokens, response gen length target 128 tokens, RPS ~120.\n- Synthetic microbench: single-request p50/p95 with seq_len sweep [64, 256, 1024].\n\nKey numbers (median across 3 runs each):\n- Baseline p95 (conversational): 178 ms\n- Candidate p95 (conversational): 210 ms\n- Baseline p50: 42 ms; Candidate p50: 44 ms\n- Throughput tokens/s (sustained): Baseline: 18.2k tok/s; Candidate: 16.0k tok/s\n- Cold start median: unchanged (~480 ms for first-token)\n- KV cache warmup time (time until steady-state p95): Baseline ~8 minutes; Candidate ~12 minutes\n\nObservations / Interesting traces:\n- Flamegraphs from perf-hosting-run-20250209 show an increased fraction of cycles inside batch_scheduler::select_window and inraft::merge_work (approx +30% CPU time).\n- Kernel-level sampling indicates more frequent small-copy ops around KV cache management on candidate run; suggests extra memcopies or sharded KV checks per batch.\n- In the candidate run, we see more 2-3ms tail latency spikes on the BatchingQueue when batch aggregation toggles between size thresholds (8 and 16).\n- Dedicated pool (reserved capacity) saw slightly worse degradation than hosted API tests; hypothesis: different autoscaling/burst buffering behavior exposing scheduler heuristics.\n\nHypotheses to prioritize:\n1) Batching scheduler revision in PR #4821 changed the thresholding logic; under our conversational mix it produces more frequent small batches causing p95 regressions. Reproducible in microbench with synthetic inter-arrival jitter.\n2) A micro-optimization in KV cache path introduced copy-on-read under some sequence lengths (affects requests with long histories). This increases CPU and memory copy overhead that adds to p95 but leaves p50 roughly same.\n3) Interaction between autoscaler burst fill and batch window commit: Dedicated pools may periodically drain queued requests into suboptimal batch sizes during low-burst windows.\n\nAction items (owners and short deadlines):\n- Maya: Run targeted microbench that toggles batch_threshold in candidate runner binary to v0.9.3 with overrides (batch_min=4,8,12) and produce p50/p95 curves. Due by 2025-02-11 EOD. Linked runner build: gs://redwood-bench/2025-02-10/runner-v0.9.3-overrides.tar.gz\n- Ethan: Add additional tracing to KV cache hot path (sampling 1/100 requests) to capture copy origins, stack traces, and payload sizes. Patch in PR-4864 (draft). Due 2025-02-12 AM.\n- Priya: Validate Dedicated pool autoscaler logs for drain windows (query job autoscale:scale-events between 2025-02-08..2025-02-10). Correlate with p95 spikes. Due 2025-02-11 AM.\n- Samir: Run end-to-end canary plan to pin runner back to v0.9.1 on one Dedicated shard and monitor p95/throughput for 6 hours. If stable, schedule formal rollback. Due 2025-02-11 noon.\n- Riley: Draft incident note for internal SRE and Customer Success describing impact and potential mitigation steps; include customer-facing template if rollback occurs. Due 2025-02-11 EOD.\n\nUnresolved questions / things to watch:\n- Whether the KV copy behavior is introduced by a dependent library bump (e.g., memcpy implementation, cuda runtime), need to cross-check build matrix.\n- Whether quantization variant rwd-7b-q4f16 is more sensitive than q5 variants; schedule quick runs on q5* tomorrow.\n- Memory pressure signals: candidate runs show slightly higher transient RSS (~+120MB), need heap profile to confirm.\n\nQuick reproducer commands (dev checklist):\n- microbench: ./runner-bench --runner binary=runner-v0.9.3 --model rwd-7b-q4f16 --seq 1024 --concurrency 64 --jitter 0.02 --out run-20250210.csv\n- trace capture: ./capture-trace --sample-rate 100 --output trace-candidate-20250210.pbz\n- kv hot path local test: python tools/kv_local_test.py --requests 10000 --mean-history 9 --variance 3\n\nNotes from discussion:\n- We should avoid broad rollout of runner v0.9.3 until we pin the batching thresholds or confirm no KV regression.\n- Maya suggested a short-term configuration flag (batching.backpressure=false) to emulate previous behavior; low-risk toggle to test in prod canary.\n- Ethan reminded us to check telemetry sampling rate changes introduced in v0.9.2 -> v0.9.3 (could skew p95 if sampling filtered high-latency events).\n\nMeeting follow-ups / next sync:\n- Stand-up tomorrow at 09:30 PT to review Maya's microbench and Priya's autoscale correlation.\n- Full review Thurs 2025-02-13 11:00 PT to decide rollback/merge strategy.\n\nAppendix: artifacts and quick links\n- Perf dashboard: https://grafana.redwood.ai/d/serving/perf-overview?panelId=5&from=now-3h&to=now\n- Runner PR: https://github.com/redwood-inference/serving-runtime/pull/4821\n- Candidate CI logs: gs://redwood-ci/serving/runner-v0.9.3/logs/2025-02-09\n- Local bench results snapshot: gs://redwood-bench/2025-02-09/summary-candidate.csv\n\nEnd of notes.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_d778713197274ef99b00b942d3c66895"
+}

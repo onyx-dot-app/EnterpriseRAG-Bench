@@ -1,0 +1,34 @@
+{
+  "title": "Poisson arrival sweep notes \u2014 asymmetric batching and warmup artifacts",
+  "owner": "Diego Martinez",
+  "drive_area": "users",
+  "path": "users/poisson-arrival-sweep-notes-diego.json",
+  "doc_type": "doc",
+  "created_at": "2025-01-18",
+  "last_modified": "2025-02-02",
+  "collaborators": [
+    "Priya Nair",
+    "Elliot Chen"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "performance",
+    "benchmark",
+    "poisson",
+    "latency",
+    "batching",
+    "warmup"
+  ],
+  "linked_artifacts": [
+    "PLT-4821",
+    "github.com/redwood-inference/serving-runtime/pull/987",
+    "confluence/redwood/Poisson-Workload-Notes"
+  ],
+  "content": "Goal:\nShort notes and results from a set of Poisson-arrival workload sweeps. Trying to reproduce real-world arrival variability and measure impact on batching timeout, KV-cache behavior, and tail latency.\n\nHypothesis:\n- Poisson arrivals (vs steady QPS) produce sporadic microbursts that change batching dynamics and increase p95/p99.\n- Increasing batch_timeout reduces tail latency by letting more requests aggregate, but hurts p50 and increases median latency.\n- KV cache hit-rate interacts with arrival patterns; session-affinity improves cache efficiency and reduces mean token compute.\n\nTestbed / environment:\n- Model: redwood/open-7b-quant-v2 (quantized int8 path), sequence length 512 typical prompts\n- Serving: dedicated-pool-3 (2x A100-SXM4 80GB per node), runtime v0.33.1-nightly\n- Client: custom loadgen run_poisson.py (scripts/loadgen/poisson-client.py), uses asyncio + jittered sleeps following Poisson process (inter-arrival exp(1/lam))\n- Network: colocated client in the same region (us-west-2), measured baseline RTT ~3ms\n- Batching knobs: batch_timeout_ms = [6, 12, 24]; max_batch_size = 64; concurrency per worker = 8\n- KV cache: on/off via env REDWOOD_KV_CACHE=true/false; session_affinity window = [30s, 300s]\n- Duration: 10 minutes warmup + 10 minutes collection per run\n\nCommands / runner examples:\n- run client: python run_poisson.py --target-rps 120 --duration 600 --seed 42 --arrival poisson --out results/poisson-rps-120.json\n- orchestration: ./scripts/run_sweep.sh --rps-list 40,80,120,180 --batch-timeouts 6,12,24 --kv true,false\n- server metrics: curl -s http://metrics-host:9090/api/metrics | jq '.batcher, .kv_hits' > server_metrics.json\n\nKey measured signals:\n- Achieved RPS (requests/s) from client\n- Server concurrency and queue depth distribution\n- p50/p95/p99 latency (server-side, request->first-token and request->last-token) in ms\n- Error rate (HTTP 5xx or 429)\n- Batch size distribution (percentiles)\n- KV cache hit % (requests where prefix cache used)\n\nRepresentative run (summary):\n- Settings: target RPS = 120 (Poisson), batch_timeout = 12ms, KV cache = true, session_affinity = 300s\n- Achieved RPS: 118.6 (client measured)\n- Errors: 0.2% (mostly 503 transient during a single node restart)\n\nLatency (ms):\n- p50: 42 ms\n- p95: 142 ms\n- p99: 312 ms\n- tail spike notes: occasional 600-900ms outliers correlated with single-node GC/eviction events in logs (see timestamp 2025-01-23T15:12Z)\n\nBatching distribution:\n- mean batch size: 14\n- batch size p90: 28\n- small batches (<4) accounted for 23% of requests (these map to microbursts)\n\nKV cache:\n- hit %: 74% overall; when session_affinity=30s this drops to ~61% and p95 increases ~12%\n\nComparative sweep: batch_timeout effects at target RPS=120 (Poisson)\n- timeout 6ms: p50 36ms, p95 192ms, p99 420ms, mean batch size 9, small_batches 36%\n- timeout 12ms: p50 42ms, p95 142ms, p99 312ms, mean batch size 14, small_batches 23%\n- timeout 24ms: p50 58ms, p95 124ms, p99 260ms, mean batch size 19, small_batches 12%\n\nInterpretation:\n- Shorter timeout reduces median significantly (good for interactive latency) but increases tail a lot because more requests get shipped in small batches during microbursts, causing high per-request overheads and more variance.\n- Longer timeout raises p50 but smooths p95/p99 \u2014 at 24ms we see fewer extreme tails but increased median. This aligns with expected batching tradeoff.\n- The optimal timeout depends on SLAs: for p95-focused services, 12-24ms looked better; for sub-100ms median targets, 6ms helps but tail risk is high.\n\nPoisson vs steady arrivals (same mean RPS = 120):\n- Steady (fixed inter-arrival): p95 ~98ms, p99 ~190ms, mean batch size 17\n- Poisson: p95 ~142ms, p99 ~312ms, mean batch size 14\n- Conclusion: stochastic arrivals materially worsen tails even at same mean RPS by producing more small-batch events and occasional short-packed bursts that trigger queue contention and blocking on GPU kernel launch.\n\nAnomalies / notes:\n- Observed a consistent ~10ms gap between client-perceived latency and server first-token metric; likely client-side connection latency + serialization. Need to instrument client more precisely.\n- One run showed a persistent 1% 429 spike aligned with autoscaler briefly dropping one worker; check autoscaler logs for scale-down policy.\n- Batcher logs show occasional >100ms dequeue stalls when node memory pressure triggered internal GC. Correlate with node-level dmesg and kubelet OOM events.\n\nActionable next steps / TODOs:\n- [ ] Re-run with tighter node-stability: pin nodes, disable autoscaler for baseline to remove scale events (assigned to Priya)\n- [ ] Add client-side synthetic jitter control to test extremes: CV (coefficient of variation) sweeps (assigned to Elliot)\n- [ ] Instrument kernel startup times to confirm if long tails are kernel launch vs model forward compute\n- [ ] Explore adaptive batch_timeout: dynamic increase during detected microbursts to trade p50 vs p99 automatically (prototype plan: rules in router, PR reference above)\n- [ ] Run same sweep on smaller model (2.7B) to isolate model-compute vs batching overhead\n\nNotes to self (scratch):\n- For writeup include small figure: two CDFs (Poisson vs steady) highlighting rightward tail for Poisson.\n- Mention integration with Redwood Optimize: could suggest a heuristic to detect arrival variance and pick batch_timeout automatically per-route.\n\nQuick conclusions (one-liner):\n- Poisson-style arrival variability increases tail latency significantly; batching timeout is an effective lever but requires SLA-aware tuning (or adaptive algorithms) to avoid median/tail tradeoffs.\n\nRaw artifacts location:\n- results/poisson-sweep-2025-01-23/ (client JSONs, server_metrics.json, batcher_logs.tar.gz)\n\nIf anyone wants to reproduce: ping me (Diego) and I will share the scripts and a short runbook.\n\nEnd of notes.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_5a2ec07c2c4246e2b5396fb4aa7cf1b3"
+}

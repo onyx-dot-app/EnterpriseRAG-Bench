@@ -1,0 +1,101 @@
+{
+  "key": "ENG-332415",
+  "team": "engineering",
+  "title": "Resolve orphaned usage window and mis-attribution when subproject is promoted to org",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-14",
+  "creator": "Sofia Nguyen",
+  "assignee": "Daniel Kim",
+  "project": "multi-tenant-billing-stability",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "billing",
+    "metering",
+    "quota",
+    "rate-limiter",
+    "postmortem-automation"
+  ],
+  "parent_issue": [
+    "ENG-328900"
+  ],
+  "dependencies": [
+    "ENG-321000",
+    "ENG-330112"
+  ],
+  "customer_impact": "medium",
+  "release": "billing-2026.03",
+  "security_review_required": "false",
+  "description": "Summary: We are observing orphaned usage windows and incorrect attribution when a 'subproject' (child workspace) is promoted to an organization-level project (reparented). Symptoms include duplicated token bucket counters, double-counted meter entries for the same API key across both the old and new parent, and transient quota denials for the new owner while the old owner continues to be billed. This ticket drives the investigation, a code fix for attribution normalization, and a backfill job to reconcile historical mis-billed units.",
+  "steps_to_reproduce": "1) Create org A with project P and subproject S under P.\n2) Issue API key K scoped to S.\n3) Generate steady background traffic (health checks + low-rate inference) for 2 hours.\n4) Promote S: reparent or 'promote' S to be a top-level org or new project owner via admin migration tool.\n5) Observe billing logs, token-bucket counters, and quota windows for both source and destination owners. Expected: ownership transfers cleanly and counters migrate. Actual: both old and new parents see active windows; billing shows duplicated metering; the new owner hits quota while the old owner continues to consume quota for the same key.",
+  "investigation_notes": [
+    "Initial hypothesis: reparent flow does not invalidate legacy claim records in the attribution cache and does not correctly transfer active rate-limiter windows (in Redis/Gate).",
+    "Observed race: migration master writes new_owner mapping in Postgres, but the in-memory attribution cache (memcached) and per-gateway in-flight window state still reference old_owner until TTL expiry or gateway restart.",
+    "Key evidence: audit trail shows mapping change at 2026-03-09T17:22:13Z, but active token-bucket rows in redis persisted under namespace 'tenant:old_owner:window' and were still being billed at 2026-03-09T17:29:xxZ.",
+    "Grafana snapshot: https://grafana.redwood.com/d/XYz123/metering-explorer?from=164&to=170 shows twin spikes identical in shape across both owners after migration.",
+    "Sample query used to detect duplicates (ClickHouse):\nSELECT org_id, count() as events, sum(tokens) as tokens, min(received_at) as first_seen\nFROM metrics.request_logs\nWHERE api_key = 'K_SAMPLE' AND received_at BETWEEN '2026-03-09 16:00:00' AND '2026-03-09 18:00:00'\nGROUP BY org_id\nORDER BY events DESC;",
+    "Gateway logs: gateway-5 contained 'claim resolved to old_owner' messages after Postgres returned mapping to new_owner due to stale local cache."
+  ],
+  "findings": "Root cause is a three-way mismatch during reparent: (1) Postgres owner mapping updated; (2) attribution cache shards (memcached) not invalidated for the key; (3) gateway-level per-key in-memory rate-window state remains under the old namespace. Without a coordinated handoff, both billing pipelines (live metering and async backfill) read different owner IDs and create duplicate entries. Additionally, our backfill dedupe logic uses only request_id + api_key which is insufficient when owner_id differs; duplicates slip through reconciliation.",
+  "proposed_solution": "1) Expand the reparent migration to perform a coordinated invalidation: write new mapping, publish an owner-change event to 'tenant-changes' Kafka topic, and synchronously invalidate attribution cache entries for affected API keys. 2) Enhance gateway to subscribe to 'tenant-changes' and atomically migrate in-memory rate windows (or mark windows as 'migrated' and move counters to new namespace). 3) Tighten backfill dedupe keys to include owner_id and a migration_generation token so the reconciliation job can collapse duplicate events created during migration windows. 4) Add a normalization backfill job to detect and correct duplicated meter rows for the window range and refund/credit overbilled customers where appropriate.",
+  "implementation_notes": [
+    "Schema: add migration_generation bigint to claims table and include it in Kafka payload for tenant-changes.",
+    "Gateway: small change to use migration_generation when resolving claim and to accept 'migrate-window' control messages. Estimated 6-10 SLOC and gated by feature flag 'gw:tenant-migrate-v2'.",
+    "Backfill: ClickHouse job that identifies identical requests (same request_id, api_key, approx timestamp) across two owners where one owner mapping changed within 5 minutes. Mark duplicates and compute refund amount for accounting.",
+    "We should avoid full redis flushes; use scoped key deletions for affected API keys to reduce blast radius."
+  ],
+  "acceptance_criteria": "1) Reparent flow triggers a tenant-changes event and affected gateway nodes log 'window migrated' entries.\n2) After migration, ClickHouse query for sample API key shows only the new owner receiving events for time > migration_time + 1s.\n3) Normalization backfill runs on a test dataset and collapses duplicates with zero false positives.\n4) Unit/integration tests cover cache invalidation and gateway migration message handling.\n5) Rollout behind feature flag; no customer-visible regression in 48h canary.",
+  "rollback_plan": "If we detect increased quota denials or billing anomalies during canary: (a) disable 'gw:tenant-migrate-v2' feature flag (b) publish rollback event that forces gateways to resume previous mapping (c) run a quick reconciliation to re-establish correct counters).",
+  "rollout_plan": "1) Merge gateway changes behind feature flag. 2) Deploy to canary gateways (gw-canary-1, gw-canary-2) and run synthetic reparent test. 3) Enable event publishing from migration tool for a narrow set of customers; monitor logs, metrics, and billing diffs for 72h. 4) Gradually expand and run normalization backfill in parallel. 5) After 1 week of stable metrics, flip feature flag globally and run full reconciliation script.",
+  "monitoring_queries": [
+    "SELECT owner_id, countDistinct(api_key) as keys, sum(tokens) as tokens FROM metrics.request_logs WHERE received_at >= now() - interval 6 hour GROUP BY owner_id ORDER BY tokens DESC LIMIT 50;",
+    "Grafana alert rule: 'duplicate-metric-window-rate' - fire if two orgs share >80% identical request fingerprinting within a 15m sliding window",
+    "Audit log check: SELECT * FROM audit.claim_changes WHERE change_type = 'reparent' AND created_at >= now() - interval 24 hour;"
+  ],
+  "linked_prs": [
+    "https://github.com/redwood-inference/gateway/pull/8742 (gateway: tenant window migration + kafka listener)",
+    "https://github.com/redwood-inference/billing/pull/2291 (backfill: dedupe by owner + migration_generation)",
+    "https://github.com/redwood-inference/migrations/pull/412 (db: add migration_generation to claims table)",
+    "https://github.com/redwood-inference/ops-scripts/pull/67 (normalization-scripts)",
+    "https://github.com/redwood-inference/serving/pull/9010 (feature-flag rollout)"
+  ],
+  "attachments": [
+    "https://redwood.atlassian.net/l/cp/ABC123 - Confluence: Postmortem draft for 2026-03-09 migration drift",
+    "https://drive.google.com/file/d/1Aq_example - spreadsheet: reconciliation-plan-and-refunds",
+    "https://grafana.redwood.com/d/XYz123/metering-explorer?from=164&to=170 - grafana: twin spikes visualization"
+  ],
+  "work_log": [
+    "2026-03-10: Sofia NG initiated ticket and added initial reproduction steps after customer report. Linked to ENG-328900 (migration-tooling).",
+    "2026-03-11: Daniel K reproduced locally using migration-sandbox and captured gateway traces. Confirmed stale cache hypothesis. Added prototype Kafka event in dev cluster.",
+    "2026-03-12: PO review with Miguel Ortega: agreed to prioritize fix and backfill; finance team notified for potential credits. Added labels and set P1.",
+    "2026-03-13: Implemented db migration to add migration_generation (PR linked). Gateway PR in progress; initial unit tests green. Ops scheduled canary window on 2026-03-16.",
+    "2026-03-14: Backfill skeleton ready; reconciliation query validated on anonymized data, showing 2.7% duplicated tokens in sample customer set. Preparing customer comms template."
+  ],
+  "comments": [
+    "Sofia Nguyen (2026-03-10): Customer support reported two customers saw unexplained quota hits after admin-promote. Assigned to Daniel to investigate.",
+    "Daniel Kim (2026-03-11): Reproduced locally. The gateway's claim cache TTL is 10m; when migration occurs within TTL we see split attribution. Temporary mitigation: reduce cache TTL to 30s for migration windows (ops-only) \u2014 needs testing.",
+    "Miguel Ortega - Product (2026-03-12): Finance requests list of affected orgs so billing can pre-authorize manual credits if normalization finds overcharges.",
+    "Priya Rao - Security (2026-03-13): Confirmed no secret leakage risk; ensure migration events are authenticated and signed.",
+    "Ops (2026-03-14): We prefer scoped cache invalidation rather than TTL reduction to avoid global perf impact. Will add an API to evict claim keys from memcached.",
+    "Daniel Kim (2026-03-14): Proposal: evict claim cache scoped to api_key patterns + publish kafka event + gateway will check for migration_generation mismatch and publish 'window-migrated' log. Implementing now."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "investigation_notes",
+    "findings",
+    "proposed_solution",
+    "implementation_notes",
+    "acceptance_criteria",
+    "rollback_plan",
+    "rollout_plan",
+    "monitoring_queries",
+    "work_log",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_850a439a380842d5ad732d7a6654f2eb"
+}

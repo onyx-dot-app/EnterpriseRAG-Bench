@@ -1,0 +1,107 @@
+{
+  "key": "ENG-274991",
+  "team": "engineering",
+  "title": "Ephemeral residency resonance during windowed continuous batching - allocator debugging",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-12",
+  "creator": "Leah Kim",
+  "assignee": "Maya Singh",
+  "project": "serving-runtime-memory",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "labels": [
+    "cudaMallocAsync",
+    "kv-cache",
+    "memory-fragmentation",
+    "continuous-batching",
+    "investigation"
+  ],
+  "release": "runtime-1.21",
+  "security_review_required": "false",
+  "description": "Intermittent growth in resident GPU pages observed under our windowed continuous-batching workload. Unlike steady-state slab bloat we've seen before, this shows rhythmic \"residency resonance\" where resident pages increase in pulses correlated to prefetch windows and long-lived streams. Goal: identify allocator behavior root cause, reproduce reliably, and land a low-risk mitigation for the 1.21 release.",
+  "reproduction_steps": [
+    "Run synthetic continuous-batching harness (tools/loadgen/windowed_kv_prefetch.py) with window_size=64, prefetch_depth=8, mix=kv-heavy, concurrency=24",
+    "Observe baseline for 10m, then enable 'aggressive-prefetch' flag (runtime config) to mirror customer workload A",
+    "Capture GPU memory snapshots every 30s via nvml (nvmlDeviceGetMemoryInfo) and cudaMemGetInfo in-app logging",
+    "Collect per-stream allocation traces with the kernel debug allocator build (runtime build: debug-alloc/2026-02-28) and run for 30 minutes",
+    "Record system metrics (CPU, host staging bytes, swap activity) and runtime metrics (pool residency, deferred_free_queue_length) to Grafana dashboard 'runtime/mem/kv-prefetch-res'"
+  ],
+  "observations": [
+    "Resident GPU memory increases in ~90\u2013120s pulses of ~180\u2013260MB before partially releasing; net growth across a run is positive (plateau only after ~40\u201350 minutes)",
+    "Deferred free queue length correlates with pulses; queue length spikes immediately after large prefetch batches finish",
+    "Pinned host staging buffer (host_staging_bytes) shows a monotonic increase, suggesting staging-to-device transfers are not fully coalescing frees",
+    "NVidia tools (nsight) show many small device allocations from the same arena with noncontiguous residency \u2014 indicating internal fragmentation",
+    "Runs without prefetch or with prefetch_depth<=2 do not exhibit pulses, pointing to prefetch window as a trigger"
+  ],
+  "investigation": [
+    "Collected malloc/free traces using env RUNTIME_ALLOC_LOG=1 and matched with stream IDs; observed that frees are issued on separate non-default streams after kernel dispatches",
+    "Inspected cudaMallocAsync pool attributes via cuMemPoolGetAttribute equivalents and saw pool.hard_limit unset; default heuristics allowed large arena growth",
+    "Reproduced behavior on Ampere and Hopper hardware; magnitude varies but pattern remains \u2014 less pronounced on GPUs with larger page sizes",
+    "Run with CUDA_VISIBLE_DEVICES single GPU and added clocked dumps: the pattern persists, ruling out multi-GPU migration issues",
+    "Tested trimming heuristics: calling cudaMemPoolTrimTo to force coalescing reduces peak but causes short spikes in latency for a few requests"
+  ],
+  "experiments": [
+    "Experiment A: disabled cudaMallocAsync (fallback to cudaMalloc) \u2014 eliminated pulses but increased per-request latency by ~12% and increased CPU-side overhead",
+    "Experiment B: lowered prefetch_depth to 2 \u2014 eliminated pulses with minimal QoR changes for synthetic workload",
+    "Experiment C: forced stream-synchronization before pool trim \u2014 reduced net growth but introduced a 50\u2013150ms tail latency regression in high-concurrency paths",
+    "Experiment D: set device mempool attribute 'release_threshold' to a conservative value (via cuMemPoolSetAttribute) \u2014 reduced fragmentation and peak residency by ~30% at moderate loads",
+    "Experiment E: implemented quick coalescing freelist (local branch) \u2014 promising in loadgen but needs safety review and broader perf tests"
+  ],
+  "root_cause_hypothesis": "Under windowed continuous batching with aggressive KV prefetch, many small device allocations are created across multiple non-default streams and then freed asynchronously. cudaMallocAsync's pool heuristics allow arena growth and delayed coalescing, producing rhythmic pulses of resident pages (ephemeral-residency resonance). Additionally, host staging allocations (pinned pages) are being retained due to stream-ordered deferred frees, preventing the system from releasing backing pages promptly.",
+  "mitigations_tried": [
+    "Lower prefetch_depth configurable at runtime (works but reduces throughput headroom)",
+    "Explicit stream synchronization in staging path before trimming (reduces residency but harms tail latency)",
+    "Adjust mempool trim thresholds (bakery-config) to favor earlier trimming \u2014 reduces steady-state but risks more cuda calls",
+    "Fallback to cudaMalloc for very small allocations (<256B) to avoid pool fragmentation \u2014 mitigates pulses but increases CPU time"
+  ],
+  "proposed_fix": [
+    "Short-term (release-1.21): Add adaptive prefetch limiter that reduces depth under high deferred_free_queue_length; expose as runtime flag and default-on for Dedicated customers",
+    "Medium-term: implement epoch-based deferred-free draining: allocate an epoch token per request window; when epoch advances, issue coalesced trims on a low-priority background stream (avoids syncs on hot paths)",
+    "Long-term: update allocator to group small allocations by lifetime class and prefer per-lifetime mempools (reduces cross-stream fragmentation) and upstream recommended cudaMemPoolSetAttribute tuning",
+    "Add an internal OSS-style regression test (loadgen scenario) that asserts resident memory growth < 50MB over 30m under windowed prefetch workload"
+  ],
+  "risks_and_tradeoffs": [
+    "Epoch-based draining reduces tail impact versus immediate syncs but adds complexity and potential for delayed reclamation if epochs misalign",
+    "Grouping by lifetime reduces fragmentation but increases internal allocator state and may increase code-path complexity for cross-request sharing",
+    "Aggressive trimming increases CUDA API traffic and can raise per-request latency on spikes",
+    "Fallbacks to cudaMalloc remove pool benefits for small allocations and will raise per-token cost"
+  ],
+  "next_steps": [
+    "(Maya) Land adaptive prefetch limiter behind feature flag and run canary on staging cluster (canary: runtime-1.21-canary-memfix)",
+    "(Leah) Add resident-memory synthetic regression to CI load test harness and create Grafana alert 'mem.residency.delta>50MB/30m for kv-prefetch'",
+    "(Rafael) Prototype epoch-based deferred-free draining as an opt-in branch for performance validation",
+    "Schedule a 1-hour cross-team review with infra and perf on 2026-03-15 to validate release trade-offs",
+    "Document firewall/regression cases in Confluence: https://confluence.redwood.ai/display/RUNTIME/ephemeral-residency-investigation"
+  ],
+  "attachments": [
+    "https://grafana.redwood.ai/d/abcd123/runtime-mem-kv-prefetch?orgId=1",
+    "https://github.com/redwood-inference/runtime/pull/4392 (experimental coalescing freelist branch)",
+    "https://drive.redwood.ai/drive/folders/1Ephemeral-Residency-TraceDumps-2026-03 (trace dumps and nvprof captures)",
+    "Confluence: https://confluence.redwood.ai/display/RUNTIME/Ephemeral+Residency+Investigation"
+  ],
+  "comments": [
+    "2026-03-02 - Leah Kim: Initial dataset and loadgen reproducer uploaded. Observed first residency pulse at ~4m. Filing ticket to track remediation for 1.21.",
+    "2026-03-04 - Maya Singh: Tried lowering prefetch_depth in dedicated canary cluster \u2014 pulses stopped but throughput dropped ~6%. Need to weigh cost vs reliability.",
+    "2026-03-07 - Rafael Ortega: Prototype for coalescing freelist shows 35% reduction in pulse amplitude on loadgen; requires safety review for concurrent deallocations.",
+    "2026-03-09 - Priya Patel (Perf): Agrees epoch-drain approach is promising; suggested background stream be low-priority compute to avoid contention with kernel queues.",
+    "2026-03-11 - Security Review bot: no secrets in traces; ensure Confluence is access-controlled when linking production traces.",
+    "2026-03-12 - Maya Singh: Preparing canary rollout plan for adaptive prefetch limiter; will include rollback condition if resident memory not reduced by 25% within 1h"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "reproduction_steps",
+    "observations",
+    "investigation",
+    "experiments",
+    "root_cause_hypothesis",
+    "mitigations_tried",
+    "proposed_fix",
+    "risks_and_tradeoffs",
+    "next_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_ddfc29da924b41068136228e778d1743"
+}

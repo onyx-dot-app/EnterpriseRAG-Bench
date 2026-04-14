@@ -1,0 +1,92 @@
+{
+  "repo": "redwood",
+  "pr_number": "27555",
+  "title": "Hardening usage event idempotency + dedupe keys (reduce duplicate billable events on retries/backfills)",
+  "author": "Cole Summers",
+  "created_at": "2026-02-13",
+  "updated_at": "2026-02-18",
+  "merged_at": "2026-02-18",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "bugfix/usage-events-idempotency-v2",
+  "merge_method": "squash",
+  "reviewers": [
+    "Logan Wright",
+    "Nadia Rahman",
+    "Mei Lin",
+    "Aisha Bello",
+    "Caleb Johnson"
+  ],
+  "labels": [
+    "billing",
+    "telemetry",
+    "data-quality",
+    "sre",
+    "bug"
+  ],
+  "linked_linear": [
+    "ENG-4430",
+    "PM-1872"
+  ],
+  "linked_jira": [
+    "SUP-28463"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "19",
+  "additions": "612",
+  "deletions": "214",
+  "breaking_change": "false",
+  "description": "Context: We have an ongoing metering hardening push and have confirmed duplicate usage events under a few conditions: (a) server-side fallback/retry paths where request logging is re-emitted, (b) partial pipeline failures where the producer retries publish, and (c) backfills that re-process request logs without stable idempotency keys. These duplicates can inflate billed_tokens / request counts and show up as drift vs billing ledger and customer usage exports (see SUP-28463 and recent Finance discrepancy sampling).\n\nWhat this PR does: Introduces a v2 idempotency scheme for usage events with deterministic event_identity, ingestion-time de-dupe, and explicit backfill semantics. The goal is that a single customer request maps to a stable set of billable usage events even if the producer retries, the consumer replays, or we re-run backfills.\n\nKey changes: 1) New event_identity_v2: We compute a deterministic SHA256 hash over stable dimensions: account_id, workspace_id, request_id, route_id, model_id, meter_kind, meter_version, usage_window_start_ms, usage_window_end_ms, and a stable attempt_ordinal. For streaming we include stream_id and chunk_ordinal ONLY for non-billable debug events; billable usage remains per-request aggregated to avoid chunk-level duplication. 2) Producer behavior: Producers now always emit request_id + attempt_ordinal. attempt_ordinal is incremented only for server-side retries/fallbacks that would otherwise create distinct billable work; client retries should reuse the same idempotency key and will be treated as the same request if request_id matches. 3) Consumer / storage: The usage-events writer now performs an idempotent upsert (MERGE) keyed on event_identity_v2 when writing to the canonical usage_events table. If an older event_identity_v1 exists for the same request_id + meter_kind + meter_version window, we keep it but mark it superseded_by_v2 to prevent double aggregation in downstream rollups. 4) Dedupe window + metrics: Added explicit counters and SLO signals: usage_events_dedupe_hit_total, usage_events_dedupe_miss_total, usage_events_conflict_total (same key, differing payload), and usage_events_late_arrival_seconds histogram. Conflicts page only when above threshold (initially warn-only) and are annotated in the meter sanity dashboard. 5) Backfill mode: Backfill jobs now set backfill_run_id and backfill_reason and MUST preserve attempt_ordinal. Backfills write with the same idempotency key, so re-running a backfill is a no-op unless the payload is materially different (in which case it is flagged as a conflict and excluded from billing until reviewed).\n\nWhy this is safe: This change is additive and does not change the meaning of billed tokens; it reduces duplicates. Downstream rollups are updated to prefer v2 identity when present, and we keep v1 fields for audit/debug. Shadow-billing compare will continue to compute old/new totals; the expected delta should be negative or ~0 (duplicates removed). Any positive delta is treated as a bug and should block rollout.\n\nTest plan: - Unit: deterministic hashing stability, conflict detection, producer attempt_ordinal semantics. - Integration: replay the same request log N times and assert only 1 billable usage row; simulate consumer crash mid-batch and re-run; simulate backfill rerun; verify rollups unchanged except duplicate removal. - Perf-canary: existing streaming + retry scenarios should no longer show double-counting.\n\nRollout: Stage behind feature flag usage_events_idempotency_v2 for 48 hours in staging + 7 days in prod in shadow mode only (write v2 key + metrics; still aggregate on v1). Then flip aggregation preference to v2 for Hosted API meters; Dedicated/Private unaffected but will benefit if they share the same ingestion path.\n\nFollow-ups: - Coordinate with PR-27518 (shadow billing compare mode) for alert annotations. - Update Finance recon queries to join on event_identity_v2. - Remove legacy v1 rollup path after 30 days of clean drift checks.",
+  "commits": [
+    "metering: add event_identity_v2 and hashing utility (stable field ordering)",
+    "telemetry-producer: plumb attempt_ordinal + normalize request_id propagation across retry/fallback",
+    "usage-writer: implement MERGE upsert on event_identity_v2 + superseded_by_v2 marker",
+    "rollups: prefer v2 identity when available; exclude superseded v1 rows",
+    "metrics: dedupe hit/miss/conflict counters + late-arrival histogram",
+    "tests: integration suite for replay/crash/backfill rerun idempotency invariants",
+    "docs: add operator notes + troubleshooting for conflicts"
+  ],
+  "changed_files": [
+    "services/metering/identity/event_identity_v2.ts",
+    "services/metering/producer/usage_event_emitter.ts",
+    "services/metering/consumer/usage_events_writer.ts",
+    "services/metering/rollups/hosted_api_rollup.sql",
+    "services/metering/rollups/common_filters.sql",
+    "services/observability/metrics/metering.ts",
+    "jobs/backfill/usage_events_backfill.ts",
+    "tests/integration/metering/idempotency_replay.test.ts",
+    "tests/integration/metering/idempotency_consumer_crash.test.ts",
+    "docs/runbooks/metering/usage-event-idempotency.md"
+  ],
+  "checks": [
+    "build (monorepo) \u2014 pass",
+    "lint \u2014 pass",
+    "unit tests \u2014 pass",
+    "integration tests (metering) \u2014 pass",
+    "sql validation \u2014 pass",
+    "perf-canary (meter invariants subset) \u2014 pass"
+  ],
+  "conversation": [
+    "Logan Wright (review): Can you clarify the contract for attempt_ordinal? I want to be sure client retries don\u2019t cause accidental dedupe when they actually represent a new request.\nCole Summers (author): Yep \u2014 attempt_ordinal is only for server-side retry/fallback inside the same gateway request_id. Client retries should generate a new request_id (SDK default) unless the client explicitly sets idempotency_key; in that case we treat it as the same billable request by design. Added comments + a unit test for this case.",
+    "Nadia Rahman (review): For streaming, please confirm we are not hashing chunk_ordinal into billable identity. Otherwise disconnect/reconnect will produce different identities and we\u2019ll reintroduce drift.\nCole Summers (author): Confirmed. Billable identity is per-request aggregated; chunk-level events are debug-only and never enter billing rollups. Updated writer to enforce meter_kind != 'billable' for chunk_ordinal inclusion, and added a guardrail test.",
+    "Mei Lin (review): Finance recon currently joins on (request_id, ts_day, meter_kind). If we keep v1 rows, we need to prevent double aggregation. I see superseded_by_v2, but do we guarantee rollups exclude them everywhere?\nCole Summers (author): Good catch. I updated common_filters.sql used by all hosted rollups to exclude superseded_by_v2 = true. Also added a regression test that compares rollup totals for a replay dataset pre/post v2 write.",
+    "Aisha Bello (review): Conflict metric paging: please make sure we don\u2019t page on low-volume staging oddities. Can we start warn-only and add to dashboard first?\nCole Summers (author): Done. Conflicts are warn-only and dashboarded; paging threshold set to 0.1% of events per 15m window and only in prod. Added runbook link to drilldown query.",
+    "Caleb Johnson (review): MERGE upserts in Snowflake can be expensive. Any perf impact on the writer? We need to keep within ingestion SLA.\nCole Summers (author): Measured on staging replay at 2x peak: writer CPU +6%, warehouse credits +3% due to MERGE. We batch MERGE by partition (hour, region) and only MERGE keys seen in the batch. Added metric usage_events_writer_merge_seconds and a guardrail alert at p95.",
+    "Logan Wright (final): Approved after the rollup filter fix + perf metric.\nNadia Rahman (final): Approved.\nMei Lin (final): Approved.\nAisha Bello (final): Approved."
+  ],
+  "release_notes": "Internal only: Usage event idempotency v2 reduces duplicate billable events from producer retries, consumer replays, and backfill reruns. Adds dedupe/conflict metrics and updates rollups to avoid double aggregation.",
+  "related_links": [
+    "Linear: ENG-4430 (Fix double-counting on retry path)",
+    "Linear: PM-1872 (Metering change control process)",
+    "Jira: SUP-28463 (Double-charged for retries)",
+    "Slack: eng-platform thread on idempotency design (1770094420)",
+    "Follow-up: PR-27518 (shadow billing compare mode)"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "conversation",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_752b416e532a44e18038051bc28eb056"
+}

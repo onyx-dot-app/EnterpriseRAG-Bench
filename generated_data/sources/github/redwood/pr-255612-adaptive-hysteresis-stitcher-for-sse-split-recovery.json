@@ -1,0 +1,72 @@
+{
+  "repo": "redwood",
+  "pr_number": "255612",
+  "title": "Adaptive hysteresis stitcher to recover SSE split JSON and preserve event order",
+  "author": "Leah Park",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-02-24",
+  "merged_at": "2026-02-24",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/streaming/hysteresis-stitcher",
+  "reviewers": [
+    "Diego Morales",
+    "Anika Patel",
+    "Marcus Li"
+  ],
+  "labels": [
+    "sse",
+    "streaming",
+    "compat",
+    "perf",
+    "bugfix"
+  ],
+  "linked_linear": [
+    "ENG-9451",
+    "PM-210"
+  ],
+  "linked_jira": [
+    "SUP-3221"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "7",
+  "additions": "784",
+  "deletions": "223",
+  "breaking_change": "false",
+  "release_notes": "Fixes rare cases where SSE chunk boundaries split JSON tokens or interleaved delimiters, improving streaming stability and tool/function-call ordering. Safe rollout via canary; no client contract changes.",
+  "description": "Motivation: In the wild we continue to see intermittent client-visible corruption when SSE chunks split JSON object boundaries or when delimiter bytes are emitted in adjacent chunks out of phase with our tokenizer state. This manifests as partial JSON events, duplicate trailing delimiters, and occasional reordering of function/tool call sentinel events under high concurrency and aggressive network intermediaries. These failures are low-frequency but have high customer impact (broken structured output, failed function calls, invalid JSON in streaming mode).\\n\\nGoal: Implement an in-server, backward-compatible recovery layer that: 1) detects mid-event SSE splits and replays/stitched fragments deterministically; 2) dampens delimiter flapping by introducing an adaptive hysteresis window to avoid emitting premature flush delimiters; and 3) preserves event ordinality for tool/function-call sentinels so downstream OpenAI-compatible clients receive consistent call order. No protocol changes to clients are required.\\n\\nWhat I changed (high level):\\n- Introduced a streaming \\\"stitcher\\\" component in api/streaming that buffers a small, adaptive hysteresis window at chunk boundaries and attempts checksum-based splice recovery when receiving continuation fragments instead of immediately flushing incomplete JSON frames. The hysteresis window grows/shrinks based on measured chunk reliability and average latency.\\n- Added a delimiter dampener that suppresses emission of trailing CR/LF delimiter bytes for up to the hysteresis window when the buffer looks likely to be a split JSON token; this avoids duplicate delimiters and unlikely escapes.\\n- Tagged tool/function-call sentinel events with an internal event-ordinal watermark during streaming. If fragments arrive out-of-order due to network reorder, the stitcher rehydrates the original ordinal before emitting the function-call event to the client, ensuring stable call order for OpenAI-compat consumers.\\n- Extended the openai-compat adapter to accept restarted fragments and use the stitcher API; this required defensive parsing code to avoid double-escaping UTF-8 sequences across chunk boundaries.\\n- Added targeted unit tests, property-based fuzzing on chunk boundary permutations, and an integration canary harness that replays real production traces with synthetic splits.\\n\\nFiles changed (summary):\\n- api/streaming/stitcher.go - new component implementing adaptive hysteresis, checksum heuristics, and ordered reassembly.\\n- api/streaming/frame_coordinator.rs - integrates stitcher into the sending path and adjusts backpressure decisions to account for buffered hysteresis windows.\\n- api/compat/openai/stream_adapter.go - defensive rehydrate/merge logic and event-ordinal tagging for function-call sentinels.\\n- pkg/proto/stream.proto - add non-client-visible event_ordinal field (internal only) used to preserve ordering in reassembly; marked as optional and guarded by server-only behaviour.\\n- integration/canary/replay_harness.py - replayer used for staged rollout tests.\\n- streaming/tests/test_split_recovery.py - new pytest suite covering split JSON, delimiter flapping, and sentinel reordering permutations.\\n- streaming/tests/fuzz/fragmenter_fuzz.go - quick fuzz harness for random chunk boundaries with UTF-8 and escape sequences.\\n\\nImplementation notes and algorithms: The stitcher keeps a sliding hysteresis window measured in bytes and estimated token boundaries. When an incoming SSE chunk ends with an incomplete UTF-8 sequence or unbalanced JSON brackets, the coordinator defers emitting a flush event and inserts the fragment into the stitcher buffer. The stitcher attempts to match continuation fragments via a rolling CRC32 checksum over the last N bytes (configurable), plus heuristic signature of recent token prefix (quotes, backslash escapes, brace depth). If a match is found within a short grace period, fragments are stitched and the combined payload is emitted as a single event. If no match arrives within hysteresis timeout, the stitcher falls back to a best-effort emit, but annotates the event with a deterministic repair flag for downstream telemetry and optional client-side rescue logic.\\n\\nTool/function-call ordinality: To maintain deterministic ordering for function-call/tool sentinel events we attach an internal event_ordinal watermark at emission time. The stitcher uses this ordinal to reorder any fragments whose assembly would otherwise produce out-of-order sentinel emissions. This is internal-only and does not change any public schema; the grace ensures the OpenAI-compatible tool-calling surface receives identical call ordering to non-streaming or unsharded streams.\\n\\nTesting and results:\\n- Unit tests: 48 new cases covering edge UTF-8 splits, nested JSON partials, and successive delimiter runs.\\n- Fuzzing: 8k randomized trace permutations; pre-change reproducer rate ~0.1% of traces produced invalid JSON; post-change reproducer rate reduced to <0.001%.\\n- Canary: Deployed to 5% of streaming traffic across two regions for 72 hours. Observed: partial_json errors down 82% in canary fleet; no meaningful latency regression (median +1ms, p95 +5ms). CPU bump bounded <3% on the serving nodes due to the lightweight checksum and small window sizes.\\n\\nBackward compatibility and rollout: No client contract changes. The stitcher is gated behind a runtime flag for fast rollback. We rolled out as: feature flag enabled in main canary -> monitor 72h -> staged ramp 5%->25%->100% over 48h windows with automated rollback on error budget triggers.\\n\\nRisk and mitigations:\\n- Risk: hysteresis could add tail-latency in worst-case networks. Mitigation: adaptive window clamps to 150ms and drains on circuit-breaker thresholds.\\n- Risk: checksum false matches could incorrectly splice unrelated fragments. Mitigation: conservative checksum+prefix signature, require minimal overlap and bracket consistency before reassembly.\\n- Risk: edge cases with legacy clients assuming delimiter behaviour. Mitigation: default behaviour remains unchanged unless the stitcher detects split signals; telemetry filed to detect any client regressions.\\n\\nChecklist (what I did):\\n- [x] Implement stitcher, hysteresis window, and delimiter dampener\\n- [x] Wire stitcher into streaming coordinator and openai-compat adapter\\n- [x] Add unit tests and fuzz harness\\n- [x] Run canary and collect metrics; adjust heuristics\\n- [x] Documentation: in-code comments + short design note in docs/streaming/hysteresis-stitcher.md\\n\\nNext steps and follow-ups:\\n- Observe production metrics for 2 weeks and tune hysteresis adaptation thresholds.\\n- Consider exposing a bounded client hint header to reduce false positives for well-behaved proxies.\\n- Expand fuzzing corpus with real-world TCP split fingerprints.\\n\\nIf you want to focus review: look at stitcher.go algorithm branch where we choose match_threshold and the interaction with frame_coordinator backpressure heuristics (frame_coordinator.rs). I left TODOs where more aggressive preemption heuristics can be experimented with.\\n\\nCommit summary: see commits list for small, easy-to-review steps; main implementation split into stitcher/core, adapter changes, tests, and canary harness.\\n",
+  "commits": [
+    "a1b4d2c - introduce stitcher component and unit tests",
+    "b2c5e8f - integrate stitcher into frame coordinator and adjust backpressure",
+    "c3d7f12 - openai-compat adapter: rehydrate fragments and attach event_ordinal",
+    "d4e9a3b - add canary replay harness and integration tests",
+    "e5f01cd - fuzz harness and additional edge-case tests",
+    "f6a23be - docs: add design note and rollout playbook"
+  ],
+  "files_changed": [
+    "api/streaming/stitcher.go (new) - core adaptive hysteresis and reassembly logic",
+    "api/streaming/frame_coordinator.rs - integrate stitcher & backpressure changes",
+    "api/compat/openai/stream_adapter.go - defensive reassembly & ordinal watermarking",
+    "pkg/proto/stream.proto - add internal event_ordinal field (server-side use)",
+    "integration/canary/replay_harness.py - replay tool for canary testing",
+    "streaming/tests/test_split_recovery.py - pytest suite for split cases",
+    "streaming/tests/fuzz/fragmenter_fuzz.go - fuzz harness"
+  ],
+  "review_thread": [
+    "Diego Morales (reviewer): Overall approach looks good. Please justify the CRC32 window size and add a microbenchmark for it.",
+    "Leah Park (author): Added microbenchmarks in streaming/tests/fuzz/fragmenter_fuzz.go and adjusted default window to 512 bytes; updated PR description with numbers.",
+    "Anika Patel (reviewer): Concern about event_ordinal leaking into telemetry. Make sure it's server-only and not serialized to public proto outputs.",
+    "Leah Park (author): Confirmed event_ordinal is marked server-only and not exposed via public SDKs; added guard comments and tests to ensure proto serialization does not include it in public messages.",
+    "Marcus Li (reviewer): Approve after CI passes and a quick canary observation period. +1",
+    "CI Bot: All checks passed (unit, integration, lint, build)."
+  ],
+  "merge_outcome": "squash and merge",
+  "notes": "Merged after canary verification and approvals. Feature flag keeps stitcher opt-in for operator rollback. CI green. Telemetry alert thresholds added to automated rollback rules.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes",
+    "review_thread"
+  ],
+  "dataset_doc_uuid": "dsid_f4c6666ca38f42a0b64ac71c77569a55"
+}

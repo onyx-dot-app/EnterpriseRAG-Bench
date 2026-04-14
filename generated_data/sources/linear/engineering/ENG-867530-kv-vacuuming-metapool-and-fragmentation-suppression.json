@@ -1,0 +1,48 @@
+{
+  "key": "ENG-867530",
+  "team": "engineering",
+  "title": "KV vacuuming metapool and fragmentation suppression plan",
+  "status": "Planned",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Kumar",
+  "assignee": "Liam O'Connor",
+  "project": "runtime-fragmentation-reduction",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-04-10",
+  "labels": [
+    "kv-cache",
+    "gpu-memory",
+    "continuous-batching",
+    "telemetry",
+    "perf"
+  ],
+  "description": "Summary: Propose and implement a metapool-based KV allocation strategy plus a cooperative \"vacuuming\" process to suppress fragmentation on GPU-resident KV caches. The goal is to preserve low tail latency under continuous batching while reducing memory waste from long-tail fragment accumulation.\n\nBackground: Our current KV cache uses a single global pool with LRU-style eviction and opportunistic compaction. Over long uptimes, small variable-length entries produced by different models and sequence lengths create many holes that are expensive to compact synchronously. Continuous batching amplifies the issue: larger batch windows increase transient KV insert/delete churn and increase allocation churn for KV slices, causing higher fragmentation and occasional OOM-eviction storms on heavily-utilized GPUs. Existing approaches in the codebase (slab coalescers, slot anchoring, background compaction) have reduced symptoms but we still see: 1) 8-15% memory headroom loss on 80%+ sustained load nodes, 2) compaction runs causing CPU/GPU stalls when run impulsively, and 3) degradation in P95 token latency during compaction spikes.\n\nGoals:\n- Reduce long-term fragmentation ratio by >= 30% on replicas running high-churn workloads.\n- Keep compaction/vacuum work off the critical path (no compaction-induced P95 token latency regressions).\n- Ensure continuous batching throughput improvements remain intact (no throughput regression > 5%).\n- Provide telemetry and knobs for ops to tune vacuum aggressiveness per pool and per tenant.\n\nDesign proposal: metapool + vacuuming + age-bins\n1) Metapool concept: split GPU KV memory into a small-number of independent \"metapools\" (fixed-size arenas) based on size classes and volatility. Example lanes: Tiny (<=128 bytes), Small (129-1K), Medium (1K-8K), Large (>8K), and Ephemeral (short-lived entries from recent batches). Each metapool uses a simple free-list allocator tuned to its size class to avoid internal fragmentation and to bound search cost.\n\n2) Age-tiered placement: on allocation, attempt to place entries into a lane using a combination of requested capacity and predicted lifetime (inferred from request attributes: model id, sequence length, prompt type). We will add a lightweight predictor (heuristic table initially: e.g., chat prefix entries go to Ephemeral) and refine offline. This reduces mixing long- and short-lived objects that create holes.\n\n3) Cooperative GPU vacuuming: introduce a low-priority background vacuum that runs on GPU compute streams reserved for async housekeeping. Vacuum tasks:\n   - Coalesce adjacent free blocks within a metapool by updating chunk metadata (no copies) where indirection is available.\n   - For variable-length entries that can't be coalesced in-place, opportunistically move cold entries into compacted pages during idle windows using low-priority CUDA kernels and async memcpy; update pointer indirections atomically.\n   - Reclaim fully-empty pages back to a global free page pool so we can shrink ephemeral lanes under pressure.\nVacuuming is rate-limited by a shared token bucket per GPU and backed off when tail latency signals rise.\n\n4) Idleness hooks and batch-aware scheduling: vacuum tasks should run during model idle windows and between batching cycles. Integrate with the continuous batching scheduler to expose short (5-50ms) windows for micro-vacuum passes. Also add a per-tenant soft-reserve that prevents vacuum from starving active workloads.\n\n5) Migration-friendly soft-reserve and pinned-inflight heuristics: maintain a small soft-reserve to avoid eviction thrashing for large VT caches during live migration/rollouts. Mark entries referenced by in-flight requests as pinned for short TTL; vacuum respects pins.\n\n6) Telemetry and knobs: add metrics per metapool: allocated_bytes, free_bytes, fragmentation_ratio (1 - largest_contiguous / total_free), vacuum_time_ms, vacuum_throughput_bytes, pinned_bytes, compaction_migrations, and eviction_pressure. Expose runtime knobs: vacuum_rate_bytes_per_sec, idle_window_threshold_ms, metapool_size_class_cutoffs, predictor_weights.\n\nImplementation plan / milestones:\n- Spike (weeks 0-1): implement in-memory metapool scaffolding (allocation/free API) + unit tests; synthetic benchmark harness to exercise mixed size churn.\n- Prototype vacuum (weeks 2-3): low-priority GPU kernel + async move path; integrate with batching scheduler idle hook; simple heuristic predictor.\n- Canary (week 4): enable on a small fleet of dedicated nodes behind feature flag. Add telemetry dashboards.\n- Iterate (weeks 5-7): tune size cutoffs, vacuum rate, predictor; add eviction fallback and graceful disable path.\n- Rollout (week 8+): staged rollout to Dedicated pool, then Private; add ops runbook.\n\nAcceptance criteria:\n- Synthetic mixed-workload benchmarks show >= 30% drop in fragmentation_ratio compared to baseline after 24h run at 85% GPU memory utilization.\n- No P95 token latency regression in continuous-batching end-to-end test (<5% change).\n- Vacuum_time_ms stays bounded and visible in telemetry; vacuum_rate can be tuned without restarts.\n- Rollout runbook documented with toggles and safe-disable procedure.\n\nRisks & mitigation:\n- Moving cold entries on GPU could introduce pointer races. Mitigate via atomic double-buffered indirection table updates and epoch-based reclamation.\n- Vacuum kernels may contend with model kernels when scheduling is tight. Use CUDA stream priorities and token-bucket rate limiting; early abort if kernel launch latency starts trending up.\n- Predictor misclassification may place long-lived items into ephemeral lane; add fast migration path and conservative defaults.\n\nRollout & experiment plan:\n- Start with internal canary on non-customer Dedicated nodes running mixed chat + embedding workloads.\n- Run 48h stability tests with continuous workload and automatic comparison of fragmentation_ratio, eviction_count, and latency.\n- If successful, gate enabling by model family and tenant risk level; run A/B for 2 weeks with traffic split.\n\nOperational runbook (outline):\n- Feature flag: runtime.kv.metapool.vacuum.enabled (per-node).\n- Emergency disable: set vacuum_rate_bytes_per_sec=0 and drain vacuum queues; if persistent, disable feature flag and restart runtime.\n- Dashboards: fragmentation_ratio (per node, per tenant), vacuum_time_ms, eviction_pressure, pinned_bytes.\n\nLinks & artifacts: will attach benchmark harness repo, design doc (Confluence), and initial PRs here when available.\n",
+  "comments": [
+    "2026-03-02 - Aisha Kumar: Initial write-up completed. Uploaded prototype notes to Confluence at /confluence/runtime/kv-metapool. Open questions: best default metapool cutoffs and predictor input signals.",
+    "2026-03-04 - Liam O'Connor: POC allocator implemented in local branch (github.com/redwood/runtime/kv-metapool/tree/poc). Basic free-list and allocation tests green. Observed 12% fragmentation improvement in microbenchmarks.",
+    "2026-03-06 - SRE (Maya Chen): Suggested telemetry names and alert thresholds. Added request to include vacuum_rate as a circuit-breaker for autoscaling interactions.",
+    "2026-03-09 - Engineering review: Flagged pointer update safety; agreed to use epoch-based indirection swap and add unit tests for concurrent pin/unpin flows.",
+    "2026-03-11 - Performance (Diego Alvarez): Proposed GPU stream priority integration and a fallback to CPU-side compaction if GPU bandwidth is saturated."
+  ],
+  "parent_issue": [],
+  "sub_issues": [
+    "ENG-867531",
+    "ENG-867532"
+  ],
+  "dependencies": [
+    "ENG-742110",
+    "ENG-823412"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.21",
+  "security_review_required": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_6d601a2255774097ad86b97ef337d775"
+}

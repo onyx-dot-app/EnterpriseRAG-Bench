@@ -1,0 +1,83 @@
+{
+  "key": "ENG-45721",
+  "team": "engineering",
+  "title": "KV writer lease and async reclamation for paged/blocked KV cache",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-25",
+  "updated_at": "2026-03-10",
+  "creator": "Aisha Kapoor",
+  "assignee": "Marco Lin",
+  "project": "runtime-memory-efficiency",
+  "cycle": "2026-W09",
+  "estimate": "8",
+  "due_date": "2026-03-31",
+  "labels": [
+    "kv-cache",
+    "gpu-memory",
+    "paging",
+    "continuous-batching",
+    "prefetch"
+  ],
+  "description": "Problem: Long-context workloads and heavy multi-tenant traffic are exposing two related failure modes in the current paged/blocked KV cache: 1) concurrent writers and eviction races cause inconsistent page state and rare corruptions under stress; 2) synchronous reclamation/compaction during eviction incurs stalls that interact badly with continuous batching and cause tail-latency spikes.\n\nProposal summary: Introduce a lightweight writer-lease protocol for KV page writers plus an asynchronous reclamation pipeline that reclaims and compacts freed page fragments off the hot inference path. The writer-lease prevents concurrent conflicting updates to the same page block, and the async reclamation moves expensive operations (compaction, cross-shard coalescing) to background workers that throttle against GPU memory pressure signals.\n\nKey goals: reduce eviction-related stalls, eliminate writer-induced state races, lower OOM/eviction events under bursty traffic, and preserve low single-request latency for streaming/continuous batches.\n\nCore ideas (high level):\n- Writer lease: each KV block has a small lease token (32-bit sequence + owner id). Writers acquire the lease before in-place updates (KV insert / growth). Lease acquisition is optimistic and falls back to copy-on-write when contended. Leases are time-bounded (ms) and renewed by the owning worker while active.\n- Epoch-based async reclamation: freed slots are queued into per-GPU reclamation rings with epoch tags. Background reclaim workers perform compaction/coalescing and GPU-side memcpy in bounded chunks, relying on epoch guarantees so in-flight readers are never invalidated.\n- Prefetch profiles + active-pin: continuous batching informs prefetcher which page ranges are hot for the next N micro-batches; hot pages are pinned (resident) during batch execution to avoid mid-batch eviction. Prefetch policy has profiles (short, medium, long) tuned from telemetry.\n- Back-pressure integration: the reclamation workers subscribe to memory-pressure metrics (resident_set_ratio, fragmentation_score). When pressure is high, reclamation increases aggressiveness and signals scheduler to reduce batch size or reduce prefetch depth.\n\nTrade-offs and rationale:\n- Lease cost vs contention safety: adding leases adds metadata and a small fast-path check, which increases write latency by ~0.3-0.6ms in microbenchmarks, but eliminates rare corruption risk and reduces heavy tail events during high concurrency. We prefer predictable micro-latency over occasional faster uncontended writes.\n- Async reclamation CPU/GPU cycles: reclamation consumes spare CPU/GPU bandwidth and can increase overall resource usage. We mitigate by rate-limiting and running reclamation during known low-CPU windows or when autoscaler detects spare capacity.\n- Compaction vs eviction speed: background compaction reduces fragmentation and future evictions but can delay immediate availability of memory. We bound compaction window and fall back to simple slab-eviction when latency SLOs are under threat.\n\nMetrics to track: eviction stalls (ms), percent of batches encountering mid-batch eviction, OOM count per hour, average resident_set_ratio, fragmentation_score, lease-contention-rate, write-path p50/p95 latency, throughput (tokens/s) under long-context workloads.\n\nWhy unique vs prior approaches: existing experiments we ran explored page-striping and pipe-lined prefetch. This approach focuses on eliminating on-path destructive operations via leases and moving expensive state mutations offline via epoched reclamation, which preserves continuous-batching latency while improving memory efficiency over time.",
+  "technical_notes": [
+    "Lease token layout: 32-bit monotonic sequence + 16-bit owner id + flags (dirty/pinned)",
+    "Lease fast-path: atomic compare-exchange on a 64-bit lease word in GPU-shared metadata; fallback to COW path allocates a new block in the per-GPU allocator",
+    "Epoch reclamation: per-GPU epoch counter advanced by scheduler at batch boundaries; reclaimers only retire fragments older than current_epoch - 2 to guarantee in-flight readers are safe",
+    "Compaction strategy: minibatch-sized compaction (64KB coalesce windows) so GPU memcpy is amortized across many fragments; full compaction is rare and rate-limited",
+    "Prefetch profiles derived from telemetry: short=next 2 micro-batches, medium=next 8 micro-batches, long=30s sliding window for chat-style sessions"
+  ],
+  "acceptance_criteria": [
+    "No KV corruption regressions in 72h fuzzing + stress harness compared to baseline",
+    "<5% increase in steady-state write p95 latency in microbench for uncontended workloads",
+    ">15% reduction in mid-batch eviction incidents measured on long-context internal benchmark (context=128k tokens, mixed tenants)",
+    "End-to-end p99 latency for streaming requests does not regress more than 10% under simulated production load"
+  ],
+  "rollout_plan": [
+    "Feature gated behind runtime flag runtime.kv.writer_lease (default off)",
+    "Canary rollout: enable on 5% of traffic on dedicated cluster A for 48h; collect metrics and flamegraphs",
+    "Gradual ramp: 5% -> 25% -> 50% -> 100% across 1 week with health gates (OOMs, eviction stalls)",
+    "Fallback: automatic disable and fallback to previous code path if p99 latency or OOM spikes beyond threshold"
+  ],
+  "linked_docs": [
+    "https://confluence.redwood.ai/display/INF/KV+Writer+Lease+Design",
+    "gs://redwood-design/kvcache/epoch-reclaim-sim.ipynb",
+    "https://dashboard.redwood.ai/r/dashboards/kvcache/fragmentation-heatmap"
+  ],
+  "prs": [
+    "https://github.com/redwood-inference/runtime/pull/5789 (writer-lease core)",
+    "https://github.com/redwood-inference/runtime/pull/5797 (reclamation workers + metrics)",
+    "https://github.com/redwood-inference/benchmarks/pull/213 (long-context benchmarks)"
+  ],
+  "test_plan": [
+    "Unit tests for lease acquisition/release, lease-expiry edge cases",
+    "Integration test: synthetic multi-writer workload that previously reproduced corruption; verify correctness with writer_lease enabled",
+    "Load test: 72-hour soak on dedicated cluster with mixed tenants and long-context suite",
+    "Fault injection: force reclaim-workers to be delayed and ensure scheduler back-pressure prevents OOM"
+  ],
+  "progress_updates": [
+    "2026-02-25: Triage and spec drafted (Aisha) - identified writer race from incident INC-2026-02-18",
+    "2026-02-28: Prototype of lease fast-path implemented; microbench shows +0.4ms median write cost under uncontended load (Marco)",
+    "2026-03-03: Built epoch reclaim simulator (notebook linked); simulated 12% fewer evictions vs baseline with bounded reclamation budget",
+    "2026-03-06: Internal review with Applied ML + Infra - agreed on compaction window limits and back-pressure signals (notes in Confluence)",
+    "2026-03-10: PRs opened (see list). Running 48h canary on staging cluster; initial telemetry shows 7% p50 latency improvement and 18% fewer OOM events on long-context synthetic tests"
+  ],
+  "dependencies": [
+    "ENG-33412",
+    "ENG-36107",
+    "ENG-41234"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.21",
+  "security_review_required": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "technical_notes",
+    "acceptance_criteria",
+    "rollout_plan",
+    "test_plan",
+    "progress_updates"
+  ],
+  "dataset_doc_uuid": "dsid_ef1a210e6bbf41a490827c51e4fb62f2"
+}

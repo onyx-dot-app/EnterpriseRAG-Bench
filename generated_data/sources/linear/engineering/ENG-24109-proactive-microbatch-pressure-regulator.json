@@ -1,0 +1,72 @@
+{
+  "key": "ENG-24109",
+  "team": "engineering",
+  "title": "Proactive Microbatch Pressure Regulator with KV-aware Admission",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-03-05",
+  "creator": "Asha Menon",
+  "assignee": "Diego Alvarez",
+  "project": "runtime-efficiency-2026",
+  "cycle": "2026-W06",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "batching",
+    "kv-cache",
+    "gpu-memory",
+    "backpressure",
+    "p0",
+    "admission-control"
+  ],
+  "parent_issue": [
+    "ENG-17555"
+  ],
+  "dependencies": [
+    "ENG-21987",
+    "ENG-20801"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.21",
+  "description": "Summary:\nSustained high QPS workloads are triggering cascading resource pressure in the serving runtime: microbatch admission spikes (larger microbatches), KV-cache thrashing, and periodic GPU memory exhaustion leading to request failures and p95/p99 latency spikes. Current admission logic reacts to instantaneous queue depth and simple CPU/GPU free memory signals; it does not account for KV footprint per-request, short-term QPS trends, nor the cost of enlarging a microbatch (increased KV memory + temporary KV-copy overhead).\n\nGoal:\nDesign and implement a proactive admission \"pressure regulator\" that smooths microbatch growth under rising QPS by predicting short-window memory pressure and throttling admission earlier, while coordinating with KV eviction heuristics and autoscaler signals to avoid hard OOMs and large latencies. The regulator must preserve throughput for latency-sensitive customers where possible and degrade predictably (soft-shed, route to variants) for best-effort traffic.\n\nRequirements / Constraints:\n- Keep end-to-end 95th and 99th percentile token latency within existing SLOs for standard-tier models during bursts.\n- Avoid GPU OOMs and high-frequency KV evictions that increase latency variance.\n- Minimize throughput loss compared to current max-throughput behavior.\n- Backwards-compatible: feature gated per-pool and per-model; allow opt-out.\n- Observable: provide new metrics (see Acceptance Criteria).\n\nProposed approach (high level):\n1) Short-term predictive headroom estimator:\n   - Maintain an exponential moving window of arrival rate (1s, 5s, 30s buckets) + microbatch completion rate.\n   - Estimate per-request average KV footprint (bytes) and expected KV growth when microbatch size increases (KV-coalescing overhead).\n   - Combine with per-GPU memory budget and reserved safety headroom to compute a predicted free-memory curve over the next 5\u201330s.\n\n2) Admission \"pressure regulator\" component in front of microbatcher:\n   - Instead of a fixed microbatch cap, compute an admission score per request: score = f(current_q, predicted_headroom, request_kv_est, priority).\n   - If score < threshold -> delay admission (short backoff) or soft-shed (route to cheaper model variant / fallback path) depending on request priority and customer tier.\n   - Use hysteresis to prevent oscillations (upper/lower thresholds + minimum hold time).\n\n3) KV-aware admission and dynamic microbatch ceiling:\n   - Tag active requests with estimated KV-size (fast heuristic based on prompt length + cached-prefix hits).\n   - Compute microbatch ceiling per-pool as a function of predicted KV memory increase rather than only GPU free memory.\n   - Prefer narrow microbatches for KV-heavy requests, allow larger microbatches for short prompts.\n\n4) Coordinated KV eviction policy improvements:\n   - Implement KV priority buckets (hot/prefetch/warm) and evict from warm first.\n   - When pressure regulator predicts sustained pressure, switch eviction to aggressive compression and demote prefetch entries to disk-backed compressed store.\n\n5) Autoscaler and pool orchestration integration:\n   - Emit early \"proactive_pressure\" signal to autoscaler to pre-warm extra workers when predicted headroom falls below threshold for >15s.\n   - When autoscaler cannot provision fast enough, regulator raises soft-shed rate gradually.\n\n6) Fallback & customer-facing behavior:\n   - For enterprise/dedicated customers with reserved capacity, prefer autoscaler and pre-warming; only soft-shed if reserve exhausted.\n   - For hosted tiers, return well-defined 429 with Retry-After or route to cheaper model variant with metadata describing degradation.\n\nImplementation plan:\n- Phase 1 (2 weeks): Implement headroom estimator + new metrics; unit tests for estimator correctness; small benchmarking harness to compare predicted vs real memory curve.\n- Phase 2 (3 weeks): Implement admission regulator with simple thresholding and per-request KV estimation; run load tests in staging on canary pool.\n- Phase 3 (2 weeks): Add KV-priority buckets and demotion-to-compressed-store code path; integrate with admission regulator decisions.\n- Phase 4 (2 weeks): Autoscaler signal integration + rollout plan; extend telemetry and dashboards; prepare runbook.\n\nTrade-offs & alternatives considered:\n- Reactive hard-shed on OOM vs predictive soft-shed: predictive soft-shed reduces p99 latency spikes but may reduce peak throughput slightly. We prioritize SLO stability over absolute peak throughput for this feature.\n- Per-request exact KV measurement (expensive) vs heuristic estimation: we use heuristics (prompt length, model tokens, cache hit indicator) to keep admission cheap.\n- Eviction to compressed disk-backed store vs aggressive in-memory eviction: disk demotion preserves useful KV entries at higher latency cost; combined with admission this keeps p95 stable.\n\nMetrics to track (new):\n- proactive_headroom_estimate_bytes (gauge per-worker)\n- predicted_vs_actual_memory_error_ratio (histogram)\n- regulator_delay_count / regulator_soft_shed_count (counter)\n- microbatch_size_distribution_by_kv_bucket (histogram)\n- kv_eviction_rate_by_bucket (counter)\n- p50/p95/p99 token latency per-pool during regulator on/off A/B tests\n\nSafety & rollout:\n- Feature-flagged per-pool; default OFF for top 5 production pools.\n- Canary rollout to isolated staging pools, then to a low-traffic hosted pool for 48h.\n- Metric-based gating: cannot proceed if p95 increases >10% or successful throughput drops >15% relative to baseline for protected customers.\n\nAcceptance criteria (see separate list):\n- New headroom estimator shows <20% median error vs actual memory curve in staging at 5s and 30s horizons.\n- During a synthetic high-QPS test, p99 latency decreases by at least 25% vs current reactive system and no GPU OOMs are observed.\n- Soft-shed behavior is exercised and clients receive clear retry/variant metadata.\n\nNotes / open questions:\n- Need telemetry to measure per-request KV footprint for model families (cost to enable: ~2% overhead). Approve? (see comment thread).\n- How aggressively should private/dedicated pools be allowed to pre-empt soft-shed? Proposal: respect contract+reserved headroom flag.\n- Coordination with billing/quota: if we route to cheaper variant, should that be counted differently in billing? Ask Product.\n",
+  "acceptance_criteria": [
+    "Headroom estimator error <20% median at 5s/30s horizons in staging",
+    "No GPU OOMs in 2-hour sustained high-QPS stress test",
+    "p99 token latency reduced by >=25% compared to baseline in high-QPS scenario",
+    "Regulator metrics present on console dashboard and alerts configured",
+    "Canary rollout completed with metrics gating and runbook verified"
+  ],
+  "comments": [
+    "2026-02-11 - Asha Menon: Initial write-up. Suggest we reuse the 'predicted headroom' proto from ENG-20801 to avoid duplicate signals.",
+    "2026-02-14 - Priya Shah: Reviewed \u2014 +1 for per-request KV heuristic, but we need a config knob to disable per-request tagging for low-latency mode.",
+    "2026-02-18 - Diego Alvarez: Implementing phase 1. Prototype headroom estimator completed locally; attaching benchmark results to the PR.",
+    "2026-02-23 - Diego Alvarez: PR opened for headroom estimator: https://github.com/redwood-inference/runtime/pull/4821",
+    "2026-02-28 - ML Infra (J. Nguyen): Load test plan uploaded to Drive: https://drive.redwood.ai/drive/folders/pressure-regulator-load-tests",
+    "2026-03-03 - Sienna Park (PM): Please confirm user-visible error codes and docs text for soft-shed behavior before phase 3. See doc: https://confluence.redwood.ai/display/RUNTIME/Pressure+Regulator+Design"
+  ],
+  "attachments": [
+    "https://github.com/redwood-inference/runtime/pull/4821",
+    "https://drive.redwood.ai/drive/folders/pressure-regulator-load-tests",
+    "https://confluence.redwood.ai/display/RUNTIME/Pressure+Regulator+Design",
+    "s3://redwood-artifacts/benchmarks/pressure-regulator/staging-2026-02-20.tar.gz"
+  ],
+  "linked_prs": [
+    "https://github.com/redwood-inference/runtime/pull/4821"
+  ],
+  "implementation_steps": [
+    "Add EMAs for arrival/completion rates and per-request KV heuristics (Phase 1)",
+    "Implement regulator admission scoring and hysteresis (Phase 2)",
+    "Add KV priority buckets and demotion-to-compressed-store path (Phase 3)",
+    "Integrate autoscaler signals and variant-routing for soft-shed (Phase 4)",
+    "Create dashboard panels and set alerts for new metrics"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "implementation_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_594a89d5d8024ce58d6ad33d7d22cb1c"
+}

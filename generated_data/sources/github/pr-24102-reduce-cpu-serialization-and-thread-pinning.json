@@ -1,0 +1,89 @@
+{
+  "repo": "redwood",
+  "pr_number": "24102",
+  "title": "Reduce CPU serialization overhead and introduce request-affine thread pinning",
+  "author": "Priya Natarajan",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-02-21",
+  "merged_at": "2026-02-21",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/runtime/cpu-path-optimizations",
+  "reviewers": [
+    "Ethan Cole",
+    "Mar\u00eda Alvarez",
+    "Jasper Liu"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "infra",
+    "p0"
+  ],
+  "linked_linear": [
+    "ENG-9123",
+    "ENG-9180"
+  ],
+  "linked_jira": [
+    "SUP-3412"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "894",
+  "deletions": "317",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "description": "Motivation: production canaries showed CPU-side stalls in the request path under medium tail-load (concurrent short requests). Root cause analysis indicated three correlated issues: a global serialization lock in the request marshalling path, KV-cache read contention on a small number of shards, and excessive cross-thread wakeups from the executor when continuous batching is active. This PR addresses those CPU-side bottlenecks with low-risk, togglable changes that reduce serialization overhead and make scheduling request-affine so hot requests avoid context migration.\n\nSummary of changes: I) Replace global request-serialization mutex with per-worker small-buffer fast-path using FlatBuffers for marshalling and a fallback to proto when necessary. II) Introduce a request-affine thread-pool (request-affine executors) that pins a request's lifecycle to a CPU core group to reduce cache churn during multi-stage request handling. III) Add a lock-free fast read path for KV-cache using a seqlock-style version stamp per shard plus per-shard read counters, and shard rebalancer to spread hot keys. IV) Reduce continuous-batching wakeups by batching wake signals and using a wait-free work-stealing hint for low-latency tails.\n\nPerformance impact (canary + micro-bench): - End-to-end P50: -6% latency, P95: -14%, P99: -18% for short inference (<128 tokens) workloads. - CPU sys time on sandboxed 8-vCPU nodes: -35% for the runtime process when under 500rps of small requests. - Throughput improved by ~9% in multi-tenant density tests due to reduced serialization stalls.\n\nRollout plan: flags added to runtime config and console: runtime.cpu_optimizations.enabled (default: false), runtime.request_affinity.policy (off|pinned|affine). Default rollout: enable on Dedicated clusters for canary group A (5% traffic) for 72 hours, compare P99 and host CPU; if stable, increase to 25% then 100%. Quick rollback: set runtime.cpu_optimizations.enabled=false -> instant drain-of-new-requests (no binary change).\n\nCompatibility and safety: changes are behind config flags. No model artifacts changed. Unit and integration tests added. This is not a breaking API change.\n\nChecklist: - [x] Unit tests for serialization fast-path and fallback - [x] KV-cache microbench and canary harness - [x] End-to-end canary config + dashboard widgets - [x] Documentation for new runtime flags and helm values - [x] Security review (no secrets touched)\n\nCommits: detailed below.\n\nNotes for reviewers: focus review on correctness of the seqlock implementation (KV-cache) and on potential live-migration interactions with request affinity. I added a conservative fairness timer on the affine pool (200ms) to avoid starvation of low-priority background tasks.\n\nAdditional context: This work was driven by ENG-9123 (investigate CPU stalls) and is intended to be low-risk stepping-stone; the next PR will expose adaptive shard sizing and per-tenant affinity policies.",
+  "commits": [
+    "a3f9b7c core: add flatbuffer marshalling fast-path with fallback to proto",
+    "b7d21a2 scheduler: introduce request-affine thread pool and pinning hooks",
+    "c4e6f1b kv-cache: add shard seqlock and hot-key sharder",
+    "d9f2aae batching: reduce wakeups and add work-stealing hint",
+    "f1bb4ee tests: add microbench and end-to-end canary config"
+  ],
+  "files_changed": [
+    "src/runtime/request_marshaller.cpp",
+    "include/runtime/request_marshaller.h",
+    "src/runtime/scheduler/affine_pool.cpp",
+    "include/runtime/scheduler/affine_pool.h",
+    "src/runtime/kv_cache/shard_seqlock.cpp",
+    "src/runtime/kv_cache/shard_seqlock.h",
+    "src/runtime/batching/continuous_batcher.cpp",
+    "tools/perf/canary/configs/cpu_affinity_canary.yaml",
+    "tests/kv_cache/seqlock_tests.cpp",
+    "tests/perf/short_infer_bench.cpp",
+    "docs/runtime/flags.md",
+    "helm/redwood/values-runtime.yaml"
+  ],
+  "diff_snippets": [
+    "src/runtime/request_marshaller.cpp: replaced global std::mutex g_serialize_lock with per-worker SmallBufferSerializer fast-path; fallback uses existing ProtoSerializer::serialize(req)",
+    "src/runtime/scheduler/affine_pool.cpp: new AffinePool::submit(request) pins thread via cpu_set and stores affinity token on RequestContext; added fairness timer to rotate affinity slots",
+    "src/runtime/kv_cache/shard_seqlock.cpp: implemented seqlock read pattern: snapshot version -> read values -> fence -> check version even; added per-shard hot_count atomic counter for rebalancer"
+  ],
+  "review_comments": [
+    "Ethan Cole: Can you explain why FlatBuffers was chosen over msgpack/Cap'n Proto here? Concerned about copying semantics on large metadata blobs.",
+    "Priya Natarajan (reply): FlatBuffers allows zero-copy read after the initial marshal and a compact encoding for our thin request envelope; large metadata still falls back to proto path to avoid regressions. Measured copy reduction ~60% on the marshalling hot path.",
+    "Mar\u00eda Alvarez: The seqlock read path looks OK but need to make sure we don't observe a torn pointer on 32-bit hosts. Add static_assert on pointer-size or ensure 64-bit-only compilation for that file.",
+    "Priya Natarajan (reply): Added BUILD guard; seqlock implementation compiled only on 64-bit targets and fallback locking path retained for 32-bit. Updated tests to assert build-time guard.",
+    "Jasper Liu: Bench results are impressive. Please confirm this does not degrade long-running batch workloads ( >1024 tokens ).",
+    "Priya Natarajan (reply): Verified in perf suite: large-batch throughput unchanged (+1% variance). Continuous batching timers are untouched for large requests; affinity only affects short-request lanes by default.",
+    "Ethan Cole: small nit, add a comment in affine_pool about the fairness timer and why value is 200ms",
+    "Priya Natarajan (reply): Added explanatory comment and a unit test that verifies fairness timer rotates affinity after 200ms under synthetic load."
+  ],
+  "ci_checks": [
+    "linux-unit-tests: pass",
+    "macos-unit-tests: pass",
+    "integration-canary: pass",
+    "perf-regression: pass",
+    "lint: pass"
+  ],
+  "release_notes": "runtime: reduce CPU serialization and add request-affine thread pinning behind a flag; P99 latency improved for short requests; rollout behind canary flag. See docs/runtime/flags.md for config and helm/redwood/values-runtime.yaml for helm values.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_comments",
+    "diff_snippets",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_38dcf60e48d348dca1bd8f838eaaf23d"
+}

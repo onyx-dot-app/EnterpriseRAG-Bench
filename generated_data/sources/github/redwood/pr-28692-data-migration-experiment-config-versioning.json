@@ -1,0 +1,70 @@
+{
+  "repo": "redwood",
+  "pr_number": "28692",
+  "title": "Data migration: experiment config versioning + schema migrations (beta)",
+  "author": "Michael Nguyen",
+  "created_at": "2025-03-22",
+  "updated_at": "2025-03-27",
+  "merged_at": "2025-03-27",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/experiment-config-versioning-migrations",
+  "reviewers": [
+    "Ethan Park",
+    "Benji Okafor",
+    "Jordan Lee",
+    "Chloe Martin",
+    "Rafael Mendes",
+    "Kaitlyn Nguyen"
+  ],
+  "labels": [
+    "platform",
+    "control-plane",
+    "migrations",
+    "rollouts",
+    "beta",
+    "backend"
+  ],
+  "linked_linear": [
+    "ENG-9021",
+    "ENG-9023",
+    "ENG-9034",
+    "PM-482"
+  ],
+  "linked_jira": [
+    "SUP-24910"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "31",
+  "additions": "1184",
+  "deletions": "312",
+  "release_notes": "Control plane now persists a schema version with experiment configs and can transparently migrate older configs during beta schema evolution. No user-facing changes in Console (yet), but enables safe rollout of new required fields and validation rules.",
+  "body": "Summary This PR introduces first-class schema/versioning for route experiment configs and a migration pathway so we can evolve the experiment schema during beta without breaking existing saved experiments or cached configs in the policy engine/router. Motivation During beta we\u2019ve iterated quickly on the experiment config structure/validation (e.g., stickiness key defaults, allocation validation, and guardrail-related fields). We currently store the experiment config as a \u201cbest-effort\u201d JSON blob with implicit shape. This has caused two classes of issues: (1) older configs fail new validations on read/update, blocking customers from stopping/ramping experiments; (2) downstream components (config cache / evaluator) can\u2019t reliably interpret configs across versions, which shows up as missing/stale results in Console for some experiments (see SUP-24910 for one representative case where results appeared stale after a schema change + cache refresh). What\u2019s in this PR 1) Schema versioning - Add explicit schema_version field to experiment config persistence (control plane DB) and to the in-memory model returned by the Experiment Service API. - schema_version is an integer starting at 1. New writes default to CURRENT_SCHEMA_VERSION. - The API includes schema_version in read/list responses. - The config digest/etag now includes schema_version to avoid cache collisions. 2) Migration framework - Add a lightweight migration registry (migrations from_version -> to_version) with deterministic transforms and validation. - Migrations are applied server-side on read and on mutation (create/update/start/stop) via a single code path: load -> migrate_to_current -> validate -> proceed. - Migrations are idempotent and safe to re-run. We persist the migrated blob back to storage only when a write path occurs OR when the new background job runs (see below). 3) Concrete migrations included - v0 (implicit) -> v1: Normalize route identifiers into route_id_template (if older configs stored raw path). Populate missing stickiness fields with safe defaults (do NOT default to low-entropy values; if missing, mark stickiness_mode=UNSPECIFIED and rely on evaluator\u2019s existing precedence rules). Ensure allocation percentages are normalized to a 0..10000 basis_points representation. - v1 -> v2 (guarded, not enabled by default yet): Adds a placeholder shape for eligibility (empty rules array) so downstream can assume the field exists. NOTE: CURRENT_SCHEMA_VERSION remains 1 in this PR; v2 migration is included but not activated. This is intentional so we can land the framework before we flip the schema. 4) Background backfill job (opt-in) - Add an internal admin job experiment_config_backfill_migrate that scans configs with schema_version < CURRENT_SCHEMA_VERSION and rewrites them after migrating + validating. - The job is rate-limited and supports a dry-run mode that emits metrics only. - This is behind an internal feature flag (admin-only) and is not required for GA; it\u2019s primarily for reducing read-time migration overhead and smoothing upcoming schema bumps. 5) Observability and safety - Metrics: experiment_config_migration_attempt_total{from,to,result}, experiment_config_migration_latency_ms, and experiment_config_migration_failure_total{reason}. - Audit: include schema_version_before and schema_version_after on update/start/stop audit events (no change diff expansion beyond what we already export; just extra fields). - Rollback: evaluator remains backward compatible with v0/v1 (it already tolerates missing fields); this PR makes that compatibility explicit in code comments/tests. Key design decisions - We migrate on read (and validate post-migration) to ensure older configs remain operable even if backfill hasn\u2019t run yet. - We do NOT automatically persist migrated configs on read to avoid surprise write amplification. Persisting happens on explicit mutation or via the admin backfill job. - We include schema_version in the cache key/etag so a schema bump forces a clean refresh in downstream caches. - CURRENT_SCHEMA_VERSION is a constant in the control plane service; bumping it requires adding a migration and updating tests. Changed areas (high level) - control-plane/experiment-service - DB schema: add schema_version column to experiment_configs (default 1 for new rows; nullable for existing rows to represent v0 during rollout). - Persistence: hydrate schema_version with null => 0 semantics to allow staged migration without rewriting the world. - API: include schema_version in ExperimentConfig and ExperimentSummary. - Migration framework: migrations/registry + unit tests. - policy-engine integration - Cache key changes: include schema_version in config digest used by the evaluator\u2019s local cache. - Added a small compatibility test ensuring v0 configs still evaluate without panic and produce deterministic assignment. - ops/admin - Backfill job implementation + flags: --dry-run, --max-updates, --qps, --tenant-allowlist. - Runbook snippet in code comments (full runbook lives in Confluence; this PR only wires metrics names). Example snippets (illustrative) - Before (v0-ish) {\"route\":\"/v1/chat/completions\",\"variants\":[...],\"allocation\":{\"a\":50,\"b\":50}} - After migration to v1 {\"schema_version\":1,\"route_id_template\":\"/v1/chat/completions\",\"variants\":[...],\"allocation_basis_points\":{\"a\":5000,\"b\":5000},\"stickiness_mode\":\"UNSPECIFIED\"} Testing - Unit tests for each migration (golden JSON fixtures). - Integration tests: config read -> migrate -> validate -> start/stop does not fail for legacy experiments. - Added a test for cache key invalidation when schema_version changes. Rollout plan - Land this PR behind existing route experiments feature flag (no behavior change for non-beta tenants). - Enable read-time migrations for all beta tenants immediately (server-side only). - Run backfill job in dry-run in staging; review migration failure metrics. - Run backfill job in production for allowlisted beta tenants (low QPS) after 48h of clean read-time migrations. Reviewer notes / discussion - Jordan Lee: \u201cEnsure schema_version is not included in bucketing hash inputs.\u201d Response: Confirmed; evaluator hashes experiment_id + variant_ids + stickiness key only. schema_version is cache/meta only. - Ethan Park: \u201cBe careful with null => 0 semantics; make sure new writes don\u2019t accidentally store 0.\u201d Response: Added DB default + application-side default assignment on insert. Added a guard that rejects writes with schema_version=0. - Kaitlyn Nguyen: \u201cAudit export should include schema transition so enterprise customers can prove config hygiene.\u201d Response: Added schema_version_before/after to experiment audit payload; redaction rules unchanged. - Rafael Mendes: \u201cBackfill job needs a hard cap + dry-run.\u201d Response: Implemented --max-updates and --dry-run, plus QPS limiter. Checklist - [x] Backward compatible read path for existing configs - [x] Cache key updated to avoid version collisions - [x] Metrics + logs for migrations - [x] Admin backfill job supports dry-run and limits - [x] Tests for migration transforms and evaluator compatibility - [x] Linear links + support incident reference CI - build-and-test: pass - lint: pass - unit-tests: pass - integration-tests: pass Merge - Squash merged into main by Michael Nguyen",
+  "commits": [
+    "experiment-service: add schema_version column and model plumbing",
+    "migrations: introduce registry + v0->v1 transforms + tests",
+    "api: include schema_version in list/get responses and etag",
+    "policy-engine: cache key update + legacy config compatibility test",
+    "ops: add admin backfill job with dry-run + rate limiting",
+    "observability: migration metrics + audit fields schema_version_before/after"
+  ],
+  "changed_files": [
+    "control-plane/experiment-service/db/migrations/20250322_add_schema_version_to_experiment_configs.sql",
+    "control-plane/experiment-service/src/models/experiment_config.ts",
+    "control-plane/experiment-service/src/migrations/registry.ts",
+    "control-plane/experiment-service/src/migrations/v0_to_v1.ts",
+    "control-plane/experiment-service/src/services/experiment_config_loader.ts",
+    "control-plane/experiment-service/src/api/experiments_controller.ts",
+    "policy-engine/src/cache/experiment_config_cache.ts",
+    "policy-engine/src/evaluator/experiment_evaluator.test.ts",
+    "ops/admin-jobs/src/experiment_config_backfill_migrate.ts",
+    "observability/src/metrics/experiment_config_migration.ts",
+    "security/audit/src/events/experiment_events.ts"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_839eb68463f74e6e91de09f37687ce2d"
+}

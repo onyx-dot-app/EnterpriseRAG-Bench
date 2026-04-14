@@ -1,0 +1,37 @@
+{
+  "title": "stochastic-fusion-exercise-notes",
+  "owner": "Aisha Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/stochastic-fusion-exercise-notes.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-02",
+  "last_modified": "2026-02-18",
+  "collaborators": [
+    "Kevin Zhao",
+    "Mariana Gomez",
+    "Oliver Chen"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "profiling",
+    "attention-kernel",
+    "FlashAttention",
+    "paged-attention",
+    "fused-ops",
+    "latency",
+    "throughput",
+    "kv-cache"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/842",
+    "INF-2173",
+    "confluence.redwood.ai/display/SRV/Attention+Kernel+Notes"
+  ],
+  "body": "Purpose: quick exploratory playbook for stochastic/fuzzy probing of fused-op vs. FlashAttention vs. paged-backed attention across mixed-sequence workloads. Aim is narrow: find low-effort kernel-decision heuristics that reduce p99 tail without regressing steady-state throughput.\n\nBackground/context:\n- Recent customer load with many short chat turns + occasional long context (up to 4k) shows spiky p99 on H100 clusters.\n- Hypothesis: kernel handoffs + prefetch thrash on mixed seqlen mixes cause microstutters. Fused-op paths are great when they stay hot; FlashAttention better for long sequences when memory locality holds. Paged-backed attention avoids OOM but may induce extra copy overhead.\n\nQuick experiment matrix (run on h100-gpu-2, CUDA 12.2):\n- Models: gpt2-medium (12B-like perf proxy), llama-13b-16k (dense kernel exercise)\n- Kernels: flash, paged, fusedops, hybrid-fallback (our runtime's on-the-fly switch)\n- Seq mixes: short-heavy (80% 32/20% 128), mixed (50/30/20 -> 16/128/1024), long-spike (95% 64, 5% 4096)\n- Batches: 1, 8, 32 (simulate inference ladder)\n- Metrics: tokens/sec (steady), p50/p95/p99 latency (ms per request), kernel-switch counts, GPU memcpy counts, CPU-side scheduling stalls (ms), page-faults if any.\n\nCommands used (dev harness):\npython -m bench.attn_run --model gpt2-medium --seq-mix \"32:0.8,128:0.2\" --batch-sizes 1,8,32 --kernels flash,fused,paged,hybrid --profile --trace=traceplay_$(date +%s).nsys\n(artifact collection: nvtx + Nsight systems + runtime trace logs under /tmp/attn_play/)\n\nRepresentative results (summary):\n- Short-heavy, batch=8: fusedops best steady throughput (tokens/sec +12% vs flash), p99=18ms vs flash p99=26ms. Kernel switch rate low.\n- Mixed, batch=8: hybrid-fallback yields best p99 (28ms) by avoiding late fallback storms; fusedops p99=45ms due to occasional fallback to slower tiled path when a 1024 sequence arrives mid-batch. Flash p99=60ms because of transient memory pressure and prefetch thrash.\n- Long-spike, batch=1: FlashAttention wins for single long request (tokens/sec higher, p99 lower) but causes brief GC-like memory reclamation that increases subsequent short-request p99 by ~35ms unless KV cache warmup allowed.\n\nTelemetry notes observed in traces:\n- Kernel handshake latency spike correlates with 'kv-alloc' events at ~24ms when long seq enters node.\n- CUDA memcpy peaks align with paged path on long spikes; paged reduces peak GPU mem but increases PCIe traffic.\n- Scheduler log shows queue re-ordering (our micro-batcher tries to coalesce but drops to FIFO when hybrid-fallback toggles), producing small head-of-line blocking.\n\nQuick hypotheses (ranked):\n1) Reduce kernel handoff frequency by hysteresis on fallback (require sustained seqlen signal for N consecutive requests before switching).\n2) Introduce ephemeral pre-warming for KV cache when a long request is detected but keep it limited-time to avoid memory blowup.\n3) Bias the micro-batcher to prefer short-request fast-path packing when overload detected (sacrifices a few long-request tokens/sec for overall p99).\n\nMicro-experiment to validate hypothesis 1 (hysteresis):\n- Config patch: fallback_hysteresis.window=3 (must see 3 long seqs in a row to switch), fallback_hysteresis.cooldown=10s.\n- Result: on mixed load, kernel switches dropped 78%, p99 improved from 45ms to 29ms, steady throughput -2%.\n- Cost: slight increased latency for first long-request but better global tail.\n\nNotes about instrumentation improvements needed:\n- Add lightweight kernel-switch counters exported to prometheus (label by model+seqlen-bin+node).\n- Emit nvtx ranges for 'kv-alloc' and 'kernel-handshake' consistently across kernels. Right now only flash path includes full NVTX.\n- Correlate CPU-thread wait-times with GPU kernel start times (traceplay already, but need automated post-processor that prints summary table).\n\nEdge cases and failure modes observed:\n- OOM recoveries on paged path sometimes invisible in runtime logs because driver reclaimed pages asynchronously; need explicit page-fault hooks and alerting.\n- Quantized fusedops (int8) shows larger variability when sequence mix changes \u2014 likely rounding introduced extra memory traffic patterns.\n\nImmediate next steps (owners):\n- (Aisha) Land the hysteresis config flag behind runtime feature flag + unit tests (Jira INF-2173). Target patch: small config + metrics. ETA: 1 week.\n- (Kevin) Add nvtx for handshake & kv-alloc in all kernel code paths; update traceplay postprocessor to generate a one-page summary. ETA: 2 weeks.\n- (Mariana) Run a two-day soak with 1% long-spike traffic on canary cluster, collect prometheus + traces. Focus on p99 regressions and any memory growth. ETA: 3 weeks.\n\nOpen questions to decide in design review:\n- What default hysteresis parameters for hosted vs dedicated tiers? (Sensible default vs conservative for enterprise?)\n- Should we add explicit pre-warm api to client to declare upcoming long-context requests? (Tooling vs runtime inference)\n\nAttachment pointers (in artifacts folder): traceplay_1709410201.nsight, perf-summaries/short-heavy-batch8.csv, hybrid-fallback-logs/2026-02-16.log\n\nNotes-to-self / quick checklist before PR:\n- add unit test for fallback window boundaries\n- add e2e soak job in infra that can replay mixed seq workload using stored traces\n- sanity-check memory accounting metrics against nvidia-smi every 30s in soak runs\n\nAppendix (raw sample numbers):\n- mixed batch=8: fusedops steady tokens/sec 12.4k, flash 11.1k, hybrid 11.7k. p50/p95/p99 fusedops 9/34/45ms, flash 12/41/60ms, hybrid 11/29/28ms.\n- short-heavy batch=8: fusedops p99 18ms (tokens/sec 14.8k)\n- long-spike batch=1: flash p99 190ms (single long-request optimized path), fusedops p99 275ms due to fallback stall.\n\nIf anyone else wants to pick this up, read the traces under /tmp/attn_play/ and start from the hybrid run; the trace IDs are embedded in the log headers.\n\nEnd of notes.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_735d52a4074c4721824e54da8bbc8682"
+}

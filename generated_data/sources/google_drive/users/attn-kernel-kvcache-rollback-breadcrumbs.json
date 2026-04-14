@@ -1,0 +1,84 @@
+{
+  "title": "Attention kernel + KV cache rollback breadcrumbs",
+  "owner": "Aisha Patel",
+  "drive_area": "users",
+  "path": "users/aisha-p/experiments/attn-kernel-kvcache-rollback-breadcrumbs",
+  "doc_type": "doc",
+  "created_at": "2026-01-28",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Ethan Brooks",
+    "Marta Ruiz"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "kvcache",
+    "attention-kernel",
+    "seqlen",
+    "debug",
+    "rollback",
+    "kv-eviction"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/1423",
+    "INF-9876",
+    "https://confluence.redwood/internal/notes/kvcache-kernel-interaction"
+  ],
+  "summary": "Scratchpad for a recurring production repro where long-prefix requests occasionally produce garbled tokens after a kernel fallback / KV-cache rollback. Focus is on interaction between attention kernel selection, workspace allocation, and KV cache index alignment when sequence length crosses boundaries.",
+  "reproduction_steps": "1) Use model: llama-13b-8k (quantized q4f16) on dedicated node with GPUs: A100-80GB.\n2) Start runtime with env RW_KERNEL_POLICY=auto and RW_KVCACHE_ROLLBACK=enabled.\n3) Send two requests in sequence from same session: a long prompt (~3500 tokens) then a short continuation (~20 tokens) with streaming enabled.\n4) Observe occasional token corruption or sudden drop to low-quality completions on the continuation.\n5) Re-run with RW_KERNEL_POLICY=attn_unfused (force) and compare outputs and logs.",
+  "commands_tried": [
+    "# run trace with kernel/kvcache\nRUNTIME_TRACE=kernel,kvcache python tools/run_inference.py --model llama-13b-8k --session-id s1 --input-file long_prompt.txt --stream",
+    "curl -s -X POST https://internal-api.redwood/v1/complete -H 'Authorization: Bearer $TOKEN' -d @payload.json | jq '.choices[].text'",
+    "ENV: RW_KERNEL_POLICY=auto RW_ENABLE_KV_CACHE_ROLLBACK=1 bin/serve --config configs/dedicated-a100.json",
+    "# force fallback path\nENV: RW_KERNEL_POLICY=attn_unfused bin/serve --config configs/dedicated-a100.json",
+    "# reproduce locally with smaller model to iterate faster\npython tools/run_inference.py --model test-1b --session-id s2 --input-file long_prompt_small.txt --trace"
+  ],
+  "logs": [
+    "[2026-02-13T14:12:22Z] kernel_selector: selected=flash_attn_fwd_v2 workspace=18MB estimated_tokens=4096",
+    "[2026-02-13T14:12:22Z] kvcache: attach_session s1 prefix_len=3510 layers=32 dtype=q4f16",
+    "[2026-02-13T14:12:22Z] memmgr: allocate_workspace failed (align=256) requested=1966080 fallback=true",
+    "[2026-02-13T14:12:22Z] kernel_selector: fallback_to=attn_unfused reason=workspace_alloc_failure",
+    "[2026-02-13T14:12:22Z] KV_CACHE_ROLLBACK: session=s1 reason=kernel_change old_kernel=flash_attn_fwd_v2 new_kernel=attn_unfused action=evict_and_rebuild prefix_len=3510",
+    "[2026-02-13T14:12:23Z] kvcache: rebuild_complete session=s1 layers_rebuilt=32 time_ms=1143",
+    "[2026-02-13T14:12:23Z] decode: got_token=<0x00>  (weird low-entropy token stream)",
+    "[2026-02-13T14:12:25Z] request-id=rq_45 decode_error: output_mismatch detected compare_hash=0x4f3a"
+  ],
+  "kernel_selection_outputs": [
+    "kernel_selection dump: {model=llama-13b-8k, seq_len=3500, batch=1, preferred_kernels=[flash_attn_fwd_v2, flash_attn_fwd_v1, attn_unfused], memory_estimates={flash_attn_fwd_v2:18MB, attn_unfused:6MB}}",
+    "decision: flash_attn_fwd_v2 chosen because fastest; mem_check failed at allocation time -> fallback to attn_unfused",
+    "note: attn_unfused uses different KV layout (interleaved vs contiguous) leading to different offset calculation in kv_index.c"
+  ],
+  "kv_cache_observations": "Observed behavior: when kernel falls back mid-session, the rollback routine triggers an evict-and-rebuild of the KV cache. Rebuild completes but the first few tokens after rebuild sometimes decode to repeated low-entropy symbols. This correlates with sessions whose prefix length crossed multiples of 2048 (e.g., 2048 -> 3500) during the long prompt. When I artificially pad the initial prompt to a fixed block size (multiple of 2048) the issue frequency drops.",
+  "hypotheses": [
+    "Hypothesis A: Kernel-specific workspace alignment affects how KV cache offsets are computed; fallback leaves stale pointer arithmetic assumptions leading to off-by-N reads during first decode steps.",
+    "Hypothesis B: Rebuild routine doesn't fully reinitialize per-layer 'block_count' when seq_len > BLOCK_THRESHOLD (2048) causing early layers to read incorrect cache slices.",
+    "Hypothesis C: Quantized dtype (q4f16) + different kernel resharding causes accumulation/rounding errors in attention exp/softmax that are amplified for the first few tokens after rebuild.",
+    "Hypothesis D: Race between async KV rebuild and decode start: streaming path begins consuming tokens before all layer pointers are stable -> transient garbage tokens.\n"
+  ],
+  "attempted_fixes": [
+    "1) Force kernel to attn_unfused at runtime (RW_KERNEL_POLICY=attn_unfused) -> corruption stops but latency + memory usage increase (~12% latency p95).",
+    "2) Add fixed-padding to prompt to next 2048 boundary (pad tokens) -> issue frequency reduced significantly in tests.",
+    "3) Serializing rebuild: introduced small sleep(25ms) after rebuild in serving runtime -> flakiness reduced but not eliminated (race may be bigger).",
+    "4) Disabled rollback (RW_ENABLE_KV_CACHE_ROLLBACK=0) causing session to continue with old KV layout -> causes immediate decode mismatch and fails more often (worse).",
+    "5) Added extra zero-initialization for per-layer pointers in rebuild routine -> local toy repro seemed to improve but production still exhibits instances.\n"
+  ],
+  "experiment_results": "Summary: pinning kernel -> elimination of corruption in ~1000-run sample but costlier. Padding appears to be a practical mitigation for customer-facing systems but not a root fix. Race-delay reduces occurrences but suggests timing window. Disabling rollback is harmful. Small changes to rebuild init look promising in toy tests; need instrumentation in prod to confirm.",
+  "next_steps": "- Add a runtime invariant check: after rebuild, compute hash of each layer KV block and assert equality with rebuild-time computed digest before allowing decode to continue. Log digest mismatches with full memory offsets.\n- Instrument kernel selector to record exact workspace size/alignment and per-layer stride for both kernels.\n- Create minimal C++ repro (single GPU, synthetic model with same layer count) that forces fallback during long prefix to validate Hypothesis A/B.\n- Discuss trade-offs with infra: is pinning kernel for customers with heavy long-prefix workloads acceptable as fast mitigation? Prepare cost impact note.\n- If race confirmed: delay decode start until all per-layer digests validated or make rebuild synchronous for affected sessions.",
+  "notes": "Random incidental: one of the failing traces had a memmgr warning about alignment=512 vs expected=256; surprised because our allocator typically rounds up. Might be introduced when buffer is borrowed by attention kernel for scratchpad; follow that call chain next. Also suspect interplay with CUDA 12.3 driver changes (recent upgrade on staging) \u2014 reproduce on older driver to isolate.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "reproduction_steps",
+    "commands_tried",
+    "logs",
+    "kernel_selection_outputs",
+    "kv_cache_observations",
+    "hypotheses",
+    "attempted_fixes",
+    "experiment_results",
+    "next_steps",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_9b15e16771eb462eaf7c32779af9465a"
+}

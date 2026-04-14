@@ -1,0 +1,33 @@
+{
+  "title": "kernel nightshift checklist \u2014 Clara",
+  "owner": "Clara Nguyen",
+  "drive_area": "users",
+  "path": "users/kernel-nightshift-checklist-clara",
+  "doc_type": "doc",
+  "created_at": "2026-03-12",
+  "last_modified": "2026-03-13",
+  "collaborators": [
+    "Ishaan Patel",
+    "Mina Torres"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "nightshift",
+    "triage",
+    "kv-cache",
+    "p99",
+    "todo"
+  ],
+  "linked_artifacts": [
+    "JIRA-RINF-4721",
+    "github.com/redwood-inference/serving-runtime/pull/1293",
+    "slack:#runtime-oncall-thread-3"
+  ],
+  "content": "Quick context / purpose:\n- Night shift scratchpad for kernel-level triage. Keep short, actionable, copy/paste-friendly.\n- Goal: stabilize p99 regression on small requests path (seq len 8\u201332).\n\nRecent observed behavior (last 24h):\n- Baseline p99 for small requests ~52ms (steady).\n- Spike window: 02:10\u201303:40 UTC \u2014 p99 jumps to 200\u2013320ms for ~15m, then intermittent bumps for next hour.\n- CPU side traces show kernel wait spikes on worker threads servicing KV cache lookups.\n- Affected service: serving-runtime-gpu-prod-a (nv-rt-3) on region-us-west-2.\n\nImmediate triage checklist (do these first):\n- [ ] Check recent deploys / rollouts (last 2 hours). Command: \n    gcloud run revisions list --filter=\"service=serving-runtime-gpu-prod-a\" --format=\"table(name,createTime)\" | tail -n 10\n- [ ] Inspect SLO-alerts page + incidents: https://console.redwood/slo/serving-runtime/p99\n- [ ] Look at kernel ooms / dmesg on host suspected: ssh ops@nv-rt-3; sudo journalctl -u serving-runtime -n 500\n- [ ] Capture top and perf during an active spike window: sudo perf top -p $(pgrep runtime_worker) -g --no-children (leave running for 30s)\n\nHypotheses (ranked):\n1) KV-cache lock contention under thin requests due to unexpected cache misses causing sync fetches (most likely).\n2) Microbatch scheduling jitter: batcher wakes and serializes requests into a slow path for small sequences.\n3) CUDA/NUMA imbalance leads to bursts where a subset of worker threads stall on memory migration.\n4) New kernel patch on host bumped scheduler behavior (less likely but check host patches).\n\nQuick experiments to run (non-invasive):\n- EXP-A: Force async fetch fallback to measure latency delta. Add env var on one replica: RUNTIME_FORCE_ASYNC_KV=true. Watch for p95/p99 change only on that instance.\n- EXP-B: Reduce max_batch_delay to 2ms on a canary replica to see if latency smooths for small seqs. Config: serving-runtime/canary-3 route.\n- EXP-C: Temporarily disable KV LRU GC to check whether eviction is thrashing. (Only on isolated canary).\n\nCommands / snippets (save for copying):\n- Check recent kernel logs (host): sudo journalctl -k -n 500 | grep -i stall || true\n- Get runtime worker thread pids: ps aux | grep runtime_worker | awk '{print $2}'\n- Perf script snapshot: sudo perf record -F 200 -p $PID -g -- sleep 15; sudo perf script | c++filt | head -n 200 > /tmp/perf-snap.txt\n- Dump kv-cache stats endpoint: curl -s http://127.0.0.1:9102/debug/kv-cache | jq '.'\n\nNotes to self (observations I saw):\n- When I hit the /debug/kv-cache endpoint during a spike, hit rate dropped to 0.34 (from usual ~0.92). Eviction rate doubled.\n- One worker process showed long syscall wait times (futex) matching p99 spikes.\n- The host had an unmerged kernel update staged but not rebooted (check apt history).\n\nTL;DR quick runbook for night:\n1) Identify whether a deploy correlates with window. If yes -> rollback candidate -> talk to release-eng.\n2) If no deploy, enable EXP-A on single canary. Wait 10m.\n3) If EXP-A fixes p99 -> root cause likely kv-cache sync miss path -> follow PR template below.\n4) If EXP-A no change, try EXP-B. If EXP-B reduces latency but lowers throughput -> tune batcher heuristics.\n\nLonger-term follow ups / ticket notes (write to JIRA once confirmed):\n- RINF-4721: \"Investigate KV cache eviction + futex contention causing p99 spikes\" (draft)\n    - Attach perf flamegraphs, kv-cache dump, host dmesg.\n    - Owner: Clara. Expected ETA for fix: 1\u20132 sprints (hotfix may be backported).\n- Potential improvement: add async contagion path for cache miss that doesn't hold global lock.\n\nOwner TODOs (my checklist):\n- [ ] Run EXP-A canary tonight and monitor for 30m. (assign: Clara)\n- [ ] If EXP-A passes, open PR with simple async fetch flag and a unit test that simulates concurrent misses. (assign: Clara)\n- [ ] If EXPA fails, run perf recording during spike and attach to RINF-4721. (assign: Clara)\n- [ ] Ping release-eng if a rollback is required. Slack: @release-eng.\n\nUnresolved questions / what to ask the oncall backup:\n- Did any infra autoscaler events coincide with the spike? (ask infra team)\n- Any memory pressure events in monitoring (OOM killer logs) we missed?\n\nSmall ergonomics notes for future:\n- Add a quick /debug/kv-cache?short endpoint that returns just hit/evict/hit_rate to avoid heavy dumps during spikes.\n- Consider exposing futex wait histograms in runtime telemetry when compiled with +futex-stats flag.\n\nRandom brain-dumps (these are fuzzy, carry low priority):\n- Maybe we should add a background thread that prefetches predicted keys for short prompts (cheap heuristic).\n- Try switching to shared_mutex for read-mostly kv access if contention is confirmed.\n\nIf I get paged: immediate script to reduce blast radius:\n- curl -X POST https://ops.redwood/replica-scale -d 'service=serving-runtime-gpu-prod-a&replicas=1' (scale down heavy path)\n- Set route weight of canary to 100% if canary proves stable: admin-route-update --service serving-runtime --route small-requests --weight canary-3:100\n\nEnd-of-shift notes (to fill before handing off):\n- What I did, what I saw, next steps. Short and explicit.\n\n---\nLast quick snapshot (03/13/2026 05:12 UTC):\n- Started EXP-A on canary at 04:50 UTC. After 12m p99 reduced from ~280ms -> 60ms on canary only.\n- Global cluster still showing intermittent events but amplitude down.\n- Next action: open RINF-4721 with perf + kv dump and request micro-release for async fetch flag on 1 more node.\n\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_75b327cb333d41fbad0694637c3cb7b8"
+}

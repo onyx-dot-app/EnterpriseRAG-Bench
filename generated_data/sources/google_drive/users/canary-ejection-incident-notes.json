@@ -1,0 +1,35 @@
+{
+  "title": "Canary ejection incident notes",
+  "owner": "Evan Kim",
+  "drive_area": "users",
+  "path": "users/canary-ejection-incident-notes",
+  "doc_type": "doc",
+  "created_at": "2025-02-14",
+  "last_modified": "2025-02-16",
+  "collaborators": [
+    "Maya R. Singh",
+    "Jonah Park"
+  ],
+  "team": "eng-release-engineering",
+  "status": "draft",
+  "tags": [
+    "canary",
+    "rollback",
+    "ci",
+    "artifact",
+    "k8s",
+    "triage"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/platform/pull/987",
+    "https://jira.redwood.com/browse/RDW-3421",
+    "https://console.cloud.google.com/cloud-build/builds?project=redwood&build=20250214-1234",
+    "https://slack-redwood.slack.com/archives/C01DEPLOYS/p1676370000000"
+  ],
+  "content": "Notes-to-self: messy, fast, still iterating. Goal: capture commands I ran, error outputs, immediate hypotheses, and next steps for clean handoff.\n\nHigh-level summary:\n- Canary for release v2025.02.14 failed at 10% with latency spike and 5% error rate. Automated canary ejection triggered but rollback left some traffic on canary instances. Suspect artifact/digest mismatch + ingress sticky sessions.\n\nTimeline (rough):\n- 2025-02-14T10:02 UTC: CI -> build pushed image gcr.io/redwood/release:v2025.02.14-0a1b2c (digest sha256:aa11bb...).\n- 2025-02-14T10:10 UTC: deploy job started (deploy/canary-release). Helm chart applied with release tag v2025.02.14.\n- 2025-02-14T10:18 UTC: monitoring alerts: canary latency p95 jumped 3x, 5xx increase.\n- 2025-02-14T10:21 UTC: auto-eject triggered (traffic scaled back to stable), but traces show ~3 pods still receiving new sessions.\n\nCommands I ran (copyable):\n- kubectl -n prod get pods -l release=canary-v2025-02-14 -o wide\n  -> showed 5 pods, 2 in CrashLoopBackOff for a short window.\n- kubectl logs pod/canary-abc-0 -n prod --since=1h | sed -n '1,200p'\n  -> error snippet: \"panic: nil pointer deref at kv_cache.go:214\" (stack + runtime frames).\n- docker pull gcr.io/redwood/release:v2025.02.14-0a1b2c && docker inspect --format='{{index .RepoDigests 0}}' gcr.io/redwood/release:v2025.02.14-0a1b2c\\  -> digest reported sha256:aa11bb..., matches CI build metadata but Helm chart picked image by tag only.\n- kubectl describe rs canary-v2025-02-14 -n prod\\  -> events: \"failed to create pod: image pull backoff\" (brief), then recovered.\n- kubectl rollout undo deployment/canary-deploy --to-revision=3 -n prod\\  -> rollout started; observed mixed images in replicaset (old RS still had some pods).\n\nObserved error snippets (copied):\n- \"error response from daemon: manifest unknown: manifest unknown\" (from node kubelet when trying to pull a very short-lived image pull attempt)\n- agent logs: \"kv_cache.go:214: assertion failed: expected slice length > 0\"\n- envoy: \"upstream 10.10.20.33:8080 unhealthy (503)\"\n\nImmediate hypotheses (ranked):\n1) Race: CI pushed new image digest but tag was reused (floating tag) and some nodes saw different digests due to regional registry replication latency => mixed artifact digests during canary rollout.\n2) Sticky sessions / session affinity + partial traffic ejection: canary pods kept long-lived connections so ejection didn't immediately drain traffic => residual errors.\n3) New binary has a latent null-pointer in a rarely-used KV path hit by canary traffic pattern (small batch of users) leading to 5xxs and pod restarts.\n4) Sidecar/envoy config mismatch on canary replicas (wrong configmap version picked up).\n\nThings tried (and results):\n- Forced pod restart for all canary pods: kubectl delete pod -l release=canary-v2025-02-14 -n prod -> pods recreated and some nodes failed to pull for ~30s but then OK. No lasting improvement.\n- Manual traffic shift using flagger/traffic-split CLI: set canary weight 0 -> one node still showed requests to canary (checked request logs with X-Request-Id)\n- Redeployed stable image explicitly by digest on canary replicaset: patched deployment image to gcr.io/redwood/release@sha256:00ff33... -> stabilized latency. This suggests tag ambiguity.\n\nEvidence pointing at tag/digest mismatch:\n- docker inspect digest != image referenced in some pod descriptions during window.\n- GCR build log shows two pushes within 30s (build 1234 and 1235) with same tag but different digests (CI race).\n\nShort-term remediation performed:\n- Manually pinned canary replicaset to stable digest and scaled canary down to 0.\n- Opened rollback PR to ensure deploy job pins by digest for canaries: PR #987 (linked).\n- Notified SRE + Pod infra in #deploys; added note to hold further canary rollouts until CI fixes tag reuse.\n\nNext steps / action items (prioritized):\n- CI: stop reusing tags for consecutive builds; use unique tag pattern (timestamp+sha) and ensure deploy reads digest from GCR API before applying. (owner: ci-team, Jira RDW-3421).\n- Release infra: add pre-deploy check that reads repo digest and compares across nodes (owner: eng-release-engineering).\n- Investigate code path causing nil pointer in kv_cache.go: add additional logging and a canary-only flag to enable heavy tracing (owner: serving-runtime team, ticket assigned).\n- Add draining validation to the canary controller: verify no active sessions for the canary before final ejection.\n\nHand-off notes for follow-up:\n- If someone picks this up, start by reading the build logs in cloud-build (linked). Confirm whether any other builds that day reused tags.\n- Check cluster node images cache: ssh into node that failed pulls (kubelet logs archived) -> path: /var/log/kubelet.log on node ip 10.20.30.40 (SRE has creds).\n\nQuestions I still have (unresolved):\n- Why did autoscaler/flagger allow ejection while sessions remained pinned? Is the ingress affinity header being honored?\n- Was there any canary-specific configmap change in the same deploy? (I didn't see one in Helm diff but need to confirm).\n\nDirty TODOs (quick):\n- [ ] Attach paused CI build artifact list to RDW-3421.\n- [ ] Add test that asserts image tag immutability for deploy pipeline.\n- [ ] Postmortem skeleton (owner: me) and link to RDW-3421 when ready.\n\nRandom operator commands I might need later:\n- gcloud container images list-tags gcr.io/redwood/release --limit=50 --format=json | jq '.[] | {tags: .tags, digest: .digest}'\n- kubectl get svc frontend -o yaml | yq '.spec.sessionAffinity'\n\nEnd notes: keep this as personal scratchpad until we have CI fix confirmed. Will convert into short incident summary for postmortem once code/digest root cause is confirmed.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_33a3aa1d210e468fa08ddd50ac001f7d"
+}

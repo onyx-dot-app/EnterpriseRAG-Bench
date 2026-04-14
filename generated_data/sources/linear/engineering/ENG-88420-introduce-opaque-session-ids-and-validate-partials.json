@@ -1,0 +1,54 @@
+{
+  "key": "ENG-88420",
+  "team": "engineering",
+  "title": "Introduce opaque session IDs + server-side partial-output validation to mitigate mismatched/duplicated SSE chunks",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-03-12",
+  "creator": "Priya Anand",
+  "assignee": "Marcus Lee",
+  "project": "runtime-stability",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "sse",
+    "streaming",
+    "hosted-api",
+    "customer-escalation",
+    "bugfix",
+    "idempotency"
+  ],
+  "release": "runtime-1.22",
+  "customer_impact": "high",
+  "security_review_required": false,
+  "description": "Summary:\nCustomer escalations from two enterprise tenants (CUST-231, CUST-447) reported cases where hosted SSE streaming responses delivered duplicated or out-of-order partial chunks after a mid-stream network hiccup. In multiple instances clients saw final combined outputs with missing tokens or duplicated fragments; some SDKs reassembled the stream incorrectly and surfaced malformed JSON to user apps. Impact: intermittent production errors for chat UI and downstream parsers.\n\nRepro (high-level):\n- Long-running generation (> 30s) over SSE\n- Artificially interrupt TCP (packet drop) or have broker transiently close connection\n- Server attempts to resume with optimistic handoff; client reconnect produces overlapping chunk ranges\n- Client-side stitcher that assumes monotonic sequence numbers stores duplicate fragments and emits malformed final output\n\nRoot causes identified during investigation:\n1) Session identity collision: session handshake relied on a short-lived ephemeral token (8 bytes) which could be reissued across quick reconnects; this allowed reconnects to be misattributed to an earlier session in edge routing scenarios.\n2) Partial-chunk acceptance heuristics: server resumed streams by comparing only chunk index, not a per-chunk checksum, allowing retransmitted vs new chunks to be accepted without detection.\n3) Client SDK reconstruction logic in some older versions would naively concat by arrival order when sequence gaps present, amplifying duplication.\n\nMitigation already deployed (hotfixes):\n- On 2026-02-28 we pushed a guard that rejects reconnects without matching long-form session ID (temporary increase in reconnect failures seen in logs). Rollout: 50% edge nodes. Dashboard: https://dashboard.redwood.internal/streams/session-errors?range=7d\n- Customer-facing workaround notes published to support KB: increment SDK to >= v2.13.1 which includes conservative reassembly. Confluence: https://confluence.redwood.ai/display/INF/KB+-+SSE+Reconnect+Workarounds\n\nPlanned engineering fix (this ticket):\nObjective: eliminate misattribution and silent duplication by introducing a server-generated opaque session identifier (64-bit hex + origin nonce) and per-chunk validation metadata. Design constraints: must be backwards-compatible with older SDKs that do not yet send the new resume token, minimal added latency per-chunk, and operate across hosted/dedicated/private deployments.\n\nDesign proposal (chosen):\n- New handshake: server returns a stable opaque_session_id in stream-init payload. opaque_session_id = sha256(stream_uuid || node_nonce)[0:16] encoded hex. This is authoritative for the lifetime of the session. Clients SHOULD include opaque_session_id on reconnect as resume_token.\n- Chunk envelope: each SSE chunk will include: sequence_number, chunk_checksum (crc32c hex), and cumulative_length. Server will reject a reconnect resume that requests a partial continuation unless the opaque_session_id matches and the last-known cumulative_length + 1 equals the new sequence start OR the first chunk checksum mismatches expected suffix -> then server forces full-resend.\n- Backcompat: if client does not supply resume_token, server falls back to previous behavior but marks stream as \"non-resumable\" and sets short TTL. We will advertise this in API docs and in SDK updates.\n- Observability: emit metric stream.resume_attempts.{accepted,rejected,conflicted} and an event with sampling of rejected payloads to S3 for triage.\n\nTrade-offs considered:\n- Stronger server-side fencing (force full resend on any mismatch) increases bandwidth for reconnects but guarantees correctness. We chose targeted rejection only when checksums/ids mismatch to balance cost.\n- Using CRC32C for checksum is fast in C++ runtime; cryptographic checksums were rejected due to CPU cost.\n\nImplementation plan and rollout steps:\n1) Runtime change: add opaque_session_id generation and attach per-chunk checksum metadata (backend: runtime/src/stream/session_manager.cc). Feature flag: sse.opaque_session_id (default off). Estimated work: 2.5 engineer-days.\n2) Gateway change: recognize resume_token and forward to runtime for validation. Feature flag: gateway.resume_validation. Estimated work: 1 engineer-day.\n3) SDK changes: v2.14.0 will include automatic resume_token propagation and conservative reassembly. Coordinate with SDK owners (ENG-SDK team). Estimated work: 1 engineer-day + release coordination.\n4) Rollout: internal dogfood and integration test run against a canary tenant, then 10% edge rollout, then gradual ramp to 100% over 72 hours. Monitor metrics and customer errors.\n\nQA and tests:\n- Unit tests for checksum generation and validation.\n- Integration test simulating reconnect scenarios with packet drops and verifying server rejects/accepts appropriately.\n- Fuzz harness for chunk reordering and duplicated injection.\n\nMonitoring / success criteria:\n- 90% reduction in stream.reconstruction_errors for affected tenants within 48 hours of full rollout.\n- No regression in average per-token latency > 2ms.\n- No increase in reconnect failure rate beyond current baseline for non-resumable clients.\n\nRolling back / mitigation plan:\n- Feature flag toggles at gateway and runtime allow immediate disable.\n- If we observe false positives (too many rejects), fallback to conservative mode that accepts duplicates but marks them and signals client SDK to de-dup.\n\nLinks and artifacts:\n- Design doc (internal): https://confluence.redwood.ai/display/INF/Stream+Session+ID+and+Chunk+Validation\n- GitHub PR (runtime): https://github.com/redwood-inference/runtime/pull/7642\n- GitHub PR (gateway): https://github.com/redwood-inference/gateway/pull/2241\n- SDK update ticket: ENG-SDK-312 (coordination)\n- Customer escalations (support): CUST-231, CUST-447 (internal links omitted)\n\nNext steps (this ticket):\n- Marcus to land runtime PR and open canary deploy (target: 2026-03-15).\n- Coordinate with SDK owners to ship v2.14.0 on or before canary.\n- Run integration test suite and capture metric snapshot pre/post rollout.\n- Update public API docs and add migration notes for Private customers.\n\nAcceptance criteria (to close):\n- Runtime and gateway PRs merged and feature-flagged live in canary.\n- Integration tests pass in CI with synthetic reconnects.\n- Observability dashboards showing decrease in reconstruction_errors for canary tenants.\n- SDK v2.14.0 released and at least one major customer upgraded.\n",
+  "comments": [
+    "2026-02-21 Priya Anand: Initial triage \u2014 escalated to runtime and gateway teams. Collected logs and repro steps from CUST-231. Marking as P0 due to customer impact.",
+    "2026-02-28 Marcus Lee: Deployed temporary reconnect guard on 50% nodes. Observed immediate drop in ambiguous resumes but a small spike in reconnect failures for older SDKs. Filed SDK follow-up.",
+    "2026-03-04 Diego Martinez (ENG-SDK): Drafted SDK changes and compatibility tests. We'll default to not sending resume_token until v2.14.0 opts in to avoid surprising older clients.",
+    "2026-03-08 Support: Notified customers of planned maintenance window for canary deploy on 2026-03-15. CUST-231 opted into canary; CUST-447 requested delay until after their weekend testing window.",
+    "2026-03-11 Marcus Lee: Runtime PR opened (see links). Need review on checksum implementation from infra team; tagging @Ava Chen for perf review.",
+    "2026-03-12 Priya Anand: Confirming cycle assignment and release notes draft. QC to run extended reconnect scenarios after merge."
+  ],
+  "dependencies": [
+    "ENG-SDK-312",
+    "ENG-90312"
+  ],
+  "sub_issues": [
+    "ENG-88421",
+    "ENG-88422"
+  ],
+  "links": [
+    "https://confluence.redwood.ai/display/INF/Stream+Session+ID+and+Chunk+Validation",
+    "https://github.com/redwood-inference/runtime/pull/7642",
+    "https://github.com/redwood-inference/gateway/pull/2241"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_a35650b2e7c34d928a0eacb70d8584b7"
+}

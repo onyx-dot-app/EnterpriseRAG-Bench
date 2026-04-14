@@ -1,0 +1,41 @@
+{
+  "title": "Staged tool pipeline + idempotent replay (post-merge notes, rollout + adapter migration)",
+  "owner": "Maya Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/staged-tool-pipeline-replay-notes.json",
+  "doc_type": "doc",
+  "created_at": "2026-03-06",
+  "last_modified": "2026-03-20",
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "collaborators": [
+    "Omar Ruiz",
+    "Lucia Fernandez",
+    "Elliot Park",
+    "Nina Patel"
+  ],
+  "tags": [
+    "runtime",
+    "tools",
+    "determinism",
+    "replay",
+    "idempotency",
+    "backpressure",
+    "rollout",
+    "openai-compat"
+  ],
+  "linked_artifacts": [
+    "github:redwood#51234",
+    "linear:ENG-1942",
+    "linear:PM-85",
+    "jira:SUP-712",
+    "doc:docs/rfcs/2026-02-staged-tool-pipeline.md"
+  ],
+  "body": "Context\n- PR #51234 merged 2026-03-02: staged tool-pipeline execution, deterministic injection order, and idempotent replay for parallel tool calls.\n- This doc is the working follow-up: what we shipped vs what we learned in dogfood, and what changed in rollout/config + adapter guidance.\n\nWhat shipped (still true)\n- Staged runtime pipeline for tool calls: prepare -> call -> collect -> inject\n  - Goal: deterministic injection ordering for parallel tool calls and fan-in injection.\n- Backpressure gating for in-flight tool calls (per request + per tenant) to protect downstream resources.\n- Idempotent replay primitives so retries don\u2019t double-execute side-effectful tools (requires adapter support).\n- SDK shims (python/ts) for opt-in staged execution.\n- Telemetry: stage latencies, contention, replay counts.\n\nWhat changed since merge (important updates)\n1) Config / flag naming\n- The runtime flag ENABLE_STAGED_TOOL_PIPELINE is being deprecated in favor of a single mode knob:\n  - TOOL_PIPELINE_MODE = legacy | staged\n- Rationale: we now need a clean way to do progressive exposure and A/B without proliferating flags.\n- Backwards behavior: if ENABLE_STAGED_TOOL_PIPELINE is set, it maps to TOOL_PIPELINE_MODE=staged (compat shim will remain through at least 2026-06).\n\n2) OpenAI-compat surface: no more \"staged_metadata\" in responses\n- Initial PR description mentioned an extra internal field in function-call responses. During dogfood we found a few downstream integrations were overly strict about unexpected fields.\n- Updated approach:\n  - No additional top-level fields are injected into OpenAI-compatible payloads.\n  - Stage ordering + replay identifiers are carried internally and in Redwood SDK headers/logs only.\n  - If we need caller-visible debugging, we\u2019ll expose it behind a separate debug flag that is explicitly non-OpenAI-compatible.\n\n3) Replay token inputs were simplified (and made more adapter-friendly)\n- Original: replay token derived from request id + stage metadata (and some implementation-specific stage graph details).\n- Updated: replay key is now based on stable tool call identity:\n  - tool_name + normalized_arguments_hash + caller_provided idempotency_key (if present) + tenant_id\n- Reason: stage metadata is runtime-specific and made cross-language adapters harder to align; tool identity is what adapter authors understand.\n- NOTE: normalized_arguments_hash uses canonical JSON (sorted keys, stable float formatting). We had a bug in early dogfood where argument hashing differed between Go and TS; canonicalization spec added to adapter cookbook.\n\n4) Safe-execute fallback is now explicitly \"best-effort\" and noisier\n- We already had a fallback path for legacy adapters that do not implement idempotency checks.\n- Update: fallback is still allowed, but it now emits:\n  - an audit log event: tool_replay_fallback_used\n  - a counter metric: tool_replay_fallback_total{tool_name,tenant}\n- This is intended to force visibility: if you care about side effects, implement adapter idempotency.\n\n5) Backpressure: changed from leaky-bucket wording to explicit concurrency limiter semantics\n- Internally we still maintain a semaphore-like limiter, but we now describe it and tune it as:\n  - per-tenant concurrency cap (default)\n  - per-request concurrency cap (default)\n  - optional adaptive limiter (pilot) that reduces concurrency when downstream error/latency spikes\n- Default caps were adjusted after the first perf-canary runs:\n  - per-request: 8 -> 6 (reduces tail amplification when callers fan out too aggressively)\n  - per-tenant: unchanged default, but we now recommend setting a tenant override for known high-parallelism customers.\n\nRollout plan (updated)\n- Old plan in PR: internal dogfood 0->10% 48h, then 10->50% 72h, then 100% after 7 days.\n- New plan (post dogfood observations):\n  1) Internal dogfood: 0% -> 25% over 24h (staged mode only for non-streaming tool chains first)\n  2) Expand to streaming tool chains: 25% -> 50% over 72h (watch structured output flake rate)\n  3) External opt-in: allow selected tenants to enable TOOL_PIPELINE_MODE=staged via support\n  4) Default-on decision deferred until we have:\n     - <0.5% increase in p95 end-to-end latency vs legacy\n     - No regressions in OpenAI-compat tests\n     - tool_replay_fallback_total trending down (adapters updated)\n- Telemetry retention: keep stage metrics for 45 days during rollout (was 30) because we want enough history across two release cycles.\n\nAdapter author notes (delta from PR + cookbook highlights)\n- MUST: implement replay check before side effects.\n  - If adapter supports an idempotency store: key by (tenant_id, tool_name, normalized_arguments_hash, idempotency_key).\n  - If tool has a natural idempotency key (e.g. external request id), pass it through.\n- SHOULD: return stable, canonical JSON results.\n  - Non-deterministic ordering in tool outputs is still a problem even with deterministic injection.\n- SHOULD: distinguish \"retryable\" vs \"already executed\" vs \"hard failure\".\n  - We are standardizing adapter return codes to improve retry semantics (follow-up task).\n\nTesting notes / known issues\n- Perf-canary timeout in early CI: now mitigated by increasing canary runtime budget + reducing default per-request concurrency cap.\n- Structured output flakes: most were from tool result JSON ordering, not from injection ordering. We added guidance + an internal linter rule for adapters.\n- Migration gap: a few HTTP adapters in the wild don\u2019t propagate idempotency keys; support will track via tool_replay_fallback_total.\n\nOpen questions / TODOs\n- Decide whether Redwood SDK should default TOOL_PIPELINE_MODE=staged for run_tool_chain only (still opt-in today).\n- Add a public-ish (but not OpenAI) debug endpoint to dump stage timeline for a request.\n- Finish compatibility matrix: confirm no unexpected fields in OpenAI payloads across streaming + non-streaming.\n\nQuick reference\n- Staged pipeline stages: prepare -> call -> collect -> inject\n- Determinism: stable tool request ordering (source order + tie-breaker) + single-pass injection\n- Replay: tool identity + normalized args hash + optional idempotency key; fallback emits audit+metrics\n- Backpressure: per-request and per-tenant concurrency caps; adaptive limiter pilot\n",
+  "dataset_noise_document": true,
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_812d84ead4f6414ca7bd2b9688b4fb0e"
+}

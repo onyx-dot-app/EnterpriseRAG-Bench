@@ -1,0 +1,73 @@
+{
+  "repo": "redwood",
+  "pr_number": "827410",
+  "title": "Introduce SLO Parachute + Fast Drain Reconciler (regional safety net & telemetry hotfix)",
+  "author": "Ava Martinez",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-02-20",
+  "merged_at": "2026-02-20",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "bugfix/slo-parachute-drain-reconciler-ava/827410",
+  "reviewers": [
+    "Ravi Patel",
+    "Sofia Nguyen",
+    "Diego Alvarez"
+  ],
+  "labels": [
+    "runtime",
+    "sre",
+    "hotfix",
+    "telemetry",
+    "perf"
+  ],
+  "linked_linear": [
+    "ENG-4257",
+    "ENG-4298"
+  ],
+  "linked_jira": [
+    "SUP-1123"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "9",
+  "additions": "436",
+  "deletions": "127",
+  "breaking_change": "false",
+  "release_notes": "Added SLO Parachute safety mode and fast drain reconciler; improved telemetry for SLO drift; config flag slo_parachute.enabled=false by default.",
+  "merge_method": "squash",
+  "body": "Context and motivation: After last week's partial region flapping incident (SUP-1123) we observed two correlated failure modes: (1) gradual SLO deterioration from cascading backoffs that left many requests in an expensive slow path, and (2) prolonged node drains that caused KV cache thrash and cold restarts. This PR introduces a two-part safety net: an SLO Parachute (a conservative temporary SLO relaxation + traffic shaping policy) and a Fast Drain Reconciler (a bounded drain coordinator to preserve KV cache hotness during region-level evictions). The goal is graceful global degradation that prioritizes customer-visible latency and avoids repeated cache cold-starts.\n\nSummary of changes: 1) runtime/slo/parachute_controller.go: new controller implementing SLO Parachute policy. When regional SLO breach predictors signal > 60s risk window, controller flips an expedited mode that reduces per-tenant soft limits (max_concurrency, soft_timeouts), enables probabilistic sampling for expensive slowpath ops, and emits a parachute.audit metric. 2) runtime/drain/reconciler_fast.go: bounded coordinator that sequences node drains with KV hotset preservation heuristics (drain window, max_concurrent_drains, staged-kv-sync). 3) controlplane/config.yaml: new flags slo_parachute.enabled, slo_parachute.threshold_ms, drain.max_concurrent_fast. 4) console/telemetry/dashboards/slo-parachute.json: dashboard for parachute state and parachute.audit timelines. 5) observability/metrics/telemetry_exporter.go: added parachute.audit, parachute.transition_count and drain.reconciler_skipped_count metrics and tagging for region/node. 6) tests/runtime/slo/parachute_test.go and tests/drain/reconciler_fast_test.go: unit and integration tests that simulate regional degradation and verify parachute triggers and no-KV-loss guarantees. 7) incident/hotfix/notes.md: quick-runbook for on-call describing when to toggle slo_parachute.enabled in emergencies.\n\nDesign notes and constraints: - SLO Parachute is conservative by default: slo_parachute.enabled=false in prod, but we wire a Linear/alert runbook that will recommend enabling automatically during a declared regional incident. Parachute transitions are rate-limited and recorded with audit tags so we can post-mortem decision timelines. - Fast Drain Reconciler does not change eviction policy; it sequences drains and requests a prioritized KV sync step before live eviction for nodes that host >5 active tenants' hot KV pages. If KV sync fails three times it falls back to normal drain (fail-open). - We intentionally avoid tenant-level hard limits; the parachute reduces soft service-level limits and applies sampling to non-core slowpath features (e.g., reranks, long context retrieval) to preserve latency for core token-generation flows. - Metrics emitted include a histogram of parachute_latency_improvement_ms so we can quantify benefit.\n\nChecklist (PR author): - [x] Unit tests for parachute controller and fast drain reconciler - [x] Integration tests with synthetic regional failover - [x] Console dashboard + query for audit events - [x] Manual runbook written and smoke-tested - [x] Feature flags gated in config - [x] Documentation note added to incident playbooks\n\nCommits summary: - commit 1: init parachute controller and config wiring - commit 2: fast drain reconciler implementation and basic tests - commit 3: telemetry metrics + dashboard JSON - commit 4: integration tests simulating region degrade - commit 5: runbook and docs + fix race in reconciler discovered during CI\n\nFiles changed (high-level): - runtime/slo/parachute_controller.go (+ tests) - runtime/drain/reconciler_fast.go (+ tests) - controlplane/config.yaml - observability/metrics/telemetry_exporter.go - console/telemetry/dashboards/slo-parachute.json - incident/hotfix/notes.md - go.mod (minor) - Makefile: add integration target novo - tests/ci/integration-parachute.yaml\n\nTesting and CI: CI initially flagged a flaky test in reconciler_fast_test (race on ephemeral timer). I pushed a small stabilization patch (commit 5) that replaced a time.After with a deterministic fake clock in tests. CI pipeline: unit -> lint -> integration-parachute. The integration job took ~12m in the CI run and passed on second attempt. All checks green in final run.\n\nReview conversation (high level): - Ravi: \"Controller looks good; can you avoid global mutable state in parachute controller? We should allow multiple concurrent regions to be in parachute independently.\" - Author: \"Done \u2014 parachute is now keyed by region and tenant-cohort; updated tests.\" - Sofia: \"Telemetry looks useful, but add a histogram for post-parachute latency delta.\" - Author: \"Added parachute_latency_improvement_ms histogram and dashboard panel.\" - Diego: \"Concern about forced KV sync adding latency to evictions \u2014 what's the timeout?\" - Author: \"We cap sync to 500ms with backoff and allow max 2 retrials; documented in runbook. If it fails gracefully falls back to normal drain.\" - QA: \"Integration sim reproduces region 3-node flapping and asserts no cache misses for >90% of tenants.\" - Author: \"Added assertion and extended the integration sim window to 3 minutes to get stable numbers.\"\n\nRollout plan: - Canary on dedicated-dev for 24h with slo_parachute.enabled=false (verify metrics & no regressions) - Enable slo_parachute.enabled=true for canary region for synthetic incident injection to measure benefits - Gradual ramp to production as a manual on-call toggle first, then tie to automated alerting thresholds after one successful incident/PGO sign-off.\n\nOperational runbook snippet (incident/hotfix/notes.md): - When regional SLOs degrade and predictors show persistent slope for 3+ minutes, enable slo_parachute.enabled for region via controlplane toggle. - Monitor parachute.audit and parachute.transition_count; if eviction pacing increases, set drain.max_concurrent_fast down by 1 and re-evaluate. - If reconciler retries exceed 3x for majority of nodes, disable parachute and revert to normal drain flow; file follow-up.\n\nWhy this is different from previous work: Prior PRs focused on eviction scheduling and per-tenant levers; this change introduces a global safety net that intentionally reduces soft service limits to preserve tail latency and pairs it with a drain reconciler that prioritizes KV hotset continuity. The combination aims to avoid repeated cold cache storms that exacerbate regional failures.\n\nNotes for reviewers: Pay attention to parachute audit tagging hygiene (region, cohort, incident_id) and edge cases where we may double-apply sampling. The integration tests include a deliberate race-shaped workload to exercise these paths.\n\nMerge outcome: Squash-merged to main after approvals from Ravi and Sofia and two green CI runs. Post-merge: created follow-up ENG-4302 to instrument longer-term experiments (20% parachute-on A/B).",
+  "commits": [
+    "init: parachute controller skeleton and config bindings",
+    "feat: fast drain reconciler with staged kv sync and concurrency limits",
+    "chore: telemetry metrics and dashboard for parachute states",
+    "test: integration sim for regional degrade and assertions for kv hotset preservation",
+    "fix: stabilize reconciler test by injecting fake clock and reduce flake"
+  ],
+  "files_changed": [
+    "runtime/slo/parachute_controller.go",
+    "runtime/slo/parachute_controller_test.go",
+    "runtime/drain/reconciler_fast.go",
+    "runtime/drain/reconciler_fast_test.go",
+    "observability/metrics/telemetry_exporter.go",
+    "console/telemetry/dashboards/slo-parachute.json",
+    "controlplane/config.yaml",
+    "incident/hotfix/notes.md",
+    "tests/ci/integration-parachute.yaml"
+  ],
+  "review_comments": [
+    "Ravi Patel: Controller looks good; avoid global mutable state so multiple regions can parachute independently.",
+    "Ava Martinez: Updated to region-keyed parachute controller and added cohorting tests.",
+    "Sofia Nguyen: Add histogram for post-parachute latency delta.",
+    "Ava Martinez: Added parachute_latency_improvement_ms and dashboard panel.",
+    "Diego Alvarez: What's the timeout for KV sync? Concerned about added eviction latency.",
+    "Ava Martinez: Cap is 500ms with exponential backoff, documented in runbook; falls back to normal drain after retries.",
+    "QA: Integration sim passes and shows >90% cache retention across simulated flaps.",
+    "Ava Martinez: Extended sim window to reduce variance and added assertion for kv retention metric."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "review_comments"
+  ],
+  "dataset_doc_uuid": "dsid_d5d1306011ba4091985fd77c88693ce0"
+}

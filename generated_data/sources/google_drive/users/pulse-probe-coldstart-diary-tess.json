@@ -1,0 +1,33 @@
+{
+  "title": "pulse-probe coldstart diary",
+  "owner": "Tess Nguyen",
+  "drive_area": "users",
+  "path": "users/pulse-probe-coldstart-diary-tess.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-03",
+  "last_modified": "2025-11-08",
+  "collaborators": [
+    "Arjun Patel",
+    "Maya Li"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "cold-start",
+    "microburst",
+    "scratchpad",
+    "gpu-warmup",
+    "profiling"
+  ],
+  "linked_artifacts": [
+    "https://jira.redwood.example/browse/INF-2345",
+    "https://github.com/redwood-inference/serving-runtime/pull/789"
+  ],
+  "content": "Purpose / motivation:\\nQuick, personal log for a pulse-probe experiment aimed at isolating cold-start contributions to 95/99/99.9 latency during short microbursts (5\u201330s). Want to understand how much of the observed tail in prod-like bursts is: (A) model cold KV cache refill, (B) GPU context warmup and CUDA kernel JIT, (C) ingress queuing jitter, or (D) orchestration-level delays (container spin, network attach). This is a scratchpad \u2014 incomplete, messy, but captures the configs and raw takeaways before I forget them.\\n\\nExperiment summary (high level):\\n- Workload: synthetic small-burst traffic that mimics chat usage: 1\u201320 concurrent short requests (avg 8 tokens generated), bursts last 5s, 15s, 30s; idle between bursts random 30\u2013300s to force cold conditions.\\n- Target binary: r-inference serving-runtime main (commit a3f8b2) with small-mod: disable proactive KV prefetch for these runs.\\n- Model: open-llama-7b variant, FP16, no quantization, sequence length = 128.\\n- Fleet config: single GPU node (A100 40GB), 1 container, no multi-tenant noise. System under limited isolation to approximate Dedicated single-tenant but not full private network.\\n- Instrumentation: token-level traces (client-side timestamps), server-side spans (request arrival, scheduling, first-token, end), nvml GPU metrics (power, mem), dmesg for driver jitter.\\n\\nKey knobs tried / rationale:\\n- cold gap (idle time before burst): 30s, 120s, 300s \u2014 to see decay of hot caches and other ephemeral state.\\n- prewarm flag: on/off \u2014 spawns a dry-run request during idle to keep kernels hot.\\n- batch window: 5ms, 20ms \u2014 to see queuing tradeoffs for 5\u201320 concurrent arrivals.\\n- kv-cache retention: 1s, 10s, infinite \u2014 test whether KV eviction policy is main tail driver.\\n- driver warmup (CUDA jit): run initial compile-only pass before bursts in some trials.\\n\\nRepresentative raw numbers (median / p95 / p99 in ms) \u2014 these are synthetic & noisy but directional:\\n- Burst 5s, idle 30s, prewarm off, batch=5ms, kv=1s:\\n  median: 42ms, p95: 180ms, p99: 740ms\\n- Burst 5s, idle 120s, prewarm off, batch=5ms, kv=1s:\\n  median: 58ms, p95: 320ms, p99: 1,200ms\\n- Burst 15s, idle 120s, prewarm on (dry-run every 60s), batch=5ms, kv=10s:\\n  median: 51ms, p95: 120ms, p99: 300ms\\n- Burst 30s, idle 300s, prewarm off, batch=20ms, kv=infinite:\\n  median: 70ms, p95: 400ms, p99: 1,800ms\\n\\nImmediate observations (raw interpretation):\\n- Short idle (30s) gives much better tail than long idle (120\u2013300s) \u2014 suggests a mixture of ephemeral kernel/jit and KV cache decay.\\n- Enabling prewarm (a single small compile/request) dramatically lowers p99 in the 120s idle case (1,200ms -> ~300ms). That points strongly to driver/JIT/initial kernel compile and/or memory allocations as a major component.\\n- Increasing batch window to 20ms reduces median at moderate concurrency but seems to increase p99 in cold conditions (probably because cold requests get batched with background prewarm/other work leading to longer per-request end-to-end).\\n- kv retention helps for bursts longer than kv TTL; when kv retention=10s we see better p95 in 15s bursts but not in 5s bursts (makes sense).\\n\\nDeeper traces notes:\\n- Server spans show a distinct gap between \\\"scheduling start\\\" and \\\"compute start\\\" of ~80\u2013450ms for many p99 events when cold. This gap disappears in prewarmed runs.\\n- GPU nvml shows small spikes in memory alloc/free right at burst boundary; correlate with the scheduling gap.\\n- No kernel OOMs or driver level errors in dmesg.\\n- Network RTT negligible (under 2ms) so networking not culprit here.\\n\\nHypothesis (what to test next):\\n1) Kernel/JIT warm-up is the dominant cold tail contributor. Test: force a compile-only warm step (like we did with prewarm) vs a minimal dummy inference and compare. If compile-only reduces tail similarly, JIT is main culprit.\\n2) KV cache decay is secondary and mostly impacts mid-tail; test by toggling kv retention aggressively and instrumenting per-shard kv-hit rate at token granularity.\\n3) Memory allocator latency for large device allocations might be part of the schedule->compute gap. Try preallocating per-model buffer pool before bursts.\\n\\nShort to-dos / next runs:\\n- [ ] Run A/B where prewarm = compile-only vs prewarm = dummy small request. Track p99 delta. (assign to Arjun)\\n- [ ] Add an experiment where we preallocate model weights and KV with a background task 60s before burst to separate allocation vs JIT. (self)\\n- [ ] Re-run with a smaller model (1.3B) to see scale effect \u2014 if p99 drops significantly relative, some part is model-size dependent. (Maya)\\n- [ ] Try a small quantized variant to see if kernel paths diverge and affect cold tail differently.\\n\\nNotes to self / mental model updates:\\n- Practical mitigation path for prod: cheap periodic prewarm (every ~60s) reduces cold p99 significantly with minimal cost; but we need cost model for continuously prewarming large fleets. Also look into lazy compile caching across containers so prewarm can be amortized.\\n- Need to log \\\"scheduling start -> compute start\\\" as a standard span so we can quantify in prod.\\n\\nQuick links & references used while running tests:\\n- INF-2345 (Jira) for microburst incident notes\\n- PR 789 (serving-runtime) where I toggled kv prefetch flag\\n\\nMisc / random thoughts:\\n- Could we implement a lightweight kernel-warm RPC during idle that only touches a tiny subset of kernels? If JIT is the big cost, targeting the hot-kernel subset should give most of the benefit.\\n- For Dedicated customers with hard SLOs, include an optional prewarm policy in rollout config.\\n\\nEnd of log. Will update after the compile-only A/B and preallocation runs.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_cb6d90cba4b74299a9362c8175dfac4b"
+}

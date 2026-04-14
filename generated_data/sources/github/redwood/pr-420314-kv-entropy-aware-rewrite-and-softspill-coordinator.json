@@ -1,0 +1,45 @@
+{
+  "repo": "redwood",
+  "pr_number": "420314",
+  "title": "KV: entropy-aware region rewrite and soft-spill coordinator to reduce fragmentation and page storms",
+  "author": "Ava Chen",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-02-26",
+  "merged_at": "2026-02-26",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/kv-entropy-rewrite-softspill",
+  "reviewers": [
+    "Diego Morales",
+    "Ethan Park",
+    "Priya Nair"
+  ],
+  "labels": [
+    "runtime",
+    "kv-cache",
+    "perf",
+    "scheduling",
+    "hotfix-risk-moderate"
+  ],
+  "linked_linear": [
+    "ENG-8732",
+    "ENG-9021"
+  ],
+  "linked_jira": [
+    "SUP-1442"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "6",
+  "additions": "482",
+  "deletions": "174",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "release_notes": "Introduces an entropy-driven compaction heuristic and a cooperative soft-spill coordinator to smooth paging spikes and reduce fragmentation; improves p50/p95 latency under mixed workloads and reduces background I/O storms.",
+  "body": "Motivation:\nWe observe two correlated phenomena under multi-tenant mixed workloads: (1) high fragmentation inside the KV cache leading to lower effective residency and more frequent paging; (2) bursty spill/paging activity where multiple tenants or background workers simultaneously trigger large rewrites, creating I/O storms that spike tail latency. Existing heuristics (occupancy, LRU age) are insufficient to capture region-level fragmentation patterns or to coordinate background rewrite activity across tenants.\n\nSummary of changes (single-string description):\n- Introduce an entropy-aware region scorer (kv/region_entropy.rs, kv/allocator/entropy_score.cpp): computes a lightweight entropy metric for slab/region fragmentation based on occupancy histogram + scatter metric; used to prioritize rewrite candidates that yield the highest compaction benefit per byte rewritten.\n- Add a soft-spill coordinator (kv/spill_coordinator.go, runtime/scheduler/spill_coordinator.cpp): a cross-tenant cooperative controller that sequences background rewrites and spillbacks using budget windows and global backpressure signals to avoid concurrent heavy I/O.\n- Implement incremental page-sieve rewrites (kv/rewrite_engine.cc): opportunistic, low-priority rewrites that run in short time-slices and prefer high-entropy regions with warm hot-set affinity to reclaim contiguous pages without blocking foreground operations.\n- Expose tuning knobs in the config plane and console (console/config_schema.yaml): entropy threshold, rewrite_window_ms, per-tenant soft_spill_budget, global_backoff_alpha.\n- Add unit and e2e tests; add microbench harness measuring rewrite throughput and tail-latency under synthetic workloads.\n\nCommits (high-level):\n- commit 1: introduce RegionEntropy struct and histogram collector + unit tests (kv/region_entropy.rs).\n- commit 2: incremental rewrite engine & low-priority scheduler integration (kv/rewrite_engine.cc, scheduler/*).\n- commit 3: soft-spill coordinator with budget windows and global backpressure signal (kv/spill_coordinator.go, runtime/scheduler).\n- commit 4: console knobs, docs, and tests; benchmark results.\n\nFiles/areas changed (high level):\n- kv/region_entropy.rs (new), kv/rewrite_engine.cc (new), kv/spill_coordinator.go (new)\n- runtime/scheduler/* (integration hooks), console/config_schema.yaml (tuning knobs)\n- tests/kv/entropy_rewrite_test.go, perf/bench/rewrite_throughput.py\n\nDesign notes / rationale:\n- Entropy metric: instead of complex compaction cost modeling, the entropy score approximates fragmentation by measuring occupancy variance across fine-grained buckets inside a region plus a scatter factor that penalizes small, widely distributed live objects. This gives a cheap, monotonic score that correlates with compaction benefit in our internal traces.\n- Soft-spill coordination: background rewrites are low priority but still cause I/O. The coordinator imposes a global budget window (ms per second) and sequences rewrites across tenants; a simple exponential backoff (global_backoff_alpha) increases delay when I/O queues exceed thresholds. This avoids synchronized rewrite waves following a GC or failure recovery.\n- Incremental rewrites: rewriter runs as micro-slices to respect latency SLOs. When it picks a region, it writes only the contiguous hot ranges that reduce page fragmentation most per byte written.\n\nBenchmarks (summary):\n- Setup: 8-GPU dedicated cluster, mixed tenant workload (30% writes, 70% reads), 100k keys per tenant, skewed Zipf(1.2).\n- Baseline: previous heuristic (LRU + occupancy)\n- Results: median p50 tail token latency unchanged (~12ms), p95 reduced from 45ms to 32ms, p99 reduced from 210ms to 150ms under sustained background rewriter load. Effective cache residency +8% on average (same memory) and background rewrite I/O bursts reduced by ~60% measured as peak MB/s. Rewrite throughput cost increased by ~12% CPU but stayed within budget due to micro-slicing.\n\nTesting and rollout plan:\n- Unit tests for entropy scoring and rewrite invariants added.\n- Integration tests simulate tenant waves and verify coordinator prevents simultaneous large rewrites across tenants.\n- Perf canary: feature gated by console flag; staged rollout to Dedicated clusters with per-tenant budget defaults conservative (soft_spill_budget=10ms/s).\n- Migration: no on-disk format changes; runtime will fall back to legacy path if coordinator disabled.\n\nReview thread (highlights):\n- Diego Morales: \"Nice metric \u2014 can you add a short doc snippet describing entropy correlation with compaction gain? Also please ensure the scorer is cheap on the hot path.\"\n  - Author reply (Ava): \"Added doc comment and a micro-benchmark; scorer uses 1 atomic per region and amortized histogram updates, see kv/region_entropy.rs. Benchmarks show <1% overhead on hot-path write tail in our microbench.\"\n- Ethan Park: \"Concern: global budget might starve low-priority but high-ROI rewrites during sustained heavy load. How do we prevent starvation?\"\n  - Author reply: \"Coordinator uses a two-tier window: guaranteed_min_ms (per tenant) + shared_pool that is fairly allocated by ROI-weighted tokens. Added tests to ensure minimum progress for each tenant.\"\n- Priya Nair: \"CI flake was a transient file handle limit in perf harness; reran and passed.\"\n\nCI details:\n- Unit tests: pass\n- Integration tests: pass\n- Perf bench: flaky on first run (fd exhaustion), rerun passed\n- Lint: pass\n\nMigration / compatibility:\n- No data format changes; feature is opt-in via console flag and config. For Private installs, default is off to allow controlled enablement by SRE.\n\nOperational notes:\n- Monitoring: added metrics kv.region_entropy.score_distribution, kv.softspill.coordinator.tokens_used, kv.rewriter.slice_duration_ms. Added alert when coordinator backoff > 5s for >3m.\n\nFollow-ups (listed in PR body):\n- ENG-9021: integrate entropy score into eviction policy for tenant-prioritized retention.\n- ENG-9105: experiment with guided compaction that considers kernel-level page alignment for better OS-level collapse.\n\nMerge outcome:\n- Approved by reviewers after two rounds of feedback. CI green after rerun. Squash-merged into main on 2026-02-26.\n\nNotes for on-call / SRE: if you observe elevated rewrite CPU or unexpected I/O, disable the coordinator via console toggle (soft_spill_enabled=false) and the system will revert to legacy per-node background rewrites.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_766f29bba5564505ad7291317ba312e9"
+}

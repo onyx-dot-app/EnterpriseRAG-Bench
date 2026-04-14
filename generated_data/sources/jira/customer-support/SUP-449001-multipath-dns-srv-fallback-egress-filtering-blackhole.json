@@ -1,0 +1,69 @@
+{
+  "key": "SUP-449001",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Intermittent private-deploy egress multipath causing DNS SRV fallback blackhole and model fetch failures",
+  "status": "Resolved",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Anika Patel",
+  "assignee": "Riley Chen",
+  "customer_company": "NovaRetail",
+  "customer_tier": "private",
+  "components": [
+    "vpc-peering",
+    "dns",
+    "egress",
+    "control-plane",
+    "serving-runtime"
+  ],
+  "labels": [
+    "private-deploy",
+    "networking",
+    "mtt-incident",
+    "dns-srv"
+  ],
+  "environment": "prod us-east",
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "affected_models": [
+    "redwood-medium-4k"
+  ],
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-331900",
+    "SUP-93188"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/runbooks/private-egress-dns-failures"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/networking-fixes/pull/184"
+  ],
+  "description": "Issue summary:\nCustomers using Private deployment (VPC peering + transit connectivity) reported intermittent model artifact download failures and control-plane delays. Failures correlated with DNS SRV lookups falling back from UDP to TCP (truncated UDP responses) which then timed out or were blocked by an egress filter, resulting in model fetch hang and 502/504 for inference requests.\n\nImpact:\n- NovaRetail observed ~30% of inference requests for the private cluster in us-east-1 returning 502 or timing out between 2026-03-09 17:10 UTC and 2026-03-10 02:45 UTC.\n- Control-plane heartbeats from serving-nodes to the private control-plane intermittently reported \"dns timeout\" and \"artifact fetch stalled\" leading to transient pod restarts and reduced capacity.\n- Customer business impact: degraded storefront search relevancy during traffic spikes; P1 escalation requested.\n\nEnvironment:\n- Private deployment (VPC peering) connecting customer VPC to Redwood-managed VPC via Transit Gateway.\n- On-customer side: route-based VPN + third-party SD-WAN appliance that does ECMP hashing across multiple WAN egresses.\n- Egress firewall appliance on customer edge performs stateful inspection and allows UDP53 but has a short TCP ephemeral port ACL for outbound connections.\n\nObserved client symptoms / timeline:\n1) 2026-03-09 17:05 UTC: First alert from NovaRetail Triage: repeated model shard download retries, long tails on artifact fetches.\n2) 2026-03-09 17:10\u201318:00 UTC: Redwood telemetry shows spike in DNS retries and UDP-to-TCP fallback for SRV (control-plane.discover.redwood.svc) across ~12 serving nodes.\n3) 2026-03-10 00:30 UTC: SRE observed increased SYN retransmits toward control-plane TCP:53 when DNS fell back to TCP; many of those SYNs never completed.\n4) 2026-03-10 02:10 UTC: Customer's edge team reported SD-WAN path rebalancing events aligning with failure windows.\n\nSteps to reproduce (approx):\n- From a serving node behind customer's SD-WAN, run repeated SRV queries for control-plane service under simulated high packet size (EDNS0).\n- Force ECMP path change between queries (simulate active/standby egress).\n- Observe: occasional UDP truncation (TC bit set) then TCP fallback which stalls because outbound TCP ephemeral port is filtered/blocked intermittently by egress firewall.\n\nLogs / telemetry snippets:\n- Serving node DNS log: \"query control-plane.discover.redwood.svc IN SRV (EDNS0) -> UDP truncated; retry over TCP\"\n- iptables conntrack on node: many entries with differing src ports; high conntrack churn.\n- Edge firewall logs (customer-provided): \"deny outbound tcp src=10.10.0.45:56012 dst=34.119.12.3:53 proto=TCP state=NEW policy=deny\" (intermittent)",
+  "investigation_notes": "Initial hypothesis considered model shard corruption and application-layer timeouts; quickly ruled out after validating checksums on stored artifacts. Focus shifted to service discovery and transport. Signs pointed to a network-level asymmetry: SD-WAN/ECMP rebalancing + egress firewall/per-flow state that did not tolerate source-port churn.\n\nKey findings:\n- EDNS0/large UDP responses caused the authoritative resolver to set the TC bit requiring TCP retry.\n- Customer SD-WAN used per-packet ECMP hashing during churn windows; TCP retries were hashed to a different egress path mid-handshake, losing state at the firewall and causing TCP SYNs to be dropped.\n- Egress firewall policy allowed UDP53 generally but enforced TCP connection state with a short inspection timeout and a static ephemeral port allowlist that was hit by source-port reuse/churn.\n- conntrack metrics on serving nodes spiked (conntrack table churn) and NAT ephemeral port reuse led to collisions under high parallelism, amplifying the problem.\n\nHypothesis validated by:\n- Reproducing truncated UDP -> TCP fallback failure in a customer lab when forcing path changes via SD-WAN emulator.\n- Temporarily disabling SD-WAN ECMP (pin single egress) removed failures; TCP fallback completed successfully.\n\nMitigation applied:\n- On 2026-03-10 03:00 UTC we coordinated with NovaRetail network team to apply an interim mitigation: pinning hash to single egress for control-plane traffic and relaxing TCP ephemeral port ACL on the egress firewall for the duration of the incident. This restored artifact downloads and control-plane heartbeats within ~8 minutes.\n- Changed DNS responses in the control-plane to prefer smaller UDP responses (reduced EDNS buffer) as a short-term product-side mitigation to reduce TCP fallback frequency.\n\nRoot cause:\nCombination of (1) large DNS responses triggering TCP fallback, (2) ECMP-based SD-WAN path rebalancing causing asymmetric egress mid-TCP handshake, and (3) egress firewall stateful filtering that dropped TCP retries due to source-port churn and short-state timeouts.\n\nResolution steps and timeline:\n- 2026-03-10 03:00 UTC: Temporary customer-side config changes (egress pin + firewall ACL relaxation) implemented; immediate recovery observed.\n- 2026-03-10 09:00 UTC: Redwood control-plane config adjusted to reduce EDNS0 buffer size for SRV and TXT records to decrease UDP truncation rate (deploy PR network/184).\n- 2026-03-11 12:00 UTC: Customer reverted to original SD-WAN ECMP but with firewall rule updates (allow ephemeral TCP outbound to DNS resolvers and extended inspection timeouts). No recurrence observed through 2026-03-12.\n\nLonger-term remediation / follow-ups:\n- Customer action: Update SD-WAN policy to prefer flow-consistent hashing or session-affinity for control-plane/resolver egress. Increase firewall inspection timeout for TCP port 53 retries and broaden ephemeral port allowlist or use stateful NAT smoothing.\n- Redwood action: Continue reducing SRV/healthcheck EDNS sizes where safe; document recommended firewall/SD-WAN configuration in Private deployment runbook.\n- Engineering ticket: TASK-1219 created to instrument DNS TC/maybe move to TCP-multiplexer fallbacks in the control-plane SDK.\n",
+  "resolution": "Mitigated by coordinated customer-side egress pin + firewall ACL relaxation and product change to reduce EDNS0 response size. Customer rolled firewall/SD-WAN config changes; no recurrence observed. Post-incident runbook updates accepted.",
+  "postmortem_link": "https://confluence.redwood.ai/postmortems/SUP-449001-dns-multipath-blackhole",
+  "comments": [
+    "2026-03-09 18:25 - Riley Chen (Support): Acknowledged ticket. Requested packet captures from customer and asked for firewall logs and SD-WAN path event windows.",
+    "2026-03-09 19:02 - NovaRetail Network Ops: Provided firewall logs showing intermittent TCP53 DENY entries and SD-WAN path-change events at matching timestamps.",
+    "2026-03-09 20:40 - Anika Patel (Support): Scoped to P1 and engaged SRE on-call (Jordan Alvarez) for deeper packet-level analysis.",
+    "2026-03-10 01:18 - Jordan Alvarez (SRE): Reproduced UDP truncation -> TCP fallback in lab with SD-WAN emulation. Observed SYNs blocked by egress firewall when path changed mid-handshake.",
+    "2026-03-10 03:05 - NovaRetail Network Ops: Applied temporary egress pin and relaxed firewall ephemeral port rule. Confirming restored artifact fetch and normal heartbeats.",
+    "2026-03-10 09:45 - Riley Chen (Support): Product change deployed to reduce EDNS0 buffer for SRV/TXT responses; monitoring rolling window for stability.",
+    "2026-03-11 13:02 - NovaRetail Network Ops: Re-enabled SD-WAN ECMP with updated firewall rules (longer TCP inspection timeout). No failures in 24h window.",
+    "2026-03-12 10:15 - Anika Patel (Support): Ticket moved to Resolved. Added follow-up items to runbook and recommended configuration checklist.",
+    "2026-03-12 10:20 - Riley Chen (Support): Closing notes: Recommend customers with SD-WAN/ECMP egress follow the runbook. Flagging to Solutions Engineering for onboarding checklist update."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "resolution",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_5014ac14737b42a0a76b8c92b4a03425"
+}

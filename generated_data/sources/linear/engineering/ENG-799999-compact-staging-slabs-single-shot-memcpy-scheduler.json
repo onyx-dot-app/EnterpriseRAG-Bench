@@ -1,0 +1,47 @@
+{
+  "key": "ENG-799999",
+  "team": "engineering",
+  "title": "Compact staging slabs and single-shot memcpy scheduler to reduce host-GPU overhead",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Patel",
+  "assignee": "Marco Ruiz",
+  "project": "runtime-performance-2026",
+  "cycle": "2026-W07",
+  "estimate": "8",
+  "due_date": "2026-03-31",
+  "labels": [
+    "prefill",
+    "memcpy",
+    "threadpool",
+    "performance",
+    "cpu-gpu",
+    "staging-slabs"
+  ],
+  "description": "Problem:\nMultiple production traces show high host-side overhead during prefill\u2192decode handoff. Symptoms: many small memcpy invocations from fragmented pinned buffers, frequent short-lived threadpool tasks creating contention, and repeated kernel-selection stalls while waiting for small transfers. These manifest as elevated p50/p95 host CPU consumption, noisy GC-like allocation patterns for pinned buffers, and periodic latency spikes under mixed workloads (short chat + long generation).\n\nHypothesis:\nIf we compact host staging into per-worker pinned slabs and schedule aggregated single-shot memcpy operations (grouping contiguous requests within a short window), we can reduce syscall/count overhead, reduce thread wakeups, and enable cleaner overlap between memcpy and kernel execution on the GPU. Combined with a small priority-aware transfer scheduler (short requests get expedited), we expect lower CPU usage, fewer context switches, and improved latency tail without materially increasing tail latency for large batches.\n\nProposed solution (implementation sketch):\n1) Staging slabs: allocate one or two large pinned host slabs per CPU worker (configurable slab_size, e.g., 8MB). Replace ad-hoc pinned allocations with slab allocations and circular allocation pointers. Slabs are reclaimed by epoch to avoid fragmentation.\n2) Aggregation window: introduce a short aggregation window (default 250\u2013500us) that collects small prefill buffers destined for the same GPU/stream. Within the window, coalesce adjacent payloads into a single iovec-backed memcpy to the slab and then perform a single cudaMemcpyAsync (or equivalent) per slab flush.\n3) Single-shot memcpy scheduler: a lightweight scheduler groups slab flushes and issues async transfers on a bounded number of transfer threads. Transfers use pinned staging and per-GPU DMA-capable streams, with completion callbacks that enqueue decode kernels.\n4) Priority steering: requests tagged low-latency (short-chat) are eligible for higher priority and smaller aggregation windows (e.g., 100us) to keep p50 tight; long/bulk requests endure slightly larger windows to improve throughput.\n5) Threadpool changes: reduce short-lived task creation by turning many small work units into a few composite tasks (slab-coalesce \u2192 single transfer \u2192 callback), reducing thread wakeups. Modify threadpool to support cooperative parking and per-worker affinity when slabs are in use.\n6) Safety/backpressure: when slabs fill, fall back to existing behavior (split-off synchronous memcpy) and emit metrics. Add soft limits and a circuit-breaker to avoid unbounded memory.\n\nTrade-offs and risks:\n- Memory overhead: per-worker slabs increase total pinned memory. Mitigation: slab_size heuristics and per-pool caps; measure against memory-constrained Dedicated nodes.\n- Increased scheduling complexity: aggregation windows introduce a small extra micro-latency; mitigated by priority steering and short defaults.\n- Edge cases: highly skewed request sizes may lead to suboptimal coalescing. Add heuristics to bypass coalesce for single huge payloads.\n- Platform differences: Windows or older kernels without io_uring optimizations might perform differently; implementation hides platform-specifics behind an abstraction layer.\n\nBenchmarks (internal prototype):\n- Setup: 8xA10 node, synthetic mixed workload (70% short-chat ~64 tokens, 30% long ~1024 tokens), baseline runtime-1.22.\n- Prototype results (canary branch): p50 prefill\u2192decode host time: 18.4ms -> 11.1ms (40% reduction); p95: 63ms -> 34ms (46% reduction); p99: 145ms -> 78ms (46% reduction).\n- CPU: host user CPU cycles for prefill path down ~30% at 95th percentile; context switches down 55%.\n- Memory: pinned memory increased by ~9% under the same qps.\n\nRollout plan:\n- Feature-flag gate: runtime flag \"compact_staging_v1\" default off for hosted; enable in Dedicated private clusters with opt-in config.\n- Canary: enable for 10% of traffic in non-critical region (us-west-2) for 48h, monitor metrics (host_cpu_pre_fill_ms, transfer_count_per_request, context_switches, p50/p95/p99 latency).\n- Gradual ramp: 10% -> 30% -> 60% -> 100% over multiple cycles with automated rollback if p99 or CPU exceed safe thresholds.\n\nTesting and validation:\n- Unit tests for slab allocation/free ordering, wraparound behavior, and failure paths.\n- Integration tests with CUDA mocks to validate single-shot transfer completion ordering.\n- Load tests using replay of production trace (one-hour window) to verify no regression in throughput and improved host metrics.\n- Chaos test: simulate stalled transfers and slab exhaustion to ensure fallback path is correct.\n\nObservability and metrics to add:\n- transfer_aggregations_per_second (gauge), avg_payload_per_transfer (histogram), slab_fill_ratio (gauge), slab_alloc_failures (counter), transfer_latency_ms (histogram).\n- Alerting on increased slab_alloc_failures or sustained transfer_latency_ms > baseline + 2x.\n\nDocs and artifacts:\n- Design doc: https://drive.google.com/file/d/1a2b3CompactStagingDesign\n- Prototype PR: https://github.com/redwood-inference/runtime/pull/8231\n- Benchmark scripts: https://github.com/redwood-inference/perf-scripts/tree/main/compact-staging\n\nAcceptance criteria:\n- p95 prefill\u2192decode host time reduced by >= 30% on mixed workload replay for canary nodes.\n- No increase > 10% in end-to-end p99 generation latency under production traffic shape.\n- CPU host user cycles for prefill path reduced by >= 20% at 95th percentile.\n- No regression in memory ops or observed OOMs in Dedicated nodes with configured slabs.\n\nNext steps (short term):\n- Complete threadpool affinity changes and integrate with slab allocator (Marco).\n- Add metrics hooks and canary rollout automation (SRE/infra).\n- Run full-production trace replay and capture a 24h diff.\n- Prepare release notes and console observability tile for runtime-1.23.\n\nLonger term ideas (future epics):\n- Replace aggregation window with an adaptive latency estimator that dynamically tunes window per queue shape.\n- Explore OS-level batching (io_uring) paths for non-CUDA DMA engines on supported kernels.\n- Kernel-hinting integration so the kernel selector prefers models/variants that yield contiguous prefill layouts for even better coalescing.",
+  "comments": [
+    "2026-02-12 - Spike: basic slab allocator implemented; microbench shows reduced small-allocation churn. - Aisha",
+    "2026-02-19 - Prototype integrated single-shot memcpy path. Early bench: p50 host prefill down ~28%. CPU savings visible. - Marco",
+    "2026-02-26 - Design review notes: SRE requested slab caps and metrics for fallback. Security asked to confirm pinned memory cannot be swapped; added doc response. - Review by Priya (SRE) and Daniel (Security)",
+    "2026-03-03 - PR #8231 posted for initial review. Needs more unit tests around wraparound. - Marco",
+    "2026-03-05 - Bench run 2026-03-05-0810: p95 improvement consistent; added benchmark artifacts to perf repo. Observed ~9% pinned memory bump. - Aisha",
+    "2026-03-09 - Code review: split large changes into allocator, scheduler, and threadpool patches for easier review. Addressed racy callback scenario reported by reviewer. - Marco",
+    "2026-03-12 - Canary started at 10% traffic in us-west-2; monitoring dashboards created. No regression in first 6h. - SRE ops (Priya)",
+    "TODO: Add automated rollback policy in the canary pipeline and finalize runtime flag naming in config schema."
+  ],
+  "dependencies": [
+    "ENG-93210",
+    "ENG-61205"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.23",
+  "security_review_required": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_8d66b390e6d14a93ae628186530dc729"
+}

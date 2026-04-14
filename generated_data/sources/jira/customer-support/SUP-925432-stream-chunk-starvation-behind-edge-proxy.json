@@ -1,0 +1,93 @@
+{
+  "key": "SUP-925432",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "SSE/Websocket streaming stalls mid-token due to edge-proxy chunk coalescing and worker starvation",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Priya Nair",
+  "assignee": "Marco Delgado",
+  "customer_company": "Acme Health",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "streaming-proxy",
+    "serving-runtime",
+    "scheduler"
+  ],
+  "labels": [
+    "streaming",
+    "latency-regression",
+    "edge-proxy",
+    "adaptive-batching"
+  ],
+  "environment": "prod - us-east",
+  "affected_models": [
+    "redwood-v1-small",
+    "gptj-large-8k"
+  ],
+  "affected_regions": [
+    "us-east",
+    "eu-west"
+  ],
+  "sla_due_at": "2026-03-14",
+  "first_response_due_at": "2026-03-12",
+  "linked_issues": [
+    "INT-40121",
+    "SUP-762000"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving/pull/1289"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/Streaming+stall+runbook"
+  ],
+  "description": "Issue summary:\nOn 2026-03-12 we started receiving multiple customer reports (first from Acme Health) where SSE and websocket streaming sessions stall mid-generation \u2014 often while a token is still being emitted (client sees a partial token and then silence). Impact: production streaming sessions for some dedicated customers experience mid-generation stalls causing client timeouts and degraded UX.\n\nImpact:\n- Intermittent mid-token stalls on long-running chat generations (20-60s).\n- Affects ~2-4% of long-form streaming requests for affected customers in us-east; smaller spike observed in eu-west.\n- Customers experience client-side timeouts and reopen attempts which sometimes succeed.\n\nEnvironment:\n- Prod serving behind the edge-nginx fleet in us-east (edge-proxy for dedicated customers).\n- Affected routes: /v1/chat/stream, /v1/generate/stream with adaptive batching enabled for throughput optimization.\n\nObserved behavior:\n- Client receives partial token bytes then connection goes quiet (no FIN/RST). Socket remains ESTABLISHED; upstream logs show worker is still assigned to request but not emitting chunks.\n- Internal metrics show concurrent request queueing and worker slot exhaustion around the time stalls occur.\n\nExpected behavior:\n- Continuous streaming of chunks until generation completes, with keepalive heartbeats preventing silent stalls.\n\nAttachments/logs:\n- Grafana: https://grafana.redwood.ai/d/streaming/streaming-slo?orgId=1&from=now-1h&to=now (spike visible 2026-03-12 16:05-16:25 UTC)\n- Kibana traces: https://kibana.redwood.ai/app/discover#/?_a=(query:(match:...)) (sample trace id: trace-20260312-5b7a)\n- Support thread: Slack #support (thread ts: 1649875600.12345)",
+  "steps_to_reproduce": [
+    "1) Use a dedicated account (Acme Health) in us-east with adaptive batching enabled.",
+    "2) Start a streaming chat request with ~6k token context and request streaming via SSE or websocket.",
+    "3) Observe that after a period of emitted tokens (~15-40s) the stream becomes silent without connection close and no final event delivered.",
+    "4) Re-running the same request sometimes completes successfully; failure rate ~2-4% on observed windows."
+  ],
+  "logs": [
+    "edge-nginx error_log: keepalive_pool_full, coalesced_write_event on socket 192.0.2.77:54321",
+    "serving-runtime INFO: worker-27: starting generation job id=gen-9a3b; kv_cache_hits=0; batch_size=1",
+    "serving-runtime WARN: adaptive_batcher delayed flush: queue_depth=62; last_flush=1270ms",
+    "proxy-trace: upstream_read_timeout not hit; connection persisted; no RST"
+  ],
+  "investigation_notes": [
+    "Support triage (Priya): Collected logs from customer, validated reproducible pattern for long-context streaming under high concurrency.",
+    "SRE (Marco): Observed edge-nginx keepalive pool saturation correlated with time windows. Nginx pooling occasionally coalesces small writes into larger TCP segments; combined with adaptive batching delaying flushes this can lead to head-of-line blocking inside worker write buffers.",
+    "Eng (Taylor): Serving runtime shows worker is still active (not crashed) but last_write timestamp stops after a partial chunk. The runtime flush path defers small chunk flushes to amortize kernel calls; when edge proxy buffers + coalescing occurs, the TCP send buffer does not actually transmit until net stack decides, resulting in perceived silence at client even though upstream app hasn't signaled end.",
+    "Hypothesis: Interaction between adaptive batching (which intentionally delays small-chunk flushes), edge-nginx keepalive and buffer coalescing, and a limited streaming worker pool causes effective worker starvation and mid-token silence. TL;DR: small-chunk buffering + proxy coalescing = silent period.",
+    "Observed amplification under burst load and when keepalive re-use leads to many streams multiplexed on same upstream connections."
+  ],
+  "comments": [
+    "2026-03-12 Priya Nair (Support): Affected customer (Acme Health) reports multiple mid-stream stalls yesterday afternoon. Collection of SDK trace, sample request IDs, and client timings attached. Asking for engineering investigation.",
+    "2026-03-12 Marco Delgado (SRE): Reproduced locally with dedicated config and load-generator; replicated 2/50 failures within 1 hour. Noted nginx keepalive_pool_full events.",
+    "2026-03-13 Taylor Kim (Serving Eng): Instrumented runtime path; added debug logging for flush/flush_delay and confirmed flush delayed beyond 1s in failing traces. Opening a quick PR to add explicit chunk flush on streaming routes.",
+    "2026-03-13 Marco Delgado (SRE): Temporary mitigation applied at edge: increased proxy_buffer_size and keepalive pool from 64->256 and tuned proxy_http_version to 1.1 for streaming routes. Also increased upstream_read_timeout to 120s. Customer reports reduced rate of stalls for initial window.",
+    "2026-03-14 Taylor Kim (Serving Eng): Merged PR #1289 to force flush on streaming-chunk boundary and added per-stream flush timeout (200ms). Scheduled controlled rollout to 10% of streaming requests to validate impact.",
+    "2026-03-14 Priya Nair (Support): Informed Acme Health of mitigation and scheduled follow-up for 2026-03-16 to confirm full resolution. Customer appreciated rapid response but asked for root-cause report."
+  ],
+  "resolution": "Workaround and mitigation: SRE increased edge keepalive pool and adjusted proxy buffering; Eng deployed change to force periodic flushes on streaming chunks and introduced per-stream flush timeout. Root cause (working hypothesis): interaction of adaptive batching delayed flushes with edge-proxy TCP coalescing and limited worker pool leading to transient silent periods mid-token. Next steps: monitor rollout, further harden batching logic to avoid delaying first N chunks, add per-route proxy config for streaming, and create a postmortem if residual error rates exceed 0.5% over 24h.",
+  "status_updates": [
+    "2026-03-12: New - triage started (Support)",
+    "2026-03-13: In Progress - SRE applied temporary edge config; Eng preparing code fix",
+    "2026-03-14: In Progress - PR merged and canary rollout started (10%)"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution",
+    "status_updates"
+  ],
+  "dataset_doc_uuid": "dsid_de5b296353e44f87a0aa1ac5f9d5bfce"
+}

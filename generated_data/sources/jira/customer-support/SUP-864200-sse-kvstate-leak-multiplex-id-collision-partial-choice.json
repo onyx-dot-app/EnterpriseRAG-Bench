@@ -1,0 +1,94 @@
+{
+  "key": "SUP-864200",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Intermittent SSE half-closed stream with cross-session kv-cache leakage causing partial/duplicated choices",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Ava Chen",
+  "assignee": "Diego Ramirez",
+  "customer_company": "Parcelly",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "kv-cache",
+    "sdk",
+    "load-balancer"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "kv-cache",
+    "multiplexing",
+    "dedicated"
+  ],
+  "environment": "prod | us-east",
+  "affected_models": [
+    "open-llm/gptx-13b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "description": "Issue summary: Parcelly calls our streaming SSE chat endpoint from a dedicated cluster. Over the last two days they observe intermittent sessions that end in a half-closed state: the client receives a final 'data: [DONE]' but the JSON choice is truncated or duplicated and subsequent requests from different browser tabs sometimes see fragments from the earlier session.",
+  "description_more": "Impact: Customer reports degraded UX for conversational product: truncated final sentences and occasional duplicated partial choices visible to other live sessions. Repro rate: ~1-2% of streams, higher during bursty batch updates. Temporary workarounds attempted by customer: retrying the stream from the client, forcing single-tab usage, switching to non-multiplexed requests \u2014 reduced occurrence but did not eliminate.",
+  "steps_to_reproduce": [
+    "1) On a dedicated tenant with multiplexing enabled, open two browser tabs to the customer's app behind a CDN (Fastly).",
+    "2) Tab A starts an SSE chat stream (streaming chat completion with kv-cache priming).",
+    "3) Midway through generation, client triggers a reconnect (network hiccup / auth refresh).",
+    "4) Tab B starts a separate SSE stream using the same multiplexing session id pool.",
+    "5) Observe Tab A receives an immediate 'data: [DONE]' but the final \"choice\" JSON is truncated or contains duplicated fragments; Tab B sometimes receives a leading fragment from Tab A's final tokens.",
+    "6) Check server-side logs for session ids and kv-cache eviction/attach events for cross-correlation."
+  ],
+  "logs": [
+    "2026-03-10T18:22:44Z service=serving-runtime level=ERROR msg=\"stream finalize: kv-attach mismatch session=ms-4f2a trace=00-abc123...\"",
+    "2026-03-10T18:22:44Z service=api-gateway level=INFO msg=\"sse disconnect: client=parcelly-frontend-3 conn_id=conn-77fbb keepalive=timedout\"",
+    "2026-03-10T18:22:44Z service=kv-cache level=WARN msg=\"tombstone collision when reusing multiplex-slot id=slot-21 owner=ms-4f2a previous-owner=ms-9d8c\"",
+    "2026-03-10T18:22:45Z service=serving-runtime level=INFO msg=\"emitting final-event: choice_partial=true session=ms-4f2a\""
+  ],
+  "comments": [
+    "Ava Chen (2026-03-10): Raised by Parcelly after they saw duplicated fragments across tabs. Provided sample client trace and session ids. Notified CS and attached customer logs.",
+    "Priya Nair (SRE) (2026-03-10): ACKed. Requested full server trace ids and the customer's multiplexing header values. Suspect multiplex slot reuse under race on reconnect.",
+    "Parcelly_Eng (2026-03-10): Provided client capture (EventSource timeline), observed final chunk trimmed and then appeared as leading fragment in new tab. Attached cURL/headers.",
+    "Diego Ramirez (2026-03-11): Instrumented allocator to log multiplex-slot lifecycle. Found slots 21/22 showing rapid allocate/free with overlapping attach windows matching customer times. Escalating to serving-runtime team.",
+    "Olivia Park (Serving Runtime) (2026-03-11): Hypothesis: kv-cache tombstone TTL too low combined with race in session detachment leads to stale KV context being re-attached to a different logical session id. This can produce partial/duplicated choices when the earlier generator emits buffered tokens after tombstone."
+  ],
+  "investigation_notes": [
+    "Correlation: customer conn_id conn-77fbb correlates to internal trace 00-abc123... across API Gateway -> Runtime -> KV-Cache. Event timeline shows client reconnect at 2026-03-10T18:22:43Z, slot deallocation at 18:22:43.120Z, new allocation at 18:22:43.135Z (15ms overlap window).",
+    "Reproduction: We reproduced locally with a synthetic client that aggressively reconnects and reuses multiplexing slots. Observed partial 'choice' emission and kv-cache tombstone warnings. Reproducible when tombstone TTL set to 50ms and multiplex allocator uses LIFO free list.",
+    "Root cause hypothesis: Race between HTTP/LD connection teardown (client-side reconnect) and multiplex-slot free path. The allocator can hand the same multiplex id to a new session before the previous runtime has fully drained buffered tokens tied to that id's KV context. The KV tombstone flow then reattaches stale state to the new session, producing mixed fragments.",
+    "Risk surface: Affects multiplexed SSE and websocket streaming on dedicated pools under bursty reconnect patterns and behind proxies that cause short disconnects (Fastly TTLs, client-side auth refresh). Non-multiplexed paths not affected.",
+    "Telemetry: Added a temporary metric 'kv.tombstone_collision' and increased logging for slot lifecycle. Early counts show ~120 collisions/day in tenant Parcelly; global rate ~0.05% of streams on ded clusters.",
+    "Temporary mitigation tested: increase tombstone TTL to 200ms and add short grace window before reassigning freed slots. This reduces incidence locally (observed drop to ~0.1% repro) but increases slot pressure under heavy load."
+  ],
+  "resolution": [
+    "Short-term workaround (applied to Parcelly's tenant on 2026-03-11): Enabled per-tenant conservative multiplexing by setting 'multiplex_reuse_grace_ms' = 250 and 'kv_tombstone_ttl_ms' = 300. Instructed customer to disable browser prefetching and reduce concurrent tab reconnect rate. Customer reported immediate UX improvement.",
+    "Medium-term fix (in progress): Serving-runtime change to decouple in-flight generator buffer ownership from multiplex slot id. Patch PR https://github.com/redwood-inference/serving-runtime/pull/8145 introduces explicit session tokens attached to buffered frames and only allows slot reuse after session token eviction. Also adds stricter invariant checks and unit tests for rapid reconnect scenarios.",
+    "Rollout plan: PR merged to canary on 2026-03-12, monitoring dashboard created (kv.tombstone_collision, stream.final_truncated_rate). Full rollout to Dedicated fleets scheduled after 72h canary and load test validation."
+  ],
+  "linked_issues": [
+    "SUP-864201",
+    "SUP-475000"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/8145"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/Streaming+Multiplexing+Runbook"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "description_more",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_915a5fba002e4abdbdd64ed0ea138aa5"
+}

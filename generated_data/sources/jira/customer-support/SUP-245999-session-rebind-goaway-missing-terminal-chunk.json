@@ -1,0 +1,79 @@
+{
+  "key": "SUP-245999",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Session rebind during GOAWAY results in missing terminal chunk and partial stream finalization",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Patel",
+  "assignee": "Miguel Santos",
+  "customer_company": "Acme Analytics",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "streaming-runtime",
+    "load-balancer",
+    "serving-runtime"
+  ],
+  "labels": [
+    "streaming",
+    "goaway",
+    "partial-output",
+    "reconnect",
+    "investigation"
+  ],
+  "environment": "prod/us-east",
+  "affected_models": [
+    "openlm-7b-v1",
+    "redwood-rlhf-13b"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "linked_issues": [
+    "SUP-4721",
+    "SUP-220501"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/runtime/pull/1290",
+    "github.com/redwood-inference/gateway/pull/658"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood/product/streaming-resume-runbook"
+  ],
+  "sla_due_at": "2026-03-12",
+  "description": "Issue summary:\nCustomer reports repeated occurrences where an in-progress streaming response (SSE and WebSocket streaming paths) terminates with a partial payload: the client receives everything up to the last sentence but never receives a terminal 'end' or final-choice metadata, which prevents client-side finalization and leads to retries/duplicate tokens.\n\nImpact:\n- Affects dedicated-tier customer traffic in us-east.\n- Client-side consumers show incomplete final output and either hang waiting for terminal event or retry and duplicate last choice.\n- Leads to confused downstream business logic that expects a finalization marker.\n\nEnvironment:\n- prod/us-east on dedicated pool (customer-tenant: acme-analytics-dedicated-3)\n- Observed on both SSE and websocket streaming clients, across Chrome and a headless Python client.\n\nSteps to reproduce (observed):\n1) Start streaming text generation to the customer-dedicated endpoint using model redwood-rlhf-13b.\n2) Generate a response > 2k tokens (long tail output).\n3) During token emission, on the same LB host a GOAWAY or keepalive probe triggers backend session rebind (observed near TCP connection rotation window).\n4) Client sees chunks up to the last paragraph; no terminal meta/event; TCP socket eventually closes from client side.\n\nObserved behavior:\n- Final \"end-of-stream\" event or terminal JSON is not delivered to the client.\n- Server logs show the upstream worker emitted an END marker (internally), but the gateway logs show a GOAWAY with a connection close before the final chunk reached the client.\n- In some cases the gateway replays a subset of the last chunk which causes partial duplicate tokens but never the final metadata event.\n\nExpected behavior:\n- Streaming paths should either deliver the terminal event before connection rebind or reliably emit a clear terminal closure message to clients even if a GOAWAY forces a session migration.\n\nAttachments / logs: request IDs included in comments. Full gzipped traces uploaded to S3 (link in investigation notes).\n\nNotes: This is not a simple keepalive truncation (where bytes are lost due to proxy buffering). The pattern looks like an ordering race between HTTP/2 GOAWAY propagation at the gateway and the final frame flush from the worker process, which results in the gateway closing the client-facing stream before the terminal frame is forwarded.",
+  "comments": [
+    "2026-03-10 10:23 - Aisha Patel (Support): Customer reported 40+ sessions in last 24h with identical symptoms. Provided sample request IDs: rq_20260310_us_8091, rq_20260310_us_8123. Asked for request traces and client SDK versions.",
+    "2026-03-10 13:45 - Miguel Santos (SRE): Pulled gateway logs for rq_20260310_us_8091. Found GOAWAY at 2026-03-10T13:41:12.482Z followed by connection close 50ms later. Upstream worker shows 'emitted-terminal' at 2026-03-10T13:41:12.531Z. Possible race where gateway shutdown precedes final frame flush.",
+    "2026-03-11 09:12 - Elena Novik (Runtime): Reproduced locally with muxing enabled. When we inject an artificial GOAWAY at the gateway layer while worker flush is in-flight, the client never receives the terminal event. Confirmed on both SSE and ws paths. Created a minimal repro script.",
+    "2026-03-11 16:08 - Miguel Santos (SRE): Applied temporary workaround on acme-analytics-dedicated-3: extended keepalive window and pin affinity for long-lived streams. Customer reports reduction in occurrences for new sessions; existing hung sessions still need resolution.",
+    "2026-03-12 11:30 - Aisha Patel (Support): Customer accepted the workaround but requests a permanent fix and postmortem. Scheduling follow-up call next week."
+  ],
+  "investigation_notes": [
+    "Trace analysis (rq_20260310_us_8091): gateway->worker RTT small (2-5ms). GOAWAY emitted by load-balancer at t0. Worker attempted to flush final frame at t0+49ms. Gateway closed client stream at t0+50ms before final frame arrived.\nAction: confirm gateway ordering semantics and buffering behavior for final frames on GOAWAY.",
+    "Hypothesis: when gateway receives backend GOAWAY or initiates connection rotation, it currently does not wait for already-in-flight final frames to be forwarded to the client. The proxy may prioritize closing connections to facilitate backend drains, which causes terminal frames to be dropped.\nEvidence: consistent 'emitted-terminal' in worker logs after GOAWAY entry in gateway logs.",
+    "Repro steps in lab: enabled explicit GOAWAY injection in gateway, reproduced missing-terminal in 95% of trials for responses with final flush latency between 20ms and 120ms.",
+    "Potential secondary factor: some client SDKs treat absence of explicit terminal marker as retry, causing duplicate choice tokens when stream resumes. This explains duplicate final tokens observed in some traces.",
+    "Related to previous tickets: SUP-4721 (reconnects/truncated streams) and SUP-220501 (edge probe teardown suppresses terminal event). Those tickets show similar end-state but different root cause (proxy rewrite vs keepalive)."
+  ],
+  "resolution_notes": [
+    "Temporary mitigation (deployed 2026-03-11): extended LB connection rotation grace window for long-lived streams in acme-analytics dedicated pool; pinned session affinity for streams > 60s. Reduced incidence for new sessions by ~85%.",
+    "Permanent fix (in progress): change gateway flush semantics to drain and forward any in-flight final frames before closing client stream on GOAWAY. Implementation in gateway PR github.com/redwood-inference/gateway/pull/658. Runtime changes to mark final-frame as high-priority flush landed in runtime PR github.com/redwood-inference/runtime/pull/1290.",
+    "Rollout plan: staged rollout to us-east dedicated pools starting 2026-03-13 with feature flag 'drain-final-frame'. Monitor terminal-event delivery metric and error-rate for 48h before global flip.",
+    "Follow-up items: add an automated regression test that injects GOAWAY during final flush; update streaming runbook with guidance to pin affinity for long-lived customer streams until rollout is complete.",
+    "Customer communications: sent interim advisory and workaround. Will provide postmortem after rollout completes."
+  ],
+  "fix_version": "gateway-2.8.1-runtime-1.12.3",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_a1b604f3d5f34b039abace329e782b4f"
+}

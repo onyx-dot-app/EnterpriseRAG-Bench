@@ -1,0 +1,82 @@
+{
+  "key": "SUP-312580",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Lingering client sockets from SDK 1.5 causing allocator attach lag and transient GPU starvation in dedicated pool",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Ava Thompson",
+  "assignee": "Diego Martinez",
+  "customer_company": "Nestly AI",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "autoscaler",
+    "scheduler",
+    "sidecar-proxy",
+    "console"
+  ],
+  "labels": [
+    "noisy-neighbor",
+    "allocator-starvation",
+    "sdk-regression",
+    "p99-latency"
+  ],
+  "environment": "prod-us-west-2",
+  "affected_models": [
+    "redwood/open-llama-7b-v2",
+    "redwood/llama-2-13b-quant"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-14T18:30:00Z",
+  "first_response_due_at": "2026-03-12T13:45:00Z",
+  "linked_issues": [
+    "SUP-314159",
+    "SUP-61234",
+    "SUP-803210"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/sidecar-proxy/pull/482",
+    "https://github.com/redwood-inference/autoscaler/pull/991"
+  ],
+  "related_confluence_pages": [
+    "https://redwood-internal.atlassian.net/wiki/spaces/SRE/pages/687201/Dedicated+Pool+Attach+Runbook",
+    "https://redwood-internal.atlassian.net/wiki/spaces/DEV/pages/9021/Sidecar+Socket+Model"
+  ],
+  "description": "Issue summary: Multiple customers on Dedicated pools (notably Nestly AI) reported sudden mid-day throughput collapse in us-west-2. Symptoms: high attach latency, GPUs showing as \"unavailable\" for short windows, autoscaler overprovisioning then failing to attach more slots, resulting in sustained p99 latency increase and request queueing. Impact: customer-facing inference throughput dropped ~45% for 11:20\u201312:15 PT window, causing timeouts and degraded SLAs (affects bursty short-stream workloads).\n\nTimeline: 2026-03-12 11:18 PT \u2014 first alerts from console (p99 spike). 11:22 \u2014 Nestly support ticket opened. 11:27 \u2014 SRE paged; initial triage found attach latencies spiking to 2.1s (baseline ~80ms). 11:45 \u2014 noticed high ephemeral socket count on sidecar-proxies and many TIME_WAIT/FIN_WAIT connections. 11:55 \u2014 rolled mitigations (sidecar restart + temporary increase of autoscaler cooldown) reduced p99 but residual throughput gap persisted. 12:10 \u2014 SDK team provided suspect client change (SDK 1.5.0) that changed keepalive/connection pooling semantics. 12:50 \u2014 further instrumentation added to allocator and sidecars.\n\nObserved behavior: continuous small inference streams (median token count <8) from Nestly's new rollout produced many short-lived connections that lingered in sidecar epoll threads. The allocator reported denied attaches due to ephemeral FD exhaustion and per-worker attach throttles. Autoscaler reacted by spinning up new nodes but attach latency prevented them from entering the pool fast enough, so overall slot availability oscillated and throughput collapsed.\n\nWhy this is distinct: unlike classic noisy-tenant high-CPU/gpu use, this appears to be a networking/socket churn pattern (many short TCP sessions combined with OS-level TIME_WAIT growth) that interacts poorly with the sidecar's connection pooling logic and the allocator\u2019s attach backoff logic.\n",
+  "steps_to_reproduce": "1) Deploy a dedicated pool with default sidecar-proxy config and autoscaler cooldown=60s.\n2) From a client mimic Nestly SDK 1.5 behavior: open 100 concurrent short-lived connections that issue a single-stream generate (8 tokens) then close socket immediately; each connection repeats at 10rps for 5 minutes.\n3) Observe sidecar epoll thread FD count and TIME_WAIT growth (netstat/tcpdump) and allocator attach latencies on the cluster (console dashboard).\n4) Watch autoscaler: new nodes will be provisioned but have delayed attach confirmations and slot registration delays.\n\nCommands (example):\n- for i in {1..100}; do (echo -e \"POST /v1/generate HTTP/1.1\\r\\nHost: api.redwood.internal\\r\\nAuthorization: Bearer <token>\\r\\nContent-Type: application/json\\r\\nContent-Length: ...\\r\\n\\r\\n{\\\"model\\\":\\\"open-llama-7b-v2\\\",\\\"input\\\":\\\"hi\\\"}\"; sleep 0.1) | nc api.redwood.internal 443 & done\n- watch sidecar fd counts: ss -s; sudo netstat -anp | grep TIME_WAIT | wc -l",
+  "logs": [
+    "[11:22:13] sidecar-proxy[proxy-7]: epoll loop: fd_count=1832, TIME_WAIT=1428",
+    "[11:25:02] allocator[scheduler-3]: attach_latency=2100ms attach_failures=34 attach_denied=12",
+    "[11:26:05] autoscaler: scale_up requested=6 nodes; first_node_attach=58s",
+    "[11:30:11] serving-runtime[gpu-12]: gpu_available=false reason='attach_timeout'"
+  ],
+  "investigation_notes": "What we've checked: kernel socket tables, sidecar fd leaks, allocator backoff counters, autoscaler scale events, GPU driver logs (no driver crashes), and tenant traffic fingerprints.\nHypothesis: SDK 1.5 changed default connection pooling to 'short-lived per-request' mode and disabled HTTP keepalive by default when using its new fast-fail feature. That elevated short TCP sessions and left many sockets in TIME_WAIT, increasing fd pressure and causing the sidecar to serialize epoll handling. The allocator's attach path is sensitive to epoll latency because attach confirmations are sent via the same control channel.\nEvidence: nestly reported they rolled out SDK 1.5 at 11:10 PT; per-ip request pattern matches our reproduction; sidecar commit hash with earlier behavior referenced in PR; bumping sidecar restart reduces TIME_WAIT quickly and restores attach latencies to normal.\nOpen questions: \n- Is sidecar-config default safe for workloads with extreme short-connection fanout?\n- Does allocator need separate control path to avoid being impacted by sidecar epoll backlog?\n",
+  "mitigation": "Immediate: 11:55 PT \u2014 restarted sidecars for affected nodes serving Nestly; temporarily increased autoscaler cooldown to 180s to avoid thrashing. Communication: advised Nestly to roll back SDK 1.5 rollout to 1.4.2 (they accepted and started rollback at 12:00 PT).\nEngineering mitigations in progress: adjust sidecar default keepalive and backlog settings; add non-blocking control channel between allocator and attach path; add autoscaler soft-attach fast-path for newly provisioned nodes.\n",
+  "resolution_summary": "Partial mitigation achieved: after sidecar restarts and Nestly SDK rollback, attach latency returned to baseline (~95ms) and throughput recovered to ~93% of expected within 30 minutes. Root cause is still being validated; long-term fixes planned (sidecar connection tuning + allocator control-plane isolation). Ticket remains In Progress until code changes are merged and rolled out to prod and we verify no regression for other customers.",
+  "next_steps": "1) Postmortem notes and RCA writeup (assigned to Diego). 2) Sidecar config change PR (owner: infra/sidecar team) and staged canary in us-west-2. 3) Autoscaler control-path change PR with unit/integration tests. 4) Add dashboard to detect sudden TIME_WAIT growth correlated with attach_latency. 5) Follow up with Nestly to confirm SDK rollout process and add warnings in SDK release notes.",
+  "comments": [
+    "Ava Thompson (Support): Initial triage attached logs and linked Nestly ticket \u2014 customer reporting 500s and long queues.",
+    "Diego Martinez (SRE): Reproduced locally with stress harness and short-conn pattern; sidecar epoll loop saturating. Restarted sidecars on impacted nodes \u2014 p99 improved to 300ms then 95ms after rollback.",
+    "Priya Rao (SDK): Confirmed SDK 1.5 introduced new default connection behavior; patch PR opened to re-enable keepalive by default for dedicated-pool customers (https://github.com/redwood-inference/clients/pull/214).",
+    "SRE Note: We should consider adding a per-sidecar fd soft-limit alarm and prefer connection-reuse in clients. Also tracking related autoscaler PR #991 for fast-path attach.",
+    "Customer (Nestly AI - Emily Chen): We rolled back to SDK 1.4.2 as requested and saw latency go back down. Would like to coordinate a grace period before SDK 1.5 is re-promoted."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "mitigation",
+    "resolution_summary",
+    "next_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_aeec8c1cd05240e5a47a4e0b40080d32"
+}

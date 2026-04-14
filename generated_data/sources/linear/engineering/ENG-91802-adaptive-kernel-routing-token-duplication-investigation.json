@@ -1,0 +1,117 @@
+{
+  "key": "ENG-91802",
+  "team": "engineering",
+  "title": "Investigate non-deterministic token duplication and softmax divergence under adaptive kernel routing",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-10",
+  "creator": "Marco Chen",
+  "assignee": "Aisha Patel",
+  "project": "serving-runtime-performance",
+  "cycle": "2026-W09",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "adaptive-routing",
+    "kv-cache",
+    "scheduler",
+    "numerical-drift",
+    "softmax",
+    "investigation"
+  ],
+  "release": "runtime-1.22",
+  "customer_impact": "high",
+  "security_review_required": "false",
+  "description": "Observed non-deterministic token duplication and growing softmax score drift in production traces when adaptive kernel routing switches between fused-attn and fallback kernels mid-request. Problem appears intermittently on long-context prefill + streaming decode workloads. This ticket tracks a deep investigative effort to find root cause, mitigate customer-facing regressions, and implement a long-term fix.",
+  "steps_to_reproduce": [
+    "1) Start a large prefill request (~2048 tokens) using model X with rotary embeddings enabled and mixed-precision path active",
+    "2) At ~prefill tail switch, send 1-2 concurrent decode requests that trigger adaptive kernel routing decision (force kernel A -> kernel B switch via synthetic load)",
+    "3) Observe token stream: duplication (repeated tokens) or insertion of previously-seen token ids during decode",
+    "4) Compare softmax outputs between run A (stable kernel path) and run B (kernel switch) to detect divergence beyond numerical epsilon"
+  ],
+  "observed_behavior": [
+    "Intermittent duplicated tokens emitted to clients during streaming decodes (1-3 duplicates per request)",
+    "Softmax logits diverging >1e-2 L2 distance after kernel switch (should be ~1e-6 under same seed/state)",
+    "KV-cache snapshot arithmetic mismatch at slot boundaries when kernel selection changes mid-request",
+    "Issue frequency increases under high scheduler load and opportunistic prefetching enabled"
+  ],
+  "expected_behavior": [
+    "Deterministic single token stream matching reference kernel run",
+    "Softmax outputs within numerical tolerance across kernel variants",
+    "KV cache continuity preserved across kernel routing events"
+  ],
+  "initial_hypotheses": [
+    "A. Memory alias / stale pointer: kernel swap leaves a small region of KV slots uninitialized or double-written leading to duplicated token generation",
+    "B. Quantization rounding mismatch: different kernels use slightly different fused-math sequences causing softmax instability to amplify during autoregressive steps",
+    "C. Scheduler preemption race: prefill/decoder handoff races can reorder updates to shared token index counters",
+    "D. Prefix/KV stitching bug: prefix cache merge does not reconcile overlapping kv-slot offsets when switching kernels"
+  ],
+  "evidence_collected": [
+    "Attached perf traces (perfetto) from failing run: https://redwood.internal/traces/rt-91802/trace-2026-03-04",
+    "Sample payloads and deterministic seed pairs uploaded: gs://redwood-debug/ENG-91802/samples.zip",
+    "Diff of logits between kernel-A-only vs kernel-A-then-B run: https://notebooks.redwood/internal/diffs/91802-softmax.html",
+    "Memory sanitizer output showing two small stale writes at KV slot boundary (see logs below)"
+  ],
+  "logs": [
+    "2026-03-04T17:12:22Z [worker-32] WARN scheduler: kernel-switch decision at seq=1984 (A->B)\n",
+    "2026-03-04T17:12:22Z [worker-32] DEBUG kvcache: write at slot_offset=131072 length=256 (caller=adaptive_router)\n",
+    "2026-03-04T17:12:22Z [worker-32] ERROR decode: duplicate token emitted token_id=5023 prev_token_id=5023 seq=1986\n",
+    "ASAN: stack-buffer-overflow at kv_slot_boundary+8 (possible stale read)"
+  ],
+  "investigation_notes": [
+    "Reproduced locally with stress harness using deterministic scheduler; toggling opportunistic prefetch reduces frequency but does not eliminate duplication",
+    "Replaying failing trace with memory fencing and extra validation detects a second writer overlapping the end of prefix buffer",
+    "Floating point repro: switching kernels with identical inputs yields tiny per-layer differences that amplify in softmax during long autoregressive loops",
+    "Behavior correlated with batch composition: mixed prefill+decode in same worker more likely than isolated decode-only workers"
+  ],
+  "actions_taken": [
+    "1) Rolled out temporary mitigation: disable opportunistic kernel switching for long-context (>1024) requests in runtime-1.22-edge (hotfix), throttled ramp to 50%",
+    "2) Added assert in KV write path to detect overlapping writes and log full stack traces (PR: https://github.com/redwood-inference/runtime/pull/1247)",
+    "3) Built a unit test that runs A->B kernel switch loops for 10k iterations under ASAN to surface overlapping writes",
+    "4) Instrumented softmax paths to emit L2 diff metric for cross-kernel comparisons and surfaced to Console (dashboard link below)"
+  ],
+  "links": [
+    "PR with mitigation and asserts: https://github.com/redwood-inference/runtime/pull/1247",
+    "Investigation notebook with logits diffs: https://notebooks.redwood/internal/diffs/91802-softmax.html",
+    "Production trace: https://redwood.internal/traces/rt-91802/trace-2026-03-04",
+    "Console dashboard for L2 softmax diffs: https://console.redwood/internal/dashboards/softmax-drift"
+  ],
+  "next_steps": [
+    "A) Root cause: confirm whether an incomplete fence/atomic causes overlapping KV writes when kernel buffer layouts differ; write small repro toggling fences",
+    "B) If race: convert KV write handoff to an atomic double-buffer swap ensuring readers only see fully-committed slots",
+    "C) If numerical amplification primary: harmonize softmax reduction numerics between kernels (reduce reorderings, use stable log-sum-exp path)",
+    "D) Run a canary of kernel-harmonization on dedicated capacity customers with long-context workloads (coordinate with SRE + CS)",
+    "E) Postmortem and public incident notes if customer-facing duplicates > 1% for affected tenants"
+  ],
+  "dependencies": [
+    "ENG-9215",
+    "ENG-52711"
+  ],
+  "sub_issues": [
+    "ENG-91803",
+    "ENG-91804"
+  ],
+  "commentary": [
+    "2026-03-02 Marco Chen: Initial report from SRE alerting on duplicated tokens observed in 3 customer calls. Assigned to Aisha to lead triage.",
+    "2026-03-03 Aisha Patel: Confirmed minimal reproducible case in CI stress harness. Hypothesis A (overlapping writes) looks promising after ASAN run.",
+    "2026-03-05 Priya Rao (ML Research): Measured softmax amplification; numerics alone explain divergence on very long autoregressive chains but not token duplication. Suggest focusing on memory/race for duplication and numerics for drift mitigation.",
+    "2026-03-07 Daniel Ortiz (SRE): Hotfix deployed to reduce opportunistic switching. Incident rate dropped by ~80% for affected tenants.",
+    "2026-03-10 Aisha Patel: Preparing PR for atomic double-buffer handoff and a matching test harness. ETA for review 2026-03-12. Will also schedule canary on dedicated cluster by 2026-03-15."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "initial_hypotheses",
+    "evidence_collected",
+    "logs",
+    "investigation_notes",
+    "actions_taken",
+    "next_steps",
+    "commentary"
+  ],
+  "dataset_doc_uuid": "dsid_8e0434db7def418c819a4be8e764ea2e"
+}

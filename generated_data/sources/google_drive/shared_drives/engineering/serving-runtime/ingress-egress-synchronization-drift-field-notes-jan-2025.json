@@ -1,0 +1,90 @@
+{
+  "title": "Ingress-Egress Synchronization Drift \u2014 field notes",
+  "owner": "Morgan Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime",
+  "doc_type": "doc",
+  "created_at": "2025-01-12",
+  "last_modified": "2025-01-20",
+  "collaborators": [
+    "Aisha Kaur",
+    "Diego Mart\u00ednez",
+    "Samir Rao"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "streaming",
+    "ingress",
+    "egress",
+    "proxy",
+    "backpressure",
+    "field-notes"
+  ],
+  "linked_artifacts": [
+    "JIRA-RT-4821",
+    "github.com/redwood-inference/serving-runtime/pull/2345",
+    "confluence.redwood.ai/rt/ingress-egress-drift"
+  ],
+  "summary": "Quick investigation notes on an observed tail-latency increase caused by timing drift between ingress-side flushes and egress-side buffering in proxy chains. This doc collects hypotheses, microbench setups, sample telemetry queries, and early numeric observations for follow-up experiments.",
+  "content": "Context: In a recent customer-reported incident we saw spikes in 99.9th percentile token latency for streaming generation requests when routes transited an edge proxy + sidecar chain (edge -> ingress-proxy -> model-sidecar -> egress-proxy). The bulk CPU and GPU metrics looked fine. Hypothesis: subtle timing mismatch between when the upstream flushes (ingress) and when the downstream flush interval / drain window runs (egress/proxy) causes tokens to accumulate into bursts, creating micro-queueing and tail amplification in the 95\u201399.999 pctl. These notes capture the small-scale bench used to reproduce and some early findings.",
+  "key_findings": [
+    "Tail amplification is sensitive to millisecond-scale drift between the client's flush cadence and proxy drain window offsets (observed amplification factor 1.6x\u20133x in 99.99p depending on config).",
+    "When ingress flush cadence and egress drain period align (phase-locked), throughput is similar but tail latency collapses. When they are anti-aligned, burst coalescence occurs at the egress buffer and triggers head-of-line delays.",
+    "Backpressure propagation is delayed by ~3\u20138ms in the proxy chain depending on buffer sizing and kernel scheduling, which can cause transient request-level buildup on hot paths.",
+    "Small payloads (<= 200 bytes per chunk) show a larger relative tail effect because more flush events interact with the drain window; larger payloads amortize the phase mismatch."
+  ],
+  "experiments": [
+    "Bench harness: 3-node local VMs (client, edge-proxy, model-sidecar+egress-proxy cohosted). Client emits fixed-length streaming tokens at configurable flush cadence (1\u201320ms).",
+    "Proxy settings sweep: drain-window (5/10/20ms), max-buffer-bytes (8KB/32KB/128KB), meter-policy (immediate/periodic), scheduling niceness.",
+    "Phase sweep: systematic offset between client flush time and proxy drain boundary from 0ms to drain-window in 1ms steps. Repeat N=5000 requests per offset.",
+    "Noise injection: random sleep jitter on client (0\u20133ms), kernel pause on proxy (simulate scheduling), and artificial KV warmup to emulate cold-paths."
+  ],
+  "telemetry_queries": [
+    "SELECT percentile(latency_ms, 99.99) FROM streaming_requests WHERE route='api.v1.generate' GROUP BY drain_phase_bin",
+    "histogram(token_ingress_ts - token_sent_ts) BY proxy_hop ORDER BY p99",
+    "count_over_time(buffered_bytes_total[5s]) BY instance,downstream_state",
+    "trace_id WHERE span.tags contains 'egress_drain' and duration > 10ms"
+  ],
+  "raw_results": [
+    "Configuration: drain-window=10ms, client-cadence=4ms, buffer=32KB -> p99.99 = 48.2ms (baseline aligned) vs 127.6ms (anti-aligned).",
+    "Phase=0ms (aligned): p95=12.7ms p99=18.9ms p99.9=26.4ms p99.99=48.2ms",
+    "Phase=5ms (anti): p95=15.8ms p99=39.1ms p99.9=84.2ms p99.99=127.6ms",
+    "With jitter(0-3ms): anti-aligned p99.99 distribution widened, median moved +22ms, standard deviation doubled.",
+    "Increasing buffer to 128KB reduced immediate packet drops but increased time-to-drain and worsened p99.99 by ~30% in anti-aligned tests."
+  ],
+  "interpretation_notes": "This looks like a classic phase-coupling problem: periodic producers (client flushes) and periodic consumers (proxy drain windows) can create constructive interference. Larger buffers hide the problem until they become the source of longer drains. Two practical levers: (1) make drain window more continuous (smaller tick or event-driven) or (2) randomizedize ingress flush offsets (add small jitter) to de-correlate events. Also consider immediate backpressure signaling so upstream slows proactively rather than accumulating tokens.",
+  "repro_instructions": "1) Start three VMs with ubuntu-22.04 images. 2) Run edge-proxy binary with --drain-window=10ms --buffer-bytes=32768 --meter=periodic. 3) Run model-sidecar (simple echo) and cohost egress-proxy with default config. 4) Client: run bench-client --flush-ms N --tokens 1000 --trace true. 5) Sweep offset: pause client start by X ms modulo drain-window to emulate phase. 6) Collect telemetry via /metrics and traces. See attached simple bench scripts in repo linked_artifacts.",
+  "quick_patches_tested": [
+    "Ingress jitter: add uniform random delay U[0,3ms] to client flush \u2014 reduced worst-case p99.99 by ~35% in anti-aligned case.",
+    "Event-driven drain: changed proxy loop to wake on socket-ready instead of periodic drain \u2014 p99.99 collapsed to near-aligned baseline but cost ~4% more CPU in steady state.",
+    "Backpressure early-signal: send synthetic RST/PAUSE upstream when buffer crosses low watermark \u2014 stabilized tails but introduced small request retries in some client HTTP stacks."
+  ],
+  "next_steps": [
+    "Run same phase sweep with real model (LLM) + kv-cache enabled to see interaction with KV warmups (Diego).",
+    "Prototype adaptive drain: gradually increase drain frequency under high ingress rate and measure CPU/cost tradeoff (Aisha).",
+    "Instrument proxy to export 'drain_phase' label and add dashboard: heatmap of phase vs p99.99 by route (short term).",
+    "Add synthetic jitter to client SDKs as opt-in mitigation and run e2e customer simulation for correctness impact."
+  ],
+  "notes_to_self": "Remember to test against gRPC streaming implementation too; HTTP chunking semantics and gRPC flow-control interact differently with partial frames. Also capture kernel scheduling state during worst tails (perf sched profiler) to rule out OS-level batching.",
+  "file_reviewers": [
+    "Aisha Kaur",
+    "Diego Mart\u00ednez"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "content",
+    "key_findings",
+    "experiments",
+    "telemetry_queries",
+    "raw_results",
+    "interpretation_notes",
+    "repro_instructions",
+    "quick_patches_tested",
+    "next_steps",
+    "notes_to_self"
+  ],
+  "dataset_doc_uuid": "dsid_0b1e383343614ca6841ba1d2716443f1"
+}

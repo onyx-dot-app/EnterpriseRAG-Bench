@@ -1,0 +1,45 @@
+{
+  "title": "throughput-latency-tradeoff-capsule-notes",
+  "owner": "Aisha Banerjee",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/throughput-latency-tradeoff-capsule-notes.json",
+  "doc_type": "doc",
+  "created_at": "2026-01-21",
+  "last_modified": "2026-02-12",
+  "collaborators": [
+    "Michael Chan",
+    "Daniel Ruiz",
+    "Leah Kim"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "e2e",
+    "throughput",
+    "latency",
+    "batching",
+    "kv-cache",
+    "coldstart",
+    "benchmark"
+  ],
+  "linked_artifacts": [
+    "JIRA: RL-2345",
+    "Confluence: serving-runtime/trace-sweep-2026",
+    "GitHub PR: https://github.com/redwood-inference/runtime/pull/782"
+  ],
+  "summary": "Notes from an experimental sweep that trades throughput (QPS / batching) against E2E latency quantiles. Focused on isolating stage-level contributions (tokenize -> model infer -> kv cache -> egress) across warm vs cold starts and two hardware classes. Key takeaway: small increases in batch size drastically lower cost/QPS but push p95 into an unacceptable range for latency-sensitive routes; KV hit rate and cold-start tails dominate p99 in low-batching regimes.",
+  "body": "Context and motivation:\\nWe ran a targeted trace sweep to characterize how increasing batching and queueing (to raise throughput) affects end-to-end latency quantiles for typical customer payload distributions. This is intended to feed routing policy decisions: which routes can tolerate batching/cost-optimized paths vs routes that need low-latency pinning.\\n\\nExperiment matrix (short):\\n- Hardware: A100 (H: a100-80gb), H100 (H: h100-80gb)\\n- Batching modes: none (batch=1), micro (batch target 4, max wait 10ms), medium (target 8, max wait 25ms), large (target 16, max wait 40ms)\\n- KV cache hit rate assumptions: high (~95%, synthetic warm workload), mixed (~60%), cold (~0%)\\n- Cold start surface: zero-worker vs warm pool (kept warm for 60s)\\n- Workload: mixed prompt lengths: short 20\u201364 tokens (60%), medium 128\u2013256 (30%), long 512\u20131024 (10%)\\n- Measurement: E2E p50/p95/p99, per-stage medians and 95th percentiles (tokenize, preprocess, model infer, kv lookup, batching wait, postprocess/egress). Traces sampled at 10k requests per config.\\n\\nHigh-level observations (bullet form):\\n- Cost vs latency: moving from batch=1 to batch target=8 reduced aggregate token compute cost by ~35% (measured via GPU utilization and tokens/sec), but p95 latency increased from ~120ms to ~340ms on A100 for mixed workload.\\n- p50 movement is modest; p95 and p99 inflate rapidly due to two factors: batching-induced queue wait and cold-start amplification for long sequences.\\n- KV cache hit rate strongly gates p99: with 95% hits, p99 dominated by batching wait + model tail; at 0% hits p99 shifts +150\u2013250ms because of cache-miss-dependent deskewing (additional DB/RPCs).\\n- H100 shows ~20\u201325% reduction in model-infer time for long sequences vs A100, but the relative p95 impact from batching wait is similar; hardware helps the base infer time but not the queueing tail.\\n\\nRepresentative per-stage breakdown (select config snapshots) \u2014 plain text lines for traceability:\\nConfig A: A100, batch=1, kv=95%, warm pool\\n- p50 total: 110ms\\n- p95 total: 125ms\\n- p99 total: 180ms\\n- stage medians: tokenize 6ms, preprocess 9ms, model_infer 80ms, kv_lookup 3ms (hit), egress 12ms\\n- stage p95: tokenize 18ms, preprocess 25ms, model_infer 105ms, kv_lookup 12ms, egress 28ms\\n\\nConfig B: A100, batch target=8, max_wait=25ms, kv=95%, warm pool\\n- p50 total: 160ms (batch wait median ~20ms included)\\n- p95 total: 340ms (batch wait p95 ~140ms; model_infer p95 ~105ms)\\n- p99 total: 560ms (long seq and some cache misses amplified)\\n- stage p95 contributions (approx): batching_wait 140ms, model_infer 105ms, egress 28ms\\n\\nConfig C: A100, batch target=8, kv=0% (cold cache), warm pool\\n- p50 total: 220ms\\n- p95 total: 520ms\\n- p99 total: 820ms\\n- notes: remote KV RPCs add ~180\u2013260ms in miss cases; these stack with batching wait.\\n\\nConfig D: H100, batch target=8, kv=95%, warm pool\\n- p50 total: 140ms\\n- p95 total: 270ms\\n- p99 total: 430ms\\n- notes: model_infer improved (~70ms p50) vs A100, batching wait similar magnitude.\\n\\nCold-start behavior (example): A100, batch=1, cold worker spinup\\n- p50 total: 240ms\\n- p95 total: 1.2s\\n- p99 total: 2.4s\\n- root causes: container image pull negligible in our infra (warm pool used), but model weights load+GPU init + JIT/optimization paths create heavy p99 tail. Warm pools materially reduce these tails.\\n\\nWhy p95 vs p99 diverge so strongly:\\n- p95 is dominated by batching wait + model variability for the majority of requests. When queueing is allowed, long waits shift p95 immediately.\\n- p99 is heavily sensitive to low-frequency events: cold model init, KV miss combined with long-sequence inference, intermittent device GC/stall, and rare egress stalls. These compound multiplicatively.\\n\\nImplications for routing and SLOs:\\n- Low-latency routes (chat UI, API-SYNC endpoints) should default to batch=1 or micro-batch with very small max_wait (<=8ms) and warm pool pinning; accept higher cost.\\n- Throughput-optimized routes (async batch jobs, background embedding pipelines) can use medium/large batching and fall back to cheaper hardware / quantized variants. Provide opt-in for customers to choose cost-latency tier.\\n- Introduce a runtime knob: quantile_sla which pins max allowed batch_wait for p95 budget. If exceeded, route is auto-failed to low-latency pool.\\n\\nTrace quality and measurement caveats:\\n- Sampling bias: we used uniform sampling at ingress but heavy-tailed requests are rarer\u2014need stratified sampling for long-seq heavy paths.\\n- Measurement noise: inter-node network jitter affected KV miss tail; next sweep should isolate KV RPC host locality.\\n- Synthetic workload approximates customer mix but lacks conversational multi-turn context which increases KV reuse; re-run with real session traces for verification.\\n\\nRecommendations (short list):\\n1) Ship a small change to routing policy that exposes a cost/latency tier for customers and pins UI routes to micro-batch or batch=1. (owner: Product + Runtime)\\n2) Add a runtime metric: batching_wait_p95 per route, surfaced in Console. Alert when > configured threshold. (owner: observability)\\n3) Warm pool warmup: ensure model weight residency and lazy-JIT priming during low-traffic windows to reduce cold-start p99. (owner: infra)\\n4) KV locality: prioritize cached-shard routing for high-throughput routes to keep miss rate low; add instrumentation to separate local vs remote kv latencies. (owner: platform-engineering)\\n5) Run a follow-up stratified trace sweep using real-session traces (Leah to coordinate) and a finer batch_wait grid (5/10/15/25/40ms).\\n\\nTrace quality and measurement caveats:\\n- Sampling bias: we used uniform sampling at ingress but heavy-tailed requests are rarer\u2014need stratified sampling for long-seq heavy paths.\\n\\nAppendix: quick checklist to reproduce\\n- config repo: runtime/benchmarks/batch-sweep-2026\\n- workload generator: tools/trace-synth (seeded with session-sample-2025-12)\\n- sampling: 10k per config over 1 hour, keep full trace payloads for 1 week\\n\\nRaw notes and hypotheses we didn't confirm yet:\\n- Hypothesis: adaptive batching (short-circuiting when queue contains long-seqs) could salvage p95 while keeping throughput\u2014needs model seq-length aware queue prioritization.\\n- Hypothesis: micro-bursts of egress network saturation coincide with KV miss spikes\u2014investigate cross-tenant egress shaping.",
+  "action_items": [
+    "Routing: add 'latency-tier' flag and default UI routes to 'low-latency' (Aisha + Michael) \u2014 due 2026-02-26",
+    "Observability: surface batching_wait_p95 and per-route kv_miss_rate on Console (Daniel) \u2014 due 2026-03-05",
+    "Infra: prototype warm-pool priming job and measure p99 improvement (Leah) \u2014 due 2026-03-12",
+    "Follow-up: run stratified trace sweep with session traces and seq-length prioritization enabled (Leah + bench infra) \u2014 schedule Q2 sweep"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "body",
+    "action_items"
+  ],
+  "dataset_doc_uuid": "dsid_b20fd50a1b604a4facf0c301d3ca9617"
+}

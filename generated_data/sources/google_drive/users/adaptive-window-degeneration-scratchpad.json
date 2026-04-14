@@ -1,0 +1,35 @@
+{
+  "title": "Adaptive window degeneration scratchpad",
+  "owner": "Aisha Patel",
+  "drive_area": "users",
+  "path": "users/adaptive-window-degeneration-scratchpad",
+  "doc_type": "doc",
+  "created_at": "2025-01-22",
+  "last_modified": "2025-02-03",
+  "collaborators": [
+    "Marco Liu",
+    "Sofia Guerrero"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "throughput",
+    "batching",
+    "prefill",
+    "p99",
+    "kv-cache",
+    "eviction"
+  ],
+  "linked_artifacts": [
+    "GHPR: https://github.com/redwood-inference/serving/pull/1824",
+    "JIRA: SRT-769",
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/SERV/pages/5667/Batching+Playbook"
+  ],
+  "content": "Notes to self - quick log of experiments + hypotheses for the weird steady-state throughput drop after rolling batching heuristics.\n\nTL;DR: After the adaptive window change in runtime (merge r1824) some pods show a slow throughput degeneration over ~30-90 minutes: overall qps drops ~15-35% while median latency stays ok but p95/p99 climbs. Suspect: window shrink/expand oscillation interacts poorly with prefill / KV cache eviction when request size distribution has a heavy tail (few long seqs).\n\nObserved behavior (recap):\n- On baseline canary (old heuristic) stable qps ~1200rps, p99 ~220ms.\n- New heuristic: start at ~1250rps but degrades to ~800-1000rps over ~1 hour.\n- CPU on inference workers: small increase (5-12%), GPU utilization unchanged.\n- slot allocation traces show frequent prefill evictions after 20-40k requests per pod.\n- warmup logs contain warnings: \"prefill-window-too-small: eviction_count=84\" on one host.\n\nCommands I ran (fast reproducible):\n- Tail batcher pod logs:\n  kubectl -n inference logs deploy/rt-batcher-canary -c batcher --since=2h | grep -i eviction | tail -n 200\n  => repeated: \"INFO prefill: evicting prefix, slots_freed=2, eviction_reason=window_shrink\"\n\n- Dumped slot occupancy over time:\n  python tools/slot_dump.py --pod rt-worker-5 --duration 3600 --out /tmp/slot-occupancy.csv\n  sample output (abridged):\n  ts,occupied_slots,total_slots,avg_seq_len\n  00:12:00,24,32,64\n  00:25:00,19,32,272   <-- spike in avg_seq_len correlated with eviction bursts\n  00:42:00,14,32,68\n\n- Quick reproduce curl through api-gateway to hit long-tail:\n  for i in `seq 1 400`; do curl -s -X POST internal-api/seq-gen -d @long_prompt.json >/dev/null & done\n  Monitor qps afterwards in grafana (inference.service.qps)\n\nHypotheses (ranked):\n1) Adaptive window shrink when a long request arrives causes immediate eviction of prefix cache (prefill), increasing work per token for subsequent short requests. Oscillation: after eviction, window expands back and tries to re-prefill, but prefill rate lags demand so measured throughput suffers.\n2) Batch packing interaction: the new window moves request boundaries so continuous-batcher forms more heterogeneous batches (mix of long and short), reducing effective batching efficiency and causing more KV cache thrash.\n3) Heuristic edge case: when avg_seq_len > threshold, kernel selection switches to fallback path (less optimized) for a short time; combined with eviction this amplifies latency tail.\n4) Scheduling/backpressure interplay: slot_replenish rate is not adapting to eviction frequency; leads to slot-starvation microphases.\n\nEvidence supporting (1):\n- Log correlation: eviction spikes immediately after long sequence arrivals (see slot dump).\n- After artificially rate-limiting long requests, degradation stops (test with 50% riffle).\n\nEvidence supporting (2/3):\n- Batch composition: I captured batch histograms with a small script (tools/batch_hist.sh). When degraded the fraction of mixed-size batches rises from 12% -> 39%.\n- CPU profiles around the time show a short bump in a fallback kernel: \"kv-prefill-fallback.cpp:serve_fallback()\" sampled more often.\n\nQuick experiments and results:\n- Revert adaptive-window flag for one canary ASG (rt-canary-2): immediate stabilization within 5m. qps back to ~1180. Suggests runtime heuristics directly connected.\n- Added a temporary throttle on long requests in gateway (drop 1/2) -> stabilization.\n- Increase prefill concurrency (prefill_workers from 2 to 4) -> partial improvement but not full recovery. Suggests filling rate matters but something else too.\n\nRelevant snippets from logs (sanitized):\n\n2025-01-22T00:41:12Z INFO prefill: scheduling prefill for slot=18, target_seq=64\n2025-01-22T00:41:12Z WARN prefill: eviction_count=0\n2025-01-22T00:45:09Z INFO prefill: evicting prefix, slots_freed=3, eviction_reason=window_shrink, active_prefills=1\n2025-01-22T00:45:10Z ERROR batcher: batch_fulfillment_latency=219ms, kernel_path=fallback\n\nStack trace (mini) when fallback path hit: \n  serve_fallback at kv-prefill-fallback.cpp:278\n  pack_batch at continuous_batcher.cpp:1421\n  handle_request at rpc_worker.cpp:391\n\nThings I want to try (next steps):\n- Telemetry: emit tag on prefill-eviction events and correlate with model/kernel selection. Add metric: inference.prefill.evictions_by_reason, and batch.mixed_composition_ratio.\n- Guardrail: add a soft floor on window shrink (min_window=0.5 * configured_window) to avoid catastrophic evictions from a single long request. Quick patch locally and run canary.\n- Increase prefill concurrency adaptively: if eviction_rate > X per minute then bump prefill_workers; also back off once rate stabilizes.\n- Change batcher packing to avoid mixing >2x length ratio in same batch (experiment).\n- Add experiment: replay production long-tail arrivals into staging with full telemetry to reproduce without affecting prod.\n\nNotes / TODO:\n- Marco: please attach profiler samples for two pods (stable vs degraded) next to PR diff.\n- Sofia: can you draft a short playbook blurb for SRE runbook if we see this in prod? Include rollback steps (revert flag, enable throttle).\n- I should open a lightweight MTR (multi-run) comparing prefill_worker scaling strategies.\n\nRandom observations / half-formed ideas:\n- Could capacitor-hysteresis (i.e., having a cooldown after eviction) smooth re-prefill bursts and avoid thrash.\n- Maybe we should separate prefill KV namespace for long sequences so eviction is less disruptive to short requests (two-tier cache).\n\nAttachment pointers I generated while testing:\n- /tmp/slot-occupancy.csv (samples above)\n- /tmp/batch-hist-20250122.json\n- local trace: traces/rt-batcher-canary-20250122.jfr\n\nIf I had to pick a priority ordering: telemetry -> soft-floor on window shrink -> quick canary -> adaptive prefill scaling.\n\nEnd notes: this is messy, but useful log of my thinking while chasing the regression. Will iterate and formalize into a playbook once we stabilize and have metrics to show.\n\n",
+  "encoding": "utf-8",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_10d2e1ff2a1c4f2ab8c9b32f02f10ee4"
+}

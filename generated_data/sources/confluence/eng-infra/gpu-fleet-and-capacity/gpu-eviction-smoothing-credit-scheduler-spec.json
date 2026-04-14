@@ -1,0 +1,59 @@
+{
+  "title": "GPU Eviction Smoothing & Credit Scheduler \u2014 Spec and Runbook",
+  "space": "eng-infra",
+  "author": "Marina Delgado",
+  "owner_team": "engineering",
+  "status": "in_review",
+  "created_at": "2024-08-12",
+  "last_updated": "2025-02-11",
+  "reviewers": [
+    "Ethan Park",
+    "Sofia Nguyen",
+    "Rahul Banerjee"
+  ],
+  "labels": [
+    "gpu",
+    "scheduling",
+    "capacity-planning",
+    "runbook",
+    "terraform",
+    "eviction"
+  ],
+  "confidentiality": "internal",
+  "summary": "This document specifies a tenant-aware eviction smoothing and credit-based scheduler designed to reduce noisy preemption impact, improve tail latency for interactive inference, and provide a predictable tenant billing signal tied to eviction exposure. It combines a short-horizon predictive filter, time-decayed credit buckets, and topology-aware placement to hedge against large simultaneous preemptions and enable graceful degradation to burst/backfill pools.",
+  "motivation": "Background and why this exists:\n\n- We observed spikes of tenant-visible latency/regressions during large-scale preemptions and spot reclaim events.\n- Existing binary eviction/backfill behavior causes tenant request spikes, cache thrashing, and KV-cache warmup storms.\n- Teams need a transparent, auditable mechanism to trade cost (eviction exposure) vs. latency predictability.\n\nThis spec introduces a scheduling shim that smooths evictions with credits and short-term predictive routing so customers (and internal tenants) experience fewer abrupt QoS regressions while allowing fleet efficiency to remain high.",
+  "goals": "\n- Reduce percentiles (p95/p99) of end-to-end inference latency during preemptive events by at least 30% vs today.\n- Provide per-tenant eviction-exposure credits that map to billing/alerts.\n- Expose a small, well-documented Terraform module and CI checks to enable self-serve adoption across regions.\n- Ensure safe fallbacks: when credit exhaustion occurs, route to burst-capacity or lower-cost preemptible pools rather than immediate hard-evict.\n",
+  "non_goals": "\n- This document does not propose changes to hardware-level preemption settings (BIOS/drivers).\n- It does not replace long-term capacity planning policies or reserved capacity contracts.\n",
+  "architecture_overview": "High-level components:\n\n1) Eviction Predictor (EP): short-horizon time-series filter that consumes node preemption telemetry (spot termination signals, cloud metadata, kernel OOM patterns) and outputs a probability score per node for the next 90s window.\n\n2) Credit Ledger: per-tenant time-decayed credit buckets. Credits are consumed when an instance experiences an unplanned eviction while serving active sessions; credits replenish slowly via background allocation or purchases (billing integration).\n\n3) Smoothing Scheduler: when EP indicates elevated risk, scheduler first consults credit ledger. If tenant has credits, scheduler will attempt to: a) prefer nodes with low risk, b) stagger evictions by migrating short-lived sessions to warm pools, c) throttle new preemptible placements for the tenant.\n\n4) Topology-aware Fallbacks: if entire AZ/region is impacted, route to designated burst pools with explicit KV-cache pre-seeding policies to reduce cold-starts.\n\n5) Observability & Billing Adapter: emits per-tenant eviction events, credit delta metrics, and charge-back fields to infra-telemetry and billing pipeline.",
+  "metrics_and_slos": "Primary metrics and SLOs:\n\n- Eviction-exposure (EE): number of unplanned evictions per tenant per 24h (target: < 0.05 per tenant-day for premium tiers).\n- P95 inference latency during preemption windows (target: 30% reduction vs baseline).\n- Credit-bucket depletion rate (operational metric to track adoption).\n- Migration success rate (target: > 98% session handoff success when scheduler initiates warm-pool migration).\n- Scheduler decision latency (should be < 50ms for placement decision).\n\nPrometheus-style labels to emit: tenant_id, region, node_pool, credit_bucket_id, decision_reason.",
+  "scheduler_algorithm": "Design details and pseudocode:\n\nOverview:\n- Credits are represented as a decaying balance: balance_t = balance_{t-1} * e^{-lambda*dt} + allocated - consumed. Lambda chosen to fully decay excess credits over 30 days by default.\n- Predictor outputs risk score R in [0,1] per node; scheduler calculates effective_risk = R * node_criticality_factor.\n\nDecision flow (per placement request):\n1) Gather candidate nodes and their risk scores.\n2) For each candidate, compute score_i = alpha * effective_risk_i + beta * topology_penalty_i + gamma * utilization_i. Lower is better.\n3) If tenant_credit_balance > threshold_T: prefer available nodes with score_i < S_preempt. Else: restrict placement to non-preemptible pools or enqueue request to burst queue.\n4) On node preemption notification: if active sessions exist, attempt best-effort session transfer to warm pool (session handoff protocol described below) and deduct credit per session transferred (credit cost function in table). If transfer fails within 6s, mark as hard-evict and emit eviction_exposure event.\n\nSession handoff protocol (short):\n- Sender checkpoint: send minimal KV-cache diff and session metadata to handoff topic (Kafka).\n- Receiver warmup: prefetch checkpointed KV into local cache, attach session token.\n- Cutover window: 1\u20133s window where requests are retried 429->client with fallback routing; client SDK has built-in retry/backoff to follow.\n\nCredit cost table (example):\n- short session (< 30s): 0.1 credit\n- medium (30s\u20135m): 0.5 credit\n- long (> 5m): 1.5 credits\n\nTunable knobs: alpha/beta/gamma weights, decay lambda, credit thresholds, handoff timeouts.",
+  "terraform_module_interface": "Terraform module example (high-level):\n\nmodule \"gpu_eviction_scheduler\" {\n  source = \"git::ssh://git@github.com/redwood/infrastructure-modules.git//gpu-eviction-scheduler\"\n  region = var.region\n  cluster_names = var.cluster_names\n  credit_ledger_table = aws_dynamodb_table.gpu_credit_ledger.id\n  kafka_topic = module.kafka.eviction_handoff_topic\n  ep_stream = module.telemetry.node_risk_stream\n  tags = var.common_tags\n}\n\nImportant outputs:\n- module.scheduler_endpoint -> internal address for placement API\n- module.credit_ledger_table -> id for billing integration\n\nIaC constraints and checks:\n- Module requires IAM role gpu-scheduler-writer with least privilege to DynamoDB, ECS/EKS, and SSM parameters.\n- Terraform plan must include a change review gate: if credit bucket policy changes ownership or replenish rate changes > 10% impact, block auto-apply.\n\nCI/CD test hooks to include:\n- Unit tests for credit decay math.\n- Integration test: simulate EP stream with induced terminations and assert migration success rate > 95% in testbed.\n- Security scan: verify no wide-open IAM policies created by module.\n",
+  "ci_cd_and_tests": "Recommended pipeline additions and gating:\n\n- Pre-merge: unit tests, linters, tfsec, and module contract tests (mock DynamoDB + Kafka).\n- Canary pipeline: deploy new scheduler module to a shadow cluster (non-customer), run fault-injection (cloud preempt simulation) and collect metrics.\n- Promoted deployment must include rollback trigger: if migration success rate drops below 96% or P99 latency increases > 20% in canary windows, automatically roll back.\n\nTest scenarios to codify in CI:\n1) Single-node preempt: verify handoff completed and credit deducted.\n2) Burst preempt (10 nodes): verify staged evacuations across 30s window instead of instantaneous thrash.\n3) Credit exhaustion: verify routing to burst pools and correct billing telemetry emitted.\n",
+  "runbook": "Operational runbook (oncall steps):\n\nSeverity: Eviction-Smoothing SLA breach (pager)\nTrigger: p95 latency spikes during preemption window AND migration success rate < 90%\nOwner: gpu-fleet-oncall (primary)\n\nImmediate steps:\n1) Acknowledge pager and post to #gpu-ops with tags (region, time, incident-id).\n2) Query scheduler metrics: recent EP scores, credit-balance per top-5 impacted tenants (Grafana board: \"GPU Eviction Smoothing \u2014 Live\").\n3) If EP false-positives spike: disable EP enforcement (feature-flag: scheduler.use_predictor=false) for affected cluster to restore baseline placements.\n4) If migration handoff failing: inspect Kafka consumer lag for eviction_handoff_topic, restart consumers with safe-ordering enabled.\n5) If credit-ledger is throttled/errored: check DynamoDB write capacity, scale autoscaling policy or switch to on-demand temporarily.\n\nMitigation and longer-term fixes:\n- If repeated cross-tenant failures observed, temporarily increase credit granting rate (ops-only override) and create a ticket to product to reconcile billing later.\n- Run targeted canary in same AZ with adjusted alpha/beta weights to recover tail latency.\n\nPost-incident actions:\n- Collect: scheduler logs, EP inputs, Kafka handoff traces, migration traces.\n- Run root-cause triage within 72h and create remediation PRs for IaC or runtime.\n",
+  "rollback_and_safety": "Safe rollback checklist:\n\n- Toggle feature flags in order: 1) disable predictor enforcement, 2) disable credit deductions (preserve ledger state), 3) revert scheduler binary.\n- Confirm that no new migrations are initiated during rollback window and that billing emits are paused to avoid false charges.\n- Coordinate with billing and product before bulk credit adjustments.\n",
+  "rollout_plan": "Migration and rollout steps:\n\nPhase 1 \u2014 Shadow (2 weeks): deploy scheduler as shadow decision path, emit metrics but do not affect placements. Run chaos tests and tune alpha/beta/gamma.\nPhase 2 \u2014 Canary (1 cluster, 1 region): enable for low-risk tenants, enable credit accounting in read-only mode.\nPhase 3 \u2014 Gradual enablement (3\u20136 weeks): progressively enable for more tenants and add automated replenishment policies for developer sandboxes.\nPhase 4 \u2014 Global rollout: enable for all preemptible pools with telemetry and billing hooks live.\n\nRollback windows: 24\u201348 hours of close monitoring after each stage.\n",
+  "ownership_and_contacts": "Primary owners:\n- System design & runtime: Marina Delgado (marina@redwood.ai)\n- Scheduler infra & Terraform: Ethan Park (ethan@redwood.ai)\n- Observability & billing: Sofia Nguyen (sofia@redwood.ai)\n\nSecondary contacts: GPU-sre rotation, infra-security for IAM reviews.\n",
+  "related_pages": [
+    "/confluence/eng-infra/gpu-fleet-and-capacity/gpu-capacity-runway-and-auto-sinking-playbook.json",
+    "/confluence/eng-infra/terraform-and-iac/gpu-iac-guardrails-and-cicd-policy-kit.json"
+  ],
+  "file_notes": "This spec intentionally separates the predictive model (EP) from scheduling policy to allow independent rollouts. Tune knobs are intentionally conservative for the first canary; operationally-owned fast paths are included (feature flags + DynamoDB overrides).",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "motivation",
+    "goals",
+    "non_goals",
+    "architecture_overview",
+    "metrics_and_slos",
+    "scheduler_algorithm",
+    "terraform_module_interface",
+    "ci_cd_and_tests",
+    "runbook",
+    "rollback_and_safety",
+    "rollout_plan",
+    "ownership_and_contacts",
+    "file_notes"
+  ],
+  "dataset_doc_uuid": "dsid_c96c1702551144b19ebd310599397d22"
+}

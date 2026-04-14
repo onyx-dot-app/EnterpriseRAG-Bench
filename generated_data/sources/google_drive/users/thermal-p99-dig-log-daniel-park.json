@@ -1,0 +1,34 @@
+{
+  "title": "Thermal p99 dig + quick triage notes",
+  "owner": "Daniel Park",
+  "drive_area": "users",
+  "path": "users/thermal-p99-dig-log-daniel-park.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-18",
+  "last_modified": "2025-02-20",
+  "collaborators": [
+    "Maya Li",
+    "Samir Patel"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "p99",
+    "thermal",
+    "gpu",
+    "kv-cache",
+    "triage",
+    "experiment"
+  ],
+  "linked_artifacts": [
+    "INF-4521",
+    "github.com/redwood-inference/serving-runtime/pull/987",
+    "confluence.redwoodinternal/pages/12345"
+  ],
+  "content": "Context\n- Observed recurring p99 latency spikes on cluster-7 (gpus: A100-80GB) between 09:30-10:15 local during high-concurrency runs. Spikes correlate with longer generation lengths (~800-1200 tokens) and periods of sustained high VRAM utilization.\n- Initial hunch: thermal throttling causing kernel frequency step-down + CUDA scheduling jitter. Secondary: KV-cache eviction path causing large memcpy spikes when cache misses align with long seq lengths.\n\nQuick reproduction notes (commands run today)\n- k8s pod: redwood-runtime/serve-7 (node: g7-042)\n- reproduce load: wrk-like harness: ./bench/loadgen -r 600 -c 40 -d 10m --seq-len 1000 --model rwd-7b-q8\n- capture perf & nvml: sudo perf record -ag -o /tmp/pf.raw -- ./bench/loadgen ...\n- nv-smi loop: while true; do nvidia-smi --query-gpu=timestamp,utilization.gpu,temperature.gpu,clocks.sm,clocks.mem --format=csv -l 1 >> /tmp/gpu-temp.csv; done &\n- kernel trace: sudo bpftrace -e 'tracepoint:sys_enter_copy_to_user { @[comm] = count(); }' -o /tmp/bpf.trace (short run)\n\nRaw observations from today's run\n- Thermal ramp: node g7-042 GPU0 temp rose from 55C -> 84C over ~6 minutes, then clock rate dropped from 1530 MHz -> 1095 MHz; coincident with p99 jump from 230ms -> 890ms.\n- VRAM: allocations peaked at 46GB (A100-80), fragmentation increased (many 64MB allocations seen in jemalloc logs).\n- KV-cache: miss spikes aligned with p99: when miss rate > 18% for 3 consecutive seconds, memcpy ops (+copy_to_user) spiked.\n- perf top (sampled) shows heavy time in aten::conv1d and our kernel_wrapper wrapper shims that do small copies per layer for quantized weights (hot path).\n\nHypotheses (ranked)\n1) Thermal throttling on sustained load causes GPU clock down and increases kernel execution time; combined w/ small-copy overheads yields tail amplification. (Primary)\n2) KV-cache eviction & rehydration causes large synchronous memcpy to host -> device on misses, stalling other kernels. (Secondary)\n3) Scheduler interference: long-running generation threads grabbing streams and not yielding while kernels block on memcopy, creating serialization at app layer. (Tertiary)\n\nImmediate mitigation ideas (fast rollouts)\n- Soft cap throughput per GPU: throttle concurrency for seq_len>600 to keep sustained power. Config: runtime heuristic: if seq_len_avg > 600 and avg_gpu_temp > 75C, cap inflight to 24. (short-term)\n- Turn on asynchronous rehydration for KV-cache: background prefetch for top-k likely keys based on recent access. (short-medium)\n- Increase mempool chunk size to reduce fragmentation (try 128MB chunks). (short)\n- Kernel-level: reduce small memcpy calls by batching contiguous quant-weight copies in kernel_wrapper (needs PR). (medium)\n\nExperiments to run (owner & metrics)\n- EXP-therm-01: limit concurrency for long seqs on g7-042; measure p50/p95/p99, gpu_temp, throughput. Owner: @Daniel. Metric: p99 delta, tokens/sec, temp. (run 3x)\n- EXP-kv-prefetch: enable async prefetch (prototype) in runtime branch daniel/async-prefetch; run against replay trace of today. Owner: @Samir. Metric: cache miss %, memcpy time, p99.\n- EXP-mempool-128: adjust mempool chunk=128MB. Owner: @Maya. Metric: fragmentation (free list counts), alloc latency, p99.\n\nShort-term TODO (today / next 2 days)\n- [ ] Push config throttle patch to canary (runtime: routing/heuristics) - small rollback risk, testing in canary pool. (Daniel)\n- [ ] Add nvml temp logging into per-request trace for canary (so we can correlate tail events to exact requests). (Samir)\n- [ ] Prototype async prefetch skeleton and unit test KV metadata path. (Samir)\n- [ ] Run mempool chunk experiment on two canary nodes (Maya)\n- [ ] Draft incident blurb for #runtime-ops summarizing temp-throttle mitigation plan. (Daniel)\n- [ ] Add ticket INF-4521 notes and link to PR once created. (All)\n\nLonger-term follow-ups\n- Investigate kernel_wrapper micro-optimizations: batch small copies; inline quant unpack; reduce kernel launches. (will require careful benching)\n- Consider power/thermal-aware scheduling at cluster-level: assign long-seq workloads to cooler GPUs or nodes with better airflow; surface node thermal score in scheduler.\n- Explore model-architecture tweaks: allow checkpointed generation state to reduce per-token memory churn for long sequences.\n\nQuick debugging checklist for follow-up runs\n- Ensure debug build (RT=debug) to get jemalloc and allocator traces.\n- Start nvprof / Nsight to capture kernel timeline for a 60s window when spike starts.\n- Run loadgen with replication of token length distribution (use yesterday's trace file: s3://bench/traces/2025-02-17-longseq.json)\n- Collect /var/log/kern.log for OOM/driver warnings\n\nQuestions / unknowns to ask infra/ops\n- Are there maintenance jobs (backup, snapshot) that coincide with 09:30 window on g7-042? (Ops)\n- Is fan curve custom or default for that rack? Could we temporarily raise fan threshold? (Data center ops)\n\nNotes to self / shorthand\n- if thermal hypothesis false, next strongest is KV eviction. Watch memcpy time breakdown in perf.\n- Check jemalloc stats in /proc for fragmentation; try purge_mode change test.\n- Keep canary window narrow, have HP rollbacks ready.\n\nMeeting notes (11:15 sync with Maya/Samir)\n- Agreed to run mempool + throttle in parallel on different canaries.\n- Samir to hand off async-prefetch PR by EOD tomorrow.\n- Maya will produce quick dashboard with temp + p99 overlay for cluster-7.\n\nReferences & commands pasted here for convenience\n- Capture jemalloc stats: curl localhost:9090/debug/jemalloc | jq .\n- Quick latency dump: curl localhost:8080/metrics?route=generate | grep p99\n- Perf record & report: sudo perf record -F 99 -p $(pidof runtime) -g -- sleep 30; sudo perf script | c++filt | head -n 200\n\nNext steps (tomorrow)\n- Run EXP-therm-01 early (06:30) to avoid noisy co-tenants and iterate quickly.\n- Re-evaluate after 3 successful runs; convene follow-up sync at 14:00.\n\nEnd of scratchpad.\n\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_ed5ce7dd587241fa861b0dfab35900c9"
+}

@@ -1,0 +1,95 @@
+{
+  "key": "PM-827103",
+  "team": "product-management",
+  "title": "Conversational output fallbacks and tool circuit-breaker acceptance",
+  "status": "In Review",
+  "priority": "P1",
+  "created_at": "2025-02-10",
+  "updated_at": "2025-02-28",
+  "creator": "Maya Patel",
+  "assignee": "Alejandro Ruiz",
+  "project": "runtime-resilience",
+  "cycle": "2025-W08",
+  "estimate": "5",
+  "due_date": "2025-03-14",
+  "labels": [
+    "streaming",
+    "tool-calling",
+    "fallbacks",
+    "safety",
+    "observability"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.21",
+  "security_review_required": "false",
+  "description": "Define concrete acceptance criteria and test coverage for agent-style conversational responses that invoke external tools (function calls) while supporting graceful degradation when tool availability or correctness degrades. Goal: ensure production systems can safely fall back to degraded behavior without data loss, provide deterministic telemetry for incidents, and enable resumable or safe-abort semantics for long-running streamed outputs.",
+  "motivation": "We have ambiguous behavior in the field when a tool becomes slow, starts returning partial/malformed payloads mid-stream, or when downstream quota/circuit-breaker policies trigger. Product teams need a deterministic contract so customers can rely on resumability, idempotency, and clear billing/failure semantics. This ticket codifies the acceptance criteria for runtime, API surface, and test harnesses.",
+  "design_decisions": [
+    "Introduce an explicit 'envelope' stream frame with types: 'emit', 'checkpoint', 'tool_invocation', 'tool_result', 'error', 'finalize' to make partial resumption and failure modes explicit.",
+    "Circuits at the tool-gateway level expose three states: CLOSED (normal), OPEN (short-circuit tool calls), and THROTTLED (soft-degrade with reduced concurrency). Policies are configurable per-customer and per-model.",
+    "Tool calls must carry an idempotency key (derived from request id + call sequence) and a TTL. The runtime will persist a minimal checkpoint (sequence id, last successful checkpoint hash, pending tool keys) for resumability in case of worker restarts.",
+    "In streaming mode the runtime will emit a 'checkpoint' frame at configurable commit boundaries (default: every 512 tokens or on tool boundary) that is safe to replay. Checkpoints are garbage-collected after 24 hours by default.",
+    "Fallback strategy: on OPEN circuit or persistent tool error, the runtime will first attempt a local-model fallback variant (lower-cost/less-capable) and then finally emit a structured error frame if no viable fallback is available.",
+    "Telemetry: emit structured events for 'tool_call.start', 'tool_call.complete', 'tool_call.error', 'checkpoint.write', 'circuit.trip', and 'fallback.used' with consistent keys to power SLA dashboards and post-incident analysis.",
+    "Customer-visible contract: schema versions are semantically versioned. Major versions are incompatible; clients must negotiate schema version at handshake. Minor versions permit additive fields.",
+    "We will provide runtime flags to opt-in to resumable streams during rollout and include e2e tests that validate resume semantics against synthetic failures."
+  ],
+  "acceptance_criteria": [
+    "API contract: When streaming, the response must be a sequence of top-level envelope frames (newline-delimited JSON). Each frame must include: frame_type (emit|checkpoint|tool_invocation|tool_result|error|finalize), sequence_id (monotonic per-request), and schema_version. Tests validate strict conformance.",
+    "Tool idempotency and TTL: Every tool_invocation frame must include an idempotency_key and ttl_seconds. If a tool receives a duplicate idempotency_key within TTL, it must not perform side effects. Runtime validates presence and rejects requests missing key with 400 + descriptive error frame.",
+    "Checkpoint durability: For streaming requests with tool_interleaving enabled, the runtime must persist checkpoint metadata to durable store at every checkpoint frame and recover to the last checkpoint on worker restart. E2E test simulates worker crash and asserts resumed stream produces identical post-checkpoint outputs.",
+    "Circuit-breaker behavior: When the tool gateway circuit is OPEN for a customer, runtime must immediately emit a 'tool_unavailable' error frame and follow the configured fallback policy\u2014either local-model fallback (emit frames from fallback model) or structured 'external_tool_disabled' finalize frame. Tests simulate repeated tool 5xx to verify trip thresholds and recovery window behaviors.",
+    "Partial/malformed tool result handling: If a tool_result frame arrives but fails schema validation mid-stream, runtime must (a) emit an 'error' frame with classification 'tool_malformed' and provenance (tool_name, call_id), (b) if allowed by policy attempt schema-coercion rules for recoverable fields, otherwise use fallback behavior. Unit tests cover both paths.",
+    "Backpressure and soft-degrade: Under heavy load, THROTTLED state should reduce concurrency and cause the runtime to emit 'throttle_notice' frames to clients. Acceptance test validates that throttled streams still produce checkpoints and can be resumed, though with lower throughput.",
+    "Idempotent resume semantics: Resuming a stream for a request at checkpoint N must guarantee no additional side effects (no duplicate external tool invocations). Test harness must verify no duplicate tool side-effects by asserting idempotency-key dedup table remains stable across resume.",
+    "Observability: For every tool call attempt, runtime must log a structured event to our observability pipeline including: request_id, call_id, tool_name, idempotency_key, latency_ms, response_size_bytes, status_code, and circuit_state. Acceptance requires dashboards showing tool_call success rate and circuit-trip counts for the last 30d.",
+    "Billing clarity: If a stream is resumed after a client reconnect, billing must clearly attribute tokens to original request_id. Acceptance test verifies token accounting reconciles to the same request across resume/replay.",
+    "Schema negotiation: Clients that send handshake header 'schema-version' older than runtime-supported major version receive a 412 Precondition Failed with guidance frame listing supported versions. Tests exercise mismatched versions and minor upgrades (ensure backward compatibility for additive fields)."
+  ],
+  "test_plan": [
+    "E2E: Simulate long-running streaming generation with an interleaved tool call; kill worker after first checkpoint; restart worker; resume stream and assert final output equals non-killed baseline.",
+    "Chaos test: Inject tool gateway 500s and verify circuit trips after configured threshold; assert runtime follows fallback policy and emits 'fallback.used' telemetry.",
+    "Schema fuzz: Feed tool_result frames with truncated JSON, unexpected field types, and additional unknown fields; verify classification into 'recoverable' vs 'fatal' and corresponding behavior per policy.",
+    "Idempotency test: Trigger the same tool_invocation idempotency_key twice across a resume boundary and assert tool side-effect executed only once (via mock downstream instrumented endpoint).",
+    "Load test: Push concurrent streaming+tool workloads to force THROTTLED state and verify checkpoints and resume remain functional under reduced concurrency.",
+    "Compatibility test: Clients negotiating schema minor version where new optional fields are present should accept frames and ignore unknown optional fields. Major version mismatch yields rejected handshake."
+  ],
+  "observability_requirements": [
+    "Emit structured telemetry events for tool_call.start/complete/error with consistent key names and JSON schema \u2014 these must be parsable by our ingestion pipeline.",
+    "Expose per-customer metric: tool_circuit_state (0=closed,1=throttled,2=open) and count of circuit_trips in the last hour.",
+    "Create a pre-built dashboard tile showing: tool_call p50/p90 latency, p99 error rate, checkpoint frequency per request, and rate of fallback.used events.",
+    "Trace correlation: Ensure every envelope frame includes trace_id and span_id to correlate with distributed traces for post-incident debugging.",
+    "Alerting: Page on anomalies where fallback.used rate > 0.5% of requests for an hour or a single tool experiences >5 consecutive trips across >10 customers."
+  ],
+  "rollback_criteria": [
+    "If e2e tests fail for resume determinism in CI, do not promote the feature flag beyond canary.",
+    "If production fallback.used rate increases by >1% and correlates with customer errors (error frames persisted), roll back to previous runtime behavior and open incident review.",
+    "If idempotency guarantees are violated (duplicate downstream side-effects observed) immediately disable resumable-stream feature flag and issue hotfix."
+  ],
+  "links": [
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/RESUME+Stream+PRD",
+    "https://github.com/redwood-inference/runtime/pull/4921",
+    "https://drive.google.com/file/d/1a2b3c-design-prototype-output-envelope/view",
+    "https://grafana.redwood.company/d/streams/tool-calls-dashboard"
+  ],
+  "notes": "Peer feedback from runtime and security teams captured on 2025-02-18: persist only minimal checkpoint metadata (avoid PII), ensure idempotency_key has low cardinality protection, and provide customer controls for checkpoint retention. PM to coordinate conformance tests with SDK teams for handshake support.",
+  "recent_updates": [
+    "2025-02-18: Design review \u2014 added checkpoint TTL and GC policy after privacy/security review.",
+    "2025-02-21: Runtime engineering proposed storing checkpoints in the s3-backed metadata store; added e2e worker-crash test to test_plan.",
+    "2025-02-25: Observability added trace_id/span_id requirement after SRE feedback.",
+    "2025-02-28: Updated acceptance criteria to require explicit error classifications (tool_malformed, tool_timeout, tool_unavailable) for downstream analytics."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "motivation",
+    "design_decisions",
+    "acceptance_criteria",
+    "test_plan",
+    "observability_requirements",
+    "rollback_criteria",
+    "notes",
+    "recent_updates"
+  ],
+  "dataset_doc_uuid": "dsid_0e9c5a3b6a45404699329c92e4ae9d77"
+}

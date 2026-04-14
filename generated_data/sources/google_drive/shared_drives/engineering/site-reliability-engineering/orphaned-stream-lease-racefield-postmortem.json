@@ -1,0 +1,90 @@
+{
+  "title": "Orphaned stream lease racefield postmortem",
+  "owner": "Aisha Kapoor",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/site-reliability-engineering/orphaned-stream-lease-racefield-postmortem.json",
+  "doc_type": "doc",
+  "created_at": "2029-03-12",
+  "last_modified": "2029-03-15",
+  "collaborators": [
+    "Diego Martinez",
+    "Hannah Liu",
+    "Omar Aziz",
+    "Priya Raman"
+  ],
+  "team": "eng-sre",
+  "status": "final",
+  "tags": [
+    "p0",
+    "streaming",
+    "kv-lease",
+    "latency",
+    "runbook"
+  ],
+  "linked_artifacts": [
+    "JIRA-INC-1142",
+    "CONFLUENCE-STREAMS-ATTACHMENT-SPEC",
+    "github.com/redwood-inference/streaming-runtime/pull/478",
+    "logs://elk/2029-03-12/streaming/fanout"
+  ],
+  "incident_id": "INC-2029-03-12-1142",
+  "severity": "P0",
+  "summary": "On 2029-03-12 at ~08:32 UTC we observed a rapid increase in hosted API streaming session p99/p999 latencies and a correlated spike in 5xx responses for new streaming attach requests. Impact: ~18% of streaming sessions experienced stalls or immediate 5xx attach failures over a 22-minute window; non-streaming requests were largely unaffected. Root cause was a race between stream-lease expiry handling and the new session attach path that caused 'orphaned' streams to remain referenced on shard leaders while their KV lease was cleared; subsequent attaches triggered synchronous rehydration work that amplified queueing and caused a head-of-line latency amplification across the shard. This doc captures timeline, analysis, mitigations, and runbook changes.",
+  "timeline": "08:32 UTC - first alerts from hosted-api-streaming-p99 > 2s and attach-error-rate > 1%08:34 UTC - SRE on-call triages, identifies surge from edge->streaming attach fanout queue08:36 UTC - temporary ingress throttles applied to reduce new attach throughput08:38 UTC - rollback of recent tenant-routing change (rolled forward earlier that morning)08:42 UTC - discovered lease expiration churn on kv-store for stream-owner keys08:45 UTC - identified correlation: rehydration job for orphaned streams executed synchronously on attach08:50 UTC - mitigation: enable async rehydrate worker and increase attach concurrency limit09:02 UTC - p99 restored to baseline for most customers10:00 UTC - full incident declared resolved (mitigations in place; CI for long-term fixes started)",
+  "root_cause": "A code path change in the attach flow (released 03-12 05:25 UTC as part of PR 478) introduced synchronous stream rehydration when an attach found a missing local in-memory descriptor but a remote KV entry existed without a valid lease. Under lease churn (observed due to a separate KV lease regenerator bug), these remote entries were in a transient state. The synchronous rehydration requested heavy disk and network IO (cache warm, model kv fetch, shard leader coordination) on the attach thread, causing head-of-line blocking in the shard acceptor and amplifying latency for other attaches. The combination of lease churn frequency, the synchronous rehydration, and lack of backpressure on attach concurrency caused systemic degradation and some 5xx errors when request timeouts fired.",
+  "contributing_factors": "1) Recent attach-path change (PR 478) reverted to synchronous behavior for recovery cases.2) KV lease regenerator was cycling leases aggressively for a subset of streams due to TTL miscalculation on low-traffic prefixes.3) No circuit breaker on rehydration work: rehydrate executed inline without a CPU/IO budget.4) Alert thresholds were focused on p95, not p999 or attach error-rate; early noise was missed.5) No 'quarantine' or tombstone state to short-circuit known-bad remote entries.",
+  "detection_and_alerting": "Initial detection came from the hosted-api-streaming-p99 alert firing at 2s. Attach-error-rate alert triggered shortly after. Observability gaps: merchant-level drilldowns were noisy and required manual correlation with kv-store TTL churn logs. We will add a new SLI for attach-latency-in-rehydration-path and increase sampling to capture stack traces for attaches that trigger rehydrate.",
+  "mitigation_and_recovery": "Short term mitigations applied in the incident: - Applied ingress attach throttling at edge to reduce new attach rate. - Rolled back the tenant-routing change to eliminate one source of uneven attach distribution. - Enabled an async rehydrate worker mode (feature flag flip) so attach path enqueues rehydrate work instead of executing inline. - Increased attach concurrency limit to reduce head-of-line blocking backlog. These mitigations restored acceptable latency and reduced 5xx rate within ~30 minutes. Root-cause fixes were implemented after triage but gated for testing.",
+  "short_term_fixes": [
+    "Enable async rehydrate by default behind a canary 10% traffic rollout",
+    "Add immediate attach concurrency limiter and per-shard in-flight counter",
+    "Patch PR 478 to avoid inline blocking on missing local descriptor",
+    "Patch KV lease regenerator TTL calc to stop aggressive cycling for low-traffic prefixes"
+  ],
+  "long_term_actions": [
+    "Design and implement a 'quarantine' tombstone marker for remote entries with uncertain lease state",
+    "Introduce rehydrate CPU/IO budget and cooperative preemption for attach threads",
+    "Add a per-tenant attach SLA guard that uses graceful degradation (reject vs queue)",
+    "Implement observable SLI: attach-triggered-rehydrate-duration and elevate to paged alert if > 500ms p95",
+    "Harden KV lease system: add lease-probe and hysteresis to prevent oscillation"
+  ],
+  "action_items": [
+    "(Aisha) ship PR to default async rehydrate and coordinate 10% canary rollout by 2029-03-18",
+    "(Diego) update KV lease TTL calculation and add unit tests by 2029-03-21",
+    "(Hannah) add attach-triggered-rehydrate-duration metric and Grafana dashboard by 2029-03-20",
+    "(Omar) add runbook step and attach-concurrency limit to edge autoscaler by 2029-03-19",
+    "(Priya) run chaos test to simulate lease churn and verify quarantine behavior by 2029-04-01"
+  ],
+  "runbook_updates": "We propose the following runbook additions and edits: - New immediate page path: streaming-attach-rehydrate-p999 > 750ms (pager if sustained >5m) - On-call triage steps: 1) verify whether attach path was flipped to sync rehydrate (check feature flags), 2) apply async rehydrate flag, 3) apply ingress attach throttles with circuit-breaker values, 4) escalate to platform-eng if KV lease churn > 5% keys in 5m - Add decision tree: if rehydrate rate > X then quarantine keyspace Y - Include a rollback checklist for PRs that touch attach path and rehydrate behavior. - Add synthetic canary: every 60s create attach->detach sequence that exercises rehydrate and report duration.",
+  "postmortem_notes": "Observability is the main lesson: the attach path is a critical hotpath and any change that can turn background work into foreground work must be paired with explicit non-blocking semantics and budget controls. We combined multiple brittle things: a small TTL bug in KV lease regenerator + a semantics change in attach flow + missing operational limits. The incident was contained quickly thanks to a defensive ops move (throttling) and the ability to flip the async rehydrate flag. Next time we should catch this in pre-release chaos tests and have a pre-approved rollback/playbook ready for lease churn behaviors. Also: treat the rehydrate flow as a first-class SLO-instrumented service.",
+  "communication_summary": "Customer-facing status updates were posted to status.redwood.ai at 08:51 UTC and 09:12 UTC explaining impact and that teams were applying mitigations; a final update was posted at 10:05 UTC. Internal postmortem slides were shared on the eng all-hands channel and to the product incident channel. No major customer escalations beyond support tickets; a few customers reported higher latency during the window and were notified proactively.",
+  "learned_checks": "1) PRs that make recovery synchronous must include a 'budget and preemption' checklist item.2) Add automated test that simulates KV-lease churn to CI.3) Expand streaming SLA alerting to include attach-error-rate and p999 rehydrate duration.4) Introduce a tombstone/quarantine marker and associated short-circuit on attach.",
+  "references_and_artifacts": "- PR 478 (attach rehydrate change): github.com/redwood-inference/streaming-runtime/pull/478 - KV lease regenerator change: github.com/redwood-inference/kvlib/commit/ab3f2 - Incident logs bundle: logs://elk/2029-03-12/streaming/fanout - Canaries history: grafana/redwood/streaming/canary-2029-03-12",
+  "notes_to_future_oncall": "If you see rising attach p999 with no corresponding traffic increase, first check feature-flag state for async rehydrate. If async is on and you're still seeing issues, inspect KV lease churn rates and the rehydrate queue lengths on the shard leader. Prefer throttling new attaches over aggressive global rollbacks unless you have a clear single PR to revert. When in doubt, flip to async, apply per-shard attach limit, and notify platform-eng immediately.",
+  "closure": "Post-incident retrospective completed 2029-03-14 with platform-eng and product-hosted-api. All action items assigned and scheduled. We will run the lease-churn chaos test in staging on 2029-03-28 and plan the quarantine design doc to be reviewed by 2029-04-05. This incident is classified as P0 with medium confidence decisions for the long-term design changes; follow-up design review required.",
+  "attachments": [
+    "sre-timeline-2029-03-12.pdf",
+    "heap-profiler-sample-08-38-utc.txt",
+    "graphs-p99-attaches.png"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "timeline",
+    "root_cause",
+    "contributing_factors",
+    "detection_and_alerting",
+    "mitigation_and_recovery",
+    "short_term_fixes",
+    "long_term_actions",
+    "action_items",
+    "runbook_updates",
+    "postmortem_notes",
+    "communication_summary",
+    "learned_checks",
+    "references_and_artifacts",
+    "notes_to_future_oncall",
+    "closure"
+  ],
+  "dataset_doc_uuid": "dsid_820bf0a2007d4986a0b49c7ec0294c7a"
+}

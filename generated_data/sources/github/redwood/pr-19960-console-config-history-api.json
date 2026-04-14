@@ -1,0 +1,61 @@
+{
+  "repo": "redwood",
+  "pr_number": "19960",
+  "title": "Console: add optimization config history API (timeline view) with pagination + filters",
+  "author": "Felix Schneider",
+  "created_at": "2026-01-17",
+  "updated_at": "2026-01-22",
+  "merged_at": "2026-01-22",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/console-config-history-api",
+  "reviewers": [
+    "Chloe Martin",
+    "Jada Williams",
+    "Benji Okafor",
+    "Allison Grant"
+  ],
+  "labels": [
+    "console",
+    "platform",
+    "observability",
+    "performance",
+    "optimize",
+    "rbac"
+  ],
+  "linked_linear": [
+    "ENG-4828",
+    "PM-903",
+    "PM-901"
+  ],
+  "linked_jira": [
+    "SUP-18503"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "18",
+  "additions": "1264",
+  "deletions": "318",
+  "breaking_change": "false",
+  "release_notes": "Adds a paginated Optimization Config change history endpoint for Console timeline view, including filters (tenant/model/region/status/actor) and stable ordering; introduces indexes to keep p95 under 200ms for large tenants.",
+  "body": "## Summary\nThis PR adds the backend API powering the Console \u201cOptimization Config History\u201d / timeline UI. It exposes a stable, paginated feed of optimization config lifecycle events (create/validate/apply/pause/promote/rollback) with filtering by scope (tenant, model, region), actor, and status.\n\nPrimary goals:\n- Enable the Console timeline view + diff navigation to reliably load for large tenants.\n- Keep queries predictable and fast (keyset pagination, stable ordering, sensible indexes).\n- Ensure auditability (all entries link back to audit events / request IDs) without requiring Console to query the audit log service directly.\n\n## API\n### New endpoint\n`GET /internal/console/optimization-config/history`\n\nQuery params:\n- `tenant_id` (required)\n- `model` (optional)\n- `region` (optional)\n- `scope` (optional; one of `tenant|model|region|deployment`) \u2014 used by UI for grouping\n- `action` (optional; e.g. `APPLY|PROMOTE|ROLLBACK|VALIDATE|CREATE`)\n- `status` (optional; `STARTED|SUCCEEDED|FAILED|PAUSED`)\n- `actor` (optional; partial match on email/subject)\n- `from` / `to` (optional; RFC3339)\n- `limit` (optional; default 50, max 200)\n- `cursor` (optional; opaque)\n\nResponse shape:\n- Items are returned in descending time order.\n- Pagination uses keyset pagination with `(occurred_at, id)` to ensure deterministic ordering under concurrent writes.\n- Each item includes: `history_id`, `occurred_at`, `action`, `status`, `config_id`, `config_version`, `previous_config_version` (when applicable), `scope` + `scope_ref`, `actor_subject`, `actor_email` (if available), `request_id`, `rollout_id` (if applicable), and `summary`.\n\nNotes:\n- This is currently an *internal* endpoint behind Console auth and RBAC checks. A public customer-facing history endpoint is tracked separately (PM-903 follow-up for exposure/field redaction).\n\n## Implementation details\n### Data source\nWe aggregate from `optimization_config_change_log` (control plane) which is already emitted by the apply controller + rollback endpoint. Console needs a timeline across actions with minimal joins.\n\n### Pagination\n- Implemented as keyset pagination rather than offset pagination to avoid O(n) scans for large datasets.\n- Cursor encodes: `occurred_at` + `id` + filters hash to prevent cursor reuse across mismatched filters.\n\n### Filters\n- All filters are optional except `tenant_id`.\n- `model` and `region` filters are applied as exact matches.\n- `actor` filter is a case-insensitive search against `actor_email` and `actor_subject` (bounded to prefix match for index friendliness; see below).\n\n### Performance tuning\n- Added covering indexes to keep the common paths fast:\n  - `(tenant_id, occurred_at DESC, id DESC)`\n  - `(tenant_id, model, occurred_at DESC, id DESC)`\n  - `(tenant_id, region, occurred_at DESC, id DESC)`\n  - `(tenant_id, action, occurred_at DESC, id DESC)`\n  - `(tenant_id, status, occurred_at DESC, id DESC)`\n- Actor search is constrained to prefix match (`actor_email ILIKE 'foo%'`) to avoid sequential scans. (The UI uses typeahead with email prefix; if we need contains-match later, we can add a trigram index guarded by a feature flag.)\n\n### RBAC / authz\n- Endpoint is gated by `optimization_config:history:read` permission.\n- Tenant scoping uses existing Console tenancy resolution (no cross-tenant history reads).\n\n### Observability\n- Added metrics:\n  - `console_history_api_requests_total{tenant_id, has_model, has_region, status_code}`\n  - `console_history_api_latency_ms_bucket{path}`\n  - `console_history_api_db_time_ms_bucket{query_name}`\n- Added structured log fields: `tenant_id`, `actor`, `cursor_present`, `limit`, `filters` (redacted)\n\n## Files / areas changed\n- `control-plane/console/api/history/optimization_config_history_handler.go` (new handler + input validation)\n- `control-plane/console/api/history/optimization_config_history_query.sql` (query builder + keyset pagination)\n- `control-plane/optimization-config/db/migrations/20260117_add_change_log_indexes.sql` (indexes)\n- `control-plane/console/rbac/permissions.yaml` (add `optimization_config:history:read`)\n- `control-plane/console/openapi/internal-console.yaml` (internal spec)\n- `control-plane/console/api/history/optimization_config_history_handler_test.go` (pagination, filters, RBAC)\n\n## Testing\n- Unit tests:\n  - Cursor encode/decode and filter hash enforcement\n  - Pagination stability with duplicate timestamps\n  - Filter combinations (model/region/action/status/date)\n  - RBAC deny paths (missing permission)\n- Integration tests:\n  - DB migration applies cleanly\n  - History query p95 under synthetic dataset (10M rows, skewed by tenant) using `EXPLAIN (ANALYZE, BUFFERS)` baseline\n\n## Backwards compatibility\nNo changes to public API. New internal endpoint + new indexes only.\n\n## Follow-ups\n- Add optional join to attach \u201cdiff preview\u201d fields for the timeline hover (blocked on diff API finalization in pr-19952).\n- Consider materialized rollup for extremely large tenants if we see hot partitions.\n\n---\n### Example request\n`GET /internal/console/optimization-config/history?tenant_id=tnt_7c2&model=llama-3.1-70b-instruct&region=us-east-1&limit=50`\n\n### Example response item (abridged)\n`ROLLBACK SUCCEEDED config=optcfg_91 version=42 prev=43 actor=oncall@redwood.ai request_id=req_01HT... occurred_at=2026-01-21T03:14:22Z`\n\n## Reviewer notes / conversation\n**Chloe Martin (requested changes):** Cursor should be invalidated if filters change; otherwise UI can accidentally reuse old cursor after changing dropdowns.\n\n**Felix Schneider (author):** Added `filters_hash` to cursor payload + server-side check. If mismatch, we now return `400 INVALID_CURSOR_FILTER_MISMATCH` with a message the Console can use to reset pagination.\n\n**Benji Okafor (requested changes):** Please avoid `OFFSET` pagination entirely; we\u2019ve seen timeouts on similar feeds. Also confirm ordering is deterministic when `occurred_at` collisions happen.\n\n**Felix Schneider:** Switched to keyset pagination using `(occurred_at, id)` and enforced `ORDER BY occurred_at DESC, id DESC` with cursor conditions. Added tests where 100 rows share the same timestamp.\n\n**Allison Grant (requested changes):** Add db time metric and tag for \u201cfilters present\u201d to help us find slow paths.\n\n**Felix Schneider:** Added `console_history_api_db_time_ms_bucket{query_name}` and a derived label set (`has_model`, `has_region`). Avoided tagging by raw model/region to prevent cardinality blowups.\n\n**Chloe Martin (approval):** Looks good. The 400 error code is fine; Console can treat it as \u201creset pagination\u201d.\n\n**Benji Okafor (approval):** \ud83d\udc4d Indexes look sane. Thanks for the actor prefix constraint callout.\n\n## CI\n- build (control-plane): \u2705\n- unit tests: \u2705\n- integration tests: \u2705\n- lint/staticcheck: \u2705\n- db migration check: \u2705\n\n## Merge\nMerged via squash to keep history clean (commit message includes Linear refs).",
+  "commits": [
+    "console/history: add OptimizationConfigHistoryHandler + request validation",
+    "console/history: implement keyset pagination + cursor encoding with filters hash",
+    "db: add indexes for optimization_config_change_log query paths",
+    "rbac: add optimization_config:history:read permission and wiring",
+    "metrics: add request/db-time histograms for history endpoint",
+    "tests: pagination stability + filter combinations + RBAC deny cases"
+  ],
+  "changed_areas": [
+    "Control plane: Console internal API",
+    "Optimization Config Service DB schema/indexes",
+    "RBAC policy bundle (Console permissions)",
+    "Observability: metrics/logging for endpoint"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_8e57120174874d9fbcdb3dfb111fc5f0"
+}

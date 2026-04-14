@@ -1,0 +1,33 @@
+{
+  "title": "ripple-threshold-scan-lab-notes - adrian",
+  "owner": "Adrian Cortez",
+  "drive_area": "users",
+  "path": "users/ripple-threshold-scan-lab-notes-adrian.json",
+  "doc_type": "doc",
+  "created_at": "2024-10-28",
+  "last_modified": "2024-11-02",
+  "collaborators": [
+    "Marta Li",
+    "Ishaan Rao"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "throughput",
+    "latency",
+    "ripple-pattern",
+    "kv-cache",
+    "adaptive-batching"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/812",
+    "JIRA: SRV-476",
+    "https://slack.redwood.com/archives/C01234ABC/p1599999999000"
+  ],
+  "content": "Purpose / context:\nQuick personal scratchpad for a new class of traffic pattern I\u2019m calling a \"ripple\": short, repeating clustered bursts separated by a baseline lull. Goal is to map the latency cliff and throughput knee as we vary queue thresholds, batch timeouts, and KV cache priming. Keep notes here so we can iterate config changes quickly and capture raw telemetry excerpts.\n\nSummary of quick findings (top line):\n- Ripple bursts expose a sharp p99 cliff when batch_timeout > 30ms and concurrency > 48.\n- KV cache priming reduces p50 by ~12% and p99 by ~18% under ripple; but cache warms slowly across repeated bursts (need a priming policy).\n- Coalescing smaller requests into batches aggressively (batch_max_tokens 1024, min_batch_size 8) improves throughput but increases tail if preemption is enabled.\n\nTest harness and run commands:\n- Load generator: custom Python harness (utils/loadgen_ripple.py) that issues Poisson clusters: cluster_size ~ N(3-20), inter-arrival inside cluster = 5-15ms, inter-cluster gap = 12s.\n- Basic load: baseline QPS 60, ripple peak QPS ~ 700 for 4s every 12s.\n- Example run: python loadgen_ripple.py --baseline 60 --peak 700 --peak-window 4 --cluster-style poisson --clients 40 --duration 1800\n- Observability: tracing sampled at 1%, token-level trace for 1 in 1000 requests; metrics via Prom (latency p50/p95/p99, qlen, active_batches, kv_hit_rate)\n\nExperiment matrix tried (key axes):\n1) batch_timeout_ms: [5, 15, 30, 60]\n2) max_concurrency: [24, 48, 72]\n3) kv_cache: [cold, warm, disabled]\n4) preemption: [on, off]\n5) batch_min_size: [1, 4, 8]\n\nRepresentative raw results (selected):\n- Config A (batch_timeout=15ms, conc=48, kv=warm, preempt=off, min_size=4)\n  - avg throughput: 680 req/s during peak\n  - p50: 18ms, p95: 48ms, p99: 132ms\n  - kv_hit_rate: 0.46 (rising over run)\n  - notes: stable across bursts, small p99 spikes at burst boundaries (~+60ms)\n\n- Config B (batch_timeout=60ms, conc=72, kv=cold, preempt=on, min_size=8)\n  - avg throughput: 720 req/s peak (more tokens/second due to batching)\n  - p50: 22ms, p95: 160ms, p99: 540ms (severe tail)\n  - observed prolonged p99 tails that persist beyond burst window (30-40s)\n  - trace shows batches waiting for timeout then large eviction/wake costs in worker kernel (see trace ID abc123)\n\n- Config C (batch_timeout=5ms, conc=24, kv=warm, preempt=off, min_size=1)\n  - avg throughput: 360 req/s (peak drop due to small batches)\n  - p50: 12ms, p95: 38ms, p99: 95ms\n  - better tail behavior but throughput underprovisioned for peak \u2014 client-side queuing builds up\n\nASCII timeline excerpt (p99 across sliding windows, units ms):\n[0s..120s] ripple cycle sample (one 12s cycle)\n  baseline:    |=====| p99=22ms\n  burst start: |=====| p99 jumps -> 110ms (5s)\n  mid-burst:   |=====> p99 peaks 540ms (if batch_timeout high)\n  cooldown:    |==| p99 decays back to baseline over 20s\n\nObservations / hypotheses:\n- Longer batch_timeout is double-edged: better throughput but increases head-of-line blocking when bursts are dense, producing long tails that leak into cooldown windows.\n- Higher concurrency without corresponding scheduling fairness (preemption) amplifies the tail because oversized batches monopolize GPU worker threads. Preemption helps in average but introduces jitter as batches are torn down and requeued.\n- KV caching is effective but needs an explicit priming policy keyed by request class (short prompt vs long prompt). Warm cache reduces early-burst p99 but the hit-rate ramp is slow (need TTL overrides during initial bursts).\n- The runtime statistics show a consistent pattern: batch formation latency + kernel wake cost dominates p99 during ripple peaks, not token generation time.\n\nActionable next steps (short list):\n- Try adaptive batch_timeout: reduce to 10ms when queue length exceeds threshold Q=120, otherwise 30ms. Add a boolean flag in config to toggle. (Follow-up PR: see linked PR above.)\n- Implement fast-priming: on first N requests of a customer/session, force synchronous cache fill to avoid p99 bleed in first two bursts.\n- Add histogram sampling at batch formation time to isolate where the waiting time accumulates (client enqueue vs batch formation vs kernel scheduling).\n- Re-run with synthetic clients that randomize context length more aggressively \u2014 current runs used mostly 128-token contexts; add 32-token and 1024-token mixes.\n\nLoose notes / ideas to remember:\n- Could we use a micro-batcher that creates small eager batches for the first 200ms of a burst then switches to larger coalesced batches? (hybrid batching)\n- Consider soft-priority lanes: small quick-return prompts get a fast lane with stricter preemption limits.\n- Maybe introduce a short-lived token credit system so clients with repeated bursts are throttled into predictable buckets.\n\nOpen questions / TODOs:\n- How repeatable are these findings on Dedicated pool vs Hosted? (need to re-run on dedicated-qa)\n- Is the p99 tail correlated with specific kernel versions? Need to label runs with GPU driver/kernel+cuDNN version.\n- Confirm whether preemption tearing is causing allocator fragmentation leading to long wake costs \u2014 get SRE to correlate with host-level metrics.\n\nRaw traces and attachments: reference trace IDs in Prom/Jaeger and PR for instrumentation. I dumped p99 CSVs to /tmp/ripple-runs/2024-10-28-runA.csv on the laptop; will upload to shared artefacts if useful.\n\nNotes to self (brief):\n- When presenting to product, highlight that ripple is realistic: mobile push notifications + user think-time create clustered load.\n- For now, recommend conservative batch_timeout (<=15ms) for latency-sensitive customers and expose an \"adaptive batching\" toggle in console.\n\nEnd of scratchpad.\n\n-- Adrian\n(putting this here so I don\u2019t lose the numbers; will convert to a cleaned proposal if PM asks)",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_006f58e3f4814434844008bcaaf34104"
+}

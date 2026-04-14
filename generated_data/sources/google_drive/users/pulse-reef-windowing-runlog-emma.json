@@ -1,0 +1,35 @@
+{
+  "title": "pulse reef windowing runlog (personal)",
+  "owner": "Emma Chen",
+  "drive_area": "users",
+  "path": "users/pulse-reef-windowing-runlog-emma",
+  "doc_type": "doc",
+  "created_at": "2025-02-18",
+  "last_modified": "2025-03-01",
+  "collaborators": [
+    "Rafael Ortiz",
+    "Mira Patel"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "throughput",
+    "burst-patterns",
+    "kv-cache",
+    "quantization",
+    "windowing"
+  ],
+  "linked_artifacts": [
+    "https://linear.app/RED-834",
+    "https://github.com/redwood-inference/runtime/pull/4123",
+    "https://confluence.redwood.ai/display/INFR/Reef+Windowing+Experiments",
+    "slack://channel/C01ABCDEF/thread/1678901234"
+  ],
+  "body": "Notes to self: pulse-reef windowing exploration\n\nGoal\n- Understand how short repeating pulses (the \"reef\" pattern: clusters of small bursts separated by medium gaps) interact with a windowed batching layer + KV cache warming. Target is to maximize tail stability (p99/p999) while preserving high sustained QPS for small request payloads.\n\nHypothesis\n- A window_ms around 150-250ms with short pulse lengths (40-80ms) will allow the runtime to form useful batches without letting kv-cache eviction churn too much.\n- Quantized model variant should increase QPS but may amplify p999 when cold I/O or kernel fallback occurs.\n\nQuick summary (TL;DR) - Best observed config: window_ms=200, pulse_ms=60, inter_pulse_gap=700ms, batching_max_tokens=2048.\n- Hot-cache sustained QPS up ~18% vs baseline; p95 improved but p999 still sensitive to rare cold windows.\n- q4 quant gave highest throughput but saw p999 spikes during worker evaporation/eviction events.\n\nTest harness and env\n- client: synthetic-go-client v0.9.1 (single-threaded, 128 outstanding async requests cap)\n- model variants: llama2-13b-q4f16 (q4), llama2-13b-fp16 (fp16)\n- hardware: 1x node with A100-80GB (4-way partitions in runtime), driver/runtime commit: runtime@a3f9b2\n- server flags: --batch-window-ms=<X> --batch-max-tokens=2048 --kv-cache-ttl-sec=45 --spinup-threshold=0.65\n- workload: requests with 64 prompt tokens, avg answer 40 tokens. Payload small (headers ~1KB).\n- measurement: 5m warmup + 10m measurement; sampled traces and full histograms collected.\n\nTraffic patterns (reef definitions)\n- reef-A: pulse_ms=60, pulse_rps_peak=1200, inter_pulse_gap=700ms, pulses_per_burst=6 (short clustered reef)\n- reef-B: pulse_ms=120, pulse_rps_peak=800, inter_pulse_gap=1000ms, pulses_per_burst=3 (fatter reefs)\n- baseline: poisson steady 400 qps\n\nRepresentative commands (local)\n- ./bench --pattern reef-A --window-ms 200 --client-concurrency 128 --duration 15m --model q4 --tag reef-A-win200-q4\n- ./bench --pattern reef-A --window-ms 100 --model fp16 --tag reef-A-win100-fp16\n\nResults (condensed)\n- Hot-cache (post 5m warmup)\n  model | sustained qps | p50 ms | p95 ms | p99 ms | p999 ms | notes\n  q4-win200 | 420 qps | 14 | 36 | 88 | 310 | kv-hit ~91%, steady batching\n  fp16-win200 | 360 qps | 16 | 48 | 130 | 470 | higher mem, slower warm cache recovery\n  q4-win100 | 380 qps | 13 | 46 | 110 | 360 | smaller window reduces batch efficiency but tighter p50\n\n- Cold-window spikes (first request after >60s idle)\n  q4-win200 cold p99 ~ 1.2s (single-sample spikes), fp16 cold p99 ~ 2.6s (larger kernel path swap)\n\n- Effect of window_ms sweep (reef-A, q4)\n  window_ms | qps | p95 | p999\n  50 | 300 | 60 | 520\n  100 | 350 | 44 | 420\n  200 | 420 | 36 | 310\n  350 | 438 | 34 | 330\n- Observation: beyond 200ms marginal QPS gains, window >300ms raises p999 slightly due to coalesced large batches causing occasional scheduler jitter.\n\nObservations and micro-findings\n- KV-cache TTL=45s is a sweet spot for reef-A; lowering to 20s caused >2x p999 spikes because frequent evictions interacted with pulse timing.\n- Spinup-threshold (0.65) matters: when set too low (0.5) we saw more workers spun up+evicted which increased p999 tail.\n- Quantization: q4 unlocks throughput but increases sensitivity to long-tailed kernel slow-paths (observed on GPU memory pressure events). On the + side, q4 recovery time after cold windows is shorter.\n- Smaller window (<=100ms) keeps p999 sometimes higher because less batching leads to more small requests hitting slowpath alone.\n- For reef-B (fatter reefs) larger window (~300ms) performed slightly better due to contiguous pulse energy.\n\nSketch of an ASCII timing diagram (reef-A, window=200ms)\n- timeline: |pulse(60ms)|gap(700ms)|pulse(60ms)|...  window buckets of 200ms will capture most pulse content; some pulses split boundary when aligned to tail of window -> inefficient batches.\n\nActionable next steps / TODOs\n- Re-run with adaptive windowing: window_ms = min(200, observed_interarrival_quantile_50*2) (implement in client shim). Test whether adaptive reduces boundary splits.\n- Add more detailed end-to-end traces for p999 samples to identify whether slow events are kernel-level or scheduler enqueue delays. Attach full traces to RED-834.\n- Try increasing kv-cache-ttl to 90s for q4 to see if p999 stabilizes further (tradeoff: memory footprint).\n- Test variant with batch-max-tokens=1024 to see effect on scheduling jitter at p999.\n\nOpen questions / scribbles\n- Is the observed p999 amplification correlated with specific CUDA driver patch? Need to correlate host-level dmesg/CUDA logs for the spike timestamps.\n- How much of the p999 is attributable to client-side bottleneck (client backlog, TCP retransmission) vs server scheduling? We should run a perfectly local microclient pinned to same AZ.\n\nAttachments (collected traces)\n- saved traces: s3://redwood-bench/traces/reef/reefA_win200_q4_20250218.tar.gz\n- perf counters: s3://redwood-bench/perf/reefA_counters_20250218.csv\n\nNotes to self: label this run \"reef-A-windowing-v1\" and mark in the experiment index. Keep to follow-up experiments small and targeted (one knob at a time). Rafael to help instrument adaptive-window prototype. Mira to validate spinup threshold flips with canary traffic.\n\nEnd of scratch log.\n\n-- Emma\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_dc25cd27485441a6ae6b2630c306f275"
+}

@@ -1,0 +1,42 @@
+{
+  "repo": "redwood",
+  "pr_number": "27450",
+  "title": "Add scheduled meter sanity check job + alert hooks (drift/dupes/freshness)",
+  "author": "Caleb Johnson",
+  "created_at": "2026-02-03",
+  "updated_at": "2026-02-07",
+  "merged_at": "2026-02-07",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/meter-sanity-check-job",
+  "reviewers": [
+    "Logan Wright",
+    "Nadia Rahman",
+    "Mei Lin",
+    "Aisha Bello"
+  ],
+  "labels": [
+    "telemetry",
+    "billing",
+    "sre",
+    "observability",
+    "data-quality"
+  ],
+  "linked_linear": [
+    "ENG-4421",
+    "PM-1842",
+    "ENG-4415"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "19",
+  "additions": "1184",
+  "deletions": "132",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "body": "## Summary\nAdds a scheduled \"meter sanity\" job that aggregates key correctness/freshness signals for usage metering and emits alert hooks (Prometheus metrics + Alertmanager rules) with initial thresholds and per-env configuration.\n\nThis is the first step toward catching billing-impacting issues (late-arriving usage events, duplicates from retries/backfills, and drift between usage-event aggregates vs billing ledger) before Finance sees them at invoice preview.\n\n## Motivation / context\nWe\u2019ve had a few recent investigations where we only noticed metering anomalies after:\n- customer disputes (invoice vs usage export)\n- month-end close reconciliations\n- experiment readouts looking \"off\" due to missing dimensions / duplicate events\n\nThis PR wires up automated daily checks and a small set of core KPIs so we can tune thresholds over time and start building an incident trail for \"meter health\".\n\nRelated:\n- Linear: ENG-4421 (alert on drift vs billing ledger), PM-1842 (sanity-check KPIs), ENG-4415 (Console dashboard consuming the same aggregates)\n- Support threads/tickets: SUP-28463 (double-charged retries), SUP-28451 (invoice vs usage export mismatch)\n\n## What\u2019s included\n1) Scheduled job (k8s CronJob) that computes and stores daily aggregates\n- Runs hourly for freshness checks + daily rollups at 02:30 UTC\n- Writes results into `billing.meter_sanity_daily` (Snowflake) and also emits Prometheus gauges for near-real-time alerting\n- Job is idempotent per (day, meter_version, env) and safe to re-run\n\n2) Aggregation queries (initial set)\nPer day, broken down by `account_id`, `product`, `meter`, `region`, `model`, `endpoint_family`:\n- Freshness: max event lag (p95), % events arriving > 6h late\n- Completeness: null-rate for required dimensions (region/model/account_id)\n- Duplicates: duplicate usage_event_id rate; dedupe-key collision counts\n- Drift: absolute and relative drift between usage-event aggregates vs billing ledger (tokens, requests, embeddings units)\n- Outliers: z-score based spikes in per-account billed tokens vs trailing 7d baseline (guarded to reduce noise)\n\n3) Alert hooks + configuration\n- Adds Prometheus metrics namespace `meter_sanity_*`\n- Adds Alertmanager rules (behind a feature flag by env):\n  - `MeterSanityFreshnessSLOViolated` (page SRE + Telemetry)\n  - `MeterSanityLedgerDriftHigh` (page Telemetry, notify Finance channel)\n  - `MeterSanityDuplicateRateHigh` (ticket + Slack)\n- Thresholds are configurable via `config/meter_sanity.yaml` and can be overridden per environment.\n\n## Initial thresholds (subject to tuning)\nThese are intentionally conservative to avoid paging storms during rollout.\n- Freshness: page if p95 event lag > 90 minutes for 2 consecutive runs\n- Ledger drift: warn at >0.75% relative drift AND >$250 estimated impact (per account-day); page at >2.0% AND >$1,000 impact\n- Duplicate rate: warn at >0.10% duplicate usage_event_id; page at >0.50%\n- Missing dimensions: warn at >0.05% null region; page at >0.25% (per region/model breakdown)\n\nNotes:\n- The $$ impact estimate uses current pricebook table in Snowflake (approx; intended for prioritization, not accounting).\n- Drift checks compare \"eligible\" rows only (same meter_version, excludes backfills tagged with `is_backfill=true` by default).\n\n## Implementation details\n- New service module: `billing/ops/meter_sanity_job`\n- Query runner uses our existing Snowflake client with statement tagging (`app=meter-sanity-job`) for auditability.\n- Stores both raw counts and normalized rates; emits metrics with labels capped to avoid cardinality blowups (account_id is hashed for Prometheus labels, full values only in Snowflake table).\n- Adds a small library of query templates so ENG can extend without touching CronJob wiring.\n\n## Files / areas changed (high level)\n- `billing/ops/meter_sanity_job/*` (new)\n- `billing/sql/meter_sanity/*.sql` (new)\n- `deploy/k8s/cronjobs/meter-sanity.yaml` (new)\n- `config/meter_sanity.yaml` (new)\n- `observability/prometheus/meter_sanity.rules.yml` (new)\n- `lib/snowflake/statement_tags.ts` (tagging)\n- `docs/runbooks/meter_sanity.md` (initial runbook + triage steps)\n\n## How to test\n- Unit: `pnpm test billing/ops/meter_sanity_job`\n- Local dry run against dev Snowflake: `./bin/meter-sanity --env=dev --day=2026-02-01 --dry-run`\n- Staging:\n  1. Deploy CronJob\n  2. Verify `billing.meter_sanity_daily` populated for last 2 days\n  3. Verify Prometheus targets scrape `meter_sanity_*`\n  4. Temporarily set drift threshold to 0.0001 in staging to validate rule wiring (then revert)\n\n## Rollout plan\n- Merge behind `METER_SANITY_ALERTS_ENABLED=false` by default\n- Enable in staging for 48h, tune thresholds\n- Enable in prod with paging disabled for first week (notifications only)\n- After 1 week, move drift/freshness to paging based on observed baseline\n\n## Follow-ups (not in this PR)\n- Wire this dataset into Console dashboard tiles (ENG-4415)\n- Add per-endpoint-family token counting invariants for OpenAI-compat endpoints\n- Add explicit reconciliation hooks for month-end freeze window\n\n---\n## Review notes / discussion\n**Logan Wright:** Please cap Prometheus label cardinality; do not put raw account_id in labels.\n**Author:** Done. Account label is `account_hash` (sha256 truncated) for metrics; full `account_id` only in Snowflake table.\n\n**Nadia Rahman:** Drift should be gated on comparable populations. Backfills and shadow billing comparisons can skew.\n**Author:** Added `is_backfill` exclusion by default and a separate metric `meter_sanity_backfill_rows` so we can monitor when exclusions are hiding drift.\n\n**Mei Lin:** Need a Finance-friendly view of the table + statement tags for audit.\n**Author:** Added statement tags + documented the table schema in the runbook. Export permissions remain restricted.\n\n**Aisha Bello:** Alert text should include pointers to queries/runbook and avoid paging on single-run spikes.\n**Author:** Added 2-run confirmation on freshness/drift and included runbook + dashboard links in annotations.\n\n## CI\n- build: pass\n- unit tests: pass\n- lint: pass\n- integration (staging dry-run): pass (reran after fixing missing env var in CronJob manifest)\n\n## Release notes\nInternal: Adds automated metering sanity checks (freshness, duplicates, drift) with initial alert hooks and configurable thresholds. No customer-facing changes.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_6bdae033142c48ffa3c23c1e57029736"
+}

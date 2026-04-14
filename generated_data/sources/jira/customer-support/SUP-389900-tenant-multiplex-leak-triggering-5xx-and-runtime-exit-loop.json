@@ -1,0 +1,70 @@
+{
+  "key": "SUP-389900",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Tenant multiplex leak causing sustained 5xx wave and runtime exit-loop under mixed streaming+embedding load",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-13",
+  "reporter": "Aisha Patel",
+  "assignee": "Marco Ruiz",
+  "customer_company": "SynthScale Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "kv-cache",
+    "ingress-proxy"
+  ],
+  "labels": [
+    "5xx",
+    "streaming",
+    "embeddings",
+    "tenant-isolation",
+    "watchdog-reset"
+  ],
+  "environment": "prod | us-east",
+  "affected_models": [
+    "gpt-medium-ops-2024q4"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-12",
+  "linked_issues": [
+    "SUP-472901",
+    "SUP-612207"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/4120"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SUPPORT/tenant-multiplex-investigation-runbook"
+  ],
+  "description": "Issue summary:\nCustomer SynthScale reported sharp increase in 5xx errors starting 2026-03-12 09:14 UTC concurrent with a large mixed workload (long-lived streaming chats + large embedding batch uploads).\n\nImpact:\n- ~18% error rate on tenant requests for 30+ minutes with many clients experiencing failed streaming sessions and failing embedding uploads.\n- Several runtime pods entered an exit-loop (watchdog-triggered restarts) causing repeated upstream 502/503s at the API gateway.\n- Customer reports degraded UX: streaming sessions drop after initial tokens and embeddings fail with 5xx during upload retries.\n\nOccurrence pattern / hypothesis:\n- Appears tied to tenant connection multiplexing: a leak of ephemeral session handles in the ingress proxy results in an inflated in-flight connection count for the tenant.\n- Influx of multiplexed streaming + embedding batches triggers aggressive prefetch and kvcache writes; kvcache lock contention then causes serving runtime threads to block, eventually tripping GPU watchdog restarts.\n\nEnvironment:\n- Dedicated tenant in prod(us-east-1) on Dedicated pool-d-5\n- API gateway version: v2.33.1\n- Serving runtime image: redwood/serving-runtime:2026-02-27-abcdef\n\nSteps to reproduce (observed):\n1) Large client opens ~120 persistent streaming connections with keepalive.\n2) Same client launches concurrent embedding bulk upload (multi-part, 1000 vectors) while streams active.\n3) Within 90s, keepalive counters at ingress show sustained half-open socket count growth and multiplex handles per worker exceed expected thresholds.\n4) Serving runtime CPU thread saturation and kv-cache write latencies spike.\n5) GPU watchdog resets occur, runtime pods restart, API gateway surfaces 502/503/504 to clients.\n\nRelevant log excerpts:\n- ingress-proxy: \"WARN conn_pool: leaked_handle tenant_id=sst-88f, handle_id=0x7f9a5a2c\"\n- api-gateway: \"ERROR upstream 502 fn=proxy_request tenant=sst-88f backend=runtime-42 status=BAD_UPSTREAM\"\n- runtime kernel: \"E NVML: GPU watchdog reset triggered by driver NVML_ERROR_UNKNOWN\"\n- runtime app: \"ERROR worker: prefetch_task stuck waiting on kvcache: shard=12 lock_wait=1234ms\"\n\nTemporary mitigations applied:\n- Support throttled tenant concurrency at the gateway for synthscale via per-tenant limit (rate limit reduced to 50 concurrent streams) at 2026-03-12 10:03 UTC \u2014 observed error rate drop to 2.6% within 6 minutes.\n- Evicted and cycled affected runtime pool nodes to break stuck prefetch/kvcache locks.\n\nRequested next actions / ask from Engineering:\n- SRE/Eng to investigate potential leak in ingress multiplex handle accounting and add guard rails to prevent handle growth beyond threshold.\n- Add runtime circuit-breaker to abort heavy prefetch/kvcache operations when lock wait > 500ms to avoid blocking GPU watchdog-critical threads.\n- Collect full pprof / thread dumps from a sample runtime pod immediately when lock_wait exceeds 200ms.\n\nCustomer notes:\n- Customer provided request IDs and client timestamps (attached). They are on a dedicated contract and need an RCA and remediation timeline for production hardening.\n\nAttachments:\n- synthscale_request_ids_2026-03-12.csv (attached to ticket)",
+  "comments": [
+    "2026-03-12 09:31 - Support (Aisha Patel): Initial customer report received via email. Logged request IDs and escalated to SRE. Notified on Slack #support-synthscale.",
+    "2026-03-12 09:45 - SRE (Marco Ruiz): Observed ingress handle growth on prod-us-east. Short-term mitigation: apply per-tenant concurrency cap and drain one runtime pool. Implemented at 10:03 UTC. Monitoring now.",
+    "2026-03-12 10:12 - Customer (SynthScale - Elena M.): Confirming partial recovery \u2014 streaming stability improved but some embedding uploads still get 5xx. Asked for ETA on permanent fix and whether we can whitelist brief higher burst for scheduled jobs.",
+    "2026-03-12 13:05 - Eng (Dmitri Volkov): Running heap/profile captures from a restarted runtime pod. Early signs point to kvcache shard lock hot-spot; opening PR for lock-timeout guard. See PR: https://github.com/redwood-inference/serving-runtime/pull/4120",
+    "2026-03-13 08:22 - SRE (Marco Ruiz): Confirmed PR merged to canary with a 500ms kvcache lock abort. Monitoring canary for 24h then roll to prod. Noted a required follow-up: ingress multiplex metrics need an alert (MAX_HANDLES > 80)."
+  ],
+  "investigation_notes": "- Trace of tenant sst-88f shows handle leakage pattern: delta(handles) outpaces delta(close) under mixed workload.\n- kvcache instrumentation indicates heavy write amplification during concurrent embedding multi-part uploads.\n- GPU watchdog triggers correlated with long-stalled threads in runtime (threads waiting on kvcache shard locks).\n- No immediate OOM in pod; restarts are watchdog-triggered watchdog resets reported by NVML.\n- Reproducer: synthetic load runner opened 130 streams + concurrent 10k vector embedding upload reproduces the issue locally on dedicated-sim cluster.\n- Hypothesis: ingress proxy improperly reuses/retains multiplex handles for streaming connections when concurrent large multipart uploads pause socket flush, leading to logical connection count > physical limit and kvcache thrash.\n\nOpen questions:\n- Is there a race in ingress-proxy's handle lifecycle during multi-part uploads with long-lived streams?\n- Should the gateway enforce hard per-tenant multiplex limits earlier (reject vs queue)?\n\nTelemetry/dashboard links:\n- Metrics: https://grafana.redwood.ai/d/ingress/tenant-handles?orgId=1&var-tenant=sst-88f\n- Logs: https://logs.redwood.ai/synthscale/requests?from=2026-03-12T09:00&to=2026-03-12T11:00\n- Slack thread: https://slack.redwood.ai/archives/C01234567/p1678600000000",
+  "resolution": "Mitigation in-place: per-tenant concurrency cap and runtime pool recycle reduced error rate. Engineering to roll kvcache lock-timeout guard to prod. Permanent fix pending canary validation and ingress-proxy leak patch.",
+  "next_steps": "1) Monitor canary for 24h after kvcache-guard rollout. 2) Add ingress multiplex handle alert (MAX_HANDLES > 80) and automated soft-rejecting policy. 3) Schedule RCA write-up and follow-up with customer by 2026-03-17.",
+  "resolution_notes": "Temporary throttle applied and nodes cycled. PR merged to canary for kvcache lock abort. Pending ingress-proxy fix and automated alerting. Customer updated 2026-03-13.",
+  "public_communication": "We informed the customer of a temporary mitigation and that a code change to limit kvcache lock wait is in canary. Committing to an RCA and roadmap for ingress hard-limits by 2026-03-17.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution",
+    "next_steps",
+    "resolution_notes",
+    "public_communication"
+  ],
+  "dataset_doc_uuid": "dsid_7148cafd11084223a403a577e146bfe2"
+}

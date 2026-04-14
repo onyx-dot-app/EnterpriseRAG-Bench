@@ -1,0 +1,132 @@
+{
+  "key": "ENG-82712",
+  "team": "engineering",
+  "title": "Async credit-burn race causing transient quota exceedances",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-08",
+  "updated_at": "2026-03-12",
+  "creator": "Ruth Chen",
+  "assignee": "Diego Morales",
+  "project": "billing-core",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "rate-limiter",
+    "billing",
+    "quota",
+    "investigation"
+  ],
+  "dependencies": [
+    "ENG-30109",
+    "ENG-20111"
+  ],
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "customer_impact": "medium",
+  "description": "Summary: We observed short-lived but repeatable transient cases where clients were able to exceed their quota window by a small number of tokens/requests. Root cause appears to be a race in the asynchronous credit-burn path used by the sharded per-key enforcer: duplicate/parallel consume events and delayed cache invalidations allowed short bursts to pass between accounting checkpoints. This affects correctness of usage accounting and rate enforcement (fairness + billing).",
+  "steps_to_reproduce": [
+    "1) Configure a per-key token bucket with small window (e.g. 60s, 1000 tokens) and enable async credit-burn (default path)",
+    "2) From a single API key, fire parallel requests that intentionally straddle the refill boundary (high concurrency at T0, T0+1s)",
+    "3) Observe that a subset of requests succeed beyond the expected limit for the window and accounting events show duplicate consumes in the enforcer log",
+    "4) Reproduce consistently under a 50-100 rps client with 8 concurrent goroutines in staging; increased likelihood if one or more enforcer shards are experiencing CPU/GC pauses or network latency to Redis/KV cache"
+  ],
+  "observed_evidence": [
+    "Grafana: rate_limit.burst_exceed_count spiked in us-west-2 during the test run: https://grafana.redwood.example/d/abcd/rate-enforcer?orgId=1",
+    "Publish log lines showing duplicate consume_id for same request: https://logs.redwood.example/app/kafka/prod?query=consume_id",
+    "Billing delta graph: small positive bias in per-minute token accounting for affected orgs: https://dashboards.redwood.example/d/billing/token-diff"
+  ],
+  "root_cause_analysis": [
+    "Race between local shard's async emit of a 'consume' message and the central aggregator's reconciliation step. The enforcer shard will optimistically accept a request and emit a consume to the commit log; if the commit log publish is retried or reordered, the central counter may see duplicate increments before dedup is applied",
+    "KV cache TTL/refresh can return stale remaining-credit values to the shard which then assumes more tokens are available and performs optimistic accepts",
+    "No global monotonic sequencing or idempotency key verification for the credit-burn path, and our de-dupe window is too short relative to observed network jitter",
+    "Edge cases amplified when autoscaling moves leases between shards (lease handoff does not drain all in-flight optimistic accepts)"
+  ],
+  "impact_summary": [
+    "Affects fairness: some customers can issue short bursts above their quota, affecting multi-tenant fairness under load",
+    "Affects billing correctness: small over-counts in tokens used can drift billing reports until reconciled",
+    "Observed in staging and a small set of high-throughput customers in production (estimated <0.5% of keys active during spike)",
+    "No observed data exfiltration or security compromise; strictly accounting/enforcement correctness"
+  ],
+  "short_term_mitigation": [
+    "1) Disable async credit-burn for high-throughput keys via feature-flag (ff:disable_async_burn) to force synchronous commit path",
+    "2) Increase de-dupe window for consume_id from 2s -> 10s to catch reorder/retry cases",
+    "3) Temporarily lower shard acceptance threshold (reject on lower remaining-credit margin) to reduce speculative accepts",
+    "4) Communicate to affected customers via support playbook if billing delta > $100 in a day"
+  ],
+  "long_term_fix": [
+    "1) Re-architect credit-burn to include monotonic commit sequence numbers per key and use CAS on central counters or a single-writer-per-key lease",
+    "2) Add exactly-once semantics via persistent commit-log + idempotent apply (consume_id persisted and checked before apply)",
+    "3) Improve lease handoff: drain in-flight optimistic accepts before transferring shard responsibility",
+    "4) Add integration tests that simulate network partitions, retries, and reorder to validate no-exceed property under concurrency",
+    "5) Add a canary with synthetic high-concurrency client and automated CHAOS tests to detect regressions"
+  ],
+  "acceptance_criteria": [
+    "No measurable increase in rate_limit.burst_exceed_count in staging under the sustained 100rps multithreaded stress test for 30 minutes",
+    "Per-minute token accounting drift between enforcer and billing < 0.01% for the canary orgs during the canary period",
+    "Unit and integration tests added to repo covering reorder/retry and lease handoff cases",
+    "Change rolled out to production with canary and metrics monitored for 72 hours without regression"
+  ],
+  "implementation_notes": [
+    "Primary code paths: enforcer/service/async_burn.go, committer/commitlog_writer.go, lease/hand_off.go",
+    "Proposed PR will add consume_id persistence in commitlog and a fast index in redis for dedupe checks before apply",
+    "Backward compatibility: maintain current behavior behind runtime feature flag and allow gradual migration",
+    "Performance trade-off: CAS/strong-commit approach will increase median latency for accepts by ~3-8ms in microbenchmarks \u2014 we'll offset with batching improvements in runtime-1.22"
+  ],
+  "related_prs": [
+    "https://github.com/redwood-inference/redwood-runtime/pull/1849 (wip: commitlog idempotency)",
+    "https://github.com/redwood-inference/redwood-runtime/pull/1852 (lease handoff draining)"
+  ],
+  "confluence_links": [
+    "https://confluence.redwood.example/display/BILLING/Async+credit+burn+investigation",
+    "https://confluence.redwood.example/display/ENG/Rate+Enforcer+design+notes"
+  ],
+  "timeline_and_updates": [
+    "2026-03-08: Issue created by Ruth Chen after stochastic test revealed burst exceedances in staging",
+    "2026-03-09: Diego Morales reproduced locally using multithreaded harness; increased de-dupe window reduced occurrences",
+    "2026-03-10: Short-term mitigation feature-flag rollout tested in staging (disabled async burn for 3 keys) - reduced burst_exceed_count to 0 during test window",
+    "2026-03-11: Draft PR for commitlog idempotency submitted; code review pending from infra team",
+    "2026-03-12: Decided on long-term plan: monotonic sequence + idempotent apply; estimate 5 points; canary plan created"
+  ],
+  "rollout_plan": [
+    "Stage 1: Merge behind FF and run staging canary with synthetic clients for 48h",
+    "Stage 2: Enable FF=true for 1% traffic in us-west-2 for 24h, observe metrics",
+    "Stage 3: Ramp to 10% and then 50% over 48h if green, then global migration",
+    "Rollback: FF off will revert to old behavior; additionally we maintain a per-org emergency reject rule to clamp bursts if billing delta > threshold"
+  ],
+  "monitoring_queries": [
+    "rate_limit.burst_exceed_count{env:prod}",
+    "billing.token_drift.sum() by (org)",
+    "enforcer.accept_latency.p50,p95",
+    "commitlog.apply_retries.count"
+  ],
+  "tests_to_add": [
+    "integration: network-reorder-and-retry-test (simulates commit publish reorder)",
+    "stress: high-concurrency-lease-handoff (verifies no excess accepts during handoff)",
+    "unit: consume_id_dedupe logic edge cases"
+  ],
+  "notes": [
+    "Coordination required with billing team \u2014 notify before production rollout to reconcile any small historical billing drift",
+    "Discuss with runtime team trade-offs for CAS vs single-writer lease (latency vs complexity)",
+    "Follow-up: evaluate if similar races exist in embedding/metering path and open separate ticket if found"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_evidence",
+    "root_cause_analysis",
+    "impact_summary",
+    "short_term_mitigation",
+    "long_term_fix",
+    "acceptance_criteria",
+    "implementation_notes",
+    "timeline_and_updates",
+    "rollout_plan",
+    "monitoring_queries",
+    "tests_to_add",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_fadfab2f574547d1a31cfb5694df7991"
+}

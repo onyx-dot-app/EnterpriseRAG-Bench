@@ -1,0 +1,93 @@
+{
+  "key": "SUP-551237",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Final SSE fragment dropped after transparent proxy migrated connection during long-lived stream",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Aisha Patel",
+  "assignee": "Diego Marin",
+  "customer_company": "NimbusDocs Inc",
+  "customer_tier": "enterprise",
+  "components": [
+    "api-gateway",
+    "edge-proxy",
+    "serving-runtime"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "proxy",
+    "post-handshake",
+    "investigation"
+  ],
+  "environment": "prod us-east-1",
+  "affected_models": [
+    "redwood-3b-v1"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-13",
+  "first_response_due_at": "2026-03-12",
+  "description": "Issue summary:\nCustomer reports that long-lived SSE streams occasionally terminate with the final JSON choice missing (trailing punctuation and terminal metadata absent). The stream connection is handed off by a transparent proxy when the client's NAT mapping changes, and following that handoff the final fragment (the server's end-of-stream marker plus last tokens) is not received by the client, causing client-side parsers to error.\n\nImpact:\n- Affected customer flows: real-time document summarization pipeline that depends on receiving a complete terminal choice and metadata (request_id, final: true).\n- Frequency: ~3-4 occurrences per 10k streaming requests for this customer in us-east-1 over the last 72h.\n- Customer-visible: incomplete outputs, downstream job failures, and occasional duplicate retry requests due to client error handling.\n\nObserved behaviour summary:\n- Stream emits partial tokens, then connection is migrated by a transparent edge proxy (CloudEdge) to a new backend socket. After migration, the client receives a final empty chunk / keepalive but does not receive the terminal JSON object containing the final tokens/metadata. Server logs show the final \"end\" event was emitted and acknowledged by the server process, but bytes appear missing on the TCP stream after proxy migration.\n\nExpected behaviour:\n- After connection migration, either the full final fragment should be delivered to the client or a clear resumable event should be sent so client can resume and fetch tail. Client should not receive a truncated/incomplete terminal choice that causes JSON parse failures.\n\nRelevant IDs and traces:\n- Sample request_id: req-20260311-nimbus-77b9f\n- Edge connection IDs: edge-conn-8f3a / edge-conn-9b7c (handoff observed at 2026-03-11T21:03:09.512Z)\n- Server trace (X-Trace-ID): trace-9a2c-db4f\n- Grafana: https://grafana.redwood.internal/d/streams/streaming-errors?var-customer=NimbusDocs&from=2026-03-11T20:00:00Z&to=2026-03-12T00:00:00Z\n- Kibana sample: https://kibana.redwood.internal/app/discover#/doc/trace-9a2c-db4f\n",
+  "steps_to_reproduce": [
+    "1) Use long-running SSE client with streaming summarization payload (~1500 tokens expected).",
+    "2) Place a transparent edge proxy (CloudEdge) that performs connection migration on NAT mapping change or idle rebalancing.",
+    "3) Start stream, then trigger a client network change (simulate mobile->wifi switch or force NAT mapping change at ~90-120s).",
+    "4) Observe client parser errors; server side shows the final 'end' event emitted but client didn't get final JSON completion chunk."
+  ],
+  "logs": [
+    "server (serving-runtime) stdout 2026-03-11T21:03:09.511Z: INFO req=req-20260311-nimbus-77b9f emitted final_event seq=117 end=true",
+    "edge-proxy (cloudedge) 2026-03-11T21:03:09.514Z: WARN conn-handoff edge-conn-8f3a -> edge-conn-9b7c during active_stream req=req-20260311-nimbus-77b9f",
+    "client error: JSONParseError at byte 13224: unexpected end of input (client reported stack trace and raw buffer)"
+  ],
+  "comments": [
+    "2026-03-12 08:14 - Aisha Patel (Support): Initial report received from customer; attached client logs and sample request_id. Marking P1 due to customer pipeline failures.",
+    "2026-03-12 09:02 - Diego Marin (SRE): Reproduced a handoff in our staging edge by simulating NAT change. Observed that the proxy swaps backend socket while server is writing trailing bytes; suspect proxy drains socket incorrectly. Collecting tcpdump and tracing headers.",
+    "2026-03-12 13:30 - Marco Ruiz (Edge team): Confirmed CloudEdge does immediate backend swap and does not guarantee in-flight byte flush in the current default config. We have a config 'graceful_drain_ms' that is set to 0 in production for performance. Testing with 200ms drain prevented the issue in local repro.",
+    "2026-03-13 10:21 - Diego Marin (SRE): Customer-side mitigations suggested: increase client-side keepalive to detect migration and trigger resume; temporarily enable 'prefer-long-lived-connections=false' on customer's LB to stay on single socket. Customer applied LB change and reported two hours without occurrence.",
+    "2026-03-14 11:05 - Lina Chen (Serving Runtime): Server-side improvement proposal: emit explicit 'end-of-stream' sentinel in a separate, high-priority frame before streaming final tokens (adds idempotent resume anchor). Preparing a small change to include sequence footer before final payload.",
+    "2026-03-14 15:42 - NimbusDocs (Customer): Shared that disabling connection pool rebalancing at their edge reduced failure rate but would like a permanent platform fix.",
+    "2026-03-14 16:10 - Diego Marin (SRE): Creating follow-up internal change: adjust CloudEdge defaults to set graceful_drain_ms=250 for connections that carry SSE traffic; serving-runtime will add explicit terminal sentinel in next canary. Linking PRs below."
+  ],
+  "investigation_notes": [
+    "tcpdump from edge-conn-8f3a shows server wrote final 2 packets (JSON terminator + metadata) but the subsequent ACKs are associated with new backend socket after handoff - packets never forwarded to client socket.",
+    "edge-proxy code path: connection_migrate() currently tears down old backend socket immediately when mapping changes; no buffering of outbound bytes in 'transparent' mode.",
+    "serving-runtime's current streaming path emits final JSON as part of normal frame sequence; no separate sentinel or flush flag is set, so bytes can be lost if proxy drains prematurely.",
+    "Repro in staging with graceful_drain_ms=0 shows failure reliably; setting to >=200ms eliminates lost terminal fragment in repro environment.",
+    "Client parsers fail with a non-recoverable JSONParseError; SDK retry logic attempts a full retry which may duplicate downstream results (observed in customer's pipeline)."
+  ],
+  "resolution_notes": [
+    "Workarounds implemented for customer: 1) customer disabled connection rebalancing on their LB, 2) support enabled edge route pinning for SSE streams for NimbusDocs account (temporary). Both reduced incidence rate immediately.",
+    "Short-term platform mitigation: edge ops to roll out a config change to set CloudEdge 'graceful_drain_ms' = 250 for SSE-tagged routes (canary rollout started 2026-03-14 17:00 UTC).",
+    "Medium-term fix: serving-runtime change to emit an explicit 'stream-end' sentinel frame (sequence anchor) and call OS-level socket flush before closing backend socket. PR: https://github.com/redwood-inference/serving-runtime/pull/2392",
+    "Long-term: update edge-proxy connection migration to buffer final outbound bytes when in transparent mode or to perform half-close semantics that ensure delivery; track work in INT-6421 (edge rebalancing resilience epic).",
+    "Post-deploy monitoring: dashboard added to alert if SSE streams show increase in 'incomplete_terminal_choice' metric; notify #support and #edge-ops on spike > 5/hr per region.",
+    "Customer follow-up: scheduled call 2026-03-16 to validate canary behaviour and discuss SLA credit if incidents recur."
+  ],
+  "linked_issues": [
+    "INT-6421"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/2392",
+    "https://github.com/redwood-inference/edge-proxy/pull/1887"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.internal/display/EDGE/Connection+Migration+Runbook",
+    "https://confluence.redwood.internal/display/STREAMS/SSE+End-of-Stream+Design"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_967e55e0560c4f72b7c9caf1d4af44c0"
+}

@@ -1,0 +1,33 @@
+{
+  "title": "elastic-concurrency-threshold-sandbox",
+  "owner": "Hector Alvarez",
+  "drive_area": "users",
+  "path": "users/elastic-concurrency-threshold-sandbox-hector",
+  "doc_type": "doc",
+  "created_at": "2024-11-15",
+  "last_modified": "2024-12-02",
+  "collaborators": [
+    "Maya Kapoor",
+    "Liam Chen"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "concurrency",
+    "elastic-scaling",
+    "latency",
+    "throughput",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "JIRA-4821",
+    "https://github.com/redwood-inference/serving-runtime/pull/913",
+    "confluence:serving-runtime/elastic-scaling-notes"
+  ],
+  "content": "Goal:\\nQuick sandbox to study how the runtime's elastic concurrency threshold (ECT) interacts with bursty ingress and automatic batch sizing. I wanted a compact run that surfaces oscillations and a heuristic for a safe default ECT for small-hosted customers.\\n\\nBackground / hypothesis:\\n- ECT tries to keep active request count per worker below a target to avoid blocking and oversized batches.\\n- If ECT is too low, we underutilize GPUs (low throughput). If too high, queuing and tail latency spike for p95/p99 when batches grow and KV cache churn increases.\\n- Hypothesis: for mixed short/long token workloads, a slightly conservative ECT with quicker drain (shorter burst_backoff_ms) reduces p99 spikes at a modest throughput cost.\\n\\nTestbed (local cluster config):\\n- Model: openchat-medium (approx 8B, FP16; KV cache warmup behavior observed)\\n- Fleet: 4 x v100-equivalent (32GB) nodes, worker threads: 8, initial batch_timeout_ms: 8\\n- Router: single region, qps generator on separate node (no network noise), synthetic arrival patterns\\n- Workload: 70% short (prompt+20 tokens), 30% long (prompt+150 tokens), payload distribution constant per run\\n- Duration per run: 1,800s (30m) with 10m steady-state sampling after 20m warmup\\n\\nVariables swept:\\n- ECT (active concurrency per worker): [2, 4, 8, 12]\\n- burst_backoff_ms: [40, 80, 160]\\n- arrival pattern: Poisson baseline vs clustered bursts (10s bursts at 3x base qps every 60s)\\n- auto_batching: enabled (max_batch_size=64), dynamic_batch_timeout disabled for isolation\\n\\nRun notes + key metrics captured (p50/p95/p99 latencies in ms, avg throughput in req/s):\\n- Each run CSV exported to /tmp/ect-runs; below are aggregated numbers from steady window.\\n\\n--- Run A: ECT=2, backoff=40ms, poisson ---\\np50: 18ms, p95: 62ms, p99: 210ms, throughput: 860 req/s\\nObservations: very stable latencies, low batch sizes (avg batch 6), GPU utilization ~42%. p99 mostly from occasional long requests piling but rare.\\n\\n--- Run B: ECT=4, backoff=40ms, poisson ---\\np50: 20ms, p95: 91ms, p99: 360ms, throughput: 1180 req/s\\nObservations: throughput improved ~37%. p99 increased notably; spikes correlate with simultaneous long requests leading to larger batches (avg batch 12). KV cache miss rate increased briefly during spikes.\\n\\n--- Run C: ECT=8, backoff=40ms, clustered bursts ---\\np50: 42ms, p95: 310ms, p99: 980ms, throughput: 2150 req/s (during bursts), long-tail behavior severe\\nObservations: During bursts worker pools accepted many concurrent requests, batch sizes grew to 30-48. Response latency for short requests ballooned because they waited for in-flight long samples. CPU watchdog and backpressure callbacks kicked in, router started fallback to smaller model after 3 consecutive ms > 1200ms (seen at 3 points).\\n\\n--- Run D: ECT=12, backoff=160ms, clustered bursts ---\\np50: 64ms, p95: 680ms, p99: 2,300ms, throughput: 2700 req/s peak\\nObservations: extreme p99. Backoff too slow to drain; workers stayed saturated. GPU utilization hit >95% but effective QoS poor. Not acceptable for SLAs.\\n\\n--- Run E: ECT=4, backoff=160ms, clustered bursts ---\\np50: 28ms, p95: 140ms, p99: 420ms, throughput: 1200 req/s baseline, 1800 req/s bursts\\nObservations: increasing backoff reduced tail compared to ECT=4/backoff=40. Larger backoff helped drain but increased time to recover between bursts.\\n\\nMicro-observations (trace snippets):\\n- When long requests arrive concurrently, we saw a chain: batch growth -> KV cache evictions -> longer KV miss latency -> delayed generation start -> further queuing.\\n- The router's eager batching policy exacerbated tail for ECT>=8 when arrival clustering present.\\n- Short requests suffer most from batch growth; p50 remains OK up to ECT=4 but p95/p99 diverge.\\n\\nQuick heuristics extracted:\\n1) For mixed short/long workloads, set default ECT=3-5 per worker for 32GB GPU and openchat-medium-equivalent models. It keeps p99 under 500ms in clustered burst scenarios while retaining ~60-75% peak throughput.\\n2) Use conservative burst_backoff_ms (>=80ms) to give workers time to drain KV churn; 160ms safe but slows recovery. 80ms is a pragmatic default.\\n3) Add short-request fastlane: detect requests estimated <40 tokens (via header hint or tokenizer pre-check) and route to low-latency queue with tighter batch caps. This reduced observed p99 for shorts by ~45% in an add-on run.\\n4) Enable lightweight KV pinning for hot prefixes during bursts to reduce eviction cascades (experimental).\\n\\nNames of interesting traces (local ids): trace-20241120-A3 (ECT4 spike with kv-miss waterfall), trace-20241120-C1 (ECT8 cluster meltdown).\\n\\nNext steps / TODOs:\\n- Re-run with dynamic_batch_timeout enabled to see if it self-corrects batch growth without manual ECT tweaks.\\n- Run same sweep with quantized model (8-bit) to see if compute vs KV latency tradeoffs change thresholds.\\n- Prototype short-request fastlane in router and measure end-to-end effect for p99 of short requests.\\n- Draft a recommendation PR for default ECT/backoff in hosted product config (target: default safe values, plus telemetry flags).\\n\\nAppendix: quick command notes (for reproducibility)\\n- qps generator: ./tools/qpsgen --pattern clustered --base 1200 --burst-mult 3 --burst-interval 60 --duration 1800 --seed 42\\n- run harness: ./harness/bench --workers 4 --threads 8 --model openchat-medium --ect 4 --backoff-ms 80 --out /tmp/ect-runs/run-ECT4-80.csv\\n\\nScratchy closing thought: defaulting to high concurrency to chase throughput feels tempting for PLG funnels but it silently kills p99 during real user bursts. Safer to bias defaults toward slightly conservative ECT and make throughput tuning explicit in Dedicated offerings.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_4471d947b8114ebab3aa7174a0446733"
+}

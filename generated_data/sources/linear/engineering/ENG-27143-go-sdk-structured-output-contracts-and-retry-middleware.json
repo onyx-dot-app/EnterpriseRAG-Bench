@@ -1,0 +1,72 @@
+{
+  "key": "ENG-27143",
+  "team": "engineering",
+  "title": "Go SDK: structured-output contracts, adapter patterns, and retry middleware for streaming",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-13",
+  "creator": "Ava Chen",
+  "assignee": "Diego Martinez",
+  "project": "sdk-unification",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "go-sdk",
+    "streaming",
+    "structured-output",
+    "retries",
+    "ergonomics"
+  ],
+  "parent_issue": [
+    "ENG-26300"
+  ],
+  "dependencies": [
+    "ENG-25412",
+    "ENG-26999"
+  ],
+  "customer_impact": "medium",
+  "release": "go-sdk-1.12",
+  "security_review_required": "false",
+  "description": "Problem: customers building production streaming handlers with the Go SDK need a predictable, typed way to decode structured outputs from models while keeping ergonomic streaming APIs and robust retry semantics for transient infra failures. Current helpers are ad-hoc and don't compose well with per-call retry policies or checkpointed resume semantics.\n\nThis ticket designs and implements a small, idiomatic Go contract layer (typed structs + decoding adapters) plus a streaming retry middleware that composes with existing client transport. Goal: make structured output decoding safe and easy to use in streaming handlers, enable transparent resumable retries for transient errors, and provide example patterns for common PII and eval workloads.",
+  "background": "Existing artifacts: prior PRs introduced generics-based decoders but left gaps: no standardized interface for \"contracts\" (validation + partial decode), no way to attach per-stream checkpoint metadata, and retry handling is either naive (replay from start) or left to integrators. We need an SDK-level primitive that: (1) decodes incremental chunks into typed domain structs, (2) exposes checkpoints (cursor/token) that allow server-side resume or best-effort replay, and (3) hooks into a retry middleware that replays only missing tail events where safe.",
+  "acceptance_criteria": "1) New Contract[T any] interface implemented and documented.\n2) Adapter and Decoder helpers that let users define typed structs and incremental decoders with <=3 lines of wiring.\n3) Streaming retry middleware that can be enabled per-call and demonstrably retries on transient network/gRPC errors without duplicating already-consumed events when model provides checkpoints.\n4) Unit tests covering decoder edge cases, validation failures, and retry windows.\n5) Integration example: ticket includes a sample app that decodes `SearchResult` streaming messages with checkpoint resume and is added to examples/streaming/ in the repo.\n6) Backwards compatible: existing streaming API surface remains available with opt-in for the new middleware/adapters.",
+  "proposed_solution": "High-level design:\n- Introduce Contract[T any] with methods: FromFragment(fragment []byte) (T, bool, error) // returns typed object when fragment completes, bool for 'complete'\n  and Checkpoint() string // opaque resume token if available.\n- Provide a Decoder[T] concrete type: holds a streaming buffer, incremental JSON/tokenizer, and Validate(T) error hook. Exposes Next() (T, error) which returns typed items as they become available.\n- Adapter[T] builder: NewAdapter[T](contract ContractFactory[T], opts...) which returns a streaming handler func(ctx, stream) that decodes and sends typed items to a user-supplied callback.\n- Middleware: RetryMiddleware that wraps transport streams and tracks last acknowledged checkpoint returned by the Contract. On transient error, it will re-OPEN a new stream and send a small resume hint (checkpoint token), allowing server to fast-forward. If no checkpoint available or server does not support resume, middleware falls back to exponential-replay with deduplication by caller-supplied idempotency token.\n- Opt-in per-call config: StreamingOptions{EnableResume:true, MaxRetryWindow:30s, IdempotencyToken: \"\"}.\n\nTradeoffs considered:\n- Server-side resume capability is ideal; when unavailable we must replay. Using idempotency tokens is safest but requires user-side dedupe on the consumer.\n- Unit-of-work boundaries: prefer conservative (replay few events) to avoid exposing misordered semantics.\n- Complexity: keep public API surface small; hide tokenizer details behind Decoder.",
+  "technical_notes": "Implementation details and patterns:\n- Decoder uses encoding/json.Decoder + buffered bytes.Reader for streaming JSON lines and for mixed token streams. For models that return partial JSON objects across chunks, Decoder accumulates fragments until a full object parse succeeds.\n- ContractFactory[T] is just func() Contract[T], allowing stateful per-stream contracts (e.g., for accumulating multi-chunk objects).\n- Checkpoint token is defined as base64(JSON{offset:int, sequence:int, sha256:string}) so it is opaque but verifiable on resume.\n- Retry policy hooks into transport error classification (transient: deadline/connection reset/50x). Non-transient errors bubble to client.\n- Backpressure: Decoder exposes a channel and a configurable buffer size. If user callback is slow, middleware will apply client-side flow control by pausing read pump to reduce memory pressure.\n- Thread-safety: Decoder instances are NOT safe for concurrent Next() calls; library will document single-reader constraint.\n\nExample snippet (illustrative):\n\npackage examples\n\n// SearchResult represents the typed structured output the model emits.\ntype SearchResult struct {\n  ID string `json:\"id\"`\n  Score float64 `json:\"score\"`\n  Snippet string `json:\"snippet\"`\n}\n\n// Contract impl (simplified)\ntype searchContract struct {buf bytes.Buffer}\nfunc (c *searchContract) FromFragment(f []byte) (SearchResult, bool, error) {\n  c.buf.Write(f)\n  var s SearchResult\n  dec := json.NewDecoder(&c.buf)\n  if err := dec.Decode(&s); err == io.EOF {\n    return SearchResult{}, false, nil // not complete\n  } else if err != nil {\n    return SearchResult{}, false, err\n  }\n  // compact buffer: drop consumed bytes (implementation detail)\n  return s, true, nil\n}\nfunc (c *searchContract) Checkpoint() string { return computeCheckpoint( /* ... */) }\n\n// Wiring in user code:\n// adapter := sdk.NewAdapter(func() sdk.Contract[SearchResult] { return &searchContract{} }, sdk.StreamingOptions{EnableResume:true})\n// err := adapter.Handle(ctx, stream, func(item SearchResult) error { store(item); return nil })\n",
+  "api_examples": "1) Minimal adapter usage:\n- NewAdapter usage with typed callback and automatic retries:\n  adapter := sdk.NewAdapter(func() sdk.Contract[SearchResult] { return &searchContract{} }, sdk.StreamingOptions{EnableResume:true, MaxRetryWindow:\"30s\"})\n  err := adapter.Handle(ctx, stream, func(item SearchResult) error { fmt.Println(item.ID); return nil })\n\n2) Explicit Decoder usage for advanced cases:\n  dec := sdk.NewDecoder[SearchResult](contractFactory(), sdk.DecoderOptions{BufSize: 16*1024})\n  for {\n    item, err := dec.Next(ctx)\n    if err == io.EOF { break }\n    if err != nil { return err }\n    // validate + process\n  }\n",
+  "rollout_plan": "1) Merge behind feature flag `go-sdk.streaming.resume` and default OFF.\n2) Enable for internal canary (redwood-internal org) and run example app for 48h.\n3) Collect telemetry on resume success rate, duplicate deliveries, and memory usage.\n4) If metrics look good, flip default to ON in go-sdk-1.12.\n5) Publish migration guide and examples in the docs site.\n\nRisk mitigation: expose toggles for MaxRetryWindow and IdempotencyToken to quickly disable resume logic if we observe duplicates.",
+  "test_plan": "Unit tests:\n- Decoder: fragmented JSON across many small []byte slices.\n- Contract validation failures: malformed payloads should return validation errors and stop stream if user config says so.\n- Checkpoint encoding/decoding roundtrip.\n- RetryMiddleware: simulate transient network termination mid-stream and assert that resumed stream starts at checkpoint and no duplicate items delivered when server supports resume.\n\nIntegration tests:\n- end-to-end example with in-memory mock server that supports resume tokens.\n- fallback replay path test: mock server that DOES NOT support resume; assert idempotency-dedupe handles duplicates.\n\nPerformance tests:\n- memory high-throughput: 1k small objects/sec for 5 minutes, ensure <200MB heap for decoder buffer default sizes.\n",
+  "monitoring": "Metrics to add:\n- sdk.stream.decoder.fragments_received (counter)\n- sdk.stream.decoder.objects_emitted (counter)\n- sdk.stream.retry.attempts (counter, labeled by reason)\n- sdk.stream.resume.success_rate (gauge/ratio)\n- sdk.stream.duplicates.detected (counter)\nAdd logs at INFO for resume attempts and at WARN when dedupe fallback triggers.",
+  "pr_links": [
+    "https://github.com/redwood-inference/go-sdk/pull/1724",
+    "https://github.com/redwood-inference/go-sdk/pull/1731"
+  ],
+  "related_docs": [
+    "confluence/redwood/sdk/streaming-contracts",
+    "docs/examples/streaming/checkpoint-resume.md",
+    "design/streaming-retry-strategy.md"
+  ],
+  "comments": [
+    "2026-03-02 - Ava Chen: Initial design outlined in meeting notes. Decided on opaque base64 checkpoint tokens so we have freedom to change internals without breaking clients.",
+    "2026-03-04 - Diego Martinez: Implemented prototype Decoder and ContractFactory. Found edge case with partial numeric tokens across chunk boundaries; using encoding/json.Decoder solves it mostly but added additional buffering to handle truncated UTF-8 sequences.",
+    "2026-03-06 - Priya Rao (PM): Please ensure example demonstrates behavior when server doesn't support resume and when dedupe token is required. Also add clear docs on eventual duplicate delivery semantics.",
+    "2026-03-08 - Diego Martinez: Added RetryMiddleware and a mock server that understands `Resume-Checkpoint` header. Local tests show 93% resume success on simulated transient errors. Still tuning backpressure behavior.",
+    "2026-03-11 - Security Review (notes): No sensitive keys in checkpoint tokens; tokens are HMAC'd with service key. We should still run a short crypto review but low risk. Marking security_review_required=false for the ticket because review is operational and already done.",
+    "2026-03-13 - Ava Chen: Added integration example to examples/streaming/search-resume. Preparing PRs. Next: run internal canary and collect telemetry for one week."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "background",
+    "acceptance_criteria",
+    "proposed_solution",
+    "technical_notes",
+    "api_examples",
+    "rollout_plan",
+    "test_plan",
+    "monitoring",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_05ae23aecacd4c3ab00743d7a36ae1bf"
+}

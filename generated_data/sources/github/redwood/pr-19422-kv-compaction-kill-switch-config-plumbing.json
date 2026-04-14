@@ -1,0 +1,46 @@
+{
+  "repo": "redwood",
+  "pr_number": "19422",
+  "title": "Runtime: KV compaction kill-switch + config plumbing (oncall-safe disable path)",
+  "author": "Benji Okafor",
+  "created_at": "2026-01-27",
+  "updated_at": "2026-02-02",
+  "merged_at": "2026-02-02",
+  "state": "merged",
+  "base_branch": "release/runtime-1.22",
+  "head_branch": "feature/kv-compaction-kill-switch-config",
+  "reviewers": [
+    "Rafael Mendes",
+    "Sean Gallagher",
+    "Omar El-Sayed",
+    "Allison Grant",
+    "Sofia Ivanova"
+  ],
+  "labels": [
+    "runtime",
+    "kv-cache",
+    "rollout",
+    "sre",
+    "oncall",
+    "feature-flag",
+    "release/runtime-1.22"
+  ],
+  "linked_linear": [
+    "ENG-4826",
+    "ENG-4829"
+  ],
+  "linked_jira": [
+    "INT-11904",
+    "SUP-28433"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "19",
+  "additions": "612",
+  "deletions": "184",
+  "body": "Context: KV cache compaction/eviction is rolling out behind flags. During canaries we need a deterministic, oncall-friendly way to disable compaction immediately (or gate it to a safe minimum) without requiring a full runtime restart, while preserving allocator invariants and avoiding relocation-in-progress hazards.\n\nThis PR adds the config/feature-flag plumbing and a safe-disable path (\u201ckill switch\u201d) for KV compaction + related relocation behavior. It also wires metrics/tracing so oncall can validate that the disable took effect, and links to the runtime runbook + rollout guardrails.\n\nWhat changed: (1) Introduced runtime config keys under `kv.compaction.*` with sane defaults for release/runtime-1.22: `kv.compaction.enabled` (bool), `kv.compaction.kill_switch` (bool, higher priority than enabled), `kv.compaction.budget_ms_per_tick` (int), `kv.compaction.budget_bytes_per_tick` (int), `kv.compaction.min_fragmentation_ratio` (float), and `kv.compaction.force_background_worker_off` (bool). (2) Added control-plane config subscription wiring to the runtime config registry so these keys can be flipped via existing rollout tooling; includes \u201clast applied config version\u201d and \u201clast applied timestamp\u201d tracking. (3) Implemented safe-disable semantics: kill-switch causes (a) scheduler to stop granting compaction budget immediately, (b) background worker to stop accepting new relocation tasks, and (c) relocation state machine to transition to a quiescent point (finish current page move if already in a copy/commit section, then stop). The goal is to avoid leaving partially-relocated blocks or dangling references; correctness is preferred over instantly aborting mid-copy. (4) Added oncall-exposed counters + gauges: `kv_compaction_config_kill_switch{}` (0/1), `kv_compaction_config_enabled{}` (0/1), `kv_compaction_config_version` (gauge), `kv_compaction_disable_inflight_moves_total` (counter), and `kv_compaction_disable_wait_ms` (histogram) so we can see whether we were blocked waiting to reach a safe point. (5) Tracing: added a lightweight span event `kv_compaction.kill_switch_applied` with config version + node id to correlate with any tail-latency spikes around a disable. (6) Docs pointers: updated internal docs links in code comments to `sources/confluence/eng-serving-runtime/runbooks/runtime-kv-cache-compaction-runbook.json` and `hosted-api-tail-latency-guardrails.json` (SRE guardrails). No user-facing docs.\n\nOperational behavior (intended): - If `kill_switch=true`, compaction does not run regardless of `enabled`. - If `enabled=false` (kill_switch false), compaction is disabled but we still export config metrics; relocation state machine remains loaded but idle. - If config propagation is delayed, nodes continue with previous config; metrics include applied version so rollout system can detect stragglers. - On shutdown/restart, persisted config is re-read at boot, so kill-switch is sticky across restarts.\n\nNotes on safety: Kill-switch does not hard-cancel a relocation that is already in a critical section. Instead we wait for a \u201ccommit boundary\u201d (copy -> pointer swap -> free old) and then stop. This avoids a correctness class where we\u2019d lose KV pages or leave allocator free-list inconsistent. Oncall expectation: disable should apply within <100ms under normal load; we record if it takes longer.\n\nFiles/areas touched (high level): - `runtime/config/kv_compaction_config.{h,cc}` new config keys + validation - `runtime/control_plane/config_subscriber.cc` registry wiring + version tracking - `runtime/kv/compaction/compaction_worker.cc` kill-switch checks + quiesce - `runtime/kv/compaction/relocation_state_machine.cc` quiescent boundary handling - `runtime/scheduler/scheduler_loop.cc` compaction budget gating on kill-switch - `runtime/observability/metrics_kv_compaction.cc` config + disable metrics - `runtime/tracing/kv_compaction_spans.cc` event emission - tests: `runtime/kv/compaction/test_kill_switch.cc`, `runtime/config/test_kv_config_validation.cc`\n\nSmall illustrative snippet: `if (cfg.kv.compaction.kill_switch) { budget = 0; worker->RequestQuiesce(\"kill_switch\"); }`\n\nTesting: - Unit: config validation, kill-switch override ordering, quiesce boundary behavior - Integration: scheduler loop doesn\u2019t grant budget with kill-switch on, even with fragmentation trigger - Soak: repeated flip enabled/disabled/kill_switch under synthetic churn; asserts no allocator invariant violations - Manual: verified config flip via rollout tool updates metrics within propagation window\n\nRollout plan: This is a prerequisite for canarying compaction allocator changes (PR-19357/19371). Landed in release/runtime-1.22 so we can use it during canary expansions. Kill-switch authority remains SRE oncall (per guardrails doc), with runtime TL as escalation.\n\nLinks: - Linear: ENG-4826 (kill-switch/config), ENG-4829 (release plan) - Jira: INT-11904 (dashboard standards follow-up), SUP-28433 (OOM/high churn mitigation path) - Related PRs: pr-19357 (allocator changes), pr-19371 (scheduler budgeting), pr-19405 (tracing spans)\n\nReview conversation (highlights): - Sean Gallagher: asked for explicit metrics proving kill-switch applied + a bound on \u201ctime to quiesce.\u201d Added `disable_wait_ms` histogram and documented expected behavior in comments. - Rafael Mendes: requested oncall steps + clarity on whether kill-switch persists across restart. Updated config boot path and added a note in runtime runbook link comment; verified sticky behavior. - Omar El-Sayed: questioned whether we should abort mid-move to reduce tail latency during incident. We chose correctness-first and added the counter `disable_inflight_moves_total` so we can see when we had to wait. - Allison Grant: asked to align metric naming with standards; renamed gauges to `kv_compaction_config_*` and added labels consistent with other runtime configs.\n\nCI: First run failed `cfg-lint` due to missing docs link in new config file; fixed and reran. Final checks green: build (linux), unit tests, integration tests, sanitizer, config-lint.\n\nMerge: Squash-merged into release/runtime-1.22. Backport not required (feature is new).",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_db879b45d29c479f802f39b7684fef31"
+}

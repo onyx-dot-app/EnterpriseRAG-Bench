@@ -1,0 +1,89 @@
+{
+  "key": "ENG-52640",
+  "team": "engineering",
+  "title": "Investigate scanline memory oscillation caused by continuous batching + KV prefetch interplay",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-27",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Raman",
+  "assignee": "Marco Liu",
+  "project": "runtime-memory-stability",
+  "cycle": "2026-W09",
+  "estimate": "5",
+  "labels": [
+    "cuda",
+    "memory",
+    "kv-cache",
+    "continuous-batching",
+    "investigation",
+    "hotfix"
+  ],
+  "description": "Summary: Intermittent GPU memory oscillation and slow leak-like growth observed under continuous batching when KV cache prefetching is enabled. Symptoms surface after prolonged runs (~30\u201390 minutes) with mixed sequence lengths and heavy prefix reuse. This ticket tracks root-cause analysis, non-disruptive mitigations, and a considered allocator/stream sync approach for runtime-1.22.",
+  "steps_to_reproduce": [
+    "Deploy runtime-1.21 with KV prefetch enabled and continuous batching policy (max_batch 64, latency SLO 120ms)",
+    "Use a workload with 70% short prompts (<=64 tokens) and 30% long prompts (>=1024 tokens) arriving with Poisson inter-arrival (lambda tuned to saturate tail GPUs)",
+    "Enable KV cache warmup (prefetch ahead of generation by 2 tokens) and allow asynchronous host-pinned staging to be used for k/v shard transfers",
+    "Observe memory over 60\u2013120 minutes using our gpu-memtrace dashboard and collect per-stream allocation traces (cudaMallocAsync/Free events)"
+  ],
+  "observed_behavior": "GPU resident memory shows periodic oscillations: sharp climbs during mixed long batch merges and slow partial declines after free waves. Over time we see increased arena residency: cudaMallocAsync falls back to creating new device arenas rather than reusing freed blocks. Pinned host staging also grows transiently on high-prefetch workloads, and peak residency spikes coincide with long-sequence merges and KV eviction events.",
+  "expected_behavior": "Transient increases during peak merging should return to a stable baseline; cudaMallocAsync should reuse freed blocks across streams and arena churn should be minimal. Pinned host staging should be reclaimed promptly and not grow unbounded under steady-state traffic.",
+  "experiments": [
+    "A: Disabled KV prefetch entirely -> memory oscillation vanished in 3/3 runs (baseline stable)",
+    "B: Forced stream synchronization after each KV prefetch (cudaStreamSynchronize) -> peak reduced but end-to-end latency violated SLOs by ~20%",
+    "C: Increased cudaMallocAsync release threshold via mempool tuning (reclaim aggression) -> lowered arena count but increased fragmentation and sporadic OOMs under long tails",
+    "D: Introduced 'deferred free wave' batching (coalesce frees to a dedicated background stream) -> reduced cross-stream quarantine, improved reuse, but noticed transient pinned host staging surges",
+    "E: Added async-page-unmap for host-pinned staging after N seconds idle -> host staging growth flattened and KV prefetch retained benefit"
+  ],
+  "analysis": "Root hypothesis: Interaction between continuous batching's coalesced long sequences and concurrent KV prefetch creates a timing window where allocations for KV prefetch and generation merge on different streams. cudaMallocAsync maintains per-stream arenas and a quarantine period for recently freed blocks; because frees and subsequent allocs occur on different streams, the allocator sometimes refuses immediate reuse, causing it to allocate new arenas. Over repeated cycles the allocator scatters small residual allocations across arenas, increasing fragmentation and illusion of leak. Additionally, host-pinned staging used for KV transfers accumulates when deferred unmap logic isn't aggressive enough for high-prefetch patterns.",
+  "actions_taken": [
+    "Instrumented per-stream arena metrics and added tracepoints for 'free_on_stream' vs 'alloc_on_stream' (PR: https://github.com/redwood-inference/runtime/pull/8321)",
+    "Temporarily disabled prefetched-KV host staging in canary to validate effect on production tenants (canary id: canary-memory-stab-03)",
+    "Implemented deferred-free wave on a dedicated 'reclaim' stream in local branch for experiment (branch: feature/reclaim-wave-52640)",
+    "Created dashboard tile showing arena count, fragmentation ratio (largest_free/total), pinned-host-staging bytes, and per-stream pending frees"
+  ],
+  "results": "- PR instrumentation shows >60% of new allocations happening on streams that do not match the streams where frees occurred in peak windows.\n- Deferred free-wave reduces cross-stream allocation misses by ~45% and peak arena count by ~30% in synthetic replay.\n- Aggressive mempool release reduces residency but increases fragmentation; unacceptable for mixed workloads.\n- Host staging deferred-unmap tweak flattened host-staging growth by ~70% with negligible perf regression.",
+  "links": [
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/INF/pages/32412/scanline-memory-oscillation",
+    "PR (instrumentation): https://github.com/redwood-inference/runtime/pull/8321",
+    "PR (deferred-free-wave): https://github.com/redwood-inference/runtime/pull/8347",
+    "Dashboard: https://grafana.redwood.company/d/mem/arena-and-staging?var=canary-memory-stab-03",
+    "Repro script: https://gitlab.redwood.internal/runtime-tests/-/blob/main/repros/scanline_oscillation_repro.py"
+  ],
+  "mitigations": [
+    "Ship deferred-free-wave on reclaim stream behind runtime flag (runtime.flag.experimental.reclaim_wave) to canary tenants",
+    "Add short-term KV prefetch backoff for streams that exhibit >N pending frees to avoid contention windows",
+    "Expose host-staging unmap timeout config to ops and default to lower timeout in runtime-1.22 canary",
+    "Add allocator metrics to SLA alerts so we can auto-roll back flag if arena count crosses threshold"
+  ],
+  "long_term_proposals": [
+    "1) Stream-aware allocator: extend allocator to honor stream affinity and allow immediate reuse when cross-stream synchronization is detected without expensive cudaStreamSynchronize calls",
+    "2) Cross-stream free handoff: allow a fast-path that trades an atomic pointer between streams to avoid quarantine-induced allocation of new arenas",
+    "3) KV prefetch scheduling: make prefetch scheduling workload-aware so we avoid simultaneous prefetches that overlap with long-sequence merges",
+    "4) Smarter host staging lifecycle: asynchronous unmap that batches unmaps and supports early hinting based on workload turbulence"
+  ],
+  "next_steps": [
+    "Roll out deferred-free-wave behind flag to 5% of canaries (owner: Marco Liu) \u2014 target: 2026-03-15",
+    "Monitor arena count and fragmentation for 72 hours; collect traces for any regressions (dashboard watchers: infra-oncall, perf-team)",
+    "Prototype cross-stream free handoff (spike) and measure allocation miss rate delta (owner: Kunal Verma) \u2014 1 week spike",
+    "Finalize runtime config knobs for host-staging unmap timeout and document operational guidelines (owner: Eva Thompson)"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "experiments",
+    "analysis",
+    "actions_taken",
+    "results",
+    "mitigations",
+    "long_term_proposals",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_78082963cecd46209efff468d099b2b4"
+}

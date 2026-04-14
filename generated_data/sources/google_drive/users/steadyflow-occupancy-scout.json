@@ -1,0 +1,34 @@
+{
+  "title": "Steadyflow occupancy scout \u2014 intermittent throughput regression",
+  "owner": "Riley Chen",
+  "drive_area": "users",
+  "path": "users/steadyflow-occupancy-scout.json",
+  "doc_type": "doc",
+  "created_at": "2025-01-14",
+  "last_modified": "2025-02-02",
+  "collaborators": [
+    "Samir Gupta",
+    "Maya Torres"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "throughput",
+    "continuous-batching",
+    "occupancy",
+    "kv-cache",
+    "regression",
+    "investigation"
+  ],
+  "linked_artifacts": [
+    "JIRA: INF-2048",
+    "https://github.com/redwood-inference/serving-runtime/pull/3281",
+    "https://redwood.slack.com/archives/C01234567/p1700000000000"
+  ],
+  "content": "Context:\n- Intermittent throughput drop observed on steadyflow pool (pool-id=sf-04) since 2025-01-12 deploy. Baseline 20K tokens/s -> drops to ~9\u201311K tokens/s for 10\u201330 minute windows, then recovers. No OOMs reported. CPU on host is stable. GPU utilization dips from 92% -> 35% during incidents.\n\nHigh-level goal:\n- Capture a reproducible trigger or at least reliable detection heuristics.\n- Narrow to continuous-batching config or KV-cache interaction.\n\nQuick observations from dashboards:\n- Prefill_latency.p50 increases slightly (~5\u201310ms) before drop; prefill_latency.p95 spikes coincide with throughput dips.\n- Active_requests count on router stays constant; queue depth on worker increases a bit (but not to throttling limits).\n- KV-cache hit rate falls ~6% during incidents.\n\nHypotheses (ranked):\n1) Continuous-batcher window drift + occupancy hysteresis: batch windows shift so many partially-filled windows are sent -> lower throughput under same concurrency.\n2) KV cache eviction thrash when sequence length distribution changes -> more prefill work per request -> runtime enters smaller micro-batches.\n3) Slow-to-wake worker (slab allocator state) causing temporary slot starvation -> reduces batching aggregation.\n4) Autoscaling/capacity bleed (containers marked draining) -> routing to fewer workers with cold caches.\n\nCommands / probes I ran (timestamps local):\n- Collected live batch histograms on node t2-worker-08: curl -s http://t2-worker-08:9090/metrics | grep batch_window_size -> saw bimodal: 1 and 8 token windows during dip (2025-01-15T14:03).\n- Dumped KV cache stats: curl -s http://t2-worker-08:9090/debug/kvstats -> hits 87%, misses 13% baseline; during dip 80/20.\n- Triggered microtrace on runtime: /opt/ri/bin/trace-capture --duration 120s --filter=\\\"batch,kvcache,prefill\\\" -> collected trace file /tmp/trace-sf-14-01-15.pb.\n- Replayed request set locally with envoy proxy to mimic latency distribution: python tools/replay_trace.py --trace /tmp/trace-sf-14-01-15.pb --concurrency 32 -> saw throughput collapse locally when prefill latencies hit p95>120ms.\n\nSnippets from logs (redacted):\n- 2025-01-15T14:02:33Z [serving-runtime] WARN batcher: window_expansion: occupancy=0.27 window_ms=5 -> flush_count=9\n- 2025-01-15T14:02:37Z [kv-cache] INFO eviction: evicting 256 entries score=0.12\n- 2025-01-15T14:02:40Z [serving-runtime] WARN slot_manager: slot-starvation-detected tid=0x7f3b  free_slots=2 inflight=30\n\nWhat looks odd:\n- batcher log: 'occupancy=0.27' repeatedly for ~3 minutes, while overall inflight requests unchanged. Suggests many small windows being flushed early.\n- eviction bursts align with occupancy dips. Could be correlated (eviction causes more prefill work -> windows shrink) but direction unknown.\n\nQuick experiments to run (next):\n- Add a short-lived feature flag to slow down eviction bursts: kv_cache.eviction_aggressiveness -> 0.8 for a minute on pool sf-04. Watch throughput/kv-hit. (Risk: memory growth).\n- Force batcher to use fixed-window mode for 5 min: batcher.mode=fixed_window_ms=8 -> see if occupancy stabilizes.\n- Deploy a debug build with additional sampler logging for batch_window_selection (10% sampling) to collect richer traces without full perf impact.\n\nRepro recipe (best-effort, low-risk):\n1) On staging pool mimic traffic: use replay_trace.py with original inter-arrival times but punch a synthetic spike in sequence lengths (25% of requests with long sequences).\n2) Observe KV cache hit rate and batch window distribution.\n3) Toggle eviction aggressiveness and fixed-window mode.\n\nNotes / sticky points:\n- The problem tends to appear on pools running with compact-kv quantization profile. Haven't reproduced on FP16 pools yet. Suspect memory layout/eviction thresholds differ by profile.\n- Autoscaler logs show scale events ~1m before several incidents, but not always. Need to cross-check router decisions (maybe transient draining).\n- There is an open PR (#3281) that touched batcher heuristics; landed exactly at deploy time. Might be a red herring but deserves review.\n\nImmediate actionable checklist (owner: Riley / ping Samir):\n- [ ] Add ephemeral flag for kv eviction throttle on sf-04 (Samir to sign off DB mem risk).\n- [ ] Roll batcher to fixed-window for canary subset (Riley).\n- [ ] Correlate scheduler/container drain events with incidents (Maya).\n- [ ] Attach collected trace /tmp/trace-sf-14-01-15.pb to JIRA INF-2048.\n- [ ] If fixed-window removes regression, revert fix in PR #3281 and add unit test for occupancy hysteresis.\n\nQuestions for triage meeting:\n- Is there a way to surface a per-pool \"occupancy score\" alert (p95 of occupancy < 0.4 for 5m) without creating noise?\n- Should we prefer KV cache hysteresis (temporary holdback on eviction) over batcher conservative behaviour? Which is lower-risk for customer workloads?\n\nMisc scratch ideas (brain dump):\n- Add a lightweight servo that increases window_ms when kv-hit-rate drops below threshold, to allow more aggregation.\n- Maintain a short-term ring buffer of recent window sizes and use exponential smoothing to avoid flip-flopping.\n- Consider a tiny randomized jitter to eviction timestamps to avoid synchronized eviction storms across replicas.\n\nAttachments / artifacts to include in ticket:\n- /tmp/trace-sf-14-01-15.pb (trace capture)\n- small replay trace: /tmp/replay-short-sf.pb\n- grafana snapshot id: gfsnap-20250115-1405\n\nUnresolved threads / follow-ups:\n- Confirm if quantized pools use a different cache eviction policy (MAYA to confirm with infra team).\n- Ask release-eng whether PR #3281 was rolled back in any clusters during emergency mitigation window.\n\nNotes to self: log more context in future captures: include env vars (BATCHER_MAX_WINDOW_MS, KV_MAX_ENTRIES), heap usage snapshot and kernel slab stats.\n\nEnd of scratchpad.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_cd7ae293faa24e54bf1e0017de4014dc"
+}

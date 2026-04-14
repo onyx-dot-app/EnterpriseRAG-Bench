@@ -1,0 +1,62 @@
+{
+  "repo": "redwood",
+  "pr_number": "523999",
+  "title": "kv-slot-batcher: reserve adapter for lightweight slot batching and prefetch steering",
+  "author": "Maya Chen",
+  "created_at": "2025-01-18",
+  "updated_at": "2025-01-22",
+  "merged_at": "2025-01-22",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/kv-slot-batcher-reserve-adapter",
+  "reviewers": [
+    "Ravi Patel",
+    "Sofia Garc\u00eda",
+    "Liam O'Neill"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kv-cache",
+    "batching"
+  ],
+  "linked_linear": [
+    "ENG-2217",
+    "ENG-2334"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "8",
+  "additions": "642",
+  "deletions": "198",
+  "release_notes": "Introduce a lightweight reserve adapter that batches small KV slot reservations and supplies prefetch steering hints to the prefetcher. Improves median latency under high-concurrency workloads and reduces per-token CPU overhead. No API/compatibility changes.",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "commits": [
+    "92f3a4c: introduce ReserveAdapter and SlotBatcher core primitives",
+    "b7d8c21: integrate adapter with kv_cache::reserve_path and scheduler hints",
+    "e4a1d07: add unit + microbench harness for slot batching and prefetch steer",
+    "f1c2b90: tweak eviction fastpath to honor soft-lease counters",
+    "0a9d3fe: docs: add design notes and config knobs"
+  ],
+  "changed_files": [
+    "src/runtime/kv_cache/reserve_adapter.rs",
+    "src/runtime/kv_cache/mod.rs",
+    "src/runtime/block_manager/slot_batcher.rs",
+    "src/runtime/prefetch/prefetcher.rs",
+    "src/runtime/scheduler/hint_router.rs",
+    "tests/microbench/kv_slot_batcher.rs",
+    "docs/design/kv-slot-batcher.md",
+    "Cargo.toml"
+  ],
+  "body": "Problem: Small, concurrent KV cache reservations for short-context workloads generate many tiny allocations and scheduler handoffs, which increases per-request CPU overhead and creates noisy eviction churn. On high-concurrency generation workloads (many short prompts with streaming), we observed ~18% p50 latency regression and higher tail jitter due to reservation contention and immediate prefetches for marginally useful slots.\n\nGoals: Reduce per-reservation overhead, aggregate small reservations to amortize synchronization, and provide lightweight steering hints to the prefetcher so it focuses on likely hot slots. All changes must be backward compatible with existing slot ownership semantics and respect existing pin/eviction guarantees.\n\nWhat this PR does:\n- Introduces a ReserveAdapter abstraction that sits between caller code (kv_cache::reserve_path) and the underlying block/slot allocator. The adapter performs short-lived aggregation of reservation requests into SlotBatches, holding reservations in a cheap local pool for O(1-5ms) to improve reuse and coalescing.\n- Adds a SlotBatcher implementation (slot_batcher.rs) that groups reservations by affinity key (model+request bucket) and sequence length bucket to maximize locality. Batches are size-capped and flushed on a combination of time and backpressure thresholds.\n- Adds prefetch steering hooks: the adapter emits lightweight, best-effort steering hints to the prefetcher (prefetcher.rs) so the prefetcher prioritizes batches with higher reuse probability. Hints are advisory; no correctness depends on them.\n- Soft-lease counters: rather than hard-pinning on reservation, we introduce a soft-lease counter that allows the eviction fastpath to be aware of recent adapter activity and avoid immediately reclaiming freshly-batched slots. This avoids eviction ping-pong on workloads with rapid reuse.\n- Scheduler integration: hint_router.rs consumes adapter hints and maps them to scheduler priorities when routing requests to serving pools. This reduces head-of-line blocking for high-locality batches.\n- Tests and microbench: added a microbench harness that simulates 1000 concurrent short prompts to validate latency and throughput improvements and new unit tests for the adapter lifecycle.\n\nDesign notes and tradeoffs:\n- The ReserveAdapter is intentionally lightweight: it retains reservations only for a short dwell period to increase reuse without violating observable semantics. If a reservation is not reused within the dwell window, it's flushed to the allocator as before. This avoids long-lived implicit pins.\n- Batching uses affinity keys to maintain strong locality; affinity keys are coarse (model + bucket) to avoid over-sharding.\n- Steering hints are lossy and non-authoritative: they only influence prefetch ordering. If the prefetcher is disabled the system still functions identically to today.\n- We intentionally avoid adding additional persistent metadata to the block header to keep on-disk compatibility intact. All adapter state is in-memory and ephemeral.\n\nBenchmark results (local perf lab, p95 runs):\n- Baseline: 1000 concurrent short-stream requests, p50 latency 18.4ms, throughput 9.4k tokens/s, CPU 78%\n- With ReserveAdapter: p50 latency 15.1ms (-18%), throughput 10.8k tokens/s (+15%), CPU 66% (-15% CPU), tail jitter reduced (p99 / p50 ratio improved ~22%)\n- Memory: transient adapter overhead ~1.5MB per serving worker under test config; configurable via adapter.max_memory_bytes.\n\nChecklist (both checked in code where applicable):\n- [x] Unit tests for adapter lifecycle and batch flush semantics\n- [x] Microbench harness reproducing high-concurrency short-context workload\n- [x] CI integration: lint, unit, integration microbench step\n- [x] Config knobs and defaults exposed via runtime config with safe conservative defaults\n- [x] Design doc: docs/design/kv-slot-batcher.md\n\nFiles changed (high-level):\n- src/runtime/kv_cache/reserve_adapter.rs: new core. Contains ReserveAdapter, lightweight timing wheel, and metrics emission.\n- src/runtime/block_manager/slot_batcher.rs: new batching policy, capacity accounting, and flush logic.\n- src/runtime/prefetch/prefetcher.rs: accept optional advisory steering hints; small reordering logic.\n- src/runtime/scheduler/hint_router.rs: minor router extension to map hints to priority lanes.\n- src/runtime/kv_cache/mod.rs: wiring into existing reserve_path entrypoint and config knobs.\n- tests/microbench/kv_slot_batcher.rs: harness and reproducible scenarios.\n- docs/design/kv-slot-batcher.md: rationale, knobs, and perf numbers.\n- Cargo.toml: added small dev-dep for bench harness.\n\nReview conversation (high-level chronology):\n- Ravi: \"Nice clean separation. Two requests: (1) can we make the dwell window configurable per-pool? (2) please add a metric for 'batched_reserve_hit_rate' so we can SLO on expected reuse.\"\n  - Maya: \"Added pool-level dwell window (config + safe default) and a new metric 'kv.reserve_adapter.batch_hit_ratio' exposed via metrics crate. See last commit e4a1d07.\"\n- Sofia: \"Concern about eviction interaction: if batches keep slots alive, will this starve other tenants?\"\n  - Maya: \"Adapter uses soft-lease counters with max_soft_lease_ms; eviction code checks combined hard pins + soft_lease and falls back to reclamation under memory pressure. I added comments and a unit test validating reclamation under forced pressure.\"\n- Liam: \"Microbench was convincing. Can we add a short integration test that runs the hint path through the scheduler to ensure no regressions?\"\n  - Maya: \"Added a scheduler routing smoke test in microbench. It exercises hint->router->pool path.\"\n- Ravi (approve): \"LGTM after docs update\"\n- Sofia (approve): \"Verified on perf lab, merging after CI passes\"\n\nCI: All checks passed (lint, unit, integration microbench using perf-canary harness). No flaky runs in the observed CI window.\n\nFollow-ups and future work:\n- Explore adaptive dwell window based on measured reuse heat (ENG-2334).\n- Consider exposing per-model affinity tuning via config center for large customers.\n- Longer-term: merge steering hints with predictive prefetch models in prefetcher v2.\n\nNotes: This change targets runtime performance and is safe for release without customer-facing API changes. Ops: rollout plan is a staged flag rollout (off by default), enable for a subset of serving pools, validate metrics, then flip globally if stable.\n\nRelated resources: Linear ENG-2217 (kv reservation batching), ENG-2334 (prefetch steering followup). Design doc: docs/design/kv-slot-batcher.md (included in this PR).",
+  "tags": [
+    "perf-lab-verified",
+    "non-user-facing"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_b0b7075d84264834984b89c82444e47b"
+}

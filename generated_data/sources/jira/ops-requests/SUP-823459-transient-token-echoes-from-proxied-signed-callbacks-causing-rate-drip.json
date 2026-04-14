@@ -1,0 +1,76 @@
+{
+  "key": "SUP-823459",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Intermittent 429s during mixed keepalive + signed-callback workflow; apparent token \"echo\" across proxied callbacks",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Ava Chen",
+  "assignee": "Marco Alvarez",
+  "customer_company": "HeliosSearch",
+  "customer_tier": "dedicated",
+  "environment": "prod-us-west",
+  "components": [
+    "api-gateway",
+    "rate-limiter",
+    "signed-url-service",
+    "edge-proxy",
+    "serving-runtime"
+  ],
+  "labels": [
+    "throttle",
+    "signed-url",
+    "keepalive",
+    "dedicated-pool",
+    "investigation"
+  ],
+  "affected_models": [
+    "llama-3-medium",
+    "open-instruction-2B"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-12",
+  "first_response_due_at": "2026-03-11",
+  "linked_issues": [
+    "SUP-210007",
+    "SUP-712999"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/api-gateway/pull/4192"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SUPPORT/Signed+URL+Callback+Accounting+Runbook"
+  ],
+  "description": "Issue summary: HeliosSearch is seeing transient 429s in their dedicated pool during large-scale document enrichment jobs. The traffic pattern mixes long-lived streaming connections (SDK keepalive) with asynchronous signed-url callbacks to their ingest orchestrator. The customer reports 429s observed only after the callback chain completes for many documents and does not correlate directly to their token usage dashboard.\n\nImpact: Several enrichment batches (~5-10% of requests) are rejected with 429s for 10-30s intervals, causing retries and falling throughput. This is affecting nightly enrichment SLA and causing backfills to miss windows.\n\nEnvironment: Dedicated pool, prod-us-west, tenant: helios-prod, worker fleet behind a corporate edge proxy that forwards signed-callback POSTs to Redwood signed-url endpoints.\n\nSteps to reproduce (as provided by customer):\n1) Start a multiprocess batch that opens persistent SDK connections with keepalive enabled (4 concurrent persistent streams per worker).\n2) For each document, the pipeline requests a signed upload URL and immediately uploads to the object store, then calls the callback endpoint with the signed-url metadata.\n3) Callback chain fans to a separate ingestion fleet which posts back to Redwood callback endpoint (proxied through their edge) that triggers embedding generation and a short streaming chat request to the model.\n4) After several thousand callbacks, observed 429s spike for a subset of those streams; logs show rate-limiter rejects on the callback POSTs and immediately on some short streaming requests.\n\nObserved logs / headers provided:\n- X-RateLimit-Remaining: 0 (on some rejected responses)\n- x-rw-tenant-window: 60s\n- callback request shows client IPs rotating (edge nat) and a consistent API key header per tenant.\n- Edge proxy rewrites Host and adds X-Forwarded-For; occasional duplicate Content-MD5 headers observed (customer proxy bug).\n\nCustomer hypothesis: callback proxy is duplicating or re-sending callbacks under load, causing multiple accounting events for the same logical document and exhausting tenant burst credits. They also suspect keepalive sessions are keeping token windows open and misattributing refill timing.\n\nWhy this ticket is different: We've seen many 429 patterns tied to preflight and healthchecks; this case mixes signed-callback fanout, long-lived keepalives, and edge-level proxy behavior that may be producing duplicate accounting across the token-bucket shards. The customer is on a dedicated pool with custom edge; they are requesting concrete mitigation steps and whether Redwood should adjust burst pools or route affinity for signed callbacks.",
+  "comments": [
+    "2026-03-10 - Support (Ava Chen): Customer opened. Collected request IDs and sample rejected X-Request-Id headers. Asked for ingress raw tcpdump and proxy logs; customer provided sanitized proxy logs and a few packet captures.",
+    "2026-03-10 - SRE (Marco Alvarez): Noted tenant uses a single API key. Initial hypothesis: edge NAT rotation + proxy replays may create duplicate accounting when callbacks are retried by the proxy. Requesting ingestion of the tenant into a debug token-accounting trace for the suspected window (us-west-2, 2026-03-09 02:00-04:00 UTC).",
+    "2026-03-11 - Customer (Sara Patel, HeliosSearch): We observed the spike correlates to our nightly backfill process hitting ~12k callbacks/min. We see the proxy requeue on transient 5xx from our side, but Redwood rejects are the ones causing retries upstream. We attached sanitized proxy configs showing an aggressive retry policy (3 retries, no jitter).",
+    "2026-03-11 - Support (Ava Chen): Confirmed we will run a rate-accounting trace and check for duplicate preflight/POST counting and token-bucket shard attribution. Asked product if a temporary per-route isolation for callbacks can be applied for this tenant while investigating.",
+    "2026-03-12 - Product (Daniel Kim): Can enable route isolation on the dedicated pool for signed-callback path (/v1/callbacks/uploaded) as a short-term mitigation (route will use separate burst bucket). Recommending customer reduce proxy retries and add request-id dedupe in edge. Preparing rollout steps.",
+    "2026-03-12 - Support (Marco Alvarez): Found accounting trace: ~24% of callback POSTs show duplicate ingress accounting events within a 2s window with different edge IPs; many align with proxy retry timestamps. Also saw keepalive streams maintaining open windows causing refill alignment anomalies during the spike."
+  ],
+  "investigation_notes": "1) Token accounting trace pulled for tenant helios-prod (us-west-2) for the interval. Matched X-Request-Id list provided by customer to internal accounting logs.\n2) Identified duplicate accounting entries where the same callback body (hash) generated two accounting records due to edge retry and lack of dedupe key in the proxy passthrough. Both events hit different rate-limiter shards (edge sharding by source IP) and were not recognized as the same logical request, leading to double decrement of burst credits.\n3) Keepalive streams: Our refill scheduler aligns token refill per connection window. Long-lived streams + heavy callback bursts caused refill waves to be misaligned, reducing effective burst capacity during peak. Long-lived connections held partial windows that couldn't be reclaimed fast enough under the callback storm.\n4) No evidence found of server-side double-counting inside Redwood; root cause appears to be combination of (a) customer edge retry behavior causing duplicate callbacks, and (b) dedicated-pool shard alignment that treats different ingress ip as separate accounting events without cross-edge dedupe.\n5) Reproducibility: We reproduced the double-counting in a test harness by simulating proxied retries and rotating source IPs: duplicate callbacks produced multiple accounting decrements even when identical payloads were submitted within the dedupe TTL.",
+  "resolution_notes": "Short-term mitigations applied 2026-03-12:\n- Product enabled route-level burst isolation for /v1/callbacks/uploaded for helios-prod in the dedicated pool (separate burst bucket) to stop callback storms from draining main tenant burst credits. This was rolled out in two minutes with monitoring.\n- Support recommended (and customer applied) proxy config changes: reduce retries to 1, add exponential backoff with jitter, and enable request-id propagation so the proxy can dedupe at edge.\n- SRE opened an internal perf ticket to add cross-shard callback-dedupe using request-id/Content-MD5 within a short TTL (PR linked).\n\nLonger-term follow-ups (action items):\n- PR to add cross-ingress dedupe feature to the rate-limiter (linked PR: github.com/redwood-inference/rate-limiter/pull/227). Owner: Marco Alvarez. ETA: 3 sprints.\n- Evaluate token refill alignment improvements for dedicated pools with persistent connections; product will propose refill smoothing options.\n- Run post-mortem with HeliosSearch to document edge configuration recommendations and add a KB entry to the support docs: \"Mitigating callback storms with dedicated pools\".\n\nCurrent status: Route isolation mitigates immediate impact; monitoring shows rejects down to <0.2% of prior peak. Customer agreement to keep route isolation for 48 hours while we finish dedupe PR.",
+  "resolution": "Route-level isolation enabled; customer adjusted proxy retries; engineering PR created for cross-shard dedupe",
+  "notes_for_billing": "Customer requested we not bill for burst overage during the incident window (2026-03-09). Escalation to finance required. Support recommended crediting merchant for excess rejected attempts; pending finance review.",
+  "follow_up_tasks": [
+    "Add KB article for callback fanout and proxy retry guidance",
+    "Implement cross-shard dedupe in rate-limiter (PR #227)",
+    "Proposal for refill smoothing on dedicated pools"
+  ],
+  "original_location": "jira/customer-support/SUP-823459-transient-token-echoes-from-proxied-signed-callbacks-causing-rate-drip.json",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_8b8e47bfa9404bbbabf656192610d329"
+}

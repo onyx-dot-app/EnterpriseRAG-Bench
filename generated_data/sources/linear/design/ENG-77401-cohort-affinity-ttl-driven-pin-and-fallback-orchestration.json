@@ -1,0 +1,74 @@
+{
+  "key": "ENG-77401",
+  "team": "engineering",
+  "title": "Cohort-affinity TTL pinning with tier-aware fallback and canary cohort splits",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-15",
+  "updated_at": "2026-03-12",
+  "creator": "Marco Chen",
+  "assignee": "Priya Nair",
+  "project": "Routing & Rollouts",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "labels": [
+    "routing",
+    "rollout",
+    "pinning",
+    "canary",
+    "tiering",
+    "kv-cache",
+    "observability"
+  ],
+  "dependencies": [
+    "ENG-34102",
+    "ENG-35910"
+  ],
+  "release": "runtime-2.3",
+  "security_review_required": "false",
+  "customer_impact": "high",
+  "description": "Problem: We need deterministic model version pinning for cohorts (sessions/customers) that preserves canary/A-B splits while allowing graceful degradation when capacity or quality issues appear. Current pinning is session-sticky without TTL and doesn't account for tier-based fallbacks or cache warm-up, which causes large cold-cache penalties and hard-to-reproduce canary noise.\n\nGoals: \n- Provide cohort-level pinning with TTL and decay so experiments (canary/A-B) produce stable metrics but don't permanently lock traffic.\n- Support per-customer hard-pins (enterprise commitments) vs soft cohort pins (experiments).\n- Make fallback hierarchical and tier-aware (region -> tier -> variant) with predictable economics and latency SLOs.\n- Minimize KV cache churn and warm-up penalties during rollouts.\n- Enable automated adaptive-split adjustments (skew correction) when canary quality/latency deviates.\n\nDesign summary (chosen approach): \n1) Cohort assignment and pin metadata: \n   - Cohort key: deterministic hash over (customer_id || cookie_id || session_id) with configurable namespace per-route.\n   - Pin record stored in routing-store (sharded KV): {cohort_key, pinned_model_version, pin_type, pin_ts, ttl_seconds, cohort_version, cohort_hash_seed} (we store as flat fields).\n   - Pin types: HARD (enterprise-level, no automatic expire), SOFT (experiment pin, TTL with decay), TRANSIENT (per-request affinity, no storage).\n   - TTL semantics: SOFT pins include an initial TTL and an exponential decay function on re-pinning (repeated exposures extend TTL but with diminishing returns) to bound lifetime while preserving steady traffic during a rollout.\n\n2) Canary cohort splits: \n   - Rollouts configured as cohort-weighted buckets rather than pure percentage-by-request. We derive bucket weights using consistent hashing with weighted ranges so the same cohort maps to the same bucket across restarts.\n   - We implement cohort cohorts for canaries: small set of high-fidelity cohorts (e.g., internal orgs, beta customers) plus a probabilistic patient cohort for general population.\n\n3) Tier-aware fallback policy (ordered): \n   - Prefer: same-region, same-tier, pinned-version (if available).\n   - Fallback 1: same-region, lower-tier compatible variant (quantized/cheaper) if pinned unavailable or instance saturated.\n   - Fallback 2: cross-region, same-tier compatible variant within latency budget.\n   - Fallback 3: best-effort hosted variant with quality-preserving transforms (e.g., constrained max_tokens or higher temperature fallback).\n   - For HARD pins we skip automated downgrade to lower-quality variants unless manual override or emergency degrade mode is enabled.\n\n4) Soft-pin override under pressure: \n   - Soft pins are advisory; routing can temporarily route away if local capacity saturated or p99 latency > configured threshold. The system records override events (override_count, override_reason) so the pin TTL can be shortened (decay) after an override to allow subsequent cohorts to rebalance.\n\n5) Cache warm-up and KV cache considerations: \n   - To avoid cold prefix penalties, the router will do two-stage steering for newly pinned cohorts: a small fraction of their traffic is routed to the pinned model prior to full split (cache warm-up window). Warm-up size is configurable per rollout.\n   - Eviction policy for routing-store: use LRU with pin-type prioritization (HARD > SOFT > TRANSIENT). We will batch writes to the routing-store to reduce write pressure during large percent rollouts.\n\n6) Metrics and telemetry: \n   - Per-cohort and per-model-version metrics: p50/p95/p99 latency, error rate, generation quality score (where available), token-cost per request, cache-miss rate.\n   - Canary evaluation window: min requests and min unique cohorts per bucket to consider metric stable.\n   - Alerts: automatic regression detection when canary cohort quality drops by configured delta or latency increases above SLO.\n\n7) Adaptive split control: \n   - If canary shows regression (quality or latency), automated policies reduce cohort weights by multiplying canary weight by corrective factor and extend warm-up on rebalancing. The system attempts two automatic reductions before pausing rollout and paging on-call.\n\nTrade-offs considered: \n- Stateless vs stateful pinning: Stateless percentage-by-request is simpler but produces noisy cohort coverage for canaries. We chose cohort-stateful pins for reproducibility at the cost of KV-state complexity.\n- Hard vs soft pins: Hard pins protect enterprise contracts but reduce our ability to adapt under pressure. We allow explicit admin overrides and emergency degrade modes.\n- Cache warm-up increases short-term cost to prevent long-term quality noise; we added a configurable warm-up budget.\n\nImplementation plan (milestones): \n- M1 (2 weeks): Routing-store schema + KV sharding + API to read/write pin records (migration plan for existing pins).\n- M2 (2 weeks): Cohort hashing library + consistent-weighted buckets + rollout config schema changes.\n- M3 (3 weeks): Fallback engine and soft-pin override logic + override auditing events.\n- M4 (2 weeks): Warm-up steering, batched writes, LRU prioritization.\n- M5 (2 weeks): Metrics instrumentation + canary evaluation automation + alerting rules.\n- M6 (1 week): E2E tests, chaos test (simulate region outage), and staged rollout to internal orgs.\n\nRollout and migration: \n- Start by enabling SOFT pins for internal and beta cohorts only. \n- Run shadow mode (routing decisions computed but not enforced) for 1 week to validate metrics and override counts. \n- After validation, enable active routing for non-HARD cohorts on a single region, with 5% cohort coverage and warm-up staging.\n\nRollout safety and rollback criteria: \n- Immediate rollback if: canary p99 latency increases by >40% and absolute p99 > 2x configured SLO, or error rate >1% absolute increase, or quality score drift >5% with >1000 eval requests.\n- Auto-shrink if minor regressions: reduce canary weight by 50% and extend warm-up by 2x.\n\nOperational notes: \n- Console exposure: add cohort mapping view and per-cohort pin audit trail, plus admin override controls.\n- Data retention: pin audit logs retained for 90 days.\n- Cost: warm-up increases token use \u2014 include cost accounting per rollout in the Console.\n\nOpen questions: \n- How to surface model-variant semantic compatibility (we currently rely on curated compatibility matrix maintained by model onboarding).\n- TTL decay parameters: default safe values proposed but needs product sign-off.\n- Backfill strategy for existing permanent pins: convert to HARD or SOFT with migration TTL.\n\nAttached artifacts listed below.",
+  "comments": [
+    "2026-02-16 - Marco: initial design doc and trade-offs posted in Confluence (see design_docs). Requesting PM review on TTL defaults.",
+    "2026-02-20 - PM (Ellen Rodriguez): prefer conservative default TTLs; asked for admin UI to manually tag HARD pins. Added as acceptance criteria.",
+    "2026-02-25 - Design (Samir Patel): console mockups uploaded; need to show pin lineage and recent override events. Design will provide assets next sprint.",
+    "2026-02-28 - Infra review (Liu Zhang): suggested batched writes and a per-shard rate limiter for the routing-store; otherwise OK.",
+    "2026-03-03 - PR feedback (code owner Roberto Silva): refactor cohort hashing into shared-lib and add deterministic salt versioning to avoid accidental remapping during deploys.",
+    "2026-03-10 - Priya: started implementation for routing-store API; implemented read path and basic write; will add batching next week.",
+    "2026-03-12 - Marco: enabled shadow mode for internal orgs in us-west-2; collecting metrics. Initial override rate observed ~0.6% of routed requests.\n"
+  ],
+  "linked_prs": [
+    "https://github.com/redwood-inference/redwood-runtime/pull/1189",
+    "https://github.com/redwood-inference/routing-service/pull/452",
+    "https://github.com/redwood-inference/console/pull/339"
+  ],
+  "design_docs": [
+    "https://confluence.redwood.ai/display/RUNTIME/Cohort+Pinning+Design",
+    "https://confluence.redwood.ai/display/RUNTIME/Canary+Bucket+Weighting+Spec"
+  ],
+  "test_plan": "Unit tests for cohort hashing and bucket assignment, integration tests for routing-store write/read and fallback ordering, chaos test simulating regional saturation and ensuring soft-pin overrides occur and are audited. Load test to validate batched write durability under rollout traffic.",
+  "rollout_plan": "1) Shadow run for 7 days for internal and beta cohorts. 2) Enable active SOFT pins at 5% cohort coverage in us-west-2 with 1-hour warm-up. 3) Monitor for 72 hours; if stable, increase to 20% across canary cohorts. 4) Expand to other regions with staged throttling. Admins can mark cohorts as HARD to lock in enterprise commitments.",
+  "acceptance_criteria": [
+    "Routing-store correctly returns same pinned version for a cohort across restarts",
+    "Fallback ordering respects tier boundaries and records override events",
+    "Shadow mode telemetry matches simulated active routing within 1% variance",
+    "Canary evaluation automation triggers alerts on regressions and auto-shrink behavior functions as documented",
+    "Console shows cohort-to-version mapping and override audit trail"
+  ],
+  "notes": [
+    "Follow-up: implement per-route warm-up budget UI in Console (PM: Ellen)",
+    "Follow-up: add compatibility matrix automation during model onboarding to surface safe downgrade paths",
+    "Follow-up: cost-analysis job to estimate warm-up token overhead for initial rollouts"
+  ],
+  "original_location": "linear/engineering/ENG-77401-cohort-affinity-ttl-driven-pin-and-fallback-orchestration.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "test_plan",
+    "rollout_plan",
+    "comments",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_97538e46310d493680cd1e1fa8b3d513"
+}

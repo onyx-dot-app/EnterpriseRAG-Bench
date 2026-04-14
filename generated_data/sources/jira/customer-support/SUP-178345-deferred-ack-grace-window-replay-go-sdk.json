@@ -1,0 +1,68 @@
+{
+  "key": "SUP-178345",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Duplicate external tool invocations after resume due to deferred-ack grace window mismatch in Go SDK streaming",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Maya Chen",
+  "assignee": "Rafael Ortega",
+  "customer_company": "BrightQube",
+  "customer_tier": "dedicated",
+  "environment": "prod | us-east-1",
+  "components": [
+    "serving-runtime",
+    "go-sdk",
+    "streaming-proxy",
+    "webhook-dispatcher"
+  ],
+  "labels": [
+    "idempotency",
+    "deferred-ack",
+    "streaming",
+    "tool-calling",
+    "go-sdk"
+  ],
+  "affected_models": [
+    "redwood-open-lambda-1"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-13",
+  "first_response_due_at": "2026-03-11",
+  "linked_issues": [
+    "SUP-41209",
+    "SUP-12903"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/4921"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.com/display/OPS/Streaming+Retry+Guidelines"
+  ],
+  "description": "Issue summary:\nWhen BrightQube's Go client uses the streaming API to invoke external tooling (webhook actions via function-calling), intermittent network interruptions followed by client resume lead to duplicate external tool invocations. The duplicate occurs even when the client supplies an idempotency key. Root cause appears related to how the Go SDK and serving runtime reconcile the deferred-ack grace window and resume timestamps, resulting in the server re-queueing an already-dispatched tool run.\n\nImpact:\n- Duplicate webhook POSTs to BrightQube's downstream task processor (up to 2x in observed cases).\n- Side effects: duplicate emails and duplicate records in customer DBs.\n- Affects a handful of requests (~0.1% of streaming sessions) during network flaps; customer reports material operational cost and user confusion.\n\nEnvironment:\n- Customer: BrightQube (dedicated cluster)\n- Deployment: Redwood Dedicated, us-east-1, prod\n- SDK: redwood-go v0.9.4 (BrightQube pins to this version)\n- Server: serving-runtime 1.12.3-prod\n- Webhook dispatcher: internal webhook-dispatcher service behind streaming-proxy\n\nSteps to reproduce (customer-provided):\n1) Start streaming generation with function/tool calls enabled (Go SDK).\n2) Ensure function call triggers an outbound webhook from streaming runtime to customer's task endpoint.\n3) Simulate a brief network interruption between client and streaming-proxy (~3-6s).\n4) Client resumes streaming session using resume token within 10s.\n5) Observe two webhook POSTs for the same logical tool invocation (same payload) separated by ~1-3s.\n\nExpected behavior:\n- Single webhook POST per logical tool invocation when client resumes, provided idempotency key is present or the server-side pending invocation record indicates prior dispatch.\n\nActual behavior:\n- Server re-dispatches the tool invocation during resume if the deferred-ack grace window calculation marks the prior dispatch as \"expired in-flight\" due to timestamp skew between proxy and runtime state. This bypasses the idempotency guard under certain resume/timing combinations.\n\nTemporary workaround provided to customer:\n- Enable server-side webhook deduplication (BrightQube implemented a per-request nonce check).\n- Customer upgraded to redwood-go v0.9.5 (contains additional client-side resume timestamp anchoring) which reduced frequency but did not eliminate duplicates.\n\nBusiness impact:\n- Customer paused rollout of a feature relying on single-execution guarantees. BrightQube requests a prioritized fix and a clear migration path for Dedicated customers.\n",
+  "comments": [
+    "2026-03-10 09:12 - Maya Chen (Support): Initial ticket created with BrightQube reproduction steps and sample request IDs: rq_9c3a, rq_9c3b. Customer included webhook delivery logs showing two POSTs with identical payloads and different server timestamps.",
+    "2026-03-10 11:04 - Rafael Ortega (SRE): Acknowledged. Assigned for investigation. Requested streaming proxy and runtime traces for the example request IDs.",
+    "2026-03-10 13:20 - BrightQube (Customer): Uploaded full trace and nginx proxy logs (S3 link: s3://brightqube-support/traces/2026-03-09/rq_9c3a.zip). Noted that client reconnection happened at client-side timestamp 2026-03-09T22:31:12Z.",
+    "2026-03-11 08:45 - Rafael Ortega (SRE): Investigation note: correlated dispatch events in webhook-dispatcher for rq_9c3a show two dispatches at 22:31:12.842Z and 22:31:14.109Z. Proxy logs show RESUME negotiation completed at 22:31:12.700Z. Looks like runtime considered the prior dispatch as timed-out and retried upon resume handshake.",
+    "2026-03-12 10:02 - Priya Nair (Go SDK Eng): Verified client resume logic in v0.9.4: resume anchor uses client-provided timestamp but server uses its own deferred-ack cutoff. Proposed change: include server-side sticky invocation state and explicit 'resumed_since' header on resume, to avoid replaying invocations within the grace window.",
+    "2026-03-12 15:28 - Maya Chen (Support): Shared proposed mitigation steps with BrightQube and offered to schedule a hot-patch rollout on their dedicated cluster. Customer accepted and requested ETA for fix and patch notes.",
+    "2026-03-12 17:05 - Rafael Ortega (SRE): Created a temporary config flag on BrightQube's runtime cluster (streaming.reject-replay-within-ms=5000) to drop replays within 5s of last dispatch. Monitoring for duplicates ongoing.",
+    "2026-03-12 17:30 - BrightQube (Customer): Confirmed duplicate rate dropped from ~0.1% to ~0.01% after config change. Requests permanent fix and SDK guidance for future resume semantics."
+  ],
+  "investigation_notes": "Hypotheses:\n1) Deferred-ack grace window computed on runtime differs from value assumed by streaming-proxy resume logic, leading to re-queueing.\n2) Go SDK v0.9.4 resume handshake doesn't include a deterministic resume-anchor nonce the server trusts, so server treats resume as a fresh delivery in race conditions.\n\nEvidence collected:\n- webhook-dispatcher logs (two near-identical dispatches) matched proxy resume timestamps.\n- Serving-runtime metrics show 'tool_dispatch_retry' spike correlated with resume handshake events.\n- No evidence of webhook consumer returning retryable error; server retried proactively.\n\nTemporary mitigations tested:\n- runtime config to reject replayed dispatches within a 5s window (reduced duplicates).\n- upgrade to go-sdk v0.9.5 (client-side anchoring) reduced frequency.\n\nNext steps:\n- Implement server-side authoritative resume-anchor check: store 'pending-tool-invocation' state keyed by invocation_id and resume-anchor nonce; treat resume as idempotent if resume-anchor <= last_dispatch_timestamp + grace_ms.\n- Add resume 'resumed_since' header in Go/TS/Python SDKs and require server-side honor.\n- End-to-end test harness to simulate network blips and measure duplicate rate across versions.\n",
+  "resolution_notes": "Planned fix (target):\n- Short term (hotfix): rollout runtime config flag streaming.reject-replay-within-ms defaulting to 3000ms for Dedicated customers (will be toggled by SRE). Deployed to BrightQube on 2026-03-12 as pilot (observed reduction).\n- Mid term (v1.12.4 runtime + SDKs): implement persisted pending-invocation state and resume-anchor handshake. SDKs will add 'resumed_since' header and include invocation nonce in resume frames.\n- Tests: add cross-language test scenarios in CI to cover resume-with-replay window.\n\nRollout plan:\n1) Merge server-side PR and tag runtime 1.12.4 (engineering PR: https://github.com/redwood-inference/serving-runtime/pull/4921).\n2) Release coordinated SDK updates (redwood-go v0.9.6, redwood-ts v1.4.2, redwood-py v0.11.0) with resume header behavior.\n3) Offer dedicated-cluster patch or config change for customers on earlier runtime.\n4) Publish KB article: \"Streaming resume best practices and prevents duplicate tool dispatches\" and notify BrightQube.\n\nFollow-ups assigned:\n- Priya Nair: implement SDK header and tests (ETA 2026-03-19).\n- Rafael Ortega: runtime change + hotfix packaging for Dedicated clusters (ETA 2026-03-18).\n- Maya Chen: coordinate customer communication and post-incident summary (ETA 2026-03-20).",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_ff20c999e6954fd09ca327d457595227"
+}

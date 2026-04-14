@@ -1,0 +1,47 @@
+{
+  "key": "ENG-19257",
+  "team": "engineering",
+  "title": "Tier-aware admission control to protect Dedicated throughput floors under saturation",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-01-29",
+  "updated_at": "2025-03-21",
+  "creator": "Rafael Mendes",
+  "assignee": "Keiko Yamamoto",
+  "project": "Dedicated Throughput SLO + Tier Definitions",
+  "cycle": "2025-W08",
+  "estimate": "13",
+  "due_date": "2025-03-15",
+  "labels": [
+    "Dedicated",
+    "SLO",
+    "admission-control",
+    "overload-protection",
+    "routing",
+    "feature-flag"
+  ],
+  "dependencies": [
+    "ENG-19244",
+    "ENG-19263"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.19",
+  "security_review_required": "false",
+  "body": "Context\nDedicated is formalizing a throughput SLO with tiered entitlements (Standard / Plus / Premium). Under regional contention (warm pool drain, burst pool saturation, partial host failures, capacity rebalancing), we need deterministic behavior that preserves each customer\u2019s committed throughput floor and ensures higher tiers degrade last.\n\nThis ticket implements tier-aware admission control and overload behavior at the edge + scheduler boundary for Dedicated deployments.\n\nGoals\n- Preserve committed throughput floors for Dedicated deployments during saturation.\n- Ensure tier-specific degradation order:\n  - Premium: preserve floor; burst throttled last; minimal queueing latency\n  - Plus: preserve floor; burst throttled before Premium\n  - Standard: preserve floor; burst throttled first; stricter queue caps\n- Make overload behavior explicit and observable (reject reasons, queue depth, time-in-queue).\n- Provide safe rollout via feature flag and per-region enablement.\n\nNon-goals\n- This ticket does not define the throughput SLO metric itself (see ENG-19244 / SRE SLO doc).\n- This ticket does not implement tier\u2192pool selection (see ENG-19263).\n- This ticket does not change contract language or pricing.\n\nDesign overview\nWe apply admission control in two layers:\n1) Edge (request ingress):\n   - Per-deployment concurrency caps (in_flight_limit) and bounded queue (max_queue_depth).\n   - Early rejection with stable error codes and retry hints when a request would exceed caps.\n   - Separate counters for committed vs burst traffic classification.\n\n2) Scheduler/runtime boundary:\n   - When the serving pool reports saturation (GPU queue latency rising, token backlog exceeding threshold), apply shedding in this order:\n     a) Burst requests (all tiers)\n     b) Standard non-burst requests beyond committed floor safeguards\n     c) Plus non-burst requests beyond committed floor safeguards\n     d) Premium non-burst requests (only if we are already violating floor due to infra incident)\n\nKey concept: committed vs burst\n- Committed traffic = requests that fit within the customer\u2019s contracted committed throughput for the deployment/shape.\n- Burst traffic = requests beyond committed capacity, routed to burst headroom if available (and metered separately).\n- Classification is computed using:\n  - deployment_id + tier + configured committed_tps (control plane config)\n  - token accounting from runtime (prompt_tokens + generated_tokens)\n  - moving window estimation to avoid per-request \u201cgaming\u201d\n\nImplementation details\n- New config surface (control plane \u2192 router):\n  - tier (standard|plus|premium)\n  - committed_tps_floor (tokens/sec)\n  - burst_enabled (true/false) + burst_policy (best_effort)\n  - queue parameters: in_flight_limit, max_queue_depth, max_queue_wait_ms\n- New overload signals from pool:\n  - saturation_state: normal|degraded|overloaded\n  - gpu_queue_p95_ms, scheduler_backlog_tokens\n- Admission control decisions emit:\n  - redwood_admission_reject_total{tier,reason,deployment_id,region}\n  - redwood_admission_queue_depth{tier,deployment_id}\n  - redwood_admission_queue_wait_ms_bucket{tier}\n  - redwood_committed_vs_burst_tokens_total{tier,deployment_id,mode}\n\nReject behavior (customer-facing)\n- If queue full / over cap: HTTP 429 for client-side throttling patterns; HTTP 503 for capacity/saturation conditions.\n- Include:\n  - x-redwood-retry-after-ms\n  - x-redwood-admission-reason (internal-friendly string; filtered for customer surfaces)\n\nTier defaults (initial)\n- Standard: lower in_flight_limit, strict max_queue_wait_ms (favor fast-fail)\n- Plus: mid caps\n- Premium: higher in_flight_limit, slightly higher max_queue_wait_ms to preserve floor during transient spikes\n\nRollout plan\n- Feature flag: dedicated_tier_admission_control\n- Phase 1 (internal): enable in staging + one canary region (us-east) for 2 internal Dedicated accounts\n- Phase 2 (beta): enable for 3 beta customers selected in PM-482 plan (ensure Premium + Standard represented)\n- Phase 3 (GA): enable per region after alert-noise review and postmortem of any floor violations\n\nAcceptance criteria\n- Under synthetic saturation test (burst > 2x committed for 15 minutes):\n  - Premium maintains >= 99% of committed_tps_floor (as measured by SLO evaluator window)\n  - Standard experiences shedding of burst first; committed floor preserved unless infra incident\n- All rejects are attributable by tier + reason and visible in the Dedicated throughput dashboard.\n- Oncall can quickly distinguish: customer throttling vs Redwood saturation vs misconfiguration.\n- No regression in non-saturated latency p50/p95 (>2% increase) for Dedicated.\n\nTest plan\n- Unit tests for admission decision logic (reason codes, tier ordering)\n- Integration tests with simulated saturation_state transitions\n- Load test harness: constant committed load + ramping burst load; validate:\n  - queue depth bounds\n  - committed token rate stability\n  - reject ratios by tier\n\nLinks\n- PR: sources/github/redwood/pr-19348-tier-aware-admission-control-guards.json (implementation)\n- Related: ENG-19244 (per-deployment throughput metrics), ENG-19263 (tier\u2192pool mapping)\n- Dashboard spec: Dedicated throughput SLO dashboards (Observability)\n\nOpen questions\n- Do we want Standard to default to fast-fail (low queue wait) vs buffering? Current default is fast-fail to avoid tail latency and to make burst behavior obvious.\n- How do we present 429 vs 503 consistently to customers in Console? (Design ticket DES-784 is tracking customer-facing widget messaging.)\n\nOutcome / summary (as of completion)\n- Implemented tier-aware queue caps + shedding order behind feature flag.\n- Rolled out to us-east canary, then expanded to 5 beta deployments (2 Premium, 2 Plus, 1 Standard).\n- Tuned thresholds after initial alert noise: adjusted saturation detection to use scheduler_backlog_tokens + gpu_queue_p95_ms with hysteresis to avoid flapping.\n- Documented operational notes in tier-aware routing/overload runbook and wired reject reason panels into the Dedicated dashboard.",
+  "comments": [
+    "2025-02-03 (Sean Gallagher): Please ensure we\u2019re not using request count as a proxy anywhere in the guard path. Metric attribution should align to tokens/sec SLO semantics. For rejects, we need reason codes that map cleanly to SLO exclusions (customer throttling vs Redwood capacity).",
+    "2025-02-06 (Mina Haddad): We should avoid tier logic living only at the edge; the scheduler needs to participate or we\u2019ll still starve floors when batch formation gets weird. Also add a safe default when tier is missing (treat as Standard and emit config_error metric).",
+    "2025-02-12 (Allison Grant): Add queue wait and depth metrics with tier labels, otherwise we can\u2019t explain \u201cwhy\u201d a floor was violated. Also request a panel for reject rate by reason that SRE can use during incidents.",
+    "2025-02-18 (Keiko Yamamoto): Implemented queue caps + reject reasons. Added hysteresis in saturation_state to prevent flapping. Next: integrate committed vs burst classification using token windows from ENG-19244 metrics (blocked until the streaming double-count fix lands).",
+    "2025-02-24 (Rafael Mendes): Oncall concern: 429 vs 503 semantics. Proposal: 429 only when we can positively identify customer-side concurrency cap exceeded (per API key), otherwise 503 for pool saturation. Please document in runbook and keep consistent across tiers.",
+    "2025-03-04 (Owen Phillips): Tested against a customer repro from SUP-18510 (streaming mismatch). After PR-19422 fix, the committed/burst classifier stopped oscillating. Reject telemetry now matches dashboard within ~1-2%.",
+    "2025-03-12 (Sergio Costa): Dashboard panels added for reject reason breakdown + queue depth. Please confirm final metric names before we freeze the dashboard JSON in observability-pack.",
+    "2025-03-21 (Keiko Yamamoto): Marking Done. PR-19348 merged and flag enabled for beta cohort in us-east + eu-west. Follow-up: tighten defaults per tier once PM finalizes Standard/Plus/Premium entitlements (tracked in PM-489)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_c8bb9ef10e5743c1a4af362fb7d9cd1e"
+}

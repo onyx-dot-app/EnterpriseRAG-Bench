@@ -1,0 +1,101 @@
+{
+  "key": "ENG-482468",
+  "team": "engineering",
+  "title": "inflight tenant upgrade causing double reservation on route pre-allocation",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-02-18",
+  "creator": "Maya Chen",
+  "assignee": "Rafael Ortega",
+  "project": "rate-engine-stability",
+  "cycle": "2026-W06",
+  "estimate": "5",
+  "due_date": "2026-02-25",
+  "labels": [
+    "billing",
+    "rate-limiter",
+    "high-impact",
+    "regression",
+    "customer-facing"
+  ],
+  "parent_issue": [
+    "ENG-271819"
+  ],
+  "dependencies": [
+    "ENG-314271",
+    "ENG-402345"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "We observed a class of incidents where a tenant's plan change (e.g., Starter -> Business) performed during an active request window causes the route-level pre-allocation / reservation logic to reserve credits twice for the same logical request set. The result is transient negative balances for that tenant and unexpected throttles on unrelated routes. This ticket tracks investigation, mitigation, and a safe fix path.",
+  "observed_behavior": "When a tenant upgrade event is emitted while in-flight streaming requests are being processed and 'allowance_reservation' is enabled for certain routes, the per-route pre-allocation code writes a new reservation without detecting that the previous window's reservation is still bound to the same request identifiers. Two reservations are applied to the shard accounting: one from the pre-upgrade policy snapshot and one from the post-upgrade snapshot. This leads to double-debit of burst credits and immediate per-key throttles until a reconciliation job runs.",
+  "impact_summary": "Multiple customers experienced transient failed requests and spurious throttles. Visible effects: 1) Short-term 4xx throttles for quota-exceeded on routes that should have had headroom, 2) Billing snapshots showing duplicated reservation rows for same request IDs, 3) On-call pages and customer tickets. Potential revenue and SLA risk for Dedicated customers if left unfixed.",
+  "steps_to_reproduce": [
+    "1) Enable feature flag 'allowance_reservation' on a test org",
+    "2) Configure route '/v1/generate' with route-level burst preallocation (prealloc-window=60s)",
+    "3) Start a steady stream of streaming generation requests from a client (concurrent 40 streams, varied seq lengths)",
+    "4) While requests are mid-flight, trigger an org plan upgrade via admin API (starter -> business) which updates org policy and increases burst pool",
+    "5) Observe metric 'reservation_count' and per-key-balance on the shard: duplicate reservation rows created within the same epoch for identical request fingerprints",
+    "6) Verify resulting throttles and negative balances in shard logs and 'metering.dedup_failures' counter"
+  ],
+  "logs_and_artifacts": [
+    "log-snips/shard-23-2026-02-10-14-32-11.txt: reservation write x2 for request_fingerprint=0x9f1",
+    "dashboards/rate-engine/reservations-by-request (time series spike around 2026-02-10T14:30Z)",
+    "confluence: https://confluence.redwood.ai/rate-engine/inflight-reservation-incident-2026-02-10",
+    "repro-script: gs://redwood-testing/repro/inflight-reservation/repro_v1.sh"
+  ],
+  "investigation_notes": [
+    "The reservation flow uses a per-route snapshot derived at policy-eval-time. When a tenant upgrade is applied, we atomically swap the org policy in the control plane but we do not invalidate existing reservation-id mappings in the shard cache.",
+    "Shard-level reservation writes are append-only for the epoch to avoid losing in-flight allocations. This append-only plus a lack of idempotency key allows both the old and new reservation to be applied for overlapping request fingerprints.",
+    "Race window: roughly the policy swap RPC + 150-300ms of request processing overlap during streaming tokenization flushes.",
+    "We reproduced locally with a shim that fast-forwards the policy-change event and saw consistent double reservations when route preallocations are active.",
+    "Root cause hypothesis: reservation code assumes monotonic policy version for a request fingerprint. Mid-flight upgrades violate that assumption and allow two different policy versions to both create legitimate reservations for the same logical work.",
+    "We verified there were no authorization bypasses or signature issues \u2014 purely accounting duplication.",
+    "Relevant code pointers: rate_engine/reservation_manager.go:ReservePrealloc, policy/allocator.go:ApplyRoutePrealloc, shard/txn_writer.go:AppendReservation"
+  ],
+  "temporary_mitigation": "1) Turn off 'allowance_reservation' for affected orgs until patch is deployed (feature-flag rollout). 2) Backfill job to detect duplicate reservations with same request_fingerprint within epoch and collapse them into a single reservation (run nightly) \u2014 used as a stopgap.",
+  "proposed_fix": "Make reservations idempotent by attaching a reservation-id derived from (org-id, route-id, request_fingerprint) and perform a compare-and-set on the shard reservation index. Additionally, on policy-change events, mark in-flight reservation context invalid and ensure only the reservation with the highest policy-version wins. Update shard AppendReservation to detect existing reservation-ids and no-op on duplicates.",
+  "design_decisions_and_tradeoffs": [
+    "Option A (idempotency key): Add reservation-id and cheap check on write. Pros: minimal behavioral change, fast fix. Cons: small additional index on shard and one more lookup per reservation write.",
+    "Option B (policy-grace-window): On policy-change, block new reservations for 500ms while in-flight ones finish. Pros: simpler shard changes. Cons: may increase latency and cause underutilization during upgrades.",
+    "We recommend Option A for production stability; Option B could be kept as a short-circuit fallback in severe incidents.",
+    "Will include a migration step to backfill existing duplicate reservation-ids and a reconciliation tool to collapse duplicates without losing allocation guarantees.",
+    "Need to coordinate with Billing/Backfill team for reconciliation acceptance criteria.",
+    "Estimate assumes small shard index change + tests: 5 story points (see 'estimate')."
+  ],
+  "acceptance_criteria": [
+    "Unit tests that enforce idempotent reservation writes (attempted duplicate writes must be no-op)",
+    "Integration test reproducing previous race and showing only a single reservation entry",
+    "Load test against staging that simulates plan-upgrade event during high concurrency with zero duplicated reservations",
+    "Backfill job that can safely collapse duplicates with audit logs and no net change to customer billing (billing team approval required)",
+    "Feature flag gating and gradual rollout to production with canary on 5% of orgs for 24h"
+  ],
+  "implementation_plan": "1) Implement reservation-id generation and shard index lookup in reservation_manager (ENG+Shard owners). 2) Add compare-and-set logic in txn_writer to dedupe by reservation-id. 3) Add policy-version check to reservation flow to keep highest-version reservation. 4) Add unit/integration tests. 5) Deploy behind feature flag in runtime-1.20 to staging then canary to prod.",
+  "rollout_plan": "Feature-flagged rollout: staging -> canary (5% orgs, 24h) -> ramp 25% (24h) -> full. Rollback by toggling feature flag or reverting reservation-id code path. Add a monitoring dashboard for 'dedup_writes' and 'duplicate_reservation_detected' counters.",
+  "testing_plan": "- Unit tests for reservation-id logic. - Integration harness that simulates policy change mid-flight (use repro script). - K8s canary deployment with synthetic traffic generator. - Billing backfill dry run on snapshot of test shard. - QA sign-off with billing and product.",
+  "qa_notes": "Coordinate with Billing to validate reconciliation results. Ensure that reconciliation tool emits audit records mapping collapsed reservations to original rows. Validate that customer-visible billing snapshots do not show duplicated reservations post-fix.",
+  "related_prs": [
+    "https://github.com/redwoodinc/rate-engine/pull/2147 (WIP)",
+    "https://github.com/redwoodinc/shard/pull/982 (txn dedupe)"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "observed_behavior",
+    "impact_summary",
+    "steps_to_reproduce",
+    "logs_and_artifacts",
+    "investigation_notes",
+    "temporary_mitigation",
+    "proposed_fix",
+    "design_decisions_and_tradeoffs",
+    "acceptance_criteria",
+    "implementation_plan",
+    "rollout_plan",
+    "testing_plan",
+    "qa_notes"
+  ],
+  "dataset_doc_uuid": "dsid_c6cc054597f140d0abbfde44a2594b19"
+}

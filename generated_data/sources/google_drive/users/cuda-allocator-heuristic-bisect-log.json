@@ -1,0 +1,34 @@
+{
+  "title": "CUDA allocator heuristic bisect log",
+  "owner": "Samir Patel",
+  "drive_area": "users",
+  "path": "users/cuda-allocator-heuristic-bisect-log",
+  "doc_type": "doc",
+  "created_at": "2026-02-23",
+  "last_modified": "2026-03-11",
+  "collaborators": [
+    "Avery Chen",
+    "Marta Ruiz"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "gpu-oom",
+    "cuda",
+    "allocator",
+    "bisect",
+    "nvml",
+    "repro"
+  ],
+  "linked_artifacts": [
+    "JIRA: INF-4512",
+    "https://github.com/redwood-inference/serving-runtime/pull/832",
+    "https://console.cloud/projects/infra/logs?query=vm-instance-42"
+  ],
+  "content": "Objective:\\nQuick capture of bisect steps, commands, error fragments, and hypotheses around intermittent OOMs that look correlated with the allocator heuristic (optimistic chunk coalescing) on CUDA 12.x + driver 535 mix. Keep rough timeline, commands I ran, and minimal repro attempts so we don\u2019t lose context between runs.\\n\\nSummary of failure mode observed:\\n- Workload: batched chat generation (rolling KV cache reuse, variable sequence lengths up to 8192).\\n- Symptom: sudden CUDA out-of-memory in middle of batch processing (nccl/allreduce not involved), driver still responsive, process receives CUBLAS/CUDA error then exit.\\n- Pattern: more frequent after long-lived process (~12\u201336 hours) with many variable-length requests; often follows a sequence where a spike of long prompts momentarily increases allocation pressure.\\n\\nTop-level hypothesis: the custom allocator heuristic that aggressively merges adjacent free chunks to reduce fragmentation sometimes miscomputes alignment or reuses stale GPU pointers after an async free completion race, leaving an allocation bitmap inconsistent with actual VRAM usage. Alternatively, driver/lib mismatch causes different reported free memory windows.\\n\\nCommands & state grabs I used during repro attempts (copy-paste ready):\\n- NVIDIA stack versions: nvidia-smi && cat /proc/driver/nvidia/version\\n  Output snippet I saved: \\\"NVRM version: NVIDIA UNIX x86_64 Kernel Module 535.86.10 Thu Jan 29 2026\\\"\\n- nvml sample: python -c 'import pynvml as n; n.nvmlInit(); h=n.nvmlDeviceGetHandleByIndex(0); print(n.nvmlDeviceGetMemoryInfo(h));'\\n  Example output: {\\\"total\\\": 4294967296, \\\"free\\\": 734003200, \\\"used\\\": 3560964096}\\n- run under cuda-memcheck: CUDA_LAUNCH_BLOCKING=1 cuda-memcheck --tool memcheck ./serve_local --model=...\\n  Observed: cc? Did not produce deterministic stack; memcheck slowed flow and made OOM less likely (timing-sensitive).\\n- traced allocations via LD_PRELOAD shim (malloc/free logging) on CPU side to correlate operator lifetimes. Log: allocator shows many small frees followed by a single large coalesce.\\n\\nRepresentative error snippets I captured from stderr: \\n- \\\"CUDA error: out of memory (code 2), line 342 in runtime.cu\\\"\\n- \\\"cuMemAlloc failed: CU_ERROR_OUT_OF_MEMORY 2\\\"\\n- \\\"NVML: Unhandled error: NVML_ERROR_UNINITIALIZED while querying memory after crash\\\"\\n- kernel stack dumps showing addresses in cudaMallocAsync paths (libcublas, my allocator glue)\\n\\nBisect strategy I ran (notes):\\n1) Repro harness simplified to deterministic input stream using small/large alternating prompts. Ran 50k requests to try to trigger drift.\\n2) Toggle allocator config flags: OFF (OS allocator), POOL_FIXED, POOL_COHERENT, POOL_AGGRESSIVE_COALESCE. Behavior: POOL_AGGRESSIVE_COALESCE increases OOM rate dramatically.\\n3) Swap CUDA runtime versions in container image: 12.2.0, 12.3.1. OOM more frequent on 12.3.1 + driver 535.\\n4) Run with/without rdma/nvlink visible (export CUDA_VISIBLE_DEVICES plus NVLINK env toggles) \u2014 no obvious difference.\\n5) Reduced batch size and KV cache to see threshold: lower batch -> less frequent OOM but still occurs after long uptimes.\\n\\nSmall repro attempt (pseudo):\\n- loop sending requests with seq_len pattern: [128, 512, 2048, 8192, 64, 4096] repeated with sleep 0.1s for 100k cycles. Collector script logs nvml free after each request.\\n- observed a gradual downward trend in baseline free memory (small percent) until a sudden drop -> OOM. Suggests leak or fragmentation growth.\\n\\nHypotheses (ranked):\\n- H1: allocator coalescing race with async frees. Coalesce merges a block still referenced by stream callback. (High priority)\\n- H2: mismatch between CUDA runtime and driver reporting free memory transiently wrong under certain async semantics. (Medium)\\n- H3: application-level retained handles (hidden caching of GPU tensors) due to edge-case in KV cache eviction. (Low-medium)\\n\\nEvidence for H1:\\n- Turning off aggressive coalescing reduces the failure frequency in multiple runs.\\n- Libtrace logs show free then immediate coalesce entry with matching pointer range but later kernel references that pointer (timing overlaps).\\n\\nWhat I tried that DIDN\u2019T help:\\n- Forcing synchronous cudaStreamSynchronize everywhere (hid the problem, but unacceptable perf).\\n- Upgrading/downgrading libcudart alone (no clear change).\\n- Explicit cudaDeviceReset between batches (not feasible).\\n\\nNext investigational steps (concrete):\\n- Add guard to allocator: on coalesce, require stream quiescence via cudaEventQuery for the streams owning buffers (cheap sampling). Roll as flag to A/B test on canary.\\n- Reproduce on a clean host with matching driver/runtime matrix (12.2 + 535, 12.3 + 535, 12.3 + 540) and collect nvml diffs + dmesg output.\\n- Create minimal C repro that uses cudaMallocAsync + streams + custom coalescing to see if bug can be reproduced outside of runtime.\\n- Attach gdb to long-lived server when mem high to capture backtrace of last free/coalesce.\\n\\nNotes / loose ideas:\\n- Could be exacerbated by our use of pinned host pages / cross-device copies. Pinned allocation churn could pressure driver caches.\\n- Investigate whether kernel smaps for process show pinned memory complementary pattern.\\n\\nImmediate CI todo: open small canary PR with environmental toggle to disable aggressive coalesce and add nvml sanity checks every N requests (INF-4512 references the ticket).\\n\\nRecent run logs and artifacts:\\n- /tmp/repro-runs/run-2026-03-10-coalesce-on.log (1000 cycles)\\n- /tmp/repro-runs/trace-2026-03-10-ldpreload.log\\n\\nIf anyone picks this up: try the minimal C repro first. If you can reproduce outside python/perf noise we can isolate allocator vs driver. Ping me in #eng-serving-runtime and add notes to INF-4512.\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_6e8a7397addf4850bfd387c3c2e3fac8"
+}

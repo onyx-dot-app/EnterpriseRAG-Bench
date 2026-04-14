@@ -1,0 +1,92 @@
+{
+  "key": "SUP-88246",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Intermittent 503s and long tail latency from gateway buffer oscillation + growing request headers for streaming sessions",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-13",
+  "reporter": "Ayesha Khan",
+  "assignee": "Marco Diaz",
+  "customer_company": "Lumina Health",
+  "customer_tier": "dedicated",
+  "environment": "prod-us-east",
+  "components": [
+    "api-gateway",
+    "load-balancer",
+    "serving-runtime"
+  ],
+  "labels": [
+    "streaming",
+    "timeouts",
+    "header-growth",
+    "investigation-ongoing"
+  ],
+  "affected_models": [
+    "llama-3-8k",
+    "redwood-instruct-v1"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "linked_issues": [
+    "SUP-62177",
+    "SUP-41207"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/infra/pull/4382"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/13421/Gateway+timeout+runbook"
+  ],
+  "sla_due_at": "2026-03-11",
+  "description": "Issue summary:\nMultiple customers (notably Lumina Health) reported intermittent 503 responses and long-tail (500ms\u20136s) latency on streaming completions when sessions carry large request metadata. Failures are concentrated on streaming endpoints during sustained KV cache warm-up and at times of high connection churn.\n\nImpact:\n- Several production streaming sessions from Lumina Health experienced mid-stream 503s and reconnects, degrading UX for real-time assistants.\n- Error rate spike ~2.7% on /v1/streaming/completions for us-east between 2026-03-10T09:10 and 2026-03-10T11:45 UTC.\n\nEnvironment:\n- Hosted API (dedicated capacity) serving in us-east-1; Redwood gateway + AWS NLB in front for TLS termination; internal nginx sidecars and internal api-gateway cluster.\n\nObserved behavior:\n- Streaming sessions with repeated small requests and rotating metadata headers (trace IDs, customer-provided context headers) showed progressive header size growth in the downstream path.\n- When aggregated header size exceeded proxy buffer thresholds, upstream proxy started buffering then hitting idle/write timeouts, causing mid-stream 503s and connection resets.\n- TTFB and token emission delays correlated with periods of proxy flush/backpressure in the gateway logs.\n\nExpected behavior:\n- Streaming sessions should maintain steady low p95 latency and not experience mid-stream 5xx due to header/connection buffering.\n\nSteps to reproduce (approx):\n1) Start a long streaming completion session against /v1/streaming/completions with a client that rotates per-chunk metadata headers (simulates tracing middleware that appends a small header on each chunk).\n2) Send a series of ~40 small messages over 90s; observe request/response headers growth at the gateway.\n3) Monitor gateway/nginx proxy logs and stream for 503 or ECONNRESET events when header accumulation crosses ~16KB.\n\nLogs and traces:\n- Gateway access logs (excerpt): 2026-03-10T09:22:14Z GET /v1/streaming/completions 503 \"upstream-reset\" \"bytes_sent=12K header_bytes=18.9K\"\n- Nginx error: \"upstream timed out (110: Connection timed out) while sending to client, client: 10.0.4.6\"\n- Serving runtime trace: increased write stalls during KV warmup windows; per-request queue time spiked to 450ms.\n- Dashboard: https://grafana.redwood.internal/d/streaming/streaming-latency?orgId=1&var-region=us-east (spike around 2026-03-10T09:10\u201311:45)",
+  "steps_to_reproduce": [
+    "Create long-lived streaming session with rotating small extra metadata headers",
+    "Send ~40 small messages over ~90s interval",
+    "Observe gateway access logs for header_bytes growth and 5xxs",
+    "Repeat against prod us-east cluster to reproduce timing dependency"
+  ],
+  "investigation_notes": [
+    "Initial hypothesis: nginx proxy buffer thresholds combined with header growth cause intermediate buffering and then an idle/write-timeout when flush cannot keep up.",
+    "Checked gateway and sidecar configs: max_header_size/default_buffer_size set to conservative values (16k). Several customers send extra trace/tenant headers \u2014 combined effect pushes size over limit during session.",
+    "Observed correlation between KV cache warm-up windows and increased CPU per serving-instance; when backend slower to emit tokens, proxy buffers grow and hit idle timeouts.",
+    "Ran capture: tail of gateway connection states showed many FIN_WAIT and slow_writer entries during spikes.",
+    "Confirmed not an application-level rate limit: request QPS within expected ranges; increased median backend latency ~120ms during warmup windows is amplifying buffering.",
+    "Reviewed related prior tickets: SUP-62177 (mid-stream reset during KV warmup) \u2014 similar symptom but that incident was ALB header growth; this one reproduces with NLB+sidecar nginx."
+  ],
+  "comments": [
+    "2026-03-10 10:05 \u2014 Ayesha Khan (Support): Customer reported first occurrence after they enabled a new tracing SDK that appends a lightweight header per chunk. They saw clients reconnect twice in 30 minutes.",
+    "2026-03-10 10:22 \u2014 Marco Diaz (SRE): Reproduced locally by simulating rotating headers. Confirmed header_bytes passes 16KB threshold after ~35 chunks; nginx starts buffering then returns 503s.",
+    "2026-03-10 11:00 \u2014 Priya Mehta (Infra): Temporarily increased proxy_buffer_size on staging ingress and disabled proxy_buffering for streaming routes; instant reduction in 5xxs in smoke tests.",
+    "2026-03-10 12:05 \u2014 Lumina Health (Customer): Confirmed partial mitigation when we instructed them to reduce per-chunk metadata. Asking for permanent fix/rollout timeline.",
+    "2026-03-11 09:35 \u2014 Marco Diaz (SRE): Runbook link posted: https://slack.redwood.com/archives/C01234ABCD/p1678461234000000 #sre-latency \u2014 plan to roll change to production ingress as canary to 10% of traffic."
+  ],
+  "temporary_workaround": "Advised customers to disable per-chunk trace header emission where possible. Support team applied a temporary config on staging ingress: proxy_buffering off for /v1/streaming/completions and increased large_client_header_buffers to 32k for a canary node.",
+  "resolution_notes": "Partial mitigation deployed to prod on 2026-03-12: updated gateway nginx template to set large_client_header_buffers 4 32k for streaming vhost and disabled proxy_buffering on streaming route handlers. Idle timeout for streaming listeners increased from 30s -> 75s. Results: error rate dropped from 2.7% -> 0.3% in canary, p95 latency improved. Full rollout scheduled 2026-03-14 with follow-up patch to instrument header-size histogram in metrics and add an alert when 99th percentile header size > 16KB.",
+  "postmortem_followups": [
+    "Add automated telemetry: header_size.bytes histogram for streaming routes (priority P0)",
+    "Add client guidance to SDK docs about per-chunk headers and streaming best practices",
+    "Implement server-side header trimming policy: drop known safe-trace headers if cumulative header size exceeds threshold",
+    "Update runbook with steps to toggle proxy_buffering without full deploy"
+  ],
+  "final_status": "Partial fix applied to canary; full rollout pending and monitoring in place.",
+  "resolution": "Workaround + config change applied to gateway; permanent instrumentation and policy follow-ups scheduled.",
+  "related_incident_id": "INC-2026-1031",
+  "attachments": [
+    "s3://redwood-logs/prod-us-east/gateway/2026-03-10/streaming-503-tail.log",
+    "s3://redwood-logs/prod-us-east/nginx/2026-03-10/error-sample.log"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "temporary_workaround",
+    "resolution_notes",
+    "postmortem_followups",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_81eabe8795c64f16a8b909273dbf67ea"
+}

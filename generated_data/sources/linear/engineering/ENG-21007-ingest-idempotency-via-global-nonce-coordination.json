@@ -1,0 +1,77 @@
+{
+  "key": "ENG-21007",
+  "team": "engineering",
+  "title": "Ingest idempotency via global nonce coordination for billing-safe retries",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-14",
+  "creator": "Maya Patel",
+  "assignee": "Liam O'Connor",
+  "project": "billing-consistency",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "due_date": "2026-04-01",
+  "labels": [
+    "billing",
+    "idempotency",
+    "quota",
+    "reliability",
+    "multi-region"
+  ],
+  "parent_issue": [
+    "PM-402"
+  ],
+  "dependencies": [
+    "ENG-15432"
+  ],
+  "customer_impact": "high",
+  "release": "billing-2026.04",
+  "security_review_required": "true",
+  "description": "Problem: Retries and timeouts across the ingestion pipeline can result in duplicate usage records that cause incorrect per-token billing, quota exhaustion, and noisy alerts for customers. Existing dedupe work (sticky/consumption ledgers) addresses some cases but we still see duplicates in the at-least-once ingestion window across multi-region failovers and client-side retries.\n\nGoal: Implement a robust, low-latency idempotency coordination layer that ensures a single billing event per logical request while preserving latency SLOs and working with rate-limit/quota enforcement. This should: (1) prevent double-consumption for common retry patterns, (2) integrate with rate limiting so quota adjustments happen exactly once, and (3) support streaming/partial-response cases where usage accounting may be reported incrementally.",
+  "technical_solution": "Overview: Add a lightweight global nonce coordination service plus per-tenant ingestion markers that together create a canonical \"first-write wins\" acceptance path for billing-affecting events. Key pieces: \n\n1) Client-visible request_nonce: SDKs/docs will recommend clients attach a 128-bit request_nonce (UUIDv4 or client-generated HMAC). The server will accept and use it if present. For non-SDK traffic, we will accept server-generated nonces at ingress.\n\n2) Ingest-idempotency table (durable KV): A small, highly-available key-value store (Redis Primary with AOF or Dynamo/Spanner in regions) storing keys of the form <tenant_id>:<request_nonce> -> {status, accepted_at, billing_marker_id, ttl}. TTL configurable per-customer/workload.\n\n3) Atomic check-and-set acceptance: At ingestion, use a single atomic operation (SETNX or conditional write) to claim the nonce. If claim succeeds -> process request and emit a billing_marker (immutable ledger entry) that is the source of truth for metering. If claim fails -> read stored billing_marker_id and treat current request as a retry (idempotent).\n\n4) Billing_marker ledger: Billing events are recorded to the existing consumption ledger (ENG-15432). Billing_marker_id references ledger entry used by downstream billing pipes so duplicate processing is impossible (ledger entries are append-only and deduped by id).\n\n5) Partial/streaming responses: For streaming, clients can provide a session_nonce + sequence numbers. We treat the final terminal event (or checkpoint) as the point to atomically claim the request_nonce for billing. Intermediate chunks are buffered and do not generate billing. For services that report incremental usage (e.g., token counts mid-stream), we provide a checkpoint API that performs an atomic delta-commit against the billing_marker_id.\n\n6) Rate limiter & quota integration: When a nonce is first claimed, we perform quota checks and decrement the quota atomically in the same transaction where possible. If the quota decrement fails due to contention, the claim is rolled back. For widely-distributed rate limit stores we use a compare-and-swap against a global quota lease to ensure single-decrement semantics.\n\n7) Cross-region failover: Use region-local fast check + async cross-region reconciliation. Where strong cross-region consistency is required, the ingest-idempotency table will be the ground truth (writes require a quorum). To keep latency SLOs, default to local claim path with short TTL and async reconciliation; expand to quorum writes for enterprise customers that enable strict duplicate prevention.\n\nTrade-offs discussed: \n- Fast local Redis claim path gives best latency but can lead to rare duplicates on split-brain. We mitigate with short TTC GC and reconciliation.\n- Quorum writes eliminate duplicates but increase tail latency; make this an opt-in enterprise toggle.\n- Storing every nonce indefinitely is unbounded storage; TTL + GC + tombstones with eventual ledger reference avoids unbounded growth.\n\nImplementation notes: Prefer Redis primary with AOF for low-latency claim path, backed up asynchronously to a durable ledger. Use HMAC-based request_nonces where client identity is known to prevent nonce guessing.\n",
+  "acceptance_criteria": [
+    "No customer-visible duplicate billing events in 99.99% of production retries (measured over a two-week canary).",
+    "Quota counters are decremented exactly once for successful requests; automation tests prove single-decrement under simulated concurrent retries.",
+    "Streaming checkpoints produce identical billing markers when replayed; partial replays do not create new ledger entries.",
+    "End-to-end integration test against consumption ledger (ENG-15432) shows idempotent ingestion with no duplicate ledger entries.",
+    "Monitoring dashboards show dedupe-hit-rate, claim-latency P50/P95/P99, and reconciliation conflict rate; alerts configured for >0.1% conflicts during canary."
+  ],
+  "implementation_plan": "1) Spike (2d): implement prototype Redis claim + ledger write in a sandbox; measure claim latency and collision rate under load.\n2) Design review (1d): review with billing, infra, security.\n3) API changes (1d): update SDKs to surface request_nonce and streaming checkpoint API.\n4) Service work (5d): implement claim logic, billing_marker creation, quota atomic decrement hooks, and revert path.\n5) Tests (3d): unit + chaos tests (network partition, duplicate retries, replays).\n6) Canary (7d): rollout to 5% traffic on staging, monitor, increase to 25% then 100% with enterprise quorum opt-in gating.\n7) Postmortem + GA: run a 2-week observation, finalize docs, and flip default TTLs if stable.",
+  "test_plan": "Unit tests: claim success/failure, tombstone TTL, checkpoint idempotency.\nIntegration tests: synthetic clients performing aggressive retries (1000 RPS) across simulated multi-region ingress gateways - assert single ledger entry per logical request.\nChaos tests: Redis primary failover during claim, network partition between ingestion and ledger, concurrent claimant storms.\nPerformance tests: measure extra P50/P95 latency added by claim path; target <3ms median overhead for local claim path.\nQA checklist: verify SDK nonce propagation, backward compatibility when nonce absent, and clear diagnostics (logs + tracing) for dedupe decisions.",
+  "monitoring_and_alerting": "New metrics: ingest_claim_success_rate, ingest_claim_latency_ms{p50,p95,p99}, ingest_claim_conflict_rate, dedupe_reconciliations_per_min, billing_marker_duplicates_detected.\nDashboards: billing/dedupe-overview and per-tenant dedupe heatmap.\nAlerts: page on >0.1% dedupe_conflict_rate sustained for 10m; warn on claim_latency_p99 >50ms.\nLogs/traces: include request_nonce, tenant_id, claim_result, billing_marker_id in traces for easy investigation.",
+  "rollout_plan": "- Stage 1: Internal canary on staging cluster (5% of traffic). Verify metrics for 72 hours.\n- Stage 2: Canary on production non-enterprise tenants (10%). Monitor for duplicates and latency changes for 1 week.\n- Stage 3: Enable enterprise strict-quorum mode for selected customers after validation.\n- Stage 4: Full rollout, enable default TTL GC, and deprecate older ad-hoc dedupe paths.\nRollback: disable claim gating and revert to current ledger write path; telemetry will still detect duplicates for investigation.",
+  "risks_and_mitigations": [
+    "Increased tail latency under quorum writes -> Mitigate: keep quorum opt-in and default to local claim path; expose opt-in toggle to Account teams.",
+    "Storage growth for nonces -> Mitigate: TTLs, compaction job, tombstone+GC pipeline wired to ledger references.",
+    "Edge cases with streaming partials -> Mitigate: require explicit checkpoint API for billing and treat non-checkpointed streams as best-effort (documented in SDK).",
+    "Quota race conditions under heavy concurrency -> Mitigate: atomic decrement in same claim transaction and test under high contention."
+  ],
+  "links": [
+    "https://confluence.redwood.internal/designs/ingest-idempotency-v2",
+    "https://github.com/redwood/inference/pull/14258",
+    "https://grafana.internal.redwood/d/billing/ingest-dedupe"
+  ],
+  "comments": [
+    "2026-03-10 Maya Patel: Created ticket after postmortem for INC-2026-03 (double-charge during gateway failover). Initial spike recommended to validate latency impact.",
+    "2026-03-11 Liam O'Connor: Completed prototype against redis in sandbox. Median claim latency ~1.8ms, p99 ~9ms under 2k RPS. Noted race on failover that led to a duplicate in one test scenario.",
+    "2026-03-12 Product review (Priya Rao): OK to proceed with local-fast path default. Request enterprise toggle for strict mode and an invoice-safety flag.",
+    "2026-03-13 Security review: HMAC nonces approved; require rotation policy for server nonces and restrict who can request unlimited TTL via account settings.",
+    "2026-03-14 Liam O'Connor: Implementing checkpoint API and integrating atomic quota decrement. Blocked briefly on infra PR for Redis HA config (INFRA-778)."
+  ],
+  "notes": "This approach aims to be compatible with the existing consumption ledger design (ENG-15432). If successful, we should be able to retire several client-side ad-hoc dedupe heuristics. Keep an editorial runbook for support to explain how to correlate request_nonce -> billing_marker during disputes.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "technical_solution",
+    "acceptance_criteria",
+    "implementation_plan",
+    "test_plan",
+    "monitoring_and_alerting",
+    "rollout_plan",
+    "risks_and_mitigations",
+    "notes",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_f27b34e8566d45f18e979800710aa833"
+}

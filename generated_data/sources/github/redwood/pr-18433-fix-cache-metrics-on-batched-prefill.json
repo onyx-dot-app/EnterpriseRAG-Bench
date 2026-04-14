@@ -1,0 +1,84 @@
+{
+  "repo": "redwood",
+  "pr_number": "18433",
+  "title": "Fix cache hit attribution for metrics under continuous batched prefill",
+  "author": "Samir Qureshi",
+  "created_at": "2025-03-12",
+  "updated_at": "2025-03-15",
+  "merged_at": "2025-03-15",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "bugfix/cache-metrics-batched-prefill",
+  "reviewers": [
+    "Omar El-Sayed",
+    "Sofia Ivanova",
+    "Noah Patel",
+    "Nadia Rahman"
+  ],
+  "labels": [
+    "runtime",
+    "metrics",
+    "telemetry",
+    "bug",
+    "perf"
+  ],
+  "linked_linear": [
+    "ENG-4822"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "9",
+  "additions": "214",
+  "deletions": "87",
+  "description": "Summary: Fixes incorrect cache hit/miss attribution in runtime metrics when multiple requests share a continuous batch prefill. Previously, the prefill stage could be executed as a single fused prefill for a set of requests (continuous batching). Our cache telemetry code was attributing prefill-derived cache outcomes (prefix reuse / KV reuse) to the batch as a whole, then fan-out incrementing per-request counters using the wrong join keys. This produced two bad effects in dashboards: (1) inflated hit counts for some routes/models (double-ish counting depending on batch shape), and (2) hit-rate distortions that correlated strongly with batch size and prefill coalescing rather than true cache behavior.\n\nContext / why now: We saw a mismatch between span annotations (trace-level) and metrics breakdowns in the canary dashboard for the new cache telemetry. In workloads with high concurrency + similar prompt lengths, prefill batching increased and the hit-rate metrics drifted upward vs expected, while wasted-prefill was noisy. This blocks SRE/Telemetry from trusting the signals for alerts/recommendations.\n\nRoot cause: The metric instrumentation was keyed off PrefillBatchId and then tried to map back to RequestContext using the active scheduler queue snapshot. Under continuous batching, requests can enter/leave the fused prefill window, and the mapping is not stable across the entire prefill run. Additionally, the cache result object returned by the cache layer was \u201cbatch-aggregated\u201d (reused_tokens_total, misses_by_reason) rather than per-request/per-segment. We were then distributing totals evenly (or per-token heuristic) which is wrong for partial reuse and causes incorrect per-route attribution.\n\nFix: 1) Introduce an explicit per-request CacheAttributionToken that is minted at request admission to the batch and passed through prefill execution. 2) Change the cache layer\u2019s telemetry hook to emit an event per request segment (request_id + segment_index) with reused_tokens, attempted_tokens, and miss_reason (if any). 3) In the metrics layer, aggregate only along stable keys (request_id, model_version_id, route_id, deployment_mode, region, prompt_len_bucket) and increment counters/histograms exactly once per request segment. 4) Add guards to prevent fan-out duplication when a request spans multiple micro-batches (continuous batch \u201cstitching\u201d).\n\nImplementation notes: - This PR does not change cache policy or scheduler behavior; it only changes how we attribute telemetry. - Event emission remains sampling-aware (respects existing cache telemetry sampling gates) and uses the same allowlisted tag set. - We keep batch-level debug stats behind a trace-only annotation (no new high-cardinality metric labels).\n\nIllustrative snippet (simplified): Before: metrics.kv_cache_hits_total.add(batch.reused_tokens_total, tags=tags_for(requests[0])) // wrong: tags derived from an arbitrary request; fan-out adds again per request. After: for seg in prefill_result.request_segments: metrics.kv_cache_reused_tokens_total.add(seg.reused_tokens, tags=tags_for(seg.request_ctx)); metrics.kv_cache_attempted_tokens_total.add(seg.attempted_tokens, tags=tags_for(seg.request_ctx))\n\nTests: - Added integration test that drives two routes concurrently such that they fuse into a single prefill batch (forced by scheduler test harness). Asserts that attempted_tokens_total equals the sum of both requests, and reused_tokens_total matches only the request that should hit (based on seeded prefix cache). - Added regression test covering \u201cstitching\u201d: request A starts in batch1 and continues in batch2; ensures we don\u2019t double-count attempted tokens. - Updated an existing unit test for the prefill metrics aggregator to validate segment-index semantics.\n\nPerformance/overhead: No measurable change in the perf-canary p95; the per-request event is emitted from already-available per-request prefill accounting. The new attribution token is an integer stored in RequestContext and passed by value.\n\nRollout: Safe to ship behind existing flags. No config changes required. Dashboards should show a small correction (downward) in hit counts for routes that heavily rely on continuous batching.\n\nRelated: ENG-4822 (KV cache hit/miss counters). This also unblocks dashboard correctness work in observability-pack (PR-612).\n\nChecklist: - [x] Unit tests - [x] Integration test for batched prefill attribution - [x] Verified tags comply with cardinality policy - [x] Verified trace annotations still line up with metrics on canary\n\nNotes for reviewers: The key behavioral change is that hit-rate is now computed off per-request attempted/reused tokens, not batch totals. This should align with the ADR semantics for partial hits and avoid batch-size artifacts.",
+  "commits": [
+    "runtime/metrics: add per-request attribution token plumbing through prefill",
+    "runtime/cache: emit per-request-segment telemetry from continuous batch prefill",
+    "runtime/metrics: replace batch fan-out accounting with per-request aggregation",
+    "tests: add batched prefill integration test + stitching regression",
+    "docs: update internal comment blocks describing attribution constraints"
+  ],
+  "changed_files": [
+    "runtime/scheduler/continuous_batcher.cc",
+    "runtime/scheduler/continuous_batcher.h",
+    "runtime/cache/cache_telemetry.h",
+    "runtime/cache/prefix_cache.cc",
+    "runtime/metrics/cache_metrics.cc",
+    "runtime/metrics/cache_metrics.h",
+    "runtime/tracing/cache_spans.cc",
+    "runtime/tests/integration/test_cache_metrics_batched_prefill.cc",
+    "runtime/tests/unit/test_cache_metrics_aggregation.cc"
+  ],
+  "ci_checks": [
+    "build-and-unit-tests (linux-x86_64): pass",
+    "runtime-integration-tests: pass",
+    "lint (clang-format + tidy): pass",
+    "perf-canary (cache-telemetry overhead): pass"
+  ],
+  "review_conversation": [
+    "Omar El-Sayed: Can you clarify what exactly was getting double-counted? From the diff it looks like we were incrementing both tokens_total and requests_total multiple times, but the graphs I saw were mostly hit-rate inflation, not request volume inflation.",
+    "Samir Qureshi (author): Yep. request counters were usually OK because they were incremented on request completion, not in prefill. The inflation was primarily in token-based numerators/denominators: attempted_tokens_total and reused_tokens_total. We were taking a batch-level attempted/reused summary and then fanning out per request. For a batch of N, each request got credited with the full batch totals (or a heuristic split), which made hit-rate correlate with N. This PR changes attempted/reused accounting to be per-request segment so sums across requests equal the batch totals exactly once.",
+    "Sofia Ivanova: I\u2019m concerned about the stability of the mapping. Continuous batching isn\u2019t a single static list; requests can be admitted mid-prefill depending on the microbatch boundaries. How do we guarantee the attribution token stays correct if a request is \u201cstitched\u201d across two prefill microbatches?",
+    "Samir Qureshi (author): Good call. The token is minted at request admission to the scheduler and stored on RequestContext; it doesn\u2019t rely on the batch snapshot. For stitching, the cache telemetry callback now emits (request_id, segment_index). The metrics aggregator dedupes by (request_id, segment_index, stage=prefill) so if a request is processed in multiple microbatches, we count each segment once. Added test_cache_metrics_batched_prefill_stitching to cover this.",
+    "Noah Patel: Why introduce segment_index rather than just request_id? Also, do we risk increasing event volume (one event per segment) beyond what sampling expects?",
+    "Samir Qureshi (author): segment_index is to model partial hits and partial attempts within a single request. With streaming + tool calls we can have multiple prefill segments per logical request; also, in continuous batching we can split prompt processing. Without segment_index, we either undercount (only first segment) or overcount (sum without dedupe). On volume: worst case events ~= prefill segments, which is already bounded by our internal segmentation logic. Sampling gate is still applied at request admission; if a request isn\u2019t sampled, we emit no segment events. So we\u2019re not multiplying sampled requests; we\u2019re giving more accurate accounting within sampled requests.",
+    "Nadia Rahman: Please confirm labels don\u2019t change. The metrics naming/cardinality policy explicitly forbids per-request labels and anything derived from prompt content. I see you mention request_id in the telemetry hook.",
+    "Samir Qureshi (author): Confirmed: request_id/segment_index only exist in the internal event struct used to aggregate; they never become metric labels. Exported labels remain model_version_id, route_id (allowlisted), deployment_mode, region, prompt_len_bucket, plus miss_reason enum where applicable. I added a comment in cache_metrics.cc and a unit test asserting the tag allowlist is unchanged.",
+    "Omar El-Sayed: One more: how does this interact with the fix in PR-18428 (stream retries double counting)? Any chance we\u2019re reintroducing a retry path that counts twice because the same segment is retried?",
+    "Samir Qureshi (author): I audited the retry path. Retries now carry a new logical attempt_id but the same request_id; however, segment_index is assigned per attempt. In the retry case we want to count attempted_tokens (because we actually did work again) but we must avoid counting reused_tokens as a \u201chit\u201d when the retry is due to transport. The existing guard from PR-18428 ensures we don\u2019t treat retry-prefill as cache-hit attribution unless the cache layer explicitly reports reuse. I also ensured segment_index increments on a new prefill compute, so metrics reflect real work while staying consistent with hit semantics.",
+    "Sofia Ivanova: Can we add a note in the description that this is expected to lower hit-rate in workloads with big batches? SRE will get nervous if graphs change.",
+    "Samir Qureshi (author): Added to rollout section + pinged Allison/Sean to expect correction in canary dashboards.",
+    "Omar El-Sayed: Approved after test coverage + explanation. Thanks for the detailed breakdown.",
+    "Nadia Rahman: Approved. Please make sure downstream dashboards use attempted/reused tokens, not request counts, for hit-rate; otherwise this won\u2019t fix their graphs.",
+    "Samir Qureshi (author): Ack. I linked this PR in the dashboard ticket notes and added a short note to the internal metrics README follow-up PR."
+  ],
+  "merge_method": "squash",
+  "merge_commit": "9b7f4c2c1f6c0fdbd1d7e6c1f0c2a1b3a61d9e42",
+  "release_notes": "Fixes KV/prefix cache telemetry correctness under continuous batching by attributing prefill attempted/reused tokens per request segment (removes batch-size artifacts in hit-rate).",
+  "breaking_change": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_conversation"
+  ],
+  "dataset_doc_uuid": "dsid_d45b165437834544b798a18544d8996c"
+}

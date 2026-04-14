@@ -1,0 +1,80 @@
+{
+  "key": "ENG-25618",
+  "team": "engineering",
+  "title": "Watermark priority eviction: LRU+TTL+prefix-affinity with atomic prefix guarantees",
+  "status": "Planned",
+  "priority": "P1",
+  "created_at": "2024-11-15",
+  "updated_at": "2024-11-27",
+  "creator": "Aisha Patel",
+  "assignee": "Markus Chen",
+  "project": "kv-cache-coherence",
+  "cycle": "2024-W47",
+  "estimate": "8",
+  "due_date": "2025-01-10",
+  "labels": [
+    "kv-cache",
+    "eviction",
+    "gpu-memory",
+    "continuous-batching",
+    "correctness"
+  ],
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Design and implement a watermark-based priority eviction policy for the serving runtime KV cache that blends LRU recency, TTL staleness, and prefix affinity. The goal is to reduce GPU memory pressure during continuous batching while preserving strong correctness guarantees for prefix-scoped cached state (no partial prefix evictions visible to in-flight requests). This ticket covers design, reference implementation, tests, and a staged rollout.",
+  "background": "We currently operate a KV cache shared across batched requests and sequences. Existing eviction approaches (pure LRU or TTL) either evict useful prefix data aggressively or cause uneven GPU memory fragmentation. Continuous batching complicates correctness because multiple requests can reference overlapping prefixes while the runtime performs trimming. We need a practical policy that is memory-aware, latency-friendly, and can give programmers invariants about prefix atomicity across batch boundaries.",
+  "proposal": "1) Score-based candidate selection: maintain a lightweight per-entry score combining (a) recency decay (LRU timestamp), (b) TTL staleness penalty, (c) prefix-affinity boost if the entry is part of an active prefix group recently accessed, and (d) memory cost estimate (bytes on GPU). Score = alpha*recency_rank + beta*ttl_penalty - gamma*affinity + delta*size_cost (tunable constants).",
+  "invariants": [
+    "prefix_coherence: Eviction must not leave a prefix partially invalidated such that an in-flight batched request observes a missing piece of the prefix.",
+    "atomic_mark_and_drain: Entries selected for eviction must go through a mark->drain->reclaim lifecycle that is observable and idempotent across concurrent batches.",
+    "no_unbounded_memory_leak: Eviction yields sufficient reclamation under steady-state workloads such that GPU memory usage stays bounded with configured headroom.",
+    "eviction_order_soundness: Score ordering is approximate but monotonic under stable access patterns; we provide probabilistic bounds on suboptimal evictions.",
+    "compatibility_with_prefetch: Eviction must not conflict with ongoing async prefetches; prefetches carry a reservation token preventing reclamation until settled."
+  ],
+  "design_details": "- Shard watermarks: per-shard low/high watermarks drive eviction triggers. The high watermark fires a sampling-based eviction pass that selects candidates by score.\n- Prefix groups: maintain lightweight prefix metadata (head pointer, refcount, active_batch_epochs) so we can atomically evict whole prefixes. Prefix groups can be coalesced when contiguous or logically related entries are created by the tokenizer/kv generation logic.\n- Mark->Drain->Reclaim protocol: when candidates are chosen, the runtime writes a tombstone marker and increments the prefix epoch. The marker signals in-flight batch handlers to consult the epoch; if a handler started before the epoch, it keeps a local reservation and cannot rely on reclamation. After a drain window (configurable: e.g., 2x max_batch_latency) and once reservation counts drop to zero, the reclaimer frees GPU memory. This ensures no batch sees half-evicted prefixes.\n- Continuous-batching tie-in: batch controllers annotate requests with their start epoch. The cache API exposes checkpoints so handlers can obtain consistent snapshots.\n- Memory-aware scoring: we bias eviction toward large contiguous GPU allocations (e.g., KV items that allocate entire CUDA blocks) to reduce fragmentation and reclaim more bytes per operation.",
+  "safety_proofs_sketch": "We provide a lightweight correctness argument: define an epoch counter per prefix. Any request accessing a prefix reads the current epoch at start and increments an active counter; eviction increments epoch and waits for active counter to drop. Therefore, a request with epoch <= old_epoch sees all pre-eviction data. This gives an atomicity invariant similar to linearizability for prefix reads. We will formalize and convert this sketch into unit tests and a small model-checker harness that simulates concurrent batch arrivals and eviction timing to assert absence of partial-prefix observations.",
+  "test_plan": "- Unit tests for scoring function (deterministic inputs -> expected ordering).\n- Integration test: synthetic workload with overlapping prefixes + continuous batching; verify no request observes partially evicted prefix across a large sample.\n- Property-based test: randomized start times, eviction rates, TTL distributions; assert invariants hold.\n- GPU stress test: replay production traces at 2x peak to validate reclamation and fragment compaction behavior.\n- Chaos: introduce artificial delays in reclaim path and ensure system degrades gracefully rather than corrupting state.\n- Metrics validation: assert eviction latency, reclaim window, and reservation drain behavior in canaries.",
+  "acceptance_criteria": [
+    "Implementation merges into runtime with feature flag behind 'watermark-eviction'.",
+    "Automated tests pass: unit, integration, property-based harnesses included in CI.",
+    "Canary run (staging) for two weeks with production-like trace: no observed partial-prefix failures and GPU memory under configured headroom.",
+    "Telemetry: eviction_count, reclaimed_bytes, average_drain_time, reservation_conflicts all emitted and within expected bounds.",
+    "Documentation: design doc and runtime API docs published; runtime-1.20 release note entry."
+  ],
+  "rollout_plan": "1) Merge behind feature flag. 2) Run internal staging canary on low-traffic shards for 72 hours. 3) Expand to canary fleet (10% traffic) for 2 weeks with increased telemetry retention. 4) If stable, enable for all non-critical shards. 5) Monitor OOM alerts and latency regressions for 14 days before broad enablement. Rolling back flips the feature flag and triggers a soft reclaim to avoid leaving tombstones.",
+  "metrics": [
+    "eviction_pass_duration_ms < 5ms (target per shard)",
+    "reclaimed_bytes_per_pass > 1MB (target)",
+    "prefix_drain_time_ms < 2x p95_batch_latency",
+    "partial_prefix_error_count == 0 in staging canary",
+    "gpu_memory_headroom_pct >= configured_headroom"
+  ],
+  "dependencies": [
+    "ENG-24167",
+    "ENG-21488",
+    "runtime-kernel-alloc-changes"
+  ],
+  "references": [
+    "https://confluence.redwood.ai/kv/cache-watermark-design (internal)",
+    "github.com/redwood-inference/runtime/pulls/XXXX (WIP)"
+  ],
+  "notes": "This approach trades slightly more bookkeeping (epochs, reservation counters) for a strong user-facing atomicity guarantee. Tunable knobs (drain window, scoring weights) will be surfaced in console for Dedicated customers. Interaction with cross-shard prefix coalescing will be addressed in follow-up: we intentionally scope this ticket to single-shard prefix atomicity.",
+  "implementation_tasks": "- core: implement scoring and sampling eviction pass.\n- prefix-metadata: epoch + reservation counters.\n- tombstone API: mark/drain/reclaim lifecycle.\n- batch-propagation: annotate requests with start_epoch and increment reservations.\n- tests: unit/integration/property harness.\n- metrics and telemetry.\n- docs and runbook.",
+  "original_location": "linear/engineering/ENG-25618-kv-watermark-priority-eviction-atomicity.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "background",
+    "proposal",
+    "invariants",
+    "design_details",
+    "safety_proofs_sketch",
+    "test_plan",
+    "acceptance_criteria",
+    "rollout_plan",
+    "metrics",
+    "notes",
+    "implementation_tasks"
+  ],
+  "dataset_doc_uuid": "dsid_d3fc23230b0f419b9e8d44407c979b1b"
+}

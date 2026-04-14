@@ -1,0 +1,96 @@
+{
+  "key": "ENG-271999",
+  "team": "engineering",
+  "title": "SSE resume token leasing and backoff harmonization for partial-chunk idempotency",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-03-05",
+  "updated_at": "2025-03-12",
+  "creator": "Aisha Patel",
+  "assignee": "Marco Nguyen",
+  "project": "streaming-protocols",
+  "cycle": "2025-W10",
+  "estimate": "5",
+  "due_date": "2025-03-20",
+  "labels": [
+    "sse",
+    "reconnect",
+    "reliability",
+    "protocol",
+    "backoff",
+    "compat"
+  ],
+  "description": "Problem: Our current SSE resume mechanism treats resume tokens as opaque identifiers with unlimited reuse; this leads to ambiguous replays when clients reconnect mid-chunk and causes either duplicate events or dropped partial output. We also have inconsistent client/server backoff behavior: clients use client-side exponential backoff while servers sometimes instruct different retry intervals, creating oscillation and capacity spikes.\n\nGoal: Design and implement a server-driven 'resume token leasing' model that encodes an epoch and lease TTL, combined with a harmonized backoff negotiation (server-suggested backoff + client-jittered enforcement) to minimize duplicates, allow safe idempotent replays of partial chunks, and reduce reconnect storms across scaled hosts. Maintain compatibility with legacy resume tokens and allow feature-flagged rollout per customer/org.",
+  "acceptance_criteria": [
+    "Server issues resume_token objects that include: token_id, sequence_watermark, lease_epoch, lease_ttl_iso8601 and optional server_nonce",
+    "Clients attempting resume must present token + lease_epoch; server validates lease_ttl and rejects expired leases with HTTP 409 (LeaseExpired) including suggested earliest_retry timestamp",
+    "Reconnect handshake supports server-suggested backoff via 'Retry-After' and 'X-RI-Backoff' headers; clients apply jittered enforcement and obey server-specified maximum retries per minute",
+    "Partial-chunk replay is idempotent: server replays from sequence_watermark and reuses stable chunk-boundary hints to avoid duplication of already-acknowledged frames",
+    "Legacy clients (resume_token_v1) can still resume but are mapped to conservative server-side semantics (short lease, stricter de-duplication) to avoid regressions",
+    "End-to-end tests covering normal resume, expired-lease, token-rotation, and multi-host failover exist in the integration suite",
+    "Metric coverage: resumed_connection_rate, lease_expiry_rate, duplicate_frame_rate, time_to_resume; alerts configured for duplicate_frame_rate > 0.1% and lease_expiry_rate growth > 2x baseline"
+  ],
+  "tech_notes": [
+    "Token format: base64url(JSON) signed with server key. Payload fields: {token_id, seq_watermark, epoch, ttl_seconds, server_nonce(optional)}. Signing prevents client tampering and allows stateless validation on scaled hosts.",
+    "Lease semantics: When a token is minted on initial connection, server records a short lease (default 30s) and includes ttl_seconds. On graceful disconnect client should include last-acked seq to request lease extension (POST /sse/extend). Unauthenticated resumption without valid lease -> HTTP 409.",
+    "Idempotency strategy: every chunk frame includes chunk_id + chunk_offset + cumulative_ack. On resume, server compares seq_watermark and chunk_offset to avoid re-emitting bytes already acked by the client. If watermark is in the middle of a chunk, server will re-send the chunk from chunk_offset; client must apply chunk-level dedupe by chunk_id and offset.",
+    "Backoff harmonization: server sends 'X-RI-Backoff: base=2s,max=120s,scale=linear' metadata during 5xx or capacity events. Clients compute backoff = min(max, base * 2^n) then apply +/- jitter(0..20%) but must not retry faster than server-specified base. Server-provided 'Retry-After' takes precedence for individual 503 responses.",
+    "Compatibility: Introduce resume_token_v2 while accepting v1. v1 tokens map to epoch 0 and default ttl 5s to force conservative replays. We will not revoke v1 tokens immediately but will mark them in telemetry to measure usage before eventual deprecation.",
+    "State storage: Prefer stateless token verification using signed tokens to avoid cross-host coordination. For lease extension and revocation we use a small, strongly-consistent store (etcd) for active_lease index keyed by token_id when extension frequency is high (to avoid long-lived leases overwhelming stateless model).",
+    "Security: Signed tokens prevent client forgery. Revoke path: admin revoke endpoint will mark token_id revoked in etcd; resumed attempts will return HTTP 401 (Revoked).",
+    "Failure modes and mitigation: If a client reconnects to a different host that has not seen the latest token (clock skew or delayed replication), the host will query the active_lease index; if unavailable, the host returns 202-Resume-Deferred with small backoff suggestion and correlation_id for debugging."
+  ],
+  "design_links": [
+    "https://confluence.redwood.ai/display/STREAM/SSE+Resume+Token+Leasing+Design",
+    "https://drive.redwood.ai/streaming/proofs/resume-token-v2-sequence.pdf"
+  ],
+  "prs": [
+    "https://github.com/redwood-inference/streaming-runtime/pull/842",
+    "https://github.com/redwood-inference/console/pull/391"
+  ],
+  "dependencies": [
+    "ENG-250123 (etcd-lease-indexing)",
+    "ENG-267890 (chunk-boundary-headers)",
+    "PM-221 (billing/usage-metrics-update)"
+  ],
+  "rollout_plan": [
+    "Feature-flag controlled: resume_token_v2 on by default for internal orgs only",
+    "Canary: enable for 5 production orgs with high traffic, observe duplicate_frame_rate and lease_expiry_rate for 72h",
+    "Gradual ramp: 25% -> 50% -> 100% over 2 weeks if metrics stable",
+    "Fallback: server can opt-out per-org by downgrading token issuance to v1 semantics for 30 minutes",
+    "Post-mortem checklist: collect last-10 failed resumes per org and attach to incident dashboard"
+  ],
+  "qa_tests": [
+    "Integration test: resume mid-chunk -> server resumes from chunk_offset and client applies dedupe -> assert no duplicate data delivered",
+    "Load test: reconnect storm simulation across 1000 clients with harmonized backoff -> peak qps reduction compared to current baseline",
+    "Compatibility test: v1 client resumes against v2 server and receives conservative behavior (short ttl)",
+    "Chaos test: host failure during resume -> other host honors signed token and continues stream"
+  ],
+  "monitoring_and_alerting": [
+    "Create dashboards: Resumes by token_version, Resume Success Rate, Duplicate Frame Rate, Lease Expiry Rate",
+    "Alert: Duplicate Frame Rate > 0.1% sustained for 15m",
+    "Alert: Lease Expiry Rate jump > 2x baseline in any 1h window"
+  ],
+  "comments": [
+    "2025-03-05 - Aisha Patel: Created ticket after on-call incident where a reconnect storm caused duplicate partial chunks for a major customer. Captured initial proposal; will schedule architecture review.",
+    "2025-03-06 - Ravi Shah (PM): Please add customer-impact estimation and list early-adopter orgs. Also ensure billing doesn't double-count replayed tokens.",
+    "2025-03-08 - Sofia Liu (Design): Chunk-level headers look good; we need to standardize the human-readable chunk boundary hints in Console trace view.",
+    "2025-03-10 - Marco Nguyen: Implemented prototype in streaming-runtime PR #842. Observed a 35% drop in duplicate_frame_rate in the dev harness. Added etcd fallback for lease lookups.",
+    "2025-03-12 - QA (Evan Park): Found edge-case where token TTL expiry during grace reconnect returns 409 but client retries immediately; added server-suggested earliest_retry and will update client SDK to obey.",
+    "2025-03-12 - Security (Leah Morales): Reviewed token signing approach; recommended rotating signing keys monthly and adding key_id to token header for verification."
+  ],
+  "release": "streaming-2025.03",
+  "customer_impact": "high",
+  "security_review_required": "true",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "tech_notes",
+    "rollout_plan",
+    "qa_tests",
+    "monitoring_and_alerting",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_1582581808d74baa93e2dcadca649843"
+}

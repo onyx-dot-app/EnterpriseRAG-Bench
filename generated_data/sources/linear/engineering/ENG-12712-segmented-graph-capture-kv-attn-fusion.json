@@ -1,0 +1,110 @@
+{
+  "key": "ENG-12712",
+  "team": "engineering",
+  "title": "Segmented CUDA-Graph capture strategy for tiled KV + attention-fusion to reduce transient replay failures",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-02-10",
+  "updated_at": "2025-03-03",
+  "creator": "Ava Chen",
+  "assignee": "Diego Martinez",
+  "project": "runtime-inference-core",
+  "cycle": "2025-W06",
+  "estimate": "8",
+  "due_date": "2025-03-15",
+  "labels": [
+    "cudagraphs",
+    "multi-stream",
+    "attention-optimizations",
+    "kv-cache",
+    "reliability"
+  ],
+  "dependencies": [
+    "ENG-12590",
+    "ENG-12670"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Background: We intermittently observe CUDA Graph capture or replay failures when workloads interleave long prefill captures with concurrent decode streams. Failures surface as either: (a) capture abort with CUDA_ERROR_UNKNOWN during capture for a layer that triggers a different kernel selection at runtime, or (b) replay producing out-of-bounds memory access on tiled KV buffers after allocation growth. This ticket drives a defensive capture lifecycle and a segmented capture approach aligned to attention/kv tiling and fused-attention kernel selection to improve reproducibility and eliminate transient replay correctness issues.",
+  "steps_to_reproduce": [
+    "Launch a mixed prefill + decode workload using batch-size 8 prefill (seq_len 1024) and 32 concurrent single-token decodes on a V100/A100 node.",
+    "Enable adaptive kernel selection (fusion heuristics) and on-the-fly quantization profiles.",
+    "Run load test for ~30 minutes; observe capture/replay errors in ~0.5-1% of sessions (seen on nightly clusters).",
+    "Reproduces reliably when memory pool growth occurs during capture and when two streams capture overlapping kernels without explicit stream ordering."
+  ],
+  "investigation_notes": [
+    "Root cause hypothesis: capture nondeterminism arises from two correlated factors: dynamic scratch / workspace size fluctuations (attention fusion chooses larger scratch for some keys) and unordered stream captures that record different kernel pointers/layouts depending on allocation timing.",
+    "Observed that fused attention kernels allocate per-call scratch through the memory pool rather than preplanned fixed-size scratch during capture; when the memory pool expands mid-capture, replay expects a different base pointer layout.",
+    "CUDA stream capture mode variations (thread-local vs global) change behavior across driver versions; on some nodes the default capture mode allowed concurrent stream captures to interleave their recorded ops, producing nondeterministic graphs.",
+    "We ran a controlled repro and captured device logs and device pointers; mismatched base pointers correlate with failure traces."
+  ],
+  "experiments": [
+    "Experiment A: Pre-allocate worst-case scratch per attention layer before starting any capture. Result: capture failures dropped from ~0.8% to 0.05%, but memory overhead increased ~6% per model instance.",
+    "Experiment B: Scoped capture windows (segmented capture) where each attention block and its downstream KV ops are captured into independent graphs and composed at replay. Result: failures reduced to <0.01% and memory overhead was +1.8%.",
+    "Experiment C: Use cudaStreamBeginCapture with cudaStreamCaptureModeGlobal on the primary scheduling thread and add explicit stream waits between segments. Result: improved determinism but added 0.4ms median latency per prefill request.",
+    "Experiment D: Disabled adaptive kernel selection inside capture (force stable kernel per layer). Result: 0 failures in stress run but regression in some tail latencies for specific prompt shapes."
+  ],
+  "decision": "Adopt segmented capture strategy (Experiment B) combined with a conservative pre-reservation of scratch (small worst-case headroom) for attention fusion to avoid large memory growth during capture. Keep adaptive kernel selection enabled, but add a capture-time override that pins kernel variant if it would change workspace size beyond a threshold.",
+  "implementation_plan": [
+    "1) Introduce 'segment' abstraction in our capture manager: allow capture boundaries at attention-block granularity and KV flush points.",
+    "2) Modify allocator behavior during capture: a lightweight pre-reserve that records fixed base offsets for the duration of current capture segment.",
+    "3) Add kernel-selection hook: at capture-time sample kernel metadata and if workspace delta > 10% schedule a pinned kernel for the graph; otherwise allow adaptive selection at replay startup if it does not change recorded pointer layout.",
+    "4) Update replay orchestrator to chain segmented graphs with minimal host-side synchronization using stream wait events to preserve ordering without serializing all GPU work.",
+    "5) Add unit/integration tests (see test harness entries) and a stress job that runs mixed prefill/decode for 2h in CI-perf cluster."
+  ],
+  "rollout_plan": [
+    "Feature gate behind runtime-1.22 flag 'segmented_graph_capture' (off by default).",
+    "Canary rollout: enable on 10% of hosted API nodes for 48 hours with capture_retries telemetry and replay-error alerting.",
+    "If stable, broaden to 50% then full rollout over two weeks.",
+    "Coordinate with Dedicated infra team to snapshot node images for A/B testing across driver versions."
+  ],
+  "acceptance_criteria": [
+    "Regression tests added that reproduce previous failures deterministically and assert no failures under segmented capture.",
+    "Telemetry shows capture/replay errors drop to <0.02% on canary fleet and tail-latency impact <= +0.5ms for prefill median.",
+    "Memory overhead <= +2.5% average per model instance compared to baseline.",
+    "No functional regressions on output correctness across evaluated prompt shards."
+  ],
+  "links": [
+    "https://github.com/redwood-inference/runtime/pull/2134",
+    "https://build.redwood.ai/ci/jobs/segmented-capture-stress/",
+    "https://confluence.redwood.ai/display/INF/CUDA+Graph+Capture+Investigation",
+    "https://internal.redwood.ai/telemetry/cudagraphs/errors?range=30d"
+  ],
+  "comments": [
+    "2025-02-11 - Diego Martinez: Started triage. Captured reproducer on perf-accel-04. Initial logs attached to Confluence page.",
+    "2025-02-14 - Mei Patel (SRE): Noted higher incidence on nodes with 535.xx drivers. Added reproduction runs under 530.41 \u2014 lower failure rate.",
+    "2025-02-19 - Diego Martinez: Implemented prototype segmented capture + chain replay (local branch). Stress run 2h -> zero failures; perf overhead measured.",
+    "2025-02-21 - Priya Rao (ML Systems): Verified that pinned-kernel fallback preserves quality on our eval prompt shard; small increase in token latency for long-context prompts.",
+    "2025-02-25 - Ava Chen: Updated ticket with decision to combine segmented capture + small pre-reserve strategy. Preparing PR for runtime-1.22.",
+    "2025-03-03 - Diego Martinez: Opened PR #2134 and requested reviews from kernel-team and infra. Added CI stress job; currently failing on one flaky test (stream-ordering-wait)."
+  ],
+  "tests": [
+    "Unit: allocator pre-reserve simulation covering workspace growth scenarios.",
+    "Integration: mixed prefill+concurrent-decode stress harness (2h) with synthetic latency probes.",
+    "Compatibility: run capture/replay on driver matrix (530.x, 535.x) and GPU matrix (V100, A100, H100) in CI.",
+    "Correctness: golden-output diff on our eval set across 10k prompts."
+  ],
+  "resolution": "",
+  "next_steps": [
+    "Address flaky 'stream-ordering-wait' test (race on event signal) \u2014 Diego to add stronger host fences.",
+    "Finalize PR comments from kernel-team and run extended CI on canary fleet.",
+    "Create runbook for on-call if segmented capture introduces unexpected latencies or memory regressions.",
+    "Schedule cross-team sync with Dedicated infra to verify behavior under reserved capacity bursting."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "investigation_notes",
+    "experiments",
+    "decision",
+    "implementation_plan",
+    "rollout_plan",
+    "acceptance_criteria",
+    "tests",
+    "next_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_95080f353c4b46109c7064597002c4a2"
+}

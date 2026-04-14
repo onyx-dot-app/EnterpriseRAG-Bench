@@ -1,0 +1,70 @@
+{
+  "repo": "redwood",
+  "pr_number": "65991",
+  "title": "probe-based fastpath gating with lightweight consistency checks and safe-mode fallback",
+  "author": "Asha Varma",
+  "created_at": "2025-11-20",
+  "updated_at": "2025-12-02",
+  "merged_at": "2025-12-05",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/fastpath-probe-gating-consistency",
+  "reviewers": [
+    "Miguel Ortega",
+    "Lena Park",
+    "Jordan Chen"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kv-cache",
+    "safe-mode",
+    "tests"
+  ],
+  "linked_linear": [
+    "ENG-5421",
+    "ENG-5490"
+  ],
+  "linked_jira": [
+    "SUP-998"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "7",
+  "additions": "412",
+  "deletions": "128",
+  "description": "Motivation: transient kernel incompatibilities and scheduling pressure occasionally cause our fast (kernel-optimized) codepath to emit subtly different attention corner-cases compared to the stable slow path. This manifests as rare correctness drift under tight latency budgets when we aggressively favor the fast path. This PR introduces a low-overhead probe-and-validate gating mechanism plus a conservative \"safe-mode\" fallback to ensure correctness while preserving most of the fast-path win.\n\nWhat this changes (summary):\n- Fast-path probe: before switching a worker to a new fast kernel variant, the worker runs a tiny micro-benchmark (probe) that exercises attention edge-cases (short prefix, long memory, kv cache reuse) and computes a compact validation token (rolling hash + checksum) of the probe outputs.\n- Lightweight consistency checks: the probe token is compared against an expected token for that kernel/model/seqconfig. Mismatches block the fast-path and create a diagnostic event.\n- Safe-mode fallback: on mismatch or repeated probe failures the worker enters safe-mode: it routes requests to the stable slow kernel and uses a conservative precision profile (FP32/FP16 fallback sequence) to maximize parity. Safe-mode is scoped per-host and decays after a successful probe window.\n- KV-cache-aware probing: probes are run both with empty and primed KV cache to catch cache-dependent divergences; we avoid draining real live KV entries by using a local ephemeral cache snapshot.\n- Scheduling integration: scheduler adds a probe budget per epoch and prefers low-latency probes during low-util periods; probes are throttled to avoid affecting p99.\n- Observability and rollback: new metrics (probe_success, probe_failure_reason, safe_mode_entries, safe_mode_duration) and a diagnostic payload attached to failure events; a quick flip flag inserted in config to disable probes or force safe-mode for emergency mitigation.\n\nChecklist:\n- [x] unit tests for probe harness and checksum comparison\n- [x] integration tests exercising primed/unprimed KV paths\n- [x] end-to-end canary on benchmark-lab with 3 models (gpt-small, gpt-medium, opt-6b)\n- [x] dashboards for probe metrics and alerts on elevated failure rates\n- [x] rollout plan and rollback flag in runtime config\n\nPerformance impact: canary results show median latency change +1% on typical sequences; tail impact negligible when probe budget is set to 1 probe per 10k requests per host. When fast-path is allowed, token throughput improved by 7-11% on our CPU+GPU mixed pools for served sequence-length distribution used in ENG-5421. Safe-mode incurs expected cost (2\u20133x token CPU work) but is scoped to affected hosts and decays quickly once a stable kernel/probe pair is validated.\n\nTesting notes:\n- benchmark-lab run id: bl-2025-11-26-ffprobe (attached metrics snapshot in PR artifacts)\n- Integration harness includes a synthetic adversarial suite that ramps KV re-use patterns to surface cache-dependent bugs.\n\nCompatibility and migration:\n- Probe tokens are versioned by (model_hash, kernel_variant, seq_profile, probe_version). When loading older kernels that lack tokens the system treats them as probe-missing and will perform a full validation run the first time (safe-mode until validated).\n- No model API changes. All config is behind runtime feature flag fastpath_probe_enabled (default ON in canary, default OFF in prod until we complete broader rollout).\n\nRollout plan:\n1. Merge to main -> internal canary (benchmark-lab) for 48 hours.\n2. Gradual rollout to Hosted low-traffic region (10% hosts) and monitor probe_failure_rate < 0.1%.\n3. Expand to Dedicated pools, then set fastpath_probe_enabled ON for most fleets.\n4. If probe failure spikes, flip fastpath_probe_enabled to OFF or force safe-mode (operator fix).\n\nNotes on correctness tradeoffs: the design intentionally keeps probes compact to avoid p99 regressions; this means very rare divergence types might not be caught immediately and will surface as diagnostic events or user reports. The safe-mode provides a deterministic recovery path for these cases.\n\nRelated: references ENG-5421 (kernel stability), ENG-5490 (kv cache priming heuristics).",
+  "commits": [
+    "a1f4d9d: runtime/probe: add probe harness and token generator",
+    "b2c3e76: runtime/scheduler: integrate probe budget and throttle",
+    "c3f7b22: runtime/kv: add ephemeral cache snapshot util for probes",
+    "d4a8a10: observability: probe metrics, events and dashboard links",
+    "e5b91ff: tests: add integration suite for primed/unprimed kv probe cases"
+  ],
+  "files_changed": [
+    "runtime/probe/probe_harness.go",
+    "runtime/scheduler/probe_budget.go",
+    "runtime/kv/ephemeral_snapshot.go",
+    "observability/metrics/probe_metrics.promql",
+    "tests/integration/probe_kv_adversary_test.py",
+    "docs/ops/fastpath_probe_runbook.md",
+    "configs/runtime_defaults.yaml"
+  ],
+  "patch_snippet": "--- a/runtime/probe/probe_harness.go\n+++ b/runtime/probe/probe_harness.go\n@@ -1,6 +1,22 @@\n+// lightweight probe harness used to validate kernel variants at runtime\n+func RunProbe(ctx context.Context, kernel Kernel, seqProfile SeqProfile) (string, error) {\n+  // run micro-benchmark (short prefix + long reuse pattern)\n+  out, err := kernel.RunProbeSequence(seqProfile)\n+  if err != nil { return \"\", err }\n+  return ComputeProbeToken(out), nil\n+}\n",
+  "review_conversation": [
+    "Miguel Ortega: Left a detailed comment about the potential for probe overhead to affect p99; suggested adding scheduler safeguards. Asha: added probe_budget and throttling in scheduler and re-ran canary.",
+    "Lena Park: Requested stronger telemetry around 'why' a probe failed (checksum vs. crash). Asha: split failure reasons and added probe_failure_reason label (checksum|crash|timeout|vc_mismatch).",
+    "Jordan Chen: Asked for safe-mode decay semantics. Asha: implemented exponential decay (success window of 5 consecutive probes to exit).",
+    "QA (automated): initial CI run showed one flaky integration test (kv-adversary) failing intermittently \u2014 test updated to be less timing-sensitive and re-run."
+  ],
+  "merge_method": "squash",
+  "release_notes": "Introduce probe-based fastpath gating with lightweight validation tokens and a per-host safe-mode fallback. Adds probe metrics and a runtime flag to disable probes in emergencies. Improves fast-path safety with minimal median-latency impact; can be rolled back via config.",
+  "notes": "This PR intentionally keeps the probe payload minimal; future work (ENG-5602) will expand probe coverage if we can maintain the same budget constraints.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_conversation",
+    "release_notes",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_19e8d04ba4664e52b239f93e4c17d279"
+}

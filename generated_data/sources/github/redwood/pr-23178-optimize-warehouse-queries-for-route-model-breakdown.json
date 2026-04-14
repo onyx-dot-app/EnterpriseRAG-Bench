@@ -1,0 +1,67 @@
+{
+  "repo": "redwood",
+  "pr_number": "23178",
+  "title": "Optimize warehouse queries for route/model breakdown (MV + clustering + p95 targets)",
+  "author": "Thomas Baird",
+  "created_at": "2026-02-11",
+  "updated_at": "2026-02-14",
+  "merged_at": "2026-02-14",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "perf/usage-insights-warehouse-query-optimizations",
+  "reviewers": [
+    "Logan Wright",
+    "Mei Lin",
+    "Chloe Martin",
+    "Allison Grant",
+    "Felix Schneider"
+  ],
+  "labels": [
+    "perf",
+    "telemetry",
+    "console-backend",
+    "analytics",
+    "sre"
+  ],
+  "linked_linear": [
+    "ENG-3821",
+    "ENG-3812",
+    "ENG-3814"
+  ],
+  "linked_jira": [
+    "SUP-24863"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "612",
+  "deletions": "198",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "description": "Context: Usage Insights breakdown queries (route + model) were timing out for larger ranges (esp. 30d) and causing elevated warehouse spend due to repeated full scans. This PR introduces a materialized view + clustering strategy for the route/model aggregates, updates the query builder to hit the MV when filters are compatible, and adds perf benchmarks + p95 targets that match the Console interactive budget.\n\nWhat changed (high level): 1) Materialized view for interactive breakdowns: Added a warehouse MV on top of telemetry.usage_route_model_agg_hourly that pre-joins model bucketing + normalized routes and precomputes the common metrics used by the Console table (tokens_in/out, billed_tokens, cache_hit_tokens, retry_count, fallback_count, req_count, latency_ms_p50/p95, cost_usd). The MV is keyed by (workspace_id, project_id, time_bucket_hour, route_canonical, model_family, model_version_bucket, region, deployment_mode) and is clustered to optimize the top access pattern: (workspace_id, project_id, time_bucket_hour) + selective dimensions (route_canonical, model_family).\n\n2) Partition/clustering tweaks on base aggregates: Adjusted clustering/partition hints on telemetry.usage_route_model_agg_hourly to reduce spill in range scans and to improve pruning for common filters. Also added a small \u201chot window\u201d optimization for the last 48h, which is the dominant interactive range for most Console usage.\n\n3) Query planner and guardrails: Updated the usage insights query service SQL builder to route queries to the MV when: time grain is hourly or daily, requested dimensions are a subset of [route, model, region, deployment_mode], and the time range <= 31 days. For requests that include unsupported dimensions or very large ranges, we keep the existing path but apply stricter limits (max rows, required workspace filter) and return a clearer error message with guidance.\n\n4) Benchmarks + targets: Added benchmark harness and documented p95 targets for interactive queries. Benchmarks include (a) 24h, (b) 7d, (c) 30d, and (d) 30d + route filter (selective) across representative workspaces (small/medium/large cardinality). Results are checked in as fixtures so we can track regressions.\n\n5) Observability: Added query-level tracing attributes for: warehouse_path=(mv|base), scanned_bytes_estimate, result_row_count, and pruning_ratio, and a counter for \u201cfell back to base path\u201d with reason codes.\n\nPerformance summary (Snowflake, prod-like dataset; measured from query service, excluding auth but including warehouse execution time): Before: 24h breakdown p95 1.6s; 7d p95 5.9s; 30d p95 14.2s (frequent timeouts at 20s gateway limit). After: 24h breakdown p95 430ms; 7d p95 820ms; 30d p95 1.9s (no timeouts in 50-run sample). Warehouse cost impact: scanned bytes reduced ~68% for 7d and ~74% for 30d in the benchmark suite. Note: numbers vary by workspace cardinality; worst-case (very high distinct routes) still improves materially but can exceed 2s for 30d; see \u201cKnown limitations\u201d.\n\nTargets (for beta): p95 (server-side) <= 600ms for 24h, <= 1.0s for 7d, <= 2.5s for 30d (breakdown table). Availability handled by upstream service SLO; this PR only sets latency budgets and emits metrics.\n\nFiles/areas changed: - services/usage-insights-query/sql/: MV-aware SQL builder + fallback logic - services/usage-insights-query/benchmarks/: benchmark runner + fixtures + README - telemetry/warehouse/migrations/: MV definition + clustering changes - telemetry/warehouse/ddl/: base agg clustering tweaks - observability/tracing/: new attributes + metrics\n\nIllustrative snippet (MV routing): IF requested_dimensions \u2286 supported_mv_dims AND range_days <= 31 AND grain IN ('hour','day') THEN use telemetry.mv_usage_route_model_breakdown ELSE use telemetry.usage_route_model_agg_hourly.\n\nTest plan: - Unit: SQL builder snapshots for MV path and base path; guardrail error messages - Integration: ran benchmark harness in staging warehouse against a 30d backfilled dataset; validated no correctness drift on totals vs base query within rounding tolerance - Manual: Console breakdown table load for 24h/7d/30d on 3 internal workspaces; verified filters (route/model/region) and pagination - Observability: verified new traces show warehouse_path and scanned_bytes_estimate populated\n\nCorrectness notes: MV uses the same rounding rules as base query (cost_usd rounded to 1e-6 internally, display rounding elsewhere). No changes to attribution semantics; this is a pure performance change.\n\nKnown limitations / follow-ups: - MV does not currently support arbitrary \u201ctop-N by cost with nested dims\u201d beyond the supported set; the service falls back to base query and may be slower. - For workspaces with extreme route cardinality, 30d queries can still be >2.5s if no selective filters are applied; we should consider a daily rollup MV for 30d+ once we see real beta traffic. - Backfill: MV relies on existing hourly aggregate freshness; it doesn\u2019t change lag behavior.\n\nRollout: Safe to deploy behind the existing query service; MV creation is additive. If the MV causes warehouse instability, we can flip USE_MV_USAGE_INSIGHTS=false to force base path (config flag included).\n\nReview notes / conversation highlights: Logan Wright: \u201cCan we guarantee the MV won\u2019t change totals vs billing?\u201d Author: \u201cMV is a projection of the same aggregated dataset; validated against base query results over 30d; no semantic changes; added integration check in benchmark harness comparing sums.\u201d Mei Lin: \u201cClustering keys: do we really want model_version_bucket before route?\u201d Author: \u201cSwapped order to prioritize route/model filters; also added workspace/time first for pruning; see updated DDL in latest push.\u201d Chloe Martin: \u201cGuardrail error copy should mention recommended range.\u201d Author: \u201cUpdated: suggests <= 7d for unfiltered large workspaces + recommends adding route/model filter.\u201d Allison Grant: \u201cPlease emit a metric for MV fallback reasons so we can alert.\u201d Author: \u201cAdded counter usage_insights_mv_fallback_total{reason=\u2026} and included in tracing attributes.\u201d Felix Schneider: \u201cConsole uses daily grain in one view; will it hit MV?\u201d Author: \u201cYes; MV supports hour/day; verified in staging traces.\u201d\n\nCI: build/test/lint passed. Benchmark job is informational for now (does not gate merge) but produces artifacts in CI logs; we can gate once we have stable baseline numbers.",
+  "commits": [
+    "Add MV definition for usage insights route/model breakdown",
+    "Adjust clustering/partitioning on hourly aggregate table",
+    "Route query builder to MV for supported filters + add fallback reasons",
+    "Add benchmark harness + baseline fixtures for 24h/7d/30d workloads",
+    "Add tracing attributes and metrics for scanned bytes + MV usage"
+  ],
+  "changed_areas": [
+    "services/usage-insights-query/",
+    "telemetry/warehouse/migrations/",
+    "telemetry/warehouse/ddl/",
+    "observability/tracing/"
+  ],
+  "ci_checks": [
+    "unit-tests (pass)",
+    "lint (pass)",
+    "typecheck (pass)",
+    "integration-smoke (pass)",
+    "warehouse-benchmarks (pass, informational)"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "commits"
+  ],
+  "dataset_doc_uuid": "dsid_f8d02f99ea5447edba0e5be127952a8e"
+}

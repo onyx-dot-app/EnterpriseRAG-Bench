@@ -1,0 +1,64 @@
+{
+  "key": "ENG-35711",
+  "team": "engineering",
+  "title": "Rate-limit window accounting for cache short-circuiting in interleaved batch pipelines",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "creator": "Asha Patel",
+  "assignee": "Miguel Torres",
+  "project": "metering-inference-accuracy",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "due_date": "2026-03-24",
+  "labels": [
+    "billing",
+    "metering",
+    "rate-limits",
+    "kv-cache",
+    "batching",
+    "slo"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.24",
+  "security_review_required": "false",
+  "description": "Problem statement:\n\nWhen requests are served from mixed sources within the same GPU batch (some tokens served via prefix/KV cache hit, others produced by the model), our current rate-limiter and quota accounting treat the entire batch token count as a single atomic charge. This causes two systematic errors: (1) overcharging tenants for tokens that were short-circuited by the cache (leading to customer complaints and reconciliations), and (2) incorrect rate-limit throttling where a tenant's leaky-bucket is drained faster than actual non-cached token generation, producing spurious 429s.\n\nObserved examples:\n- Single-batch example: Batch contains 4 requests from tenant A and 1 from tenant B. Tenant A contributes 300 total tokens, but 220 tokens are satisfied from prefix/KV cache. Current metering attributes the full 300 tokens to tenant A at batch emission time. Correct behavior should charge only the 80 generated tokens.\n- Windowing example: Tenant flows that do many small requests with high cache-hit ratios see sudden quota exhaustion when coalesced into larger GPU batches with low actual compute.\n\nGoal:\nProduce a reliable, auditable algorithm and implementation that ensures per-tenant quota usage and rate-limit windows count only the net non-cached token consumption, while preserving the runtime performance (no extra per-token critical-path latency) and offering traceable audit events for billing reconciliation.",
+  "background_and_constraints": "Background:\n- Runtime groups requests into coalesced batches for GPU efficiency. Batches are created by the scheduler and can interleave requests from multiple tenants and routes.\n- We have a KV/prefix cache layer that can fully or partially satisfy prefixes; the runtime short-circuits generation for cached tokens.\n\nConstraints:\n- Must not add per-token RPCs to control plane.\n- Metering events should be emitted asynchronously without blocking model response streaming.\n- Changes must be backward compatible with offline billing pipelines and existing quota semantics for tenants that don't use cache.\n- Implementation should support both hosted and Dedicated modes (with flags for Private installs).",
+  "proposal_summary": "High-level approach:\n1) Emit per-request token delta at the batch flush boundary: each request will carry metadata: requested_tokens, cached_tokens, generated_tokens = requested_tokens - cached_tokens. At model completion we compute generated_tokens.\n2) Per-tenant quota consumption is decremented by generated_tokens. For rate limiting, the leaky-bucket accounting consumes generated_tokens from the user's window.\n3) For micro-batches where generated_tokens == 0, emit a 'cache_shortcircuit' meter event (zero-charge) so billing can record cache effectiveness and for audits.\n4) Update the batching pipeline to keep a compact per-request descriptor (two integers) attached to the batch object. This avoids per-token instrumentation and keeps overhead O(requests_in_batch).\n5) Add a shadow-mode rollout: produce both old-style batch_total_charge events and new per-request delta events for 2 billing cycles; reconcile differences in the billing pipeline and dashboards before flipping the rate-limit to use deltas.\n\nWhy this is different from existing approaches:\n- Existing tickets focused on prorating or coarse attribution across prefetch and cache hits. This proposal centers rate-limit window semantics (leaky-bucket drains) to reflect actual compute demand rather than batch nominal size. It is optimized to be low-overhead and audit-friendly.",
+  "acceptance_criteria": "1) Unit + integration tests that simulate multi-tenant coalesced batches with mixed cache hits validate that per-tenant quota decreases equal the sum of generated_tokens.\n2) Shadow telemetry must show >= 99.9% alignment between total billed tokens (old method) and sum(generated_tokens)+server-overheads after 2 billing cycles for normal workloads. Any discrepancy > 0.1% must be documented and mitigated.\n3) No additional tail latency (>5th percentile to 99.9th) attributable to metering changes under synthetic load (benchmarked).\n4) 429s related to overcharging must decrease for cache-heavy tenants in canary environment.\n5) Emitted meter events include these new fields: event_type (\"token_delta\"|\"cache_shortcircuit\"), tenant_id, request_id, generated_tokens, cached_tokens, batch_id. The schema must be added to the billing contract and backward compatibility considered.\n6) Rollout gated by successful billing-team reconciliation and signoff from security (KMS/audit) if required.",
+  "implementation_plan": "Phase 1 - Design + Telemetry (2w):\n- Finalize event schema with billing team.\n- Add compact per-request descriptor (requested_tokens, cached_tokens) to batch proto.\n- Implement instrumentation to compute generated_tokens at batch completion and emit token_delta events to Kafka (shadow).\n\nPhase 2 - Shadow + Reconciliation (3w):\n- Run in shadow for two billing cycles, collect discrepancies, and produce reconciliation dashboard.\n- Implement any proration corrections if small disparities are systemic.\n\nPhase 3 - Toggle and Rollout (1w):\n- Add feature flag to switch rate-limiter to use generated_tokens for consumption.\n- Canary in one region and two enterprise tenants; monitor quota usage anomalies and errors.\n\nPhase 4 - Cleanup (1w):\n- Remove old-style batch_total_charge emission after signoff.\n- Update docs, developer SDKs and support runbook.\n",
+  "test_plan": "- Unit tests: batch descriptor math, edge cases with negative/zero generated_tokens, multi-tenant summation.\n- Integration tests: scheduler + KV cache + runtime to simulate: all-cached requests, all-generated, mixed partial prefix hits, and interleaved tenant batches.\n- Load tests: 95/99/99.9 latency and metering emit rate under production-like QPS.\n- Billing reconciliation tests: synthetic billing job to compare legacy and new event aggregates.\n- Chaos tests: forced prefetch eviction and KV latency spikes to ensure we don't double-charge on retries.\n",
+  "metrics_to_monitor": "- token_delta_emitted_rate\n- pct_diff_shadow_vs_legacy_billed_tokens\n- tenant_429_rate_change_for_cache_heavy_tenants\n- metering_event_emit_latency_p50/p90/p99\n- billing_dispute_incidents_count\n",
+  "risks_and_mitigation": "Risk: Small timing differences between cache short-circuiting and batch completion could yield temporary negative generated_tokens due to accounting race.\nMitigation: Floor generated_tokens at zero and record an anomaly metric (generated_tokens_negative_count) to investigate root causes.\n\nRisk: Billing downstream consumers rely on batch_total_charge event shape.\nMitigation: Maintain dual emission during shadow and provide a compatibility layer in billing pipeline that can reconstruct batch_total_charge from token_delta aggregates.\n\nRisk: Privacy/PII in emitted events.\nMitigation: Only emit tenant_id (no customer identifiers) and ensure Kafka topic is encrypted and ACLed; consult security if Private deployments require additional controls.\n",
+  "stakeholders": "- Billing: Priya Nair\n- Runtime: Miguel Torres (owner)\n- Observability: Luke Nguyen\n- Product (PM): Clara Osei\n- Security & Compliance: Jenna Stone\n",
+  "linked_docs": [
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/metering/cache-shortcircuit-spec",
+    "https://github.com/redwoodinc/runtime/pull/4821"
+  ],
+  "linked_prs": [
+    "github.com/redwoodinc/runtime/pull/4821",
+    "github.com/redwoodinc/billing/pull/937"
+  ],
+  "comments": [
+    "2026-03-10 Asha Patel: Created initial draft after post-mortem with billing team. Putting on 2-week design cycle.",
+    "2026-03-11 Priya Nair: Billing signoff required for schema - please include legacy totals for at least 2 cycles so we can reconcile.",
+    "2026-03-11 Luke Nguyen: Observability: add batch_id and request_id to emitted events for correlation with traces.",
+    "2026-03-12 Miguel Torres: Starting prototyping. Plan to implement per-request descriptor in batch proto; will avoid increasing RPC size significantly.",
+    "2026-03-12 Clara Osei: PM note - high customer impact on enterprise cache-heavy users; prioritize canary with two customers who reported issues.",
+    "2026-03-12 Jenna Stone: Security reviewed the schema; no additional controls required for hosted, but Private installs may request topic ACLs."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "background_and_constraints",
+    "proposal_summary",
+    "acceptance_criteria",
+    "implementation_plan",
+    "test_plan",
+    "metrics_to_monitor",
+    "risks_and_mitigation",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_15f42bae167f4f818ccdddd671bc2825"
+}

@@ -1,0 +1,35 @@
+{
+  "title": "gpu-driver-lib-sleuthing-log-2026-03",
+  "owner": "Ethan Zhao",
+  "drive_area": "users",
+  "path": "users/gpu-driver-lib-sleuthing-log-2026-03.docx",
+  "doc_type": "doc",
+  "created_at": "2026-03-11",
+  "last_modified": "2026-03-12",
+  "collaborators": [
+    "Maya Patel",
+    "Santiago Ruiz"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "gpu",
+    "cuda",
+    "driver",
+    "oom",
+    "container",
+    "ldconfig"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/2048",
+    "https://redwood.atlassian.net/browse/INF-1234",
+    "https://redwood.slack.com/archives/C01ABCDE/p1642000000000"
+  ],
+  "content": "Purpose:\\nQuick personal sleuthing log for the strange OOM / driver mismatch I hit on the device-sandbox yesterday. Intended as a timeline + commands tried + micro-hypotheses so I can hand off to infra or pick up later. Not exhaustive.\\n\\nContext / reproducibility:\\n- Host: ubuntu-22.04 (ec2 m6i-like dev nodes for local repro) with attached A100-40GB.\\n- Container base: nvidia/cuda:12.1.1-base-ubuntu22.04 -> but we also tried 11.8 variants.\\n- Framework: PyTorch nightly build pinned in container wheel. Repro is intermittent (fails after long warmup or under memory pressure).\\n- Symptoms: sudden CUDA OOM during KV cache growth (inference warmup). Sometimes container logs show libcuda link issues before OOM.\\n\\nObserved errors (snippets copied from logs):\\n- \\\"RuntimeError: CUDA out of memory. Tried to allocate 1.50 GiB (GPU 0; 40.00 GiB total capacity; 36.20 GiB already allocated; 512.00 MiB free; 36.85 GiB reserved in total by PyTorch)\\\"\\n- \\\"libcuda.so.1: cannot open shared object file: No such file or directory\\\" (only on a few nodes)\\n- \\\"cuda_driver: failed to initialize (UNKNOWN ERROR)\\\"\\n- \\\"E tensorflow/stream_executor/cuda/cuda_driver.cc:XXXX] failed call to cuInit: CUDA_ERROR_UNKNOWN\\\"\\n- \\\"undefined symbol: cuDevicePrimaryCtxRetain_v2\\\" (appears when mixing 11.x runtime with 12.x libcuda)\\n\\nCommands I ran (notes inline):\\n- nvidia-smi -> baseline GPU state and driver reported (Driver Version: 535.86, CUDA Version: 12.1)\\n- docker run --gpus all -it --rm --entrypoint bash nvidia/cuda:12.1.1-base-ubuntu22.04\\n  - inside container: ldconfig -p | grep libcuda  # check available libcuda symlinks\\n  - ldd /usr/local/cuda/lib64/libcudart.so | grep cuda  # see what libcudart is linked against\\n- dpkg -l | grep nvidia  # on host to check driver packaging\\n- ls -l /usr/lib/x86_64-linux-gnu/libcuda*  # confirm host libcuda presence and symlinks\\n- strace -f -e open,read -p <pid>  # attach during container start to see which lib path fails\\n- LD_DEBUG=libs python -c \\\"import torch; print(torch.version.cuda)\\\"  # to show loader resolution in runtime\\n\\nWhat I observed after runs:\\n- Containers using cuda:12.x images on hosts with older driver (e.g., 520.x) sometimes still work but hit subtle API mismatches when using new cuInit symbols.\\n- Some nodes had /usr/lib/x86_64-linux-gnu/libcuda.so.1 -> libnvidia-ml.so symlink missing. Kernel updates had left stale .so files.\\n- When we preloaded host libcuda into the container with --volume /usr/lib/x86_64-linux-gnu:/host-lib:ro and LD_PRELOAD=/host-lib/libcuda.so.1 the workload either: a) worked around missing link, or b) hit symbol mismatch (undefined symbol). So preloading is brittle.\\n\\nMicro-hypotheses (ranked):\\n1) Driver vs runtime mismatch: host driver is older/newer than the container CUDA runtime, causing missing symbols (cuInit_v2 vs cuInit) or incompatible expectations.\\n2) Partial upgrades left mixed libcuda variants on host (multiple versions present) and container picks wrong one via ldconfig path order.\\n3) Memory fragmentation (kvcache + model buffers) + driver memory accounting differences between driver versions leads to OOM only on some driver versions.\\n4) PyTorch or runtime bug that surfaces only when certain driver returns unexpected free mem values (e.g., returns smaller free memory and triggers aggressive reservation).\\n\\nQuick repro recipe (for infra to try):\\n1) On suspect node, run: docker run --gpus all -it --rm --entrypoint bash nvidia/cuda:12.1.1-base-ubuntu22.04\\n2) Inside: apt update && apt install -y psmisc strace lsof\\n3) pip install torch --extra-index-url https://download.pytorch.org/whl/nightly/cpu  # or use our wheel in artifacts\\n4) Run small script that grows KV cache gradually (attached below) until OOM and capture dmesg + container logs.\\n\\nAttached tiny test (paste into container as grow_kv.py):\\n-----\\nimport torch\\nfrom time import sleep\\nT = torch.empty((1024,1024,512), device='cuda:0')  # allocate chuncks repeatedly to simulate warmup\\nchunks = []\\ntry:\\n    for i in range(100):\\n        chunks.append(torch.empty((1024,256,256), device='cuda:0'))\\n        print(i, torch.cuda.memory_allocated(), torch.cuda.memory_reserved())\\n        sleep(0.5)\\nexcept Exception as e:\\n    print('fail', e)\\n-----\\n\\nLogs to collect when handing to infra:\\n- output of nvidia-smi -q -x\\n- /var/log/syslog and dmesg around time of failure\\n- docker inspect <container> (Env, mounts)\\n- LD_DEBUG output from failing python process\\n- ldd on relevant .so files inside container and on host\\n\\nWhat not to do (lessons learned):\\n- Avoid LD_PRELOAD host libcuda unless you fully control driver/runtime versions \u2014 it trades one failure for symbol mismatch.\\n- Don't mix vendor driver packages with custom installed .so copies in /usr/local. It confuses ldconfig.\\n\\nOpen questions / next steps:\\n- Can infra standardize on minimum driver version that supports runtime 12.1? (I think >= 525.x but need confirmation)\\n- Should we add a node-level probe that checks 'compatibility matrix' (host driver vs container runtime) and labels nodes for scheduling?\\n- Is there a PyTorch flag to reduce reservation behavior so we can avoid hitting fragmentation OOM while we patch drivers?\\n\\nTODOs for me:\\n- [ ] File INF ticket with host node IDs + logs (INF-1234 is placeholder)\\n- [ ] Try repro on an H100 node (different allocator behavior)\\n- [ ] Create a small script that checks libcuda symbol table (nm -D) and reports presence of cuInit_v2, cuDevicePrimaryCtxRetain_v2 etc.\\n\\nNotes to hand off:\\n- If you take this, start with the node that reported \\\"undefined symbol: cuDevicePrimaryCtxRetain_v2\\\" (node id in slack thread above). Collect 'ldd' on libcudart and libcuda in container and host.\\n- I left a copy of collected ldd outputs in the PR artifacts (link above).\\n\\nEnd of scratchpad.\\n\\n-- Ethan",
+  "original_location": "google_drive/users/gpu-driver-lib-sleuthing-log-2026-03.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_f8ce92dd6d4941dc9d8f8f24e3dd9d45"
+}

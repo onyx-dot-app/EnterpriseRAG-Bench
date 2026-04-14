@@ -1,0 +1,74 @@
+{
+  "key": "SUP-847362",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "SSE resume interleaves binary attachment frames with JSON delta on immediate client retry, resulting in truncated final payload",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Patel",
+  "assignee": "Diego Ramos",
+  "customer_company": "KiteAI Inc.",
+  "customer_tier": "enterprise",
+  "environment": "prod us-east",
+  "components": [
+    "streaming",
+    "api-gateway",
+    "client-sdk",
+    "serving-runtime"
+  ],
+  "labels": [
+    "sse",
+    "reconnect",
+    "partial-output",
+    "attachments",
+    "http2",
+    "investigation"
+  ],
+  "affected_models": [
+    "redwood-3b-v1",
+    "redwood-7b-v2"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "linked_issues": [
+    "SUP-847360",
+    "INT-1122"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/2891"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/Streaming+Resume+Runbook"
+  ],
+  "description": "Issue summary:\nCustomer reports truncated streaming responses and missing attachments when the client does an immediate reconnect (retry loop) after a short network hiccup. The client uses our SSE endpoint and sends an idempotency token; attachments (binary frames encoded as base64 envelope in our stream) are occasionally interleaved into the JSON delta stream on resume and the final JSON array is truncated by the client-side parser.\n\nImpact:\n- Intermittent data loss for long streaming responses that include attachments (images/embeds).\n- Customer-facing feature (real-time document generation) produces corrupted outputs ~2-3x/day for KiteAI in us-east.\n\nEnvironment:\n- Production (prod us-east).\n- KiteAI using our JS SDK v1.14.0 behind a corporate proxy + CloudFront in front of our API.\n- Client opens SSE, gets ~30s of stream, experiences a short transient (TCP reset), reconnects immediately with same session id and idempotency token.\n\nSteps to reproduce (as supplied by customer and reproduced in staging):\n1) Start a long generation that returns alternating JSON delta events and base64-encoded attachment envelopes.\n2) Mid-stream, induce a connection drop (tcpkill or simulate client network flap).\n3) Client performs immediate reconnect (no randomized backoff) and sends same session id + idempotency token.\n4) Observe resumed stream: some binary attachment frames appear between JSON array items. Client parser throws a JSON parse error or drops trailing array items.\n\nObserved behavior:\n- Resumed stream frequently includes small binary envelope chunks that are not correctly labeled as attachments (boundary markers dropped) and appear before the closing JSON array. The client-side parser sees a malformed JSON stream and stops processing; the final chunk(s) are not applied.\n- Server logs show two resume attempts for the same session within 100ms and duplicated system messages. Upstream (CloudFront) reports TLS record coalescing and HTTP/2 connection reuse for the same origin.\n\nExpected behavior:\n- Resume should preserve event boundaries: JSON deltas first, then attachment envelopes properly wrapped. Duplicate system messages should be deduplicated; final JSON array must not be truncated.\n\nRelevant logs / excerpts (sanitized):\n- client: \"SSE reconnect session=ks_72ef idempotency=tok-19 start=2026-03-09T22:15:03.123Z\"\n- gateway: \"incoming resume: session=ks_72ef from=203.0.113.45 via CloudFront-ELB\"\n- serving-runtime: \"write: delta[...]{JSON chunk} | write: attach[base64 chunk fragment] | write: delta[...]{JSON chunk}\"\n- client error: \"SyntaxError: Unexpected token B in JSON at position 13412\"\n\nNotes about uniqueness of this failure:\n- The issue appears when three conditions align: immediate client reconnect (no jitter), upstream connection coalescing (CloudFront/edge merges small TLS records), and mixed-surface responses (JSON delta + binary-style attachment envelopes). We have many SSE truncation reports; this one differs because the binary attachment fragment is being injected into the JSON stream (boundary marker lost), not simply missing final bytes.\n",
+  "comments": [
+    "2026-03-10 10:02 - Aisha Patel (Support): Initial triage done with KiteAI logs attached. Customer confirms they can reproduce reliably by toggling 'fastReconnect=true' in their SDK.",
+    "2026-03-10 11:45 - Diego Ramos (SRE): Reproduced in staging using tcpkill + no jitter. Observed coalesced TLS records when CloudFront-like proxy is enabled. Filed INT-1122 to look at gateway recordization behavior.",
+    "2026-03-10 14:20 - Ben Zhou (SDK): Confirmed SDK v1.14.0 sends immediate reconnect without jitter when fastReconnect flag is set; adding 200-500ms backoff reduces failure frequency dramatically in our tests.",
+    "2026-03-11 09:33 - SRE Team (Automated): Added Grafana dashboard link: https://grafana.redwood.internal/d/streams/resume-errors (error spike at 2026-03-09T22:15UTC).",
+    "2026-03-11 13:02 - Diego Ramos (SRE): Attempted patch to gateway that preserves boundary markers across write coalescing; pushed canary to staging (serving-runtime PR #2891). Observed reduced incidence but not eliminated when CloudFront is in the path.",
+    "2026-03-12 08:55 - Customer (KiteAI): Applying client-side workaround for now (enable reconnectBackoff setting). Will monitor and report if any residual errors after server patch rollouts.",
+    "2026-03-12 12:30 - Diego Ramos (SRE): Rolling patch to api-gateway globally in us-east; monitoring metrics. Follow-up: will add stricter idempotency dedupe logic in-serving runtime (see PR link)."
+  ],
+  "investigation_notes": "Hypothesis: Upstream (CloudFront / corporate proxy) is combining small write fragments into fewer TLS records during the reconnect handshake. Our streaming stack relies on explicit boundary markers between JSON events and attachment envelopes; when record coalescing occurs, the gateway path occasionally drops or merges the boundary token (\"--ATTACH--\") into the previous TLS fragment. On immediate reconnects, the server replay/resume code path does a fast-forward of buffered fragments which exposes the merged binary fragment in the middle of a JSON array.\n\nWhat we tested:\n- Reproduced in staging with CloudFront-like proxy and no reconnect jitter.\n- Confirmed that toggling client-side reconnectBackoff to 200-500ms reduces failure rate.\n- Canary gateway change that disables record coalescing of small writes reduced, but didn't eliminate failures when CloudFront is present.\n- Confirmed that inserting an explicit escape wrapper around attachments prevents the client parser from failing (temporary mitigation).\n\nNext investigation steps:\n- Add server-side resume reassembly guard to enforce event-boundary checks before emitting to clients.\n- Add deduplication on duplicate system messages for same session id within 500ms window.\n- Engage CDN/CloudFront engineers to check configuration that might cause TLS record coalescing for small writes.",
+  "resolution": "Workaround provided to customer: enable reconnectBackoff (200-500ms) in SDK and set stream.attachBoundaryStrict=true to preserve envelope markers.\n\nFix work completed / rollout notes:\n- PR #2891 (serving-runtime): added boundary-preservation layer in api-gateway that marks attachment envelopes and refuses coalescing rewrite. Canary rolled in staging 2026-03-11.\n- PR #2903 (serving-runtime): added resume sanity-check to drop out-of-order binary envelopes and log a resume-mismatch (deployed to us-east on 2026-03-12 11:00 UTC).\n- Added short client-side dedupe window to ignore duplicate system messages for same session (SDK v1.14.1 issued to KiteAI).\n\nStatus: Patch rolled to prod us-east; monitoring metrics. Customer reports no new truncation incidents in 24h after rollout and client-side workaround.\n\nFollow-ups / action items:\n- Engineering: add unit/integration test for mixed JSON+attachment resume scenarios (owner: serving-runtime team).\n- Ops: monitor Grafana panel for replay errors and resume-mismatch logs for next 7 days (owner: SRE).\n- Product: document reconnectBackoff recommendation in SDK quickstart for streaming heavy-attachment workloads.",
+  "final_notes": "This ticket documents a corner-case resume race where upstream TLS/HTTP/2 coalescing combined with immediate client reconnects can surface binary envelope fragments inside JSON streams. Root cause is a combination of network path behavior + resume reassembly assumptions. Mitigations applied across SDK, gateway, and serving runtime. Recommend including reconnect jitter as a best practice in SDK defaults for streaming endpoints.",
+  "attachments": [
+    "kiteai_stream_sample_2026-03-09.log",
+    "staging_repro_script.sh"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution",
+    "final_notes"
+  ],
+  "dataset_doc_uuid": "dsid_5f9a2a7be093467da1b606a1579bc67f"
+}

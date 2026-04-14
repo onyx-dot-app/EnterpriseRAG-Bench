@@ -1,0 +1,97 @@
+{
+  "repo": "redwood",
+  "pr_number": "28502",
+  "title": "Fix race in rollout step transitions that can double-execute rollback",
+  "author": "Jada Williams",
+  "created_at": "2026-02-23",
+  "updated_at": "2026-02-26",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "bugfix/rollouts-step-transition-race-idempotency",
+  "merged_at": "2026-02-26",
+  "merge_method": "squash",
+  "reviewers": [
+    "Ethan Park",
+    "Jordan Lee",
+    "Rafael Mendes",
+    "Chloe Martin"
+  ],
+  "labels": [
+    "rollouts",
+    "control-plane",
+    "reliability",
+    "bug",
+    "sre-reviewed"
+  ],
+  "linked_linear": [
+    "ENG-4829",
+    "ENG-4821",
+    "ENG-4861"
+  ],
+  "linked_jira": [
+    "SUP-19422"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "14",
+  "additions": "312",
+  "deletions": "97",
+  "breaking_change": "false",
+  "description": "Context: While wiring SLO-driven auto actions into the rollout controller, we observed occasional duplicate rollback execution in staging when the controller received concurrent signals (SLO evaluator tick + manual pause/rollback request, or duplicate queue deliveries). The symptom was two rollback executors attempting to revert the same rollout step, producing: (a) duplicate audit events, (b) traffic split \u201cthrash\u201d (two sequences of step-downs), and (c) occasional terminal state mismatch (rollout marked ROLLED_BACK while the step transition record was still in PROGRESS). Root cause: Step transitions were not guarded by a single-writer constraint. The controller\u2019s state machine allowed two goroutines to pass the precondition checks (\"step is eligible to transition\") before either persisted the new step state, because step status and rollout version were read outside a transaction and the executor call was launched before we had a durable transition token. Fix: 1) Add a per-rollout transition lock implemented as a DB-backed compare-and-swap (CAS) on (rollout_id, step_id, transition_seq). We now acquire a transition lease row (rollout_step_transitions) using INSERT ... ON CONFLICT DO NOTHING, and treat the resulting transition_id as the single durable token for the rest of the transition. 2) Make rollback execution idempotent by requiring an action_id (transition_id) and recording executor progress in rollout_action_executions with a UNIQUE(rollout_id, action_id, action_type). Re-entrancy becomes a no-op and returns the previously computed result. 3) Move state updates to a transaction that (a) verifies the expected step_state + rollout_generation, (b) writes transition record, (c) sets step_state=TRANSITIONING with transition_id, and only then enqueues executor work referencing transition_id. 4) Add explicit handling for retry/replay: if we see step_state=TRANSITIONING with an active transition_id, we return \"already transitioning\" and do not schedule a second executor job. 5) Add targeted metrics + logs: rollout_step_transition_conflict_total, rollout_action_idempotent_replay_total, and structured log fields rollout_id/step_id/transition_id for correlation with the new audit stream. Testing: Added unit tests for CAS contention, executor idempotency, and transition replay; added a staging simulation test that sends concurrent \"auto-rollback\" and \"manual rollback\" requests and asserts only one transition + one executor run occurs. Rollout impact: This is a correctness fix that reduces the probability of traffic split oscillation and duplicate rollback actions under load. No API changes. References: Found while testing auto-rollback SLO integration; ties directly to staging findings from SUP-19422-like scenario and the controller hook work in pr-28411/pr-28444.",
+  "commits": [
+    "rollouts/controller: introduce transition_id and DB lease acquisition for step transitions",
+    "rollouts/executor: add idempotency table + UNIQUE constraint on (rollout_id, action_id, action_type)",
+    "rollouts/controller: wrap step state updates + enqueue in a single transaction with generation check",
+    "tests: concurrent transition simulation + replay/idempotency unit tests",
+    "obs: add conflict/replay counters and structured logs for transition correlation"
+  ],
+  "files_changed": [
+    "services/rollouts/controller/step_transitions.go (acquireTransitionLease, transactional state update, replay guard)",
+    "services/rollouts/controller/rollout_state_machine.go (use transition_id token, avoid launching executor pre-commit)",
+    "services/rollouts/executor/rollback_executor.go (idempotent execution keyed by transition_id)",
+    "services/rollouts/store/migrations/20260223_add_rollout_step_transitions_and_action_executions.sql (new tables + UNIQUE constraints)",
+    "services/rollouts/store/rollouts_repo.go (CAS helpers, generation checks)",
+    "services/rollouts/telemetry/metrics.go (new counters + labels)",
+    "services/rollouts/controller/step_transitions_test.go (CAS contention + replay cases)",
+    "services/rollouts/executor/rollback_executor_test.go (idempotency + retry behavior)",
+    "services/rollouts/integrationtests/concurrent_rollback_transition_test.go (staging-style concurrency test)"
+  ],
+  "ci_checks": [
+    "build (linux/amd64): pass",
+    "unit tests: pass",
+    "integration tests: pass",
+    "lint: pass",
+    "db-migration-check: pass",
+    "race (go test -race subset): pass"
+  ],
+  "conversation": [
+    "Ethan Park (review): Can you clarify whether the transition lease is per-rollout or per-step? I\u2019m worried about serializing unrelated steps if we ever run multi-step operations in parallel.",
+    "Jada Williams (author): Lease is per (rollout_id, step_id). The table key is (rollout_id, step_id, transition_seq) and we only acquire for the specific step being mutated. We still effectively have single-writer per step, not global per rollout. If later we parallelize across steps, we won\u2019t block.",
+    "Jordan Lee (review): The generation check looks right, but are we guaranteed generation increments on every state change? If not, CAS might not prevent the double enqueue.",
+    "Jada Williams (author): Good catch. Previously generation was only bumped on step boundary changes. This PR bumps rollout_generation whenever step_state transitions into TRANSITIONING and when it leaves TRANSITIONING. That makes stale readers fail the txn precondition. Added a test: \"stale generation cannot enqueue second executor\".",
+    "Rafael Mendes (SRE review): What happens when DB is slow and controller retries? Could we get stuck in TRANSITIONING if the executor job is lost?",
+    "Jada Williams (author): If enqueue fails after the transaction commits, we leave the step in TRANSITIONING with transition_id and rely on the controller periodic reconciler to re-enqueue by transition_id (idempotent). Added explicit path: if step_state=TRANSITIONING and last_executor_heartbeat is missing/old, we re-enqueue. (Reconciler already existed; now it is safe.)",
+    "Chloe Martin (review): Please add an audit correlation field so Console can dedupe events if something still replays.",
+    "Jada Williams (author): Added transition_id to the controller structured logs + metric labels, and to the internal action context passed to the audit emitter (no schema change here, but the event will carry the same correlation_id we use elsewhere). Follow-up in the audit-stream PR will map it to the final event schema.",
+    "Ethan Park (review): DB migration adds two new tables; any retention / cleanup plan?",
+    "Jada Williams (author): action_executions is bounded by rollout retention; we already GC rollout records after N days depending on environment. step_transitions is same. Added indexes only on the lookup patterns we use (rollout_id, step_id, transition_id).",
+    "Jordan Lee (review): One more request: can we return the previous executor result on replay rather than just \"ok\"?",
+    "Jada Williams (author): Done. rollback_executor now reads the existing execution row and returns the stored outcome + timestamps. That helps reconciler and audit emitter produce consistent events.",
+    "Rafael Mendes (approve): Approving from SRE side. This reduces the blast radius of auto actions and should prevent the traffic split thrash we saw in staging.",
+    "Ethan Park (approve): Approved. Thanks for tightening the transaction boundary + moving enqueue post-commit.",
+    "Chloe Martin (approve): Approved."
+  ],
+  "release_notes": "Internal: Fixes a race condition in rollout step transitions that could cause rollback execution to run twice under concurrent triggers or retries; adds transition lease + idempotent rollback execution keyed by transition_id.",
+  "related_links": [
+    "Linear: ENG-4829 (rollback executor idempotency and safety)",
+    "Linear: ENG-4821 (rollout controller SLO evaluator hook)",
+    "PR: pr-28411-rollout-controller-hook-slo-evaluator",
+    "PR: pr-28444-rollback-executor-revert-traffic-split-safely"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "conversation",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_4856d1d79a5a4e2d9bdf82f2d0e13ec1"
+}

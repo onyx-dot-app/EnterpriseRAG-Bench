@@ -1,0 +1,79 @@
+{
+  "key": "ENG-821555",
+  "team": "engineering",
+  "title": "Client Seal + Affinity Ledger: optimistic ingest reservation to prevent duplicate billing",
+  "status": "Planned",
+  "priority": "P0",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-10",
+  "creator": "Aisha Patel",
+  "assignee": "Marco Chen",
+  "project": "metering-hardening",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-04-07",
+  "labels": [
+    "billing",
+    "idempotency",
+    "rate-limiting",
+    "quota",
+    "runtime"
+  ],
+  "dependencies": [
+    "ENG-74211",
+    "ENG-412345"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.20",
+  "security_review_required": "true",
+  "description": "Problem: Intermittent client/network timeouts + at-least-once ingestion semantics lead to duplicate metered charges when retried requests are accepted and counted by the ingest pipeline. Existing approaches (opaque replay tokens, client-side dedupe windows, server dedupe heuristics) reduce but do not eliminate race conditions across proxies, LB failovers, and multi-region failback. Goal: design and implement a practical, low-latency protocol that prevents duplicate billing in common retry/timeouts without adding large coordination bottlenecks or single-point commits.\n\nProposal summary: Introduce a short-lived client-generated \"seal\" (a compact signed token) combined with a per-customer affinity ledger on the ingest frontier. The flow: 1) Client generates a seal per logical request (deterministic nonce + timestamp + client-id) and attaches it as X-Redwood-Seal header; 2) Edge/ingest node attempts an optimistic reservation in the local affinity ledger (idempotent upsert keyed by customer+seal) with state=reserved; 3) The ingest continues through normal pipeline; on success the ingest frontier atomically commits the ledger entry -> state=committed; 4) On transient failure the client retries with the same seal; edge checks the ledger and either returns previous outcome (if committed) or reacquires reservation if previous reservation expired; 5) Periodic reconciliation sweep resolves stale reservations (reserved -> cancelled after TTL + backoff).\n\nKey properties: low-latency (local affinity ledger avoids cross-region sync on the fast path), strong duplicate-suppression for typical retry patterns, bounded memory/disk lifetime via TTL and background sweeps, compatibility fallback for legacy clients (no seal => keep current behavior).\n\nWhy this over global sequencer or fully synchronous ledger: global coordination adds end-to-end latency and availability constraints. A local optimistic reservation with deterministic client seal achieves most of the duplicate-suppression benefit with minimal coordination; reconciliation handles rare split-brain cases.\n\nAPI/SDK changes: add optional X-Redwood-Seal header. SDK helpers to create seals (signed with client SDK key or HMAC using api-key prefix). Provide language-specific helper that produces stable seals for retries. Document header semantics and TTL expectations.",
+  "comments": [
+    "2026-03-02: Initial write-up and whiteboard session. Decided to favor optimistic local ledger over global sequencing after perf numbers from microbenchmarks (see PR-branch).",
+    "2026-03-04: Engineering design review notes: need clear ownership of ledger garbage collection; suggested states: reserved, committed, cancelled, tombstone. Agreed to use a small write-ahead-log per affinity shard for crash-safety.",
+    "2026-03-05: Trade-offs discussed with Product (Lara Gomez): P0 because customers have surfaced double-charge incidents. Product asks for a telemetry plan and migration timeline for Dedicated/Private customers.",
+    "2026-03-06: Security reviewed basic seal format. Action item: require HMAC using the existing API key secret, and add replay TTL enforcement. Security: avoid exposing per-request HMAC key in logs. See security note: https://confluence.redwood/secure/seal-format (internal).",
+    "2026-03-07: Implementation spike: built affinity ledger prototype in rust-edge with local RocksDB store per shard. Benchmarks: median reserve latencies 1.8ms additional on ingest path, p95 ~4.5ms. PR: https://github.com/redwood-inference/edge/pull/1832 (prototype).",
+    "2026-03-08: Observability plan: add metrics: seal_reserve_attempts, seal_reserve_hits, seal_reserve_conflicts, seal_commit_latency, seal_reconciliation_actions. Dashboards: /dashboards/metering/seal-ledger-overview. Alert: >0.1% unexpected double-counts per 10k requests triggers pager.",
+    "2026-03-09: Compatibility: will continue to honor existing dedupe heuristics for legacy clients. SDK rollout: default new SDK versions will enable seals; server will reject malformed seals with 400 and accept without header for opt-out. Backwards-compat path documented in RFC-633 (link: https://docs.redwood/ingest/seals-rfc).",
+    "2026-03-10: Migration plan: stage 1 (canary): enable seal support read-path on runtime-1.20 in region us-west-2 for 3 internal customers; stage 2: enable write-path + reconciliation for 50% traffic; stage 3: gradual ramp + customer opt-in. Rollback: feature flag disables seal-reservation atomically."
+  ],
+  "acceptance_criteria": [
+    "New header X-Redwood-Seal accepted by edge; idempotent reservation created on affinity ledger for seal key.",
+    "Committed ingests with seals result in ledger entries moved to committed within <1s in 99% of cases.",
+    "Retries with identical seal do not produce additional meter charges (observed via integration test harness and synthetic workload).",
+    "Reconciliation sweep cancels stale reserved entries after TTL and produces audit records for manual review.",
+    "Telemetry dashboards and alerts are in place and tested with canary customers.",
+    "SDK helpers published for JS/Python/Go and documented examples added to quickstart."
+  ],
+  "implementation_notes": [
+    "Affinity ledger sharding: shard by customer-id % N where N = number of leader shards in region; keep shard map small and stable during rollout.",
+    "Reservation latency optimization: use local WAL+memtable then background flush; WAL fsync on reserve is optional for performance but required for strict correctness in Dedicated mode (configurable).",
+    "Clock skew handling: include client_ts in seal, but rely on server wall time for TTL expiry; accept +/- 5s skew margin to avoid false cancellations.",
+    "Quota interactions: reservation consumes a provisional quota unit. If reservation later cancelled, provisional consumption is released. Implement provisional counters namespace to avoid double counting with committed counters.",
+    "Backpressure: when affinity shard is overloaded, respond with 429 instructing client to jitter-retry; do not fall back to accepting duplicates silently.",
+    "Testing: unit, fuzz tests for seal parsing, chaos tests simulating partition + retries, end-to-end metering verification against golden dataset."
+  ],
+  "risks_and_mitigation": [
+    "Risk: affinity shard outage causing increased 429s -> mitigation: fast fallback path to best-effort dedupe but alert and auto-scale shards.",
+    "Risk: mis-signed/malicious seals may attempt denial-of-service; mitigation: per-customer seal ratelimits and cheap HMAC verification path with token bucket.",
+    "Risk: edge storage growth -> mitigation: TTL + aggressive reconciliation + compact tombstone policy, monitor seal-ledger-size metric.",
+    "Risk: billing regressions during migration -> mitigation: dual-write shadow ledger and compare counts for 48h, plus manual audit hooks."
+  ],
+  "next_steps": [
+    "Finish WAL durability options PR and decide default for Hosted vs Dedicated (action owner: Marco Chen, due 2026-03-15).",
+    "Add provisional quota counters implementation (owner: Priya Nair, estimate: 3).",
+    "Publish SDK helpers and example for Node/Python (owner: Daniel Ortiz, due 2026-03-22).",
+    "Create canary plan and contact two customers for early opt-in (owner: Lara Gomez, PM).",
+    "Open infra task to create reconciliation K8s CronJob with scaling and backoff (owner: SRE team)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "acceptance_criteria",
+    "implementation_notes",
+    "risks_and_mitigation",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_3b30ebc395b8447ea4c74634f8836cc5"
+}

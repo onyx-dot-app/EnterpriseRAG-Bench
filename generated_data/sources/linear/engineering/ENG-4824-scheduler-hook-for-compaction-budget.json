@@ -1,0 +1,62 @@
+{
+  "key": "ENG-4824",
+  "team": "engineering",
+  "title": "Scheduler hook for KV compaction budgeting at prefill/decode boundaries",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2026-01-13",
+  "updated_at": "2026-02-11",
+  "creator": "Talia Benson",
+  "assignee": "Sofia Ivanova",
+  "project": "KV cache compaction improvements",
+  "cycle": "2026-W04",
+  "estimate": "5",
+  "due_date": "2026-02-07",
+  "release": "runtime-1.22",
+  "customer_impact": "high",
+  "labels": [
+    "serving-runtime",
+    "scheduler",
+    "kv-cache",
+    "compaction",
+    "tail-latency",
+    "perf",
+    "feature-flag"
+  ],
+  "parent_issue": "ENG-4821",
+  "dependencies": [
+    "ENG-4823",
+    "ENG-4822"
+  ],
+  "links": [
+    "GitHub PR: sources/github/redwood/pr-19371-scheduler-integration-compaction-budget.json",
+    "Design doc: sources/confluence/eng-serving-runtime/kernel-and-scheduling/kv-cache-compaction-design.json",
+    "ADR: sources/confluence/architecture-and-standards/decision-records/adr-kv-cache-compaction-budgeting.json",
+    "Perf canary scenario: sources/linear/engineering/ENG-4828-perf-canary-scenario-mixed-length-bursts.json"
+  ],
+  "body": "## Context\nWe\u2019re adding KV cache compaction to reduce fragmentation and burst-driven tail latency. A recurring failure mode in early prototypes was *scheduler-visible latency spikes* when compaction work lands on the hot path during decode (especially under mixed-length + high churn).\n\nThis ticket integrates compaction budgeting into the runtime scheduler so compaction work is:\n- predictable (bounded per scheduling loop / per request step)\n- aligned with natural boundaries (prefill vs decode) to avoid stalling token generation\n- observable and controllable (budgets, kill-switch, metrics)\n\n## Problem statement\nToday the scheduler has no explicit \u201cbudget gate\u201d for memory maintenance work.\n- Compaction worker can opportunistically move pages when fragmentation triggers, but without scheduler awareness it may run during decode steps.\n- Decode stalls propagate into p95/p99 (and in practice show up as multi-tenant tail spikes during bursts).\n\nWe need a scheduler-level API to:\n1) allocate a small compaction budget at safe times\n2) strictly disallow compaction past the budget once decode is in progress (unless we are in a degraded/overload path where we\u2019re already shedding)\n\n## Proposal (implementation)\n### 1) Add a scheduler-owned compaction budget object\n- Budget is represented in both:\n  - `max_bytes_to_move` (hard cap)\n  - `max_time_us` (optional secondary cap to prevent long copy loops)\n- Budget resets at deterministic points in the scheduler loop.\n\n### 2) Enforce budgets at prefill/decode boundaries\nHook points:\n- **End of prefill batch (preferred):** after we finish prefill compute and before we enqueue decode steps for newly admitted sequences.\n- **Between decode micro-batches:** only allow extremely small \u201cmaintenance slice\u201d if the scheduler is idle waiting for kernels / if there is slack; default = 0 for Hosted.\n\nDefault behavior by phase:\n- Prefill phase: allow compaction with configured budget.\n- Decode phase: disallow compaction by default; only allow if `allow_decode_compaction=true` *and* scheduler reports slack *and* overall queue depth is below a threshold.\n\n### 3) Budget source + config knobs\nBudget parameters come from runtime config (feature-flagged):\n- `kv_compaction.enabled`\n- `kv_compaction.budget.prefill_bytes`\n- `kv_compaction.budget.prefill_time_us`\n- `kv_compaction.budget.decode_bytes` (default 0)\n- `kv_compaction.budget.decode_time_us` (default 0)\n- `kv_compaction.scheduler.max_budget_per_loop_bytes` (guardrail)\n\n### 4) Backpressure integration (minimal for this ticket)\nIf allocator is in \u201cnear-OOM / high fragmentation emergency\u201d state, scheduler should:\n- surface a reason code in logs/metrics (e.g., `compaction_emergency=true`)\n- optionally trigger eviction path (not implemented here; see ENG-4825)\n\n### 5) Observability requirements\nEmit (or ensure emitted) metrics tagged by phase:\n- `kv_compaction_budget_bytes_total{phase=prefill|decode}`\n- `kv_compaction_bytes_moved_total{phase=...}`\n- `kv_compaction_budget_exhausted_total{phase=...}`\n- `kv_compaction_time_us_total{phase=...}`\n\nAdd trace spans around budgeted compaction sections (if tracing already exists, ensure phase tag is included).\n\n## Acceptance criteria\n- No compaction work runs during decode by default (Hosted defaults), verified via counters/spans.\n- Under mixed-length burst scenario (perf-canary), p99 regression is <= 1% vs baseline with compaction disabled, while fragmentation improvements are still observed over a multi-minute run.\n- Budget enforcement is strict: bytes moved never exceed budget + small constant overhead (accounting for page granularity).\n- Kill-switch / config can disable scheduler-triggered compaction without restart.\n\n## Testing plan\n- Unit tests:\n  - budget accounting (bytes/time caps)\n  - phase gating correctness (prefill allowed, decode blocked)\n- Integration tests:\n  - long-lived sequences + churn: ensure decode remains stable, budgeted compaction executes only at prefill boundaries\n  - cancellation during relocation should not deadlock scheduler (edge case tracked separately; see follow-ups)\n- Perf validation:\n  - run benchmark-lab mixed-length generator and perf-canary scenario; compare p95/p99 + throughput\n\n## Risks / gotchas\n- Prefill boundary might be too late if fragmentation spikes mid-decode (emergency path). We should ensure emergency signals are visible even if we choose not to compact in decode.\n- If prefill batches are rare (steady decode), compaction may make slower progress; may require background compaction later, but still budgeted.\n\n## Scope\nIN SCOPE:\n- scheduler hooks + budget object + phase gating\n- config wiring for budgets\n- metrics / spans necessary to prove gating\n\nOUT OF SCOPE:\n- eviction selection logic (ENG-4825)\n- UI in Console\n\n## Rollout notes\n- Start with internal canary pools with conservative budgets.\n- Hosted: decode budgets remain 0 until SRE sign-off.\n- Dedicated: may allow small decode budgets only after data shows no tail regression.\n\n## Definition of done\n- PR merged with tests\n- Perf runs attached in comments\n- Default config agreed with SRE/PM for runtime-1.22 canary",
+  "comments": [
+    "2026-01-14 \u2014 Sofia Ivanova: Drafted scheduler hook points. Strong preference: run compaction slice only at end-of-prefill. Decode gating will default to hard off. Need input from Omar on whether compaction progress is acceptable when prefill is low-frequency.",
+    "2026-01-16 \u2014 Omar El-Sayed: Agree with end-of-prefill as primary hook. For long-lived decode-only workloads we may not make progress; that\u2019s acceptable for v1 as long as fragmentation doesn\u2019t worsen. Please emit a metric for \u201ccompaction starvation\u201d (budget offered but 0 opportunities) so we can see this in prod.",
+    "2026-01-18 \u2014 Sean Gallagher: For Hosted rollout, decode compaction must be 0 by default. Guardrail: if `kv_compaction_bytes_moved` correlates with p99 spikes during canary, we need quick kill-switch. Please make budget gating visible in traces (phase tag is enough).",
+    "2026-01-23 \u2014 Julian Moore: Scheduler loop already has a natural prefill->decode transition; added callback seems straightforward. Watch out: prefill can overlap with decode in current pipeline mode; ensure we tag phase based on request state, not global mode.",
+    "2026-01-28 \u2014 Sofia Ivanova: Implemented budget struct + phase gating. Added counters `budget_exhausted_total` and `budget_bytes_total` tagged by phase. Decode budget defaults to 0. Need perf run with mixed-length bursts after rebase on allocator PR.",
+    "2026-02-03 \u2014 Marcus Reed: Ran perf-canary scenario locally (A100, mixed-length bursts). With prefill-only compaction budget 64MB/loop: throughput -0.2%, p99 +0.4% (within tolerance). Fragmentation ratio improved ~18% over 10 min. Attaching run ID: benchlab-2026-02-03-mlb-17.",
+    "2026-02-06 \u2014 Sofia Ivanova: Opened PR for review. Remaining: add a starvation metric (count loops where compaction wanted but phase gating blocked).",
+    "2026-02-08 \u2014 Allison Grant: Please standardize metric names to match metrics standard doc. Also add phase label enum exactly `{prefill,decode}` (no `prefill_end` etc).",
+    "2026-02-10 \u2014 Sofia Ivanova: Updated metrics naming/labels, added starvation counter. PR approved by Omar + Sean pending CI green.",
+    "2026-02-11 \u2014 Connor O'Brien: Merged into runtime-1.22 train behind feature flag. Release note will mention default decode budget = 0 for Hosted. Marking ticket done."
+  ],
+  "follow_ups": [
+    "ENG-4825 \u2014 ensure eviction triggers integrate cleanly with scheduler emergency state",
+    "ENG-4828 \u2014 verify perf-canary thresholds reflect new metrics and phase gating",
+    "Add runbook note: decode compaction remains off by default; enabling requires SRE approval (runtime-1.22 canary)"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "comments",
+    "follow_ups"
+  ],
+  "dataset_doc_uuid": "dsid_a5370563f60d4cdc8f81bb5341c35270"
+}

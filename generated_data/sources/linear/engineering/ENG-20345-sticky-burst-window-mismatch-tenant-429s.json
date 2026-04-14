@@ -1,0 +1,115 @@
+{
+  "key": "ENG-20345",
+  "team": "engineering",
+  "title": "sticky-burst-window-mismatch-causing-intermittent-tenant-429s",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-14",
+  "creator": "Asha Patel",
+  "assignee": "Sameer Khatri",
+  "project": "serving-reliability",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "hosted",
+    "dedicated",
+    "private",
+    "rate-limiting",
+    "p0-escalation"
+  ],
+  "dependencies": [
+    "ENG-18903"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-2026.03",
+  "security_review_required": "false",
+  "description": "Multiple customers across Hosted, Dedicated, and Private reported short-lived but high-volume 429 bursts during peak traffic windows. Symptoms include opaque 429 responses with X-Rate-Limit headers showing remaining=0 while dashboards show quota still available. The produced outage pattern is: after a leader node failover or autoscaler shift, certain tenants experience a stream of 429s for 30s-3min and then recover. This ticket captures investigation, mitigation, and the patch to prevent recurrence.",
+  "observed_impact": [
+    "Service: generation endpoints returned 429 for ~20-120s for affected tenants",
+    "Affected: a mix of Hosted trial users and 3 Dedicated customers (non-prod load tests) and one Private deployment (customer-managed cluster)",
+    "User-visible: failed requests, client retries, and some downstream timeouts; spike in support escalations and SLO alerts"
+  ],
+  "reproduction_steps": [
+    "1) Warm tenant with sustained qps to create non-zero burst tokens",
+    "2) Trigger leader failover (kill serving leader or simulate node preempt) or trigger autoscaler relocation",
+    "3) Immediately send concurrent requests that collectively exceed per-tenant burst allowance",
+    "4) Observe 429s for the next 30-180 seconds with tokens showing zero in response headers despite quota dashboard showing allowance"
+  ],
+  "root_cause_summary": "A mismatch in burst-window state between components: the rate limiter cache (in-memory) and the cross-node burst metadata (Redis) used different window boundaries after failover and applied dedup logic incorrectly. Two contributing factors: clock alignment assumptions in the in-process cache (rounded by seconds) vs Redis stored window IDs (microsecond precision), and a regression from change that attempted to optimize burst reconciliation by early-evicting stale leases. Combined, these produced 'sticky zero' state where a tenant's burst tokens were marked drained on followers even after Redis indicated availability.",
+  "detailed_root_cause_facts": [
+    "Cache eviction PR #1224 introduced an early-evict path that did not update the redis version token on leader handoff",
+    "Leader->follower handoff path expects a redis lease refresh but code path short-circuited when queue depth > threshold",
+    "Clock skew between nodes (<=250ms) caused different window rounding and incorrect window_id comparisons leading to 'mismatched window' branch being taken more often under load",
+    "Private deployment had older rate-limiter config (refresh_interval=15s) exposing the race more often than hosted (refresh_interval=5s)"
+  ],
+  "temporary_mitigations_applied": [
+    "Rolled back early-evict optimization on runtime hosts in Hosted (reverted commit runtime/1234) \u2014 immediate reduction in incidents",
+    "Increased burst window tolerance on Dedicated pools and instructed Dedicated ops to increase per-tenant burst allowance by 20% as stopgap",
+    "For Private customer, provided a hotfix script to align refresh_interval and restart coordinator agents during off-peak window",
+    "Opened an incident Slack channel (#incident-ENG-20345) and notified oncall teams and affected customers with status and ETA"
+  ],
+  "proposed_fix": [
+    "1) Canonicalize window_id generation to use service-wide monotonic window epoch and microsecond granularity; enforce via a single helper in rate-limiter module",
+    "2) Make burst state updates atomic using Redis CAS (WATCH/MULTI or a versioned hash) so leader handoff always writes a new version visible to followers",
+    "3) Remove short-circuit path in leader->follower handoff and add exponential backoff with jitter for lease refresh to avoid contention under load",
+    "4) Add defensive fallback: if in-memory cache disagrees with Redis by more than one window, prefer Redis but return a soft-limit (quota-warn) header instead of hard 429 for 10s to allow graceful recovery",
+    "5) Add feature flag to toggle the new reconciliation behavior per-deployment (hosted default ON, dedicated/private off until validated)"
+  ],
+  "implementation_notes": [
+    "Patch targets: rate_limiter/{cache,redis_lease}. Go + C bindings in runtime-host",
+    "Expected code changes ~220 LOC across 6 files plus tests",
+    "Include integration test that simulates leader handoff and concurrent requests verifying no 429s and window convergence",
+    "Add observability: metric 'burst_window_mismatch_events' and trace span for 'burst_reconcile' with tags {tenant, node_role}"
+  ],
+  "rollout_plan": [
+    "Canary deploy fix to 5% of hosted capacity during low-traffic window (UTC 02:00-04:00)",
+    "Run synthetic load for 30m with leader failover exercises in canary",
+    "If stable for 2 hours, progress to 50% then full rollout over 6 hours",
+    "Dedicated: schedule manual upgrade with customer ops assistance; start with one Dedicated cluster in staging",
+    "Private: provide patch bundle and migration guidance; require coordinated downtime window for older-managed clusters"
+  ],
+  "testing_and_validation": [
+    "Unit tests for window_id helper and CAS update logic",
+    "Integration test harness that runs leader failover and asserts zero persistent 429s",
+    "Load test: replicate customer pattern (burst + failover) at 2x observed QPS for 20 minutes",
+    "Security review: confirm Redis CAS use doesn't expose new attack surface",
+    "SLO smoke checks: latency and error budget monitored for 24h post-rollout"
+  ],
+  "postmortem_actions": [
+    "Document design rationale and debug checklist in Confluence (link in 'links')",
+    "Ship metric + dashboard for immediate detection of mismatch events and alerting thresholds",
+    "Add e2e scenario to periodic chaos testing that includes leader preemptions and burst traffic",
+    "Follow-up project to harmonize rate-limiter config defaults across Hosted/Dedicated/Private"
+  ],
+  "links": [
+    "https://github.com/redwood-inference/runtime/pull/1309 (work-in-progress PR)",
+    "https://dashboard.redwood.ai/d/alerts/incident-ENG-20345 (incident dashboard)",
+    "https://confluence.redwood.ai/display/INF/ENG-20345+-+Burst+Reconciliation+Design",
+    "https://github.com/redwood-inference/runtime/commit/commit-rollback-1234"
+  ],
+  "comments": [
+    "2026-03-10 Asha Patel: Ticket created after P0 escalations from support during peak window. Initial triage assigned to Sameer.",
+    "2026-03-11 Sameer Khatri: Reproduced locally with leader kill. Observed window_id mismatch and redis version delta. Started rollback of early-evict on canary hosts.",
+    "2026-03-12 Ops: Rolled back change in Hosted canary (runtime/commit-rollback-1234). Incidents decreased by 70% for affected tenants.",
+    "2026-03-13 Sameer Khatri: Drafted atomic CAS patch and added integration test harness. Need infra approval for new Redis key patterns.",
+    "2026-03-14 PM outreach: Notified Dedicated customers of planned maintenance windows and provided mitigation steps for Private deploys. Preparing rollout calendar."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "observed_impact",
+    "reproduction_steps",
+    "root_cause_summary",
+    "detailed_root_cause_facts",
+    "temporary_mitigations_applied",
+    "proposed_fix",
+    "implementation_notes",
+    "rollout_plan",
+    "testing_and_validation",
+    "postmortem_actions",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_413f82095d34433d9986519c31751f74"
+}

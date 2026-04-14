@@ -1,0 +1,89 @@
+{
+  "key": "INT-881443",
+  "project": "internal-support",
+  "issue_type": "Bug",
+  "summary": "Rule compiler hangs when macro templates contain undetected cyclical dependencies",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Priya Mehta",
+  "assignee": "Owen Garcia",
+  "components": [
+    "rule-compiler",
+    "templating-engine",
+    "scheduler",
+    "reporting"
+  ],
+  "labels": [
+    "macro-cycle",
+    "compiler-hang",
+    "sre-triage",
+    "tech-debt"
+  ],
+  "environment": "prod us-east",
+  "linked_issues": [
+    "INT-34123-macro-sync-gc-template-orphaning",
+    "INT-128450-operator-precedence-evaluator-bug"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/routing/commit/7f3a2b1",
+    "https://github.com/redwood-inference/templating/pull/384"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/INTERNAL/pages/4291/Macro+templating+guidelines",
+    "https://redwood.atlassian.net/wiki/spaces/OP/pages/2212/Rule+compiler+runbook"
+  ],
+  "description": "Issue summary:\nA subset of macro/template bundles deployed during the March 10 release introduced cyclical references between templates (A -> B -> C -> A). The rule-compiler's dependency resolution step does not detect these cycles and enters a prolonged evaluation loop, causing a compiler worker to spin without progress.\n\nImpact:\n- Delayed rule compilation for new/updated routing templates across the us-east cluster.\n- Autoroute updates queue up behind the hung compiler shard; customers on internal tooling workflows experienced delayed assignments for up to 18 minutes.\n- Metrics: compiler task latency spike from median 1.2s to 320s on affected shard; alerting on compilation backlog triggered multiple P1 alerts.\n\nEnvironment:\n- Prod (us-east), rule-compiler fleet version: v2.14.1, templating-service: v1.9.0\n- Affected node pool: compiler-shard-7 (k8s: us-east-compiler-7)",
+  "steps_to_reproduce": [
+    "1) Push three templates with cross references: Tmpl-A references macro B, Tmpl-B references macro C, Tmpl-C references macro A (inline refs using {{ref:...}} syntax)",
+    "2) Trigger a bulk template publish via Console or API (bulk publish job id seen in logs)",
+    "3) Observe rule-compiler worker logs for dependency resolution stage and watch task remain at 'resolving_dependencies' for >5m",
+    "4) Check metrics: compilation_queue_depth for shard-7 climbs and cpu% spin remains high"
+  ],
+  "expected_behavior": "Compiler should detect cyclical macro/template dependencies at parse/validation time and fail the publish with a clear error (validation error pointing to cycle). The compiler worker should not enter an infinite or prolonged loop and should handle the invalid template by marking it failed and returning control to the orchestrator.",
+  "actual_behavior": "Compiler enters a tight evaluation loop during dependency resolution; no cycle detection is raised. The publish API returns HTTP 200 for the bulk job even though individual templates are not compiled. Compilation backlog accumulates and autoroute updates are delayed until operator intervention (restart of compiler worker clears the stuck state).",
+  "logs": [
+    "2026-03-10T08:17:02Z compiler-shard-7 pod compiler-7-2fc8: INFO resolving dependencies for bulk-job: bj-4829",
+    "2026-03-10T08:17:45Z compiler-shard-7 pod compiler-7-2fc8: DEBUG resolving dependency chain: Tmpl-A -> Tmpl-B -> Tmpl-C -> Tmpl-A",
+    "2026-03-10T08:35:12Z compiler-shard-7 pod compiler-7-2fc8: WARN stuck in dependency-resolver loop for 1080s, iterations=4321",
+    "2026-03-10T08:36:00Z orchestrator: ERROR bulk publish bj-4829 incomplete: waiting on shard-7; API returned 200 (job accepted)",
+    "2026-03-10T08:40:01Z infra: ACTION restart pod compiler-7-2fc8 (cleared stuck worker); backlog drained by 2026-03-10T08:55:00Z"
+  ],
+  "investigation_notes": [
+    "Initial triage (2026-03-10 09:00) by SRE: reproduced locally in a staging cluster using the same templating bundle \u2014 confirmed cyclical chain causes resolver to re-evaluate repeatedly without termination condition.",
+    "Static analyzer/validation step in templating-service (v1.9.0) does not include global graph cycle detection for cross-template macro refs that are created via runtime refs (inline vs import).",
+    "Compiler code path: dependency_resolver.walk() uses DFS but lacks a visited-set guard for templates referenced via dynamic macro indirection; this allows revisiting nodes via different ref paths, causing unbounded recursion/iteration.",
+    "Heap and CPU: worker did not OOM but CPU spiked; stack traces show repeated calls into dependency resolution rather than deep recursion (iterative loop detected).",
+    "Related to previous operator precedence bug (INT-128450) but root cause is different \u2014 that was evaluation order; this is missing cycle detection in the graph builder.",
+    "Affected shard (compiler-shard-7) has a single replica due to recent autoscaling config; when it becomes unhealthy the backlog cannot be redistributed because the job-assigner treats ongoing task as 'in-progress' with no failover policy for long-running dependency resolution."
+  ],
+  "comments": [
+    "2026-03-10 09:15 - Lara (SRE): Marking as P1. Reproduced in staging with minimal template set. Adding Owen for compiler changes.",
+    "2026-03-10 09:42 - Owen (Compiler eng): Looking into dependency_resolver.walk() \u2014 patch ready locally to add a visited set and cycle error. Need to run unit + integration tests against existing template corpus.",
+    "2026-03-10 10:05 - Priya (Support Ops): Noted customer impact on internal tooling; temporarily rolled back the bulk publish job and restarted compiler pod which cleared the backlog.",
+    "2026-03-11 14:22 - Diego (Platform): Autoscaler policy for compiler shards needs a lower min-replicas to avoid single-point-of-failure during bulk jobs. Adding to follow-up work.",
+    "2026-03-12 11:00 - Owen (Compiler eng): Patch opened PR #384 (templating) to add cycle detection and to fail fast on validation. Running cross-service integration tests now."
+  ],
+  "resolution_notes": [
+    "Mitigation applied (2026-03-10): immediate operator remediation \u2014 restart of compiler-shard-7 worker cleared the stuck state and drained backlog; rollback of the bulk publish job prevented further queued cycles.",
+    "Short-term fix (2026-03-12): merged validation change in templating-service to run a graph cycle detector at publish time. Tempting change also added a safety timeout in compiler dependency resolver (abort after 30s with error). PRs: templating/pull/384, compiler/pull/912.",
+    "Long-term actions: 1) Add failover for long-running compile tasks in job assigner so other replica can pick up tasks after threshold. 2) Add integration test harness that exercises templating corpus with synthetic cycles. 3) Update runbook to include 'restart compiler pod' step and how to detect cycle-induced hangs via metric 'dependency_resolver_iterations'. 4) Increase min replicas for compiler-shard pools handling bulk publishes to 2. Logged as follow-up INT-881444.",
+    "Status: patch deployed to prod us-east on 2026-03-12 02:30 UTC behind a feature flag; monitoring for 48hrs. No further compiler hangs observed in the window."
+  ],
+  "sla_due_at": "2026-03-10",
+  "related_incident_id": "INC-20260310-compiler-hang",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "expected_behavior",
+    "actual_behavior",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_8351e51e773844e396518ebc7de2a8a9"
+}

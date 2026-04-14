@@ -1,0 +1,33 @@
+{
+  "title": "thermostat-prime-variance-notes-anya",
+  "owner": "Anya Iqbal",
+  "drive_area": "users",
+  "path": "users/thermostat-prime-variance-notes-anya",
+  "doc_type": "doc",
+  "created_at": "2025-11-02",
+  "last_modified": "2026-02-18",
+  "collaborators": [
+    "Kaiya Shah",
+    "Ravi Menon"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "throughput",
+    "warmup",
+    "prime-variance",
+    "thermostat"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/842",
+    "SERV-1273",
+    "https://linear.app/redwood/issue/PRIME-42"
+  ],
+  "content": "Notes to self / scratchpad - thermostat prime variance experiments\n\nGoal:\n- See if a lightweight \"thermostat\" regulator on in-pod concurrency (slot allocation) reduces p99 spikes during short surges without hurting median throughput.\n- Thermostat = small state machine that nudges concurrency up/down based on a short EWMA of p95 latency and a hard limit on GPU mem pressure.\n\nHypotheses:\n1) Short-term reductions in concurrency during microbursts will cut p99 tail by redirecting inflight prefill/consume contention.\n2) Keeping a small reserve of warm slots (2 per replica) helps recovery when bursts end (faster warm-cache reuse).\n3) Thermostat will slightly reduce p50 under constant load due to under-utilization but improve p99 by 25-40%.\n\nExperiment setup (run 2026-02-10):\n- Model: open-llama-13b-opt64-q4_0 (quantized)\n- Hardware: single A100-80GB per replica, 4 replicas in pool (auto-shard disabled)\n- Runtime flags: prefill-priority=high, kvcache-autoprime=true, batcher.window_ms=6, batcher.max_tokens=2048\n- Baseline concurrency per replica: 8 (so global possible concurrent = 32)\n- Thermostat modes tested: off (baseline), conservative (target p95=120ms, scale step=1), aggressive (target p95=80ms, step=2)\n- Arrival patterns: short-burst (zipf-ish, 10s bursts every 60s), sustained ramp (linear 0->500 qps over 10m), poisson steady (200 qps)\n- Payload: avg prompt tokens 40, output tokens cap 120\n- Metrics collected: p50/p90/p95/p99 latencies (ms), qps, tokens/s, GPU utilization, GPU mem used, KV cache hit rate, slot warm fraction, prefill-time, queue-depth histogram sampled per-second\n\nRaw run snippets (selected):\n- Baseline short-burst (10s bursts):\n  qps_peak=620, p50=45ms, p95=190ms, p99=430ms, gpu_util=92%, kv_hit=0.22, warm_slots=0.12\n  notes: saw big prefill spikes at burst start, many cold cache misses, GPU pinned high => long tails.\n\n- Thermostat conservative:\n  qps_peak=540, p50=48ms, p95=125ms, p99=210ms, gpu_util=84%, kv_hit=0.26, warm_slots=0.34\n  notes: thermostat cut inflight at burst start by reducing local concurrency to 5, smoothing queue depth. Tails reduced ~51% vs baseline.\n\n- Thermostat aggressive:\n  qps_peak=420, p50=60ms, p95=90ms, p99=140ms, gpu_util=73%, kv_hit=0.31, warm_slots=0.45\n  notes: best p99 but sacrificed peak throughput ~32% lower than baseline. Good for latency-sensitive SLAs but cost inefficient for throughput-first customers.\n\nSustained ramp runs (0->500 qps):\n- Baseline: linear rise, p50 stable ~42ms until ~380 qps then p95 jumps to 220ms, p99 to 360ms as batches/queues overflow. warm_slots grew from 0.05 -> 0.18.\n- Conservative thermostat: maintained p95 ~115ms across ramp, p99 ~180ms. Throughput plateaued at ~470 qps (slight loss).\n\nPoisson steady 200 qps:\n- Baseline: p50=40ms p95=95ms p99=180ms kv_hit=0.29\n- Conservative thermostat: p50=43ms p95=85ms p99=120ms kv_hit=0.32\n\nShort, human-readable summary of numbers:\n- Baseline short-burst p99 ~430ms => thermostat conservative -> 210ms (-51%) ; aggressive -> 140ms (-67%)\n- Throughput loss: conservative ~13% at peak; aggressive ~32% at peak\n- KV cache hit increases correlate with slower concurrency (more warm reuse)\n\nObservations:\n- Biggest source of tail is prefill collision + kv cache cold misses during burst onset. Even when GPU had headroom, CPU-side prefill serialization causes queue spikes.\n- Thermostat's main benefit is backpressure before prefill queuing saturates worker threads.\n- Conservative mode strikes a reasonable balance for SLOs with throughput constraints. Aggressive is explicit latency-first mode.\n- Warm slot reserve of 2/replica is helpful: it prevents full coldstart cascade when bursts rotate across replicas.\n\nQuick ASCII latency ribbon (baseline vs conservative) - p99 over a 5-minute short-burst series (ms):\nbaseline:  [ 120, 230, 420, 380, 450, 410, 220, 110, 95, 130 ]\nconsv :   [ 100, 140, 210, 180, 200, 190, 160, 120, 110, 105 ]\n\nImplementation notes / code pointers:\n- thermostat lives in runtime/slot_manager (WIP). Key hooks: on_queue_depth_sample(), adjust_local_concurrency(delta). Keep adjustments small and observable.\n- Telemetry: emit \"thermostat_action\" events with prev_conc,new_conc,trigger_p95,trigger_gpu_mem. Add sample id for correlation.\n- Safety: hard floor of 2 concurrency per-replica to avoid starvation under low qps. Hard ceiling still respected by cluster autoscaler.\n\nOpen questions / next probes:\n- How does thermostat interact with prefix-cache priming when requests have long prefixes (>=400 tokens)? Could be counterproductive if we throttle too aggressively and lose large-context cache reuse.\n- Measure CPU-side prefill thread saturation: capture stack samples at burst onset. Is slowing concurrency hiding a CPU bottleneck or just shifting it?\n- Test with heterogeneous replicas (some with reserved warm slots + quantized 4-bit variants) to see if routing+thermostat together gives better econ.\n- Add jitter to thermostat step timing to avoid synchronized oscillations across replicas (we saw mild sync when all replicas used identical sample windows).\n\nAction items / TODOs:\n- [ ] Add telemetry and dashboard panels for thermostat_action and local_concurrency over time (panel per-replica). (owner: Kaiya)\n- [ ] Run burst series with long-prefix (800 tokens) and measure kvcache reuse + p99. (owner: me)\n- [ ] Implement jitter in adjust_local_concurrency() and re-run conservative/aggressive. (owner: Ravi)\n- [ ] Perf test with 8-replica cluster and mixed model sizes to simulate real traffic (staging). (owner: me/Kaiya)\n\nPersonal note: this felt promising as a \"low-risk, low-change\" control knob we can expose as a runtime flag. Worth packaging as an opt-in policy for Dedicated customers with latency SLAs. Keep experiments reproducible (script + docker image sha).\n\nEnd of scratchpad.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_5535bc321c87474ba239c48bf6235d1e"
+}

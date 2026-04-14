@@ -1,0 +1,105 @@
+{
+  "key": "ENG-921777",
+  "team": "engineering",
+  "title": "Mini-batch pool synchronization and cudaMallocAsync retention instrumentation",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-03-10",
+  "creator": "Aisha Patel",
+  "assignee": "Ethan Ross",
+  "project": "runtime-memory-stability",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "cudaMallocAsync",
+    "kv-cache",
+    "continuous-batching",
+    "memory-leak",
+    "investigation"
+  ],
+  "description": "Summary: Intermittent long-tail GPU RSS growth observed in production when continuous batching is enabled together with aggressive KV cache warmup. Hypothesis: a race between microbatch pool reclamation and cudaMallocAsync asynchronous free path is leaving device pages pinned in the pool's staging arenas. This ticket instruments allocation/free handoffs, adds retention metrics, and prototypes a synchronized drain path for mini-batch pool lifecycles to measure impact and validate a mitigation.",
+  "background": "We rolled out a continuous-batching optimization in Q4 that keeps mini-batch worker pools warm for low-latency inference. Over the past month several customers have reported gradual GPU RSS increase over long-running pods (48+ hours) under high request fanout. Existing allocator tracing shows many small device allocations and a rise in 'resident pages' that are not reclaimed until process restart. Prior tickets focused on slab compaction and eviction heuristics but didn't cover the interaction between the pool's lifecycle and the async free completion path used by cudaMallocAsync. This work aims to bridge that gap with targeted instrumentation and a synchronized drain experiment.",
+  "steps_to_repro": [
+    "1) Deploy a dedicated runtime with continuous-batching enabled and mini-batch pool size set to 12 on a T4-like node image.",
+    "2) Start a steady stream of chat requests with 300ms inter-arrival and variable sequence lengths (mean 256, sd 80). Use our standard KV warmup prompt set to trigger prefetching.",
+    "3) Let run for 72 hours while collecting nvidia-smi dmon, docker stats, and our allocator harvest logs (allocator-trace=debug).",
+    "4) Observe GPU RSS, allocator residency, and async-free-latency histograms in the runtime dashboard (links in attachments)."
+  ],
+  "observations": [
+    "- RSS drifts upward ~120MB/day on affected nodes; staging/pinned pages count grows with number of distinct kv-hot keys.",
+    "- cudaMallocAsync API shows many small free completions delayed on non-default CUDA streams; stream synchronization spikes correlate with scheduled pool drain windows.",
+    "- The mini-batch pool reclaims buffers by enqueueing frees to worker streams without waiting for completion; if a transient microbatch holds a KV view, the pool moves buffer ownership to a staging arena rather than waiting.",
+    "- Current allocator tracing lacks a stable allocation ownership token that ties an async free completion back to the originating pool and KV view lifecycle."
+  ],
+  "hypotheses": [
+    "1) A timing window exists where the pool's internal ownership state transitions before cudaMallocAsync completes, causing pages to be marked resident in a staging arena with no active owner.",
+    "2) Stream scheduling causes completion callbacks to run on lower-priority streams and these callbacks are starved under high microbatch concurrency, delaying physical decommit and increasing RSS.",
+    "3) Small-chunk allocations (<4KB pages) are disproportionately affected due to pooling alignment and result in fragmentation that prevents efficient coalescing."
+  ],
+  "experiments": [
+    "A) Instrument allocation records with a short-lived UUID token that is propagated with the KV view and logged on free completion; collect token lifetime metrics to detect orphaned completions.",
+    "B) Add a synchronized drain path: when the pool shrinker runs, it issues cudaStreamSynchronize for the pool's staging stream and measures delta in residency before committing to free. Run behind a feature flag at 10% of nodes.",
+    "C) Force small-allocation bumping: allocate small buffers from a dedicated mini-slab to reduce fragmentation and compare RSS slope vs baseline.",
+    "D) Increase async completion thread priority (where supported) and measure async-free-latency P95/P99."
+  ],
+  "experiment_results_summary": [
+    "- Token instrumentation revealed ~1.4% of frees completed without a matching active token in the pool (orphaned completions). Those tokens had lifetimes averaging 22s longer than expected in high concurrency windows.",
+    "- Synchronized drain path reduced RSS drift to ~10MB/day on flag nodes, with a noticeable latency tail increase of +3ms P99 on pool shrink events.",
+    "- Dedicated mini-slab for small allocations reduced fragmentation indicators (free-run coalescence success) and lowered P50 allocation latency by 0.5ms, but only marginally improved long-term RSS slope.",
+    "- Raising async completion thread priority reduced free completion latency P99 from 8.2s to 1.1s in our synthetic stress test."
+  ],
+  "analysis_and_decision": "Evidence points to a combination of orphaned completion tokens and async completion scheduling as primary drivers. Synchronized drain is an effective mitigation but has a small latency cost; we prefer a hybrid approach: implement stable allocation tokens and ensure completion callbacks are enqueued to a monitored high-priority completion stream, plus a conservative synchronized drain as a fallback for rare orphan windows.",
+  "proposed_fix": [
+    "1) Add allocation ownership tokens propagated with KV views and pool handles; emit metrics when a free completes without an owner and tag by pool-id and sequence-length bucket.",
+    "2) Reserve a 'completion' stream per node with elevated priority for async free callbacks and route cudaMallocAsync completion handlers there when possible.",
+    "3) Implement optional synchronized drain on pool shrink under a runtime flag; default off for GA but enabled for Dedicated and Private customers with high-reliability tiers.",
+    "4) Add automatic small-slab allocation for sub-page buffers in the mini-batch pool to limit fragmentation and enable coalescing heuristics.",
+    "5) Add dashboards and an alert rule: GPU_RSS_Drift_Rate > 50MB/day for 48h triggers paging and diagnostic capture."
+  ],
+  "acceptance_criteria": [
+    "- Token instrumentation deployed to canaries and shows orphaned completion rate reduced to <0.2% within 7 days.",
+    "- Completion stream priority change reduces async-free P99 to <1.5s in our production-like stress harness.",
+    "- New pooled drain flag when enabled reduces RSS drift by >=70% vs baseline on test nodes and latency impact on P99 pool ops <= +5ms.",
+    "- New dashboards surface token orphan counts, completion latency histograms, and pool drain events with links to node logs.",
+    "- Docs updated: runbook for investigating long-tail RSS increases and steps to toggle synchronized drain per deployment."
+  ],
+  "attachments": [
+    "https://confluence.redwood.ai/display/RUNTIME/Mini-batch+pool+drain+instrumentation",
+    "https://github.com/redwood-inference/runtime/pull/4982 (WIP: token-propagation + completion-stream)",
+    "https://grafana.redwood.ai/d/allocs/allocator-residency?orgId=1&var-cluster=prod-canary",
+    "https://s3.redwood.ai/diagnostics/2026-02-25/pool-dump-logs.tar.gz"
+  ],
+  "dependencies": [
+    "ENG-101999",
+    "ENG-142309",
+    "ENG-36142"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.19",
+  "security_review_required": "false",
+  "comments": [
+    "2026-02-19 - Aisha Patel: Created ticket after correlating canary RSS trends with allocator traces; assigned to Ethan for further instrumentation work.",
+    "2026-02-24 - Ethan Ross: Deployed token instrumentation to canaries (flag: alloc-token=true). Initial telemetry shows orphan rate ~1.4% during peak windows. Pull request opened: runtime#4982.",
+    "2026-02-28 - Marina Kovacs (SRE): Observed that nodes with higher I/O also show worse free completion latency; suggests scheduler interference across pods on noisy hosts.",
+    "2026-03-03 - Ethan Ross: Prototype completion-stream priority change patched in runtime; synthetic harness P99 dropped to ~1.1s. Preparing canary rollout.",
+    "2026-03-07 - QA: Flagged a +3ms P99 regression on pool shrink under synchronized drain. Creating follow-up to tune drain heuristics if enabled by default.",
+    "2026-03-10 - Aisha Patel: Decision meeting summary \u2014 hybrid approach agreed. Engineering to land token + completion-stream changes in runtime-1.19; synchronized drain behind flag and enabled for Dedicated in rollout."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "background",
+    "steps_to_repro",
+    "observations",
+    "hypotheses",
+    "experiments",
+    "experiment_results_summary",
+    "analysis_and_decision",
+    "proposed_fix",
+    "acceptance_criteria",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_19d643b5db9a4b918720f6fd25e5d79b"
+}

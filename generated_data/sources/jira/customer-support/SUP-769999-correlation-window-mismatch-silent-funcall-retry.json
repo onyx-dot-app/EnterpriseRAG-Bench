@@ -1,0 +1,82 @@
+{
+  "key": "SUP-769999",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Correlation-window mismatch leads to silent funcall retries and missing downstream side-effects",
+  "status": "Triage",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Emily Zhang",
+  "assignee": "Carlos Herrera",
+  "customer_company": "BrightHealth AI",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "sdk-python",
+    "sdk-go",
+    "scheduler"
+  ],
+  "labels": [
+    "idempotency",
+    "retries",
+    "funcall",
+    "correlation-window",
+    "multipart"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "rwd-gptx-3.5-realtime"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-14",
+  "first_response_due_at": "2026-03-13",
+  "description": "Issue summary:\nCustomers using our dedicated cluster report inconsistent downstream effects when invoking external tools via function-calls in multipart streaming sessions. Some requests produce no side-effect (no HTTP POST to the customer's webhook) while the model's output indicates a successful tool execution. The errors are not surfaced to the client SDKs and appear as 'silent' retries or dropouts.\n\nImpact:\n- Multiple production customers (dedicated capacity) observed missing webhook deliveries for function/tool invocations during high-concurrency bursts.\n- This causes downstream systems (billing/eventing) to miss critical events; BrightHealth AI reports missed entries in their reconciliation process.\n\nExpected behavior:\n- When a funcall is executed, either the customer webhook receives one invocation or an explicit error is returned to the SDK so the caller can retry/compensate.\n\nObserved behavior:\n- Model/chat stream reports action \"execute_tool\" and then final content shows the tool result, but no delivery to customer webhook logs. No 5xx or client-visible error recorded. Correlation token in the X-Rw-Correlation header observed to rotate mid-session in some traces.\n\nContext and urgency:\n- Customer BrightHealth AI runs time-sensitive event routing and is on a dedicated pool with pinned model version. They are requesting immediate mitigation guidance and a root cause explanation.\n",
+  "steps_to_reproduce": [
+    "1) On a dedicated deployment in us-east-1, start several concurrent multipart streaming sessions (10-20) using the Python SDK with function-calling enabled and a short ack window (200-500ms).",
+    "2) Use a webhook endpoint that logs POST bodies and intentionally add a 50-100ms processing delay on the webhook to mimic downstream latency,",
+    "3) Send prompts that trigger a tool invocation (external HTTP POST) mid-stream and pin the session id in the request metadata,",
+    "4) Rotate the client correlation token mid-session (simulate API key renewal or sidecar rotating header) or simulate an edge proxy that rewrites chunked headers,",
+    "5) Observe the SDK stream and webhook logs. Intermittently you will see model text indicating the tool result but no corresponding POST in webhook logs."
+  ],
+  "logs": [
+    "Excerpt from api-gateway trace (trace-id: trc-0a1b2c): 2026-03-12T14:02:03Z - incoming stream chunk session=sh-42, correlation=XRC-abc123 -> forwarded to runtime node-07",
+    "Runtime log (node-07): 2026-03-12T14:02:04.112Z - funcall queued: tool=webhook-poster, idempotency_key=hdr-0a1b2c, session=sh-42",
+    "Runtime log (node-07): 2026-03-12T14:02:04.384Z - correlation token rotated for session sh-42 (X-Rw-Correlation changed from XRC-abc123 to XRC-def456) due to header re-write at edge",
+    "Router log: 2026-03-12T14:02:04.386Z - outgoing funcall dispatch to external endpoint https://customers.example/webhook - connection reused",
+    "Edge / webhook logs (BrightHealth): 2026-03-12T14:02:04.39Z - no matching POST for idempotency hdr-0a1b2c found; subsequent entry at 14:02:04.60Z shows a duplicate POST for hdr-0a1b2c but with different correlation header XRC-def456",
+    "SDK client (python) observed stream entry: 2026-03-12T14:02:04.40Z - stream-> message: {action: 'execute_tool', name: 'webhook-poster', args: {...}} then final message has tool-return text. No SDK-level error emitted."
+  ],
+  "investigation": "Initial hypothesis: correlation-token rotation (header mutation) in the path between gateway and runtime or between runtime and edge is causing our funcall deduplication/idempotency lookup to miss the original call record, resulting in either a silent duplicate suppression or a missing outbound POST. The runtime's funcall dispatcher keys caching by a composite of idempotency_key + correlation_token in some codepaths (observed in snippets of older runtime branches), which is fragile when proxies rewrite correlation headers.\n\nWhat we've checked so far:\n- Confirmed dedicated cluster node-07 handled both the model stream and dispatcher for affected sessions.\n- Verified webhook received a duplicate later with different correlation header in BrightHealth logs.\n- Reviewed gateway config for header normalization and found edge sidecar sometimes rewrites 'X-Rw-Correlation' when chunked transfer encoding is used (related to h2 to h1 translation).\n- Cross-checked runtime versions across nodes: node-07 is running rwd-runtime v5.8.1; a patched branch in master changed correlation-token usage for funcall cache in v5.9.0.\n\nNext steps planned:\n- Reproduce in staging with an instrumented edge that simulates header rewrite and validate whether the funcall dispatcher cache lookup misses.\n- Add temporary telemetry to log idempotency_key vs correlation_token mapping on dispatch.\n- If confirmed, plan a hotfix to normalize idempotency lookup to ignore correlation token and instead use stable per-session/request id, plus add strict validation that header rotation triggers an explicit SDK-visible error.\n",
+  "comments": [
+    "2026-03-12 15:10 - Support (Maya Patel): Thanks for the report, Emily \u2014 assigning to runtime on-call to triage. Can you share a minimal repro script and the webhook sample logs?",
+    "2026-03-12 16:35 - Customer (BrightHealth AI - ops@brighthealth.ai): Attached webhook logs and a repro harness. We see missing events in our reconciliation for ~0.8% of streams during peak. Blocking our daily ingest pipeline.",
+    "2026-03-13 09:05 - SRE (Liam O'Connor): Pinpointed affected node and found evidence of header rewrite at edge-proxy (AWS ALB + h2 -> http/1.1 sidecar). Filed INT-415 for edge config review.",
+    "2026-03-13 12:40 - Runtime Eng (Priya Iyer): Found runtime code path where dispatcher cache key included X-Rw-Correlation for faster local dedupe. This is intended for intra-node dedupe but is brittle if token rotates. Preparing a candidate patch to use session-id + idempotency-key instead of correlation header.",
+    "2026-03-14 08:22 - Support (Carlos Herrera): Reached out to BrightHealth with short-term mitigation: add a webhook retry window of 2s on their side and enable our experimental 'stable-correlation' flag on their dedicated pool. Awaiting confirmation to toggle flag."
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/4821"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/ENG/Runtime+Funcall+Deduplication+Notes"
+  ],
+  "linked_issues": [
+    "INT-415"
+  ],
+  "resolution": "Workaround applied: enabled 'stable-correlation' config on BrightHealth's dedicated pool to force session-id keyed funcall lookups; advised customer to add short webhook retry/backoff (2s) while we deploy patch.\n\nFix planned: patch runtime (PR #4821) to stop including correlation header in primary idempotency lookup and rely on stable session/request id + idempotency_key. Patch to be validated in staging with simulated header rewrites and then rolled to dedicated pools next week.\n\nFollow-ups: update runbook to detect header rotation events and expose an explicit SDK-visible error when rotation occurs mid-stream, and add a diagnostic dashboard for correlation-token churn.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation",
+    "comments",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_291724a6e8124e0bbbcc82ea242a29b4"
+}

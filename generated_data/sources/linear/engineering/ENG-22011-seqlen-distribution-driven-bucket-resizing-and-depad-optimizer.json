@@ -1,0 +1,136 @@
+{
+  "key": "ENG-22011",
+  "team": "engineering",
+  "title": "Sequence-distribution-driven bucket resizing & depad optimizer",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-08",
+  "updated_at": "2026-03-14",
+  "creator": "Aisha Patel",
+  "assignee": "Marcus Chen",
+  "project": "runtime-batching-optimizer",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-04-01",
+  "labels": [
+    "runtime",
+    "batching",
+    "prefill",
+    "kernels",
+    "perf"
+  ],
+  "dependencies": [
+    "ENG-20377",
+    "ENG-15501"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Implement a runtime component that dynamically resizes sequence-length buckets and selectively removes padding (depad) during prefill and decode to reduce wasted tokens and enable better kernel selection. Focus is on improving p95/p99 latency and GPU utilization for mixed-length workloads without regressing single-request latency.",
+  "background": "We observe large token waste caused by static bucketing and conservative padding across workloads with heavy long-tail sequence distributions (chat history + code + short queries). Existing bucket schemes group many short-prefill requests with long decodes, causing unnecessary padding and suboptimal kernel choices. Previous tickets explored length-adaptive bucketing but left gaps around prefill/decode coordination and kernel switch thresholds.",
+  "goals": [
+    "Reduce effective padded tokens per second by >= 22% on mixed workloads (internal synthetic trace)",
+    "Improve tail latency (p95/p99) by 10-20% for customer scenarios with high sequence variance",
+    "Avoid >5% regression on single-request median latency",
+    "Provide deterministic fallback when depadding causes model-incompatible batch shapes"
+  ],
+  "acceptance_criteria": [
+    "Automated benchmark shows padded-token reduction >= 20% on mixed-seq benchmark in perf lab",
+    "No correctness regressions in generation outputs (compare token-level diffs on canonical eval prompts)",
+    "Kernel selection rules integrated into runtime and feature-flagged (off by default)",
+    "Metrics surfaced in Console: padded_tokens_saved, bucket_resizes, kernel_switches, depad_failures",
+    "End-to-end canary rollout executed for 48h with no SLO violations before broad rollout"
+  ],
+  "design_summary": "Introduce a lightweight online bucket-resizer that maintains short-term sequence-length histograms per route and per model variant. On each scheduling window we compute optimal bucket cutpoints using a cost function that balances token waste, expected kernel efficiency (from kernel performance model), and decode latency impact. Add a depad pass during prefill that trims trailing padding in micro-batches when safe. Coordinate with decode-time kernel selection by allowing a 'soft' kernel switch: keep prefill in kernel A (fast for long sequences) but allow decode to switch to kernel B if the depad reduces seqlen below a threshold. All changes behind runtime feature flag and governed by per-route policies.",
+  "algorithm_notes": [
+    "Windowed histogram (30s, exponentially decaying) keyed by route+model_variant",
+    "Cost function: cost(bucket) = alpha * padded_tokens + beta * kernel_penalty + gamma * latency_tail_penalty",
+    "Use constrained knapsack-like greedy cutpoint search for O(k*n) runtime where k = target bucket count (default 8)",
+    "Depad heuristics: only remove padding if it is trailing and all KV cache offsets remain consistent; otherwise skip depad and emit metric depad_failures",
+    "Kernel penalty derived from offline microbenchmarks: per-kernel throughput vs seqlen curve stored as lightweight lookup table in runtime"
+  ],
+  "runtime_changes": [
+    "Add bucket-resizer actor to scheduler that proposes new bucket cutpoints every 30s",
+    "Expose per-route config: max_buckets, apply_threshold (minimum padded token savings to change), allow_depad boolean",
+    "Implement depad pass in prefill path that rewrites batch shapes and adjusts KV offsets; ensure memcopy costs are bounded and measured",
+    "Introduce safe kernel-switch handshake: dispatcher can request decode-stage kernel change if depad reduces sequence length below kernel B's lower bound",
+    "Add metrics and tracing spans for decision introspection"
+  ],
+  "kernel_selection_rules": [
+    "Prefer fused attention kernels for sequences < 512 when depad savings are significant",
+    "Prefer chunked/streaming-friendly kernels for sequences > 1024",
+    "If depad predicted final seqlen crosses kernel boundary and saving > apply_threshold, select decode kernel accordingly",
+    "Fallback: when depad pass not applicable, keep existing kernel to avoid memcopy/regression"
+  ],
+  "attention_optimizations": [
+    "Enable attention fusion for short-seq batches created after depad",
+    "Apply causal-kv prefetch heuristic to reduce decode stalls for prefills with long KV chains",
+    "Add lightweight per-batch attention-sparsity check to decide whether to enable a strided/blocked attention path",
+    "Ensure attention kernel chosen supports current quantization profile and does not require re-quantization at runtime"
+  ],
+  "prefill_decode_scheduling": [
+    "During prefill, evaluate per-request final_length_estimate using prompt metadata and historical route profiles",
+    "If estimated final_length << allocated bucket, attempt depad and re-pack micro-batches within the scheduling window",
+    "Hold decode until depad+repack completes or a timeout (default 50ms) is reached to prevent head-of-line blocking",
+    "Allow decode to use a tighter batch window if depad reduces seqlen variance across micro-batch members"
+  ],
+  "experiment_plan": [
+    "Phase 1 (lab): run synthetic traces with mixed-length distribution vs baseline for 48h and gather padded token and tail latency metrics",
+    "Phase 2 (shadow traffic): enable feature flag in host staging cluster with 10% shadow traffic for customer routes identified as high-variance",
+    "Phase 3 (canary): run decode-enabled depad on 1% production traffic with full metrics and alerting",
+    "Phase 4: 48h canary expansion to 10% then full rollout if no SLO regressions"
+  ],
+  "metrics_targets": [
+    "padded_tokens_per_minute: -22% (lab target)",
+    "p95_latency: -12% (target on mixed workloads)",
+    "p99_latency: -15% (target on mixed workloads)",
+    "median_latency: <= +5% (no more than 5% regression)",
+    "kernel_switch_rate: tracked, expected 5-15% of decode batches"
+  ],
+  "rollout_plan": [
+    "Feature-flagged in runtime binary (off by default)",
+    "Short-lived canary (48h) with rollout checks in Console dashboard",
+    "If canary fails: auto rollback and capture decision traces for postmortem",
+    "Gradual rollout with per-region gating to minimize blast radius"
+  ],
+  "risks_mitigations": [
+    "Risk: memcopy overhead from depad repacking increases median latency. Mitigation: instrument memcopy cost and disable depad when memcopy latency > threshold",
+    "Risk: depad causes subtle KV misalignment leading to wrong outputs. Mitigation: strict invariants and test harness with golden token comparison; fail-open on any detected mismatch",
+    "Risk: kernel switch oscillation. Mitigation: hysteresis on kernel switch decisions and min_time_between_switches (default 5s)",
+    "Risk: increased scheduler CPU usage. Mitigation: resize histogram sampling rate and use approximate sketches if CPU pressure observed"
+  ],
+  "linked_prs": [
+    "github.com/redwood-inference/runtime/pull/4972",
+    "github.com/redwood-inference/runtime/pull/5031"
+  ],
+  "related_docs": [
+    "confluence.redwood.ai/display/RUNTIME/Bucket+Resizing+Design",
+    "drive.redwood.ai:/team/infra/benchmarks/mixed_length_traces.csv"
+  ],
+  "comments": [
+    "2026-03-09 - Aisha Patel: Prototype of histogram-based cutpoint search committed to experimental branch. Initial results show ~18% padded-token reduction on synthetic workload A.",
+    "2026-03-11 - Marcus Chen: Added depad pass prototype; observed memcopy cost ~0.9ms per micro-batch on A100. Need to benchmark on T4 and V100.",
+    "2026-03-12 - Lina Hoffman (review): Concern about KV offsets for multi-segment inputs; requested additional invariants and unit tests. Flagging as blocker until tests added.",
+    "2026-03-13 - Marcus Chen: Added unit tests for KV offset preservation and added safe-fallback code path to skip depad when offsets ambiguous.",
+    "2026-03-14 - SRE (note): Please add tracing tags for rack/region to help correlate with autoscaler behavior during canary"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "background",
+    "goals",
+    "acceptance_criteria",
+    "design_summary",
+    "algorithm_notes",
+    "runtime_changes",
+    "kernel_selection_rules",
+    "attention_optimizations",
+    "prefill_decode_scheduling",
+    "experiment_plan",
+    "metrics_targets",
+    "rollout_plan",
+    "risks_mitigations",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_2fba123df47e4d4484a6eff2f2e08e7a"
+}

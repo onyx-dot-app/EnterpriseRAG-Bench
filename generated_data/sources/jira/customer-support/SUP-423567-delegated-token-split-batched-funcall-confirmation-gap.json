@@ -1,0 +1,79 @@
+{
+  "key": "SUP-423567",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Delegated token split during edge-side re-sign causes batched funcall confirmations to be split across sessions",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-13",
+  "reporter": "Maya Thompson",
+  "assignee": "Liam Park",
+  "customer_company": "Acme Analytics",
+  "customer_tier": "dedicated",
+  "components": [
+    "sdk-go",
+    "sdk-ts",
+    "api-gateway",
+    "sidecar",
+    "webhook"
+  ],
+  "labels": [
+    "idempotency",
+    "delegated-keys",
+    "edge-proxy",
+    "batching",
+    "funcall"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "llama-3b-quant",
+    "redwood-internal-mini"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "first_response_due_at": "2026-03-10",
+  "sla_due_at": "2026-03-14",
+  "linked_issues": [
+    "SUP-472999",
+    "SUP-531407"
+  ],
+  "related_github_prs": [
+    "github.com/redwood/repo/pull/1987",
+    "github.com/redwood/sidecar/pull/412"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood/Runbooks/Funcall-Idempotency-Guide"
+  ],
+  "description": "Issue summary:\nCustomer reports that when their edge-side re-signing proxy swaps a delegated token in-flight, a single client batch of function (funcall) requests results in confirmations being split across two different session scopes. Symptoms are duplicated downstream webhook deliveries for some funcalls and missing confirmations for others.\n\nImpact:\n- Intermittent duplicated side effects for customers using batched funcalls + delegated tokens via an edge re-signing proxy.\n- Repro rate ~3-7% per batch with Acme's traffic shape (5-20 funcalls per client batch).\n- Potential billing noise due to retries and duplicate downstream actions.\n\nEnvironment:\n- Customer: Acme Analytics (dedicated pool)\n- SDKs: go-sdk v0.12.3 (primary), ts-sdk v1.9.0 in a small subset\n- API gateway + sidecar pattern: edge proxy performs delegated token re-signing (Header: X-Delegated-Auth) then forwards to Redwood hosted endpoint in us-east.\n- Model variants observed: llama-3b-quant for high-throughput inference.\n\nSteps to reproduce (as provided by customer):\n1) Generate delegated token on their orchestrator and attach to request batch.\n2) Edge-side re-sign proxy intercepts and issues new delegated token mid-request (rotation policy, client refresh).\n3) Client submits a single HTTP/2 multiplexed batch with 12 funcalls in one request stream.\n4) Proxy rewrites X-Delegated-Auth header while forwarding the stream.\n5) Redwood receives a stream where some funcalls are processed under the original delegated context and others under the re-signed delegated context.\n6) Downstream webhooks get multiple deliveries for some funcalls and others lack the final confirmation token.\n\nLogs/observables provided:\n- Customer trace IDs: trace-ACME-20260310-7c4, trace-ACME-20260311-2f1\n- Sidecar logs show header replacement event at 2026-03-10T18:23:41Z for both traces.\n- Redwood ingress logs contain same request id but two different delegated-id metadata values attached to funcall batches (delegated-id: dtk-9932, dtk-9940).\n- Webhook delivery logs show duplicates for funcall indices 2 and 9 in trace-ACME-20260310-7c4.\n\nRequested outcome:\n- Guidance and a fix path to guarantee per-batch idempotency and single-session confirmation semantics even if delegated tokens are re-signed mid-stream.\n- If a platform change is required: mitigation options and timeframe.\n",
+  "comments": [
+    "2026-03-10 19:05 - Maya Thompson (Support): Initial triage: reproduced customer's header-rewrite scenario on staging with our test proxy. Observed split-session metadata on the server side. Escalating to infra-engineering for correlation with ingress session attribution.",
+    "2026-03-10 21:12 - Liam Park (SRE): I can reproduce locally with go-sdk multiplexed stream and a header-rewrite hook. Hypothesis: our stream demultiplexer tags in-flight funcalls with delegated-token snapshot at per-message parse time; header rewrite mid-stream leads us to create a new session tag for subsequent messages within same HTTP/2 stream. Adding detailed logs and will instrument the code path where delegated auth is bound to execution context.",
+    "2026-03-11 09:33 - Sofia Ruiz (API): Noted that our policy for token-binding is at per-request boundary currently, but stream-level batching uses per-message metadata. We should consider atomic token binding at batch start when the Content-Type indicates multiplexed funcall envelope. Patch candidate: hold a batch-scope delegated_id sticky for the lifetime of the batch stream unless explicitly renegotiated by the client via a distinct start message. Will prototype.",
+    "2026-03-11 14:20 - Acme Analytics (Customer): Thanks for the quick turn. For now we've rolled back edge auto-rotation in production as a workaround; we can keep it off for 48 hours while you test. Please let us know if you need additional traces."
+  ],
+  "investigation_notes": "Findings summary:\n- Reproducible in staging when header is rewritten mid-stream by proxy.\n- Root cause: token binding occurs at message parse boundary; the runtime creates a new internal session scope when the delegated auth header changes, even if messages are part of the same client batch.\n- Consequence: confirmation/ack tokens are emitted under the session that processed the funcall, causing downstream consumers to see duplicate deliveries for funcalls processed before and after the session split.\n- Affected code areas: ingress demux, stream context binding, and webhook confirmation router.\n- Related behavior: non-multiplexed single-request batches are not impacted because token binding happens atomically at request start.\n\nHypotheses tried:\n- Forcing sticky delegated_id in runtime prevented split but required a safe check to avoid honoring client-level renegotiation.\n- Attempted to canonicalize headers at the edge in our test harness but that only masks the issue, not solve it for customers who intentionally rotate tokens mid-batch.\n\nTesting performed:\n- Unit test added to simulate mid-stream header rewrite and assert single-session binding.\n- Integration test run against staging with go-sdk multiplexed stream and mock webhook consumer. Duplicates dropped from ~5% to 0% when using sticky batch-scope binding.\n",
+  "workaround_notes": "Customer workaround applied: Acme disabled edge auto-rotation for delegated tokens. Support recommended either: (1) avoid rotating delegated tokens within a single multiplexed batch stream, or (2) ensure a fresh batch boundary is created when rotating (client emits explicit 'batch-end' before token swap).",
+  "resolution_notes": "Planned fix and rollout:\n- Implemented batch-scope token binding: runtime now captures delegated_id at batch start (identified via envelope header or first message) and retains it for the batch unless the client sends an explicit rekey message.\n- Patch created: github.com/redwood/serving-runtime/pull/4159 (adds sticky batch token binding + integration tests).\n- Rollout plan: canary to 10% of prod routing for dedicated clusters in us-east on 2026-03-18, monitor duplicate webhook rate and confirmation mismatches. Full rollout scheduled 2026-03-22 pending no regressions.\n- Post-deploy customer mitigation: Support to coordinate with Acme to re-enable edge rotation after canary window; recommend a 24-hour monitoring window.\n",
+  "postmortem_action_items": [
+    "Add docs to SDKs describing 'do not rotate delegated tokens mid-multiplexed-batch' best practice and explicit rekey message pattern",
+    "Create telemetry alert for sudden rise in per-batch delegated_id variance (indicative of in-flight token swaps)",
+    "Add e2e test to CI that simulates edge header rewrites to prevent regressions",
+    "Update runbook for SRE to include quick rollback steps and customer communication templates"
+  ],
+  "resolution_status": "fix_in_progress",
+  "external_communication": "2026-03-11 15:02 - Support: Notified customer of workaround and timeline. Will coordinate re-enable after canary. Next update scheduled 2026-03-18 post-canary initial health check.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "workaround_notes",
+    "resolution_notes",
+    "postmortem_action_items",
+    "external_communication"
+  ],
+  "dataset_doc_uuid": "dsid_f837116425b449dd9e4d67de355fc8cf"
+}

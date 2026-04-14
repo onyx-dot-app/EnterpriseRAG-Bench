@@ -1,0 +1,46 @@
+{
+  "title": "graceful-degradation-fallback-eviction-arch-review-notes",
+  "owner": "Aisha Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/graceful-degradation-fallback-eviction-arch-review-notes.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-14",
+  "last_modified": "2025-02-18",
+  "collaborators": [
+    "Evan Chen",
+    "Priya Desai",
+    "Liam O'Connor",
+    "Zhang Wei",
+    "Nora Martinez"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "eviction-policy",
+    "fallback-chain",
+    "SLOs",
+    "memory-pressure",
+    "canary-plan",
+    "design-decision"
+  ],
+  "linked_artifacts": [
+    "JIRA:RW-2127",
+    "JIRA:RW-2179",
+    "github.com/redwood-inference/serving-runtime/pull/456",
+    "confluence.redwood.ai/pages/GRACEFUL-DEG-2025"
+  ],
+  "notes": "Meeting: Architecture review \u2014 Graceful degradation, model fallback chains & eviction policy\nDate: 2025-02-14\nAttendees: Aisha Patel (chair), Evan Chen, Priya Desai, Liam O'Connor, Zhang Wei, Nora Martinez, (observing: Samir Rao)\nDuration: 60m\n\nContext / Problem statement:\n- Customers running high-concurrency inference see tail-latency spikes when GPU memory is saturated (large KV cache, long-context chat workloads). We need an operable policy for reclaiming memory and degrading work gracefully without breaking correctness for high-SLO customers.\n- Current behavior: abrupt OOM kills or broad request throttling. No structured fallback chain.\n\nGoals / Non-goals:\n- Goals: 1) ensure high-SLO (enterprise) traffic retains sub-100ms median token latency where possible; 2) provide deterministic, observable fallback chains when full model capacity unavailable; 3) minimize quality regressions for incremental fallback; 4) support safe canary rollouts and per-customer policy.\n- Non-goal: re-architect KV storage engine or replace current attention kernel; focus on policy + runtime hooks for eviction/fallback.\n\nAgenda:\n1) Quick review of constraints and metrics to monitor\n2) Proposed tiered fallback + eviction scoring algorithm\n3) Trade-offs and alternatives (A/B/C)\n4) Rollout, observability, and testing plan\n5) Action items and owners\n\nKey constraints and signals:\n- Memory pressure signals: GPU free-memory below 10% (hard), below 20% (soft), per-device fragmentation metrics, and OOM counter increments.\n- Request signals: SLO tier (enterprise vs free), request priority, model-version pinned by customer.\n- Quality signal: model-comparison delta (embedding similarity + token-level divergence) measured via in-flight canary evals.\n\nProposal (consensus): Tiered fallback chain + size-weighted, prefix-aware eviction with request-aware prioritization\n- Fallback chain per-request: primary model -> quantized-compatible variant (same architecture, lower precision) -> compact small-model fallback (architecturally compatible but fewer params) -> cached-prefix-completion (best-effort reuse of KV prefixes) -> rate-limited degrade (truncate context / fall back to summary).\n- Eviction: global score per-KV-entry = alpha * recency_score + beta * size_weight + gamma * prefix_relevance + delta * request_priority_penalty. Default coefficients: alpha=0.5, beta=0.25, gamma=0.15, delta=0.10.\n- Soft vs hard eviction: soft eviction marks entries as reclaimable (no immediate removal) and adds them to a background compaction queue. Hard eviction is used only when soft queue cannot free memory in target time window.\n- Prefix sensitivity: when prefix hits are high (>30% of tokens), lower eviction score for entries matching active routing prefixes.\n- Request-aware prioritization: requests stamped with customer_tier and route_priority influence delta in score so high-tier traffic keeps KV affinity.\n\nRuntimes/hooks required:\n- Memory watcher process per-GPU that emits states: OK, SOFT_PRESSURE, HARD_PRESSURE.\n- Fallback resolver in request path that consults per-route fallback policy (configurable in Console).\n- Eviction planner that runs continuous background compaction and executes hard evictions when required with a bounded rate (e.g., max 4% of KV entries per second to avoid large quality cliffs).\n- Telemetry hooks: emit fallback_event (which step chosen), eviction_event (id, size, score, cause), model_switch_event (latency delta, quality delta).\n\nAlternatives considered:\n- Alternative A: Global LRU-only eviction (simple). Pros: easy to implement, predictable. Cons: ignores prefix importance and request tiers, can evict high-value entries causing high-quality regressions.\n- Alternative B: Per-customer dedicated quotas (strict isolation). Pros: strongest isolation. Cons: higher resource waste, complex cross-customer packing, may increase cost for small customers.\n- Alternative C: Aggressive early quantization fallback (force-quantize model instances on memory pressure). Pros: biggest memory wins. Cons: could introduce notable quality regressions; requires validated quantization profiles for every model version.\nDecision: choose proposed hybrid (tiered fallback + score-based eviction) because it balances predictability, quality preservation, and implementation effort. Keep option C as a toggled policy for low-SLO tiers where cost savings outweigh quality loss.\n\nTradeoffs and Risks:\n- Risk: Score coefficients require tuning per workload; bad defaults may hurt tail quality. Mitigation: start with conservative coefficients + automated tuning via offline replay traces.\n- Risk: Fallback chains increase system complexity and test surface. Mitigation: strict runtime safety checks, circuit breaker on fallback frequency.\n- Risk: Observability blind spots for cross-GPU KV references. Mitigation: add span-level tracing for eviction/migration events.\n\nObservability and metrics to add (minimum):\n- fallback_rate per-model-per-route, broken down by fallback step\n- eviction_rate, eviction_size_distribution, average_eviction_score\n- memory_pressure_state transition counts and time-in-state\n- model_switch_quality_delta 95/50 quantiles (using canary evals)\n- top-20 KV prefixes by read frequency and eviction churn\n\nRollout plan:\n- Phase 0 (lab): integrate eviction planner & fallback resolver + unit tests (2 weeks)\n- Phase 1 (staging canary): enable on staging traffic, replay high-load traces (1 week)\n- Phase 2 (production canary): 1% of production requests (low-SLO tenants only) for 72 hours, monitor fallback_rate and quality_delta. Metrics gating: fallback_rate < 5% and avg quality_delta < 0.03 embedding-similarity drop.\n- Phase 3 (wider rollout): 10% -> 25% -> 100% over controlled windows.\n\nTesting & validation:\n- Offline replay harness with historical traces to simulate memory pressure and record fallback decisions.\n- Automated regression suite: synthetic long-context chat, prefix-heavy workloads, and enterprise SLO simulation.\n- Add end-to-end QA test that asserts no request-serving OOM after fallback resolver engaged.\n\nOpen questions (to be resolved):\n- How to dimension alpha/beta/gamma/delta per-model family? (Action: collect model family traces and run tuning job)\n- Is there a safe, fast on-GPU compaction primitive we can rely on or do we need to do application-level compaction? (Action: infra spike)\n- Should quantized-compatible variants be built and validated for every model by default, or only for top-used models? (Action: product + applied-ml decision)\n\nAction items:\n- \"Implement memory watcher state machine prototype\" \u2014 Evan Chen \u2014 due 2025-02-21\n- \"Sketch fallback resolver API and route-config UI knobs\" \u2014 Priya Desai \u2014 due 2025-02-20\n- \"Run offline replay to generate tuning candidates for score coefficients\" \u2014 Liam O'Connor \u2014 due 2025-02-25\n- \"Infra spike: feasibility of in-place GPU compaction\" \u2014 Zhang Wei \u2014 due 2025-02-22\n- \"Prepare staging canary plan and metric dashboards\" \u2014 Nora Martinez \u2014 due 2025-02-24\n\nNotes for docs and Console integration:\n- Add new Console page: Runtime -> Degradation Policies (perm controls, per-route priorities, fallback chains)\n- Document minimum telemetry fields and schema in our observability cookbook for SLO teams.\n\nNext meeting: 2025-02-18 10:00 PT \u2014 goal: review prototypes (memory watcher + fallback resolver API) and finalize canary gating thresholds.\n\nEnd of notes.",
+  "action_items": [
+    "Implement memory watcher state machine prototype \u2014 Evan Chen \u2014 due 2025-02-21",
+    "Sketch fallback resolver API and route-config UI knobs \u2014 Priya Desai \u2014 due 2025-02-20",
+    "Run offline replay to generate tuning candidates for score coefficients \u2014 Liam O'Connor \u2014 due 2025-02-25",
+    "Infra spike: feasibility of in-place GPU compaction \u2014 Zhang Wei \u2014 due 2025-02-22",
+    "Prepare staging canary plan and metric dashboards \u2014 Nora Martinez \u2014 due 2025-02-24"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "notes",
+    "action_items"
+  ],
+  "dataset_doc_uuid": "dsid_55d813bf2ef146b29eee07f62aa08b09"
+}

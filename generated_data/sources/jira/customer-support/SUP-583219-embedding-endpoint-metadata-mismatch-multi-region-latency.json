@@ -1,0 +1,93 @@
+{
+  "key": "SUP-583219",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Embedding endpoint returning mismatched metadata leading to rerank latency spikes across regions",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-13",
+  "reporter": "Maya Chen",
+  "assignee": "Diego Alvarez",
+  "customer_company": "NimbleDocs Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "embeddings-service",
+    "reranker",
+    "api-gateway",
+    "regional-router"
+  ],
+  "labels": [
+    "latency",
+    "metadata",
+    "multi-region",
+    "high-priority"
+  ],
+  "environment": "prod/us-east",
+  "affected_models": [
+    "rwd-embed-v2",
+    "rwd-rerank-v1"
+  ],
+  "affected_regions": [
+    "us-east",
+    "eu-west"
+  ],
+  "sla_due_at": "2026-03-12",
+  "first_response_due_at": "2026-03-10",
+  "description": "Issue summary:\nCustomer reports that calls to the embeddings endpoint intermittently return responses whose metadata (embedding_id and \"namespace\") do not match the payload order. Downstream reranker sees out-of-order candidate metadata and falls back to a CPU path, causing 2-6x tail latency spikes.\n\nImpact:\n- Affected customer: NimbleDocs (dedicated).\n- Production traffic: rerank latency tail increases from ~120ms to 800-2,400ms during incidents.\n- Result: UX timeouts in their search UI and elevated error rates reported by customer monitoring.\n\nEnvironment:\n- Redwood prod environment (vpc-dedicated) servicing NimbleDocs dedicated pool.\n- Observed in us-east primary region; cascade effects seen in eu-west for cross-region traffic.\n\nObserved behavior:\n- Embeddings API returns batches where embedding payload order does not match embedding metadata array order in the JSON response (embedding_id / namespace misaligned).\n- Reranker logs show candidate-to-metadata mismatches and triggers CPU fallback which increases tokenization and scoring latency.\n\nWhy this is critical:\n- Dedicated customers rely on deterministic mapping between embeddings and metadata for correctness. Out-of-order metadata breaks top-k stability and increases latency and 5xxs.\n",
+  "steps_to_reproduce": [
+    "1) Use NimbleDocs account credentials and call POST /v1/embeddings with batch size 16 and client-supplied ids (embed_ids array) against prod us-east endpoint.",
+    "2) Immediately call POST /v1/rerank with the returned embeddings and matching ids in the same order.",
+    "3) Observe rerank score instability and tail latency >1s in ~1/200 requests.",
+    "4) Compare embedding_id order in embeddings response JSON to original request order; intermittently they differ.",
+    "5) Reproduce frequency increases when client uses parallelized client-side batching across multiple TCP connections.",
+    "6) Re-run traffic routed to eu-west after cross-region test to observe propagated latency.\n"
+  ],
+  "logs": [
+    "[2026-03-10T14:12:03Z] embeddings-service: returned 16 items; embedding_ids ordering differs from request ordering (request: [id1,id2,...], response: [id3,id1,...])",
+    "[2026-03-10T14:12:03Z] reranker: candidate-metadata-lookup mismatch for request id1 -> metadata id3; triggering cpu_fallback=true; score_path=cpu; latency_ms=1203",
+    "[2026-03-10T14:12:04Z] api-gateway: connection from client-ip 54.32.10.12 using keepalive, 2 concurrent streams",
+    "[2026-03-11T09:41:22Z] regional-router(us-east): observed 0.78% request reordering in 10k sample window; correlated with envoy upstream reorders on 10/16 backend connections"
+  ],
+  "comments": [
+    "Maya Chen (Support) [2026-03-10]: Logged on behalf of NimbleDocs. Provided initial request/response body samples and a HAR capture. Customer seeing intermittent top-k noise and large latency spikes.",
+    "Diego Alvarez (SRE) [2026-03-10]: Assigned for triage. Initial hypothesis: parallel connection reuse + protobuf/gRPC muxing bug in embeddings-service response packing. Requesting pcap and exact client SDK version from customer.",
+    "NimbleDocs Support (customer) [2026-03-11]: Sent client SDK v0.9.3 and load pattern (16 concurrent workers, batches of 16). Observed peak on weekdays 09:00-11:00 ET.",
+    "Diego Alvarez (SRE) [2026-03-11]: Replayed traffic in staging using same SDK and concurrency. Unable to reproduce with single-region internal staging (no reorder). Enabled verbose logging in embeddings-service to capture response assembly ordering.",
+    "Priya Singh (Backend Eng) [2026-03-12]: Found a reassembly code path in embeddings-service that uses an async aggregator; under high concurrency a map iteration was non-deterministic. Patch PR prepared to enforce deterministic ordering by capturing original request index.",
+    "Diego Alvarez (SRE) [2026-03-12]: Deployed hotfix to canary in us-east. Observed reduction in reorder metric from 0.78% -> 0.02% in 2-hour window. Requesting extended verification from NimbleDocs on their traffic spike window.",
+    "NimbleDocs Support (customer) [2026-03-13]: Confirmed dramatic reduction in wrong-metadata events and tail latency; still seeing rare spikes (~1/20k). Customer requests RCA and long-term fix timeline.",
+    "Priya Singh (Backend Eng) [2026-03-13]: PR #8421 contains deterministic index tracking; additional integration tests added for parallel clients. Scheduling full rollout to dedicated pools after QA signoff.",
+    "Diego Alvarez (SRE) [2026-03-13]: Marking as in-progress. Need to verify eu-west replica behavior and update canary config to include a cross-region test. Linking to INT-1203 for router investigation."
+  ],
+  "investigation_notes": [
+    "Hypothesis: non-deterministic iteration over map/aggregation buffer in embeddings-service async aggregator produced response arrays with permuted order under concurrent writes.",
+    "Evidence: Staging replay with same SDK and concurrency produced identical symptom only after enabling interleaved response assembly; disabling connection pooling removed symptom.",
+    "Root cause seems to be a race in response assembly when multiple write goroutines append to a shared slice without preserving client-provided indices.",
+    "Related observation: envoy/upstream connection reuse and HTTP/2 stream multiplexing increased the window for concurrent assembly; router metrics show slight increase in stream resets for some backends.",
+    "Change introduced in commit ab12f3 (async aggregator refactor) likely introduced the bug; PR referenced below reintroduces stable ordering by tracking original request positions.",
+    "Residual rare spikes may be caused by cross-region replication lag when eu-west reranker pulls cached metadata and experiences transient inconsistency; further investigation with regional cache invalidation required.\n"
+  ],
+  "resolution": "Hotfix deployed to canary in us-east (2026-03-12): embeddings-service updated to preserve client-specified index positions during async aggregation. Canary metrics: reorder rate fell from 0.78% to 0.02%. Pending full rollout to all dedicated pools and cross-region verification. Follow-up work: INT-1203 to examine router connection pooling settings and an integration test added to CI for multi-connection client replay. Customer notified and will receive final RCA and change window for scheduled rollout.",
+  "linked_issues": [
+    "SUP-331210",
+    "INT-1203"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/8421"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/INF/pages/Embeddings+Async+Aggregator+RCA"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_1edbe60ca3454f35803cc26f0e3549b2"
+}

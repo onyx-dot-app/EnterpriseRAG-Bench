@@ -1,0 +1,110 @@
+{
+  "key": "SUP-77100",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Embedding namespace collision + trailing-dim padding causes rerank score inversion and intermittent timeouts",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Patel",
+  "assignee": "Diego Ramos",
+  "customer_company": "KnowMeAI",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "embeddings-service",
+    "serving-runtime",
+    "reranker"
+  ],
+  "labels": [
+    "embeddings",
+    "rerank",
+    "dimensionality",
+    "timeout",
+    "customer-impact"
+  ],
+  "environment": "prod | us-east-1",
+  "affected_models": [
+    "open-embedder-v2-512",
+    "reranker-tiny-v1"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-13",
+  "first_response_due_at": "2026-03-11",
+  "linked_issues": [
+    "SUP-91455",
+    "SUP-31721"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/embeddings-service/pull/842",
+    "https://github.com/redwood-inference/serving-runtime/pull/981"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/embedding-schema-runbook",
+    "https://confluence.redwood.ai/display/ENG/Reranker+Fallback+Runbook"
+  ],
+  "description": "Customer reports that a recent bulk re-ingest caused large shifts in reranker top-k order and intermittent 503/timeout errors from the reranking endpoint. Symptoms started immediately after KnowMeAI uploaded a new embedding batch (approx 120k vectors) and ran nightly rerank jobs. They observe: score inversions (previous top results dropped to bottom) and ~3-8% of rerank requests returning 503/timeouts for queries that previously succeeded.",
+  "impact": "Production reranking for KnowMeAI is degraded: search quality regressions (wrong top-k order) affecting UX and intermittent request failures causing job retries. This affects approximately 18% of their weekly queries since the ingest. Customer is on Dedicated tier and is using reserved capacity in us-east-1.",
+  "steps_to_reproduce": [
+    "1) Using the customer's dataset, call embeddings.upload with namespace 'user-profiles' and include vectors created by SDK v1.4.2 (they supplied file).",
+    "2) Run the rerank endpoint ratelimit of 50 qps against reranker-tiny-v1 with top_k=10 and pass the 'namespace' header set to 'user-profiles'.",
+    "3) Observe top-k order differences compared to baseline dataset embedded with SDK v1.3.x.",
+    "4) Run 1k synthetic queries and note ~3-8% 503/timeouts and increased p95 latency for rerank requests to 750-1200ms.",
+    "5) Inspect embedding dimensions returned from embeddings.list for recently ingested batch and compare against model expected dimension (512)."
+  ],
+  "logs": [
+    "2026-03-09T22:14:02Z WARN embeddings-service: ingest: namespace 'user-profiles' batch=120345 dims_detected=[512,520] -> mixed-dim detected, routing to fallback-path",
+    "2026-03-09T22:14:03Z ERROR serving-runtime: reranker request id=xyz123 queue=long fallback=true reason='mixed-dim-handling' latency=1023ms status=503",
+    "2026-03-09T22:14:03Z ERROR reranker: score-compute: numerical-exception: NaN encountered for cos-sim vector pair, input-dims (512 vs 520)",
+    "Request sample headers: Authorization=REDACTED, Content-Type=application/json, X-Embedding-Namespace=user-profiles, X-Client-SDK=redwood-python/1.4.2",
+    "Stacktrace excerpt: serving-runtime/core/fallback_handler.py: line 210 -> routing decision: FALLBACK_CPU_QUANT_PATH due to dims mismatch"
+  ],
+  "comments": [
+    "2026-03-10 09:12 - Support (Aisha Patel): Opened ticket after initial customer report. Asked for sample embedding batch and client version. Requested customer's rerank job config and recent request IDs.",
+    "2026-03-10 10:05 - Customer (Evan Liu, KnowMeAI): Provided a sample of 1000 vectors (attached) and their ingestion script. Noted they upgraded to redwood-python 1.4.2 during nightly pipeline. Asked for urgent mitigation as search is customer-facing.",
+    "2026-03-10 12:40 - SRE (Diego Ramos): Reproduced mixed-dim detection on staging with customer's sample. Confirmed embeddings-service allowed mixed dims in same namespace and tagged batch for fallback path. Pushed initial hypothesis to ticket.",
+    "2026-03-11 08:22 - Eng (Priya Menon): Investigating SDK change in 1.4.2; saw a change in numpy serialization that could append two trailing zeros when dtype=float32->bytes in some numpy builds. Proposed quick reject-on-ingest + informative error to stop silent fallback.",
+    "2026-03-12 15:30 - Support (Aisha Patel): Shared temporary workaround: advise customer to re-ingest after normalizing dims locally (trim/pad to 512) or pin SDK to 1.3.x until fix; customer accepted re-ingest as short-term plan."
+  ],
+  "investigation_notes": [
+    "Hypothesis 1: SDK v1.4.2 changed serialization leading to padding of 8 floats (~32 bytes) at end of some vectors, yielding 520 effective dims for a subset of vectors.",
+    "Hypothesis 2: Embeddings-service previously accepted heterogeneous vector shapes within same namespace and lazily routed to fallback CPU quant path, which is significantly slower and occasionally OOMs under reserved capacity, causing 503/timeouts.",
+    "Reproduction: Replaying customer's 1k vector file on staging produced identical mixed dims and triggered fallback route. Running cosine compute on mismatched shapes produced NaNs and score inversion in reranker outputs.",
+    "Telemetry: Between 2026-03-09 21:00 and 2026-03-10 03:00, the customer's rerank p95 latency increased from 420ms to 980ms and error rate spiked to 6% for queries routed to that namespace. CPU fallback replicas warmed up and experienced increased GC and occasional OOM-death cycles.",
+    "Root cause (preliminary): Combination of SDK serialization edge-case (client-side) + permissive ingest policy (server-side) allowed mixed-dimension vectors into the same namespace. The reranker assumes uniform dims; mismatch triggers fallback and numeric instability leading to score flip.",
+    "Risk: Other customers that upgraded to SDK v1.4.2 and use namespace-level mixing are at risk until ingest validation is enforced.",
+    "Confirmed related issue: SUP-91455 (embedding-cache-invalidation-delay) appears in some runs where cache keys didn't clear after re-ingest; added to linked_issues for follow-up."
+  ],
+  "resolution_notes": [
+    "Action 1 (hotfix): embeddings-service: validate per-batch vector dims on ingest and reject batch with 400 + clear message indicating expected dims and sample offending vector ids. PR: https://github.com/redwood-inference/embeddings-service/pull/842 (merged to main).",
+    "Action 2 (service change): Add strict enforcement behind a feature flag to reject mixed-dim vectors on dedicated/private clusters. Flag enabled for KnowMeAI's tenant on 2026-03-12 03:00 UTC.",
+    "Action 3 (SDK): Eng created an SDK ticket to patch serialization in redwood-python 1.4.3 to avoid trailing-zero padding; PR filed: https://github.com/redwood-inference/sdk-python/pull/304",
+    "Action 4 (customer workaround): Instructed KnowMeAI to re-ingest their batch after trimming vectors to 512 dims using 'python -m redwood.tools.normalize_vectors --dim 512' OR pin to SDK v1.3.x. Customer chose re-ingest; completed on 2026-03-11 23:40 UTC.",
+    "Action 5 (rollout): After re-ingest and feature-flag enforcement, rerank error rate dropped back to <0.5% and p95 latency returned to baseline ~430ms by 2026-03-12 12:00 UTC. Customer confirmed quality restored.",
+    "Temporary mitigation: Added a monitoring alert for mixed-dim ingestion events and a dashboard showing per-namespace dim histogram.",
+    "Status: Hotfix deployed and tenant flag set; monitoring in place. Waiting on SDK release and broader rollout."
+  ],
+  "follow_up_actions": [
+    "1) Release redwood-python 1.4.3 with serialization fix and notify customers via /status and SDK release notes (owner: SDK team, due 2026-03-18).",
+    "2) Update embeddings ingestion runbook to fail fast on mixed-dim batches and include remediation steps (owner: Eng Ops, due 2026-03-15).",
+    "3) Add unit/integration tests that simulate padded vectors from various numpy builds (owner: Embeddings team).",
+    "4) Evaluate whether auto-trim/pad is acceptable as an ingestion option (product decision; create RFC).",
+    "5) Outreach: email affected Dedicated customers who upgraded to 1.4.x with instructions and links to normalization tool (owner: Customer Success)."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "impact",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution_notes",
+    "follow_up_actions"
+  ],
+  "dataset_doc_uuid": "dsid_06867265a39d409a8956b308f168f39f"
+}

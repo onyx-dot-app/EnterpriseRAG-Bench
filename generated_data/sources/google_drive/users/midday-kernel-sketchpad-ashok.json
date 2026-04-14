@@ -1,0 +1,33 @@
+{
+  "title": "Midday kernel sketchpad \u2014 bug triage + perf TODOs",
+  "owner": "Ashok Patel",
+  "drive_area": "users",
+  "path": "users/ashok",
+  "doc_type": "doc",
+  "created_at": "2026-03-11",
+  "last_modified": "2026-03-12",
+  "collaborators": [
+    "Mina Kapoor",
+    "Diego Flores"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "todo",
+    "kernel",
+    "kv-cache",
+    "latency",
+    "triage"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/1427",
+    "JIRA: INF-3245",
+    "slack:#runtime-kernel thread ts=1710273842.000500"
+  ],
+  "content": "Midday kernel sketchpad \u2014 quick triage + perf ideas (Ashok)\\n\\nDate: 2026-03-11 (notes captured across the day)\\nContext: after the 2026-03-10 deploy (canary -> prod) we saw intermittent p95 spikes on short-context text-gen paths. This is my working scratchpad for triage, lightweight repros, and small experiment ideas. Not polished \u2014 notes to self.\\n\\nObserved symptoms\\n- p50 stable (~35ms), p95 moved from ~70ms to 140\u2013220ms for short prompts (len < 64 tokens) on model:gpt-medium-quant.\\n- spikes correlate with sustained traffic bursts from customer X (route: /v1/completions, model pinned).\\n- stack traces around spike windows show more frequent kernel page faults in the C++ allocator and increased KV cache misses.\\n- SRE reported OOM kill on one Dedicated node yesterday (node-06) \u2014 probably unrelated but keep in mind.\\n\\nQuick repro attempt (local dev)\\n1) simulate 200 qps with variable prompt lengths (50% <64, 30% 64-256, 20% >256).\\n2) run on metal-rt-small (local) with same model binary as prod (built 2026-03-09).\\n3) capture kernel logs, perf top, and /proc/vmstat every 10s.\\n\\nInitial hypotheses\\n- KV cache eviction policy changed subtly in kernel commit (ref PR 1427) \u2014 causing higher thrashing for small sequences.\\n- Quantized kernel path picks a different allocator path which increases page faults under sustained small-batch load.\\n- Autoscaler burst behavior increases concurrent worker count, which increases aggregate working set beyond node memory and triggers page reclaim.\\n\\nImmediate triage checklist (priority order)\\n- [ ] Reproduce locally with payload generator (use load-generator branch: loadgen/kv-evict-test).\\n- [ ] Run perf record on minority of canary hosts (2 nodes) during next traffic window.\\n- [ ] Add short-term metric: kv_cache_local_hit_rate (per-worker) to the telemetry exposed by runtime.\\n- [ ] Check allocator flags in the 2026-03-09 build vs previous stable (2026-03-02).\\n- [ ] Rollback PR 1427 on a single canary pool if repro is straightforward.\\n\\nNotes on KV cache behavior\\n- Current policy: global LRU across shards, eviction when free_pages < threshold. Suspect threshold too low when many small requests produce many short-lived KV entries.\\n- Idea: add a small-time bucketed TTL for entries created by sequences < 64 tokens \u2014 cheap heuristic: lifecycle <= 2s. This could cut churn for small prompts.\\n- Short-term patch: lower kv_shard_count for canary to reduce cross-shard contention (experimental).\\n\\nPerf micro-experiments to run (low-risk)\\n- Experiment A: set KV eviction threshold +20% and observe p95 for 30m.\\n- Experiment B: enable async prefetches only for large sequences (>128) and disable for small. Measure CPU overhead.\\n- Experiment C: replace jemalloc arena behavior to use per-thread caches for small allocs (build with MALLOC_CONF override).\\n\\nDebug artifacts to collect\\n- perf record/collate for hotspots in runtime::kv::Lookup and runtime::alloc::*\\n- /proc/vmstat and vm.swappiness snapshot across spike windows\\n- dmesg logs for page faults and OOM killer activity\\n- runtime debug dump: kv_shard_stats, live_allocations_count, kv_prefix_hit_histogram\\n\\nTickets and ownership\\n- INF-3245: \\\"p95 spikes after 2026-03-10 deploy\\\" \u2014 assigned to me (Ashok) as lead.\\n- INF-3251: \\\"node OOM investigation\\\" \u2014 SRE (Diego) owns. Keep coordinated.\\n- GH-1427: allocator change (author: Mina) \u2014 suspect but need repro.\\n\\nQuick action plan (next 48h)\\nDay 0 (today):\\n- repro locally with loadgen (2h) + collect perf (1h) -> update INF-3245 with attached flamegraphs.\\n- add simple kv_cache_local_hit_rate metric (quick change in telemetry lib) -> deploy to canary (2h).\\n\\nDay 1:\\n- Run controlled canary with small-batch bias traffic (6h ramp).\\n- If p95 still high, rollback GH-1427 on one canary pool and compare.\\n- If rollback reduces p95, schedule full rollback and postmortem.\\n\\nDay 2:\\n- If regression remains, try TTL heuristic for small sequences or lower shard_count.\\n- Plan longer-term fix: revisit allocator paths and consider per-worker KV partitioning.\\n\\nNotes to self / random thoughts\\n- We might be overfitting to short prompts. Some customers do only short prompts and they are sensitive to head-latency \u2014 consider a per-route config for kv_behavior.\\n- Add an e2e eval that sends 90% short prompts and tracks p50/p95 token-latency per commit. Automate as a pre-merge check for runtime changes.\\n- Remember to ping @Mina in Slack before rolling back her PR \u2014 avoid surprise.\\n\\nSnippets / CLI commands\\n- repro load (local): ./dev/loadgen --rate 200 --short-bias 0.6 --model gpt-medium-quant --out /tmp/load-logs\\n- collect perf: sudo perf record -F 99 -a -g -- ./bin/runtime --config canary.yaml; sudo perf script > perf-unfolded.txt; flamegraph.pl perf-unfolded.txt > f.svg\\n- quick telemetry grep: curl -s localhost:9090/metrics | grep kv_cache_local_hit_rate\\n\\nOpen questions\\n- Did the allocator change affect only certain hardware (A100 vs H100 micro-behaviors)? Need to tag by hardware when collecting data.\\n- Are the affected requests always single-tenant? Could be customer-specific request pattern that stresses eviction.\\n- Is there any interaction with the new batching heuristics deployed last month?\\n\\nReferences / links\\n- GH PR: https://github.com/redwood-inference/serving-runtime/pull/1427\\n- Jira: INF-3245\\n- Slack thread: #runtime-kernel (thread ts=1710273842.000500)\\n\\nNext immediate steps (right now)\\n- start local repro (30m)\\n- add kv metric change to telemetry branch and open small PR targeting canary (45m)\\n- message Mina + Diego with current notes and plan (15m)\\n\\n-- end scratchpad --\\n\\n(If I'm stepping away: leave loadgen running, drop log tarball at /tmp/ashok-kv-investigation.tar.gz, ping me on Slack if perf traces look noisy)",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_431413a3b3a845499d96556ff54d945d"
+}

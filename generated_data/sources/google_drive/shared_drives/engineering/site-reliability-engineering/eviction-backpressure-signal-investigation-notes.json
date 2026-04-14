@@ -1,0 +1,78 @@
+{
+  "title": "eviction-backpressure-signal-investigation-notes",
+  "owner": "Aisha Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/site-reliability-engineering/",
+  "doc_type": "doc",
+  "created_at": "2026-03-08",
+  "last_modified": "2026-03-10",
+  "incident_id": "INC-2026-03-08-kv-eviction-bp",
+  "summary": "Post-mortem style investigation notes for a production incident where a combination of aggressive continuous-batching heuristics and a KV-cache eviction feedback loop caused sustained latency spikes and memory pressure on the serving runtime, intermittently producing OOM-like restarts for a subset of replica pods.",
+  "impact": "~8% of live requests across the us-east cluster experienced elevated tail latency (>99p token latency x3 baseline) for ~2.5 hours; three serving-runtime replicas restarted due to OOM/killed-by-kernel during the incident window; no customer data loss reported, some degraded API responses and increased error rate for high-concurrency customers.",
+  "detection": "Automated SLO alert (tail token latency) fired at 2026-03-08T02:12Z. Pager duty escalation to eng-sre. Prometheus graph showed sudden increase in kv_cache_evictions/sec and kv_cache_size dropping concurrently with long-running batches and increased queue length on the batching queue.",
+  "timeline": "- 02:08Z: Increase in request rate from a large customer (spike in concurrent infer requests).\n- 02:10Z: Continuous-batching heuristic began grouping larger prefixes (longer avg seqLen) causing memory-per-batch to increase.\n- 02:12Z: Tail latency alert triggers; SRE on-call paged.\n- 02:15Z: Observed kv_cache_evictions/sec jump from ~20/s to ~750/s; kv cache pressure caused increased fetch misses and recompute.\n- 02:22Z: Three replicas OOM/killed within 12 minutes (OOMKilled in k8s event stream). Restarted automatically by k8s.\n- 02:30Z: Applied short-term mitigations (reduced batch_size cap, disabled aggressive batching heuristic) - latency began to recover.\n- 04:45Z: Secondary throttling rule applied at load-balancer to shed low-priority traffic. All alerts resolved by 05:00Z.",
+  "root_cause_summary": "A feedback loop between the continuous-batching module and the KV cache eviction policy. Large batches increased memory usage and KV cache insert rate; eviction policy responded by evicting older KV entries, which increased cache misses leading to more recomputation and larger transient memory allocations. That, combined with a sequence-length skew from a high-concurrency customer, pushed a few pods past their memory limits. The batching heuristic lacked a backpressure signal from the cache subsystem and didn't reduce batch size quickly when cache eviction rate crossed a danger threshold.",
+  "commands_used": [
+    "kubectl get pods -n serving -o wide --selector=app=runtime",
+    "kubectl describe pod <pod> -n serving | grep -i oom -A4",
+    "kubectl logs <pod> -n serving --since=3h | rg \\\"evict\\\" -n",
+    "curl -sS http://metrics-internal:9001/debug/kv | jq '.'",
+    "promql: rate(kv_cache_evictions_total[1m])",
+    "promql: sum(rate(serving_batch_queue_length[1m])) by (pod)",
+    "gcore/gdb steps (for core dump analysis) - only used on non-prod repros"
+  ],
+  "immediate_mitigations": [
+    "Temporarily reduced max_batch_tokens from 2048 to 1024 at 02:26Z via feature-flag to limit peak per-batch memory.",
+    "Disabled the new 'aggressive-prefix-merge' batching heuristic at 02:28Z.",
+    "Increased KV cache soft limit (cache_size_mb) by 25% for impacted node pool via config map at 02:32Z to reduce eviction churn.",
+    "Applied load-shedding for low-priority API keys at 03:00Z via rate-limiter rules to reduce overall concurrency.",
+    "Temporarily increased pod memory requests on a small canary set to avoid immediate OOMs while we investigate (non-uniform change to ensure stability)."
+  ],
+  "long_term_fixes": [
+    "Add explicit backpressure signal from kv-cache to batching layer: when eviction_rate > threshold, reduce batch_size and pause prefix merging.",
+    "Introduce a circuit-breaker for continuous-batching that can quickly fall back to per-request execution if memory pressure trends exceed safe bounds.",
+    "Tune eviction policy to prioritize entries with low reuse probability and add a small grace window to avoid immediate churn under spikes.",
+    "Create a canary test harness that replays customer-like traffic with variable seqLen distributions to validate batching heuristics before rollout.",
+    "Improve observability: add 'batch_memory_estimate' and 'kv_eviction_cause' labels to metrics, and a composite alert that fires earlier when batch_size * avg_seq_len correlates with eviction rate.",
+    "Post-rollout checklist for future batching feature flags: per-tenant throttles, early-fail thresholds, and runtime kill-switch for aggressive heuristics."
+  ],
+  "metrics_snapshot": "At 02:14Z: kv_cache_size_mb=420 (configured soft limit=512), kv_cache_evictions/sec ~ 720, avg_batch_tokens=1560, serving_batch_queue_length(avg)=48, node_mem_used_percent=89% on impacted nodes, pod_resident_set=15.6GB (limit 16Gi for impacted pods).",
+  "analysis_notes": "- Reproduced approximate behavior in staging by replaying customer traces with elevated prefix lengths; confirmed that when avg_batch_tokens > 1400 eviction/sec climbs non-linearly.\n- Memory growth happens in two places simultaneously: batch token buffers + intermediate KV recompute buffers. The latter isn't accounted for in the simple 'per-token' memory estimator used by the batching controller.\n- The eviction policy is LRU-like but uses approximate frequency counters; under high insert churn it evicts a larger fraction of items that are still mildly hot.",
+  "follow_up_tasks": [
+    "ENG-SRV-1024: Implement kv->batching backpressure signal (owner: Marcus Chen, due 2026-04-15).",
+    "ENG-SRV-1025: Add composite alert rule and dashboard tile for batch_memory_estimate x eviction_rate (owner: Sofia Ramos, due 2026-03-25).",
+    "ENG-SRV-1026: Build staging canary that replays seqLen-heavy traffic and automates batch-heuristic safety checks (owner: Aisha Patel, due 2026-04-01).",
+    "ENG-SRV-1027: Review default pod memory limits for serving runtime and create adaptive request scaling doc (owner: Platform Eng, due 2026-04-08)."
+  ],
+  "collaborators": [
+    "Marcus Chen",
+    "Sofia Ramos",
+    "Luis Ortega",
+    "Priya Sen",
+    "Jonah Park"
+  ],
+  "team": "eng-sre",
+  "status": "in_review",
+  "tags": [
+    "kv-cache",
+    "eviction",
+    "backpressure",
+    "continuous-batching",
+    "OOM",
+    "oncall",
+    "investigation"
+  ],
+  "linked_artifacts": [
+    "jira:ENG-SRV-1024",
+    "jira:ENG-SRV-1025",
+    "github:repo/redwood-serving-runtime/pull/782",
+    "github:repo/redwood-serving-runtime/issue/415",
+    "confluence:serving-runtime/kv-cache-architecture"
+  ],
+  "content": "INVESTIGATION NOTES\n\nContext:\nWe saw a production incident during a high-concurrency customer burst where continuous-batching behavior amplified memory pressure. This doc captures the timeline, immediate actions, root-cause hypotheses, and the follow-up plan. Purpose is to be a compact on-call artifact that engineering and product owners can iterate on.\n\nKey signals observed:\n- Rapid rise in kv_cache_evictions/sec concurrent with higher avg_batch_tokens.\n- Pod RSS growing toward container limit while app-level /metrics showed increased transient allocations during recompute paths.\n- Batching queue length rose and stayed high; the controller did not rapidly shrink batches.\n\nHypothesis details:\nThe batching controller uses a per-batch token estimate to decide groupings; it aims to maximize throughput but assumes stable KV hit rates. Under a customer workload with many long prefixes, the cache insert rate increased, triggering eviction. Evicted entries caused cache misses for subsequent batched requests, which forced recompute and additional temporary allocations. The combined memory from larger batches plus recompute buffers briefly exceeded pod limits for several replicas.\n\nWhy pods OOMed instead of graceful shedding?\nThe runtime's memory allocator and per-request accounting are not strictly enforced for intermediate buffers; we rely on container limits to kill runaway processes. There is no preemptive per-batch allocation cap that would make the request fail fast.\n\nShort-term lessons for on-call responders:\n- When tail latency and kv evictions rise together, consider reducing batch size and disabling new batching heuristics before scaling cluster size. Scaling can mask the problem and make eviction churn worse if multiple nodes hit the same pattern.\n- Eviction metrics are a leading indicator; add lower-threshold alerts.\n- Prefer targeted mitigations (heuristic flip, config bump) over blanket pod memory increases unless reproducing in staging is impractical.\n\nCommunication and customer impact:\n- Notified CS for customers who had increased error rates; provided a short summary and ETA for investigation.\n- No PII or customer secrets exposed.\n\nOpen questions:\n- Should we prioritize changing eviction policy or reworking batching controller to be conservative? Answer: both; eviction changes are lower-risk, but long-term safety must come from batching backpressure.\n- Can we auto-detect tenant-induced seqLen skews and auto-apply tenant-level throttles? Research ticket created.\n\nImmediate next steps (owner rotation):\n- Marcus: start ENG-SRV-1024 design doc for kv->batching signal.\n- Sofia: implement composite alert and dashboard.\n- Aisha: schedule staging replay run to validate patch and batch heuristics.\n\nAppendix: useful links and commands included above.\n\nEnd of notes.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_8d7b971179c446359c7b60773a9d255d"
+}

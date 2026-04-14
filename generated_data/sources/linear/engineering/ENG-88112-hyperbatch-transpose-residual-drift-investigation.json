@@ -1,0 +1,44 @@
+{
+  "key": "ENG-88112",
+  "team": "engineering",
+  "title": "Hyperbatch transpose race causing residual buffer desynchronization and softmax underflow drift",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-14",
+  "creator": "Nadia Kim",
+  "assignee": "Rafael Ortega",
+  "project": "runtime-performance-kernels",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "release": "runtime-1.22",
+  "due_date": "2026-03-21",
+  "labels": [
+    "regression",
+    "prefill",
+    "kernel-selection",
+    "numerical-drift",
+    "high-priority"
+  ],
+  "customer_impact": "high",
+  "security_review_required": "false",
+  "dependencies": [
+    "ENG-86420",
+    "ENG-87299"
+  ],
+  "description": "Summary:\nA recent change to the multi-stream hyperbatch transpose optimization (introduced in runtime-1.21) appears to introduce a non-deterministic correctness regression. Under moderate concurrency (multiple prefill + decode streams), outputs exhibit token-order skew and low-amplitude numerical drift in softmax outputs that accumulates across long generations. In production this shows as hallucination-like shifts on long-context workloads and an increased tail latency variance.\n\nObserved failure modes:\n- Token order anomalies: rare off-by-one token insertion/deletion observed in ~0.3% of sampled requests for long sequence lengths (>2048) under 8+ concurrent streams.\n- Softmax underflow drift: logits for later tokens show small but systematic negative bias compared to baseline, causing subtle changes in sampling probabilities (rarely changes top-1, often changes tail mass).\n- Prefill/Decode interleaving corruption: in a few cases KV cache indices appear mismatched for a single stream after another stream prefilled a contiguous hyperbatch slice.\n\nReproduction steps (deterministic):\n1) Checkout branch: main@runtime-1.21 (with hyperbatch transpose enabled).\n2) Run synthetic harness: tests/synth/hyperbatch_long_context.py with SEED=4242, concurrent_streams=12, seq_len_prefill=4096, decode_len=512, model=redwood/gptX-30B-qat_fp16.\n3) Compare token sequences and per-token logits against runtime-1.20 baseline (disable hyperbatch transpose).\n4) Failure observed in 3/100 runs: token mismatch + KL divergence of per-token distribution > 1e-3 for tokens after position 1024.\n\nHypothesis / Root cause: \nDuring adaptive kernel selection we introduced a per-device transient buffer that stores transposed activation slabs for batched attention kernels. The buffer is multiplexed across streams using a lightweight epoch counter and a best-effort CAS, but the fast path omitted an atomic fence when swapping the residual/transposed pointer on fallback kernels. Under high concurrency a prefill thread can start using a slab still being torn down by a concurrent decode stream: this yields a temporal alias where accumulating FXP/FP16 reductions see partially-overwritten inputs. The corrupted inputs cause tiny rounding differences in softmax exponent accumulation; because we use mixed-precision accumulation (FP16 paths with FP32 accumulation in some kernels) the rounding bias is non-linear and propagates across attention windows, producing the observed drift. Additionally the per-stream KV-index update was not fully linearized with respect to the transpose buffer lifetime which explains occasional KV misindexing.\n\nMitigation applied (temporary):\n- Disabled hyperbatch transpose fast-path on runtime-1.21 (hotfix branch) for loaded GPUs with >4 concurrent streams.\n- Added a conservative memory fence + stream fence in the kernel handshake for the slab swap in hotfix.\n\nWork done so far:\n- Reproduced locally and in canary region (us-west-2) using production traffic replay; added token-level diff logging.\n- Instrumented per-slab epoch counters and added histograms for slab-failures/ABA detections.\n- Implemented two candidate fixes: \n  1) Fix A (safety-first): strong atomic swap + fence + single-producer lock per-slab. Deterministic, low risk, measurable overhead (~2-4% token cost on synthetic microbenchmarks).\n  2) Fix B (perf-first): reordered pipeline to ensure slab lifetime extends until downstream decode commits KV-index (uses release-acquire semantics, avoids global lock). Lower overhead (<=1% median cost) but more complex and requires careful formalization of invariants.\n- Added unit tests to reproduce ABA by injecting scheduler yields at the CAS point.\n\nOpen questions / trade-offs:\n- Is the small perf delta (1-2%) acceptable to keep Fix A as default? Fix A is simplest and easiest to backport. Fix B gives better perf but has a larger surface area and must be verified for all kernel variants (FP16, BF16, FP32) and hardware (A100, H100, gV100).\n- We need to determine if mixed-precision accumulation policy should be made deterministic (always do FP32 accumulation for softmax reductions). That reduces drift but increases memory/compute cost.\n\nNext steps / proposed plan:\n1) Short term (this sprint): merge Fix A into runtime-1.21-hotfix and roll to 100% on Dedicated Canary group with traffic-sliced workloads. Monitor token-diff rate and tail error budget. (Assigned to Rafael)\n2) Medium term: fully implement and stress-test Fix B on a hardware matrix in CI; add formal spec doc and code comments for handshake invariants. (Assigned to Nadia + Rafael pair)\n3) Long term: evaluate moving to deterministic FP32 accumulation in attention inner-reduction or provide a toggle per-model/route in Redwood Console.\n\nMonitoring / Metrics to watch:\n- token-diff-rate (fraction of requests with any token mismatch) \u2014 alert threshold >0.01%\n- per-token KL divergence averaged over last-token window of 256 tokens \u2014 alert >2e-4\n- slab-ABA-histogram and CAS-retry-rate\n- tail latency (p99.9) on prefill-heavy workloads\n\nArtifacts / Links:\n- Repro harness: https://github.com/redwood-inference/runtime/tree/main/tests/synth/hyperbatch_long_context.py\n- Canary dashboard (prod replay): https://dash.redwood.ai/d/rtc/hyperbatch-canary?orgId=1\n- Hotfix branch PR: https://github.com/redwood-inference/runtime/pull/11458\n- Fix B WIP PR: https://github.com/redwood-inference/runtime/pull/11492\n- Investigation notes: https://drive.redwood.ai/drive/folders/1Hy_perfbatch_investigation\n\nAcceptance criteria for closing:\n- Hotfix deployed to all production fleets with token-diff-rate within baseline tolerance (<0.001%) for 72h of representative traffic AND\n- Fix B validated in CI hardware matrix with no reproducible ABA failures under stress harness and benchmarked to show <1.5% median token-cost delta OR a design decision and rollout plan documented to prefer Fix A permanently.\n",
+  "comments": [
+    "2026-03-10 - Nadia Kim: Created ticket after triage. Initial repro captured from replay of customer workload. Notified SRE and assigned to Rafael for immediate hotfix.",
+    "2026-03-11 - Rafael Ortega: Confirmed repro locally. Built CAS-fence PoC. Hotfix branch created and smoke-tested. Pushed PR #11458 for safety-first approach.",
+    "2026-03-12 - Priya Shah (SRE): Canary replay showed token-diff-rate drop from 0.32% -> 0.002% with hotfix but CPU utilization on control plane increased slightly. We should monitor autoscaling thresholds.",
+    "2026-03-13 - Leah Martinez (ML Research): Ran eval on 50 human prompts; softmax tail entropy restored to baseline for hotfix. Will run deeper A/B on quality metrics.",
+    "2026-03-14 - Rafael Ortega: Started Fix B refactor. Need architectural review from Runtime Leads (Victor Chen, Simone Rao) before merging; filing design doc link in PR.",
+    "2026-03-14 - Victor Chen: Requested microbench matrix for FP16/BF16/FP32 across H100/A100, include p50/p95 token cost and tail-error stats before greenlight for Fix B."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_6f534bd3d8834daca950b27b8a0fdde0"
+}

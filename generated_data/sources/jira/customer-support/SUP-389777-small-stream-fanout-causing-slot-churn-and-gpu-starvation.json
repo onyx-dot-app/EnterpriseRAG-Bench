@@ -1,0 +1,78 @@
+{
+  "key": "SUP-389777",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Small concurrent streaming connections from mobile SDK cause slot churn and transient GPU starvation in customer's Dedicated pool",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Marco Ruiz",
+  "assignee": "Elena Morrison",
+  "customer_company": "AtlasLearn Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "scheduler",
+    "dedicated-pool",
+    "api-gateway"
+  ],
+  "labels": [
+    "noisy-neighbor",
+    "gpu-starvation",
+    "autoscale",
+    "p1-customer-impact"
+  ],
+  "environment": "prod-us-west",
+  "affected_models": [
+    "redwood-7b-v2",
+    "community-7b-quant"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-11",
+  "linked_issues": [
+    "SUP-30877",
+    "SUP-95321"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/4421"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/678901/Noisy+Tenant+runbook"
+  ],
+  "description": "Customer reports repeated p99 latency spikes and sustained throughput degradation in their Dedicated GPU pool starting 2026-03-10 03:40 UTC. Symptoms coincide with a morning traffic pattern where thousands of short streaming requests (100-500ms each) from the AtlasLearn mobile SDK fan out rapidly. The Dedicated autoscaler does not appear to add capacity in time; GPUs show frequent small allocation/eviction cycles and kernel queue stalls. This ticket captures the investigation into allocation churn, autoscaler responsiveness, and whether scheduling heuristics are unfairly favoring large-batch jobs, enabling slot fragmentation and transient starvation for small streams.",
+  "steps_to_reproduce": "1) Use AtlasLearn mobile client simulation script to open 4k concurrent streaming sessions over 2 minutes: python tools/sim_client.py --concurrency 4000 --stream-duration 0.2 --payload-size 1kb\n2) Target the customer's Dedicated pool route: POST /v1/generate?pool=atlaslearn-dedicated with streaming SSE\n3) Observe per-GPU allocation events via internal allocator endpoint: GET /internal/allocations?pool=atlaslearn-dedicated\n4) Correlate with GPU queue depth and kernel errors from /metrics and NVidia dmon logs",
+  "observed_behavior": "- p99 generation latency from 400ms baseline to 2.8s during peak fanout.\n- Autoscaler adds 0 or 1 GPUs (insufficient) while allocator shows dozens of short-lived slot allocations and evictions.\n- GPU metrics show high context switch rate, small batch utilization (low GPU occupancy), and repeated 'allocation_timeout' traces.\n- Some requests receive 429/503 when allocator can't satisfy short-lived slot requests.",
+  "expected_behavior": "- Autoscaler should provision additional GPUs to maintain latency SLOs for customer Dedicated pool during predictable fanout spikes, or the runtime should coalesce short streams to avoid allocation churn.\n- No sustained kernel queue stalls or high eviction rate for small streaming jobs.",
+  "logs": [
+    "2026-03-10T03:42:12Z [allocator] slot_alloc start tenant=atlaslearn token=abc123\n2026-03-10T03:42:12Z [allocator] slot_alloc evict tenant=atlaslearn token=abc123 reason=short_lived\n2026-03-10T03:42:12Z [gpu-0] kernel_queue depth=127 occupancy=12%\n2026-03-10T03:42:13Z [autoscaler] evaluated=1 desired=3 current=2 last_scale=2026-03-10T03:39:01Z\n2026-03-10T03:42:14Z [nginx] 503 POST /v1/generate (upstream timeout)"
+  ],
+  "investigation_notes": [
+    "Initial hypothesis: high fanout of tiny streams causes allocator to create many ephemeral GPU slots, increasing scheduler overhead and preventing effective batching.\nMetric evidence: per-GPU small-batch ratio jumped from 8% to 62% during spike (grafana: grafana.redwood/internal/d/alloc?panel=small_batch_ratio).\nObserved allocator churn: average slot lifetime dropped to 210ms; eviction rate spiked to 38% (trace logs).\nAutoscaler behavior: scaling loop has 30s evaluation window and requires >70% sustained utilization to scale \u2014 too coarse for sub-minute spikes. See scheduler autoscale SLOs in runbook.\nNo NVidia ECC errors or hardware faults found; noisy tenant behavior confirmed by tenant-level allocation heatmap.\nPotential scheduling bug: recently landed change to 'short_stream_preemption' (runtime PR #4418) may prefer evicting older small-stream slots to free memory for larger batches, causing thrash under many small streams."
+  ],
+  "comments": [
+    "2026-03-10 06:10 - Aisha Patel (Support): Contacted customer for exact SDK version and their mobile traffic pattern. Customer confirmed they rolled a client update 2026-03-09 that enabled aggressive background prefetching.\n2026-03-10 09:04 - Elena Morrison (SRE): Correlated allocator churn in us-west with customer's tenant id. Added temporary rate cap on slot-creates for tenant atlaslearn (applied policy: max_inflight_streams=1000) to reduce immediate thrash.\n2026-03-11 02:30 - Thomas Nguyen (Runtime Eng): Investigated PR #4418; reproduced eviction pattern in staging with simulation. Proposed short-term revert and longer-term coalescing of small streams into multiplexed sessions.\n2026-03-12 11:15 - Elena Morrison (SRE): After emergency rate cap and a small autoscaler config tweak (reduce scale threshold to 55% for dedicated pools during business hours), observed p99 fall back to 640ms. Customer report: significant improvement during morning peak."
+  ],
+  "resolution": "Partial mitigation applied: temporary tenant-level throttle on slot creation plus autoscaler sensitivity adjustment. Root cause appears to be a combination of (1) client-side behavioral change producing many short streaming requests and (2) runtime policy that aggressively evicts small-stream slots under memory pressure, which, under high fanout, produces allocation churn and starvation. A runtime code change (revert PR #4418) has been drafted and is planned for quick rollout to staging for validation.",
+  "workaround": "- Customer can enable SDK batching (client-side) to group small prompts into fewer long-lived streams.\n- We've applied a tenant rate cap (max_inflight_streams=1000) and lowered autoscale threshold for the Dedicated pool as an immediate mitigation.",
+  "follow_up_actions": [
+    "Deploy revert of short_stream_preemption (runtime PR #4446) to staging and run AtlasLearn simulation suite.\nImplement multiplexing/coalescing feature to allow many tiny streams to reuse existing slots (spec PR: https://github.com/redwood-inference/specs/pull/89).\nAdd an autoscaler mode for rapid transient fanout events: evaluate 10s windows and allow temporary burst capacity.\nAdd customer-facing guidance in AtlasLearn onboarding to prefer SDK batching or multiplexed streams for mobile use-cases.\nPostmortem to be authored and linked to this ticket within 7 days."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution",
+    "workaround",
+    "follow_up_actions"
+  ],
+  "dataset_doc_uuid": "dsid_c0adcbd840f2468db3f0f3c44718e2a0"
+}

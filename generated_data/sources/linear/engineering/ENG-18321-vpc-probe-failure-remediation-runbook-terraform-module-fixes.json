@@ -1,0 +1,58 @@
+{
+  "key": "ENG-18321",
+  "team": "engineering",
+  "title": "VPC probe-failure remediation runbook + Terraform module fixes for Private deployments",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-11",
+  "updated_at": "2026-03-14",
+  "creator": "Marcus Chen",
+  "assignee": "Lina Morales",
+  "project": "private-deployments",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "due_date": "2026-03-22",
+  "labels": [
+    "runbook",
+    "terraform",
+    "remediation",
+    "vpc",
+    "kubernetes",
+    "automation"
+  ],
+  "dependencies": [
+    "ENG-17044",
+    "ENG-17298"
+  ],
+  "customer_impact": "medium",
+  "release": "private-2026.03",
+  "security_review_required": "true",
+  "body": "Summary: We frequently see Private (VPC) deployments surface transient and recurring failures reported by K8s readiness/liveness probes and the Redwood healthcheck agent. Root causes in the last 6 incidents include: VPC route drift, tightened security group rules blocking ephemeral ports, misconfigured ENI attachment timing, and Terraform state drift that left metadata access disabled on some node pools. This ticket creates an operator-friendly runbook and a suite of Terraform module patches + automated remediation primitives to reduce MTTI and prevent human error during rollouts.\n\nScope:\n- Runbook for on-call engineers to triage common Private probe failures.\n- Automated remediation primitives (k8s controller + Terraform apply pipeline) for non-customer-impacting fixes.\n- Terraform module changes to add drift detection hooks, idempotent guard rails, and safer rollouts.\n- Postmortem checks and test harness for staging to validate behavior.\n\nDetection & Alerting:\n- Primary signal: >3% 5m rolling increase in failed readiness probes per node group OR healthcheck agent reporting \"probe-500\" tag.\n- Secondary signal: CloudWatch metric: RouteTableAssociationChange > 0 in last 5m and 10m spike in ENI attach failures.\n- Alarm playbook starts in PagerDuty escalation 1 (on-call infra).\n\nRunbook (high level):\n1) Initial triage (0-10m):\n   - Check console: Redwood Console -> Private -> Node Group -> Recent health events.\n   - kubectl top nodes && kubectl get pods -A --field-selector=status.phase!=Running -o wide to find concentration.\n   - Query agent logs: kubectl -n redwood logs deployment/health-agent -c agent --since=15m | grep -E \"probe|timeout|connection refused\"\n\n2) Quick hypothesis tests (10-25m):\n   - Check VPC network objects: aws ec2 describe-route-tables --filters \"Name=vpc-id,Values=${VPC_ID}\" --query 'RouteTables[*].Associations'\n   - Verify SG/NACL: aws ec2 describe-security-groups --group-ids ${SG_ID} && aws ec2 describe-network-acls --filter \"Name=vpc-id,Values=${VPC_ID}\"\n   - ENI attach issues: aws ec2 describe-network-interfaces --filters \"Name=attachment.instance-owner-id,Values=aws\" --query '[].Status'\n   - Confirm kube-probe ports: in many clusters we use ephemeral ports 30000-32767 for hostPort debug. Check if those ports are blocked.\n\n3) Manual remediation (25-60m):\n   - If route table association drift found: run terraform plan against infra module and if drift only relates to route association, apply the following targeted change: terraform apply -target=aws_route_table_association.<name> -auto-approve.\n   - If security group unexpectedly denies ephemeral ports: create a temporary SG rule allowing the probe range and attach to affected nodes: aws ec2 authorize-security-group-ingress --group-id ${SG_ID} --protocol tcp --port 30000-32767 --cidr ${CLUSTER_CIDR}\n   - If metadata access disabled on node pools (IMDS v2 enforcement mismatch): verify cloud-init/template and re-enable metadata or roll nodes via terraform taint/replace on aws_autoscaling_group or node pool resource.\n   - If ENI race seen: scale down non-critical workloads and cordon affected nodes: kubectl cordon ${NODE} && kubectl drain ${NODE} --ignore-daemonsets --delete-emptydir-data\n\n4) Automated remediation plan (goal: fix safely within 10-30m for known safe classes):\n   - Implemented primitive #1: terraform-drift-check job in CI that runs every 5m for private customers with active deployments. If dt > threshold and only route/association mismatch, it opens a dry-run PR and (optionally) a 15m auto-apply window if the change is exact match to known-safe-change list.\n   - Primitive #2: kube-probe-controller (controller-runtime operator) that watches Pod/Node probe failure spikes and executes pre-authorized run actions: create temporary SG ingress, restart health-agent DaemonSet on nodes matching pattern, or apply a cached route-association via cloud API. Actions are rate-limited and have a safety cool-down to avoid thrashing.\n   - Primitive #3: reconciliation hook in Terraform modules: a local-exec null_resource that runs a small verification script post-apply (verify routing + probe port reachability) and fails fast in CI to prevent promotion if checks fail.\n\nTerraform module changes (high level diffs to add):\n- modules/network/main.tf: add aws_route_table_association resource labels and lifecycle { prevent_destroy = false } plus a new variable enable_association_guard (default true) to add an aws_config_configuration_recorder-style drift alarm.\n- modules/nodepool/main.tf: expose node_metadata_access variable and ensure template uses IMDS v2 by default, with a compatibility flag for older clusters.\n- modules/sg/main.tf: add a managed rule for ephemeral-probe-ports that can be toggled per-environment and a flag allow_temporary_sg_rule_ttl_seconds for operator-created temporary rules.\n- tests/verify_probe_reachability.sh: shell script used by CI null_resource to curl node:PORT and verify 200/expected response.\n\nSafety & Rollback:\n- Auto-apply window only permitted when change is identical to an approved \"safe-change\" pattern (route assoc, add ephemeral SG rule, restart agent). All auto-applies are recorded and reversible by terraform apply -destroy-target or by a controlled revert PR.\n- Controller created resources tagged with remediation=true and TTL tag so a cleanup job removes them after grace period.\n\nImplementation tasks (milestones):\n- M1 (3 days): Draft runbook document + test harness + manual remediation steps validated in staging.\n- M2 (1 week): Terraform module patches + CI drift-check job. PR: github.com/redwood-inference/private-iac/pull/245 (WIP).\n- M3 (2 weeks): kube-probe-controller MVP, rate-limiting, and audit events to CloudTrail & Console.\n- M4 (1 week): Load testing in staging with failure injection + canary on 10% of customer clusters.\n\nTelemetry & Postmortem:\n- Add a new Console dashboard: \"Private Probe Health\" with per-cluster probe fail rate, remediation actions count, and revert count.\n- On any automated remediation action, create a short incident note with: cause (detected pattern), action taken, and revert link.\n\nAcceptance criteria:\n- Runbook documented and reviewed by on-call infra + PM.\n- Terraform CI drift job runs every 5m and alerts on drift, with an approved auto-apply window implemented for safe patterns.\n- Controller reduced mean time to repair (MTTR) for the last 3 historical classes by >=40% in staging tests.\n\nNotes & links: see links field for PRs and Confluence design doc.\n",
+  "comments": [
+    "2026-03-11 Marcus Chen: Created initial ticket after two incidents this week where route association drift caused probe failures for customer X. Leaving staging runbook draft in Confluence.",
+    "2026-03-12 Lina Morales: Reviewed manual remediation steps, suggested adding TTL tagging for temporary SG rules and ensuring operator never touches customer-managed SGs. Added label 'automation' and flagged security review.",
+    "2026-03-13 Aisha Patel: Security review notes: automated SG changes must require a signed allowlist in Vault and be visible in audit logs. Recommend we integrate with KMS for temporary rule decryption. Added as requirement.",
+    "2026-03-14 Lina Morales: Opened WIP PR for TF module changes: github.com/redwood-inference/private-iac/pull/245; CI job added to CircleCI but not yet enabled for prod clusters. Kube-controller scaffolded under infra/controllers/probe_remediate.",
+    "2026-03-14 Marcus Chen: Next steps: wire up safe-change registry, create playbook snippet for on-call to disable auto-apply in case of suspected multi-region outage."
+  ],
+  "links": [
+    "https://confluence.redwood.ai/display/INF/Private+Probe+Remediation+Runbook",
+    "https://github.com/redwood-inference/private-iac/pull/245",
+    "https://console.redwood.ai/dashboards/private-probe-health",
+    "https://playbooks.redwood.ai/runbooks/vpc-probe-remediation"
+  ],
+  "commands": [
+    "kubectl -n redwood logs deployment/health-agent -c agent --since=15m | grep -E \"probe|timeout|connection refused\"",
+    "aws ec2 describe-route-tables --filters 'Name=vpc-id,Values=${VPC_ID}' --query 'RouteTables[*].Associations'",
+    "terraform plan -target=aws_route_table_association.my_assoc",
+    "terraform apply -target=aws_route_table_association.my_assoc -auto-approve",
+    "kubectl cordon ${NODE} && kubectl drain ${NODE} --ignore-daemonsets --delete-emptydir-data",
+    "./tests/verify_probe_reachability.sh ${NODE_IP} ${PROBE_PORT}"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_e2fe26129e284d068ef33b64ebb6d6b8"
+}

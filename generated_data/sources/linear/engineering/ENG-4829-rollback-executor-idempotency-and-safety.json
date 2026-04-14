@@ -1,0 +1,48 @@
+{
+  "key": "ENG-4829",
+  "team": "engineering",
+  "title": "Rollback executor: idempotency + rate-limited, safe traffic shifts under partial failure",
+  "status": "In Review",
+  "priority": "P0",
+  "created_at": "2026-01-23",
+  "updated_at": "2026-02-21",
+  "creator": "Jada Williams",
+  "assignee": "Ethan Park",
+  "project": "Auto-rollback on SLO breach integration",
+  "cycle": "2026-W07",
+  "estimate": "8",
+  "due_date": "2026-02-24",
+  "labels": [
+    "rollouts",
+    "auto-rollback",
+    "reliability",
+    "control-plane",
+    "idempotency",
+    "rate-limiting"
+  ],
+  "dependencies": [
+    "ENG-4821",
+    "ENG-4861",
+    "ENG-4826"
+  ],
+  "customer_impact": "high",
+  "release": "control-plane-2026.02",
+  "security_review_required": "false",
+  "description": "Context\nAuto-rollback/pause is being added to the rollout controller when latency/error SLOs breach during canary or A/B. This ticket focuses specifically on the rollback *executor* (the component that actually mutates traffic weights / step state) to ensure it is:\n- Idempotent (safe to retry; safe under duplicate events)\n- Rate-limited (no abrupt 100% shifts; avoid amplifying incidents)\n- Safe under partial failures (controller restart, transient API errors, cross-region propagation lag)\n\nProblem\nToday, rollback execution is implemented as a best-effort set of traffic-split updates. Under real incident conditions we can see:\n- Duplicate execution (e.g., evaluator fires twice; controller restarts mid-action)\n- Conflicting actions (pause vs rollback; multiple signals)\n- Partial failure (weight update succeeds but audit event fails; or vice versa)\n- Sudden traffic shifts that cause latency spikes or overload the baseline fleet\n\nGoal\nMake rollback execution behave like an exactly-once intent applied at-least-once:\n- Replaying the same intent should converge to the same final state\n- Intermediate states should be safe and observable\n- Execution should be bounded by conservative ramp rules\n\nScope (executor behavior)\n1) Idempotency\n- Introduce a stable idempotency key for each auto-action intent:\n  - action_id = sha256(rollout_id + action_type + target_step_id + target_model_version + decided_at_bucket)\n  - decided_at_bucket is rounded to 60s to prevent \u201cstorm\u201d of unique ids on rapid evaluator ticks\n- Executor persists action_id + current phase + last_applied_weight + timestamps in the rollout controller store.\n- If the same action_id is re-delivered, executor:\n  - resumes from recorded phase (do not restart from step 0)\n  - verifies target matches current rollout (guard against stale intents)\n  - exits successfully if already completed.\n\n2) Concurrency / conflicting actions\n- Single-writer guarantee per rollout:\n  - Acquire rollout-scoped lock (existing step-transition lock) before applying any traffic mutation.\n  - If lock cannot be acquired, requeue intent (bounded retries) and emit metric rollout_auto_action_deferred.\n- Conflict rules:\n  - If a manual action is in progress (operator-triggered rollback), auto executor must no-op + record SUPPRESSED(manual_in_progress).\n  - If pause intent arrives after rollback has begun for same rollout_id, pause is ignored (rollback wins) and audit records SUPPRESSED(rollback_in_progress).\n\n3) Rate-limited traffic shifts\n- Rollback is executed via step-down strategy rather than immediate 0/100 switch.\n  - Default: max_delta_percent_per_minute = 20 (guardrail)\n  - Default step interval: 30s\n  - Example: 50/50 -> 30/70 -> 10/90 -> 0/100 over ~90s\n- Per-tier overrides allowed but must respect safe bounds in policy engine:\n  - max_delta_percent_per_minute must be within [10, 50]\n  - step interval within [15s, 120s]\n- If baseline capacity is saturated (optional check when saturation signal available): slow down step interval (backoff) rather than keep shifting.\n\n4) Safe under partial failures\nFailure modes and expected behavior:\n- Traffic API returns 5xx / timeout:\n  - Retry with exponential backoff (jitter) up to 10 minutes total wall-clock.\n  - Do not advance phase on failure.\n  - Emit metric rollout_rollback_executor_retry_total{reason}.\n- Controller restart mid-execution:\n  - On startup, executor scans for in-progress actions (phase != COMPLETE, updated_at < now-2m) and requeues.\n- Event/audit stream failure:\n  - Traffic shift should not be blocked by audit write (fail-open for execution), but executor must write a minimal local record and attempt to backfill audit emission later.\n  - If both local store and audit emission fail, executor should fail the action (to avoid \u201cinvisible\u201d mutations) and page oncall via existing controller alert.\n- Stale rollout state / step changed by another actor:\n  - Executor validates expected step_id + traffic allocation source-of-truth version.\n  - If mismatch, mark action as ABORTED(stale_rollout_state) and require human intervention.\n\n5) Observability\nRequired fields to emit (ties into ADR-0128 audit trail):\n- action_id, rollout_id, action_type, reason (SLO monitor ids), policy_version\n- executor_phase, previous_weights, new_weights, attempted_at, succeeded_at\nMetrics to add (or confirm added by ENG-4837/PR-28471):\n- rollout_auto_action_executions_total{action_type,outcome}\n- rollout_rollback_executor_steps_total{outcome}\n- rollout_rollback_executor_duration_seconds{outcome}\n- rollout_auto_action_deferred{reason}\n\nAcceptance criteria\n- Replaying the same rollback intent N times results in exactly one converged final allocation (baseline=100%, canary=0%) with no oscillation.\n- Two concurrent intents for the same rollout_id do not interleave traffic mutations.\n- Rollback never shifts more than configured max_delta_percent_per_minute.\n- On restart during rollback, executor resumes and completes or aborts deterministically with a recorded reason.\n- All outcomes are visible in Console via audit events (success, suppressed, aborted, failed).\n\nImplementation notes / code pointers\n- Traffic split mutation uses RolloutTrafficService.UpdateWeights(route_scope, weights, if_version=...).\n- Idempotency record stored alongside rollout step transition state to reuse existing transaction semantics.\n- Rate limiter implemented in executor (not in traffic service) to keep guardrails close to policy.\n\nTest plan\nUnit\n- idempotency_key_stability_test\n- resume_from_phase_test (restart simulation)\n- conflict_rules_test (manual_in_progress, rollback_in_progress)\n- rate_limit_stepdown_test\nIntegration (staging)\n- Inject duplicate Slack/event deliveries and verify single set of traffic mutations.\n- Simulate traffic API 5xx and verify retries/backoff; ensure no over-shifting.\nE2E\n- Covered by ENG-4844 and PR-28490 (synthetic latency/error); this ticket must expose hooks to validate step-wise traffic changes.\n\nLinks\n- GitHub: sources/github/redwood/pr-28444-rollback-executor-revert-traffic-split-safely.json\n- GitHub: sources/github/redwood/pr-28502-fix-race-condition-in-rollout-step-transitions.json\n- Confluence design: sources/confluence/product-docs/design-specs/rollout-controller-slo-monitoring-integration-design.json\n- ADR (debounce/min sample): sources/confluence/architecture-and-standards/decision-records/adr-0127-slo-breach-evaluation-and-debounce.json\n\nOpen questions\n- Should we \u201cfail-closed\u201d (pause) if traffic API is unavailable for >10m, or continue serving the canary allocation? Current proposal: fail-closed by pausing the rollout step but do not attempt further shifts.\n- Do we need per-route allowlist before enabling rate-limited shifting in production (Release Eng request)?\n\nRollout notes\n- Behind feature flag: rollout.autoRollbackExecutorV2\n- Enablement order: staging -> internal prod route (hosted /v1/chat) -> broader Hosted -> Dedicated -> Private\n",
+  "comments": [
+    "2026-01-24 (Jada Williams): Marking P0 because partial-failure behavior is the most likely way auto-rollback could make incidents worse. Need strong convergence semantics before enabling beyond staging.",
+    "2026-01-28 (Ethan Park): Added draft idempotency key + action state record. Using decided_at rounded to 60s to reduce churn; reviewer feedback welcome on bucket size.",
+    "2026-02-02 (Sean Gallagher): +1 to rate limiting. Please ensure step-down doesn\u2019t trigger paging storms. Suggest emitting one summary audit event per phase + metrics for each attempt.",
+    "2026-02-06 (Benji Okafor): Policy engine safe bounds ready in ENG-4822 branch; executor should assume config already validated but still clamp as defense-in-depth.",
+    "2026-02-10 (Ethan Park): Hooked into existing rollout lock; found race when rollback + step transition happen close together. Spun off fix in PR-28502; adding dependency in code comments.",
+    "2026-02-14 (Allison Grant): Metric labels must not include raw rollout_id in high-cardinality counters; use hashed rollout_id only in logs/audit events. Please confirm metrics adhere to standard.",
+    "2026-02-18 (Connor O'Brien): For release train, need backout plan: if executor V2 causes unexpected behavior, toggle flag and fall back to pause-only behavior (no rollback).",
+    "2026-02-21 (Ethan Park): PR-28444 ready for review. Includes step-down strategy + idempotency record. Remaining: refine abort reasons + add integration test for controller restart mid-flight."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_6c50c23917ef447d901c3a1f071ce369"
+}

@@ -1,0 +1,35 @@
+{
+  "title": "Holdback Primewave benchmark notes",
+  "owner": "Sadia Khan",
+  "drive_area": "users",
+  "path": "users/holdback-primewave-benchmark-notes-sadia.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-04",
+  "last_modified": "2026-02-27",
+  "collaborators": [
+    "Ravi Patel",
+    "Mira Gomez"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "warmup",
+    "holdback",
+    "latency",
+    "tail",
+    "kv-cache",
+    "benchmark",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "JIRA-RI-428",
+    "github.com/redwood-inference/benchmarks/pull/62",
+    "slack://thread/C02ABC123/1698152345"
+  ],
+  "content": "Goal\n- Quick experiments to understand impact of \"holdback\" priming (what I'm calling PrimeWave) on tail latencies during mixed-priority bursts.\n- Specifically: small steady background traffic (best-effort) + short high-priority spikes (latency sensitive). Measure p50/p95/p99 and QPS under several warmup strategies.\n\nBackground / motivation\n- We see p99 jumps during short bursts even when average cache hit metrics look \"okay\". Hypothesis: when high-priority requests arrive, the model KV cache and attention warm paths are cold for that priority lane because prior BE (background) traffic pollutes slots. A small intentional holdback/priming for latency-sensitive requests (send X warmup tokens ahead of main prompt) might reduce tail.\n- Need empirical data to decide trade-offs: wasted token overhead vs tail latency wins.\n\nExperiment matrix (short)\n- Env: single dedicated GPU node (A100-sim), model: rw-instruct-13B-quant (same variant used in prod canary).\n- Client harness: redwood-bench v0.9 (rb-run) that simulates two lanes: background (BE) and foreground (FG). BG: steady Poisson arrival, FG: periodic spikes (100 reqs over 3s).\n- Key knobs: warmup_tokens (0, 8, 32, 64), holdback_delay_ms (0, 25, 100), prefill_ratio (none vs softfill), concurrency_limit (per-lane) fixed at 16.\n- Each run: 10m steady + 2m spike window repeated 6 times; collect per-request latency and qps.\n\nCommands used (notes to self)\n- rb-run --scenario holdback-primewave --bg-rate 25 --fg-spike 100x3s --model rw-instruct-13b-q --warmup 32 --holdback 25 --softfill true --outdir /tmp/primewave/r3\n- payload: 4-8 token system, 128 output tokens (kept consistent).\n\nRaw observations (selected runs)\n1) baseline (warmup=0, holdback=0, softfill=false)\n- steady BG qps ~25, FG peak ~33 (due to concurrency limits)\n- p50 55ms, p95 220ms, p99 620ms during spikes\n- KV cache hit-rate (foreground traces) ~12% at spike start -> climbs after 6s\n\n2) warmup=8, no holdback\n- p99 reduced to ~420ms\n- token overhead ~8 tokens/request (~6% cost increase)\n- foreground kv-hit ~28% at first 2s\n\n3) warmup=32, holdback=25ms, softfill=true\n- p50 50ms, p95 140ms, p99 190ms at peak (best run)\n- kv-hit ~74% on first FG requests\n- throughput similar to baseline (small extra CPU processing for warmup requests)\n- token overhead ~32 tokens (~24% cost bump) but effective latency savings for FG\n\n4) warmup=64, holdback=100ms, softfill=true\n- marginal additional p99 improvement vs 32 (p99 ~170ms)\n- costs scale, and BG lane tail slightly worsens (BG p99 +30ms) likely due to resource stealing for heavy warmups\n\nRepresentative ASCII timeline (p99 during repeated spikes)\n- baseline:   |---^------^-----^---|  (spike p99 peaks: 620ms, 580ms, 640ms)\n- warmup32:   |--^--^--^--^--^--|   (spike p99: 190ms, 185ms, 195ms)\n\nQuick numeric summary (avg across 6 spikes)\n- baseline (0): p50 53ms, p95 210ms, p99 610ms, cost factor 1.00\n- w8: p50 52ms, p95 160ms, p99 420ms, cost factor 1.06\n- w32+hold25+softfill: p50 50ms, p95 142ms, p99 190ms, cost factor 1.24\n- w64+hold100+softfill: p50 51ms, p95 135ms, p99 170ms, cost factor 1.48\n\nNotes / interpretation\n- PrimeWave (warmup + small holdback + softfill) seems to massively increase KV cache warmness for FG lane on first requests and reduces p99 by ~3-4x compared to baseline.\n- Diminishing returns after 32 tokens; 64 tokens gives only modest extra tail benefit but noticeably more cost and some BG impact.\n- Holdback_delay helps align warmup completion with actual request arrival (avoid wasted prefill if FG delayed). 25ms seems enough in our synthetic pattern. Too long a holdback (100ms) adds complexity and slightly hurts BG.\n- Softfill (i.e., allow trimmed warmup to reuse background contexts when possible) reduced BG interference vs brute warmup.\n\nOpen questions / risks\n- Real-client arrival patterns are noisier; our spike shape is synthetic. Need a run with trace-driven arrivals from prod-traffic-2026-02 (sampled).\n- Some models with longer KV chain may need more warmup tokens; 32 might be model-specific.\n- Cost accounting: token overhead needs to be amortized against error-rate or SLA penalties for p99 breaches. Finance input required.\n- Interaction with batching: warmups might reduce batching efficiency if warmup creates extra micro-requests. Evaluate in batching-enabled runs.\n\nNext steps / TODOs\n- [ ] Re-run with prod-trace overlay (use rb-trace --file=samples/prod_jan2026.json) and same knob matrix. (Ravi to help with trace slicing).\n- [ ] Add batching knob: batch_timeout 5/10/20ms and see interplay.\n- [ ] Small experiment for dynamic warmup: adaptive warmup length based on recent kv-hit for that tenant (sketch: warmup_len = clamp(8..64, f(hit_last_30s))). Put prototype in github branch warmup/adaptive.\n- [ ] Calculate break-even cost: what percentile improvement per token paid. Ask finance for average token cost for dedicated instances.\n- [ ] Draft a short runbook for SRE: when to enable PrimeWave per-route vs global.\n\nNotes to self (implementation concerns)\n- Warmup requests must be annotated so we don't count them as customer billable in metrics (or tag them separately).\n- Warmup should be cancellable if slot preempted; otherwise we accumulate useless warmup tokens.\n- Ensure privacy: warmup uses synthetic neutral context not real user content.\n\nSlack snippets I will paste to #serving-runtime\n- \"Ran PrimeWave runs today. Best config: warmup 32 tokens + 25ms holdback + softfill. Reduced FG p99 from ~610ms -> ~190ms. Cost +24%. Will run trace-driven next. PTAL? JIRA-RI-428 for context.\"\n\nEnd notes: keeping this as scratchpad; will refine into a proper mini-PRD if trace-driven results align.\n\n-- Sadia K.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_de0ec8e5873842faac1d51e56b454b21"
+}

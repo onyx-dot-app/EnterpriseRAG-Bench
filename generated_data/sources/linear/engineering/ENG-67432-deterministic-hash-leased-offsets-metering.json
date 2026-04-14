@@ -1,0 +1,51 @@
+{
+  "key": "ENG-67432",
+  "team": "engineering",
+  "title": "Deterministic request hash + leased offsets for metering stability",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-03-10",
+  "creator": "Liam Chen",
+  "assignee": "Aisha Patel",
+  "project": "Billing and Quota Hardening",
+  "cycle": "2026-W08",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "billing",
+    "metering",
+    "idempotency",
+    "rate-limiting",
+    "reliability"
+  ],
+  "description": "Problem: At-least-once delivery from edge/proxy retries + transient region failovers are causing duplicate billing events and quota miscounts for some customers. Existing heuristics (short-lived ingest tokens + partial dedupe) reduce noise but do not eliminate corner cases: long tail retries, cross-region retries, and streaming partial-commits sometimes produce duplicate token-level charges.\n\nGoal: Implement an ingest-side idempotency + monotonic-offset scheme that: (1) ensures a single canonical billing record per logical request, (2) plays nicely with rate limiting and quotas, (3) handles client retries and region failover without global locking, and (4) provides reconciliation hooks for eventual correctness for rare edge failures.\n\nDesign summary: Two cooperating pieces: (A) Deterministic Request Hash (DRH) and (B) Leased Monotonic Offsets (LMO).\n\nA) Deterministic Request Hash (DRH):\n- Each incoming API request gets a canonical hash computed from stable request fields: API key id, model-id, canonicalized prompt/inputs (trim/normalize whitespace), generation parameters (temperature/stop sequences), and client-provided idempotency_hint if present. We exclude volatile fields (client timestamp, ephemeral debugging metadata).\n- Hash algorithm: HMAC-SHA256 using a server-side ingest-key to prevent client collision attacks. Output truncated to 128 bits for storage efficiency.\n- Purpose: quick de-dup check in the ingest proxy and a stable identity for reconciliation.\n\nB) Leased Monotonic Offsets (LMO):\n- Each project/customer is sharded to a local ingestion partition. For each partition we maintain a local monotonic offset counter used by billing-ledger entries. When DRH is new for a partition, the ingest coordinator issues a short-lived lease for the next offset (offset_id + lease_token) and returns that to the request path. The ledger commit must present the lease_token to finalize charging.\n- If a request with the same DRH arrives while a lease exists, the coordinator returns the same offset_id and a renewed lease. This ensures retries map to the same billing record.\n- Leases are timeboxed (e.g., 30s). If a lease expires without commit, the offset remains reserved for a grace window to allow late commits, then can be reclaimed via reconciliation and marked as orphan if uncommitted after policy window.\n\nOperational flow:\n1) Ingest proxy computes DRH and queries local coordinator.\n2) If DRH known and committed -> return canonical billing id and usage delta = 0 (idempotent).\n3) If DRH seen but lease active -> return same offset and route request to the same worker which can fetch cached KV cache for generation continuation.\n4) If DRH unseen -> coordinator issues leased offset and worker proceeds. At commit time, worker sends commit + lease_token -> billing ledger verifies lease_token and persists canonical record (tokens/embedding units).\n\nInteraction with rate limiting / quotas:\n- Rate limit checks occur pre-lease to avoid issuing offsets for requests that would be rejected. Pre-check computes request cost estimate using model profile heuristics (expected token output distribution) and consults quota token buckets. If quota rejected, we respond with 429 and do not issue an offset.\n- Quota charging happens on commit only. While leased, the projected cost is not deducted until commit to avoid double-charges on retries that never commit. This means some temporary overcommit risk if many leases are outstanding; we mitigate by bounding concurrent leases per customer and conservative pre-estimates.\n\nFailure modes & compensation: \n- Partial stream produced but commit failed: Worker can retry commit with same lease_token; if commit permanently fails (worker crash + lease expiry), reconciliation marks the offset as orphaned and triggers a compensation flow (refund/credit if tokens were provisionally applied elsewhere).\n- Cross-region retries: DRH + partitioning by customer ensures cross-region requests map to same partition via consistent hashing of customer id. Coordinator is sharded but can proxy to owning partition; extra hop increases latency for cross-region failover but preserves idempotency guarantees.\n\nSharding & performance trade-offs:\n- Avoid global offsets by sharding per-customer (or per-tenant range). Coordinator is implemented using a lightweight, in-memory shard with leader lease to avoid consensus for each offset. Leader failover uses write-ahead logs for durability.\n- Expected latency overhead: ~2-6ms per request due to a coordinator RPC (local DC). We measured baseline ingest vs. coordinator hop in tests and find acceptable trade-off for P0 billing correctness issues.\n\nReconciliation & observability:\n- Periodic sweep job identifies: DRH entries without ledger commit past grace window, duplicate committed offset_ids for same DRH, and lease churn. Sweep produces actionable alerts and automatic minor compensation (credits) when confident.\n- New metrics: duplicate_charge_rate, orphaned_offset_count, lease_renewal_rate, median_commit_latency, estimated_pre-commit_overcommit. Dashboards + alert thresholds added to Console Billing dashboards.\n\nTesting plan:\n- Unit tests for DRH canonicalization, HMAC salt rotation, collision resistance.\n- Integration tests with simulated client retries (single-region and cross-region), worker crashes, and lease expiry.\n- Load test to validate coordinator scales to expected QPS under heavy clients (benchmark in k8s cluster).\n\nRollout plan:\n1) Implement coordinator and DRH computation behind feature flag. Canary in one low-traffic region for 48 hours.\n2) Compare billed units and duplicate_charge_rate vs. control. Target: reduce duplicate_charge_rate by >95% for canary customers.\n3) Gradual ramp: 10% -> 50% -> 100% over 7 days with automated rollback on regressions.\n4) Run full reconciliation on historical window to ensure no accounting gaps before cutover.\n\nOpen trade-offs / unresolved decisions:\n- Lease duration: 30s chosen conservatively; we need a small canary to validate. Longer leases reduce collisions but increase reserved offsets tail.\n- Compensation policy: automatic credits vs. manual review for orphaned large invoices; propose threshold-based auto-credit with manual flow for >$1000 events.\n- HMAC key rotation: rotating ingest-key requires replay mapping; need to design a key version header in DRH to support rotation without breaking dedupe.\n\nExpected outcome: eliminate class of duplicate billing due to retries and cut down billing reconciliation workload. Primary risk is added complexity and small latency increase at ingest.\n\nAcceptance criteria (pre-release):\n- End-to-end integration tests pass including chaos scenarios.\n- Canary duplicate_charge_rate < 0.1% and no customer-facing errors introduced.\n- Observability dashboards instrumented and alerts sane.\n\n",
+  "comments": [
+    "2026-02-21 - Liam Chen: Initial RFC drafted and reviewed with backend reliability. Added DRH canonicalization rules; flagged HMAC rotation as open issue.",
+    "2026-02-26 - Aisha Patel: Prototyped coordinator service; bench shows 3.8ms median extra due to local RPC. Creating load test tickets.",
+    "2026-03-02 - Maya Ortiz (PM): Requested explicit SLA behavior for quota rejection; added pre-check step so we don't issue leases for rejected requests.",
+    "2026-03-06 - Security review (Ivan Kuznetsov): OK with HMAC approach; requested key rotation header and KMS integration notes. Marked security_review_required=true.",
+    "2026-03-09 - Eng review (Ravi Singh): Suggested using 128-bit hash truncation to save storage; confirmed collision risk acceptable at scale after analysis.",
+    "2026-03-10 - Aisha Patel: Added reconciliation sweep plan and compensation thresholds. Beginning implementation of coordinator endpoints."
+  ],
+  "links": [
+    "https://confluence.redwood.ai/display/BILL/Deterministic+Request+Hash+and+Leased+Offsets+Design",
+    "https://github.com/redwood-inference/ingest-coordinator/pull/212",
+    "https://github.com/redwood-inference/billing-ledger/pull/478",
+    "https://grafana.redwood.ai/d/abc123/duplicate-billing-overview?orgId=1",
+    "https://docs.redwood.ai/operational-playbooks/billing-reconciliation"
+  ],
+  "dependencies": [
+    "ENG-74211",
+    "ENG-33109"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.21",
+  "security_review_required": "true",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_1748ded2c99340a486b5e8385e3a6758"
+}

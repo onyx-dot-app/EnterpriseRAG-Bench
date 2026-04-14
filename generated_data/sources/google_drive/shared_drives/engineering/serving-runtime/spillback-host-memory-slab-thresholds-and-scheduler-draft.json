@@ -1,0 +1,37 @@
+{
+  "title": "Spillback host memory slab thresholds and scheduler (draft)",
+  "owner": "Aisha N. Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/spillback-host-memory-slab-thresholds-and-scheduler-draft.json",
+  "doc_type": "doc",
+  "created_at": "2024-11-20",
+  "last_modified": "2024-12-18",
+  "collaborators": [
+    "Daniel R. Kim",
+    "Sofia M. Ortega",
+    "Jun Wei"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "kv-cache",
+    "spillback",
+    "paging",
+    "pcie",
+    "uma",
+    "scheduling",
+    "latency-slo"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/kv-runtime/pull/842",
+    "CONFCLOUD-1234",
+    "JIRA-RT-467"
+  ],
+  "content": "Purpose:\\nThis note collects a cohesive approach for 'spillback' \u2014 the runtime behavior where cold KV slots are relocated from GPU-local storage to host memory or NVMe over PCIe \u2014 and a lightweight host-side paging/scheduler design that balances tail-latency SLOs and SKU cost. This is a draft for internal review: goal is a pragmatic implementation that can be validated with perf runs and A/B rollout in Dedicated clusters.\\n\\nBackground and motivation:\\n- Observed behavior: transient working-set growth produces 99th percentile latency spikes when GPU-resident KV pages are evicted or cold-miss fetches hit PCIe NVMe.\\n- We want deterministic degradation: when local GPU memory pressure grows we should gracefully move cold pages to host rather than thrash or block hot requests.\\n- Two host topologies to handle: UMA (host and device share coherent memory or fast peer path) and discrete PCIe/NVMe backends. Tradeoffs: UMA gives lower latency but limited capacity; PCIe+NVMe provides capacity at higher per-page latency and throughput variance.\\n\\nDesign goals:\\n1) Predictable tail: bound 99/99.9p impact by limiting in-flight spillback fetches per model and prioritizing hot page residency.\\n2) Bounded bandwidth: avoid saturating PCIe/NVMe burst capacity by token-bucket rate-limiting and background flush lanes.\\n3) Simple integration: scheduler implemented in host control-plane (agent) with hooks into inference path; minimal changes to kernel hot path.\\n4) Observable and tunable: expose slab thresholds and token counts via Console; autopilot suggestions from Optimize.\\n\\nKey concepts and components:\\n- Slab residency classes: HOT (always GPU-resident), WARM (GPU preferred, allowed to be evicted under pressure), COLD (spillback -> host/NVMe). Slots transition by access frequency windows (epoch-based).\\n- Epoch sampler: per-model lightweight counter that increments on KV hits. Window length default: 1 minute; tunable. Decay multiplier applied every epoch.\\n- Spillback lanes:\\n  * Fast lane (UMA peer or NVMe with cached PCIe mappings) \u2014 limited parallelism N_fast per GPU.\\n  * Slow lane (NVMe cold): larger queue, lower concurrency N_slow. Background prefetcher may pull WARM->HOT under idle tail budget.\\n- Backpressure tokens: a capped token pool per model and per-GPU. A request that needs a spill fetch must acquire a token; if none available, the runtime enqueues request with priority and optionally falls back to a lower-fidelity model variant.\\n\\nThreshold heuristics (starting defaults for experiments):\\n- GPU memory pressure threshold -> trigger slab reclassification: 80% used (soft), 92% used (aggressive).\\n- HOT quota maintained at min(0.6 * available_slots, max_hot_per_model) where max_hot_per_model = 4096 for large-gen models (tunable).\\n- Token pool sizes: N_fast = 8, N_slow = 32 per GPU. Token refill: steady-state refill 2 tokens/sec for fast lane, 6 tokens/sec for slow lane; burst allowed up to pool cap.\\n- Epoch sampling: sample window = 60s, decay = 0.75. Promote to HOT if hits > 16 within epoch; demote if hits < 2.\\n\\nScheduler pseudocode (host agent):\\n- on memory pressure event:\\n    calculate current HOT/WARM/COLD distribution using epoch counts\\n    target_hot = compute_target_hot_slots()\\n    mark lowest-score slots as candidates for spillback until hot_slot_count <= target_hot\\n    enqueue spillback operations into fast/slow lanes based on backend affinity\\n- on request needing KV page:\\n    if page in GPU: proceed\\n    else if obtain_token(page.backend_lane): start fetch and attach token to request\\n    else: if fallback model available -> route to fallback; else enqueue with priority and return provisional tokens/timeouts\\n\\nPrefetch/backfill policy:\\n- During low GPU utilization windows, background agent selects high-score WARM pages for prefetch back to GPU up to a background budget (bg_tokens). Default bg_tokens = 16 per GPU.\\n- Prefer prefetch for pages observed in consecutive epochs (signal of re-hotting).\\n\\nProfiling and metrics to collect:\\n- per-page fetch latency histograms split by lane (UMA/PCIe/NVMe)\\n- token acquisition wait times\\n- evictions/sec and spillback throughput\\n- request tail latency delta attributable to spillback\\n- background prefetch success ratio\\n\\nFailure modes and mitigation:\\n- PCIe burst saturation -> detect via increasing fetch latency and reduce token refill and background prefetch rate automatically.\\n- Starvation of hot slots due to aggressive prefetch -> cap prefetch to fraction of free slots and prioritize eviction of true COLD pages.\\n- Torn states (page concurrently moved by two agents) -> use short lease metadata on page descriptor with update CAS via control-plane service to serialize moves.\\n\\nOpen questions and experiments:\\n1) Right granularity for epoch window vs. per-request recency counters. Lower granularity reduces churn but may delay hotspot promotion.\\n2) Quantify UMA fast-lane vs PCIe slow-lane thresholds on our hardware matrix (A100 with NVMe, RTX shared nodes). Need microbench: single-page fetch p50/p95/p99, plus throughput at 8/32/128 concurrency.\\n3) Determine fairness policy cross-tenant: tokens per-tenant or strict per-model pools? Suggest starting with per-model pools with tenant-level debt accounting.\\n4) Should we expose an opt-in per-customer policy to prefer cost (push more to host) vs prefer latency (reserve extra HOT slots)?\\n\\nNext steps and rollout plan:\\n- Implement prototype host-agent token pool + simple spillback enqueuer (3 wk sprint).\\n- Add observability metrics and synthetic benchmark harness (2 wk).\\n- Run lab matrix experiments across hardware types to tune N_fast/N_slow and epoch params (2 wk).\\n- Canary in Dedicated with opt-in SLA toggle and automated rollback on tail-latency regressions (2 wk).\\n\\nNotes to reviewers:\\n- This is intentionally conservative: token gating allows us to bound worst-case amplification. We should avoid speculative global heuristics until we have per-hardware empirical curves.\\n- I'm leaving explicit data structures and proto APIs for a follow-up spec \u2014 think of this doc as the operational playbook and behavior contract.\\n\\nReferences and links:\\n- Related GH PR: https://github.com/redwood-inference/kv-runtime/pull/842\\n- Existing experiments: JIRA-RT-467\\n- Thread: #serving-runtime on Slack (see pinned discussion Nov 13)",
+  "__orig_filename": "spillback-host-memory-slab-thresholds-and-scheduler-draft.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_85628acc3e0c42bfbb832a7ec7158e88"
+}

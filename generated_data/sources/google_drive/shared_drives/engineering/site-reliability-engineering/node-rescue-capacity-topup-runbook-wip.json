@@ -1,0 +1,36 @@
+{
+  "title": "Node rescue and capacity top-up runbook (wip)",
+  "owner": "Maya Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/site-reliability-engineering/node-rescue-capacity-topup-runbook-wip.json",
+  "doc_type": "doc",
+  "created_at": "2024-11-07",
+  "last_modified": "2025-02-12",
+  "collaborators": [
+    "Ethan Brooks",
+    "Lina Gomez",
+    "Samir Patel",
+    "Ruth Park"
+  ],
+  "team": "eng-sre",
+  "status": "wip",
+  "tags": [
+    "runbook",
+    "gpu",
+    "evacuation",
+    "capacity",
+    "oncall",
+    "heterogeneous"
+  ],
+  "linked_artifacts": [
+    "JIRA-SRE-2127",
+    "confluence://sre/evacuate-topup-guides",
+    "github.com/redwood-inference/ops/recipes/auto-topup/PR-904"
+  ],
+  "content": "Purpose: quick-reference runbook for rescuing a degraded node (GPU hardware or driver issues), performing a safe cordon/drain, applying a temporary heterogeneous backfill, and rehydrating caches/kv stores so serving SLAs recover with minimal request loss. This is a working doc \u2014 fill in cluster-specific IDs and region tags during incident.\n\nWhen to use this:\n- Node shows repeated GPU ECC errors, driver panics, or GPU kernel OOMs.\n- Node Ready toggles to NotReady after transient repair attempts.\n- Immediate capacity shortage causing request queueing and elevated latency that cannot be solved by autoscaler fast-path.\n\nSafety prechecks (first 5 minutes):\n- Pager escalation: if > 10% tail latency increase or error-rate > 3x baseline for 5m, notify SRE lead and Product Oncall.\n- Check cluster health: kubectl get nodes -o wide | egrep \"NotReady|Unknown\"\n- Confirm pods affected: kubectl get pods --all-namespaces -o wide --field-selector=status.phase=Failed OR describe pods on the impacted nodes.\n- GPU health: ssh to node (if allowed) and check nvidia-smi, /var/log/messages and dmesg for ECC or reset events.\n  - nvidia-smi -q | egrep \"Ecc|Xid|Reset\"\n  - journalctl -k | egrep \"NVRM|GPU|nvlink\"\n\nDecision: repair in-place vs replace node\n- If driver can be recovered within 15 min with a safe restart (no sustained kernel panics) and there is spare capacity, attempt in-place: restart nvidia-driver, kubelet restart, test with a synthetic GPU job.\n- If multiple XID errors, persistent machine-level panics, or hardware swap required -> Replace node and backfill.\n\nIn-place quick repair (if chosen):\n1) Cordon node: kubectl cordon NODE_NAME\n2) Restart kubelet and driver: sudo systemctl restart nvidia-docker.service || sudo systemctl restart nvidia-persistenced && sudo systemctl restart kubelet\n3) Run a small test container that uses the GPU: kubectl run gpu-test --image=nvcr.io/nvidia/cuda:11.8-base --restart=Never --command -- sleep 60 --requests=nvidia.com/gpu=1 --limits=nvidia.com/gpu=1 -n staging-test\n4) Monitor logs for 5\u201310m. If no errors, uncordon: kubectl uncordon NODE_NAME.\n\nReplace node + capacity top-up (preferred if hardware suspected):\n1) Mark node unschedulable: kubectl taint node NODE_NAME rescue=true:NoSchedule --overwrite\n2) Drain gracefully: kubectl drain NODE_NAME --ignore-daemonsets --delete-local-data --grace-period=120 --timeout=10m\n   - If critical pods with PodDisruptionBudget block drains, escalate to product oncall for permission to violate PDBs. Document PDB name and owner.\n3) Trigger replacement: follow infra provider playbook (cloud console or metal ops): - Create replacement node with tag: redwood-rescue, region, gpu-type=<backfill-gpu> (see hetero guidance below).\n4) If using heterogeneous backfill (e.g., different GPU model), label node: kubectl label node NEW_NODE gpu.backfill=true gpu.type=rtx-a5000 (or appropriate)\n5) Add node to serving pool: remove NoSchedule taint and allow pod-scheduling.\n\nWorkload hints for heterogenous backfills:\n- Avoid scheduling long-lived KV-cache rehydration jobs onto mismatched GPU types. Use nodeSelector or node affinity to keep cache warmers on original pool where possible.\n- For serving pods, prefer starting a small fraction (10\u201320%) of replicas on the new node type to validate behavior. Use a rollout or manual placement.\n- If model quantization differences matter (FP16 vs INT8), ensure model variant compatible with GPU. If not, route traffic to compatible variants until migration is done.\n\nCache/KV rehydration and warmup steps (important to restore latency quickly):\n- Identify critical caches on the drained node (prefix caches, kv-store shards).\n  - Query Redis/etcd topology and find keys with node affinity.\n  - Run a targeted warmup job that replays recent hot prefixes (from traces): python scripts/rehydrate_hot_prefixes.py --keys-file hot-prefixes-NODE_NAME.txt --parallel=8\n- If using local disco cache on node (memcache), accept some cold misses; start warmers at low QPS and ramp.\n\nTraffic routing and SLO safety gates:\n- If overall error rate or 95th latency remain > SLO after replacements, enable routing fallback: update routing policy to point traffic to low-latency region or dedicated pool (see routing playbook).\n- Do not trigger global fallback unless incident commander authorizes.\n\nCommands cheat-sheet:\n- kubectl get nodes -o wide\n- kubectl describe node NODE_NAME\n- kubectl cordon NODE_NAME; kubectl drain NODE_NAME --ignore-daemonsets --delete-local-data --grace-period=120 --timeout=10m\n- kubectl uncordon NODE_NAME\n- kubectl label node NODE_NAME key=value --overwrite\n\nRollback criteria:\n- If new node causes unexpected errors (GPU driver incompat, scheduler evictions), cordon it immediately and rollback label/taint changes. Use: kubectl cordon NEW_NODE; kubectl drain NEW_NODE --delete-local-data --force; then deprovision via infra ticket.\n\nPost-incident activities (required):\n- Capture timeline in incident doc: who, what, when, decision points, mitigations. Link to JIRA.\n- Run a short postmortem within 72 hours if user impact > 30 minutes or > 5% customer requests failed.\n- Update this runbook with exact playbook commands used (replace placeholders) and any tuned thresholds.\n- Schedule a follow-up to evaluate inventory: how many similar nodes exist (same firmware/driver) and whether batch replacements are warranted.\n\nNotes to self / open questions (fill during runbook iteration):\n- Add exact command for our infra provider to provision a node with a specific GPU SKU (cloud CLI or metal ops script).\n- Add automatic metric check script to detect ECC XID trends and create a remediation alert pipeline.\n\nAcceptance criteria for runbook completion:\n- We validated heterogeneous backfill path in staging (test cluster) with at least one model and one cache warmer.\n- Documented rollback steps are tested and timed under 15 minutes.\n\nAppendix: useful links and quick refs:\n- GPU health dashboard (grafana): https://grafana.redwood.company/d/gpu-health\n- Incident template: https://confluence.redwood.company/sre/incident-template\n- Jira epic for capacity automation: JIRA-SRE-2127\n\nEnd of doc \u2014 please add notes from real incidents below as examples so new oncall can learn.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_0d254f5de5cb4dd6b4f91bb1477ec200"
+}

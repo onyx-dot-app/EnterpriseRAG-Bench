@@ -1,0 +1,67 @@
+{
+  "key": "SUP-90312",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Partial streamed responses terminate silently during long-form generation (SSE/WebSocket)",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-13",
+  "reporter": "Ava Martinez",
+  "assignee": "Liam Chen",
+  "customer_company": "TextFlow Labs",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "api-gateway",
+    "streaming-proxy",
+    "dedicated-cluster"
+  ],
+  "labels": [
+    "streaming",
+    "timeout",
+    "dedicated-customer",
+    "investigating"
+  ],
+  "environment": "prod us-west",
+  "affected_models": [
+    "redwood/gpt-large-1",
+    "gpt-medium-1-quant"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-13",
+  "first_response_due_at": "2026-03-12",
+  "linked_issues": [
+    "SUP-68214",
+    "SUP-79521"
+  ],
+  "related_incident_id": "INC-2026-03-12-02",
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/4123"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/Streaming+SSE+Runbook"
+  ],
+  "description": "Issue summary:\nCustomer reports that during long-form chat generations (SSE and WebSocket streaming) the connection remains open but no additional data is emitted for 6-20s and the stream ultimately terminates with a 499/EOF on the gateway. The client sees a partial response (last token sequence) and no 'done' event. This has been reproducible with reproducible prompts that generate 800-2000 token outputs.\n\nImpact:\n- TextFlow Labs (dedicated) is seeing intermittent production failures for end-user flows resulting in content truncation in the product. Estimated ~3-5% of long responses fail during an 8-hour window.\n- Customer is on dedicated capacity; impacts their SLAs with their customers.\n\nEnvironment:\n- Dedicated cluster id: ded-cluster-usw-71\n- prod us-west region (us-west-2)\n- API via streaming endpoints: /v1/stream/chat SSE and websockets\n- Models: redwood/gpt-large-1 (float16), fallback gpt-medium-1-quant\n\nSteps to reproduce (from customer):\n1) Start a streaming chat session with long assistant output (~1k tokens) using SSE.\n2) Wait for the model to generate; observe initial tokens stream normally for ~200-600 tokens.\n3) Around a variable point (often when KV cache grows or at a token boundary), the stream stops emitting further chunks for 6-20s, then connection either closes silently or returns a 499 from the customer gateway.\n\nObserved logs from customer (trimmed):\n- client: \"receiving 'data:' lines up to token 472 then silence\"\n- nginx reverse proxy: \"upstream prematurely closed connection while reading response header from upstream\"\n- customer side: \"socket closed (EOF) after 12s of silence\"\n\nRelevant internal logs (excerpt):\n- api-gateway: 2026-03-12T14:22:33Z GET /v1/stream/chat session=abc123 status=200 bytes=48 streamed=true\n- streaming-proxy: 2026-03-12T14:22:45Z conn=conn-987 idle_write_timeout=10s write_chunk=0\n- serving-runtime: 2026-03-12T14:22:46Z model=redwood/gpt-large-1 seq=512 kv_size=3.9MB token_emit_latency=45ms\n- kube node kernel: OOMKilled=false, netstat shows retransmits during period\n\nNotes: customer sees higher failure probability when prompts include long context (past 6k tokens) or when using model variant gpt-large-1. They report that non-streaming completions (batching) succeed for the same prompts but with higher latency.\n",
+  "investigation": "Initial hypothesis: timeouts or sticky proxy behavior between streaming-proxy and runtime when KV cache growth causes intermittent stall in token emission. Possible causes considered:\n- upstream write stalls due to blocking I/O in the runtime or a blocking GC cycle in the inference process\n- streaming-proxy idle/write timeouts incorrectly configured for dedicated clusters (10s threshold observed)\n- backpressure handling bug in the websocket/SSE proxy: zero-byte write suppressed and leads to silent keepalive loss\n- large KV cache iteration causing kernel-level packet loss and retransmits\n\nActions taken so far:\n- Reproduced on dedicated staging with same model and long context; captured tcpdump between streaming-proxy and runtime. Observed periods of no packets for ~8-12s while the runtime CPU is busy on a CPU thread (not GPU).\n- Temporarily raised proxy idle_write_timeout to 30s on a canary; customer reports 0 failures in 90m test (previously ~4 failures/hr).\n- Attached profiler to serving-runtime process during repro: found a lock contention in metrics aggregation path that runs on the token emission path (adds 1-10ms per token but can spike when KV map resize occurs).\n- Verified kernel network retransmits spike correlates with periods of blocked user-space activity (profiling shows runtime threads blocking GC/resize).\n\nNext steps proposed:\n- Patch streaming-proxy to send keepalive/ping frames during long emission stalls (short-term mitigation).\n- Fix lock contention in metrics path in serving-runtime (medium-term patch) and add more granular non-blocking metrics flush.\n- Add regression unit/integration test that simulates large KV caches and verifies keepalive behavior end-to-end.\n",
+  "comments": [
+    "2026-03-12 15:05 - Support (Ava Martinez): Logged by TextFlow Labs support engineer. Provided request ids and sample prompt. Marking P1 given customer SLA exposure.",
+    "2026-03-12 15:28 - Eng (Liam Chen): Reproduced in staging. Seeing same silent window. Captured tcpdump and attached to ticket. Creating a canary to raise proxy idle timeout.",
+    "2026-03-12 17:02 - SRE (Priya Rao): Canary applied to ded-cluster-usw-71 : increased streaming-proxy idle_write_timeout to 30s for 2 pods. Monitoring metrics. No user-facing 499s for 90m.",
+    "2026-03-12 18:30 - Customer (TextFlow Labs, Samir Patel): Confirmed significant reduction in failures during test window. Asking for ETA on permanent fix and whether this will affect other dedicated customers.",
+    "2026-03-13 09:15 - Eng (Liam Chen): Identified lock in metrics aggregation path. Opening PR to change metrics flush to background worker (see related_github_prs). Planning hotfix for next deploy."
+  ],
+  "resolution": "workaround applied: increased streaming-proxy idle_write_timeout to 30s for affected dedicated cluster; applied to customer cluster as short-term mitigation.\n\nPermanent fix planned: remove blocking metrics aggregation from token emission path and implement active keepalive pings from streaming-proxy when runtime is stalled. Target: patch merged by 2026-03-16, rolling deploy to dedicated clusters starting 2026-03-17.\n\nFollow-ups:\n- Postmortem if customer-facing error rate does not drop below 0.5% after fix.\n- Add automated test in ci that simulates KV growth and ensures streaming stays alive.\n- Notify other dedicated customers via #support-ops and include mitigation steps for on-prem/VPC customers who run older proxy versions.",
+  "resolution_status": "In Progress",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation",
+    "comments",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_58ade2e010f14e11b5bd6bcfffcab82e"
+}

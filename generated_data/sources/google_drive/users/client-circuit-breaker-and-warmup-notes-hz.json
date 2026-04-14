@@ -1,0 +1,34 @@
+{
+  "title": "Client Circuit Breaker & Warmup Notes",
+  "owner": "Harper Zhao",
+  "drive_area": "users",
+  "path": "users/harper-z",
+  "doc_type": "doc",
+  "created_at": "2025-11-04",
+  "last_modified": "2026-02-28",
+  "collaborators": [
+    "Maya Cooper",
+    "Rui Patel",
+    "Samir Gupta"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "release",
+    "canary",
+    "circuit-breaker",
+    "warmup",
+    "safety"
+  ],
+  "linked_artifacts": [
+    "JIRA:INF-4187",
+    "GH: redwood-inference/serving-runtime#2521",
+    "confluence:/pages/viewpage.action?pageId=12345678"
+  ],
+  "content": "Purpose\n---\nFreeform scratchpad for designing a client-side circuit breaker + warmup sequence for small-scale canaries of the new model-packing runtime (v0.9.3). Goal is to reduce noisy 5xx spikes, protect downstream client libraries, and ensure steady token-latency distribution during ramp. NOT a formal runbook \u2014 use this to capture heuristics and test notes before we formalize a playbook.\n\nContext\n---\n- Target release: runtime packaging + batching changes (v0.9.3).\n- Primary risk: transient KV-cache invalidations causing 4xx/5xx burst when traffic first hits canary nodes.\n- Secondary risk: client throttling/backpressure cascades causing long-tail latency.\n- Canary size target: staged cohorts under SDK/edge clients, starting at 0.5% of global traffic.\n\nHigh-level approach\n---\n1) Client-side circuit breaker (CSCB) layered with server-side safety: client limits open requests + immediate failover to host fallback.\n2) Warmup cohorts: small cohorts with initial low QPS + conservative timeouts to prime caches and kernels.\n3) Instrumentation gate: only increase cohort size if metrics pass for two consecutive windows.\n\nClient circuit breaker design (proposed)\n---\n- Modes: CLOSED -> PROBATION -> OPEN -> HALF-OPEN -> CLOSED\n- Key metrics tracked per client region: consecutive 5xx count, 95th latency, percent short-circuit (local cb rejects), error budget burn rate.\n- Thresholds (initial, conservative):\n  - PROBATION after 3 consecutive 5xx within 60s window\n  - OPEN after 6 consecutive 5xx within 3m window or if 95th latency > 1200ms sustained for 2 windows\n  - HALF-OPEN after 5m cool-down; allow 5 probe requests per minute to judge health\n- Probation behavior: reduce concurrency by 50%, increase per-request timeout by +300ms, route new requests to stable model variants when possible.\n- Open behavior: short-circuit with graceful fallback (cached completion or lower-capability model) and emit metric tag cb_open=true.\n- Observability: every state transition emits event to telemetry with request-sample (trace id).\n\nWarmup cohort plan\n---\nStage A (priming):\n- Cohort size: 0.5% of traffic for 30m window.\n- Client config: concurrency cap 2, per-request timeout 2s, circuit breaker probation thresholds doubled (very tolerant while priming).\n- Server action: keep kernels hot (no preemption), pre-populate KV prefix cache for popular prompts (simulate warm inputs).\n- Success criteria: 95th latency <= 700ms, error rate <0.1% absolute increase vs baseline, no more than 1 circuit breaker open event.\n\nStage B (steady warm):\n- Ramp to 2% over 60m if Stage A passes two windows.\n- Client config: concurrency cap 4, timeout 1.5s, normal CB thresholds.\n- Additional checks: memory alloc patterns stable (no >15% variance), GPU utilization within expected band.\n\nStage C (validation):\n- Ramp to 10% over next 3h if Stage B good for 2 consecutive windows.\n- Run targeted smoke tests from canary cohort: heavy KV-churn, long context-length requests, function-calling sequences.\n\nMetrics and gating windows\n---\n- Window length: 5m evaluation; require 2 consecutive windows passing to move to next stage.\n- Primary gates: 95th latency, error rate increase, cpu/gpu anomaly, CB open count.\n- Automated gating thresholds (first pass):\n  - 95th latency increase <= +20% from baseline\n  - Error rate increase <= +0.5 percentage points absolute\n  - Circuit breaker opens <= 2 per window\n  - No new class of 5xx signatures (e.g., RLModelFailure)\n\nSmoke test checklist for each cohort\n---\n- [ ] synthetic latency sweeps (short -> long contexts)\n- [ ] KV-heavy sequences to exercise cache priming\n- [ ] concurrency spike test (burst 3x expected per-client QPS for 30s)\n- [ ] function-calling with large tool payload to test marshalling layer\n- [ ] verify fallback response correctness (cached vs degraded model)\n\nRollback & fallback hooks (client play)\n---\n- Immediate local fallback: serve cached completion or call fallback model variant (downgrade to small-llm) when CB open.\n- Centralized rollback: if server-side alarms trigger (cascade rate >= threshold) we issue traffic pin to stable model and send canary cohort to safe route.\n- Emergency: force clients to short-circuit all non-essential enriched calls (tool-calls, images) and preserve minimal text completion traffic.\n\nOperational run commands (notes)\n---\n- quick pin to stable model (CLI): rcli routing pin --model stable-v0.9 --cohort=canary\n- throttle cohort: rcli traffic update --cohort=canary --pct=0.1\n- query cb state for a region (dev helper): curl -H \"Authorization: Bearer $TOKEN\" https://telemetry.internal/api/cb-state?region=us-west-2\n\nOpen questions & TODOs\n---\n- Durable client config propagation: how quickly do client SDKs get updated thresholds? Need a config TTL plan.\n- Should we ship a binary toggle to flip CB into \"learning\" mode for first 24h? Pros/cons.\n- Determine final numeric thresholds with SRE after a dry-run on staging.\n- Add test harness to inject synthetic 5xx signatures and validate CB transitions.\n\nNotes from experiments (scratch)\n---\n- 2026-01-14: quick stress on staging - cold KV causes 400s for a subset: increasing probation window from 60s->180s reduced noise but hid real flapping. Need careful balance.\n- 2026-02-02: Maya's priming idea (prewarm by replaying QPS 10 mins prior) reduced first-minute 95th by ~18% in local test. Consider adding prewarm replay as opt-in.\n\nNext steps (practical)\n---\n- [ ] Draft SDK config flags and default values for client CB (Harper)\n- [ ] Schedule staging dry-run with SRE and Maya (target window: next Thursday 10\u201312 PST)\n- [ ] Implement telemetry event contract for CB transitions (Samir)\n- [ ] Bake warmup replay tool into staging harness (Rui)\n\nAppendix: quick defaults (for discussion)\n---\n- client.default.timeout=1500ms\n- client.default.concurrency=4\n- client.cb.probation_threshold=3-in-60s\n- client.cb.open_threshold=6-in-3m\n- client.cb.half_open_probes=5-per-minute\n\nEnd of scratchpad\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_0e47217c00ac4af7a5a036d1bdef809f"
+}

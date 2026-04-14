@@ -1,0 +1,52 @@
+{
+  "key": "ENG-31416",
+  "team": "engineering",
+  "title": "Adaptive tiered breaker mesh with anchored fallback orchestrator",
+  "status": "In Review",
+  "priority": "P1",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-03-03",
+  "creator": "Priya Nambiar",
+  "assignee": "Liam Torres",
+  "project": "reliability-mesh-2026",
+  "cycle": "2026-W08",
+  "estimate": "8",
+  "due_date": "2026-03-15",
+  "labels": [
+    "slo",
+    "circuit-breaker",
+    "multi-region",
+    "load-shedding",
+    "runtime"
+  ],
+  "parent_issue": [
+    "ENG-29811"
+  ],
+  "dependencies": [
+    "ENG-30500",
+    "ENG-30987"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.21",
+  "security_review_required": "false",
+  "description": "Summary: Implement an adaptive, tiered circuit-breaker mesh that operates on three orthogonal axes (tenant, model, dependency) and supports region-aware anchored fallbacks. The goal is to provide predictable SLO preservation under partial failure (node/region/globally degraded downstream), allow safe progressive degradation (graded shedding), and ensure deterministic, auditable fallback behaviour for customer-facing requests.\\n\\nProblem statement: Current soft-trip and fallback behaviors are spread across services (router, model-proxy, and tenant policy layer) and are tuned for coarse thresholds. During cross-region incidents we observed oscillation (rapid open/close) and unsafe fallthrough to incompatible model variants causing token overruns and user-visible failures. We need a unified breaker mesh design that: (1) lets us express composite trip conditions, (2) provides hysteresis and cooldown tuned per axis, and (3) orchestrates safe fallbacks with capacity, version, and cost constraints considered.\\n\\nScope:\\n- Design and ship a breaker mesh controller in the serving control plane that maintains per-tenant, per-model, and per-dependency breaker states.\\n- Define composable trip predicates (latency p95, error rate, queue-depth, token budget exhaustion, egress rate) and a way to synthesize them into a score.\\n- Implement region-aware anchored fallback orchestrator: when a breaker trips in one region, route to the nearest compatible fallback (local quantized variant, warm cache, or dedicated degraded path) with SLA guarantees.\\n- Add observability (per-breaker telemetry, synthetic canary for each fallback path, and incident playbook) and a dashboard.\\n- Rollout plan with staged canary and feature flag, plus automated rollback criteria.\\n\\nNon-goals:\\n- Rewriting kernel-level batching.\\n- Changing public API surface for customers.\\n\\nSuccess criteria:\\n- Circuit oscillation reduced by 90% in injected fault tests (see test harness below).\\n- Under a simulated dep failure (40% p50 latency bump + 5% error spike) we maintain application SLO (P99 latency and error budget) for 95% of tenants using fallback routing.\\n- No user-visible token budgeting regressions (<= 2% variance in token spend for degraded requests).\\n\\nProposed design (high-level):\\n1) Breaker mesh model: each breaker is an entry in the control plane with attributes: scope (tenant/model/dependency), score vector, state (CLOSED|OPEN|HALF_OPEN|DEGRADED), last_transition_ts, cooldown_window, retry_backoff. The mesh controller evaluates streaming metrics and computes a normalized risk score per breaker.\\n2) Composite trip algorithm:\\n   - Metrics: error_rate_30s (E), p95_latency_10s (L), queue_depth_avg (Q), token_burn_rate (T).\\n   - Each metric normalized to [0,1] via historical baseline and capped thresholds.\\n   - Risk score R = max(wE*E, wL*L, wQ*Q, wT*T) + alpha * EWMA(R_prev) where alpha is inertia to prevent flapping.\\n   - Thresholds are tiered: warning (0.5), soft_trip (0.8), hard_trip (0.95).\\n3) Hysteresis and cooldown: open only when R >= hard_trip for N consecutive evaluation windows; downgrade to DEGRADED on soft_trip for shorter windows; reopen only after cooldown and successful synthetic checks. Backoff uses exponential window with jitter.\\n4) Region-aware anchored fallback: each breaker has fallback candidates prioritized by (compatibility_score, locality_penalty, capacity_headroom, cost_multiplier). Anchoring rule: prefer fallbacks within same region unless compatibility_score < 0.7, or capacity_headroom < 0.2. If same-region fallback is not viable, route to a dedicated degraded pool in another region with explicit fanout limits.\\n5) Safe fallback behaviors (in priority order):\\n   - Serve cached or synthetic partial response (if data-stale policy allows).\\n   - Route to quantized/latency-optimized model variant (with per-tenant token cap).\\n   - Route to a statically degraded pipeline (abbrev response, content warning).\\n   - Return soft-503 with transparent degraded_reason header (for strict customers).\\n6) Backfill and reconciliation: controller writes breaker state to a distributed config store and emits audit events for every state change (for compliance and incident review).\\n\\nImplementation notes and tradeoffs:\\n- Complexity vs correctness: a mesh controller centralizes decision making (easier to audit) but adds a control-plane dependency. We'll mitigate with local cached state and safe-fallbacks if control plane is unreachable.\\n- Computation cost: risk scoring runs at 5s cadence for high-volume breakers and 30s for low-volume. We'll shard evaluation across controller replicas by hash(scope).\\n- Data gravity: model-level breakers require per-model counters; we will reuse existing per-shard metric streamers and aggregate in the controller to avoid double counting.\\n- Tenant fairness: ensure that fallback decisions have tenant-level quotas to prevent noisy neighbors taking all degraded capacity.\\n\\nExample breaker config (proto-like, stored as JSON in config store):\\n{\\n  \\\"scope\\\": \\\"tenant:t-47/model:m-7/dependency:cache-redis-eu\\\",\\n  \\\"weights\\\": {\\\"error\\\": 0.5, \\\"latency\\\": 0.3, \\\"queue\\\": 0.1, \\\"tokens\\\": 0.1},\\n  \\\"thresholds\\\": {\\\"warning\\\": 0.5, \\\"soft_trip\\\": 0.8, \\\"hard_trip\\\": 0.95},\\n  \\\"cooldown_sec\\\": 120,\\n  \\\"half_open_probe\\\": {\\\"type\\\": \\\"synthetic\\\",\\\"success_rate\\\": 0.98, \\\"timeout_ms\\\": 600},\\n  \\\"fallback_candidates\\\": [\\\"model:m-7-q4-hr\\\",\\\"cache:read-only-warm-eu\\\",\\\"degraded-pipeline:short-answer\\\"],\\n  \\\"anchoring\\\": \\\"region-preferred\\\"\\n}\\n\\nObservability and testing:\\n- Metrics to emit: breaker_state_change, breaker_risk_score, fallback_invoked, fallback_latency, fallback_success_rate, tokens_for_fallback_requests.\\n- Dashboards: per-region breaker heatmap, per-tenant fallout view, synthetic probe health table.\\n- Test harness: extend chaos-runner with: (a) per-region latency injection, (b) randomized error spike, (c) capacity starvation of quantized pool. Define automated pass/fail based on SLO preservation and oscillation measure.\\n\\nRollout plan:\\n- Phase 1 (canary): enable for 5 internal tenants + synthetic traffic in eu-west-1 region, feature-flag default to passive (evaluate only). Duration 1 week.\\n- Phase 2 (staggered): enable active mode for selected low-risk tenants across two regions. Duration 2 weeks.\\n- Phase 3: global enable for all tenants with monitoring guardrails and auto-rollback on incident criteria.\\n\\nAutomated rollback triggers (examples):\\n- Spike in global P99 > 2x baseline for > 10 minutes attributed to fallback routing.\\n- > 5% of active clients receiving soft-503 in a 5m window.\\n\\nOpen engineering tasks (next steps):\\n- Control plane API: create /breaker/{id} GET/PUT and /breaker/evaluate POST (ENG-30500 reference).\\n- Local runtime cache: implement local breaker cache with TTL and LRU eviction (ENG-30987 tracking).\\n- Fallback capacity manager: circuit quota enforcement per-tenant.\\n- Dashboards & synthetic probes (roadmap ticket PM-421).\\n\\nLinks and artifacts:\\n- Design doc (Confluence): https://confluence.internal/redwood/reliability/mesh-breakers-2026\\n- Proto PR: https://github.com/redwood-inference/internal-protos/pull/142\\n- Test harness branch: https://github.com/redwood-inference/chaos-runner/compare/mesh-breakers\\n- Incident runbook draft: https://docs.internal/redwood/incident/runbooks/breaker-mesh\\n\\nRisks and mitigations:\\n- Control-plane outage: mitigation is local cached states with conservative default closed state and automatic fallback to safe-503 when uncertain.\\n- Compatibility mismatch between models: validate with a compatibility matrix + compatibility_score; maintain a fallback blacklist per tenant.\\n- Cost blowout: enforce per-tenant fallback token caps and a global cost guard that can progressively limit fallbacks by cost multiplier.\\n\\nNotes from reviews:\\n- SRE: request to add quota-throttling metric per tenant for fallback invocations. (Addressed: added \\\"tokens_for_fallback_requests\\\" metric).\\n- PM: prefer explicit transparency to customers for degraded responses; added degraded_reason header.\\n- Design: UI will need a per-tenant breaker timeline and fallback history (Console ticket created: PM-554).\\n\\nAcceptance criteria for code review:\\n- Unit tests cover scoring math and state transitions.\\n- Integration test with chaos-runner demonstrates reduced oscillation.\\n- Dashboard shows expected metrics and alerts fire on rollback conditions.\\n",
+  "updates": [
+    "2026-02-22: Initial design draft posted to Confluence; flagged for SRE review.",
+    "2026-02-24: Architecture sync with runtime and console teams; agreed on control plane API sketch.",
+    "2026-02-27: Prototype risk scoring implemented in controller service; basic unit tests added.",
+    "2026-03-01: SRE requested additional per-tenant quota metrics; added to metric list and test harness plan.",
+    "2026-03-03: PR opened for proto changes and controller scaffolding: https://github.com/redwood-inference/internal-protos/pull/142"
+  ],
+  "links": [
+    "https://confluence.internal/redwood/reliability/mesh-breakers-2026",
+    "https://github.com/redwood-inference/internal-protos/pull/142",
+    "https://github.com/redwood-inference/chaos-runner/compare/mesh-breakers",
+    "https://docs.internal/redwood/incident/runbooks/breaker-mesh"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "updates"
+  ],
+  "dataset_doc_uuid": "dsid_29a9deb9bef84a72a4256af1304ffaf4"
+}

@@ -1,0 +1,41 @@
+{
+  "title": "Microburst harmonics: PP/TP sensitivity and interconnect coupling",
+  "owner": "Sofia Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/microburst-harmonics-pp-tp-sensitivity.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-18",
+  "last_modified": "2025-03-02",
+  "collaborators": [
+    "Arjun Patel",
+    "Leila Moreno",
+    "Maya Okafor"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "multi-gpu",
+    "pipeline-parallel",
+    "tensor-parallel",
+    "nccl",
+    "latency",
+    "microburst",
+    "profiling"
+  ],
+  "linked_artifacts": [
+    "JIRA-INV-412",
+    "github.com/redwood-inference/serving-runtime/pull/987",
+    "confluence/redwood/pp-tp-harmonics",
+    "slack://thread/C02ABC123/hoist-nccl-noise"
+  ],
+  "summary": "Experiment log for an unusual tail-latency phenomenon where periodic small-request bursts align with pipeline stages and interconnect scheduling to produce amplified p99 spikes. Shows that TP/PP configuration, host staging, and NCCL scheduling create resonant conditions; proposes jittered pacing and affinity-aware placement as mitigations.",
+  "content": "Context:\nThis is a working exploration of repeated tail-latency spikes we saw in Canary runs for long-context models when using hybrid tensor-parallel (TP) + pipeline-parallel (PP) partitioning. The behaviour looks like periodic p99 amplifications (\"harmonics\") tied to request arrival patterns, interconnect topology (NVLink/NVSwitch rings), and NCCL collective scheduling. Goal is to (1) reproduce reliably; (2) map which variables move the p99; (3) propose low-risk mitigations that don't reduce throughput dramatically.\n\nEnvironment:\n- Cluster: rack with 8x H100-80GB nodes, dual-socket hosts, Mellanox HDR-200 fabric, NVSwitch topology inside each host (4x GPUs per host).\n- OS: Ubuntu 22.04 + CUDA 12.2, NCCL 2.16.3, cuDNN 9.1.\n- Runtime: redwood-serving v3.4.1 (dev branch with tracing hooks).\n- Model used: llama-70b (float16), sequence lengths: 512 / 2048 / 4096 mixture.\n- Workload generator: synthetic client fanning 300 concurrent connections, Poisson/periodic arrival modes.\n\nKey knobs tested:\n- PP degree: 1, 2, 4, 8\n- TP degree: 1, 2, 4\n- Host staging enabled/disabled\n- NVLink partitioning (island mode vs full fabric) via slot assignment\n- NCCL environment: NCCL_P2P_LEVEL=NVL, NCCL_ALGO=RING/TREE, NCCL_ASYNC_ERROR_HANDLING=1\n- Request pacing: burst (periodic 10 requests in 50ms) vs Poisson arrivals vs jittered inter-arrival times\n\nReproduction recipe (quick):\n1) Start 4-node setup: nodes A-D, each with 4 GPUs. Launch model with PP=4, TP=2 (so pipeline stages span nodes, TP within stage uses two GPUs).\n2) Start generator in burst-mode: every 1s emit 10 short-sequence (512) requests, plus background Poisson low-rate long-sequence (2048).\n3) Collect per-token latency traces, NCCL trace logs (NCCL_DEBUG=INFO), and runtime debug hooks (microsecond timestamps at send/recv/compute boundaries).\n4) Observed: every 1s alignment produces a p99 spike ~3\u20135x higher than baseline; p50 stable.\n\nRepresentative numbers (PP=4, TP=2, burst-mode, host-staging ON):\n- Steady throughput: 210 tokens/s overall\n- p50 latency per request: 180 ms\n- p95: 420 ms\n- p99: 1.9 s (spikes to 4.6s at resonance points)\n- Observed pattern: p99 spikes are tightly synchronized across shards (stages) within ~3\u20135ms, implying a coordinated stall rather than independent slow requests.\n\nDiagnostic observations:\n- NCCL timeline shows repeated back-to-back collectives for short tensors that coincide with host-to-device staging windows. The collectives appear to queue on the same host-link micro-cycle, causing buffer contention.\n- Flame-trace of stage handshake shows stage-boundary send/recv waiting on NCCLCollective for small-sized allreduce (few MB) but with higher queuing delays when bursts align.\n- When TP is increased (more intra-stage parallelism), the harmonic spikes change frequency (halved or quartered depending on TP factor), suggesting interplay between per-stage compute time and arrival periodicity.\n- Islanded NVLink (constraining communication to intra-host) reduces amplitude but increases average latency slightly due to additional remote-copy on host->host hops.\n- Host staging offloads (disable host-staging) removed one dominant queuing point but moved pressure to PCIe read latency, making spikes less synchronized but overall p99 still higher than ideal.\n\nHypotheses (why this happens):\n1) Resonant alignment: periodic client bursts line up with the pipeline stage boundary windows (compute ends + collective start), producing constructive queuing across stages. If stage compute time is an integer multiple of the burst period, this amplifies.\n2) NCCL collective scheduling granularity: NCCL seems to batch small collectives into the same NIC micro-scheduler quantum when they arrive within the same clock tick, creating microburst amplification on the fabric.\n3) Host staging interplay: host staging creates an extra synchronization point where multiple GPUs on the same host flush pending transfers together, making cross-host collectives start at nearly same time.\n\nControlled checks performed:\n- Randomized jitter on client inter-arrival times (uniform +/- 20ms) reduced p99 by ~45% while throughput unchanged.\n- Changing NCCL_ALGO=TREE (vs RING default) reduced synchronized queuing and lowered p99 by ~30% in this topology.\n- Turning TP up to 4 (keeping PP constant) changed the spike frequency and reduced peak p99, but increased p50 by ~10% due to smaller per-GPU compute chunks.\n- Artificially adding a 5ms compute delay on stage 2 breaks alignment and collapses harmonics completely \u2014 confirms alignment role.\n\nActions and proposed mitigations (ranked low-risk to higher-impact):\n1) Client-side jittering/pacing: add small randomness to inter-arrival times for small requests. Low effort, immediate benefit.\n2) Inference runtime: add per-route micro-pacing option (configurable random delay window 0\u201320ms). Implement as a request scheduler plugin.\n3) NCCL tune: experiment with NCCL_ALGO and NCCL_BUFFSIZE for small allreduces; consider forcing TREE for small-sized collectives on this fabric. Medium risk (needs testing across topologies).\n4) Placement policy: affinity-aware placement to avoid all pipeline stage boundaries sharing the same host staging window. Spread stage handoffs across NIC quanta where possible. Higher development cost.\n5) Adaptive batching: detect repeating microburst patterns and dynamically buffer a tiny number of requests to break resonance. Needs careful SLO tradeoff.\n\nOpen questions / next experiments:\n- Is this observable on other fabrics (e.g., RoCE over Ethernet) or specific to HDR NVLink+Mellanox micro-scheduler?\n- Can we detect resonance at runtime cheaply (e.g., autocorrelation of inter-arrival vs stage latencies) and automatically toggle pacing?\n- Impact on cold-start/steady-state throughput for customer workloads (run on Hosted API logs with sampling).\n- Explore NCCL tracing at lower level (NCCL_PLUGIN traces) to confirm micro-scheduler alignment hypothesis.\n\nArtifacts / quick links:\n- Repro script: github.com/redwood-inference/serving-runtime/bench/repro/microburst_harmonics.sh (see linked PR)",
+  "notes": "This is a working doc. Next: run a 48-hour canary with jitter-enabled option on a subset of Canary traffic and capture real-host traces. Sync with SRE about fabric-level counters we can pull from Mellanox. Book follow-up with NCCL eng (internal) to review collectives queuing.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "content",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_25744ff9d6df4a3bbf2299a0b51290f0"
+}

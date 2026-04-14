@@ -1,0 +1,33 @@
+{
+  "title": "speculative-decode-early-exit-field-log-ansel",
+  "owner": "Ansel Romero",
+  "drive_area": "users",
+  "path": "users/speculative-decode-early-exit-field-log-ansel.json",
+  "doc_type": "doc",
+  "created_at": "2024-11-18",
+  "last_modified": "2024-12-02",
+  "collaborators": [
+    "Maya Patel",
+    "Ravi Sinha"
+  ],
+  "team": "eng-applied-ml",
+  "status": "draft",
+  "tags": [
+    "speculative-decoding",
+    "early-exit",
+    "latency",
+    "p99",
+    "kv-cache"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/runtime/pull/482",
+    "JIRA-MLINF-1293",
+    "confluence:speculative-decode-design-2024"
+  ],
+  "content": "Goal / hypothesis:\n\nQuick notes to self while running the speculative decoding + early-exit patch on a small fleet. Hypothesis: combining a shallow speculative token generator (spec-factor=2) with an early-exit confidence threshold on the language head (conf_thresh=0.82) reduces p99 generation latency for short requests (<=40 tokens) without materially increasing cost or harming p50. Expectation: token throughput might increase slightly due to faster termination on many examples, but KV-cache churn could negate gains for multi-turn contexts.\n\nEnvironment / baseline:\n- Model: rw-open-7b-v2 (float16), same weights for all runs.\n- Hardware: 4x A10G dedicated worker pool (single-model allocation per worker), 32GB host mem.\n- Baseline runtime: greedy decode, no speculative, no early-exit (master at commit 4b9c).\n- Traffic generator: local replay of 10k short conversational requests sampled from prod-sample-2024-10 (mixture: 70% single-turn Qs, 30% short chat turns).\n- Metrics captured: latency token-at-a-time wallclock, p50/p95/p99 generation complete, tokens/sec, KV-cache hit ratio, retransmits (fallbacks), cost estimate per 1M tokens from billing model.\n\nKey config knobs tested:\n1) spec_factor {1 (none), 2, 3}  -- how many speculative tokens are proposed ahead of authoritative head\n2) conf_thresh {0.70, 0.82, 0.90} -- early-exit confidence threshold when to stop decoding early\n3) speculative_fallback_timeout_ms {0 (immediate fallback), 5, 10} -- how long to wait for authoritative check before accepting speculative tokens\n4) kv_cache_prefetch {on|off} -- whether speculative proposals pre-warm KV cache for next step\n\nExperiment matrix (summary runs):\n- Run A (baseline): spec_factor=1, conf_thresh=N/A, fallback_timeout=0, kv_cache_prefetch=off\n- Run B: spec_factor=2, conf_thresh=0.82, fallback_timeout=5ms, kv_cache_prefetch=on\n- Run C: spec_factor=3, conf_thresh=0.70, fallback_timeout=10ms, kv_cache_prefetch=on\n- Run D: spec_factor=2, conf_thresh=0.90, fallback_timeout=5ms, kv_cache_prefetch=off\n\nResults (aggregated):\n- Baseline (Run A): p50=28ms, p95=120ms, p99=280ms, tokens/s=780k, KV hit=96.1%, fallback_rate=0%\n- Run B: p50=26ms, p95=98ms, p99=190ms, tokens/s=930k, KV hit=95.6%, fallback_rate=3.8%\n- Run C: p50=25ms, p95=110ms, p99=220ms, tokens/s=1.02M, KV hit=94.2%, fallback_rate=9.7%\n- Run D: p50=27ms, p95=105ms, p99=205ms, tokens/s=890k, KV hit=95.9%, fallback_rate=1.4%\n\nQuick interpretation:\n- Best p99 improvement seen in Run B (spec_factor=2 + conf_thresh=0.82 + kv prefetch). p99 dropped ~32% vs baseline.\n- Run C (more aggressive spec) improved tokens/sec but fallback_rate jumped to ~10% which added jitter and increased KV churn; not acceptable for multi-turn chat where cache continuity matters.\n- Run D (tight conf_thresh=0.90) reduces false accepts (fallback_rate 1.4%) but p99 improvement smaller than Run B \u2014 likely too conservative threshold.\n- KV cache prefetching appears net-positive in this mix: lower p99 in B vs D even though fallback exists; prefetch warms next step and reduces miss penalty.\n\nObserved failure modes / anomalies:\n- Rare but visible double-token emission (client-side observable duplicate token) when speculative accepted and authoritative arrives late; caused edge-case in merging logic. Repro rate ~0.02% of requests on Run C.\n- For requests with long contexts (>200 tokens) the speculative proposals caused >1% KV eviction events on a10g due to prefetch working set expansion; avoided by turning prefetch off for long-context requests.\n- Small subset (approx 5% of prompts) where early-exit cut answers short and quality dropped (conf_thresh too aggressive). These are mostly factual/multi-step reasoning prompts \u2014 need safety bump or prompt-length aware threshold.\n\nMicro-cost estimate (very rough):\n- Baseline cost per 1M tokens (in this env): $58.\n- Run B: +2.3% raw token costs due to some fallbacks -> net cost ~$59.3, but effective user-perceived latency improvement suggests better UX for interactive apps.\n- Run C: +6.8% token cost because of higher retransmit rate despite throughput gains -> ~$62.9. Not worth it.\n\nQuick ascii latency curve (p99 across runs)\n( lower is better )\nRun A [###########] 280ms\nRun B [#######    ] 190ms\nRun C [########  ] 220ms\nRun D [########  ] 205ms\n\nActionable next steps / TODOs:\n- Fix merge edge-case that causes duplicate token emission (high priority). Patch idea: sequence watermark + idempotent client emit suppression.\n- Add 'context-length aware' heuristics: disable prefetch / reduce spec_factor when context_tokens > 128.\n- Run a targeted quality evaluation on prompts requiring multi-step reasoning; set per-prompt conf threshold overrides (or opt-out tag).\n- Add telemetry: label speculative-accepted vs authoritative pathways in traces so we can easily filter traces with fallbacks and duplicates.\n- Run same matrix on a heterogeneous fleet (8xH100) to compare hardware impact; H100 may tolerate larger spec_factor with less KV churn.\n\nExperiment artifacts / commands used (local):\n- ./bench/replay.py --input samples/short-chat-10k.json --config experiments/speculative/bench-b.json --out results/b.json\n- runtime PR with feature flag: feature/speculative-early-exit (see linked PR).\n\nNotes to self:\n- This is promising for low-latency single-turn UIs (search, chat bubbles). For long-form generation and chain-of-thought we must be conservative.\n- When communicating to product: frame this as a latency-improvement mode with opt-in heuristics for conversation UIs; show cost tradeoffs.\n\nReferences / saved traces: results/b.json, results/c.json (kept in my local sandbox).\n\nEnd of log.\n\n-- Ansel\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_cca90dea284546aaa4023d9a91e62ab9"
+}

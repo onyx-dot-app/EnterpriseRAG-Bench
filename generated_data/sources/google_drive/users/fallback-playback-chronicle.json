@@ -1,0 +1,34 @@
+{
+  "title": "Fallback playback chronicle: AZ2->AZ1 routing oscillation",
+  "owner": "Isabelle Nguyen",
+  "drive_area": "users",
+  "path": "users/fallback-playback-chronicle.json",
+  "doc_type": "doc",
+  "created_at": "2026-03-10",
+  "last_modified": "2026-03-12",
+  "collaborators": [
+    "Samir Kapoor",
+    "Jordan Lee"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "routing",
+    "failover",
+    "debug",
+    "az2",
+    "playback"
+  ],
+  "linked_artifacts": [
+    "JIRA-RT-4821",
+    "https://github.com/redwood-inference/infra/pull/1228",
+    "confluence:Routing-Policies-Playbook"
+  ],
+  "body": "Quick scratchpad / playback log \u2014 for personal triage. DO NOT PUBLISH verbatim.\n\nContext:\n- Incident observed 2026-03-09 15:08-15:40 UTC: customer traffic from eu-west (region routing policy) experienced repeated fallbacks from AZ2->AZ1 for ~32 minutes. User-facing error rate spiked to ~2.7% 503s for short windows.\n- Affected service: smart-router (edge routing layer) routingPolicy=latency+preferred-az.\n- Probable interaction: latency threshold + capacity-based fallback + stale route table entries.\n\nImmediate reproduction steps I ran (local playback against staging routing endpoint):\n1) Basic curl to debug endpoint to list region routes:\n   curl -sS -H 'Authorization: Bearer REDACTED' \\\n     'https://staging-router.redwood.internal/v1/debug/routes?model=redwood-3b&region=eu-west' | jq -C .\n   -> See route table: primary: az2.prod.pool.4 (score 0.72), fallback: az1.prod.pool.2 (score 0.67)\n\n2) Triggered simulated request pattern (burst of 60 reqs/s) using siege:\n   siege -c60 -t1M -b 'POST https://staging-router.redwood.internal/v1/generate' \\\n     'Authorization: Bearer TESTKEY' -H 'X-Region: eu-west' -H 'X-Client: playback'\n   Observed: router logs show repeated 'invoking fallback' messages after 45s.\n\nCommands I used to inspect infra (truncated outputs included):\n- kubectl (router namespace)\n  kubectl -n router get pods -l app=smart-router -o wide\\  \n  -> router-7d8f         Running   2/2     6d    10.0.32.14   az2-node-4\n  -> router-6c3b         Running   2/2     4d    10.0.41.9    az1-node-2\n\n- Checked router metrics (promql quick checks):\n  requests_total{route=\"az2\"} increased then dropped; 5xx_errors{route=\"az2\"} spiked simultaneously.\n\n- Example log snippet from router-7d8f (az2):\n  [2026-03-09T15:09:12.435Z] INFO  route_eval.go:312 - request id=cli-89f2 route=az2 score=0.71 latency_est=120ms -> selected\n  [2026-03-09T15:09:44.012Z] WARN  fallback_manager.go:88 - request id=cli-b4d1 fallback invoked from az2 -> az1 reason=capacity_exhausted threshold=0.75\n  [2026-03-09T15:10:01.903Z] ERROR router.go:423 - request id=cli-c33a upstream error: 503 \"no capacity\"\n\n- Router internal debug endpoint returned this when queried at 15:11UTC:\n  {\"route\":\"az2\",\"last_health_check\":\"2026-03-09T15:10:55Z\",\"recent_latency_p95_ms\":186.3,\"active_tokens\":1420,\"capacity_limit\":1500}\n\nHypotheses (rank-ordered):\n1) Short-lived capacity saturation on az2 pool: active_tokens approaching capacity_limit -> circuit triggers fallback. But why oscillation? Might be retry/backoff config too short causing churn.\n2) Latency estimator overshoot: p95 jumps cause latency-first policy to move traffic and then quickly move back when p95 falls (thrash).\n3) Stale capacity metadata: healthcheck cadence too low so decisions based on slightly stale snapshot (30s delay).\n4) KV cache sync problem between router replicas (router-7d8f vs router-6c3b markets different view).\n\nThings I tried and notes: \n- Increased healthcheck frequency in local staging (from 30s -> 10s) and replayed burst. Result: oscillation reduced but not eliminated. Suggests staleness is part of problem but not whole story.\n- Hit /debug/state on both router pods and diffed the route tables; saw mismatch in 'last_seen_capacity_ts' (~12s difference).\n- Turned on stricter backoff: retry_backoff_min 200ms -> 800ms. Replay: fewer rapid switches, but some fallbacks persisted (likely true capacity constraint).\n\nQuick checks to run on production during next window (run from on-call jump box):\n- curl -s 'https://router-prod.redwood.internal/v1/debug/pools?az=az2' | jq .\n- kubectl -n router logs router-<pod> --since=60m | grep -E \"fallback|capacity_exhausted|circuit\" -n\n- promql: increase(last_over_time(active_tokens[2m]), 5m) and check capacity utilization trends\n- tcpdump on router host (rotate capture quickly) focusing on port to inference-backend to see connection resets\n\nRepro recipe (staging) to approximate incident:\n1) Deploy small change to staging routing policy: healthcheck_interval=10s, backoff_min=800ms (non-invasive, rollback-friendly).\n2) Warm model pools by firing low-rate background pings for 5m.\n3) Fire 60-80 rps ramp starting at t0 for 5m, observe router logs, prom, and backend pod metrics.\n4) Correlate fallbacks with backend pod eviction/restarts or OOMs.\n\nOpen questions / TODOs:\n- Are there background tasks evicting model workers in az2 around 15:00 UTC? Check k8s eviction events and node autoscaler logs.\n- Confirm rate of config propagation for routing policies; is there a window where half the routers see one policy and half another? (config push timeline)\n- Validate inference backend CPU/GPU throttling metrics around the spike.\n- Add metric for per-route decision entropy (to quantify thrash).\n\nQuick one-off mitigation (if we see this again prod):\n- Increase fallback_hold_period to 30s (avoid immediate bounce back).\n- Temporarily prefer capacity-weighted routing for eu-west until pool pressure subsides.\n- Notify infra team to check node autoscaler and preemptible churn in az2.\n\nNotes for postmortem (if confirmed):\n- Timeline (UTC)\n  15:07 - slight p95 uptick in az2 -> first micro-fallbacks\n  15:09 - fallback rate grows, customer 5xxs appear\n  15:17 - brief autoscaler activity observed (scale-up + scale-down?)\n  15:40 - traffic normalizes after policy tweak and backoff tuning\n\nAttached artifacts / quick links: JIRA-RT-4821 has playbook draft; infra PR #1228 contains an experiment to increase healthcheck cadence.\n\nFinal ad-hoc notes:\n- If we add a long-lived 'sticky' decision window (e.g., 20s), we should measure latency percentiles impact before rolling to prod.\n- Consider adding a rapid-sample path to read instantaneous pool saturation (not smoothed p95) to gate fallbacks during bursts.\n\n-- end scratchpad --\n",
+  "_filename": "fallback-playback-chronicle.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_e3b5d8a9fec7472eb120891e4c97508c"
+}

@@ -1,0 +1,97 @@
+{
+  "key": "ENG-41205",
+  "team": "engineering",
+  "title": "Reduce controlplane row width and mitigate hot-read contention",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-03-12",
+  "updated_at": "2025-03-18",
+  "creator": "Aisha Patel",
+  "assignee": "Marcus Lee",
+  "project": "control-plane-db-cleanup",
+  "cycle": "2025-W11",
+  "estimate": "5",
+  "due_date": "2025-04-04",
+  "labels": [
+    "db-tech-debt",
+    "performance",
+    "migration",
+    "safe-deploy"
+  ],
+  "customer_impact": "medium",
+  "release": "controlplane-2025.04",
+  "security_review_required": "false",
+  "description": "Background: The control plane's core tenant and entity tables have gradually accumulated wide row schemas (large JSONB blobs, redundant metadata columns, and sporadic denormalized fields). These wide rows drive high IO amplification on hot-tenant reads, inflate working set sizes for primary and secondary indexes, and increase checkpoint/replication churn during maintenance windows. Several recent incidents (see related notes) show p95 tenant-list reads and background compaction causing CPU and IO spikes on primary clusters.",
+  "problem_statement": "We need a surgical plan to reduce average row width for the top 3 hot tables, move cold or infrequently-read payloads off the hot path, and introduce read-side structures to avoid repeated expensive joins for tenant-scoped reads. The work must be online-migration friendly with small-risk rollbacks and measurable performance impact per change.",
+  "goals": "1) Reduce median row width for tenant_rows by >= 40% for active tenants. 2) Reduce p95 tenant-list and tenant-metadata read latency by >= 30% under production workload. 3) Reduce primary index size on hot tables by >= 30% on a representative dataset. 4) Provide rollback-safe migration steps and per-step validation queries.",
+  "non_goals": "Full normalization of every JSONB field; rewriting application-level ownership models; migrating cold archival datasets (separate archive initiative will handle long-term archiving).",
+  "solution_overview": "High level approach: (A) Identify the three highest-heat tables over a 30-day window and the top columns contributing to row width. (B) Introduce 'payload_shard' pattern: move large JSONB payloads and optional metadata into a small lookup table (one-to-one by id) or object store reference, leaving a narrow descriptor on the hot table. (C) Add materialized partial views tuned for tenant reads where appropriate to precompute the common projected columns. (D) Update ORM mappings and queries to use the new narrow columns and lookup paths. (E) Deploy migrations as zero-downtime online steps with validation and fast rollback path.",
+  "detailed_plan": "Phase 0 - Discovery (2 days): run analyzer queries to produce heat map and byte-contribution per column; attach sample explain plans for top 10 queries. Phase 1 - Schema scaffolding (3 days): add new payload_shard table(s) with FK -> id but no immediate data population; add appropriate indices and FK constraints deferrable initially. Phase 2 - Dual-write and read fallback (2 weeks): update production service to write both old and new payload locations and add read-fallback so reads consult payload_shard if present, otherwise fall back to inline JSONB. Monitor divergence metrics. Phase 3 - Backfill in small batches (4 days): backfill payload_shard for 1% tenant batches across hours with throttling and verify checksums. Phase 4 - Promote narrow reads (3 days): flip reads for canary tenants to read primarily from payload_shard and reduce projection of JSONB. Phase 5 - Drop inline columns (2 days): after 1 week of stable canary and sufficient coverage, remove inline payload columns and ARGUMENTALLY compact indexes. Phase 6 - Add tenant materialized partial views (3 days): create per-tenant partial materialized views or a consolidated materialized view with tenant filter columns to accelerate common queries. Final - Cleanup (1 day): remove dual-write code paths, drop deferrable constraints used for migration.",
+  "migration_sql_snippet": "-- Create lookup storage for heavy payloads\nCREATE TABLE control.payload_shard (id uuid PRIMARY KEY, payload jsonb, created_at timestamptz DEFAULT now());\nCREATE INDEX ON control.payload_shard ((id));\n-- Add reference column to hot table (narrow)\nALTER TABLE control.tenant_rows ADD COLUMN payload_shard_id uuid;\nALTER TABLE control.tenant_rows ALTER COLUMN payload_shard_id SET DEFAULT NULL;\n-- Backfill example (batching by id ranges)\nINSERT INTO control.payload_shard (id, payload)\nSELECT id, large_payload FROM control.tenant_rows WHERE payload_shard_id IS NULL LIMIT 1000;\n-- Update backfilled rows to reference the new shard entry\nUPDATE control.tenant_rows tr SET payload_shard_id = ps.id FROM control.payload_shard ps WHERE tr.id = ps.id;",
+  "validation_queries": "-- size reduction check (estimate of payload bytes)\nSELECT avg(pg_column_size(large_payload)) AS avg_payload_size FROM control.tenant_rows WHERE tenant_id IN (select id from control.tenants where active=true LIMIT 100);\n-- compare after backfill using JOIN to ensure content parity\nSELECT count(1) FROM control.tenant_rows tr JOIN control.payload_shard ps ON tr.payload_shard_id = ps.id WHERE (tr.large_payload IS DISTINCT FROM ps.payload) LIMIT 1;",
+  "rollout_stages": [
+    "staging dual-write and read-fallback: run 48h smoke tests and perf profile",
+    "canary: 5% of tenants - observe p50/p95 and IO metrics for 72h",
+    "ramp: 25% -> 50% over next 48h if no regressions",
+    "full: flip reads for all active tenants; schedule off-peak drop of inline columns"
+  ],
+  "metrics_to_monitor": [
+    "p50/p95 read latency (tenant-list) pre/post change",
+    "IO throughput and ops/sec on primary DB nodes",
+    "index size (relation_size) for tenant_rows and related indexes",
+    "replication lag and checkpoint duration during backfill windows",
+    "dual-write divergence rate (should be 0)",
+    "CPU saturation on read replicas"
+  ],
+  "rollback_plan": "If divergence or latency regressions exceed thresholds, immediately revert read path to inline JSONB (dual-write keeps writes safe). Backfill can be paused and compensating deletes applied to payload_shard for incomplete batches. We will preserve old columns for at least 7 days after flip to enable fast reversion. All revert operations have an associated runbook with exact SQL statements and should be executed by on-call DB eng.",
+  "risk_and_mitigation": "Risk: Backfill IO causing replica lag or primary IO contention. Mitigation: aggressive throttling, small batch sizes, run during low-traffic windows, use statement_timeout and pg_sleep between batches. Risk: application bugs reading from new shard leading to N+1 queries. Mitigation: code review, integration tests, and performance benches in staging. Risk: FK constraint creation locks large tables. Mitigation: create constraints as NOT VALID and validate later with CONCURRENT/VALIDATE where supported.",
+  "testing_and_validation": "Unit tests for ORM mapping changes, integration tests that exercise dual-read paths, performance tests in perf cluster with synthetic traffic matching tenant skew, and a 72-hour canary observing defined metrics. Add a synthetic workload that reproduces worst-case hot-tenant scenario to validate p95 improvements.",
+  "dependencies": [
+    "ENG-27358",
+    "ENG-35719"
+  ],
+  "related_links": [
+    "https://github.com/redwood-inference/controlplane/pull/8792",
+    "confluence:Control Plane DB heatmap - March 2025",
+    "grafana:prod/controlplane/tenant-read-latency"
+  ],
+  "open_questions": "1) Should payload_shard be deployed as JSONB in-postgres or as a file/object-store reference? Tradeoffs: PG keeps transactional semantics but increases DB size; object-store reduces DB bloat but requires additional fetch and caching. 2) For materialized views, do we create per-tenant MVs for the top 50 tenants or one consolidated MV with tenant_id filter column? 3) What SLA window is acceptable for the backfill run?",
+  "activity_log": [
+    "2025-03-12: Created ticket - initial heatmap attached",
+    "2025-03-13: Design sync with DB eng - agreed on payload_shard pattern and dual-write strategy",
+    "2025-03-15: Prototype migration SQL ran on staging clone; observed 28% index size reduction for sample dataset",
+    "2025-03-17: PR opened updating ORM (link above) and dual-write feature flag added",
+    "2025-03-18: Canaries scheduled for 2025-03-20 - monitoring dashboards prepared"
+  ],
+  "acceptance_criteria": [
+    "Heatmap shows top-3 hot tables row-width reduced by >=40% on canary tenants",
+    "p95 tenant-list latency improvement >=30% on canary workload",
+    "No replica lag > 30s during backfill windows",
+    "All regression tests and perf benches pass in staging and perf clusters"
+  ],
+  "notes": "This ticket focuses narrowly on reducing hot-path row width and protecting read performance. Follow-on tickets will tackle long-term archival and cross-tenant compaction. Coordinate with infra on maintenance windows and with SEs for communication to affected customers.",
+  "attachments": [
+    "s3://redwood-artifacts/controlplane/heatmap_march2025.csv",
+    "drive:Design - payload_shard rationale v1.pdf"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "problem_statement",
+    "goals",
+    "non_goals",
+    "solution_overview",
+    "detailed_plan",
+    "migration_sql_snippet",
+    "validation_queries",
+    "rollout_stages",
+    "metrics_to_monitor",
+    "rollback_plan",
+    "risk_and_mitigation",
+    "testing_and_validation",
+    "open_questions",
+    "acceptance_criteria",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_cce7ee7cdddb40cc894b990c2b8cc953"
+}

@@ -1,0 +1,34 @@
+{
+  "title": "spatial-temporal-threshold-sweep",
+  "owner": "Sofia Martins",
+  "drive_area": "users",
+  "path": "users/spatial-temporal-threshold-sweep-log-sofia.json",
+  "doc_type": "doc",
+  "created_at": "2025-01-17",
+  "last_modified": "2025-02-03",
+  "collaborators": [
+    "Jordan Lee",
+    "Maya Patel"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "throughput",
+    "kv-cache",
+    "sweep",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "https://git.redwood.ai/infra/rrt/pulls/812",
+    "RD-2147",
+    "https://redwood.slack.com/archives/C02ABC123/p1700000000000"
+  ],
+  "content": "Goal: quick exploratory sweep to find the spatial (cache hit distribution across user prefixes) and temporal (idle-to-burst warmup) thresholds where we start seeing >2x p99 pain for small requests. Aim is to inform adaptive prefetch + batching heuristics.\n\nContext / why:\n- Recent customer incident (RD-2147) saw p99 spikes when a small cohort hit after 45\u201390s idle windows. Hypothesis: KV cache eviction by LRU + shard hot-reshuffle before steady multiplexing.\n- Want to quantify where simple prefix prewarm (width X) buys us latency and where it becomes wasteful for throughput.\n\nEnvironment / harness:\n- Model: gomel-7B-fp16 (prod-sim variant)\n- Hardware: single A100-80GB (shared dev pool), isolated runtime instance\n- Runtime config: kv_cache=True, cache_capacity=256MB, batcher.max_batch_tokens=2048\n- Client: local loader that simulates arrival patterns; measures end-to-end server response start-to-last-byte\n- Measurement slice: token-length requests with prompt=short (avg 24 tokens), gen cap=16 tokens\n\nSweep plan (coarse first pass):\n- Spatial prewarm width W: [1, 4, 8, 16]\n- Temporal idle interval I: [5s, 20s, 45s, 90s, 180s]\n- Concurrent inflight (fanout) levels C: [1, 4, 8]\n- 3 repeats per cell, 2-minute steady-state after start, collect per-request latency plus timestamps\n\nNotes on workload generator:\n- Arrival shape: burst (all requests at t=0 for 2s) and spaced (poisson lambda to match QPS 30)\n- For burst we measure initial 30s post-burst heavily since warmup effects show then\n- We capture kernel-level metrics via /metrics endpoint (kv_hits, batch_size_histogram, cpu_gpu_util)\n\nRepresentative raw results (median of repeats) \u2014 burst mode, C=4, prompt 24 tokens:\nW=1, I=45s => QPS_peak 110, median_latency 78ms, p95 240ms, p99 620ms, kv_hit_rate 12%\nW=4, I=45s => QPS_peak 108, median_latency 82ms, p95 160ms, p99 220ms, kv_hit_rate 41%\nW=8, I=45s => QPS_peak 103, median_latency 84ms, p95 150ms, p99 190ms, kv_hit_rate 58%\nW=16, I=45s => QPS_peak 101, median_latency 86ms, p95 148ms, p99 185ms, kv_hit_rate 67%\n\nTrend calls:\n- Doubling W from 1->4 yielded ~3x reduction in p99 for the 45s idle case while throughput dropped only ~2%.\n- Marginal returns after W=8 are small for p99; cost (memory + increased prefetching) grows.\n- For short idle (I=5s) effect is muted: W=1 already had kv_hit_rate ~65% and p99 ~95ms.\n\nEdge case (I=180s, burst):\nW=1 => p99 950ms, kv_hit 4%\nW=4 => p99 540ms, kv_hit 22%\nW=8 => p99 250ms, kv_hit 48%\n=> indicates large idle windows need wider prewarm to avoid catastrophic slowdown. But note that prewarming W=8 at I=180s increases background prefetch work that will collide with other tenants in multi-tenant pool.\n\nObserved failure modes / anomalies:\n- One repeat at W=16, I=90s had GPU stall 3s (rare) \u2014 kernel-level logs show a cuBLAS allocation panic then recovery; filing infra PR (see linked PR).\n- Batch size histogram during warmups showed many single-request batches (batch_size=1) for first 12s; batching config had conservative timeout=5ms which may be too low for noisy bursts.\n\nQuick ascii heatmap (p99 ms by W x I) \u2014 rough\n(I cols: 5s,20s,45s,90s,180s)\nW=1 | 95, 120, 620, 780, 950\nW=4 | 90, 110, 220, 310, 540\nW=8 | 88, 105, 190, 210, 250\nW=16| 85, 102, 185, 200, 220\n\nPreliminary conclusions (for discussion):\n1) For customer-facing default, recommend a conservative W=4 prewarm when idle>30s for hosted pool; gives good p99 improvement with modest cost. Tag as opt-in configurable by tenant.\n2) For Dedicated/private where memory isolation exists, suggest W=8 as a default for aggressive low-p99 SLAs.\n3) Batching timeout needs re-evaluation: increase to 8\u201312ms during detected warmup windows to allow small coalescing and avoid 1-shot batches.\n4) Add circuit to detect repeated long-idle accesses (I>60s) and trigger selective cold-warm prefetch only for heavy prefixes (top-K by recent QPS) \u2014 to cap background cost.\n\nNext steps / TODOs:\n- Expand sweep to multi-GPU small pool (2xA100) to measure cross-shard KV coherence cost (assign to Jordan)\n- Add a measurement for tail-queueing: capture queue length at APIGW when burst hits (Maya)\n- Draft a short customer note template explaining mitigation options (so we can proactively contact impacted customers)\n- Create rollout flag \"prefetch-width\" with server-side default 4 and per-tenant override; add canary (RD-2189)\n\nQuestions to answer in follow-up runs:\n- How does prewarm width interact with quantized model variants (int8) \u2014 less memory, different kernel shapes\n- Is there a smarter LRU variant (freq-aware) that keeps prefixes seen in the last 5 minutes irrespective of raw recency?\n\nNotes to self:\n- Save raw traces to s3://redwood-dev/sofia/spatial-sweep/2025-01-17/ (done)\n- Re-run the failing W=16 case with env var RTF_ALLOC_DEBUG=1 to catch GPU allocation sequences\n- Check the PR tests against prod-kernel-compat matrix\n\nRough estimate of unit cost impact (back of envelope):\n- W=4 prewarm adds ~+6% avg memory footprint, increases background token generation ~0.8 tokens/sec per prewarm width per instance during idle windows.\n- For hosted at scale we need a throttling limiter to avoid >10% baseline cost uplift when many tenants idle concurrently.\n\nIf anyone wants the raw csv per-run ping me and I'll share. Slack: @sofia.martins.\n\nEnd of scratchpad.\n",
+  "_format_version": "1.0",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_1246499d00604408bfd623c07c3d317a"
+}

@@ -1,0 +1,119 @@
+{
+  "key": "ENG-9962",
+  "team": "engineering",
+  "title": "Streaming reconnects: reconcile partial-chunk token accounting and de-duplication",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-14",
+  "creator": "Asha Patel",
+  "assignee": "Diego Ramirez",
+  "project": "billing-metering",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "metering",
+    "streaming",
+    "billing",
+    "investigation",
+    "slo"
+  ],
+  "dependencies": [
+    "ENG-8814",
+    "ENG-7581"
+  ],
+  "customer_impact": "high",
+  "release": "billing-2026.03",
+  "security_review_required": "false",
+  "description": "Several customers have reported intermittent overbilling for streaming responses when client connections reconnect mid-stream. Symptoms: token counts in billing logs are higher than tokens observed in final responses and customer repros show duplicated suffixes in assembled outputs. Initial detection came from anomalies in the billing dashboard (billing-dashboard/streaming-token-anomalies) and from manual cases in Support. This ticket investigates pipeline correctness for streaming token accounting, focuses on partial-chunk boundaries, reconnection/idempotency, and interactions with rate-limiters and the prefix caching layer. Goal: guarantee that each generated token is billed exactly once, even with reconnects, retries, and aborted streams.",
+  "observed_behavior": [
+    "When client reconnects with same session-id but missing last N bytes, the assembler sometimes applies the tail chunk twice, producing duplicated tokens and double-counting in downstream metering events.",
+    "Billing pipeline counts (ingest -> aggregator -> ledger) show +10-200 extra tokens compared to final reconstructed payload in ~0.2% of high-throughput streams during our stress tests.",
+    "Race between rate limiter drop/retry and streaming aggregator ack path causes duplicate emission of final-chunk events when ack lost and upstream retries send the same content again.",
+    "KV/prefix cache can cause server to resume with overlapping cached prefix which, without correct sequence reconciliation, results in duplicated token spans being emitted to the metering topic."
+  ],
+  "repro_steps": [
+    "Start a long streaming generation with a deterministic model and client that records chunks with sequence numbers.",
+    "Kill the client connection after partial chunk boundary (mid-token boundary simulated) and reconnect using same stream id but without exact last-seen sequence ack.",
+    "Trigger a server-side retry (simulate transient downstream error) so the server re-emits remaining tokens. Compare assembled output before and after and compare token-meter events in kafka topic 'metering-stream-events'.",
+    "Run with KV caching enabled and with a high batching window to increase likelihood of overlap and race conditions."
+  ],
+  "hypothesis": [
+    "Metering events are emitted per-emission (server-side chunk flush) rather than per-finalized-unique-token, so re-emissions after reconnect are treated as new tokens.",
+    "Missing durable sequence acks between streaming runtime and metering producer lead to non-idempotent writes to the metering topic under retries.",
+    "Rate limiter backpressure can cause the runtime to split/merge chunks differently across retries, changing chunk boundaries and confusing naive de-duplication logic."
+  ],
+  "acceptance_criteria": [
+    "Reproducer that previously showed duplicate token accounting must report equal token totals between final assembled payload and billing ledger in 10k-run stress test with <0.01% mismatch.",
+    "Add end-to-end integration test that simulates reconnects/mid-chunk failures and asserts billing topic events are idempotent by stable sequence IDs.",
+    "Deploy fix behind feature flag; rollout to 10% traffic for two days with no regressions in latency or throughput metrics.",
+    "Document design and update runbooks for Storage/Monitor team explaining new telemetry and how to triage similar anomalies."
+  ],
+  "proposed_solution": [
+    "Introduce per-stream monotonically increasing chunk_sequence that is persisted to the durable stream metadata store (lightweight append-only) before emitting metering events. Metering producer will include (stream_id, chunk_sequence, chunk_hash) and be idempotent on that triple.",
+    "Change metering aggregator to perform de-duplication by chunk_sequence + chunk_hash instead of naive event dedup windowing. Reject or ignore repeated chunk_sequence values when chunk_hash matches.",
+    "If server resumes and emits overlapping prefix due to KV cache resume, runtime must compute overlap length and emit metering delta (new_tokens_only) instead of the whole chunk emission.",
+    "Make the streaming client SDK include last-acked-sequence metadata in reconnect handshake so runtime can reconcile and avoid re-sending already-billed tokens when possible.",
+    "Add a small compensating-transaction path: if duplicate billing already occurred (detected by ledger checksum mismatch), emit a reversal event to ledger with audit trail."
+  ],
+  "implementation_notes": [
+    "Add light-weight per-stream seq persistence in runtime state store (RocksDB column family 'stream_seq') keyed by stream_id. Keep retention short (1 hour) to bound storage.",
+    "Extend metering Kafka schema to include chunk_sequence and chunk_hash. Follow Confluence schema migration process and coordinate with consumers (billing-processor, accounting-ledger).",
+    "Add kafka-producer idempotency (idempotent producer configs) and at-least-once semantics with dedup logic in the billing consumer to tolerate replays.",
+    "Update rate-limiter tests to vary batching windows to validate chunk boundary changes do not break dedup logic.",
+    "Coordinate with SDK team for client handshake change: reference PR draft github.com/redwood-inference/sdk/pull/452."
+  ],
+  "testing_plan": [
+    "Unit tests for chunk overlap calculation and chunk_hash correctness.",
+    "Integration tests simulating reconnects, delayed acks, rate-limiter backpressure, and KV cache resume; assert no extra billing events emitted.",
+    "Load test against staging with 2000 concurrent streaming clients, enable feature flag, measure token-count mismatch rate and p95 latency change.",
+    "Post-deploy canary: route 10% of production streams to the new path; monitor 'billing.token_mismatch_rate' and 'stream.latency_p95'."
+  ],
+  "rollout_plan": [
+    "Ship server changes behind 'streaming-metering-dedupe' feature flag.",
+    "Deploy billing consumer changes in a coordinated 2-step rollout (consumer read-only mode -> dedupe mode) to avoid breaking in-flight consumers.",
+    "Enable feature for internal traffic, run smoke tests, then 10% production traffic for 48h. If green, increase to 50% then 100% over next 72h.",
+    "Run ledger reconciliation job nightly for first week to detect and auto-reverse any historical overcharges discovered."
+  ],
+  "metrics_and_observability": [
+    "New metrics: metering.event_dup_count, metering.duplicate_chunk_ratio, metering.compensations_emitted, stream.seq_persist_failures.",
+    "Dashboards: billing-dashboard/streaming-token-anomalies updated with per-model and per-region breakdown. Alert if metering.duplicate_chunk_ratio > 0.1% for 1h.",
+    "Tracing: include stream_id and chunk_sequence as baggage in traces to link generation paths to metering events."
+  ],
+  "notes": [
+    "2026-03-10: Triage meeting \u2014 Assigned to Diego. Determined severity P0 due to customer billing impact. (Asha)",
+    "2026-03-11: Reproduced locally with deterministic model; confirmed duplicate chunk emissions when client reconnects without re-sending last-ack. Logged sample events to kafka topic. (Diego)",
+    "2026-03-12: Design review with billing and SDK teams. Agreed on chunk_sequence + chunk_hash approach; SDK handshake change required. (Asha, Priya S., Mark L.)",
+    "2026-03-13: Initial prototype changes pushed to branch feat/streaming-dedupe. Linked PR: https://github.com/redwood-inference/runtime/pull/1287. Requesting review from infra and billing owners.",
+    "2026-03-14: Discovered potential race where sequence persistence could fail under heavy GC pauses; added recovery/backoff note to implementation. Need infra review on RocksDB tune. (Diego)"
+  ],
+  "attachments": [
+    "Confluence: https://confluence.redwood.ai/display/BILL/Streaming+Metering+Deduplication+Design",
+    "PR: https://github.com/redwood-inference/runtime/pull/1287",
+    "SDK PR draft: https://github.com/redwood-inference/sdk/pull/452",
+    "Dashboard: https://grafana.redwood.ai/d/streaming/billing-dashboard?view=token-anomalies"
+  ],
+  "next_steps": [
+    "Finish prototype and add unit tests for sequence persistence (owner: Diego, ETA 2026-03-17).",
+    "Open schema migration RFC and schedule cross-team sync with Billing, Ledger, and SDK teams (owner: Asha, target 2026-03-16).",
+    "Add staging canary and load tests; run nightly reconciliation scripts during canary window (owner: SRE)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "observed_behavior",
+    "repro_steps",
+    "hypothesis",
+    "acceptance_criteria",
+    "proposed_solution",
+    "implementation_notes",
+    "testing_plan",
+    "rollout_plan",
+    "metrics_and_observability",
+    "notes",
+    "attachments",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_14b4328bc11d4bb1861512a93ff9efda"
+}

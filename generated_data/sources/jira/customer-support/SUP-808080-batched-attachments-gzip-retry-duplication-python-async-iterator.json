@@ -1,0 +1,75 @@
+{
+  "key": "SUP-808080",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Batched attachments with gzip-encoded payloads cause duplicate tool executions on retry via Python async iterator",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Maya Patel",
+  "assignee": "Ethan Clark",
+  "customer_company": "SwellHealth",
+  "customer_tier": "dedicated",
+  "components": [
+    "sdk-python",
+    "serving-runtime",
+    "api-gateway",
+    "edge-proxy"
+  ],
+  "labels": [
+    "idempotency",
+    "retries",
+    "attachments",
+    "python-async",
+    "gzip",
+    "investigation"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "redwood-gpt-3.5-large",
+    "llama-2-13b"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-13",
+  "first_response_due_at": "2026-03-11",
+  "linked_issues": [
+    "SUP-314159"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/sdk-python/pull/4521"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/Support/pages/Batched+Attachments+Gzip+Retry+Investigation"
+  ],
+  "description": "Issue summary:\nCustomer uses the Python async iterator SDK to send batched requests that include multiple attachments (binary blobs) per request. They gzip each batch on the client side. When the server returns a transient 202+retryable ack (internal queue enqueue), the SDK retries and we observe duplicate tool/function executions downstream (duplicate webhook calls and duplicate DB side effects).\n\nImpact:\n- Multiple duplicate downstream webhook posts and side effects for a small subset (~0.6%) of batched requests during transient enqueue failures.\n- Customer reports data duplication and billing noise for high-volume ingestion job.\n- Affects dedicated customers using client-side gzip + async iterator batching pattern.\n\nEnvironment:\n- Customer: SwellHealth (dedicated cluster)\n- SDK: sdk-python v1.14.2 (async iterator example)\n- Runtime: dedicated serving pool in prod-us-east\n- Proxy: edge-sidecar with gzip passthrough enabled\n- Observed on models: redwood-gpt-3.5-large (primary), also reproduced on llama-2-13b in test runs\n\nSteps to reproduce (customer-provided):\n1. Use async for chunk in client.stream_batches(...): send batch that contains 3 attachments (binary ECG, JSON metadata, PDF) compressed with gzip at client before sending.\n2. Server returns 202 Accepted with body {\"enqueue\": \"ok\", \"trace\": \"...\"} but internal queue intermittently times out when attempting to ack.\n3. SDK interprets 202 as transient and retries the entire batch (full gzip binary) after applying backoff.\n4. Downstream worker consumes both messages from queue (original and retried) and triggers the same tool/function twice (webhook POST + DB write).\n\nObserved behavior:\n- Duplicate webhook POSTs with identical payloads and same content checksum but different request IDs.\n- No idempotency key present in the batched/gzipped envelope because the client included per-item IDs inside the compressed payload, not in the request headers or envelope-level idempotency metadata.\n\nExpected behavior:\n- Retries should either be deduplicated server-side by an envelope-level idempotency key or the SDK should ensure a stable idempotency token is attached to the request header even when payloads are gzipped by client.\n\nLogs and traces (redacted):\n- API gateway logs show repeated POSTs for the same client session id within a 2s window: request_id=req-17a3, req-17a4\n- Serving runtime trace: enqueue attempt 1 -> internal queue timeout (timeout after 550ms) -> SDK retry -> enqueue attempt 2 -> queue ok -> downstream worker processed message id ws-993 -> processed again id ws-994\n- Edge proxy logs show content-encoding: gzip on both requests; content-length identical.\n\nCustomer-provided code snippet (sanitized):\nasync for batch in batch_generator():\n    compressed = gzip.compress(serialize(batch))\n    await client.stream_send(compressed, headers={\"Content-Encoding\": \"gzip\"})\n\nWorkaround attempted by customer:\n- Client-side dedupe table (in-memory) keyed by per-item UUIDs inside payload. Reduced duplicates but did not eliminate them because some retry windows cross process restarts.\n\nNotes:\n- This pattern differs from single-request idempotency since the idempotency data is buried inside a compressed envelope and not visible to middle proxies or the enqueueer.\n- There are existing tickets about idempotency header truncation and token rotation, but this is specifically about envelope-level idempotency and client-side gzip in the async iterator pattern.\n",
+  "comments": [
+    "2026-03-10 09:12 - Support (Maya Patel): Triage completed. Assigned to SRE for replication in dedicated infra. Asked customer for sample batch ID and timestamps.",
+    "2026-03-10 11:05 - Customer (SwellHealth - devops@swllhealth.com): Provided sample request_ids req-17a3 and req-17a4, and worker ids ws-993/ws-994. Confirmed sdk-python v1.14.2 and they are compressing client-side.",
+    "2026-03-11 08:43 - SRE (Ethan Clark): Reproduced locally using async iterator + gzip envelope. Observed server returns 202 on simulated transient queue ack and SDK issues full retry. Added debug logs to show envelope lacks envelope-id header. Referenced linked issue SUP-314159 for batching dedupe history.",
+    "2026-03-11 14:22 - SDK Eng (Leah Huang): Noted SDK behavior is to retry on 202 when ack flow indicates transient error. SDK currently does not synthesize an envelope-level idempotency header when payload is compressed. Investigating safe header injection semantics for compressed envelopes.",
+    "2026-03-12 09:10 - SRE (Ethan Clark): Ran a small canary with server-side dedupe when content-length and checksum match within 5s window. Canary prevented duplicates in test harness for this pattern. However this approach might be risky for other workloads (false dedupe).",
+    "2026-03-12 13:30 - Support (Maya Patel): Notified customer of temporary mitigation and next steps: a) short-term server-side dedupe canary b) SDK patch to add X-Envelope-Id header when async iterator is used and client sets Content-Encoding:gzip. Waiting on SDK PR.",
+    "2026-03-12 16:05 - SDK Eng (Leah Huang): Opened PR https://github.com/redwood-inference/sdk-python/pull/4521 to add deterministic envelope id generation (uuid4 v5-like with client session + sequence) and surface header X-Envelope-Id unless customer opts out. Marked for review."
+  ],
+  "investigation_notes": "Initial hypothesis: duplicate executions caused by lack of envelope-level idempotency when client compresses payload. Confirmed by reproducer. Alternate hypothesis (header truncation at proxy) was ruled out because edge proxy preserved Content-Encoding and headers; both requests had identical lengths and gzip metadata. Packet-level traces show identical binary bodies. Evidence points to SDK retry semantics combined with missing envelope idempotency. Server-side short-lived dedupe works in canary but could create false positives in high-throughput heterogeneous workloads. Proposed long-term fix: SDK-generated X-Envelope-Id for batched async streams plus guidance to include explicit envelope-id when using client-side compression. Also document pattern in support KB.",
+  "resolution_notes": "In Progress - short-term server-side dedupe canary enabled for the customer's dedicated pool (monitored). SDK patch PR #4521 created and under review to add a deterministic envelope id header for async iterator batched sends when Content-Encoding:gzip is present. Post-merge action items: release patch in v1.14.3, notify affected customers, add KB article outlining recommended pattern (envelope id header + per-item ids). Follow-up: measure false-dedupe rate in 30-day canary and consider adding idempotency verification in serving runtime to safely dedupe based on envelope-id + model+route.",
+  "follow_up_actions": [
+    "Merge SDK PR and ship v1.14.3 patch",
+    "Create KB: 'Avoiding duplicates with client-side gzip in async batching'",
+    "Monitor canary false-dedupe rate for 30 days",
+    "Consider API contract update to recommend envelope-id header for compressed envelopes"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes",
+    "follow_up_actions"
+  ],
+  "dataset_doc_uuid": "dsid_acb5d1640b02482ba6c12d5b42a5575a"
+}

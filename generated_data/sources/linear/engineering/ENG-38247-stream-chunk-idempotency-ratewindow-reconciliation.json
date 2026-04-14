@@ -1,0 +1,74 @@
+{
+  "key": "ENG-38247",
+  "team": "engineering",
+  "title": "Streaming chunk idempotency and rate-window reconciliation for accurate token metering",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-10",
+  "creator": "Amrita Singh",
+  "assignee": "Carlos Rivera",
+  "project": "metering-stability",
+  "cycle": "2026-W10",
+  "estimate": 8,
+  "labels": [
+    "billing",
+    "streaming",
+    "rate-limits",
+    "customer-impact",
+    "postmortem-driven"
+  ],
+  "customer_impact": "high",
+  "release": "billing-pipeline-2026.03",
+  "security_review_required": false,
+  "description": "Problem statement:\n\nWe continue to observe small but material discrepancies between tokens emitted by the serving runtime (request-level logs) and tokens recorded in the metering pipeline for streaming responses. Root causes appear to be a combination of: 1) reconnect/resume semantics that cause partial chunks to be retransmitted and double-counted, 2) chunk boundary tokenization differences when streaming chunk split/merge happens, and 3) race conditions between the rate-limiter's token window accounting and the async commit path in the metering aggregator.\n\nImpact: customers see overbilling in a subset of streaming-heavy products; internal alerts show \"metering-mismatch\" rate ~0.18% on high-volume tenants, exceeding SLO of 0.05%. Rate-limit enforcement can be overly permissive or overly strict due to the mismatch between in-flight uncommitted tokens and the rate-window calculation. This causes both incorrect throttles and billing errors.\n\nGoals: 1) Guarantee idempotent token accounting for streaming sessions (reconnects/resumes) with strong invariants, 2) Reconcile rate-window enforcement with uncommitted in-flight tokens so quotas reflect real usage, 3) Provide an automated audit and correction job to remediate historical mismatches and issue customer credits where appropriate.",
+  "reproduction_steps": "1) Enable streaming verbose logging for a test tenant.\n2) Start a long streaming generation that emits ~200 tokens across multiple chunks.\n3) Simulate a network blip and client reconnect that requests resume from last acked chunk.\n4) Observe serving logs (stream frames) vs metering events (kafka metering-topic).\nExpected: total tokens in metering equals tokens served.\nObserved: metering count > serving count due to retransmitted partial chunks being counted twice; in some cases tokenization differs if chunk boundary splits a multi-byte tokenization unit leading to +1 token due to tokenizer rounding.",
+  "root_cause_analysis": "We traced the flow and found three correlated issues: 1) The stream producer emits a frame-level id that is not forwarded to the metering pipeline; metering deduping is therefore done at a coarse session-level which can't differentiate retransmits. 2) The metering pipeline accepts chunk token_count provided by the runtime without re-tokenizing when chunk boundaries are merged \u2014 small tokenizer variance can accumulate. 3) The rate limiter calculates 'available tokens' only from committed metering DB counts, ignoring uncommitted in-flight tokens buffered in the aggregator, leading to windows drifting under high concurrency.\n\nTrade-offs considered:\n- Always re-tokenizing chunks in the metering pipeline: most accurate but expensive CPU on the pipeline and increases SLO risk.\n- Relying on the runtime-provided token counts with stronger idempotency keys: cheaper but requires a small runtime change.\n- Enforcing rate-limits only at ingress (fast path) vs at commit time: ingress-only is low-latency but can allow temporary overuse; commit-time enforcement is strict but requires backpressure support for streaming sockets.\n\nDecision: implement idempotency and sequence-based deduping in the metering pipeline coupled with a lightweight re-tokenization validation sample (1% of chunks) to detect tokenizer drift. Update the rate-limiter to account for 'in-flight reserved tokens' (per-session checkpoints) so enforcement reflects pending usage. This balances correctness, cost, and rollout risk.",
+  "solution_outline": "1) Runtime change (small): attach stream_chunk_id (uuid per chunk) + session_epoch (increment on reconnect) to every streaming frame and include runtime_token_count.\n2) Metering pipeline changes:\n   - Use (customer_id, session_id, session_epoch, stream_chunk_id) as dedup key.\n   - Maintain a per-session committed_offset pointer in metering DB (Redis + durable backup) for quick idempotency checks.\n   - When a new chunk arrives: if dedup key seen -> ignore; else validate runtime_token_count against a cached tokenizer for suspect samples.\n   - Emit committed token delta events to billing topic only after dedup decision.\n3) Rate limiter changes:\n   - Track reserved_in_flight_tokens per session and per-customer (in Redis).\n   - On chunk accepted for streaming, reserve tokens immediately (atomic increment); on commit or drop, decrement. Enforcement checks available_quota = quota_window - committed_tokens - reserved_in_flight_tokens.\n4) Audit/migration:\n   - Backfill job that correlates serving frames, metering-topic events, and commit logs to compute mismatches per customer.\n   - Generate corrective adjustments and credits for mismatches beyond threshold, with manual review for large adjustments.\n5) Telemetry and alerts: mismatch_ratio, dedup_hit_rate, reserved_vs_committed_ratio, token_validation_fail_rate.",
+  "acceptance_criteria": "- Streaming sessions with simulated reconnects show 0 duplicate token counts in metering for 1M test tokens.\n- Mismatch ratio for production tenants drops below 0.05% within 48 hours of canary rollout.\n- Rate-limit behavior remains stable: no customer experiences sudden throttles beyond planned canary; enforcement tests pass.\n- Audit job produces a reconciled ledger and a proposed credit batch with <0.1% false positives on a sample of 10 tenants.\n- Unit and integration tests added; CI coverage for metering de-dup logic >= 90%.",
+  "implementation_notes": "- Add new protobuf schema field to streaming frame: chunk_id (string), session_epoch (int32), runtime_token_count (int32). Backwards compatible: if absent, pipeline falls back to current behavior and marks chunk as 'legacy'.\n- Metering pipeline component changes in kafka-consumers/metering-aggregator service. Use Redis for hot checkpoints and Postgres for durable ledger.\n- Token validation sample will call tokenizer microservice in a throttled path (100 qps global). Keep sampling at 1% by default, configurable per-customer.\n- Use compare-and-set semantics for reserved token increments to avoid races: redis.HINCRBY and versioned key for per-session.\n- Add feature flag metering.idempotency.v1 for safe rollouts.\n- Add schema version bump and migration plan for older entries.",
+  "tests": "- Unit tests: dedup key handling, session_epoch bumps, reservation increments/decrements.\n- Integration: end-to-end test harness that runs a fake runtime client, induces reconnects, asserts metering topic emits exactly once per chunk.\n- Load: 1k concurrent streaming sessions for 1 hour on staging to validate Redis checkpoint scaling and rate limiter headroom.\n- Fuzz: chunk boundary injection to ensure tokenizer sampling picks up drift.\n- Canaries: 5% traffic -> 25% -> 100% with health checks at each stage.",
+  "rollout_plan": "Phase A (staging): enable feature flag, run full tests, validate metrics.\nPhase B (canary): 5% production traffic for 48h with strict monitoring. If dedup_hit_rate < 99.99% or mismatch_ratio decreases and no unexpected throttles, progress to 25% for 72h.\nPhase C: 100% rollout and run backfill audit.\nFallback: disable metering.idempotency.v1 flag which returns pipeline to legacy behavior if critical failure detected.\nCommunication: Notify CS + billing ops before canary and after full rollout with data on adjustments and endpoints for appeal.",
+  "migration_and_audit": "- Run a correlation job (kafka->serving logs->metering DB) to compute per-customer delta for the last 90 days.\n- Flag customers with >0.5% positive delta or absolute >$500 mismatch for manual review.\n- Generate credit proposals in billing system and record adjustments as draft entries.\n- Build a small console view (internal) for billing ops to inspect mismatch shards and approve credits.\n- Timeline: audit job run during canary and final run post 100% rollout. Expect run time ~8 hours for 90 days of data on current cluster; optimization may be required.",
+  "telemetry": "Metrics to add/observe: \n- meterer.dedup_hits (counter)\n- metering.dedup_misses (counter)\n- metering.mismatch_ratio (gauge by customer)\n- billing.reserved_vs_committed_ratio (histogram)\n- tokenizer.validation_failure_rate (counter)\n- rate_limiter.rejected_by_reserved (counter)\n- end2end.metering_latency_p95\nAlerts:\n- mismatch_ratio > 0.1% for >1h => P1 (notify eng + billing ops)\n- dedup_miss_rate increased by >5x baseline => P0 (investigate immediately)\n- reserved_vs_committed_ratio > 2.0 => Investigate potential leak in reservation accounting.",
+  "attachments": [
+    "https://confluence.redwood.ai/display/METER/Streaming+Idempotency+Design",
+    "https://github.com/redwood-inference/metering/pull/1421",
+    "https://dashboard.redwood.ai/d/ops/metering-mismatch?orgId=1",
+    "https://drive.google.com/drive/folders/1X_sample_playbook_for_audit"
+  ],
+  "dependencies": [
+    "ENG-37422",
+    "ENG-37901",
+    "PM-218"
+  ],
+  "parent_issue": [],
+  "sub_issues": [
+    "ENG-38248",
+    "ENG-38249"
+  ],
+  "notes": "Follow-on work: evaluate moving tokenizer checks to a dedicated validation pipeline to decouple CPU cost from main metering path. Consider a future enhancement to stream-level soft quotas to give clients better UX when they approach quotas.\n\nSLA discussion: billing ops requests a coordinated customer notification plan for any credits applied. Work with legal if any high-value corrections affect contracts.",
+  "comments": [
+    "2026-03-02 Carlos Rivera: Pushed initial prototype of dedup key handling to branch eng/metering/dedup-proto. Works locally but needs Redis checkpoint behavior tested under concurrency.",
+    "2026-03-04 Nia Patel (Billing Ops): Please ensure audit job groups by billing_account_id and not only tenant_id; many customers have multiple sub-tenants.",
+    "2026-03-06 SRE: Added a staging job to run the backfill against a snapshot to estimate runtime and memory usage. Estimated 7.5 hours for 90 days with current cluster sizing.",
+    "2026-03-09 Product review (Liam O'Connor): Approved approach. Request that we surface a per-customer reconciliation report in Console under Billing -> Corrections.",
+    "2026-03-10 Carlos Rivera: Feature flag added. Can start canary once infra quotas for Redis are increased; tracking infra ticket ENG-37901."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "reproduction_steps",
+    "root_cause_analysis",
+    "solution_outline",
+    "acceptance_criteria",
+    "implementation_notes",
+    "tests",
+    "rollout_plan",
+    "migration_and_audit",
+    "telemetry",
+    "notes",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_499aea0bfc994be1aeaead355563eff2"
+}

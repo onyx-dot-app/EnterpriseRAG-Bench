@@ -1,0 +1,96 @@
+{
+  "repo": "eval-harness",
+  "pr_number": "874551",
+  "title": "Introduce confidence-normalized regression gate and replay rate-limiter",
+  "author": "Aisha Patel",
+  "created_at": "2024-11-08",
+  "updated_at": "2024-11-15",
+  "merged_at": "2024-11-15",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/confidence-normalized-gate-replay-limiter",
+  "reviewers": [
+    "Marcus Green",
+    "Priya Rao",
+    "Liam O'Neill"
+  ],
+  "labels": [
+    "eval",
+    "ci",
+    "flakiness",
+    "perf",
+    "feature"
+  ],
+  "linked_linear": [
+    "ENG-1984",
+    "ENG-2009",
+    "PM-402"
+  ],
+  "linked_jira": [
+    "SUP-1132"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "8",
+  "additions": "524",
+  "deletions": "87",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "merged_by": "Marcus Green",
+  "description": "Motivation: CI flakiness from prompt-set regressions is often correlated with low-confidence outputs and concentrated replay bursts. This PR implements a confidence-normalized regression gate and a replay rate-limiter (replay throttle) to reduce noisy failures and protect downstream infra during automated backfills. The two pieces work together: the gate reduces false-positive failures by normalizing metric thresholds against the model's confidence distribution; the replay limiter spaces out automated replays and applies progressive quarantine for consistently flaky prompts.\n\nWhat this changes: introduced a new gate type `confidence_normalized_threshold` that computes an adjusted pass threshold per-cohort using a running calibration of model confidence (softmax entropy + median logit gap). The gate can be enabled per-prompt-set and configured with a normalization window and minimum-sample floor to avoid over-calibration on small cohorts. Added a replay controller `replay_rate_limiter` used by the checkpoint replay system and the CI smoke-runner to rate-limit replays by cohort, with backoff and quarantine semantics for repeatedly failing examples.\n\nDesign summary (high-level):\n- Confidence normalization: compute cohort-level confidence_factor = clamp(1.0 + alpha * (baseline_entropy - observed_entropy), 0.6, 1.4). Adjust raw metric threshold = base_threshold * confidence_factor. This reduces spurious failures when models are broadly uncertain and tightens thresholds when model confidence increases.\n- Replay rate-limiter: token-bucket per-cohort with configurable burst and sustained rates, plus an exponential backoff for examples that fail 2+ consecutive replays. After N_quarantine_failures an example is marked as `quarantined` and excluded from automated replay until a manual triage or a TTL expires.\n- Flaky suppression: aggregated flaky score stored alongside evaluation metadata to drive downstream triage dashboards and reduce pager noise.\n\nConfig example (single string YAML blob included in one field below in the changed files):\n```\nevaluation_gates:\n  - name: confidence_normalized_threshold\n    type: confidence_normalized\n    params:\n      base_threshold: 0.88\n      alpha: 0.25\n      normalization_window_days: 14\n      min_samples: 50\n      clamp_min: 0.6\n      clamp_max: 1.4\nreplay_controller:\n  type: replay_rate_limiter\n  params:\n    burst_per_minute: 10\n    sustain_per_minute: 2\n    backoff_multiplier: 2.0\n    quarantine_after: 3\n    quarantine_ttl_hours: 48\n```\n\nFiles changed (high-level): added gate implementation, replay controller, unit tests, integration test harness, docs and a small console-dashboard hook for flaky counts. See `files_changed` for specifics.\n\nTesting and validation: local unit tests (coverage added around gate math and throttle behavior), integration run against a real nightly model profile (ran with `smoke-run --profile nightly-2024-11-01 --dry-run=false`) and a staged CI on `staging-evals` that exercised backoff/quarantine paths. Observed reduction in false-positive failures on a 2-week retrospective run: failing PRs attributable to low-confidence prompts down 42% and total replay volume during backfills reduced by ~63% with default limits.\n\nRollout plan: feature-flagged gate + controller. Default off for existing prompt-sets; opt-in via prompt-set metadata. Gradual enablement for high-volume cohorts first, then all cohorts after 2 weeks of monitoring. Dashboard shows quarantined counts and replay volume.\n\nRelated: references ENG-1984 (rollout stability), ENG-2009 (replay orchestration improvements) and SUP-1132 (support ticket highlighting noisy regressions).\n\nChecklist: \n- [x] Unit tests for gate math and edge cases\n- [x] Integration smoke runs against nightly profile\n- [x] Dashboard metric for quarantined prompt count\n- [x] Docs: short-runbook and config examples\n- [x] Feature-flag gating and rollout notes\n",
+  "commits": [
+    "a1c3b9f: add confidence-normalized gate implementation and unit tests",
+    "b2f6e12: add replay rate-limiter controller and integration tests",
+    "c4d5e7a: add docs and console hook for flaky counts",
+    "d7f11ee: wiring: feature-flag + config schema + default disabled",
+    "e9a0ff3: fix: clamp handling and additional safety checks"
+  ],
+  "files_changed": [
+    "eval-harness/gates/confidence_normalized_gate.py",
+    "eval-harness/replay/replay_rate_limiter.py",
+    "eval-harness/tests/test_confidence_normalized.py",
+    "eval-harness/tests/test_replay_rate_limiter.py",
+    "eval-harness/config/default_gates.yaml",
+    "eval-harness/integration/staging_smoke_runner.py",
+    "eval-harness/docs/gates.md",
+    "console/plugins/flaky_summary_widget.py"
+  ],
+  "patch_snippets": [
+    "--- a/eval-harness/gates/confidence_normalized_gate.py\n+++ b/eval-harness/gates/confidence_normalized_gate.py\n@@ def adjusted_threshold(base_threshold, alpha, observed_entropy, baseline_entropy):\n-    return base_threshold\n+    factor = 1.0 + alpha * (baseline_entropy - observed_entropy)\n+    factor = max(min(factor, 1.4), 0.6)\n+    return base_threshold * factor\n",
+    "--- a/eval-harness/replay/replay_rate_limiter.py\n+++ b/eval-harness/replay/replay_rate_limiter.py\n@@ class ReplayRateLimiter:\n-    def allow(self, cohort):\n-        # naive always-allow for initial implementation\n-        return True\n+    def allow(self, cohort):\n+        # token-bucket per-cohort: burst + sustained enforcement\n+        self._refill_tokens(cohort)\n+        if self._tokens[cohort] > 0:\n+            self._tokens[cohort] -= 1\n+            return True\n+        return False\n"
+  ],
+  "reviews": [
+    "Marcus Green (2024-11-09): requested changes \u2014 please add min_samples floor and explicit clamp to avoid runaway thresholds in small cohorts.",
+    "Aisha Patel (2024-11-10): responded \u2014 added min_samples config and clamp, added unit tests for small cohorts.",
+    "Priya Rao (2024-11-12): approved after minor docs nits fixed.",
+    "Liam O'Neill (2024-11-14): requested change \u2014 add telemetry for replay backoff events. Aisha replied that telemetry was added and integration smoke validated the counters."
+  ],
+  "ci_summary": [
+    "Unit tests: pass (python 3.10, coverage 88%)",
+    "Integration staging: pass (staging-evals run)",
+    "Lint: pass",
+    "E2E backfill smoke: pass (replay exercised with rate-limiter)"
+  ],
+  "discussion_highlights": [
+    "Decision to normalize against cohort entropy rather than raw confidence per-example to reduce sensitivity to single-example noise.",
+    "Telemetry added for: adjusted_threshold_applied, replay_throttle_hit, example_quarantined. These appear in the console flaky widget.",
+    "Rollout will use feature-flag and two-week monitoring window; default off for existing prompt-sets to avoid surprises."
+  ],
+  "release_notes": "Add confidence-normalized evaluation gate and replay rate-limiter to reduce false-positive regression failures and control replay load. Feature-flagged; opt-in per prompt-set. Adds telemetry for throttles and quarantines.",
+  "notes_for_ops": "If large cohorts start hitting quarantines unexpectedly, increase min_samples or disable the gate; replay rate limits are configurable via eval-harness config and can be relaxed per-cohort. Dashboards: evals.replay.throttle.hits and evals.quarantine.count show impact.",
+  "post_merge_actions": [
+    "Monitor evals.quarantine.count and evals.replay.throttle.hits for first 2 weeks",
+    "Enable gate for two low-volume cohorts as canary after merge",
+    "Schedule follow-up (ENG-2009) to autosuggest per-cohort params based on historical traffic"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "patch_snippets",
+    "reviews",
+    "discussion_highlights",
+    "release_notes",
+    "notes_for_ops",
+    "post_merge_actions"
+  ],
+  "dataset_doc_uuid": "dsid_efd8ad3735814aa7a2b64a77b3d947cd"
+}

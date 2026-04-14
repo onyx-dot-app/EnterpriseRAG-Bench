@@ -1,0 +1,46 @@
+{
+  "key": "ENG-48912",
+  "team": "engineering",
+  "title": "Deferred async sample commit with latency-predictor prefilter to eliminate hot-path blocking",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-10",
+  "creator": "Avery Chen",
+  "assignee": "Nikhil Rao",
+  "project": "observability-sampling",
+  "cycle": "2026-W09",
+  "estimate": "5",
+  "due_date": "2026-03-22",
+  "labels": [
+    "tracing",
+    "sampling",
+    "performance",
+    "hotpath",
+    "observability"
+  ],
+  "release": "runtime-2.4",
+  "security_review_required": "false",
+  "customer_impact": "medium",
+  "dependencies": [
+    "ENG-43000",
+    "ENG-47500"
+  ],
+  "sub_issues": [
+    "ENG-48913",
+    "ENG-48914"
+  ],
+  "body": "Summary:\nWe observed that committing sampled spans into the tracing backend still touches hot-path allocations and blocking points (span serialization, sync I/O, heavy metadata enrichment). This ticket implements a two-part approach: 1) a lightweight micro-window latency predictor + prefilter that marks requests likely to be tail/interesting, and 2) a deferred async sample commit mechanism that replaces expensive hot-path work with a 1-byte marker and ring-buffer enqueue. A background worker performs enrichment and commit off the hot path.\n\nGoals:\n- Reduce hot-path CPU and allocation overhead caused by sampling metadata preparation by >= 40% in high-QPS services.\n- Preserve high-fidelity tail capture: maintain recall >= 95% for p99 events compared to current tail-based sampler.\n- Provide safe backpressure and graceful degradation (no blocking on enqueue; measurable drop metrics).\n\nDesign (high level):\n- Latency predictor prefilter: per-request lightweight estimator computed using a 32-bit EWMA of recent service latency + micro-window quantile sketch. Predictor returns one of three buckets: unlikely-tail, probable-tail, definite-tail. Only probable/definite candidates proceed to full sampling path. Predictor uses no heap allocations and is implemented with atomic counters per shard to avoid contention.\n- Deferred async commit: hot path does minimal work: record trace-id + small tag byte in span header, then append a 64B compact record into a per-shard ring buffer (lock-free MPMC). The ring buffer entry contains trace-id, timestamp, predictor-bucket, short route hash, and a pointer/reference index into existing request context (no copying of headers).\n- Background workers read batches from ring buffers, reconstruct the full span (copying only when actually sampled), fetch enrichment info (user-ids, feature flags), serialize, and push to tracing backend with retry/backoff.\n- Backpressure policy: when ring buffer utilization exceeds configured thresholds, background worker raises a \"sampling-backpressure\" metric and rule reduces predictor sensitivity (favoring only definite-tail) and starts dropping low-priority non-user spans. Drops are recorded as span-drop telemetry.\n\nImplementation notes:\n- New config flags: sampling.deferred_enabled, sampling.predictor_window_ms, sampling.ring_buffer_size, sampling.backpressure_thresholds. Default off; enable behind feature flag for canary hosts.\n- Language/runtime impact: implement core ring-buffer and predictor in our shared tracing shim (C++) to ship to services with minimum per-language bindings. Provide thin Go/Ruby/Python wrappers to set 1-byte marker and enqueue.\n- Safety: ensure trace continuity for existing trace collectors by not modifying the visible trace-id or trace headers. The hot-path marker is an additive header only.\n\nPerformance spike results (prototype run on payment-proxy-staging):\n- Baseline (current hot-path sampling): additional CPU p50 overhead +12%, allocations +1.2MB/s, tail p99 latency increase +0.8ms.\n- Prototype (deferred commit + predictor): CPU p50 overhead +4% (66% reduction vs baseline), allocations +0.3MB/s, tail p99 latency increase +0.1ms.\n- Tail-capture recall: prototype captured 96% of p99 events vs baseline tail-sampler (measured on a 24h production-like replay).\n\nRollout plan:\n1) Developer spike (complete) \u2014 feature branch and unit tests (PR #1234).\n2) Canary rollout to 5% of payment-proxy hosts (controlled by runtime config per host) for 72 hours. Monitor sampling-backpressure, span-drop-rate, p99 latency, and recall metric from replay harness.\n3) If canary metrics stable, expand to 25% for 48 hours and run full e2e load test (billing path).\n4) Full cluster enable behind workload-targeted flags.\n\nMonitoring & dashboards to add:\n- sampling.deferred.enqueued_per_second (per-service)\n- sampling.deferred.ring_utilization (percent)\n- sampling.deferred.drop_rate (per-service, per-route)\n- sampling.predictor.bucket_distribution (unlikely|probable|definite)\n- sampling.recall_vs_baseline (daily replay compare)\n- tracing.hotpath_cpu_delta (before/after)\n- alert: sampling.deferred.drop_rate > 0.5% sustained => auto rollback on canary\n\nPR / Artifacts:\n- Prototype branch and measurement scripts: https://github.com/redwood-inference/tracing/pull/1234\n- Micro-bench macrobench results: https://docs.internal.redwood/tracing/deferred-sampling-spike\n\nOpen questions / trade-offs:\n- Predictive bias: the predictor may overfit to recent traffic shape; we mitigate with periodical retrain/update to adjust sensitivities and by exposing a manual override per-route.\n- Memory cost: ring-buffer memory is per-host; we calculated 1.5MB per shard for default sizes \u2014 acceptable versus saved allocations.\n- Complexity: background workers add more moving parts (retry/backoff, auth to tracing backend). We will reuse existing retry library and agent credentials.\n\nRisks & mitigations:\n- Risk: background worker backlog causes delayed visibility for traces. Mitigation: expose latency histogram for commit lag and a hard TTL after which we drop and emit drop metric.\n- Risk: sampling skew across services. Mitigation: add weekly replay-based recall checks and cross-service sampling calibration job.\n\nNext steps / checklist:\n- [x] Complete predictor algorithm and unit tests (Avery)\n- [x] Implement lock-free ring buffer and benchmarking (Nikhil)\n- [x] Prototype background worker and integration tests (Sofia)\n- [ ] Add canary runtime flags and deploy to payment-proxy staging (Nikhil)\n- [ ] Create canary dashboard and SLO alerts (Liam)\n- [ ] Run 72-hour canary and evaluate recall metrics (team)\n- [ ] Prepare migration doc for platform teams and SDK owners\n\nExpected follow-ups (post-merge):\n- ENG-48913: sampling observability \u2014 add replay-based recall guardrails and automated daily audit.\n- ENG-48914: sampling SDK ergonomics \u2014 add language wrappers and helper to enable marker + enqueue with one call.\n\nOwner notes: keep the hot-path API minimal. The single-call should be a no-allocation fast path; any heavy enrichment must live outside the request thread.\n",
+  "comments": [
+    "2026-03-02: Spike completed; predictor tuned on 7-day sample traffic. Initial numbers promising (see body).",
+    "2026-03-04: Design review with observability; request to add routing-awareness to predictor (per-route baselines). Accepted; scope updated.",
+    "2026-03-07: PR #1234 opened for ring-buffer + predictor core (link in PR section). Request for additional unit tests around wrap/overflow cases.",
+    "2026-03-10: Security review: no secret material; background worker uses existing agent token flow. Security acked for canary (no full review needed yet)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_b36a9e1c16144774925f5a8d2f9a9150"
+}

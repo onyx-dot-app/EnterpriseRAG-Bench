@@ -1,0 +1,54 @@
+{
+  "key": "ENG-22143",
+  "team": "engineering",
+  "title": "Observability metrics + structured logs for bounded autoscaling (desired vs bounded, bound-hit, prediction error)",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-06-20",
+  "updated_at": "2025-08-02",
+  "creator": "Allison Grant",
+  "assignee": "Caleb Johnson",
+  "project": "Autoscaling policies with customer bounds (Dedicated Capacity & Fleet Management)",
+  "cycle": "2025-W27",
+  "estimate": "8",
+  "due_date": "2025-07-31",
+  "labels": [
+    "dedicated",
+    "autoscaling",
+    "observability",
+    "metrics",
+    "predictive-scaling",
+    "auditability",
+    "release-blocker"
+  ],
+  "dependencies": [
+    "ENG-22140",
+    "ENG-22142"
+  ],
+  "sub_issues": [
+    "ENG-22145",
+    "ENG-22146"
+  ],
+  "customer_impact": "high",
+  "release": "dedicated-2025.08",
+  "security_review_required": "false",
+  "description": "Context\n- Dedicated autoscaling is adding customer-configurable min/max bounds + optional predictive scaling.\n- We need deterministic, auditable telemetry to answer:\n  1) What did the autoscaler want (requested desired capacity)?\n  2) What did it actually set after applying bounds/guardrails (bounded/effective desired)?\n  3) How often are customers hitting bounds (especially max-bound saturation)?\n  4) Is predictive scaling helping or hurting (forecast accuracy + override reasons)?\n\nScope (this ticket)\n- Define and implement metrics + structured logs for:\n  - desired vs bounded replicas (and reason codes)\n  - bound-hit counters + time-in-bounded-state\n  - prediction error and forecast freshness\n- Align naming + label policy with: sources/confluence/architecture-and-standards/observability-standards/metric-naming-for-scaling-and-capacity.json\n- Ensure metrics are suitable for per-customer drilldown without exploding cardinality.\n\nNon-goals\n- Build full dashboards/alerts (tracked in ENG-22145 + dashboard spec).\n- Change autoscaling decision logic beyond emitting telemetry.\n\nImplementation notes\n- Primary component: dedicated-autoscaler loop (fleet autoscaler) + capacity-policy evaluation layer.\n- Emit metrics from the autoscaler controller process (where desired is computed) to avoid inconsistencies between services.\n- For auditability, pair each scale decision with a structured log event that includes inputs + outputs; long-term retention is via audit events (ENG-22146).\n\nMetrics (proposed + shipped)\nAll metrics must include: deployment_id, region.\n- Avoid customer_id as a metric label (high cardinality); include customer_id only in structured logs and audit events. If needed for drilldown, use join via deployment_id -> customer mapping in the dashboard layer.\n- Include model_id only where explicitly required; default is to omit.\n\n1) Desired vs bounded capacity\n- redwood.dedicated.autoscaler.desired_replicas (gauge)\n  - Value: raw desired replicas computed before bounds clamp.\n  - Labels: deployment_id, region, signal_mode=[reactive|predictive|hybrid]\n\n- redwood.dedicated.autoscaler.bounded_desired_replicas (gauge)\n  - Value: desired replicas after applying min/max bounds + safety clamps.\n  - Labels: deployment_id, region, signal_mode\n\n- redwood.dedicated.autoscaler.capacity_clamp_total (counter)\n  - Increments when bounded_desired != desired.\n  - Labels: deployment_id, region, clamp_type=[min|max|safety_baseline|rate_limit|cooldown], signal_mode\n  - Note: clamp_type is mutually exclusive per decision; we emit the highest-precedence clamp reason (per ADR) to keep interpretation consistent.\n\n- redwood.dedicated.autoscaler.capacity_clamp_seconds (counter)\n  - Adds delta-time spent in a clamped state.\n  - Labels: deployment_id, region, clamp_type, signal_mode\n  - Rationale: counters are easier to alert on than sampling a boolean.\n\n2) Bound-hit counters (explicit min/max)\n- redwood.dedicated.autoscaler.bound_hit_total (counter)\n  - Increments when clamp_type is min or max.\n  - Labels: deployment_id, region, bound=[min|max], signal_mode\n\n- redwood.dedicated.autoscaler.bound_headroom_replicas (gauge)\n  - Value: max_bound - bounded_desired when bounded_desired < max; 0 when at/over max.\n  - Labels: deployment_id, region\n  - Note: for at-max saturation, headroom=0 is the key signal; when max is unset (legacy), emit -1 and label legacy_policy=true.\n\n3) Prediction error + freshness\n- redwood.dedicated.predictor.forecast_age_seconds (gauge)\n  - Value: now - forecast_generated_at.\n  - Labels: deployment_id, region, provider=[internal|partner], status=[ok|stale|missing]\n\n- redwood.dedicated.predictor.forecast_required_total (counter)\n  - Increments each autoscaler tick when predictive mode is enabled.\n  - Labels: deployment_id, region\n\n- redwood.dedicated.predictor.forecast_used_total (counter)\n  - Increments when a valid (non-stale) forecast was used in the decision.\n  - Labels: deployment_id, region\n\n- redwood.dedicated.predictor.forecast_error_tokens_per_s (histogram)\n  - Value: |predicted - observed| for demand rate (tokens/s) at evaluation time.\n  - Labels: deployment_id, region, horizon=[5m|15m|60m]\n  - Buckets: tuned to expected Dedicated ranges; keep bucket count modest.\n  - Note: If observed rate unavailable, do not emit a sample; emit a structured log with reason.\n\n- redwood.dedicated.autoscaler.predictive_override_total (counter)\n  - Increments when reactive signals override predicted desired (e.g., queue depth high).\n  - Labels: deployment_id, region, override_reason=[queue_depth|saturation|p95_latency|forecast_missing|forecast_stale|guardrail], signal_mode\n\n4) Scale event attribution\n- redwood.dedicated.autoscaler.scale_event_total (counter)\n  - Increments on every applied scale action (replica count change).\n  - Labels: deployment_id, region, direction=[up|down|none], reason=[reactive|predictive|bounds|min_safety|cooldown|rate_limit], signal_mode\n  - Note: direction=none is emitted when the controller evaluates but makes no changes; useful for rate calculations.\n\nStructured logs (shipped)\n- Emit a single JSON log per evaluation tick, sampled at 1:1 for pilots and 1:N for GA (configurable).\n- Event name: dedicated_autoscaler_decision\n- Required fields (log payload):\n  - timestamp, deployment_id, region, signal_mode\n  - desired_replicas_raw, desired_replicas_bounded\n  - min_bound, max_bound, effective_min, effective_max\n  - clamp_type (same taxonomy as metrics)\n  - inputs: queue_depth, utilization, p95_latency_ms, tokens_per_s_observed\n  - forecast: predicted_tokens_per_s, horizon, age_seconds, provider, status\n  - decision: scale_delta, new_target_replicas\n  - why: list of short reason strings (bounded to <=5, each <=64 chars)\n- Guardrails:\n  - No customer-provided PII or request content.\n  - Ensure reason strings are from a fixed enum or well-controlled templates to avoid unbounded cardinality.\n\nAcceptance criteria\n- Metrics emitted in at least one canary region (us-east-1) for pilot deployments.\n- Metrics follow naming + label conventions; validated by observability lint checks.\n- Dashboards can plot desired vs bounded replicas and bound-hit rate using only deployment_id + region.\n- Structured logs include both requested desired + bounded desired + clamp reason.\n- Verified in simulation/replay harness (ENG-22147) that clamp counters move as expected across scenarios (min clamp, max clamp, forecast missing, stale forecast).\n\nTesting / validation\n- Unit tests:\n  - clamp reason precedence mapping\n  - emission of bound_hit_total only on min/max clamps\n  - forecast staleness -> forecast_used_total not incremented, override reason increments\n- Integration test:\n  - run autoscaler tick with mock predictor returning null/stale/valid\n  - ensure logs include required fields and metrics are emitted\n\nLinks\n- Confluence metric naming standard: sources/confluence/architecture-and-standards/observability-standards/metric-naming-for-scaling-and-capacity.json\n- Related PR (implementation): sources/github/redwood/pr-48241-add-metrics-desired-vs-bounded-capacity.json\n- Alerting follow-up: ENG-22145\n- Audit events follow-up: ENG-22146\n\nRollout notes\n- Pilot: metrics at 1:1, logs at 1:1; verify no cardinality blowups.\n- GA: logs sampled down (default 1:20) except when clamp_type=max or unmet_min_capacity (force 1:1 for debugging).",
+  "comments": [
+    "2025-06-21 (Allison Grant): Please keep labels to deployment_id + region; customer_id is explicitly not allowed as a metric label due to cardinality and cost. We can join via metadata in the dashboard layer.",
+    "2025-06-24 (Vanessa Ortiz): +1 on clamp_type taxonomy. Make sure max-bound saturation is easy to alert on (either time-in-state or repeated clamp events).",
+    "2025-06-27 (Sergio Costa): For dashboards we\u2019ll need a stable way to display min/max configured values. If those aren\u2019t metric labels, can we emit min_bound/max_bound as gauges (deployment_id, region) so we don\u2019t need to call the control plane for every panel?",
+    "2025-06-28 (Caleb Johnson): Added min_bound_replicas and max_bound_replicas gauges (deployment_id, region) behind the same flag. Not included as labels anywhere. Will wire into the Grafana spec so it\u2019s a single datasource.",
+    "2025-07-03 (Rafael Mendes): Please include an explicit metric for forecast_age_seconds and forecast_used_total. During incidents we need a fast way to tell whether predictive mode is silently falling back to reactive due to staleness.",
+    "2025-07-10 (Caleb Johnson): PR up: pr-48241. Includes desired/bounded gauges, clamp counters, forecast freshness metrics, and dedicated_autoscaler_decision structured log event. Also added a lint check to reject customer_id labels.",
+    "2025-07-16 (Miles Thornton): Reviewed PR. One request: ensure clamp_type is single-valued and matches ADR precedence; otherwise dashboards will be ambiguous when multiple guardrails apply.",
+    "2025-07-17 (Caleb Johnson): Updated implementation to choose the highest-precedence clamp reason only (max > min > safety_baseline > cooldown > rate_limit). Added tests. Ready for re-review.",
+    "2025-07-23 (Vanessa Ortiz): After pilot incident, we need a way to spot null forecasts causing unsafe downscale attempts. The structured log event should include forecast.status and the final bounded desired; this will help validate the hotfix behavior.",
+    "2025-08-02 (Allison Grant): Marking done after merge + canary verification in us-east-1. Dashboard/alert work continues in ENG-22145, and audit retention is tracked in ENG-22146."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_8bd908f868b149e3afe880dade674c98"
+}

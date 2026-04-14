@@ -1,0 +1,36 @@
+{
+  "title": "egress-path-traceback-notes",
+  "owner": "Aisha Park",
+  "drive_area": "users",
+  "path": "users/egress-path-traceback-notes.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-11",
+  "last_modified": "2025-02-14",
+  "collaborators": [
+    "Lucas Meyer",
+    "Priya Nair"
+  ],
+  "team": "eng-site-reliability",
+  "status": "draft",
+  "tags": [
+    "oncall",
+    "routing",
+    "egress",
+    "fallback",
+    "latency",
+    "debug"
+  ],
+  "linked_artifacts": [
+    "INC-3472",
+    "SRE-1223",
+    "https://confluence.redwood.ai/pages/viewpage.action?pageId=81234567",
+    "https://github.com/redwood-inference/serving-runtime/pull/879",
+    "https://redwood.slack.com/archives/C01ABCD2EFG/p1691234567890123"
+  ],
+  "content": "Goal: quick trace of the incident where traffic from eu-west-1 nodes started taking long paths and triggers to fallback policy to us-east-1. Personal breadcrumb log for later replay / postmortem draft.\n\nSummary notes:\n- Symptoms: elevated p95/p99 latency for model generation (token latency spiked ~300ms -> 2.1s), client-side 504s reported, intermittent 'connection reset by peer' around 03:10 UTC. Canary reroutes showed sudden jump to us-east-1 on SmartRouting fallback.\n- Initial suspect: smart-routing decision tree + egress path asymmetry. Could be NAT / egress gateway flapping in eu-west-1 or an upstream transit issue.\n\nWhat I tried (ordered):\n1) Quick reproducer (from a debug GCE jump host in eu-west-1):\n   curl -v -H \"Authorization: Bearer DEBUG_TOKEN\" -H \"X-Redwood-Route: prefer-eu\" https://api.redwood.ai/v1/generate?model=rw-7b\n   -> UDP: got HTTP/1.1 502 sometimes, then 504 upstream timed out.\n\n2) Traceroute + mtr to endpoint IPs returned inconsistent AS paths:\n   traceroute -n 34.210.45.12 \n   mtr -r -c 100 34.210.45.12\n   -> several hops show long latency at hop 7 (transit provider) then alternate AS path to us-east via IX. Suggests possible BGP path changes.\n\n3) tcpdump on node (captured SYN/FIN resets):\n   sudo tcpdump -i eth0 host 34.210.45.12 -w /tmp/egress.pcap\n   -> timestamps: SYN, SYN-ACK delayed ~1.8s; some connections ended with RST from remote.\n\n4) kube-proxy / iptables check on node -> no dropped rules but seen conntrack high: \n   sudo conntrack -S | grep \"tcp_established\"\n   sysctl net.netfilter.nf_conntrack_max = 262144\n   -> conntrack usage ~220k, approaching limit. Hypothesis: conntrack exhaustion causing late drops (RST).\n\n5) Checked NAT gateway metrics (via infra dashboards):\n   - eu-west-1 egress-nat-1: CPU spikes, ephemeral ports exhaustion warning around 03:05 UTC.\n   - autoscaling did not kick due to misconfigured alarm (threshold set to 95% but real exhaustion at 85% due to port fragmentation).\n\n6) Serving runtime logs (from pod logs):\n   [2025-02-14T03:06:12Z] WARN SmartRouter: route evaluation: prefer-region=eu-west-1, candidate list: [eu-west-1-primary, eu-west-1-fallback, us-east-1-primary]\n   [2025-02-14T03:06:12Z] ERROR HealthChecker: endpoint eu-west-1-primary unhealthy: tcp dial timeout\n   [2025-02-14T03:06:12Z] INFO FallbackPolicy: triggered region-fallback -> selected us-east-1-primary after 3 failures\n   -> interesting: healthcheck failure reason is 'tcp dial timeout' (network-level) not application error.\n\n7) Observability traces (zipkin):\n   - trace IDs show long wait in client socket connect before TLS handshake. No evidence of model slowdown once connection established. Points to network egress problem.\n\nHypotheses (ranked):\nA) Egress NAT ephemeral port exhaustion + conntrack saturation in eu-west-1 causing TCP connect delays and resets.\nB) Transit provider had transient BGP path changes causing longer AS path and packets diverted to us-east via IX. Smart routing sees failed healthchecks and falls back.\nC) Misconfigured healthcheck window + aggressive fallback thresholds exacerbated issue (fallback triggers too quickly when transient network blips occur).\nD) Firewall / security group rate-limit on outbound to specific egress prefix (unlikely but possible, check WAF).\n\nImmediate mitigation steps taken:\n- Manually scaled up NAT pool nodes in eu-west-1 (spin up 2 additional nat instances) -> immediate reduction in conntrack pressure.\n- Increased conntrack max by 20% on affected node pool as temporary relief.\n- Adjusted SmartRouting healthcheck grace from 3->5 attempts to reduce flip-flopping while infra stabilizes.\n\nRemaining action items (for postmortem):\n- Create durable fix for ephemeral port exhaustion: change NAT config to use port-preservation and increase port range; ensure autoscaling alarm uses correct metric (active ephemeral ports). Ticket: SRE-1223.\n- Revisit SmartRouting fallback thresholds and consider transient-network smoothing (exponential backoff) for TCP dial timeouts. File a product PRD to propose 'network-smoothing' policy.\n- Run BGP path stability analysis with netops to confirm transit blips (ask provider for routing logs during window).\n- Add synthetic e2e healthcheck for egress path that exercises TCP connect + TLS for the region; alert separately from application-level healthchecks.\n\nNotes / oddities to follow up:\n- I saw one host with conntrack at ~252k (above configured max). That host started dropping and was restarted by node autopilot after 2m. We should make node-restart a last resort.\n- There were a few records of \"prefix suppression\" in our IX logs during same window. Might be correlated to provider maintenance.\n- Query: do we want fallback to prefer regional warm standby instead of full region hop? The Dedicated pools have warm standbys but Hosted routing does not always pick the warm one. Need product alignment.\n\nSnippets to copy to PM / Postmortem:\n- \"Root cause appears to be egress NAT ephemeral port exhaustion combined with transient upstream path changes; SmartRouting detected TCP dial timeouts and triggered cross-region fallback sooner than desirable.\"\n- \"Immediate fix: scale NAT + bump conntrack. Long-term: port config, autoscale alarms, healthcheck smoothing.\"\n\nPlayback checklist (for handover):\n- [ ] Attach pcap + mtr output to INC-3472\n- [ ] Confirm NAT autoscale alarm rule change \n- [ ] Schedule meeting with netops + provider for BGP dump\n- [ ] Draft SmartRouting fallback tuning proposal (link to PRD)\n\nMisc commands / snippets saved:\n- netstat -tunp | grep 34.210.45.12\n- sudo ss -s | egrep \"estab|timewait|closed\"\n- sudo conntrack -L | grep SYN_SENT | wc -l\n- kubectl logs -n redwood serving-runtime-xxxxx --tail=500 | grep \"FallbackPolicy\\|HealthChecker\"\n- aws cloudwatch get-metric-statistics --namespace \"NAT\" --metric-name \"PortUsage\" --start-time 2025-02-14T02:50:00Z --end-time 2025-02-14T03:20:00Z --period 60 --statistics Maximum\n\nIf I forget: main lead for networking follow-up is Lucas Meyer. Priya to draft routing policy changes.\n\nEnd notes: keep as scratch for now. Will polish into postmortem after we validate BGP logs and NAT metrics.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_03d035deb449493c9467986e71c0f22b"
+}

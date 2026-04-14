@@ -1,0 +1,61 @@
+{
+  "key": "ENG-4934",
+  "team": "engineering",
+  "title": "Build error budget computation job (rolling windows, DQ checks, backfill)",
+  "status": "In Review",
+  "priority": "P0",
+  "created_at": "2026-01-09",
+  "updated_at": "2026-02-27",
+  "creator": "Rafael Mendes",
+  "assignee": "Aisha Bello",
+  "project": "Tiered SLOs + Error Budget Policy (Q1 2026)",
+  "cycle": "2026-W07",
+  "estimate": "8",
+  "due_date": "2026-02-21",
+  "customer_impact": "high",
+  "security_review_required": "false",
+  "labels": [
+    "sre",
+    "slo",
+    "error-budgets",
+    "observability",
+    "deploy-gates",
+    "data-quality"
+  ],
+  "dependencies": [
+    "ENG-4921",
+    "ENG-4922",
+    "ENG-4926",
+    "ENG-4930"
+  ],
+  "related_prs": [
+    "sources/github/redwood/pr-28438-define-slo-config-schema-and-loader.json",
+    "sources/github/redwood/pr-28492-add-burn-rate-alerting-queries-and-recording-rules.json",
+    "sources/github/redwood/pr-28510-deploy-gate-warn-on-error-budget-burn.json"
+  ],
+  "links": [
+    "sources/confluence/eng-sre/slo-and-error-budgets/error-budget-policy-and-enforcement.json",
+    "sources/confluence/architecture-and-standards/observability-standards/sli-specification-api-gateway-and-routing.json",
+    "sources/confluence/eng-sre/runbooks/slo-tooling-operations-and-oncall-guide.json",
+    "sources/google_drive/shared_drives/engineering/site-reliability-engineering/tiered-slo-targets-working-sheet.json",
+    "sources/google_drive/shared_drives/engineering/observability/tier-tagging-metrics-plan.json"
+  ],
+  "description": "Problem\nWe need a canonical, computed \u201cerror budget state\u201d per SLO (tier x region x endpoint class) to support:\n- Console budget status + drilldowns\n- Burn summaries (incident-bot)\n- Deploy gates (warn-only -> enforcement)\n- Post-incident accounting (how much budget was spent, when, and by what SLI)\n\nThis ticket builds/ships the computation pipeline that produces budget_remaining + budget_status on a rolling window with data quality guards and a backfill strategy.\n\nScope\nIn-scope for Q1 2026 rollout:\n- Hosted (shared) + Dedicated (reserved capacity) tiers\n- Endpoints: chat/completions, embeddings, streaming\n- Regions: US + EU core regions (as defined in SLO config)\n- SLIs: success rate (non-5xx per spec), latency SLI (requests under threshold), streaming reliability (disconnect/error events)\n\nOut of scope (explicitly):\n- Private tier enforcement (may reuse same machinery later)\n- Per-customer Dedicated account breakdown in the first pass (we compute per-tier/per-region/per-endpoint; account views come via separate pipeline + RBAC work)\n\nHigh-level approach\n1) Inputs\n- SLO definitions from the SLO config loader (ENG-4926 / PR-28438). Each SLO defines:\n  - tier (hosted|dedicated)\n  - region\n  - endpoint_class (chat|embeddings|streaming)\n  - window (initially 28d rolling)\n  - objective (e.g., 99.9% availability, 95% latency-under-threshold)\n  - references to pre-aggregated SLI metrics/recording rules (ENG-4930 / PR-28492)\n\n2) Computation\nFor each SLO over window W:\n- total_events = sum(total) over W\n- bad_events = sum(bad) over W\n- good_events = total_events - bad_events\n- observed_good_ratio = good_events / total_events\n- allowed_bad_events = (1 - objective) * total_events\n- budget_remaining_events = allowed_bad_events - bad_events\n- budget_remaining_pct = clamp(budget_remaining_events / allowed_bad_events, 0..1)\n\nFor latency SLOs using \u201cgood if latency <= threshold\u201d semantics:\n- total_events = total requests\n- bad_events = requests over threshold\n\nFor streaming reliability SLO:\n- total_events = stream sessions (or stream responses initiated) per SLI spec\n- bad_events = server disconnect/error events counted as \u201cRedwood-caused\u201d per exclusions\n\n3) Storage / API for consumers\nWrite computed state to the SLO state store used by:\n- Deploy gate service (ENG-4935/ENG-4941) to decide warn vs block\n- Console SLO dashboard backend (DES-233 dependent work)\n- incident-bot burn summaries\n\nProposed minimal schema (conceptual):\n- slo_id (stable hash of tier+region+endpoint+metric)\n- window (e.g., 28d)\n- as_of (timestamp)\n- total_events, bad_events\n- objective\n- budget_remaining_pct\n- status (green|yellow|red|unknown)\n- dq_status (ok|degraded|missing)\n- dq_notes\n\nNOTE: Implementation must keep cardinality bounded. Compute exactly at SLO-config grain (no model/customer dimensions here). Top contributors remain a dashboard query problem, not a budget computation dimension.\n\n4) Data quality checks (gating-safe)\nWe must not enforce deploy gates when data is clearly missing/invalid.\nProposed checks per (slo_id, window):\n- Metric coverage: required time series exist for the SLO\u2019s recording rules\n- Staleness/gaps: within the last 30m, at least N datapoints present (configurable per scrape interval)\n- Zero-traffic: if total_events == 0 for a meaningful sub-window (e.g., >6h), mark dq_status=degraded and status=unknown (avoid \u201cgreen by silence\u201d)\n- Ingestion lag: if telemetry indicates lag > X minutes, mark dq_status=degraded and status=unknown\n\nPolicy for consumers:\n- If status=unknown => deploy gate should not block; warn-only with \u201cDQ degraded\u201d messaging + open an internal alert\n\n5) Backfill strategy\nWe need a backfill to avoid waiting 28 days after launch.\n- Phase 1 (launch): backfill last 7d with hourly \u201cas_of\u201d points, plus compute current 28d state if metrics history exists\n- Phase 2 (steady state): hourly job computes current state only (and optionally daily snapshots for reporting)\n- Idempotent writes keyed by (slo_id, as_of, window)\n- Backfill job is rate-limited + time-bounded to avoid blowing up PromQL range query load\n\n6) Scheduling / reliability\n- Run as an Argo CronWorkflow (or existing Redwood scheduled jobs framework) every 15 minutes initially (final cadence: 30\u201360 minutes ok, but we want budget burn to reflect quickly for comms/deploy gates)\n- Retries with jitter; alerts to #eng-sre on repeated failures\n\nAcceptance criteria\n- [ ] Given an SLO config, job produces budget_remaining_pct + status for each SLO at the expected cadence\n- [ ] Status transitions align with policy thresholds (green/yellow/red) and match burn-rate alert logic at a high level (no contradictory states)\n- [ ] DQ degradation results in status=unknown and does not cause deploy gate to hard-block\n- [ ] Backfill can populate at least 7d history without overwhelming metrics backend\n- [ ] Runbook section added: \u201cBudget job failing / DQ degraded\u201d with remediation steps\n- [ ] Metrics emitted for the job itself (duration, success/failure, SLOs processed, DQ failures)\n\nNotes / open questions\n- Window length: default 28d per policy draft; confirm if any SLOs are 30d for SLA mapping.\n- Status thresholds: proposed\n  - green: remaining >= 50%\n  - yellow: 10% <= remaining < 50%\n  - red: remaining < 10%\n  - exhausted: remaining <= 0% (treated as red + triggers release freeze)\n  (Exact cutoffs to align with error budget policy doc.)\n- Data store: prefer the same store used by deploy gate (keep single source of truth). If that\u2019s not available, land in telemetry DB with a lightweight read API.\n\nImplementation plan (incremental)\n1) Implement compute library + unit tests (deterministic with fixture time series)\n2) Implement range queries against recording rules for (total, bad)\n3) Add DQ checks + \u201cunknown\u201d status plumbing\n4) Add cron job + metrics + alerting on job health\n5) Add 7d backfill command (manual trigger) + guardrails\n6) Wire to deploy gate + console consumer behind feature flag\n\nRisks\n- PromQL range query load during backfill; mitigate with chunked backfill + rate limiting\n- Tier-tag propagation errors produce misleading budgets; rely on ENG-4922 + DQ sampling checks comparing tag distributions\n- Zero-traffic SLOs falsely appear perfect; handled via \u201cgreen by silence\u201d prevention\n",
+  "activity": [
+    "2026-01-09 \u2014 Rafael Mendes: Filed ticket after ENG SLO kickoff; deploy gates need a canonical budget store, not just burn alerts.",
+    "2026-01-14 \u2014 Aisha Bello: Drafted computation semantics. Aligning with Allison Grant\u2019s SLI spec for exclusions (client aborts, invalid requests, rate-limits).",
+    "2026-01-17 \u2014 Thomas Baird: Flagged cardinality risk if we include model/customer dimensions in the budget table; agreed to compute at SLO-config grain only.",
+    "2026-01-21 \u2014 Logan Wright: Confirmed recording rules will expose {tier,region,endpoint_class} totals + bad counts. Backfill needs rate limiting to protect Mimir query path.",
+    "2026-02-03 \u2014 Jordan Lee: Deploy gate should treat dq_status!=ok as non-blocking. Requested explicit status=unknown to simplify policy logic.",
+    "2026-02-10 \u2014 Sergio Costa: Console dashboard will read current budget state + last 24h snapshots; asked for hourly snapshots to render trend line without heavy PromQL in UI.",
+    "2026-02-19 \u2014 Aisha Bello: Implemented job prototype in staging; DQ check caught missing tier labels in one EU path (blocked by ENG-4922 rollout).",
+    "2026-02-24 \u2014 Miles Thornton: Asked to ensure multi-region failover/fallback doesn\u2019t double-count retries; reiterated SLI spec rule to count only final served attempt for success SLI.",
+    "2026-02-27 \u2014 Aisha Bello: Marking In Review. Backfill limited to 7d/hourly, current state computed every 30m. Pending review from Logan (telemetry) + Jordan (gates)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "activity"
+  ],
+  "dataset_doc_uuid": "dsid_309c75e97120462da4c20e0dcee1b68e"
+}

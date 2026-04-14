@@ -1,0 +1,60 @@
+{
+  "key": "ENG-4823",
+  "team": "engineering",
+  "title": "Add validation gates: GPU health + driver/CUDA parity (pre/post provisioning)",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-10-03",
+  "updated_at": "2025-10-18",
+  "creator": "Vanessa Ortiz",
+  "assignee": "Gabe Wilson",
+  "project": "Provision-to-ready automation (Dedicated Capacity & Fleet Management)",
+  "cycle": "2025-W41",
+  "estimate": "8",
+  "due_date": "2025-10-11",
+  "customer_impact": "high",
+  "security_review_required": "false",
+  "labels": [
+    "fleet",
+    "provision-to-ready",
+    "validation-gates",
+    "gpu-health",
+    "drivers",
+    "dedicated",
+    "sre-reviewed"
+  ],
+  "dependencies": [
+    "ENG-4822",
+    "ENG-4825"
+  ],
+  "sub_issues": [
+    "ENG-4824",
+    "ENG-4830"
+  ],
+  "links": [
+    "Confluence: ADR-017 readiness state machine (Allocated/Provisioning/Validating/Ready/Quarantined)",
+    "Confluence: Node configuration baseline (GPU workers)",
+    "Drive: Provision-to-ready validation checklist (draft)",
+    "GitHub: redwood-helm-charts/pr-244 (validation agent DaemonSet)",
+    "GitHub: redwood/pr-18429 (record validation artifacts + failure reasons)",
+    "GitHub: redwood/pr-18452 (quarantine on repeat validation failures)",
+    "GitHub: redwood/pr-18481 (harden validation agent timeouts/retries)"
+  ],
+  "description": "Context\n- Part of the Provision-to-ready automation sprint. We need automated validation gates that are authoritative enough to block nodes from joining serving pools, but actionable for on-call.\n- This ticket covers two of the highest-signal gates:\n  1) GPU health checks (hardware + driver stack sanity)\n  2) Driver/CUDA/NCCL parity checks (detect drift from the golden image + avoid mixed stacks within a pool)\n\nGoal\n- Prevent unhealthy or misconfigured GPU nodes from ever reaching Ready.\n- Catch driver/toolkit drift early (before inference workloads) and provide precise failure reasons.\n- Support staged rollout constraints (initially us-east + A100) but design gates to work across GPU types and regions.\n\nNon-goals\n- Not implementing the NCCL fabric smoke test here (tracked in ENG-4824).\n- Not implementing the global quarantine policy logic (ENG-4825/PR-18452), but our checks must produce structured results compatible with it.\n\nImplementation plan\nA) GPU health validation (post-provision, before Ready)\n- Run via validation-agent DaemonSet on target nodes.\n- Collect and evaluate:\n  - `nvidia-smi -L` and `nvidia-smi -q` basic availability (driver responding, expected GPU count).\n  - ECC health signals:\n    - Fail gate on any \"volatile\" double-bit ECC errors.\n    - Warn (but do not fail) on single-bit ECC errors above threshold unless repeated across reboots.\n  - Xid errors:\n    - Fail gate if recent Xid codes in the last N minutes are in the \"quarantine-worthy\" set (initial set: 31/43/45/48/79/109; exact mapping documented in agent config).\n    - Ignore known-benign transient codes when explicitly allowlisted.\n  - Persistence mode and power management sanity:\n    - Validate persistence mode is enabled where required by baseline.\n    - Validate no GPU is in a \"lost\" state.\n  - DCGM optional mode (behind feature flag): if dcgm-exporter present, run a quick diagnostic (level 1) and treat failures as gate failures.\n\nB) Driver/CUDA/NCCL parity validation\n- The golden image pipeline produces an \"expected stack\" manifest (driver version, CUDA runtime version, NCCL version) per image channel (candidate/stable).\n- Validation-agent reads \"expected stack\" from control-plane readiness service (by pool_id + image_channel) and compares against node-reported versions.\n- What we compare:\n  - NVIDIA driver version (from `nvidia-smi --query-gpu=driver_version --format=csv,noheader`)\n  - CUDA runtime version (from `nvidia-smi` output and/or `nvcc --version` when present)\n  - NCCL library version (from `libnccl.so` package metadata; distro-specific fallback)\n- Policy:\n  - Fail gate if driver version mismatches expected major.minor.patch.\n  - Fail gate if CUDA minor differs from expected (we pin CUDA minor during this sprint to reduce flake / mixed stacks).\n  - NCCL version: allow patch-level drift if ABI-compatible (config-driven), otherwise fail.\n- Output structured failure reason including: expected vs observed + remediation suggestion (reimage vs drain/retry).\n\nC) Mixed GPU SKU edge cases\n- Dedicated pools should not intentionally mix GPU SKUs, but we have seen transient states during capacity events and mis-tagged instances.\n- Add a guard:\n  - Determine SKU from PCI IDs / `nvidia-smi --query-gpu=name`.\n  - Compare against pool\u2019s expected SKU(s) from provisioning metadata.\n  - Fail gate if a node\u2019s detected SKU is not in the pool allowlist.\n- For known multi-SKU pools (future), allowlist supports multiple entries, but still emits a warning if the pool contains >1 SKU at once (metric only).\n\nD) Observability + artifacts\n- For each gate, emit:\n  - Validation step name (e.g., `gpu.health`, `stack.parity`, `gpu.sku_guard`)\n  - Start/end timestamps, duration\n  - Result (pass/fail) + failure_code (stable enum) + short failure_message\n  - Pointer to bundled logs (object storage URL or log index reference)\n- Metrics (no per-node IDs):\n  - `fleet.validation.pass_count{step,region,gpu_type,pool_type,image_channel}`\n  - `fleet.validation.fail_count{step,region,gpu_type,pool_type,image_channel,failure_code}`\n  - `fleet.validation.duration_ms{step,region,gpu_type,pool_type,image_channel}`\n\nAcceptance criteria\n- When GPU health check fails, node MUST remain in Validating (or transition to Quarantined based on orchestration policy), and must not join serving pools.\n- When driver/CUDA parity fails, failure reason must include expected vs observed versions, and recommend reimage.\n- Checks must be deterministic and not depend on internet access.\n- Produces structured artifacts stored via readiness service; operators can see failure_code and log pointer in tooling.\n- Handles the following edge cases:\n  1) Mixed GPU SKUs detected in a pool -> fail with `SKU_MISMATCH`.\n  2) Driver drift (node on older driver than expected) -> fail with `DRIVER_VERSION_MISMATCH`.\n  3) Driver drift (node on newer driver than expected) -> fail with `DRIVER_VERSION_MISMATCH` (prefer fail-closed during sprint).\n  4) `nvidia-smi` times out or errors -> fail with `NVIDIA_SMI_UNAVAILABLE`.\n  5) GPU count mismatch (expected 8, saw 7) -> fail with `GPU_COUNT_MISMATCH`.\n  6) Xid errors present in recent window -> fail with `GPU_XID_RECENT`.\n\nTest plan\n- Unit tests (validation agent):\n  - Parse fixtures for `nvidia-smi -q` output (healthy/unhealthy, ECC/Xid variants).\n  - Version comparison tests (driver/CUDA/NCCL) including allowlisted patch drift.\n  - SKU parsing tests for common names (A100 80GB PCIe vs SXM variants as separate SKUs).\n- Integration tests (kind-like / staging cluster):\n  - Golden image manifest is fetched and compared correctly by pool_id/image_channel.\n  - Simulate drift by overriding agent-reported driver version and ensure gate fails + artifact stored.\n  - Ensure readiness service records step durations + failure_code.\n- Canary / rollout validation:\n  - During us-east A100 staged rollout, compare validation failure rate to baseline (<2% expected after initial bake stabilization).\n\nRollout notes\n- Gate enforcement is behind feature flag (region + gpu_type scoped). Start with us-east + A100 only.\n- Fail-closed for parity mismatch; we can relax once image pipeline promotion is stable.\n\nOperational guidance (for runbook)\n- DRIVER_VERSION_MISMATCH / CUDA_VERSION_MISMATCH: reimage node to pool\u2019s current stable image; if widespread, halt rollout and evaluate image promotion.\n- GPU_XID_RECENT: drain and quarantine node; if repeats after reimage, treat as potential hardware issue.\n- NVIDIA_SMI_UNAVAILABLE: check driver modules and kubelet/container runtime; often indicates partial driver install or a broken image bake.\n\nOpen questions\n- Confirm final list of Xid codes to fail vs warn (need Infra + SRE alignment).\n- Confirm whether we should allow \u201cnewer driver than expected\u201d in emergency capacity scenarios (proposal: keep fail-closed during sprint).\n\nProgress updates\n- 2025-10-04: Drafted failure_code enums + initial policy (fail-closed) and shared with SRE for review.\n- 2025-10-07: Implemented GPU health parsing + artifacts emission; added SKU guard; sent PR for review.\n- 2025-10-10: Added parity comparison against expected stack manifest; aligned naming with readiness service fields.\n- 2025-10-14: Addressed review feedback: reduce metric cardinality (removed node_id tags), improved error messages and log bundling.\n- 2025-10-18: Staged rollout confirmed in us-east A100. Validation flake rate acceptable; remaining flake work tracked in ENG-4830.\n",
+  "comments": [
+    "2025-10-04 (Miles Thornton): Please make failure_code stable and queryable; avoid putting raw driver strings in metric labels. Artifact body/log bundle is fine.",
+    "2025-10-06 (Aisha Bello): Ensure metrics are aggregate only; no pool_id in alerts initially. We can add pool_id to dashboards via logs/queries later if needed.",
+    "2025-10-07 (Nina Petrova): SKU matching: distinguish A100 PCIe vs SXM; we saw a misprovision that looked like 'A100-SXM4-80GB' when the pool expected PCIe.",
+    "2025-10-09 (Keiko Yamamoto): For parity mismatches, fail-closed is correct for sprint. Make sure remediation message says reimage and does not suggest manual driver install.",
+    "2025-10-12 (Ethan Park): Ensure readiness service stores expected_stack_version used for evaluation (for forensics when image channel changes).",
+    "2025-10-14 (Vanessa Ortiz): +1 on default quarantine after repeated failures; but this ticket should only emit clear reasons and let orchestrator decide transitions."
+  ],
+  "resolution": "Merged validation-agent updates to run GPU health + stack parity gates, store artifacts/failure reasons, and block readiness until pass. Enabled behind staged rollout flag for us-east A100. Follow-ups for flake/timeout tuning tracked in ENG-4830.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_2d6a99d9af96439b8cbaf3efe55b1942"
+}

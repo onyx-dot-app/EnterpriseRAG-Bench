@@ -1,0 +1,81 @@
+{
+  "key": "ENG-888888",
+  "team": "engineering",
+  "title": "Intermittent GPU resident growth during continuous batching with async allocator and KV prefetch (memory-sherpa probe)",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-13",
+  "creator": "Aisha Kapoor",
+  "assignee": "Lars Muller",
+  "project": "runtime-memory-stability",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "cudaMallocAsync",
+    "kv-cache",
+    "allocator-forensics",
+    "continuous-batching",
+    "investigation"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.21",
+  "security_review_required": "false",
+  "parent_issue": [
+    "ENG-783214"
+  ],
+  "description": "Summary: Over the last two weeks we have observed slow, intermittent increases in GPU resident memory (RSS) on nodes serving KV-prefetch-heavy chat workloads that use continuous batching. The pattern diverges from classic fragmentation: resident grows in small steps after sustained microbatching bursts and does not fully reclaim after model idle periods. Impact: nodes eventually hit OOM guardrails and trigger fallback to smaller model variants, causing latency regressions and customer throttling. Goal: find root cause (allocator interaction vs. KV cache accounting vs. stream synchronization), propose immediate mitigations, and implement a robust fix that prevents long-tail RSS drift during steady-state continuous batching.",
+  "repro_steps": [
+    "1) Provision a 4xA100 dedicated pool with runtime-1.21 image and our usual serving config (continuous batching enabled, kv-prefetch enabled).",
+    "2) Deploy model 'open-7b-opt' (quantized) and pin routing to a single GPU to maximize local KV shadows.",
+    "3) Replay synthetic trace: 1200 concurrent clients sending chat turns with variable prompt prefixes (average seq len 600, tail 2048) for 6 hours, maintaining steady QPS that triggers microbatching (~64 microbatches/minute).",
+    "4) Enable our detailed allocator tracing (cuda_mem_trace=1, slab_debug=2) and collect periodic NVML snapshots (RSS, active allocations) every 30s and cudaMallocAsync counters every minute.",
+    "5) Observe resident memory trend, slab age histograms, and counts of stream-queued frees and pending tombstones."
+  ],
+  "telemetry_findings": "Observed behavior: (a) Slow upward RSS trend ~30-80 MB per hour on affected nodes; (b) cudaMallocAsync 'pending_free_count' increases in waves coincident with KV-prefetch peaks; (c) slab pool show increased \"age=3\" bucket residency that does not decline after traffic quiesces; (d) NVTX traces show free calls placed on non-host streams and a delayed stream-synchronize before memory reuse; (e) allocation histogram shows more mid-sized allocations (~128KB-1MB) pinned for longer than expected. Notable counters: 'cudaMallocAsync.alloc_attempts' stable, 'cudaMallocAsync.pending_bytes' correlated with RSS growth; 'kv_cache.viewpin_count' spikes align with slabs that later become sticky.",
+  "experiments_run": "Experiment A (disabled KV prefetch): resident growth stopped across 4 runs -> suggests strong coupling with KV prefetch. Experiment B (force host stream frees): added explicit cudaStreamSynchronize after frees in allocator path -> immediate reduction in pending_free_count and partial RSS rollback but not full. Experiment C (tuned slab hysteresis down): more aggressive slab reclamation reduced growth but increased CPU jitter in serving path. Experiment D (patched allocator to coalesce frees every 200ms instead of on-demand): reduced pending_free_count waves but introduced latency tail risk in microbursts. Collected traces and PRs: github.com/redwood/runtime/pull/3421 (alloc-sync-probe), github.com/redwood/runtime/pull/3448 (slab-hysteresis-tune).",
+  "root_cause_hypothesis": "Primary hypothesis: interaction between KV-prefetch's long-lived view pins and cudaMallocAsync's deferred-free semantics is causing a subset of slab chunks to be held 'resident' because frees are enqueued onto streams that are not being synchronized promptly relative to when the allocator attempts to reuse memory. Secondary hypothesis: slab pool hysteresis parameters prevent timely reclamation of mid-sized chunks when the workload oscillates between KV-prefetch bursts and inference-only bursts, so small residue accumulates across cycles.",
+  "proposed_actions": [
+    "Short-term mitigation: introduce a conservative synchronous cleanup path on gputemp nodes triggered when pending_free_bytes exceeds threshold (config flag: allocator.eager_reclaim=true).",
+    "Medium-term fix: change KV viewpin lifetime semantics so that viewpins don't pin device memory when a host-staging copy is present (optimize for prefetch->staging flow).",
+    "Long-term: implement stream-aware free-aggregation that associates frees with the owning model's commit fence and a slab reclamation policy that is time-and-utilization-aware, plus better telemetry for slab fragment provenance."
+  ],
+  "blockers": "Need kernel-level verification from NVIDIA team regarding expected behavior of cudaFreeAsync in presence of device-to-device prefetches (we have an open support ticket). Also need a small repro harness that reproduces slab aging in <3 hours for CI; current repro takes 6+ hours which slows iteration.",
+  "attachments": [
+    "https://confluence.redwood.ai/display/RUNTIME/ENG-888888+memory-sherpa-investigation",
+    "https://grafana.redwood.ai/d/allocator/kv-prefetch-resident-trends?panelId=7",
+    "https://github.com/redwood/runtime/pull/3421",
+    "https://github.com/redwood/runtime/pull/3448",
+    "s3://redwood-logs/alloc-traces/ENG-888888/2026-03-11.tar.gz"
+  ],
+  "comments": [
+    "2026-03-10 Aisha Kapoor: Created ticket after observing steady RSS drift on 3 prod nodes; attached initial NVML and allocator traces.",
+    "2026-03-11 Lars Muller: Ran controlled repro with KV prefetch disabled \u2014 drift stopped. Looking into where prefetch holds device pointers. Opened two experiments (alloc-sync-probe, slab-hysteresis-tune).",
+    "2026-03-12 Eng oncall (Miguel Santos): Noted one node returned to baseline after manual 'allocator.eager_reclaim' toggle. Suggest adding automated reclaim when pending_free_bytes > 1GB.",
+    "2026-03-13 Aisha Kapoor: Filed support ticket with NVIDIA; collecting small-run harness for CI. Planning pair on long-term stream-aware free aggregation next week."
+  ],
+  "mitigation_plan": "1) Roll config 'allocator.eager_reclaim=true' to affected Dedicated pools as a temporary safety valve. 2) Add alert rule 'allocator.pending_free_bytes > 1GB for 20m' to automations that trigger a coordinated reclaim. 3) Back out slab-hysteresis tuning from Experiment C (caused latency jitter) and instead prefer explicit reclaim paths.",
+  "long_term_fix": "Design and implement 'stream-aware free aggregation' and 'kv-staging-pointer-ownership' model: frees are batched and gated on model-specific fences; KV prefetch will prefer host-staging copies when available and release device pins earlier. Include unit+integration tests that simulate stream reordering and microbatch patterns. Target: runtime-1.22 rollout with canary on 10% of Dedicated capacity.",
+  "acceptance_criteria": [
+    "No sustained RSS drift in 24h steady-state synthetic replay (target < 50MB net change).",
+    "Alerts for pending_free_bytes should not fire on canary after fix rollout.",
+    "No regression in 99th percentile tail latency on canary traffic (<= existing baseline + 5ms).",
+    "Telemetry exposes slab chunk provenance and pending_free_bytes correlator for future debugging."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "repro_steps",
+    "telemetry_findings",
+    "experiments_run",
+    "root_cause_hypothesis",
+    "proposed_actions",
+    "blockers",
+    "mitigation_plan",
+    "long_term_fix",
+    "acceptance_criteria",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_9aee6035b59c4b33bc505f9384c3c30f"
+}

@@ -1,0 +1,54 @@
+{
+  "key": "ENG-18250",
+  "team": "engineering",
+  "title": "Define accounting rules for partial KV cache hits and multi-tenant batch attribution",
+  "status": "In Review",
+  "priority": "P1",
+  "created_at": "2026-02-25",
+  "updated_at": "2026-03-12",
+  "creator": "Asha Patel",
+  "assignee": "Liam O'Connor",
+  "project": "metering-consistency",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "labels": [
+    "metering",
+    "billing",
+    "kv-cache",
+    "batching",
+    "quota",
+    "high-impact"
+  ],
+  "description": "Summary:\nWe currently have inconsistent billing and quota behavior when requests are served from a combination of prefix/KV cache hits and live model tokens, especially when multiple customers' requests are coalesced into a single GPU batch. This ticket defines deterministic accounting rules and a minimal set of implementation changes to ensure: (1) per-request billed tokens equal the uncovered token work attributed to that request, (2) rate limit and quota consumption reflects billed tokens (not wall-clock or cached-only requests unless policy dictates), and (3) coalesced batches' costs are split fairly and reproducibly across input owners.\n\nProblem details and symptoms observed:\n- Incident: several customers reported quota exhaustion without corresponding model usage in logs. Investigation showed long prefixes were served entirely from KV cache but our quota pipeline still deducted full input length for some interleaved coalesced batches.\n- Non-deterministic attribution: when the batch-assembler picks requests from different customers, downstream metering sometimes recorded tokens based on the merged sequence length rather than per-request uncovered suffix lengths.\n- Edge case: partial-KV hit where prefix is cached and only suffix requires model generation. Billing sometimes charged full generation length or, conversely, zero (if a cached response path short-circuited downstream metering).\n- Impact: customer confusion and incorrect invoices; potential revenue loss and SLA risk.\n\nDesign goals / constraints:\n- Accurate per-request billing for model compute work (measured in model tokens generated / consumed by the runtime), ignoring tokens served entirely from a certified cold cache unless customer opts into free-cache billing policy.\n- Deterministic allocation of GPU batch cost to originating requests, reproducible in O(1) per-request post-hoc reconciliation.\n- Minimal performance regression: tracing and attribution should add small constant overhead to the batch assembly path.\n- Backwards-compatible billing records: invoice_event schema should accept supplemental attribution fields but keep existing fields for older consumers.\n\nProposed rules (final recommendation):\n1) Per-request \"billed_model_input_tokens\" = max(0, input_tokens - cached_prefix_tokens). For streaming / partial generation, billed_model_output_tokens = actual generated tokens (as observed by runtime). Total billed tokens = billed_model_input_tokens + billed_model_output_tokens.\n2) If a request was satisfied entirely from the prefix/KV cache (billed_model_input_tokens == 0 and generated tokens == 0), then:\n   - Quota consumption = 0 by default. (Feature flag: billing.charge_for_cache_hit = true to opt all cached responses into billing.)\n3) When multiple requests are coalesced into a single GPU batch, split model compute cost across requests proportional to each request's billed token count (input + output as defined above). If billed token sum is zero for all requests (rare), split by request-count.\n4) Rate limiter should decrement quotas by the billed token count at the moment the batch finalization completes (post-runtime token accounting), not at request enqueue time. This avoids double-charges for prefetched paths that later hit cache.\n5) Metering events stored in billing stream (invoice_event) must include: request_id, customer_id, billed_input_tokens, billed_output_tokens, cache_prefix_tokens, batch_id, batch_token_share_percent. These fields are optional additions to preserve compatibility with legacy pipelines.\n\nImplementation plan (high level):\n- Runtime changes (batcher/service layer):\n  - At batch assembly time, retain per-request meta: input_tokens, cache_prefix_tokens. Add per-request trace id to batch proto. (Minimal change in batch_assembler module.)\n  - After generation completes, runtime computes per-request generated_tokens and emits a batch-level token vector. Add a deterministic token-splitting function that attributes compute cost to each request using the rules above.\n- Metering pipeline:\n  - Introduce a new stage \"batch_attributor\" that consumes batch traces, computes per-request billed tokens, and emits invoice_event records with the new fields.\n  - Move quota decrement from request_enqueue hook to post-batch-attribution hook. Implement idempotency to tolerate retries.\n- Storage/schema:\n  - Add optional columns to invoice_event table: cache_prefix_tokens, billed_input_tokens, billed_output_tokens, batch_id, batch_share. All as nullable integers/strings. Migration will add columns with defaults but keep old path functional.\n- Feature flags & compatibility:\n  - billing.charge_for_cache_hit (off by default) to support legacy behavior for customers billed differently.\n  - metering.attribution_v2 rollout flag to switch pipeline consumers.\n\nTelemetry and validation:\n- Dashboards: add a \"cache-hit billing drift\" dashboard comparing billed tokens vs observed model tokens per-customer over time.\n- Unit & integration tests: synthetic multi-tenant batch tests to cover full-cache, partial-cache, and no-cache mixes.\n- Reconciliation: nightly job to compare runtime token-usage metrics with billing events for top-100 customers for first 7 days post-rollout.\n\nRollout plan:\n1) Merge runtime instrumentation that emits necessary per-request metadata (no billing changes yet). Canary to 10% of production traffic.\n2) Deploy metering.batch_attributor in read-only mode that writes attribution to a debug stream only. Validate with reconciliation tooling.\n3) Enable quota decrement shift behind feature flag for a single internal org. Observe for 72 hours.\n4) Gradually enable for all orgs and flip billing.charge_for_cache_hit if product decides to charge cached hits.\n\nOpen design decisions and trade-offs:\n- Charge-for-cache-hit policy: product must decide whether long-prefix cached responses should be free. Recommendation: default free, with opt-in charge for enterprise customers who want usage-aligned billing.\n- Splitting by billed token share vs exact runtime GPU cycles: proportional token split is simpler and explainable; per-request GPU cycle accounting would be more accurate but requires instrumenting kernel-level metrics and complex attribution for attention/kv-cache savings. We propose tokens-based split for now.\n\nBackward compatibility & customer communication:\n- Since some invoices might change under the new accounting, we will publish a short note in billing docs and include an \"accounting change\" banner on the Console Billing page before the wide rollout.\n\nSecurity & privacy:\n- The new invoice_event fields are customer-scoped and do not add new plaintext secrets. Marked security_review_required = false for engineering scope; if product enables new charge-for-cache policy, contract/legal should review messaging and terms.\n\nDone criteria:\n- All per-request invoices for canary orgs show billed tokens consistent with runtime token logs for >99.9% of requests.\n- Reconciliation job for top customers shows <0.1% drift attributable to attribution algorithm.\n- Production rollout feature flag flipped and billing docs updated.\n\nNotes on related tickets and why this is distinct:\n- This ticket focuses on deterministic per-request accounting when partial KV/prefix cache hits intersect with multi-tenant batch coalescing and rate limiter placement. It differs from earlier metering normalization tickets by formally defining per-request token attribution and moving quota decrement to post-generation attribution.",
+  "comments": [
+    "2026-02-26 - Asha: Initial write-up and reproduction logs attached. Found two customer-reported cases where quota decrements happened despite 100% KV prefix hit.",
+    "2026-02-28 - Liam: Reviewed design, raised question on whether we should consider charging cached outputs for enterprise customers. Added feature flag proposal.",
+    "2026-03-03 - Eng Infra (Maya Chen): Confirmed batch proto can carry per-request cache_prefix_tokens with negligible size delta. Suggested adding batch_id UUID for correlation.",
+    "2026-03-06 - Billing (Carlos Ruiz): Asked for migration plan for invoice_event consumers in downstream ETL. Offering to coordinate a two-week consumer freeze window.",
+    "2026-03-09 - QA (Priya Nair): Added test matrix for coalesced batches: combinations of (all cached, partial cached, none cached) x (1..8 concurrent tenants).",
+    "2026-03-12 - Liam: PR opened for runtime instrumentation (https://github.com/redwood-inference/runtime/pull/2487). Metering pipeline draft PR in internal repo linked below. Marking In Review.",
+    "Follow-ups: schedule retro after 2-week canary, add billing docs page, decide on default for billing.charge_for_cache_hit."
+  ],
+  "links": [
+    "https://github.com/redwood-inference/runtime/pull/2487",
+    "https://git.internal.redwood/infra/metering/pulls/431",
+    "https://confluence.redwoodinc.com/display/BILL/Partial+KV+Hit+Accounting+Design",
+    "https://grafana.redwood.internal/d/abcd123/cache-hit-billing-drift"
+  ],
+  "parent_issue": [
+    "ENG-17903"
+  ],
+  "dependencies": [
+    "ENG-16421",
+    "ENG-15834"
+  ],
+  "customer_impact": "high",
+  "release": "billing-2026.03",
+  "security_review_required": "false",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_486a17a9a60448a18788f9ba3b87319d"
+}

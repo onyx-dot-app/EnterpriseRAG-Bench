@@ -1,0 +1,44 @@
+{
+  "repo": "redwood",
+  "pr_number": "129876",
+  "title": "lazy-reservation-and-slab-fractioning-for-paged-kv",
+  "author": "Asha Kapoor",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-02-25",
+  "merged_at": "2026-02-25",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/paged-kv-lazy-reserve-slab-fract",
+  "reviewers": [
+    "Diego Martinez",
+    "Priya Nair",
+    "Liam O'Connor"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kv-cache",
+    "infra"
+  ],
+  "linked_linear": [
+    "ENG-1142",
+    "ENG-1198"
+  ],
+  "linked_jira": [
+    "SUP-872"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "812",
+  "deletions": "299",
+  "breaking_change": "false",
+  "release_notes": "Introduces lazy commit reservations and slab fractioning for the paged KV block manager. Improves memory reuse and reduces write amplification; no API changes.",
+  "body": "Context and motivation:\nThe paged KV block manager currently conservatively reserves commit tokens and prefers whole-slab reclamation. For workloads with high locality and many short-lived prefixes (e.g., prefix caching for multi-tenant chat sessions), this leads to two observable inefficiencies: (1) transient reservations that hold slab capacity but never get dirtied, and (2) coarse-grained slab eviction that prevents intra-slab reuse, increasing churn and IO writeback.\n\nSummary of changes (single-line bullets for quick scanning):\n- Add lazy reservation tokens: only convert a soft-reservation into a committed reservation when a write actually occurs. Soft-reservations are tracked cheaply and do not increment commit counters that block slab reuse.\n- Implement slab fractioning: allow a slab to be split into 2/4 logical fractions for allocation/reuse to increase packing density for small hot pages. Fractioning happens at allocation time; fractions can be coalesced lazily when full-slab reuse is needed.\n- Background coalescer: lightweight background worker that coalesces adjacent free fractions into full slabs during low load windows to keep fragmentation bounded.\n- Metrics and tracing: new paged_kv.lazy_reserve_hit/miss, paged_kv.fraction_alloc_count, paged_kv.coalesce_cycles gauges and histograms. Added debug traces for reservation->commit lifecycle.\n- Tests and benchmarks: unit tests covering race cases for lazy commit, integration test to ensure crash-safety under uncommitted-soft-reservations, and end-to-end perf harness with internal microbenchmarks.\n\nDetailed description (technical):\nLazy reservation semantics: introduce two reservation types: soft_reservation (cheap, can be dropped) and hard_commit (previously just reservation). Soft reservations are recorded in a small per-shard bloom-ish bitmap and a lightweight refcount. When a caller performs the first written mutation to that block, we atomically promote the soft_reservation to a hard_commit (path guarded by existing commit_mutex to preserve consistency). This avoids incrementing global committed_block counters for read-only or canceled reservations.\n\nSlab fractioning design: slabs remain the same underlying physical unit (4MB by default) but now may be logically partitioned into 2 or 4 fractions based on historical allocation size histograms. The allocator uses a new heuristic: if >60% of recent allocations in a shard are <256KB, prefer 4-way fractioning; otherwise 2-way or no fractioning. Fraction metadata is stored in the existing slab header extension (24 bytes) to avoid additional mallocs and keep on-disk layout compatible. Coalescing metadata is versioned so older on-disk slabs are still readable.\n\nBackground coalescer: single threaded per-N shards, rate-limited task that runs when (1) CPU idle < 30% and (2) free_fraction_ratio > 0.5. Coalescer merges adjacent free fractions into larger free spans to reduce fragmentation long-term. Coalescing uses epoch-safe reclamation so normal request paths do not need stop-the-world pauses.\n\nSafety and crash recovery: soft reservations are only persisted as ephemeral metadata in-memory and not written to on-disk slab headers. To guard against lost soft reservations on process restart, the allocator treats any partially-occupied fraction as free and lets the background recovery pass revalidate contents via checksums (unchanged from existing recovery flow). Hard commits still have the same on-disk commit markers.\n\nBenchmarks and results (internal perf harness, measuring steady-state serving with mixed read/write prefix workloads):\n- Small-prefix 80/20 read/write workload (tenants=200): average memory fragmentation down by 22%, cache hit effective capacity +14% (measured by evictions), host CPU for allocation path down 8%.\n- Mixed-batch inference workload (continuation-heavy KV hits): 95th percentile latency for token-serving path reduced by 6.2ms (approx 4.3% at 95p), p50 no-regression.\n- Writeback IO: write amplification reduced ~9% in microbench test due to better packing of hot pages.\n\nCommits (high-level):\n- feat: add soft_reservation + promotion logic (allocator/*.cc, runtime/kv_shard.h)\n- feat: slab fractioning allocator and headers (allocator/slab_fraction.cc, allocator/slab_header.h)\n- fix: coalescer worker and rate limiter (allocator/coalescer.cc)\n- perf: add metrics and traces (observability/paged_kv_metrics.{cc,h})\n- test: unit + integration + perf harness updates (test/kv_lazy_reserve_test.cc, test/coalesce_integration.cc)\n\nFiles changed (high level):\n- allocator/slab_pool.cc (new fractioning heuristics, ~+230/-34)\n- allocator/slab_fraction.cc (new, +410)\n- allocator/slab_header.h (+24 bytes to header)\n- allocator/coalescer.cc (+142)\n- runtime/kv_shard.h (+60)\n- runtime/kv_reservation.{cc,h} (+120)\n- observability/paged_kv_metrics.cc (+48)\n- test/kv_lazy_reserve_test.cc (+95)\n- test/coalesce_integration.cc (+170)\n- benchmarks/paged_kv_pack_density.py (+85)\n- docs/ops/paged-kv-adm.md (docs +60)\n- build/BUCK / CMakeLists tweaks (+/-)\n\nReview conversation (highlights):\n- Diego Martinez (reviewer): \"Nice approach. Concern: are we underestimating the memory overhead for per-shard soft bitmaps? Can we quantify worst-case?\"\n- Author (Asha): \"Answered: worst-case bitmap per-shard ~128KB (default config) and we add a knob paged_kv.soft_reserve_bitmap_bytes. Added microbench numbers + memory column. If customers need to reduce, setting to 32KB still keeps >95% of benefits in our tests.\"\n- Priya Nair: \"We need an explicit abort path for promoted reservation failures (OOM) so callers don't assume commit success.\"\n- Author: \"Added abort semantics: promotion returns an error and the calling txn can fail cleanly; documented in runtime/kv_reservation.h and surfaced in the unit tests.\"\n- Liam O'Connor: \"Integration looks solid. Please add an observability dashboard tile for fraction utilization.\"\n- Author: \"Added dashboard JSON and linked in docs/ops/paged-kv-adm.md.\"\n\nCI and validation: all unit tests passing; integration job 'kv-integration-large' passing after one rerun (flake on network mount); perf job ran with new harness and results attached in artifacts/perf/129876/results.zip. Fuzzer did not find races in our promotion path after 48h.\n\nMerge strategy and outcome:\n- Merge method: squash and merge.\n- Merge commit message appended to change log with short benchmark summary.\n\nFollow-ups and known limitations:\n- This patch slightly increases CPU for background coalescer under very high churn if fractioning is over-aggressive; added an opt-out flag (paged_kv.enable_fractioning=false) and dynamic telemetry to flip heuristics server-side in the short term.\n- Long-term: consider multi-size fractioning (e.g., 8-way) and adaptive fraction lifetime informed by TTL signals from upper layers. Filed ENG-1229 for follow-up exploration.\n\nChecklist (as part of PR description):\n- [x] Unit tests added/updated\n- [x] Integration tests added that simulate crash/restart\n- [x] Benchmarks added to perf harness\n- [x] Docs/ops page updated\n- [x] Metrics and tracing added\n\nIf you want to run locally: checkout branch, run `bazel test //test:kv_lazy_reserve_test` and `python3 benchmarks/paged_kv_pack_density.py --runs 20`.\n\nIf any reviewer wants a walkthrough I can present perf harness results and show a flamegraph for the allocation hot path.\n\nSigned-off-by: Asha Kapoor <asha@redwood.ai>\n",
+  "merge_method": "squash",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_e84d468b7a034cecba75685963dba9f7"
+}

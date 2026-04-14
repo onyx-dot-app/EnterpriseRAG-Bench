@@ -1,0 +1,69 @@
+{
+  "key": "SUP-391827",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Proxy thread saturation during tenant affinity migration causing intermittent 503s and elevated error rate",
+  "status": "Resolved",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Samira Khan",
+  "assignee": "Ethan Cooper",
+  "customer_company": "CacheCorp",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "ingress-proxy",
+    "serving-runtime",
+    "autoscaler"
+  ],
+  "labels": [
+    "5xx",
+    "prod-incident",
+    "tenant-affinity",
+    "threadpool"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "redwood/gptx-13b",
+    "open/llama-65b-compat"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-10",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-472901",
+    "SUP-902421"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/proxy/pull/1892",
+    "https://github.com/redwood-inference/runtime/pull/2145"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/runbooks/ingress-threadpool-psa",
+    "https://confluence.redwood.ai/postmortems/2026-03-10-tenant-affinity-migration"
+  ],
+  "description": "Issue summary:\nDuring a staged tenant affinity migration (reassigning tenant session affinity to new proxy pools), we observed a correlated rise in 503 responses for a subset of dedicated customers. Error rate for affected route rose from baseline ~0.2% to 7% over a 12-minute window.\n\nImpact:\n- Several dedicated tenants (notably CacheCorp) reported intermittent 503s on generate and chat endpoints.\n- Elevated customer error rate and increased p99 latency for small payload streaming sessions.\n- No large-scale GPU OOMs, but upstream runtime processes recorded abnormal panics and worker restarts.\n\nEnvironment:\n- prod us-east (az: us-east-1a/us-east-1b)\n- Rolling affinity migration job started at 2026-03-10T18:06:00Z\n\nSteps to reproduce (observed pattern):\n1) Trigger affinity migration for a target tenant pool (internal migration job).\n2) Proxy accept queue depth increases and ingress-proxy thread busy count climbs to 100% on a subset of nodes.\n3) Apigw begins returning 503 to clients when hedged/streaming handshakes stall.\n4) Upstream runtimes hit thread scheduling contention leading to SIGABRT in one runtime process, followed by immediate restarts.\n\nKey logs / metrics observed:\n- apigw.ingress.accept_queue.depth from 20 -> 900 within 6m for nodes handling migrated tenants.\n- ingress-proxy.thread_pool.busy_pct -> 98% on 3/6 nodes.\n- runtime.process[worker-12].panic: \"sched_yield failed: thread-starve\" (repeated 8 times)\n- error-rate(route: /v1/chat/completions) spiked to 7% and gradually recovered after rollback.\n\nRelevant runbook excerpt: \"If ingress accept queue rises > 500 and 5xx rate > 1% for >5m, pause affinity job and investigate threadpool utilization.\"",
+  "comments": [
+    "2026-03-10 18:12 Support (Samira): Customer CacheCorp reporting intermittent 503s; provided sample request IDs and timestamps. Escalating to SRE.",
+    "2026-03-10 18:18 SRE (Ethan): Observed accept_queue depth spike correlated to affinity migration job. Marking incident Sev1 and pausing migration as immediate mitigation.",
+    "2026-03-10 18:22 Engineering (Priya Singh): Noted ingress-proxy thread_pool busy_pct near 100% on three proxy nodes. Increased proxy threadpool size on the fly for the affected nodes as stopgap. Monitoring impact.",
+    "2026-03-10 18:35 SRE (Ethan): After threadpool bump, error rate fell from 7% -> 2.5% over 10m but one runtime continued to crash repeatedly. Isolating tenant routing away from the problematic runtime node.",
+    "2026-03-10 19:00 SRE (Ethan): Rolled back affinity migration entirely per runbook. Error rate returned to baseline by 19:10 UTC. Notifying customer of temporary workarounds and rollback.",
+    "2026-03-11 09:15 Support (Samira): CacheCorp confirms service stabilized; requesting postmortem and preventative actions.",
+    "2026-03-12 14:00 Eng (Priya): Deployed proxy hotfix to improve accept-queue backpressure handling and a patch to the runtime scheduler to avoid panic on transient thread-starve. Scheduling controlled re-run of migration with throttling next week."
+  ],
+  "investigation_notes": "Hypotheses considered:\n- Hypothesis A: Affinity migration produced a short-lived connection-fanout that overfilled proxy accept queues and starved proxy thread workers. Evidence: accept_queue spike aligned exactly with migration window.\n- Hypothesis B: Proxy threadpool configuration too conservative for concurrency shape of the migrated tenants; threadpool exhaustion cascaded to upstream hedged retries. Evidence: nodes hit 98-100% busy and immediate improvement after bumping pool size.\n- Hypothesis C: Synthetic runtime bug: under heavy ingress scheduling pressure, runtime scheduler can hit an assert leading to panic. Evidence: single runtime binary showed repeated \"sched_yield failed\" panics. Related to an edge case in runtimes with pinned affinity.\n\nPartial findings:\n- No network-level packet loss detected; TCP retransmit rates stayed nominal.\n- Proxy CPU was high but not saturated; contention was on thread availability and accept-queue handling.\n- The runtime that crashed had been pinned to the same CPU affinity mask as the proxy process (legacy deploy config) \u2014 likely amplifying contention under the migration load.\n\nShort-term mitigations applied:\n- Paused the affinity migration job at 18:20 UTC.\n- Increased ingress-proxy threadpool on affected nodes.\n- Rerouted tenant traffic away from the offending runtime instance.\n- Notified CacheCorp and tracked SLA impact metrics.\n\nLonger-term action items (captured separately):\n- Remove hard CPU affinity pinning between proxy and runtime in dedicated deploys (ENG-5741).\n- Add migration-rate limiter to affinity job (OPS-1122).\n- Improve proxy accept-queue observability and automated pause when depth > 400 (OBS-908).\n- Runtime scheduler guard to avoid panic on transient thread-starve (RUNTIME-231).",
+  "resolution_notes": "Root cause summary:\nA high-rate tenant affinity migration caused a concentrated burst of new accept handoffs on a subset of ingress-proxy nodes. The ingress-proxy threadpool was exhausted by the handoff pattern (accept_queue growth + busy threads). This amplified into upstream pressure: hedged retries and stalled handshakes increased runtime scheduling pressure and exposed a latent runtime panic when CPU affinity contention occurred.\n\nFix and rollout:\n- Immediate: paused the affinity migration and increased proxy threadpool size on affected nodes. Rerouted traffic away from the unstable runtime.\n- Hotfixes committed: proxy backpressure handling improvement (PR #1892) and runtime scheduler guard to prevent panic (PR #2145). Both were deployed to a canary subset on 2026-03-12 and monitored for 24h.\n- Preventative: affinity migration job updated with rate limiting and pre-flight checks that verify accept_queue < 50 on target nodes. CPU affinity pins removed for proxy/runtime co-location in dedicated clusters.\n\nCustomer communication:\n- Notified CacheCorp immediately after rollback and followed up with a technical summary and mitigation timeline. No billing adjustments requested; support credited 1 day of reduced SLA as goodwill.\n\nPost-incident follow-up:\n- Engineering to run a controlled re-run of tenant migrations with throttling on 2026-03-18 (ENG-6542).\n- Observability: add alert for combined metric (accept_queue > 400 && 5xx_rate > 1% for 5m).\n- Ops: update migration runbook to include preflight threadpool and affinity checks.\n\nStatus: Resolved (hotfix deployed + migration paused and policies updated).",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_3c2c3b19b640480e93de71b1890bd360"
+}

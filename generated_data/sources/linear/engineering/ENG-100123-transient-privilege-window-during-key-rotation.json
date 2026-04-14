@@ -1,0 +1,109 @@
+{
+  "key": "ENG-100123",
+  "team": "engineering",
+  "title": "Fix: transient privilege window during private cluster key-rotation",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-15",
+  "creator": "Maya Chen",
+  "assignee": "Arjun Patel",
+  "project": "private-security-hardening",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "due_date": "2026-03-18",
+  "labels": [
+    "security",
+    "private",
+    "rbac",
+    "sso",
+    "kms",
+    "incident-response",
+    "hotfix"
+  ],
+  "customer_impact": "high",
+  "release": "priv-2026.03.2-hotfix",
+  "security_review_required": "true",
+  "description": "Summary: Multiple customers operating on Private clusters reported intermittent privilege elevations for service accounts during scheduled KMS key rotations and control-plane maintenance windows. The issue manifests as a short-lived window (tens of seconds) where RBAC policy evaluation falls back to a stale policy snapshot concurrently with SSO assertion reconcilers applying a tenant mapping update. This allowed certain admin-mapped groups to retain previously granted rolebindings for requests routed to replicas that had not yet observed the new encryption key state. The incident affects only Private control planes and Dedicated with private-network peering; Hosted customers are not impacted.\n\nThis ticket tracks the emergency patch, validation, rollout, and follow-up tasks to ensure no regression across future key rotations and SSO metadata refresh cycles.",
+  "steps_to_reproduce": [
+    "1) On a private cluster, create a rolebinding that maps idp:group=admin-test to cluster-admin while the cluster is on key version K_v1.",
+    "2) Trigger a key rotation (K_v1 -> K_v2) using the keystore service with concurrent envelope re-encryption and accelerate propagation by pausing one control-plane replica's reconciler loop (simulated in staging).",
+    "3) Submit a burst of authenticated requests using an SSO assertion that carries a recently updated tenant map change that should remove admin-test from elevated mapping.",
+    "4) Observe authorization decisions for the paused replica: some requests are accepted with elevated privileges for ~10-40s, while audit events either omit the rolebinding change or record it on a different replica (audit gap)."
+  ],
+  "observed_behavior": "Transient acceptance of actions requiring elevated roles by identities that should have been revoked; audit logs missing corresponding revocation events during the same window; KMS envelope rotation events not uniformly visible to all control-plane nodes leading to mixed decryption contexts.",
+  "expected_behavior": "No request should be authorized by a rolebinding that was removed prior to the request timestamp. Audit logs must contain deterministic revocation/role-change events correlated with requests. KMS rotations should never cause inconsistent decryption context that affects authz decisions.",
+  "root_cause_analysis": [
+    "Race between (A) key/version propagation (keystore -> control-plane caches) and (B) in-memory RBAC snapshot updates created from SSO mapping refresh. Some replicas used decrypted payloads tied to old key material while consulting a fresh RBAC snapshot, or vice versa, creating mismatched evaluation inputs.",
+    "Authorization code path assumed atomic visibility of (key-version, rolebindings, assertion-epoch). There was no transactional ordering guarantee across the three, and reconciler backoff allowed a stale cache to persist during rotation.",
+    "Audit writer was sharded per-replica and used non-durable buffering; when replicas disagreed, some revocation events were never flushed at the same timestamp, producing gaps in the event stream."
+  ],
+  "mitigation_applied": [
+    "Hotfix v1 deployed to control plane: introduce a short quiesce window during key rotation where new SSO-derived RBAC snapshots are staged but not applied until key-version reachability confirmed across all active replicas.",
+    "Temporarily increased audit flush frequency and fall back to synchronous flush on any role-change events until stable rotation completes.",
+    "Applied partial rollback of a recent optimization that allowed RBAC snapshots to be applied before a safe decrypt handshake succeeded. Rolled back in hotspots only.",
+    "Engaged on-call security & support to notify impacted customers and provide workaround guidance (forced retry after 1 minute, redeploy service-account tokens)."
+  ],
+  "proposed_fix": [
+    "Primary: implement two-phase commit for key-version visibility + RBAC snapshot activation. On rotation, control-plane nodes will: (1) fetch new keys into local keystore, (2) validate cross-node key hash via gossip within T_quiesce, (3) apply RBAC snapshot only when >90% nodes confirm reachable key-version.",
+    "Secondary: centralize audit write via a leader-ack model for role-change events to ensure deterministic ordering and reduce missing entries.",
+    "Guard: add assertion token validation that includes key-version binding (include key-version fingerprint in the authz cache key) to avoid cross-key evaluation ambiguity.",
+    "Add unit and e2e tests in the runtime test harness to simulate staggered reconciler schedules and verify no elevation window appears under high load."
+  ],
+  "rollout_plan": [
+    "1) Merge PR: priv/controlplane: enforce-key-version-quorum (link in attachments).",
+    "2) Canary deploy to 3 non-customer staging clusters, run fuzz test harness (30m).",
+    "3) Canary to 5 low-risk private clusters (with high audit verbosity) for 1 hour; monitor authz denials/acceptances and audit flush rates.",
+    "4) Gradual rollout to remaining private clusters in 10-minute stagger with automated rollback on >0.1% unexpected acceptances or missing audit events for 5m window.",
+    "5) Post-rollout audit consumption job to backfill any missing revocation events to downstream analytics if gaps are detected."
+  ],
+  "qa_plan": [
+    "Unit tests for key-version binding in authz cache keys.",
+    "Integration tests: simulate key rotations while applying RBAC snapshot updates under varying latencies; assert zero acceptance by revoked identities.",
+    "Fuzz harness run that randomly delays reconciler loops and network partitions; verify audit flushes are consistent and no elevated actions are allowed.",
+    "Security review and threat model update prior to broad rollout.",
+    "Manual verification steps: run documented reproducible script in staging, capture audit events, and verify per-request bindings."
+  ],
+  "monitoring_playbook": [
+    "Create a dashboard: 'priv-key-rotation-authz-consistency' with metrics: authz_accept_rate_by_identity_change, audit_flush_failures, key_version_mismatch_count.",
+    "Alert: pager if authz_accept_rate_by_identity_change > 0 for revoked groups for 1m in production clusters.",
+    "Alert: audit_flush_failures > 5/min or any audit latency > 10s triggers automated rollback of the patch on the cluster.",
+    "Run a daily job for 7 days post-rollout to compare role-change events vs request acceptances and escalate if discrepancies found."
+  ],
+  "blockers": [
+    "Need final sign-off from security compliance for leader-ack audit path (PRU-SEC-47).",
+    "Dependency on keystore cross-node gossip library update (ENG-100120) \u2014 compatibility patch merged but needs validator run.",
+    "Some large customers requested a maintenance window for the scheduled rollout; coordination required with SEs."
+  ],
+  "attachments": [
+    "https://git.internal.redwood/priv/controlplane/pulls/4587 (PR: enforce-key-version-quorum)",
+    "https://confluence.redwood.com/display/SEC/Private+Key+Rotation+Authz+Incident+2026-03 (incident writeup)",
+    "https://dashboards.redwood.com/d/priv-authz/priv-key-rotation-authz-consistency (dashboard preview)",
+    "https://drive.google.com/drive/fake-link/staging-repro-scripts (staging repro scripts)",
+    "slack:#incidents (thread: T03A9B2 urgent customer escalations)",
+    "Customer tickets: C-48291, C-48302 (redacted customer IDs)",
+    "Runbook snippet: /runbooks/priv-key-rotation-hotpatch.md"
+  ],
+  "postmortem_tasks": [
+    "Follow-up: create migration plan to move audit writer to durable queue with per-tenant ordering (owner: Lina Gomez).",
+    "Create long-term design doc for transactional key+policy rotations (owner: Arjun Patel, due 2026-04-05).",
+    "Customer remediation: contact impacted customers with summary, provide signed attestation of fix and evidence (owner: Maya Chen).",
+    "Instrumentation: add telemetry to measure key-version gossip convergence time across control-plane replicas."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "root_cause_analysis",
+    "mitigation_applied",
+    "proposed_fix",
+    "rollout_plan",
+    "qa_plan",
+    "monitoring_playbook",
+    "blockers",
+    "postmortem_tasks"
+  ],
+  "dataset_doc_uuid": "dsid_7dc274aa900b4877b23d63cd53128d8f"
+}

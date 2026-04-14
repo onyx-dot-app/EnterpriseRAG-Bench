@@ -1,0 +1,72 @@
+{
+  "repo": "redwood-sdk-typescript",
+  "pr_number": "1302",
+  "title": "Standardize timeout defaults + AbortController plumbing (streaming vs non-streaming)",
+  "author": "Dana Lo",
+  "created_at": "2026-02-04",
+  "updated_at": "2026-02-15",
+  "merged_at": "2026-02-15",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/sdk-timeouts-v1",
+  "reviewers": [
+    "Ibrahim Khan",
+    "Allison Grant",
+    "Monica Patel",
+    "Henry Cho",
+    "Sahana Iyer"
+  ],
+  "labels": [
+    "sdk",
+    "typescript",
+    "reliability",
+    "timeouts",
+    "streaming",
+    "devex"
+  ],
+  "linked_linear": [
+    "ENG-5124",
+    "ENG-5121"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "19",
+  "additions": "612",
+  "deletions": "231",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "release_notes": [
+    "TypeScript SDK now supports a standardized `timeouts` config block: `timeout_ms`, `connect_timeout_ms`, `read_timeout_ms`.",
+    "Default timeouts are now consistent with the SDK timeout ADR (non-streaming: 60s overall; streaming: 10m overall + 60s idle).",
+    "Streaming now enforces an idle read timeout (no bytes/events) via AbortController to avoid hung streams behind proxies.",
+    "Legacy `timeout` option is still accepted but is deprecated; it maps to `timeouts.timeout_ms`."
+  ],
+  "body": "## Summary\\nStandardizes timeout behavior in the TS SDK and fixes AbortController wiring so cancellation/timeouts are applied correctly for both streaming and non-streaming requests. This brings TS into parity with the timeout model ADR and unblocks conformance tests around streaming idle hangs.\\n\\nPrimary changes:\\n- Introduce a single `timeouts` configuration block (`timeout_ms`, `connect_timeout_ms`, `read_timeout_ms`) at both client level and per-request override.\\n- Implement portable enforcement using `AbortController` for `timeout_ms` (overall per-attempt deadline).\\n- Implement streaming **idle** enforcement for `read_timeout_ms` by aborting the request if no bytes/events are observed for the configured period.\\n- Ensure we create a fresh AbortController/timers per retry attempt (no controller reuse across attempts).\\n- Document runtime limitations: granular connect/read enforcement is best-effort; browser fetch cannot reliably enforce connect timeouts, and non-streaming read timeout collapses to the overall timeout.\\n\\nRefs:\\n- ADR: SDK Timeout Model (v1) \u2014 Overall + Connect/Read Timeouts (published 2026-01-24, updated 2026-02-18)\\n- ENG-5124: TypeScript retry/timeout refactor\\n\\n## Motivation\\nSupport + internal dogfooding found multiple edge cases where timeouts and cancellation were inconsistent:\\n- Streaming requests could remain open indefinitely when a corporate proxy half-opened the connection (no more events, no FIN).\\n- In Node, we were sometimes creating an AbortController but not consistently plumbing it through both request + stream reader.\\n- User-provided `signal` + SDK timeout signal were not combined, causing either (a) timeouts to be ignored or (b) user cancellation to be dropped depending on call path.\\n\\nThis PR implements the ADR semantics in TS and makes streaming timeout behavior predictable.\\n\\n## Design / Behavior\\n### Public API\\nNew standardized option names (client-level):\\n```ts\\nconst client = new Redwood({\\n  apiKey: process.env.REDWOOD_API_KEY,\\n  timeouts: {\\n    timeout_ms: 60_000,\\n    connect_timeout_ms: 10_000,\\n    read_timeout_ms: 60_000,\\n  },\\n});\\n```\\nPer-request override (RequestOptions):\\n```ts\\nawait client.responses.create(\\n  { model: \"redwood/llama-3.1-70b\", input: \"...\" },\\n  { timeouts: { timeout_ms: 30_000 } }\\n);\\n```\\nLegacy compatibility:\\n- `timeout` (number) is still accepted (client + request options) and maps to `timeouts.timeout_ms`.\\n- A deprecation warning is emitted once per process when `timeout` is used.\\n\\n### Defaults (per ADR)\\n- Non-streaming default: `timeout_ms=60_000`, `connect_timeout_ms=10_000`, `read_timeout_ms=60_000`\\n- Streaming default: `timeout_ms=600_000`, `connect_timeout_ms=10_000`, `read_timeout_ms=60_000` (idle)\\n\\nDisabling:\\n- `timeout_ms=0` disables overall deadline enforcement (no AbortController timer for overall timeout).\\n- `read_timeout_ms=0` disables streaming idle enforcement.\\n\\n### Streaming semantics\\n- `timeout_ms` is the max wall-clock lifetime of the stream (per attempt).\\n- `read_timeout_ms` is an **idle timeout** between bytes/events. If we do not observe any bytes/events for `read_timeout_ms`, we abort the request and throw a typed TimeoutError (`phase=read`).\\n- We reset the idle timer on *any* received chunk, not just fully parsed SSE events, to be resilient to proxy buffering behavior.\\n\\n### Per-attempt semantics (retries)\\nTimeouts are applied per attempt. The retry layer instantiates a new controller/timers per attempt to avoid accidental cancellation propagation to subsequent attempts. (Total elapsed time bounding remains the responsibility of retry configuration.)\\n\\n## Implementation details\\n### Abort signal merging\\nWe now consistently merge user cancellation with SDK timeout cancellation:\\n- If `AbortSignal.any` exists (Node 20+/modern runtimes), we use it.\\n- Otherwise we fall back to a small local `mergeAbortSignals()` helper that forwards abort and preserves a best-effort abort reason.\\n\\n### Overall timeout timer\\n- For `timeout_ms > 0`, we create an AbortController and schedule a timer that aborts it with reason `{ type: \"timeout\", phase: \"overall\", timeout_ms }`.\\n- We always clear timers in `finally` blocks to avoid leaks.\\n\\n### Streaming idle timeout\\n- For streaming responses we wrap the response body reader and maintain a \u201clast activity\u201d timer.\\n- When the timer fires we abort the controller with reason `{ type: \"timeout\", phase: \"read\", timeout_ms: read_timeout_ms }`.\\n- We capture `x-request-id` once headers are available and attach it to the TimeoutError when possible (idle timeouts happen after headers, so request_id is usually present).\\n\\n### Error surface\\nThis PR adds/extends `TimeoutError` (SDK error taxonomy work is ongoing in a separate PR, but we need a stable shape here):\\n- `name`: `TimeoutError`\\n- `message`: includes `phase` + `timeout_ms`\\n- `request_id`: included when available\\n- `phase`: `overall | read | connect` (connect is currently best-effort / not reliably detected in fetch; set only when we can infer)\\n- `retryable`: `true`\\n\\nNon-timeout aborts:\\n- If the user signal aborts, we surface an `AbortError` mapped to our SDK error wrapper and do **not** label as TimeoutError.\\n\\n### Runtime limitations (documented)\\n- Browser fetch cannot reliably implement `connect_timeout_ms` at the network layer; we accept the option for parity but do not enforce it.\\n- For non-streaming requests, `read_timeout_ms` is effectively equivalent to overall `timeout_ms` with fetch; we keep the knob for parity but document that enforcement is via overall deadline.\\n\\n## Tests\\n- Unit tests:\\n  - Non-streaming request aborts after `timeout_ms`.\\n  - Streaming idle abort triggers after `read_timeout_ms` of inactivity and yields TimeoutError with `phase=read`.\\n  - Streaming overall abort triggers after `timeout_ms` even if bytes continue.\\n  - Merged signals: user abort wins and does not get classified as timeout.\\n  - Retry attempt isolation: first attempt timeout does not cancel subsequent attempt controller.\\n- Added fixtures for the conformance suite runner to simulate \u201cno more bytes\u201d on stream bodies (Node test harness).\\n\\n## Docs / Developer notes\\n- Updated inline option docs + README snippet in this repo to use `timeouts.*` naming.\\n- Added a short \u201cTimeouts & streaming\u201d section to `docs/streaming.md` explaining idle vs overall and how to disable each.\\n- Follow-up docs-site PR will mirror these examples across languages (tracked in ENG-5128).\\n\\n## Rollout / Compatibility\\n- No API removals in this PR.\\n- The only behavior change is the introduction of defaults for streaming overall timeout + idle timeout in cases where callers were relying on \u201cinfinite\u201d streams. Callers can set `timeouts.timeout_ms=0` and/or `timeouts.read_timeout_ms=0` to preserve the previous behavior.\\n\\n---\\n\\n### Changed areas (high level)\\n- `src/core/requestOptions.ts`: introduce `Timeouts` type + normalization (legacy `timeout` -> `timeouts.timeout_ms`).\\n- `src/core/fetcher.ts`: consistent AbortController creation per attempt; signal merging; cleanup.\\n- `src/streaming/sse.ts`: add idle timer + activity reset on chunk reads; improved cancellation semantics.\\n- `src/errors.ts`: add `TimeoutError` fields + mapping from abort reason.\\n- `test/timeouts/*.test.ts`: new coverage for overall + idle timeouts and merged signals.\\n\\n### Notable snippet (illustrative)\\nWe now abort with a structured reason so we can differentiate user abort vs timeout abort:\\n```ts\\ncontroller.abort({ type: \"timeout\", phase: \"read\", timeout_ms: readTimeoutMs });\\n```\\nand later map to `TimeoutError` in a single place.\\n\\n## Review conversation (highlights)\\n**Ibrahim Khan (requested changes)**: \u201cPlease align defaults + semantics exactly to the timeout ADR table (60s non-streaming / 10m streaming; idle=60s). Also confirm per-attempt controller creation under retries.\u201d\\n\\n**Dana Lo (author)**: \u201cUpdated defaults to match ADR; added an explicit `createAttemptSignals()` helper used by both non-streaming and streaming paths so retries always allocate a fresh controller + timers.\u201d\\n\\n**Allison Grant**: \u201cFor streaming idle timeout, reset on bytes read rather than parsed events; proxies can buffer SSE frames and we should treat any bytes as activity.\u201d\\n\\n**Dana Lo**: \u201cDone. Idle timer now resets on each `reader.read()` chunk. Added a regression test where partial SSE frames arrive in multiple chunks.\u201d\\n\\n**Sahana Iyer**: \u201cCI is running Node 18 in one workflow; `AbortSignal.any` isn\u2019t available there.\u201d\\n\\n**Dana Lo**: \u201cAdded a polyfill merge helper with feature detection; Node 18 job is green now.\u201d\\n\\n**Henry Cho**: \u201cMake sure the deprecation warning for `timeout` is non-spammy.\u201d\\n\\n**Dana Lo**: \u201cWarning is once-per-process (guarded by a module-level flag). Also added a doc note showing the new `timeouts` block.\u201d\\n\\n### Approvals\\n- Ibrahim Khan: Approved\\n- Allison Grant: Approved\\n- Monica Patel: Approved\\n\\n## CI\\n- lint: pass\\n- unit tests: pass\\n- integration (node fetch streaming): pass\\n- build: pass\\n\\n## Follow-ups\\n- Wire conformance suite \u201ctimeout phase\u201d expectations once error taxonomy PR lands (ENG-5126).\\n- Docs-site parity update (ENG-5128).",
+  "changed_files": [
+    "src/core/requestOptions.ts",
+    "src/core/fetcher.ts",
+    "src/core/mergeAbortSignals.ts",
+    "src/streaming/sseStream.ts",
+    "src/errors.ts",
+    "src/index.ts",
+    "docs/streaming.md",
+    "README.md",
+    "test/timeouts/nonStreamingTimeout.test.ts",
+    "test/timeouts/streamingIdleTimeout.test.ts",
+    "test/timeouts/streamingOverallTimeout.test.ts",
+    "test/timeouts/mergedSignals.test.ts"
+  ],
+  "commits": [
+    "refactor(options): normalize legacy timeout -> timeouts block",
+    "feat(timeouts): add overall timeout via AbortController per attempt",
+    "feat(streaming): enforce read idle timeout + clean abort propagation",
+    "feat(errors): add TimeoutError + abort reason mapping",
+    "test: add coverage for overall/idle timeouts and signal merging",
+    "docs: document timeout defaults + streaming edge cases"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_99799c7ad3d24023bfd23c4806629350"
+}

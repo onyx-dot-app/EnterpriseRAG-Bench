@@ -1,0 +1,88 @@
+{
+  "title": "Quantile trajectory decomposition for end-to-end traces",
+  "owner": "Ava Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/quantile-trajectory-decomposition",
+  "doc_type": "doc",
+  "created_at": "2024-11-07",
+  "last_modified": "2024-11-20",
+  "collaborators": [
+    "Miguel Torres",
+    "Priya Patel",
+    "Jackson Lee"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "latency",
+    "profiling",
+    "p50-p95-p99",
+    "batching",
+    "kv-cache"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/runtime/pull/1287",
+    "JIRA: INF-4521",
+    "confluence.redwood.ai/pages/viewpage.action?pageId=80823"
+  ],
+  "summary": "Working notes for a new \"quantile trajectory\" approach: rather than only reporting stage-level quantiles independently, we sample traces at global quantiles (p50/p95/p99), align them by token-emit anchoring, and decompose where the quantile divergence actually arises. Goal: actionable levers for p95/p99 reduction where classical histograms hide correlations.",
+  "motivation": "We repeatedly see p95\u2197 and p99\u2197 with similar median behavior. Standard per-stage histograms show wide tails but don't reveal whether the tail is due to queueing, GPU variance, KV misses, or serialization. Need a way to trace the temporal trajectory of a quantile event end-to-end and attribute the largest contributors with context (seq_len, batch_size, model_variant).",
+  "methodology": "1) Pull a random stratified sample of 20k traces across 72 hours, stratified by model_variant and seq_len bucket. 2) Compute global end-to-end latency quantiles (p50,p95,p99). 3) For each quantile, pick 500 representative traces closest to that quantile value. 4) Align traces by first-token-emit timestamp (anchoring) so downstream stage residence times are comparable across samples. 5) Compute stage medians and stage quantile spreads across the sample and build cumulative contribution curves. 6) Complement with conditional cohorts (seq_len>512, cold-start, batch>1).",
+  "trace_selection": "Sample window: 2024-10-28 to 2024-10-30, ~72h. Models: rwd-7b, rwd-12b, community-ggml-13b; Traffic: production-hosted (75%) + dedicated (25%). Filters: successful responses only, total tokens <= 2048, exclude retries and streamed client disconnects.",
+  "alignment_strategy": "Anchor on first-token-emit (token_emit_0) instead of request-arrival. Reason: arrival\u2192token_emit includes variable tokenization and scheduling delays; anchoring isolates runtime path after model activation and reveals batching/compute variance more clearly.",
+  "per_stage_metrics": "Overall E2E quantiles across sample: p50=52ms, p95=198ms, p99=1240ms.\nPer-stage median and tail summary (ms):\n- Tokenize: p50=3, p95=6, p99=18\n- Preprocess (CPU): p50=4, p95=16, p99=48\n- Queue wait (async-batcher): p50=8, p95=52, p99=520\n- KV load/cache-miss: p50=5, p95=22, p99=180\n- Forward GPU compute: p50=18, p95=92, p99=400\n- KV write: p50=1, p95=6, p99=24\n- Serialize+egress: p50=3, p95=10, p99=50\nNotes: At p50 the forward GPU compute is the single largest stage (~35%); at p99 the queue wait (batching) inflates dramatically and accounts for ~42% of p99 E2E in this sample.",
+  "observations": [
+    "p50 is stable and dominated by GPU compute as expected for common seq_len ranges.",
+    "p95 shows moderate growth in both GPU compute and queue wait; mixed causes (some long sequences, some small microbursts).",
+    "p99 is heavily skewed by queue wait/hold times originating in async-batcher handoff spikes and hotspot nodes with long running kernels.",
+    "Conditional cohort (seq_len>512) pushes GPU compute from p95->p99, but majority of p99 cases are short seq_len with large queue wait (i.e., batching pathology).",
+    "KV cache misses increase tail for a small fraction (~7%) of traces and correlate with specific model-version deployments where KV warmup was incomplete."
+  ],
+  "hypotheses": [
+    "Async-batcher uses a max-wait heuristic that interacts poorly with transient request bursts, producing long tail queue waits for small requests.",
+    "Some GPU nodes suffer kernel scheduling preemption or thermal throttling leading to elongated forward compute times for a subset of requests.",
+    "KV layer GC/locking increases latency for traces that hit cold shards during deployment windows.",
+    "Large serialization/egress observed when payloads include heavy metadata or when clients reconnect with slow sockets, but this is a small fraction."
+  ],
+  "quick_fixes": [
+    "Temporarily lower per-instance batch-wait threshold from 25ms -> 8ms for the low-latency tier to test reduction in p99 queue wait.",
+    "Enable eager-flush path for single-token and low-token requests (bypass async-batcher) for a 5% traffic cohort.",
+    "Add a lightweight per-node kernel-runner watchdog to kill/evict runaway kernels > 800ms compute (A/B to measure effect)."
+  ],
+  "recommendations": "Short term: roll eager-flush to 5% of traffic and measure p99 change; lower batch-wait on latency-tier nodes; add stage-level histograms conditioned on seq_len and batch size. Medium term: rework async-batcher handoff to avoid head-of-line blocking (token-slot fairness), instrument kernel preemption events, and add KV warmup rollout hooks for model version deploys.",
+  "next_steps": [
+    "Schedule A/B (eager-flush vs baseline) on 2 availability zones for 48h and capture same quantile trajectory analysis.",
+    "Create a microbenchmark harness to replay microburst traces and reproduce queue wait tail in staging (see linked PR for replay harness).",
+    "Add detailed kernel-scheduler telemetry labels to traces (kernel-id, preempt-count) and correlate with p99 samples.",
+    "Short task: patch async-batcher logging to record per-request enqueue timestamp + deque timestamp with node id and batch id for easier root-cause mapping."
+  ],
+  "notable_traces": [
+    "trc-20241029-a7c2 (p99, queue_wait=920ms, seq_len=24)",
+    "trc-20241030-f1b9 (p99, gpu_compute=630ms, seq_len=1024)",
+    "trc-20241030-c3d4 (p95, mixed queue + gpu, seq_len=64, model=rwd-12b)",
+    "trc-20241028-h2k1 (p99, kv-miss then long serialize, model=community-13b)",
+    "sample-ids-in-note: 5k-traces-sample-quantile-p95-set"
+  ],
+  "appendix_notes": "Analysis caveats: sample biased to traffic windows chosen; streaming clients with partial disconnects were excluded but do contribute to production tail. Alignment by token_emit helps isolate runtime but hides tokenization and scheduling anomalies that happen before first-token-emit; keep a second view anchored on arrival for completeness.",
+  "owner_followup": "Ava Chen - will owner the A/B, coordinating with Jackson for kernel telemetry and Priya for KV rollout hooks. Target: initial A/B results within 2 weeks.",
+  "file_notes": "Working doc \u2014 keep informal. Will convert to a formal postmortem if the A/B indicates system-level fixes are required.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "motivation",
+    "methodology",
+    "trace_selection",
+    "alignment_strategy",
+    "per_stage_metrics",
+    "observations",
+    "hypotheses",
+    "quick_fixes",
+    "recommendations",
+    "next_steps",
+    "notable_traces",
+    "appendix_notes",
+    "owner_followup",
+    "file_notes"
+  ],
+  "dataset_doc_uuid": "dsid_a097bd08013c42ce8c36b611719c7038"
+}

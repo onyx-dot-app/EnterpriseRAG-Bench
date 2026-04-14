@@ -1,0 +1,57 @@
+{
+  "key": "ENG-360123",
+  "team": "engineering",
+  "title": "Prefix catalog: probabilistic merge, session-resilient dedupe, and GPU slot compaction",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-14",
+  "updated_at": "2026-03-05",
+  "creator": "Aisha Gupta",
+  "assignee": "Marco Reyes",
+  "project": "runtime-kv-optimization",
+  "cycle": "2026-W09",
+  "estimate": "8",
+  "due_date": "2026-03-18",
+  "labels": [
+    "kv-cache",
+    "gpu-memory",
+    "continuous-batching",
+    "multi-tenant"
+  ],
+  "description": "Problem: For multi-tenant continuous batching workloads we observe duplicated prefix fragments across requests and sessions that waste GPU-resident KV memory and increase per-token cost. Existing strict exact-key dedupe misses near-duplicates introduced by small prompt edits, slot interpolation, and template parameterization. This ticket designs and implements a session-resilient prefix catalog that enables probabilistic merge of similar prefix fragments, background compaction, and GPU slot compaction to reclaim fragments safely while preserving correctness and latency SLOs.\n\nGoals:\n- Increase GPU KV hit rate for real workloads by reusing near-duplicate prefixes across sessions and tenants where allowed by isolation policies.\n- Reduce resident GPU KV footprint through compaction and slab packing without increasing tail latency beyond SLO.\n- Provide controlled probabilistic merging (merge hooks) with tunable similarity thresholds and safety checks so we avoid hallucinated cache reuse.\n\nHigh-level approach:\n1) Prefix fingerprinting: compute a dual-hash fingerprint (fast 64-bit rolling + locality-sensitive hash) for each prefix fragment at insertion time. Store both in the catalog index entry.\n2) Probabilistic candidate selection: use a small LSH table keyed by the locality-sensitive sketch to return merge candidates cheaply. Use an additional Bloom filter per tenant to avoid cross-tenant leakage for isolation-sensitive configs.\n3) Merge decision: run a lightweight similarity comparator on CPU (token overlap, n-gram Jaccard, and dot-product on a compact prefix embedding) to accept or reject merge. Record merge provenance metadata (merged_from keys delimited) to enable rollback during evictions.\n4) Atomic GPU compaction: when multiple fragments are merged, create a new compacted slab on GPU with coalesced KV entries; install via an atomic pointer swap and mark old slabs for asynchronous reclamation.\n5) Slot packing heuristic: use a best-fit bin packing of fragment sizes per GPU slab to minimize wasted slots; prefer moving small merged fragments into existing underutilized slabs before allocating new ones.\n6) Background compaction worker: async compaction that throttles to avoid extra tail latency. Compaction is scheduled based on fragmentation ratio and memory pressure signals from the allocator.\n\nTrade-offs considered:\n- False merges vs memory savings: Conservative similarity thresholds reduce incorrect reuse but reduce savings. We will expose threshold knobs: conservative, balanced, aggressive.\n- CPU cost of similarity checks: offloading heavy checks to CPU can increase host overhead; we limit checks by LSH prefilter and sample-based acceptance.\n- Multi-tenant safety: default behavior is tenant-isolated dedupe. Allow cross-tenant merge only if the tenant ACL and contract permit shared fragments (Dedicated customers can opt-in).\n\nInstrumentation and metrics (initial):\n- prefix_merge_rate: fraction of insertions that were merged (by threshold bucket).\n- prefix_hit_delta: change in KV hit rate attributable to merged entries (requires trace-level attribution).\n- slab_fragmentation_ratio: fraction of slab bytes unused due to internal fragmentation.\n- compaction_duration_ms: histogram of compaction job runtime.\n- rollback_rate: fraction of merges that were later rolled back due to correctness/regression signals.\n- tail_p99_increase_ms: p99 latency delta when compaction concurrent with serving.\n\nDesign/implementation phases:\n- Phase 1 (spike): implement dual-fingerprint and LSH prefilter on CPU, simulate merge decisions offline using 2 weeks of sampled production traces. Deliver a Confluence doc with measured collision rates and memory/reuse projections. (Spike complete: link below)\n- Phase 2 (PoC): implement in-memory catalog + merge logic in the runtime, but use host-side compacted storage (not yet GPU-resident). Validate correctness and benchmarks.\n- Phase 3 (GPU integration): implement atomic slab compaction and slot packing in GPU allocator; add async reclamation and safe rollback.\n- Phase 4 (opt-in rollout): expose controls in the Console and enable opt-in for non-sensitive tenants; run canary with traffic shaping and mitigate regressions.\n\nLinks:\n- Confluence: https://redwood.atlassian.net/wiki/spaces/INF/pages/PKV-Session-Resilient-Prefix-Catalog\n- Spike results notebook (internal): drive.google.com/drive/folders/1XxExampleSpikeNotebook\n- GitHub spike PR: https://github.com/redwood-inference/runtime/pull/1857\n\nImplementation notes:\n- Fingerprinting uses fnv64_xor for quick equality buckets and a 128-bit SimHash compressed to 64 bits for similarity LSH. We keep a short token sketch (first/last n tokens) to catch template parameter shifts.\n- Catalog index stored as a compact vector of entries: key, fnv64, simhash64, size_bytes, tenant_id, last_used_ts, merged_from_list (comma-separated ids). All values stored in host memory index; heavy payload remains in GPU slabs.\n- To avoid long GC pauses, evicted/old slabs are enqueued for batched free that runs outside request path. Reclamation also triggers compaction when fragmentation ratio > 30%.\n- Rollback: when a merged entry is found to cause a quality regression (via evals or output divergence), we record rollback cause and perform an atomic unmerge: re-create previous slabs from provenance pointers if still available or mark the merged entry as no-merge for a TTL.\n\nSecurity & privacy:\n- Cross-tenant merge is disabled by default. For Dedicated/Private customers we honor KSIs and contractual restrictions.\n- Bloom filters per-tenant ensure quick exclusion of tenants from candidate pools.\n- Merged provenance metadata is treated as internal debug data and access-controlled.\n\nRisks and mitigations:\n- Incorrect merge causing subtle output differences: mitigate with canaries, A/B evals on representative prompts, and quick rollback hooks.\n- GPU compaction impacting p99 latency: throttle compaction and prefer off-peak windows; instrument and auto-disable compaction if p99 regresses > configured threshold.\n- State explosion in merged_from metadata: cap provenance length and use sampling/summary when provenance gets too long.\n\nNext steps / immediate todos:\n- Marco: land LSH index and dual fingerprint computation in runtime core (WIP branch: feature/prefix-catalog).\n- Aisha: add Confluence section with similarity thresholds and tuned knobs for POC.\n- QA: prepare prompt regression set and load test harness for canary (estimate 3 days).\n- Infra: allocate 2 dev GPUs with tracing flags enabled for compaction telemetry.\n\nEstimated savings (simulation):\n- Median-case: 10-18% reduction in GPU KV resident bytes for sampled customer workloads.\n- Best-case (templated SaaS traffic): up to 35% reduction.\n- Expected CPU overhead: +3-6% host cycles on average for insertion-heavy workloads with balanced threshold.\n",
+  "acceptance_criteria": [
+    "Catalog computes two fingerprints for each prefix insertion and populates LSH index.",
+    "Offline simulation demonstrates measurable reuse (>8% GPU KV reduction) on sampled traces with conservative threshold.",
+    "PoC running in runtime can merge and unmerge in host memory without impacting p99 by >5% during test harness runs.",
+    "GPU compaction path implemented and can atomically swap compacted slabs for merged entries in a controlled dev canary.",
+    "Console has a toggle (off/conservative/balanced/aggressive) and an opt-in flag per tenant for cross-tenant merge.",
+    "Monitoring dashboards show prefix_merge_rate, slab_fragmentation_ratio, compaction_duration_ms, rollback_rate."
+  ],
+  "comments": [
+    "2026-02-16 - Aisha Gupta: Spike complete. SimHash collisions are ~0.7% with our 64-bit compression on the sampled traces. Offline simulation shows 12% avg GPU KV reduction at balanced threshold. Notebook uploaded.",
+    "2026-02-20 - Marco Reyes: Implemented fnv64 + simhash64 generation in feature/prefix-catalog. Added unit tests for collision edge cases. Opened PR #1892 for initial index integration.",
+    "2026-02-25 - Priya Nair (PM): Reviewed. Add explicit canary plan for Dedicated customers and ensure console toggle surfaces SLA risk. Also request that cross-tenant merge is gated behind legal/contract signoff.",
+    "2026-03-01 - Security (Dan Liu): Bloom filter approach approved for tenant isolation but flagged need for access control on merged provenance; added to security_review_required.",
+    "2026-03-04 - Marco Reyes: PoC host-side merging validated. Started implementing GPU slab compaction prototype. Observed compaction jobs that ran concurrently with 95th percentile load increased p99 by ~18ms in dev; will throttle compaction worker and re-run.",
+    "2026-03-05 - SRE (Liu Chen): Suggested adding a safety auto-disable when tail_p99_increase_ms > 10ms sustained over 5 minutes during canary. Added to rollout plan."
+  ],
+  "attachments": [
+    "https://drive.google.com/drive/folders/1XxExampleSpikeNotebook",
+    "https://github.com/redwood-inference/runtime/pull/1857",
+    "https://redwood.atlassian.net/wiki/spaces/INF/pages/PKV-Session-Resilient-Prefix-Catalog"
+  ],
+  "dependencies": [
+    "ENG-61234",
+    "ENG-70321"
+  ],
+  "release": "runtime-1.36",
+  "customer_impact": "medium",
+  "security_review_required": "true",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_3e5c1c113d574f9cb3c8d434bb00489c"
+}

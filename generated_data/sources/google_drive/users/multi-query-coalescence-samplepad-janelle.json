@@ -1,0 +1,35 @@
+{
+  "title": "Multi-query coalescence samplepad",
+  "owner": "Janelle Ortiz",
+  "drive_area": "users",
+  "path": "users/multi-query-coalescence-samplepad-janelle.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-02",
+  "last_modified": "2025-11-07",
+  "collaborators": [
+    "Marcus Chen",
+    "Ibrahim Patel"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "coalescing",
+    "latency",
+    "throughput",
+    "warmup",
+    "benchmark",
+    "qps",
+    "p99"
+  ],
+  "linked_artifacts": [
+    "GHPR: redwood/serve#4821",
+    "JIRA: SERVE-998",
+    "confluence:Priming-and-Coalescing-Notes"
+  ],
+  "body": "Objective:\nExplore the practical latency vs throughput tradeoffs when applying a small coalescing window across many short, independent queries. This was motivated by many client apps issuing 1-8 token prompts concurrently; hypothesis is that short coalescing can reduce per-request GPU kernel overhead and improve aggregated throughput, but may hurt tail latency for single-request interactive flows.\n\nHypothesis:\n1) A 2-8 ms coalescing window will show best cost/throughput gains for medium QPS (50-300 qps) on A100-like nodes.\n2) p50 improves noticeably; p99 may degrade at low load because coalescing waits for extra requests.\n3) There exists a sweet spot (around 4 ms) that reduces per-token GPU invocation overhead but preserves interactive p99 for the majority of flows.\n\nSetup / environment:\n- Date: runs 2025-11-03 to 2025-11-06 (iterative).\n- Cluster: Dedicated inference node (A100 80GB equiv), 1 model replica pinned.\n- Model: opt-mini-6B-like (approx), quantized to q4_0 for baseline; also one run with fp16 for sanity check. Reported as model: opt-m6b-q4_0.\n- Runtime: Redwood serving runtime commit GHPR 4821-built; coalescing feature toggled in request router.\n- Client harness: synthetic client (go) generating variable poisson arrivals; max concurrency limiter off; warmup requests separate.\n- Measurement window: 5m steady-state after 2m ramp (unless otherwise noted).\n- Payloads: 3 payload shapes: tiny (6 tokens), short (24 tokens), medium (120 tokens). Mixed run uses distribution 60% tiny / 30% short / 10% medium.\n- Metrics captured: p50, p95, p99 latencies (ms), tokens/s, requests/s, GPU utilization, CPU per-worker, KV cache hit rate (not relevant for independent short prompts), and observed batching sizes.\n\nCoalescing configs tested:\n- disabled (0 ms)\n- 2 ms\n- 4 ms\n- 8 ms\n- 16 ms (sanity for larger windows)\n\nKey observations (mixed distribution, 150 qps target):\n- 0 ms: p50=23ms, p95=72ms, p99=165ms, tokens/s=18.2k, avg batch size=1.07\n- 2 ms: p50=18ms, p95=60ms, p99=178ms, tokens/s=21.1k, avg batch size=1.5\n- 4 ms: p50=15ms, p95=53ms, p99=185ms, tokens/s=23.7k, avg batch size=1.9\n- 8 ms: p50=14ms, p95=57ms, p99=245ms, tokens/s=24.9k, avg batch size=2.6\n- 16 ms: p50=13.5ms, p95=84ms, p99=420ms, tokens/s=25.3k, avg batch size=3.1\n\nInterpretation:\n- Per-token throughput improved monotonically with window up to 8-16ms, but tail latency (p99) degraded sharply after ~4ms because some lonely requests waited the full coalescing window before being dispatched.\n- The p50 gains come from amortizing kernel init/overhead across multiple requests; tokens/s increasing indicates real GPU efficiency wins.\n- At 4 ms we get a strong balance: ~30% tokens/s improvement vs baseline while p95 still improves; p99 is slightly worse but within tolerable threshold for many batch-oriented workloads.\n- 8ms and 16ms improved throughput slightly more, but the p99 hit is unacceptable for interactive apps.\n\nSingle-size microbench (tiny only, 60 qps target):\n- 0 ms: p50=10ms, p95=40ms, p99=130ms\n- 4 ms: p50=7.8ms, p95=39ms, p99=310ms\nNote: p99 blowup is more severe at low overall QPS because fewer concurrent requests available to form batches within the window.\n\nBurst behavior (spiky arrival; 500 qps peak brief 10s):\n- coalescing helped smooth GPU load; average batch size spiked to 4.1 during peak for 4 ms.\n- transient p99 spikes during ramp-up but recovery was faster because more efficient packing reduced queue buildup.\n\nEdge-case: cold-start + coalescing\n- If endpoint is cold (cold kernels / cache warming), coalescing adds small extra delay but total cold latency still dominated by warmup; coalescing did not meaningfully change cold token generation time once kernels loaded.\n\nTelemetry notes:\n- Observed requests accumulated in queue for windows >8ms when traffic was sparse. Need to instrument per-tenant lonely-request ratio to guard against p99 harm.\n- GPU util improved from 48% -> 72% at 4 ms for mixed distribution run.\n\nQuick conclusions / recommendations:\n1) Default coalescing window of 4ms for tenant-class: \"compute-efficient\" (background batch jobs, low interactivity) yields good unit-cost wins with acceptable tail.\n2) Expose policy: per-route override to set coalescing window and a kill-switch for latency-sensitive routes. Suggest route default 0ms for interactive routes and 4ms for batch/ingest endpoints.\n3) Add server-side adaptive fallback: if a request waits longer than X ms and current queue length is 0 (i.e., lonely), force immediate dispatch to avoid p99 cliff. Implement small heuristic: if wait_time > 8ms and observed avg concurrency < 1.5 -> flush early.\n4) Instrument lonely-request ratio and p99 delta per-tenant. Add alert when p99 increases > 2x after toggling window.\n5) For low-QPS single-request flows, avoid static windows >2ms.\n\nFollow-ups / experiments to run next:\n- Adaptive windowing: dynamic shrinking of window when queue occupancy low.\n- Combine with prefill/priming: if a route has predictable short prompts, prefill KV cache to reduce per-request variance.\n- Run across heterogeneous GPU fleet (T4 / A10 / A100 equivalents) to quantify kernel-hookup cost differences.\n- Compare with client-side coalescing (grouping at SDK) vs server-side \u2014 tradeoffs in fairness and cross-tenant mixing.\n\nNotes to self / TODO:\n- Add traces of a few representative lonely-request p99 samples to GHPR for repro.\n- Hook new metrics into console (per-route avg batch size, lonely-request ratio).\n- Sync with SEs (Marcus) about how this impacts enterprise interactive customers.\n\nRaw logs & commands (high-level):\n- harness: ./bench --model opt-m6b-q4_0 --qps 150 --mix tiny:0.6,short:0.3,med:0.1 --coalesce-ms 4 --dur 420\n- runtime: docker image redwood/serve:2025-11-01-gh4821\n- quick grep on server logs: grep -E \"coalesce.*wait=\" /var/log/serve/requests.log | head -n 40\n\nFinal thought: small, carefully conditioned coalescing is a low-friction lever to improve unit economics for high-volume short-prompt workloads. The trick is policy and telemetry (protect lonely requests).\n\n-- Janelle",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_3b34d3cbf2144e8cb32d918460eea834"
+}

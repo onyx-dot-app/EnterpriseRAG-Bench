@@ -1,0 +1,34 @@
+{
+  "title": "iptables restore -> Node NotReady trace",
+  "owner": "Ravi Sinha",
+  "drive_area": "users",
+  "path": "users/iptables-restore-node-notready-trace.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-08",
+  "last_modified": "2025-02-11",
+  "collaborators": [
+    "Claire Morgan",
+    "Diego Alvarez"
+  ],
+  "team": "eng-sre",
+  "status": "draft",
+  "tags": [
+    "k8s",
+    "node",
+    "iptables",
+    "kubelet",
+    "gke",
+    "debug"
+  ],
+  "linked_artifacts": [
+    "INC-1423",
+    "https://github.com/redwood-inference/infra/pull/278",
+    "https://confluence.redwood.ai/pages/viewpage.action?pageId=11321"
+  ],
+  "content": "Quick scratchpad for the Node NotReady incident where nodes stopped accepting pods after a batch of rebooted hosts (noticed 2025-02-07 morning). Focus: iptables-restore failures during kubelet startup and resulting CNI/iptables mismatch.\n\nSummary/context:\n- Environment: small GKE-compatible on-prem cluster (custom COS image + containerd), autoscaling via internal tool. \n- Trigger: rolling reboot for kernel updates (package CVE-2024->2025). ~6/24 nodes rebooted; 3 nodes did not become Ready.\n- Observed: kubelet up, node reports NotReady, kube-proxy failing to establish iptables rules. Pods stuck Pending with reason: NodeAffinity/Insufficient or runtime/cni errors.\n\nTimeline notes (rough):\n- 08:04: reboot batch kicked off\n- 08:10: nodes begin re-attaching to cluster\n- 08:13: three nodes show NotReady in kubectl get nodes\n- 08:15: first manual ssh to node-12 to collect logs\n\nCommands tried and outputs (collected):\n- kubectl get nodes -o wide\n  node-12   NotReady   30m   v1.27.4   10.10.3.12   <none>\n\n- ssh root@node-12 systemctl status kubelet --no-pager\\  \n  \"Active: active (running)\" but recent restart (8:12) and lots of warnings\n\n- journalctl -u kubelet -e | tail -n 60\\  \n  \"E0208 08:13:22.123456   1621 kubelet.go:2287] Error updating node status, will retry: failed to set node annotation: Put \\\"https://apiserver/api/v1/nodes/node-12\\\": net/http: TLS handshake timeout\"\n  \"E0208 08:13:30.987654   1621 server.go:123] Failed to run iptables-restore: exit status 2: iptables-restore v1.8.8 (legacy): /run/xtables.lock: cannot open: Permission denied\"\n\n- iptables-restore /tmp/iptables.rules (manual test)\n  error: /run/xtables.lock: cannot open: Permission denied\n\n- ls -l /run/xtables.lock\\  \n  -rw-r----- 1 root xtables 0 Feb 8 08:12 /run/xtables.lock\n\n- ps aux | grep kube-proxy\\  \n  kube-proxy running as root? no, running as kproxy user (systemd configured to drop privileges) \n\n- journalctl -u kube-proxy -e\\  \n  \"failed to run command iptables-restore: exec: \\\"/usr/sbin/iptables-restore\\\": permission denied\"\n\nHypotheses so far:\n1) Permissions on /run/xtables.lock are too restrictive: kube-proxy (running as non-root) cannot write -> iptables-restore fails. But iptables usually needs root. Why was kube-proxy configured to drop privileges? Possible mismatch between package version and our service unit after image/kernel update.\n2) systemd ProtectSystem/ProtectHome or PrivateTmp flags blocking access to /run. Newer systemd or COS changes may differ.\n3) container runtime (containerd) created stray mount namespace where /run is not shared; iptables-restore executed in a different namespace without correct permissions.\n4) SELinux/AppArmor policy changed on the updated nodes causing permission denies.\n\nInvestigation notes:\n- On working node (node-08) iptables-restore runs as root because kube-proxy runs as DaemonSet with hostNetwork and hostPID, but process actually spawns iptables-restore via util that escalates. Need to check differences in systemd unit between node-08 and node-12: `systemctl cat kube-proxy` and check ExecStart and AmbientCapabilities.\n- Compared `systemctl cat kube-proxy` on healthy vs broken node: broken node had `User=kproxy` set (recent change), healthy node runs as `root`. That explains permission issue. Why change? The kube-proxy service unit was replaced by a new package from the COS image. Check image diff.\n\nQuick workaround attempted:\n- Edited systemd unit to set User=root and restarted kube-proxy -> iptables rules applied and node became Ready after ~30s.\n- Reverted (we want least-privileged): instead updated unit to add `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW` and `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW` and keep User=kproxy. Restarted -> iptables-restore still failed due to xtables lock ownership. After adding `Group=xtables` and ensuring kproxy user is in xtables group, iptables-restore succeeded. Node became Ready.\n\nRoot cause (working hypothesis):\n- New COS image packaged a kube-proxy systemd unit that runs as kproxy user for least privilege by default but omitted group membership or ambient caps declarations. The xtables lock file is owned by root:xtables with mode 0640; non-root user requires xtables group membership to acquire lock. In our previous installs, init scripts added kproxy to xtables group. The new image skipped this step.\n\nActionable next steps (for infra worklist):\n- Short term: roll patch that ensures kube-proxy unit includes AmbientCapabilities and that kproxy user is in xtables group. Create patch PR: infra/packer/cos-image-configs. (linked PR above).\n- Medium: add a startup test in baking pipeline that verifies kube-proxy can run iptables-restore as non-root. Call out as gating test.\n- Long: move to eBPF-based kube-proxy replacement in non-critical clusters to avoid iptables lock issues (tracking RFC).\n\nNotes / gotchas for future debugging:\n- Always check systemd unit diffs after image rollouts.\n- /run/xtables.lock permission problems show up as \"permission denied\" from iptables-restore; don't assume it's SELinux first.\n- For debugging quickly: `runuser -u kproxy -- /usr/sbin/iptables-restore /tmp/test.rules` replicates the exact permission environment.\n\nUnresolved:\n- Why did the package not add kproxy to xtables group? Check post-install scripts in image build logs.\n- Is there any race where xtables.lock is created before group membership applied? Unlikely but worth checking early-boot order.\n\nTODO (short):\n- [ ] Open infra bug with image team and attach logs (INC-1423).\n- [ ] Add unit test in packer build to run a simple iptables-restore as kproxy user.\n- [ ] Add note to runbook: if Node NotReady with iptables-restore permission denied -> check kube-proxy user/group + AmbientCapabilities.\n\nNotes to self: copy relevant snippets to incident postmortem. Keep this scratchpad lean and transfer final remediation steps to Confluence page (linked above).\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_781e1a23828f43ad99f2ce754bd29bf9"
+}

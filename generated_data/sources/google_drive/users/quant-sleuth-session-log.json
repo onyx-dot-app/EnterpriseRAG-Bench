@@ -1,0 +1,36 @@
+{
+  "title": "Quant sleuth session log",
+  "owner": "Aisha Raman",
+  "drive_area": "users",
+  "path": "users/aisha-raman/quant-sleuth-session-log.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-03",
+  "last_modified": "2025-11-15",
+  "collaborators": [
+    "Ethan Park",
+    "Lina Gutierrez"
+  ],
+  "team": "eng-applied-ml",
+  "status": "draft",
+  "tags": [
+    "fp8",
+    "int8",
+    "nan",
+    "repro",
+    "kv-cache",
+    "precision",
+    "investigation"
+  ],
+  "linked_artifacts": [
+    "GH: redwood/inference#2319",
+    "JIRA: INF-1452",
+    "confluence:quantization-playbook-v2"
+  ],
+  "content": "Quick session log / investigator notes. Purpose: capture commands tried, outputs, and hypotheses for the FP8/INT8 quality/NaN regressions observed on long-chat workloads. Notes are messy \u2014 for my future self and collaborators.\n\n---\nSUMMARY:\n- Intermittent NaNs when serving certain long conversational contexts (~>3k tokens) on fp8 quantized variant. Not deterministic but high frequency on particular prompt shapes (many system messages + long user history).\n- Behavior differs by backend: Triton build + cuBLASLt gives NaNs earlier than native CUDA kernels on the same card.\n- INT8 path passes unit tests but shows occasional quality drop (repetition/looping) not always NaN.\n\nTIMELINE / OBSERVATIONS:\n- 2025-10-28: First customer report: conversation collapsed into repeated token and then server error with NaN logits. Customer attached small repro prompt.\n- 2025-10-30: Local repro attempt failed initially (no NaNs). Added KV-cache prefetch of previous 8 blocks and triggered NaN.\n- 2025-11-01: Tried turning off prefix caching -> instability reduced but not eliminated.\n\nENVS / SETUP (common across runs):\n- GPU: 80GB A100 (driver 535.86), CUDA 12.1\n- Torch: 2.2.0a0+trunk local build (with cuBLASLt ops enabled)\n- Runtime: redwood-serving v1.7.2 (local dev image)\n- QUANT: fp8-e4m3 symmetric per-layer, INT8 asymmetric per-tensor (calibrated on a small corpus)\n\nCOMMANDS TRIED (most useful ones):\n1) baseline run (native kernels):\npython serve_model.py --model-path /models/mymodel --quant fp8 --cache-policy local --batch 1 --max-tokens 4096\n\n2) force triton kernels:\nTRITON_ENABLE=1 TRITON_VERBOSE=1 python serve_model.py --model-path /models/mymodel --quant fp8 --cache-policy local --batch 1\n\n3) disable fp8 autopromotion (attempted fallback to bf16):\nexport REDWOOD_QUANT_FALLBACK=0  # prevent fallback to bf16 on NaN\npython run_eval.py --prompt-file repro/prompts.txt --quant fp8 --repeat 5\n\n4) kv-cache stress pattern (repro):\n# create long history by repeated append\npython client_sim.py --prompt \"s\" --repeat 200 --session-id test-01\n\nERROR SNIPPETS (captured stdout/stderr):\n- tensor_logit = logits.max() -> includes NaN\n- cuBLASLt error: CUBLAS_STATUS_EXECUTION_FAILED at cublasLtMatmul:0x7f...\n- runtime: sample() returned NaN in softmax input (nan in logits)\n\nDEBUGGING STEPS / WHAT I TRIED:\n- Re-ran with OMP_NUM_THREADS=1 (no change).\n- Pinned TORCH_CUDA_ARCH_LIST to target architecture (compute_80).\n- Recompiled with TORCH_USE_CUDA_DSA=1 (still present).\n- Added per-layer clipping before softmax in a patched runtime: reduced NaN frequency but not eliminated (suggests values blowing up upstream).\n- Turned off rotary embeddings: NaNs still occur -> likely not rot.\n- Compared fp8 vs bf16 on same batch/seed: bf16 stable, fp8 crashes.\n- Zeroed out specific attention heads at runtime (mask): sometimes avoids NaN, points to head-localized instability.\n- Re-ran with deterministic RNG (PYTHONHASHSEED=42) but nondeterminism persists.\n\nHYPOTHESES:\n1) Quantization saturates dynamic range on deep kv-cache usage leading to amplification in attention scores (large dot-products -> exp overflow -> NaN).\n2) Kernel numerics differ: Triton/cublaslt fp8 matmul uses different accumulation order (reduced precision acc) causing rare overflow.\n3) Calibration dataset mismatch: INT8/FP8 scales computed on short sequences; when used on long-history, effective magnitudes differ and overflow.\n4) Mixed-precision promotions (some ops promoted to bf16) create mismatch in scales between layers causing drift.\n\nSAMPLE INVESTIGATIONS TO RUN NEXT:\n- Recalibrate quant scales with synthetic long-history traces (generate prompts that replicate customer history) and re-run.\n- Add runtime guard: if max(abs(tensor)) > threshold, recompute quant scale or force bf16 path for that layer. Log occurrences.\n- Instrument attention score distributions across layers/heads (min/max/mean/std) over time to find where blow-up starts.\n- Run with swapped accumulation precision: force fp32 accumulation for matmul (if possible) to test whether accumulation precision fixes NaN.\n- Try using stochastic rounding off/on (if supported) to observe effect on stability.\n\nQUICK POC COMMANDS (for next run):\n# instrument attention stats and write to /tmp/att_stats.log\nREDWOOD_DEBUG_ATT_STATS=1 python serve_model.py --model-path /models/mymodel --quant fp8 --cache-policy local --batch 1\n\n# force fp32 accumulation (env toggle in local runtime)\nREDWOOD_ACCUM_ACC=fp32 python serve_model.py --model-path /models/mymodel --quant fp8\n\nNOTES TO SELF / OBSERVATION FORMATTING:\n- Capture exact step (token idx) where max(abs(logits)) spikes. Useful for correlating with kv-cache entries.\n- Recreate minimal reproducible prompt \u2014 try to binary search on prefix length to find smallest length that triggers NaN.\n- When NaN occurs, dump per-layer activations for the last N steps (compress before storing).\n\nCONVERSATION / LINKS TO SLACK / TICKETS:\n- Slack thread: #eng-quant (see thread starting Oct 29)\n- JIRA INF-1452: \"FP8 instability on long chats\" (customer: AcmeAI)\n- GH PR: redwood/inference#2319 \u2014 earlier attempted patch to clip logits at softmax input (rollback pending more evidence)\n\nRANDOM NOTES / WILD IDEAS:\n- Could sparsity in the kv-cache (lots of repeated tokens) produce pathological attention matrices under low-precision accumulation?\n- Consider per-head dynamic switching: track head stability metric and demote unstable heads to bf16 on the fly.\n- Try training-aware quantization: use distillation traces from long chats to create better scale tables.\n\nNEXT ACTIONS (short):\n- Run recalibration with long-history traces (Lina) by EOD Fri.\n- Add attention stat logging and run a 12h stress test in staging (Ethan owning).\n- If fp32 accumulation avoids crash, prepare a short perf vs stability doc to propose as temporary mitigation.\n\n---\nEnd of session notes. Keep chaotic \u2014 will structure into a playbook if/when we find reproducible root cause.\n\n",
+  "file_path": "sources/google_drive/users/quant-sleuth-session-log.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_f31c439e3a2943e5b4785e965b409560"
+}

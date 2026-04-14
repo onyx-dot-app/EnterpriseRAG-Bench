@@ -1,0 +1,84 @@
+{
+  "key": "SUP-90147",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Intermittent inference requests time out during long streaming completions; ALB header growth and chunked keepalive suspected",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Avery Chen",
+  "assignee": "Liam O'Neill",
+  "customer_company": "Lexicraft AI",
+  "customer_tier": "dedicated",
+  "environment": "prod | us-east-1",
+  "components": [
+    "api-gateway",
+    "load-balancer",
+    "serving-runtime",
+    "networking"
+  ],
+  "labels": [
+    "streaming",
+    "timeout",
+    "alb",
+    "headers",
+    "investigation"
+  ],
+  "affected_models": [
+    "redwood-v1-large",
+    "llama-2-13b-chat"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "linked_issues": [
+    "SUP-62177",
+    "SUP-27384"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "related_github_prs": [
+    "github.com/redwood-inference/runtime#4221"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/runbooks/streaming-timeouts"
+  ],
+  "description": "Issue summary:\nCustomers (Lexicraft AI) report intermittent 504/502 timeouts and stalled streaming responses when completing long-running generation requests (~40-120s). Failures are not constant; many sessions complete normally but a subset terminate mid-stream with no application error.\n\nImpact:\n- Multiple production customers on dedicated clusters observing tail latency regressions and occasional stream termination.\n- User-facing sessions show stalled TTFB followed by ALB-generated 504 or occasional 502 from API gateway.\n\nEnvironment:\n- Dedicated capacity cluster serving Lexicraft (us-east-1).\n- Requests are proxied through ALB -> API Gateway (NLB path for some customers) -> edge mesh -> serving runtime.\n\nSteps to reproduce (customer-provided):\n1) Start a streaming chat completion with a long expected token count (prompt + continuation ~ 4k tokens).\n2) Keep connection open and allow streaming tokens to be emitted for >60s.\n3) Observe occasional stall around 30\u201390s then abrupt connection close with 504/502.\n\nObserved behavior:\n- ALB access logs show connection closed with \"502/504\" and \"Target timed out\" variants.\n- Request headers include long tracing header (x-trace-cookie / x-client-trace) and rotating cookie header from customer app (~6k-12k header size observed intermittently).\n- When headers are large and chunked keep-alive is used, TTFB rises before eventual ALB idle reset.\n\nExpected behavior:\n- Streaming requests should maintain open connection while tokens are produced; idle/reset behavior should trigger only after configured SLO timeout.\n\nRelevant logs/traces:\n- ALB logs (filtered by request_id): multiple entries showing target_response_time ~85\u2013110s then 504.\n- API gateway request logs: intermittent 502 returned with \"upstream closed connection\".\n- Serving runtime logs: long-running KV warmups observed but no internal OOMs or worker crashes.\n- Sample traces attached in comments below.",
+  "investigation_notes": [
+    "2026-03-10 - Initial triage by Support: Reproduced a stalled stream in staging by replaying customer headers; when we injected large Cookie+Trace headers (~9KB) the ALB session showed delayed ACKs followed by idle reset.",
+    "Checked ALB idle timeout (60s default) and internal proxy timeouts. Customer's client kept socket open but had large header churn as they rotate a session cookie every 15s; header growth correlated with stalls.",
+    "Observed proxy buffering behavior in API Gateway config: buffering enabled for endpoints which causes whole response to be accumulated before flush under some conditions, combined with HTTP/1.1 chunked transfers and keepalive reuse leading to edge-level TTFB regression.",
+    "No serving-runtime errors. Worker CPU and GPU utilization normal. KV-cache warmups coincide with first 1\u20132 seconds only and do not explain 60\u2013120s stalls.",
+    "ALB access-log correlation: requests with larger \"request_processing_time\" and \"target_response_time\" consistently hit timeouts. Requests with smaller headers succeed.",
+    "Hypothesis: large rotating headers cause ALB or API gateway to alter connection framing (HPACK/H2 -> HTTP/1.1 translation) or trigger proxy buffering paths which increase internal buffering and push the response into an idle state longer than ALB idle timeout, resulting in ALB resetting the connection.",
+    "Cross-reference: see SUP-27384 and SUP-62177 for prior header/buffering related streaming incidents; those were resolved by disabling proxy buffering for streaming endpoints and tightening header size on the client side.",
+    "Captured tcpdump of streaming session: shows server sending chunks but some downstream proxy ACKs delayed; suggests middle-tier buffering or Nagle/keepalive interactions rather than server pause."
+  ],
+  "comments": [
+    "2026-03-10 10:12 - Avery Chen (Support): Customer reports ~3-8% of streaming sessions end with 504 during high-throughput bursts. They provided sample request IDs and full request headers; uploading to ticket.",
+    "2026-03-10 13:45 - Liam O'Neill (SRE): Reproduced similar behavior in a staging cluster by simulating cookie rotation and long traces. ALB logs show target_response_time ~95s before 504. Adding to investigation.",
+    "2026-03-11 09:22 - Support (Avery): Customer tried disabling client-side cookie rotation and reported immediate reduction in failures across a 24h window (confirming correlation). Customer requests a permanent fix on our side as they rely on rotating cookies for auth refresh.",
+    "2026-03-11 11:05 - SRE (Liam): Temporary mitigation deployed to customer route: increased ALB idle timeout to 120s for the affected target group and disabled proxy buffering on API Gateway stage for streaming endpoints. Monitoring for 24h.",
+    "2026-03-12 08:30 - Customer (Lexicraft support): After the mitigation deploy, they observed successful completion of previously failing sessions; will monitor and provide final confirmation tomorrow.",
+    "2026-03-12 12:10 - Eng (runtime lead, Priya Rao): Logged eventual follow-up: evaluate default API Gateway stage streaming config to ensure buffering is disabled by default for 'stream-completions' route and add header-size telemetry to detect risky sessions."
+  ],
+  "resolution_notes": [
+    "Temporary workaround (deployed 2026-03-11): Increased ALB idle timeout for Lexicraft's target group to 120s and disabled proxy buffering at API Gateway stage for streaming endpoints. Customer advised to reduce rotating cookie frequency as an interim measure.",
+    "Root cause (provisional): Combination of large, frequently rotating request headers and proxy buffering/HTTP translation at edge caused increased internal buffering and extended time between network-level ACKs; ALB idle timeout then reset connections producing 504s.",
+    "Permanent remediation plan:\n- Short term: Push change to default streaming route config to disable proxy buffering and ensure chunked streaming is passed through without accumulation.\n- Medium term: Add header-size guardrails and telemetry (alert when request headers >8KB) and publish recommended client header limits in developer docs.\n- Engineering task: Assess whether API Gateway -> ALB translation config can be hardened to avoid triggering buffering when encountering large headers. Create tracking task INT-4572.",
+    "Follow-ups: Add automated test in benchmarking harness to replay large-header streaming sessions (PR referenced in related_github_prs). Update runbook with steps to increase ALB timeout and disable buffering for streaming endpoints.",
+    "Status: Mitigation in place; monitoring for 72h before moving ticket to Resolved. If no regressions, we will close with documentation + default config change."
+  ],
+  "resolution": "Mitigation applied; awaiting 72h monitoring before closure",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "comments",
+    "resolution_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_fca3892b17d043729d69006e77a6ff85"
+}

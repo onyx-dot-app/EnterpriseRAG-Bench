@@ -1,0 +1,100 @@
+{
+  "repo": "redwood",
+  "pr_number": "247001",
+  "title": "hybrid-leaky-reserve-orchestrator: continuous-batcher queueing + starvation mitigation",
+  "author": "Evan Li",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-03-05",
+  "merged_at": "2026-03-05",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/hybrid-leaky-reserve-orchestrator",
+  "reviewers": [
+    "Sofia Kumar",
+    "Rohit Menon",
+    "Aisha Patel"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "scheduler",
+    "kv-cache"
+  ],
+  "linked_linear": [
+    "ENG-12890",
+    "ENG-12902"
+  ],
+  "linked_jira": [
+    "SUP-8741"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "18",
+  "additions": "1245",
+  "deletions": "312",
+  "breaking_change": "false",
+  "description": "Motivation: Continuous-batcher workloads with mixed short/long sequences still see occasional starvation and microbursts that push tail latency above SLOs in multi-tenant pools. This PR introduces the 'hybrid leaky reserve orchestrator' (HLRO), a scheduler extension that blends soft per-lane reserves, a leaky-decay reservation model, and a short-term spillover lane to reduce starvation and bound tail latency without destroying throughput.\n\nWhat changed (overview): Implement HLRO inside continuous_batcher::orchestrator. Key ideas: 1) Soft per-queue reserves allocated from an elastic pool; unused reserve decays (leaky) so long-running heavy queues cannot permanently hoard capacity. 2) Spillover lane: requests that exceed a queue's current reserve may be forwarded to a short-lived high-priority spillover lane if probes indicate transient slack, reducing head-of-line blocking. 3) KV-pin-aware admission: requests that hold large kv-cache pins are deprioritized via a pin-weight multiplier to prevent starvation of lightweight requests. 4) Timeout jittering and staggered lease renewals to avoid synchronized preemption storms. 5) New starvation detector metric (scheduler.starvation_events) and per-queue telemetry for reserve utilization to allow ops to tune policies.\n\nPerformance: Microbenchmarks on mixed short/long synthetic traces show 12-18% reduction in 99th percentile token latency and 6% improvement in median throughput under moderate contention vs current master. Production canary on a ~200-GPU Dedicated pool demonstrated a 10% drop in alerting for queueing-related tail latency during weekday peaks.\n\nCompatibility and flagging: HLRO is behind two runtime feature flags (continuous_batcher.hybrid_reserve_enabled and continuous_batcher.spillover_gate_ms) and a cluster-level knob for max_reserve_pct. Defaults are conservative and off for existing Dedicated clusters; enabled by default in the canary playbook we used.\n\nTesting: Unit tests for reserve accounting and decay behavior, deterministic scheduler simulation harness additions, and end-to-end smoke tests in perf-canary. Added a small integration test to validate KV-pin weight math.\n\nMigration and rollout: Recommended gradual rollout: enable on one canary zone for 24-48 hours, monitor scheduler.starvation_events and queue.reserve_utilization, then expand. Include fallback path to existing admission (config: continuous_batcher.fallback_on_repeated_spillover).\n\nFiles of note: scheduler/continuous_batcher/orchestrator.cc/h, scheduler/continuous_batcher/metrics.cc, runtime/kv_cache/pinning_policy.cc, tests/scheduler/hybrid_reserve_sim_test.cc, docs/design/hybrid-leaky-reserve.md, perf/canary/playbooks/hybrid-reserve-canary.md.\n\nRisks and mitigations: Incorrect decay constants can cause oscillation; simulation harness was used to tune defaults. Spillover lane may slightly increase variance; gate ms and spillover rate limits are conservative by default. KV-pin weighting requires conservative multiplier to avoid throughput regression (default 1.2).\n\nRelated: ENG-12890 (scheduler SLO regressions), ENG-12902 (kv-cache eviction storms), SUP-8741 (customer report about long-tail pauses).",
+  "commits": [
+    "a1f3c2b: introduce HLRO control structs and basic allocation logic",
+    "b7d8e4f: implement leaky reserve decay and accounting",
+    "c3e9a2d: add spillover lane admission + gating logic",
+    "d5f7b6a: KV-pin-aware admission multiplier and unit tests",
+    "e8a1c9f: telemetry and metrics for reserve utilization and starvation detector",
+    "f2b4d1e: config flags, defaults, and canary playbook",
+    "g6c7d8b: integration + perf tests, docs and design doc"
+  ],
+  "files_changed": [
+    "scheduler/continuous_batcher/orchestrator.cc",
+    "scheduler/continuous_batcher/orchestrator.h",
+    "scheduler/continuous_batcher/allocator.cc",
+    "scheduler/continuous_batcher/metrics.cc",
+    "runtime/kv_cache/pinning_policy.cc",
+    "runtime/kv_cache/pinning_policy.h",
+    "tests/scheduler/hybrid_reserve_sim_test.cc",
+    "tests/scheduler/kv_pin_weight_test.cc",
+    "docs/design/hybrid-leaky-reserve.md",
+    "perf/canary/playbooks/hybrid-reserve-canary.md",
+    "benchmarks/continuous_batcher/hybrid_reserve_bench.py",
+    "ci/workflows/scheduler-integration.yml",
+    "examples/quickstarts/hybrid-reserve/README.md",
+    "scripts/tracegen/mixed_short_long_trace.json",
+    "tools/telemetry/dashboards/scheduler_reserve.json",
+    "scheduler/continuous_batcher/README.md",
+    "runtime/config/defaults.yaml",
+    "migration_notes/hybrid_reserve_rollout.md"
+  ],
+  "diff_snippets": [
+    "--- a/scheduler/continuous_batcher/orchestrator.cc\n+++ b/scheduler/continuous_batcher/orchestrator.cc\n@@ -112,6 +112,42 @@\n+// Hybrid Leaky Reserve: allocate soft reserves, leak unused share back to pool\n+Reserve Account::TryAcquire(...) {\n+  // conservative fast-path\n+  if (pool_.available() < min_reserve) return false;\n+  ...\n+}\n",
+    "--- a/runtime/kv_cache/pinning_policy.cc\n+++ b/runtime/kv_cache/pinning_policy.cc\n@@ -45,6 +45,14 @@\n+// Apply a small multiplier for requests holding KV pins to reduce admission priority\n+double PinWeight(const RequestMeta& m) {\n+  return 1.0 + (m.kv_pins > 0 ? config.kv_pin_multiplier : 0.0);\n+}\n"
+  ],
+  "review_comments": [
+    "Sofia Kumar: Can we reduce the global lock hold time in ReserveAccount? High contention could cause latency regressions in hot paths. Suggest using per-class atomics for common case. (requested changes)",
+    "Evan Li: Good point \u2014 refactored ReserveAccount fast path to use atomics; lock only on slow-path accounting. Added unit tests that stress concurrency.",
+    "Rohit Menon: The spillover lane looks promising. Need a clear abort path when spillover is repeatedly used to prevent oscillation. Add counters and an automatic fallback to normal admission after N consecutive spillovers. (requested changes)",
+    "Evan Li: Added spillover_failure_count per-queue and fallback config continuous_batcher.fallback_on_repeated_spillover (default true).",
+    "Aisha Patel: Observability looks solid. Please include the new metrics in the default dashboard and add an alert for starvation_events > 5/min. (approved)",
+    "Sofia Kumar: CI flaky test flapped once on first run; reran and green. Approving the changes. (approved)"
+  ],
+  "ci_checks": [
+    "unit-tests: pass",
+    "integration-tests: pass",
+    "lint: pass",
+    "scheduler-sim-harness: pass",
+    "perf-bench: pass (12-18% tail improvement on mixed trace)",
+    "canary-playbook-smoke: pass"
+  ],
+  "merge_method": "squash",
+  "merge_outcome": "merged",
+  "release_notes": [
+    "Introduce hybrid leaky reserve orchestrator to reduce continuous-batcher tail latency and prevent starvation.",
+    "New metrics: scheduler.starvation_events, scheduler.reserve_utilization.<queue>.",
+    "Feature guarded by continuous_batcher.hybrid_reserve_enabled (off by default for existing clusters)."
+  ],
+  "notes": "Conservative defaults chosen; recommend staged rollout and close monitoring. If customers request older behavior, set continuous_batcher.hybrid_reserve_enabled=false and continuous_batcher.fallback_on_repeated_spillover=true.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_comments",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_733c6c1a120c45ba89cf32b7fa58945a"
+}

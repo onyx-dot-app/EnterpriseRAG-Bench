@@ -1,0 +1,104 @@
+{
+  "key": "ENG-65214",
+  "team": "engineering",
+  "title": "Arena churn under continuous batching causing pinned-page retention in cudaMallocAsync",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-01-09",
+  "updated_at": "2025-01-25",
+  "creator": "Maya Chen",
+  "assignee": "Devon Patel",
+  "project": "runtime-memory-optim",
+  "cycle": "2025-W02",
+  "estimate": "5",
+  "due_date": "2025-02-02",
+  "labels": [
+    "cudaMallocAsync",
+    "kv-cache",
+    "continuous-batching",
+    "memory-leak",
+    "allocator",
+    "investigation"
+  ],
+  "description": "High-level: Under sustained continuous-batching workloads with heavy KV-cache warmups, we observe steady growth of resident GPU memory that does not return to baseline between requests. The growth is correlated with increased counts of \u2018pinned\u2019 pages in the cudaMallocAsync pool and repeated creation/destroy cycles of short-lived arenas. This ticket tracks root-cause analysis and targeted mitigations to prevent long-term allocator residency growth.",
+  "steps_to_reproduce": [
+    "1) Start runtime-1.19 with cudaMallocAsync enabled and default pool sizing",
+    "2) Run the continuous-batch driver used in perf lab: 200 concurrent payloads, mixed seq-len 512/1024, kv-cache enabled with 64MB chunking",
+    "3) After 1 hour, snapshot GPU memory (nvidia-smi + custom resident metrics) and allocator diagnostics (jemalloc stats + internal slab timelines),",
+    "4) Observe that free-able pages count decreases while total pool allocation increases despite stable QPS."
+  ],
+  "observations": [
+    "- nvml shows 12% increase in used GPU memory over 6 hours under steady QPS",
+    "- cudaMallocAsync pool internal 'pinned-pages' counter increases monotonically; freeing operations appear to succeed but pages remain resident",
+    "- jemalloc-like arena metrics show repeated creation of ephemeral arenas per-worker during batch merges; arenas are not being reused effectively",
+    "- KV cache eviction rates are normal, but per-request prefix caches show growth in hot-slice residency",
+    "- host pinned staging buffers spike transiently during dispatch windows; some never get reclaimed by the pool due to stream-queue sync ordering."
+  ],
+  "hypotheses": [
+    "H1: Stream synchronization ordering prevents async frees from being retired, causing pinned pages to remain resident until epoch trim which is mis-tuned",
+    "H2: Arena churn (create/destroy) increases fragmentation: cudaMallocAsync returns small fragments back to the OS/pool in non-coalesced way, leading to many small pinned pages",
+    "H3: Continuous batching introduces short-lived allocations on multiple streams that hold per-stream ownership of pages, preventing pool reuse (cross-stream residency).",
+    "H4: KV cache prefetch pattern creates many small device allocations (for shard buffers) which, combined with allocator slab policies, avoids reuse and forces new pinned pages."
+  ],
+  "experiments": [
+    "E1: Force single arena reuse by enabling per-gpu global arena (patch local) - result: arena counts stable, pinned pages growth reduced by ~30%",
+    "E2: Insert explicit cudaDeviceSynchronize before freeing staging buffers - result: immediate drop in pinned pages after sync windows but adds ~2ms tail latency per batch",
+    "E3: Increase cudaMallocAsync trim threshold from 64MB to 256MB - result: fewer small free ops observed, pinned-page growth reduced but baseline resident memory increased",
+    "E4: Change KV chunking to 256MB to reduce small allocations - result: eliminates a class of tiny allocations but increases peak transient memory; pinned growth reduced in long test",
+    "E5: Run with cudaMallocAsync disabled (fallback allocator) - result: no monotonic growth, but overall performance degrades and CPU pinned staging increases."
+  ],
+  "findings": [
+    "- Root cause appears to be interplay between stream-ordered frees and per-worker ephemeral arena creation: many small allocations on different streams delay retire of device pages, and new arenas avoid reusing previously freed address ranges, amplifying fragmentation",
+    "- cudaMallocAsync's default trimming/epoching cadence is too coarse for our continuous-batching pattern: pages freed asynchronously linger until the trim window allowing accumulation",
+    "- KV cache prefetching creates a large number of sub-64KB allocations which are expensive to coalesce under current slab config, producing many pinned fragments",
+    "- Immediate synchronization (cudaDeviceSynchronize) prevents accumulation but is not acceptable due to latency regression."
+  ],
+  "mitigations": [
+    "M1: Implement per-gpu shared arena pool to reduce arena churn (prototype merged to branch 'arena-shared-proto' in PR #7132)",
+    "M2: Tune cudaMallocAsync trim frequency dynamically based on batch churn signal (adaptive-trim flag) to retire pages more eagerly when fragmentation grows",
+    "M3: Adjust slab bucket sizes to favor larger bins for KV-prefetch allocations; add threshold so tiny KV slices are allocated from a separate tiny-allocator with coalescing",
+    "M4: Add tracing hooks to tag allocations with stream and arena id to help future audits and validate cross-stream ownership",
+    "M5: Backfill runtime tests in perf lab to exercise long-running continuous-batching scenarios nightly."
+  ],
+  "next_steps": [
+    "1) Land shared arena prototype behind runtime flag and run 24h soak in perf lab (owner: Devon) - target: 2025-01-28",
+    "2) Implement adaptive-trim heuristic (owner: Priya Gupta) - spike estimate 3 pts, target: 2025-02-04",
+    "3) Add slab reconfiguration for KV tiny allocator and validate with KV workload harness (owner: Michael Torres) - target: 2025-02-09",
+    "4) Create dashboard panel showing pinned-pages, arena-count, trim-ops, and cross-stream allocation histogram (owner: SRE) - target: 2025-01-31",
+    "5) Post-mortem doc if customer-facing memory regressions are observed (owner: Maya)"
+  ],
+  "attachments": [
+    "https://github.com/redwood-inference/runtime/pull/7132 (shared arena prototype)",
+    "https://grafana.redwood.ai/d/allocs/continuous-batch-24h?from=now-48h (perf dashboard snapshot)",
+    "gs://redwood-perf/heapshots/2025-01-16/kv-cont-batch-heap.txt",
+    "https://internal-docs.redwood.ai/confluence/runtime/arena-churn-investigation-2025-01-25"
+  ],
+  "dependencies": [
+    "ENG-142309",
+    "ENG-21388"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "comments": [
+    "2025-01-10 - Priya Gupta: Ran a quick microbenchmark changing trim interval; saw reduced growth but increased mem spike at GC. Suggest adaptive trimming",
+    "2025-01-12 - SRE (Logan): Added temporary alert on pinned-pages > 40k for prod canaries. No alerts so far from canaries.",
+    "2025-01-16 - Devon: Shared arena prototype landed to branch for soak. Initial 8h run shows arena count stable and 28% reduction in pinned pages.",
+    "2025-01-18 - Michael: KV chunking change reduced tiny allocs by 72% in synthetic test; need to run with KV hit patterns from customers.",
+    "2025-01-22 - Maya: Request to upstream a small change to allocator metrics (expose per-stream free-queue length) before we enable adaptive-trim in prod.",
+    "2025-01-25 - Devon: Running 24h soak now; next update scheduled 2025-01-28."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observations",
+    "hypotheses",
+    "experiments",
+    "findings",
+    "mitigations",
+    "next_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_69b7122a16ab44d2b60918aa70e6a9d0"
+}

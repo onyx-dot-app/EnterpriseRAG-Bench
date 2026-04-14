@@ -1,0 +1,78 @@
+{
+  "key": "SUP-539999",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Edge probe swap during long-lived stream results in missing closing delimiter and partial final paragraph",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-13",
+  "reporter": "Aisha Patel",
+  "assignee": "Marco Reyes",
+  "customer_company": "Acme Apps",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "edge-proxy",
+    "auth"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "edge-probe",
+    "investigation"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "redwood-v1-large"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-12T20:30:00Z",
+  "linked_issues": [
+    "SUP-214159",
+    "INT-330"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/edge-proxy/pull/512"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/streaming-edge-stability"
+  ],
+  "description": "Issue summary:\nCustomer reports that during long SSE streams the final closing delimiter (\"[DONE]\" metadata marker used by their client) is never received after an edge health-check swap. The response body contains the final sentence truncated in the middle of a paragraph.\n\nImpact:\n- Intermittent content loss for a small subset of long-running streams (estimated ~0.2% of streams for the affected customer)\n- Customer application treats stream as incomplete and triggers retries which double downstream token costs\n\nEnvironment:\n- Redwood hosted API (prod-us-east) hitting edge-gateway cluster behind FastEdge load balancer\n- Customer using dedicated account with pinned model redwood-v1-large, streaming via SSE over TLS\n\nSteps to reproduce (customer provided):\n1) Open SSE connection using client X with keepalive every 30s\n2) Start generation that runs for >45s and includes multi-paragraph output with final delimiter marker\n3) Observe that when an edge health-check probe causes connection handover, the client does not receive the final marker and the last paragraph may be cut mid-sentence\n\nObserved behavior:\n- Final bytes of the stream appear truncated (cut after a punctuation mark)\n- No end-of-stream metadata marker is seen in the SSE stream\n- Server logs show connection teardown around the same timestamp as an HTTP/1.1 health probe on the edge node\n\nExpected behavior:\n- Stream should include all generated tokens and the closing delimiter metadata event even if the underlying edge connection is rotated or health-probed\n\nRelevant logs/snippet (redacted):\n- Customer client trace: \"2026-03-12T18:07:12Z SSE CHUNK: \"...and finally we recommend updating your policy.\"\"\n- Connection closed without [DONE] marker at 2026-03-12T18:07:12.342Z\n- Edge proxy log: \"probe=health path=/_edge/health reused_conn=false swap_to=10.3.4.22:443 RST_SENT\"\n- Serving runtime: \"session_id=abc123 drain_timeout=0.150 connection_half_closed=true last_kv_commit=1598\"\n\nTemporary workaround suggested to customer:\n- Short term: switch to a short client-side timeout + polite retry that requests a small context resume (application-level fallback)\n- Avoid edge path rewriting by using regional endpoint (us-east.direct.redwood.example) until fix is deployed\n\nNotes:\n- Customer supplied multiple traces and the timestamps correlate with edge health-checks that happen every 30s on a subset of our FastEdge fleet\n- Not all probes cause the issue; looks correlated with probe that triggers a connection swap while there is in-flight buffered SSE data\n",
+  "comments": [
+    "2026-03-12 18:22 UTC - Customer (Tom Wu): We saw 7 occurrences over an hour window. It seems to happen when our job runs longer than 40s. Happy to provide pcap if needed.",
+    "2026-03-12 18:30 UTC - Support (Aisha Patel): Thanks Tom \u2014 we've triaged this as P1 and created SUP-539999. Can you share a full client-side trace with headers (redact tokens)? Also which SDK version?",
+    "2026-03-12 18:45 UTC - Customer (Tom Wu): Attached trace + sdk v2.3.1 header dump. Will upload pcap to the secure link.",
+    "2026-03-12 19:05 UTC - SRE (Marco Reyes): I can reproduce locally against our edge simulator when I toggle healthcheck to aggressive. I'm seeing a socket RST at the same time SSE chunks are buffered at the edge. Assigning to edge-proxy team if probe reuse logic is involved.",
+    "2026-03-12 19:20 UTC - Edge eng (Priya Srinivasan): Looking into probe handler. Initial thought: reuse_conn=false but socket handoff code may be racing with chunk flush; adding instrumentation to record drain sequence numbers.",
+    "2026-03-13 09:10 UTC - Support (Aisha Patel): Customer notified that we're actively investigating and provided suggested workaround to use regional endpoint. Customer confirmed temporary mitigation reduces failures.",
+    "2026-03-13 12:00 UTC - Edge eng (Priya Srinivasan): Instrumentation added; early data shows correlation with drain_timeout < 200ms when probe arrives mid-chunk. Continuing analysis."
+  ],
+  "investigation_notes": [
+    "2026-03-12 20:00 UTC - Reproduced in internal test harness by simulating aggressive healthcheck swap while SSE buffer contains partial JSON payload. The buffer flush path did not complete before the swap; edge sent TCP RST rather than draining gracefully.",
+    "Hypothesis A: Edge health-check handler aggressively rotates connections and can trigger RST when out-of-order chunk flush occurs, causing client to miss final delimiter. This will lead to incomplete SSE assembly on client SDKs that expect an explicit end event.",
+    "Hypothesis B: Certain TLS session resumption / 0-RTT behavior on the FastEdge node can cause half-close semantics that our serving runtime treats as terminal before emitting the metadata marker. Investigating TLS handshake logs.",
+    "Data: Kibana query id=kq-8821 shows 43 events across the cluster matching 'drain_timeout<0.25 && probe_swap=true' between 2026-03-12T17:00 and 2026-03-12T19:00. Grafana dashboard link: https://grafana.redwood.internal/d/streaming/edge-drain?var-node=fastedge",
+    "Added additional logging to edge-proxy which records chunk_ack_id and probe_id. Early results show probe_id 0x7a matched with chunk_ack_id left unflushed for affected sessions.",
+    "Related: INT-330 contains previous notes about connection reuse heuristics introduced in edge-proxy v2.1.7. That change lowered drain window to favor faster failover under load; might be regression for long-lived streams."
+  ],
+  "resolution": [
+    "Root cause: Edge health-check swap could preemptively reset a connection mid-chunk flush. The aggressive connection rotation logic in edge-proxy v2.1.7 reduced the drain grace window; when probe coincided with buffered SSE data, the TCP shutdown semantics caused clients to miss the final metadata marker.",
+    "Fix implemented: edge-proxy patch (PR #512) increases drain grace window for streaming endpoints and ensures explicit flush of SSE chunk queue before any RST path is taken. Also added a probe-tag to stream logs for easier correlation.",
+    "Rollout plan: canary deploy to 5% FastEdge nodes in us-east on 2026-03-14 02:00 UTC, monitor Kibana query kq-8821 and customer error rate. Full rollout expected 2026-03-15 pending telemetry.",
+    "Customer communication: Notified Acme Apps 2026-03-13 with workaround and timeline. Will follow up post-canary and confirm closure once telemetry shows <0.01% occurrence and customer verifies.",
+    "Follow-ups: Add a unit/integration test in edge-proxy suite to simulate probe swap during buffered chunk flush. Add runbook entry under Streaming + Edge Troubleshooting. Consider longer-term: better graceful-drain negotiation protocol with serving runtime (RFC ticket)."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_1c764b3812d64592a8b859419cc44076"
+}

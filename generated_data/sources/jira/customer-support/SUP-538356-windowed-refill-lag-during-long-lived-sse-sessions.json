@@ -1,0 +1,72 @@
+{
+  "key": "SUP-538356",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Windowed token-refill lag causing sporadic 429s on long-lived SSE streams",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev2",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Zara Klein",
+  "assignee": "Miguel Ortega",
+  "customer_company": "BrightLedger Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "rate-limiter",
+    "ingest-worker",
+    "sse-proxy"
+  ],
+  "labels": [
+    "rate-limit",
+    "sse",
+    "throttling",
+    "dedicated-pool",
+    "investigation"
+  ],
+  "environment": "prod | us-west-2",
+  "affected_models": [
+    "redwood-open-7b-quant"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-15",
+  "first_response_due_at": "2026-03-12",
+  "linked_issues": [
+    "SUP-824301",
+    "INT-2210"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/edge-proxy/pull/312"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/1543+SSE+streaming+runbook"
+  ],
+  "description": "Issue summary:\nCustomer BrightLedger reports intermittent 429 responses affecting a subset of long-lived Server-Sent Events (SSE) streams used by their telemetry ingest pipeline. The 429s appear after several hours of healthy streaming and are noisy enough to trigger fallback logic on their side, causing data duplication and higher cost.\n\nImpact:\n- ~12% of BrightLedger's telemetry SSE connections in us-west-2 return 429 on token refresh windows during daily batch windows (observed 2026-03-11 22:00-02:00 UTC).\n- Leads to retries from their connector, duplicated payloads, and elevated token consumption. Customer sees increased billable token counts and requests support escalation.\n\nEnvironment:\n- BrightLedger dedicated pool (customer-dedicated-45) in us-west-2.\n- Long-lived SSE connections (HTTP/1.1) with periodic keepalive comments every 30s.\n- Connector version: bl-ingest v2.3.1 (uses multiplexed single HTTP connection per host).\n\nSteps to reproduce (customer-provided):\n1) Deploy a synthetic client that opens ~200 SSE streams to the dedicated endpoint and keeps them open for 8+ hours.\n2) Emit a 30s keepalive comment on each stream and send a 2KB telemetry event every 90s.\n3) Observe 429s appearing after ~3-5 hours on a subset of streams, often coincident with scheduled connector rotate job (customer cron that restarts one connector pod every 30m).\n\nObserved logs (customer snippets):\n- \"HTTP/1.1 429 Too Many Requests - rate limit window exhausted (token_bucket:window=300)\"\n- Connection ID churn visible in client logs around same time as 429 spikes.\n\nWhy this feels unique:\n- Most previous tickets cover websocket multiplex or short-lived sessions where connection churn is obvious. This is long-lived SSE + periodic connector restarts + LB behavior producing a refill misattribution pattern: the rate-limiter appears to reassign remaining per-connection tokens to newly observed connection identifiers while the dedicated pool's per-tenant/window accounting lags by one refill window.\n\nExpected next steps in this ticket: attach server-side traces, confirm windowing math, and propose mitigation for dedicated pools.",
+  "investigation_notes": "Initial findings:\n- Replayed customer repro in staging (dedicated-sim). After ~4h, we saw token-bucket counters for several connection IDs drop to negative throttle state and then generate 429s.\n- Rate-limiter uses a windowed refill strategy with keys keyed by (tenant_id, connection_fingerprint). For SSE the fingerprint is derived from client IP + ephemeral port + LB-assigned x-forwarded-for header. When LB rotates origin connections the fingerprint changes and the rate-limiter creates new buckets but the global tenant accounting still attributes used tokens to the old bucket until the periodic reconciliation job runs. This mismatch creates a short interval where the tenant appears over-spent and returns 429s on new connection IDs.\n- Reconciliation delay typically 45-90s; however under heavy churn (customer cron restart) the reconciliation queue falls behind and the effective refill lag becomes multiple minutes, amplifying 429s.\n\nHypotheses:\n1) Relying on ephemeral connection attributes for SSE fingerprinting is fragile under LB or connector restarts; a stable client-side identifier would avoid bucket churn.\n2) Reconciliation job interval and priority is insufficient under dedicated-pool scale and needs backpressure protection or immediate handoff semantics.\n3) Keepalive comments are occasionally seen as 'activity' and shift expected refill patterns, confusing window alignment in the accounting logic.\n\nEvidence and traces:\n- Trace: trace-redwood-20260313-77b4 (linked in internal tracing console).\n- Rate-limiter debug dump: /internal/dumps/rl/dump-2026-03-13-03.log (uploaded to incident artifacts).\n\nImmediate mitigations tried:\n- Increased reconciliation worker parallelism on a staging dedicated pool; observed 60% reduction in 429 spike duration.\n- Short-term config change: extended per-connection grace tokens from 5 -> 20 for dedicated pools; reduced customer-visible 429s but increases risk of overcommit on tenant quotas (temporary measure).",
+  "comments": [
+    "2026-03-12 11:14 - Support (Zara): Acknowledged with BrightLedger, collected repro harness and asked for time windows and connector logs.",
+    "2026-03-12 13:05 - BrightLedger (Ops): Provided reproducer and noted connector restarts every 30m during their nightly backfill.",
+    "2026-03-13 09:22 - SRE (Miguel): Ran staging replay; captured rate-limiter dumps and flagged reconciliation backlog. Linked trace 'trace-redwood-20260313-77b4'.",
+    "2026-03-13 15:40 - Platform Eng (Aisha): Confirmed fingerprint scheme uses XFF+ephemeral-port; suggested adding stable client token header as option for SSE clients.",
+    "2026-03-14 08:55 - Support (Zara): Applied temporary per-connection grace tokens and informed customer; requested permission to schedule a controlled change to reconciliation worker priority in prod.",
+    "2026-03-14 12:30 - BrightLedger: Accepted temporary mitigation; asked for permanent fix timeline and whether this will affect billing reconciliation."
+  ],
+  "resolution_notes": "Mitigation applied (2026-03-14): temporarily increased per-connection grace tokens for BrightLedger dedicated pool and bumped reconciliation worker parallelism in prod for dedicated pools.\n\nPermanent plan (next steps):\n- Platform team to implement stable SSE fingerprint header (X-Client-Stream-Id) and document in ded-pool SDKs; target: 2-week rollout with feature flag.\n- Adjust reconciliation job to be event-driven on connection lifecycle events instead of purely periodic; follow-up INT ticket opened.\n- Add a billing-safe flag to metric exports to avoid double-counting during transient reconciliation windows.\n\nFollow-ups and action items:\n- INT-2210: Add event-driven reconciliation prototype to scheduler backlog.\n- SUP-824301: Coordinate with Billing to validate that the temporary grace tokens do not lead to invoice disputes for BrightLedger.\n- Create console guidance entry: \"Best practices for long-lived SSE streams\" and link to customer onboarding docs.\n\nStatus: In Progress \u2014 mitigation in place, permanent fixes scoped and prioritized.",
+  "attachments": [
+    "artifact://logs/rl-dump-2026-03-13-03.log",
+    "artifact://traces/trace-redwood-20260313-77b4.json"
+  ],
+  "customer_impact_summary": "BrightLedger experienced intermittent 429s on long-lived SSE streams causing connector retries and duplicate payloads. Temporary mitigations reduced customer-visible errors while a fix (stable stream fingerprint + event-driven reconciliation) is planned.",
+  "owner_notes": "Miguel to own rollout of reconciliation worker changes. Zara to coordinate customer comms and confirm billing impact with Billing POC (Lina Park).",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "comments",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_6f7faa4fe11744408e5698c7c74aa35f"
+}

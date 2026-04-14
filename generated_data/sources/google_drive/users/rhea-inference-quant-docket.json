@@ -1,0 +1,34 @@
+{
+  "title": "Inference quant & KV quick docket",
+  "owner": "Rhea Patel",
+  "drive_area": "users",
+  "path": "users/rhea-inference-quant-docket.json",
+  "doc_type": "doc",
+  "created_at": "2026-03-11",
+  "last_modified": "2026-03-12",
+  "collaborators": [
+    "Noah Kim",
+    "Ida Chen",
+    "Samir Bhatt"
+  ],
+  "team": "eng-applied-ml",
+  "status": "draft",
+  "tags": [
+    "quantization",
+    "kv-cache",
+    "microbench",
+    "prompt-eval",
+    "todo"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/842",
+    "JIRA-ML-1192",
+    "slack:#aml-kv"
+  ],
+  "content": "Quick context:\\n- Running a targeted microbench and eval pass for a small Llama-style model (7B-ish) under 4-bit QAT-like profiles + KV cache enabled. Goal: understand tail latency regressions when prefix cache hits are low and when sequence length jumps from 32->256.\\n\\nHypothesis:\\n- Primary cause of tail spikes is dequantization overhead + suboptimal kernel path when KV cache is sparse (cache misses cause repeated dequant calls).\\n- Secondary cause: suboptimal batching heuristics for sudden long sequences (autoscaler/batcher not bumping to different kernel).\\n\\nWhat I ran (notes):\\n1) baseline (FP16) run - single GPU, batch=1, seq=256, prompt prefix 32 tokens cached\\n   - cmd: ./microbench --model rlhf-7b-fp16 --seq-len 256 --batch 1 --kv-cache-prefix 32 --profile perf.json\\n   - obs: p50=48ms, p90=85ms, p99=210ms, tokens/s=85\\n\\n2) quant-4bit (Q4) run - same setup\\n   - cmd: ./microbench --model rlhf-7b-q4 --seq-len 256 --batch 1 --kv-cache-prefix 32 --quant-profile q4a --profile perf-q4.json\\n   - obs: p50=40ms, p90=95ms, p99=400ms, tokens/s=110\\n   - note: p50 improved but p99 doubled -> suspect bad path + lock contention in dequant code\\n\\n3) stress: drop prefix cache to 0 (cold cache)\\n   - q4 cold: p50=92ms, p90=320ms, p99=980ms (very bad)\\n   - fp16 cold: p50=110ms, p90=270ms, p99=520ms\\n   - interpretation: quant cold-case even worse: dequant overhead + maybe extra memcpy/format conversion on every token loop\\n\\nPrompt templates I used for evals (short snippets):\\n- instr-short: \\\"Summarize: {text} -> 1-2 lines\\\"\\n- instr-long: \\\"Expand and critique the following paragraph: {text} -> 4-6 points\\\"\\n- code-rewrite: \\\"Refactor this Python function for readability: {code}\\\"\\n\\nQuick qualitative eval notes (human skim 20 samples):\\n- Q4 small hallucination increase on token-level punctuation (split tokens), esp in code-rewrite tests (variable names mangled occasionally).\\n- instr-short largely OK; quality loss visible on longer completions where model now prefers shorter stop tokens.\\n\\nMicrobench commands & helpers used:\\n- baseline: ./microbench --model {model} --seq-len {L} --batch {B} --profile {out}\\n- perf check: jq '.metrics.token_latency | {p50, p90, p99}' perf.json\\n- quick-run wrapper (local): ./run-and-log.sh --model $MODEL --profile out.json --iters 50\\n\\nImportant traces I grabbed: perf-q4.json, kernel-trace-q4.log, nvprof-20260311.out (in /tmp/rhea-traces).\\n\\nQuick root-cause suspects (things to verify):\\n- [ ] Dequant path: check if we fallback to non-vectorized dequant when seq-len > 128 (kernel switch heuristic). See PR #842 for kernel selector rules.\\n- [ ] KV eviction threshold: when prefix < 16 we may be rehydrating KV on every request (investigate trims).\\n- [ ] Locking in per-thread dequant buffers: look for mutex contention in kernel-trace-q4.log.\\n\\nPatch/experiment ideas (fast wins):\\n- A) Force quantized path to use streaming dequant buffer (avoid realloc per token): env EXP_STREAM_DEQUANT=1 run.\\n- B) Temporary heuristic: for q4, if prefix<64 and seq>128, route to FP16 variant (fall back) to keep p99 bounded. Add logic behind feature flag ff/q4-cold-fallback.\\n- C) Microbenchmark: try chunked-dequant (dequant 16 tokens at a time) to amortize overhead.\\n\\nPlanned runs (todo list):\\n- [ ] Run A with EXP_STREAM_DEQUANT on the same workload (50 iterations) \u2014 assigned to me (Rhea). Due EOD 2026-03-12.\\n- [ ] Add ff/q4-cold-fallback behind config and run AB test with 1000 requests (Noah to help on rollout).\\n- [ ] Reproduce with different model (mistral-like 7B) to rule out architecture-specific kernel selector (Ida).\\n- [ ] Add microtrace instrumentation to measure per-token dequant time (requires small runtime change; PR draft started).\\n\\nOpen questions / notes to follow up:\\n- Is the new kernel-selector logic in PR 842 definitely deployed on our GPU pool? I saw mixed kernel versions on traces. (Check s3 artifact tags + docker image hash).\\n- Does the batcher coalesce short-long sequences badly? Need to inspect batching logs (sre: /infra/logs/batcher/*).\\n- Consider adding a synthetic TTL for KV entries to avoid frequent rehydration when clients keep jumping seq lengths.\\n\\nRandom working thoughts (notes to self):\\n- If we fallback q4->fp16 in cold-case, measure cost delta per-token. Might be cheaper overall if p99 drops enough (avoid SLA penalties).\\n- Could add a quick heuristic at router: if recent kv-hit-rate < 0.2 and seq>128 then prefer fp16-route.\\n\\nSlack threads and tickets to attach when I make PR:\\n- slack: https://company.slack.com/archives/C04AMLKQ0/p1678459923000\\n- jira: JIRA-ML-1192 (investigation)\\n- PR stub: https://github.com/redwood-inference/serving-runtime/pull/842\\n\\nNext immediate steps (today):\\n1) Run EXP_STREAM_DEQUANT (local GPU) x50, collect perf-q4-stream.json (Rhea)\\n2) Pair with Noah to draft ff/q4-cold-fallback and run a small canary (Noah+Rhea)\\n3) Ping Ida to spin the mistral-7b variant on infra and run same microbench (Ida)\\n\\nIf I end up not finishing: leave trace files in /tmp/rhea-traces and write a short summary into the JIRA ticket.\\n\\n-- End of docket (quick, messy; keep iterative)\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_a6b32533efd145899e8576a691ee4e08"
+}

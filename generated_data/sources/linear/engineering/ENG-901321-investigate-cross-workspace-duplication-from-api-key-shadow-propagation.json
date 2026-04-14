@@ -1,0 +1,78 @@
+{
+  "key": "ENG-901321",
+  "team": "engineering",
+  "title": "Investigate cross-workspace duplication from API key shadow propagation",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-02-15",
+  "updated_at": "2025-03-04",
+  "creator": "Aisha Mehta",
+  "assignee": "Zachary Kim",
+  "project": "Billing & Quotas Reliability",
+  "cycle": "2025-W06",
+  "estimate": "5",
+  "due_date": "2025-03-08",
+  "labels": [
+    "billing",
+    "metering",
+    "rate-limiter",
+    "investigation",
+    "incident"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Summary: Multiple customers reported doubled token billing and duplicate ingress counts over short windows after a sequence of proxy redeploys and a downstream claims-merge job. This ticket captures the triage, reproducible test, root-cause hypothesis, and proposed remediation. The behaviour is intermittent and correlated with: (1) ephemeral proxy rotation, (2) concurrent claim-merge window, and (3) service-account delegation events. Initial signs pointed to both attribution duplication and over-counted rate-limiter hits.\n\nContext: Our metering pipeline receives an ingress record when the API gateway accepts a request tagged with an api_key_id and claim_token. Attribution uses a transaction across three systems: gateway (ingress record), claim-service (maps claim_token -> workspace), and billing-aggregator (consumes ingress and emits metering rows). A background job merges duplicate claims for short-lived delegated keys (claim-merge). During claim-merge, some requests' claim_token briefly resolve to the pre-merge and post-merge workspace resulting in two in-flight attribution annotations.\n\nObserved customer impact: Several customers in different orgs saw +95% billing spikes for 3-7 minute windows on 2025-02-12 and 2025-02-14. Rate limiter reported double-consumption for burst windows which caused temporary throttling for a handful of projects. We saw ~1.2k duplicated metering rows across multiple ingestion partitions for each affected minute in the worst case.\n\nKey artifacts: Dashboard: https://console.redwood.example.com/dashboards/billing/duplications (note: internal). Sampling query used to identify duplicates (billing-db): SELECT api_key_id, claim_token, hour_bucket, COUNT(*) as cnt FROM metering.ingress WHERE created_at >= '2025-02-12'::timestamp AND event_name = 'ingress' GROUP BY 1,2,3 HAVING COUNT(*) > 1 ORDER BY cnt DESC LIMIT 200;\n\nInvestigation notes:\n- Reproduced locally by replaying ingress events while running claim-merge job concurrently; duplication appears when claim-service sometimes returns both old and new workspace ids for claim_token due to eventual-consistency cache TTLs.\n- Trace 1 (request-id 59a8c3f2): gateway emitted ingress record, followed by claim-service returning workspace A; claim-merge job replaced mapping to workspace B and re-emitted a sync event that caused the aggregator to accept a second attribution row for the same original request.\n- Race window: ~200-800ms depending on Kafka lag and claim-merge batching.\n- Root hypothesis: billing-aggregator treats attribution mapping updates as new independent attributions instead of applying an idempotency key tied to request-id + ingress-timestamp. Aggregator consumes both the original attribution and the post-merge reconcile event as distinct meter events.\n\nReproduction steps (validated in staging):\n1) Create ephemeral delegated key and issue a claim_token.\n2) Send 100 concurrent requests through gateway with same claim_token.\n3) Start claim-merge background job which replaces claim_token->workspace mapping mid-flight.\n4) Observe duplicate rows in aggregator and corresponding doubled token counts.\n\nLogs and excerpts:\n- Gateway log sample: 2025-02-12T12:04:17Z INFO ingress emitted request_id=59a8c3f2 api_key_id=ak_7Gx... claim_token=ct_3a9\n- Claim-service before merge: 2025-02-12T12:04:17Z DEBUG resolve claim_token=ct_3a9 -> workspace=ws_A cache_hit=false\n- Claim-merge: 2025-02-12T12:04:17Z INFO merged claim_token ct_3a9: ws_A -> ws_B (seq=342)\n- Aggregator consuming re-sync: 2025-02-12T12:04:17Z WARN duplicate attribution detected request_id=59a8c3f2 previous_workspace=ws_A new_workspace=ws_B\n\nExperiments run:\n- Applied a quick patch in staging aggregator that checks for existing attribution using (request_id, api_key_id, hour_bucket) idempotency key and rejects second attribution within same 1-minute bucket. Result: duplicate rows reduced by ~98% in staging runs.\n- Simulated higher Kafka partition lag: duplication rate increased linearly with lag.\n\nRoot cause (final hypothesis): The aggregator currently treats claim re-resolution events as fresh ingress when they are reconciliation events. There is no robust idempotency guard keyed on the original request identifier (gateway request_id) or an ingress-level nonce, and our claim-service does not include the original request_id when emitting a post-merge reconcile event. The combination allows the aggregator to accept two billing-attribution rows for the same logical request.\n\nDecision log:\n- Short-term mitigation (accepted): Add a dedupe layer in billing-aggregator that uses idempotency key (request_id + api_key_id + minute_bucket) and an expiration TTL of 24 hours. Implement this as a write-through check against aggregator's local redis cache to avoid cross-node races.\n- Long-term fix (accepted): Modify claim-service to include the original ingress request_id in merger re-sync events and change aggregator to treat re-syncs as correction events (update existing attribution row) rather than new events. Also add a transactional reconciliation path where aggregator will attempt to update existing metering row when possible.\n\nPatch references and PRs:\n- Staging quickfix PR: https://github.com/redwood-inference/billing-aggregator/pull/1842 (feature/dedupe-idempotency)\n- Claim-service follow-up: https://github.com/redwood-inference/claim-service/pull/912 (feature/emit-request-id-on-resync)\n- Longer term design doc: https://confluence.redwood.example.com/display/BILL/Attribution+Reconcile+Design (internal)\n\nImpact and rollout plan:\n- Apply short-term dedupe patch to staging and canary (1% traffic) on 2025-03-05. Monitor duplication metrics and downstream billing deltas for 48 hours.\n- If stable, ramp to 10% and then 100% over 72 hours.\n- Deploy claim-service change in a later release (runtime-1.22.1) with migration window where aggregator accepts request_id-bearing re-syncs as corrections.\n\nOpen questions / Risks:\n- Dedup TTL: 24 hours is a stopgap; some long-tail incidents could still dedupe incorrectly if legitimate replays occur after TTL expiry. Need to align with replay semantics.\n- Memory pressure on local redis caches if high QPS and large idempotency window. Need to add eviction metrics and throttles.\n- Potential for partial rollouts causing asymmetric behaviour across nodes (some nodes dedupe, others not) \u2014 can cause inconsistent billing until full rollout. Strategy: ensure canary matched by routing policy to avoid splitting customer traffic across mixed behaviour.\n",
+  "steps_to_reproduce": [
+    "Create an ephemeral delegated api key and claim_token in staging",
+    "Issue 100 concurrent generation requests through gateway with the same claim_token",
+    "While requests are inflight, trigger claim-service's claim-merge job to replace mapping",
+    "Inspect billing-aggregator tables for duplicate attributions by request_id"
+  ],
+  "timeline": [
+    "2025-02-12: First customer report of doubled billing spikes; on-call triage started",
+    "2025-02-13: Initial reproduction in staging confirmed; quickfix dedupe patch prototyped",
+    "2025-02-14: Additional customer spikes correlated with cluster node proxy restarts",
+    "2025-03-04: Decision to implement short-term dedupe and long-term claim-service change"
+  ],
+  "decisions": [
+    "Implement short-term dedupe in billing-aggregator using idempotency key (request_id + api_key_id + minute_bucket)",
+    "Modify claim-service to include original request_id on claim-resync events",
+    "Treat resync events as corrections (update) rather than new ingestion records in aggregator"
+  ],
+  "next_steps": [
+    "Merge and deploy aggregator dedupe quickfix to canary on 2025-03-05 (PR #1842)",
+    "Run expanded staging load test with injected claim-merge windows to validate dedupe under lag",
+    "Implement request_id payload in claim-service PR #912 and run compatibility tests",
+    "Add observability: duplication-rate chart, dedupe-hit counters, redis-evictions metric",
+    "Schedule post-mortem session with SRE, Billing, and Claim-service owners after full rollout"
+  ],
+  "related_issues": [
+    "ENG-76050",
+    "ENG-332415",
+    "ENG-50321"
+  ],
+  "attachments": [
+    "https://logs.redwood.example.com/trace/59a8c3f2",
+    "https://github.com/redwood-inference/billing-aggregator/pull/1842",
+    "https://github.com/redwood-inference/claim-service/pull/912",
+    "https://confluence.redwood.example.com/display/BILL/Attribution+Reconcile+Design"
+  ],
+  "comments": [
+    "2025-02-15 - Aisha Mehta: Opened ticket after triage. Initial reproduction script attached and shared in #billing on Slack.",
+    "2025-02-18 - Priya Nair (SRE): Observed duplication correlated with kafka consumer lag spikes on partition 11. Suggested adding consumer offsets logging.",
+    "2025-02-20 - Zachary Kim: Implemented staging dedupe prototype using redis. Reduced duplicates by ~98% in test run.",
+    "2025-02-25 - Miguel Alvarez (Billing): Raised concern about memory growth for 24h dedupe TTL; requested eviction metrics and upper bounds before rollout.",
+    "2025-03-04 - Product: Approved short-term mitigation and requested customer communications template for affected accounts."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "timeline",
+    "decisions",
+    "next_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_083c91a3691842dcb1c182d2fe28c1e6"
+}

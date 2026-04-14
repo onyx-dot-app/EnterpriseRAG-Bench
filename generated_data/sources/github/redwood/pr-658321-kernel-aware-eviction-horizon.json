@@ -1,0 +1,44 @@
+{
+  "repo": "redwood",
+  "pr_number": "658321",
+  "title": "kernel-aware eviction horizon and reservation-based deferral for KV cache",
+  "author": "Priya Nair",
+  "created_at": "2026-02-15",
+  "updated_at": "2026-03-02",
+  "merged_at": "2026-03-02",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/kernel-aware-evict-horizon",
+  "reviewers": [
+    "Ethan Zhang",
+    "Miguel Alvarez",
+    "Luca Romano",
+    "Sara O'Connor"
+  ],
+  "labels": [
+    "runtime",
+    "kv-cache",
+    "perf",
+    "scheduling"
+  ],
+  "linked_linear": [
+    "ENG-16234",
+    "ENG-17045"
+  ],
+  "linked_jira": [
+    "SUP-4421"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "7",
+  "additions": "612",
+  "deletions": "184",
+  "breaking_change": "false",
+  "release_notes": "Introduces kernel-aware eviction scoring and a reservation-based deferral window to reduce fragmentation-induced spillovers and improve latency stability under high batching variance.",
+  "description": "Summary: This PR adds a kernel-aware eviction horizon and a tenant reservation queue to the KV cache manager. The goal is to reduce pathological spillovers and fragmentation when kernel selection (e.g. quantized vs fp16 paths) and continuous batching patterns cause interleaved hot/cold object lifetimes. The change provides a scoring function that accounts for fragmentation contribution, kernel hotness, and reservation horizon to defer eviction of recently reserved regions. It also adds an async compaction task that runs opportunistically when kernel hotness is low.\n\nMotivation and context: We've seen multiple incidents where the runtime's kernel switching and variable batch shapes led to high internal fragmentation and frequent micro-spills that increased p99 completion time for short requests. Those spill events were noisy (jittery), causing throughput drops and unexpected cloud egress. This PR synthesizes ideas from our scheduler and kernel-selection teams: make eviction decisions aware of the kernel heatmap and avoid evicting blocks that are likely to be reused by an upcoming kernel-window/batch.\n\nDesign: 1) Eviction scorer: new composite score = alpha*frag_score + beta*age_score + gamma*kernel_hotness - delta*reservation_credit. \"frag_score\" measures internal fragmentation by tracking contiguous free slot fractions per segment; \"kernel_hotness\" is a recent frequency-weighted counter for kernel invocations touching a shard. 2) Reservation horizon: callers (scheduler/runtime) can reserve a short horizon (configurable ms window) for regions expected to be reused by an incoming batch; reserved regions are deprioritized for eviction and get a reservation_credit that decays linearly at horizon expiry. 3) Async compaction: a background compaction task coalesces small adjacent free runs when kernel_hotness is below threshold to avoid compaction work during hot kernels. 4) Backpressure smoothing: when spill rate exceeds threshold we slow reservation acceptance and engage a prioritized eviction pass that respects tenant pacing.\n\nImplementation notes: - KV cache metadata: added kernel_hotmap (per-segment LRU-like counters) and reservation metadata (horizon_ts, credit). Implemented with lock-sharded metadata buckets to keep contention low. - Evictor path: replaced the tight O(n) scorer loop with a sampled priority heap with amortized maintenance; added fast-path for purely cold eviction. - Compaction: implemented a lock-free gather stage followed by a short critical-section rewrite; compaction is capped per-cycle to bound latency. - Config flags: runtime.eviction.kernel_aware.enabled (default true in canary), runtime.eviction.reservation_horizon_ms (default 50), runtime.compaction.max_ms_per_cycle (default 5).\n\nBenchmarks and results: - Unit and integration tests added: kv_cache_eviction_test, reservation_horizon_integration_test, compaction_race_test. - Microbench (local): under a mixed-workload trace (40% short chat, 60% long), peak eviction-induced spilldowns dropped 78%, memory reclaimed more steadily (reduction in fragmentation score by 43%), p99 latency for short requests improved from 212ms -> 163ms. - Canary (staging): deployed to a small dedicated pool for 72h with synthetic jittered batch shapes; observed 12% tail-latency reduction and 6% average token cost reduction due to fewer emergency spills.\n\nCommits: - 1) add kernel hotmap counters and reservation metadata (+234/-24) - 2) eviction scorer + sampled priority heap (+198/-60) - 3) async compaction task and ops (+102/-40) - 4) flags, docs, tests (+78/-60)\n\nFiles changed (high level): - runtime/kv/cache_manager.cc: new scorer, reservation handling, hooks to scheduler - runtime/kv/compactor.cc: async compaction worker with cycle cap - runtime/kv/metadata.h: kernel_hotmap & reservation structs - runtime/kv/benchmarks/evict_bench.cc: microbench harness - docs/ops/kv-eviction.md: operational guide and flags - tests/kv/reservation_horizon_test.cc: integration tests - tests/kv/compaction_test.cc: race and latency tests\n\nReview conversation (high-level): - Ethan Zhang: \"Nice direction. Can you add a metric that exposes reservation hit-rate and tie it to an alert? Also please make the default horizon conservative (50ms) and add a runtime flag.\" Priya: \"Added metric runtime.kv.reservation.hit_rate and made horizon configurable with default 50ms (canary only).\" - Miguel Alvarez: \"Concern: compaction concurrent path must not regress p50 on hot kernels. Can we cap compaction time per cycle and gate on kernel_hotness?\" Priya: \"Compaction now checks kernel_hotness and respects max_ms_per_cycle=5ms; added unit test compaction_race_test to validate.\" - Luca Romano: \"Can we add a smoke test for Dedicated capacity to ensure tenant pacing behaves under commit-based quotas?\" Priya: \"Added a canary smoke in the bench harness and a pacing integration test; results included in PR description.\" - Sara O'Connor: \"Please document operator steps to rollback and the expected metrics to watch.\" Priya: \"Added docs/ops/kv-eviction.md with rollback and monitoring playbook.\"\n\nCI and validation: - CI: linux/build (pass), linux/test (pass after one flaky test rerun), fuzz (pass), lint (pass). - Canary pipeline: staged rollout to 5% of dedicated pool -> 25% -> 100% after 72h with metric gates passed.\n\nMerge and rollout: - PR approved by Ethan and Miguel, +2 approvals. - Merge method: squash and merge. - Release: runtime 2.8.1-canary -> promoted to 2.8.1 for dedicated; hosted will enable kernel_aware flag in staged rollout.\n\nNotes on operational concerns and fallbacks: - If unexpected latency regressions occur, ops can set runtime.eviction.kernel_aware.enabled=false to revert to prior evictor within the same process. - Reservation horizon is safe-guarded: reservations are lightweight credits only and cannot permanently pin memory; expiry and force-evict path exist. - Compaction is bounded\u2014should not cause CPU spikes under normal configs.\n\nFollow-ups (future work): - Integrate tighter signals from batch scheduler for more deterministic reservation windows (ENG-17045) - Consider GPU-aware kernel-weighted placement in the allocator so that kernel affinity reduces cross-kernel fragmentation - Evaluate adaptive horizon that learns optimal ms per tenant based on traffic patterns\n\nThis PR is intentionally conservative: flags default to canary-only, compaction is capped, and behavior can be rolled back at runtime. It stitches together kernel-selection signals with the KV cache eviction logic to reduce fragmentation-driven spills that have hurt tail latency. Merge: squash and merge by Priya Nair on 2026-03-02.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_653387a73de94da798ce21eb5cd98b8d"
+}

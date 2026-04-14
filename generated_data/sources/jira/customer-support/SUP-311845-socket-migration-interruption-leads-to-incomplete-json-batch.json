@@ -1,0 +1,72 @@
+{
+  "key": "SUP-311845",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Socket migration during client network handoff causes truncated final JSON batch in SSE stream",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "customer_company": "NovaRetail",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "api-gateway",
+    "edge-proxy"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "socket-migration",
+    "json-truncation"
+  ],
+  "environment": "prod.us-east",
+  "affected_models": [
+    "gptx-13b-v1"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-12",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Maya Patel",
+  "assignee": "Ethan Chen",
+  "description": "Issue summary:\nCustomer (NovaRetail, dedicated) reports that during mobile network handoff (carrier change) their SSE-based streaming responses sometimes end with a truncated JSON 'batch' \u2014 the stream closes without the terminal closing brace and client parsing fails. Impact: downstream service that validates JSON payloads treats those responses as errors, causing feature degradation (order summarization job fails ~10%% of sessions on affected clients).\n\nImpact:\n- Intermittent: ~8-12%% of long streaming sessions from NovaRetail's mobile clients in us-east-1 during the last 72h.\n- Customer-visible: final aggregation step fails (client reports JSON parse error).\n- Business: dedicated customer running production traffic; affects critical summarization pipeline.\n\nEnvironment:\n- Redwood hosted dedicated fleet (us-east-1), model gptx-13b-v1 pinned on route nova-retail-summarize-v2.\n- Clients: iOS app behind carrier NAT, connection uses SSE over HTTPS via our edge-proxy pool.\n\nSteps to reproduce (customer-provided):\n1) Start long SSE generation from app (prompt set that yields 800-1200 tokens).\n2) Trigger network handoff (toggle airplane mode or move between carriers).\n3) Observe SSE disconnect and reconnect; sometimes final SSE event arrives truncated and no final 'end_of_stream' marker is present.\n\nObserved behavior:\n- Final events occasionally look like: \"data: {\\\"choices\\\":[{\\\"text\\\":\\\"...final sentence without closing brace\\\"}\"\n\n- Client receives connection close with no explicit end event; SSE parser throws a JSON error.\n\nExpected behavior:\n- Either the resume protocol should replay missing suffix or the server should emit a well-formed terminal event (closing JSON and metadata) even if connection migrates.\n\nRelevant logs/sample traces:\n- Edge logs (proxy) contain a short 102/connection migrate followed by immediately proxied request with new source IP.\n- Serving runtime trace (trace-id: trace-311845-1) shows a tokenization flush around disconnect and the last chunk write acknowledged but not marked as terminal.\n- Customer captured chunk sequence (base64-encoded for transport) shows trailing partial UTF-8 sequence and missing 'choices' closing brackets.\n\nFast reproduction note: Customer supplied a reproducible sequence when toggling cellular on iPhone 14 Pro in us-east-1; they captured the SSE window and attached truncated payload snippets.",
+  "comments": [
+    "2026-03-10 09:12 - Maya Patel (Support): Customer reported consistent failures during carrier handoff. Provided sample SSE capture and app logs. Requested urgent triage due to production impact.",
+    "2026-03-10 10:05 - Ethan Chen (SRE): I can see corresponding edge logs showing conn-migrate events. Opening deeper serving-runtime trace. Marking as P1/Sev1. Assigning to runtime team for kernel/buffer investigation.",
+    "2026-03-10 13:30 - runtime@redwood (comment): Initial hypothesis: edge-proxy performs TCP-level handoff which creates socket duplication; upstream keeps partial write state and our SSE framing logic treats the reappearance as a new stream without emitting terminal event. Risk: partial UTF-8 boundary split results in invalid JSON when stitched.\nLink to slack: #support (thread SUP-311845).",
+    "2026-03-11 08:47 - Customer (NovaRetail engineer): Attaching a short screen recording and raw SSE capture. Repro rate ~11%% across 200 attempts in field tests. Asking for workaround: retries or server-side guard to close streams cleanly.",
+    "2026-03-11 11:12 - Ethan Chen (SRE): Observed a pattern where edge proxy issues a 421 (migrated) then the client reopens a fresh SSE. Our session ID mapping currently uses ephemeral connection token; in migration path the server does not synthesize an explicit terminal event for the previous stream. Will try a fix to synthesize terminal event on migration detection and add additional UTF-8-safe chunking before emitting JSON frames.",
+    "2026-03-12 14:05 - runtime@redwood: PoC change applied to dev cluster to insert a short 'terminal-sentinel' on connection migration. Running soak tests simulating NAT rebinds and carrier handoffs.",
+    "2026-03-12 16:22 - Maya Patel (Support): Updated customer that we're testing a mitigation. Requested they try a client-side tolerant parser (fallback to incremental parse) as temporary workaround.",
+    "2026-03-12 18:00 - NovaRetail (customer): Confirmed reduction in failure rate when client applies incremental parsing fallback (failures down to ~1.2%%) but requested a permanent server-side fix.",
+    "2026-03-12 19:10 - Ethan Chen (SRE): Linking this to related historical ticket SUP-371200 (session shadowing) for cross-reference; that ticket includes earlier analysis of migration-induced duplicate session tokens."
+  ],
+  "investigation_notes": [
+    "Hypothesis 1: Edge-proxy connection migration causes our HTTP/streaming adapter to close socket without writing the final terminal SSE event. The client then reconnects and receives the rest of content from a new ephemeral session, leaving a dangling partial JSON chunk in the first session.",
+    "Hypothesis 2: Our chunk framing logic does not guarantee UTF-8 boundaries when split across socket detach. Truncation of multibyte codepoint leaves invalid JSON when stitched. Need to ensure chunk flushes are UTF-8-safe and last write marks terminal metadata.",
+    "Trace evidence: serving-runtime trace-311845-1 shows last write call returned success from a write queue but the 'terminal' flag was not persisted to the session state due to an early connection cleanup path. Edge proxy shows conn-migrate with 0.200s overlap between old and new IPs.",
+    "Temporary mitigation attempted: synthesizing a terminal sentinel when conn-migrate event detected at proxy layer. Soak tests indicate improved behavior for simulated NAT rebinding.",
+    "Data points: Failure spikes correlate with mobile network events (carrier NAT timeouts ~60s). Desktop clients show near-zero incidence. Customer's mobile repro confirms transport-level cause.",
+    "Related code areas: streaming-adapter (sse_writer.go), session-mapper (proxy), runtime flush path (kv-cache flush and chunk-emitter)."
+  ],
+  "resolution": "Mitigation in test: server now writes a UTF-8-safe terminal sentinel + final metadata on connection-migrate events from the proxy. Deployed to prod canary for nova-retail route 2026-03-12 22:00 UTC. Customer confirmed major reduction with client-side incremental-parse fallback in place. Next steps: merge stabilization PR, add unit tests for UTF-8 boundary preservation, and extend proxy-to-runtime migration signal with an explicit 'session-end' handshake. Post-deploy follow-up: monitor nova-retail telemetry for 72h; engineering to schedule a full backfill fix in 2-week sprint.",
+  "linked_issues": [
+    "SUP-371200"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/inference-runtime/pull/882"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/4800/SSE+Runbook"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_15ea247ca5644bd5be4c02291b5dbdfb"
+}

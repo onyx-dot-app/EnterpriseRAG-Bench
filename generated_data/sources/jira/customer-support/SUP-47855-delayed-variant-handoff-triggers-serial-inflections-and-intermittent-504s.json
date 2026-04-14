@@ -1,0 +1,88 @@
+{
+  "key": "SUP-47855",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Delayed variant handoff causes serial warmups and intermittent 504/timeouts for dedicated customer",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-13",
+  "reporter": "Aisha Khan",
+  "assignee": "Marcus Liu",
+  "customer_company": "ScaleWrite Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "routing",
+    "autoscaler",
+    "scheduler",
+    "api-gateway"
+  ],
+  "labels": [
+    "latency-regression",
+    "fallback-routing",
+    "coldstart",
+    "high-priority"
+  ],
+  "environment": "prod us-east",
+  "affected_models": [
+    "redwood-13b-quantized",
+    "redwood-7b-v1"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-12T16:00:00Z",
+  "first_response_due_at": "2026-03-12T13:00:00Z",
+  "linked_issues": [
+    "SUP-33421",
+    "SUP-51234"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/routing@pr/2113"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/variant-fallback-routing-runbook"
+  ],
+  "description": "Issue summary:\nCustomer ScaleWrite reports intermittent 504s and 5xx timeouts during a steady traffic spike for their dedicated pool. Symptoms point to requests being routed to slower/warmup variants in series rather than parallel, producing cascading cold-starts and elevated p99 latency.\n\nImpact:\n- Customer-facing inference latency p99 climbed from ~250ms to 1.8s for some endpoints during spike windows.\n- Intermittent 504 responses observed (~0.8% of requests) over a 90-minute window on 2026-03-12.\n- Affects critical production workflows (document indexing and user-facing chat).\n\nEnvironment:\n- Dedicated pool for ScaleWrite (dedicated tenant, us-east-1).\n- Routes configured: primary -> quantized-13b (fast), fallback -> warm-cpu-13b (slower warmup path).\n- Autoscaler policy: scaleUpOnQueue with step-scaling; warm-pool size set to 0.\n\nObserved behavior (brief):\n- When primary replicas transiently hit capacity, routing logic issued fallback to an alternative variant. Instead of sharding traffic across multiple initializing replicas, the router sent serial requests to single initializing replicas, triggering repeated warmups. During handoff the KV prefix cache was invalid for the new replica, making each request more expensive until fully warmed.\n\nSteps to reproduce (customer traffic pattern):\n1) Send a steady stream of concurrent requests (~120 rps) with bursts up to ~200 rps for 20 minutes aimed at endpoint /v1/generate.\n2) Primary (quantized-13b) replicas reach concurrent token limits and signal routing fallback.\n3) Router directs subset of traffic to fallback variant instances which are in 'initializing' state.\n4) Requests queue and are serially admitted to a small set of initializing replicas, producing repeated coldstarts and 504s.\n\nExpected:\n- Router should distribute fallback traffic across healthy warm replicas (or place into a pre-warmed pool) and avoid serially initializing replicas.\n- KV/prefix cache should warm quickly or be seeded to avoid large per-request penalties.\n\nActual:\n- Serial handoffs to single initializing replicas created a thundering-warmup effect; fallback routing used a deterministic single-shard policy in this path which amplified latency and timeouts.\n",
+  "logs": [
+    "2026-03-12T12:05:13Z ERROR router: fallback chosen for request id=xyz123 variant=warm-cpu-13b state=initializing replica=rep-7 queue_len=4",
+    "2026-03-12T12:05:13Z WARN serving-runtime: rep-7 kv-cache-miss prefix=customer:scalewrite session=abcde coldstart=true",
+    "2026-03-12T12:05:13Z ERROR api-gateway: request id=xyz123 returned 504 after 12000ms upstream=rep-7",
+    "2026-03-12T12:06:02Z INFO autoscaler: launched rep-9 for variant=warm-cpu-13b scale_event=step_up target_replicas=3"
+  ],
+  "comments": [
+    "Support (Aisha): Received customer report at 2026-03-12 12:12 UTC. Customer observed p99 spike and intermittent 504s after a daytime traffic increase. Collecting traces and asked for sample request IDs.",
+    "Customer (ScaleWrite - ops@scalewrite.com): Provided request samples and mentioned pattern: low sustained traffic with sudden 30s bursts. Reports that the issue correlates with hour-of-day 11:00-12:30 UTC.",
+    "SRE (Marcus): Initial logs show fallbacks to warm-cpu-13b where replicas were in initializing state. Routing policy appears to favor single-rep handoff for this tenant during constrained capacity. Reproduced locally with similar load pattern; observing serial warmups and high KV miss rates.",
+    "SRE (Elena): Ran heap of traces and dashboard snapshots: queueing observed in router shard 4, concurrency limits hit on quantized-13b. Autoscaler started new replicas but replicas remained in 'initializing' for ~18-22s before accepting full traffic.",
+    "Engineering (Ravi): Hypothesis: fallback routing path uses deterministic hashing/shard that picks a single initializing replica when fallback candidate list is small. Also cache seeding isn't happening for new fallback replicas. Propose: change fallback to round-robin across initializing replicas + seed KV cache for fallback variants.",
+    "Support (Aisha): Customer asked for a short-term mitigation: can we increase warm-pool size or change tenant routing to prefer more replicas? Escalated to product for config change for their dedicated pool."
+  ],
+  "investigation_notes": [
+    "01 - Confirmed request ids from customer map to router logs where variant=warm-cpu-13b and replica state=initializing.",
+    "02 - Dashboard: p50 unchanged, p95 modest increase, p99 and error rate spike aligned with fallback window. Memory/CPU on primary replicas show expected load; fallback triggered due to concurrency caps on token execution paths, not OOM.",
+    "03 - Reproduced locally using a stress test harness (loadgen) that mimics customer's burst pattern. Reproduction shows serial warmup behavior when fallback candidate set size <=2.",
+    "04 - Review of router code path: fallback selection uses candidate_shard = hash(tenant_id) % candidate_count; with candidate_count small, this consistently picks same replica under correlated failures.",
+    "05 - KV/prefix cache cold-miss measured at ~110ms extra per request for initial tokens; repeated because new replicas served many sequential requests while cache warmed slowly.",
+    "06 - Autoscaler launched new fallback replicas but they reached 'ready' state staggered; routing did not round-robin across ready instances immediately.",
+    "07 - No evidence of network-level issues or TLS problems; errors are at application/serving layer."
+  ],
+  "resolution_notes": [
+    "Short-term mitigation (applied 2026-03-12T15:45Z): Increased warm-pool_min for ScaleWrite dedicated pool from 0 -> 2 to ensure at least two warm replicas available for fallback variants. Adjusted routing fallback policy to prefer non-initializing ready replicas when available.",
+    "Customer workaround communicated: throttle upstream burstiness (client-side retry/backoff) or enable prewarm setting for critical endpoints. ScaleWrite accepted warm_pool increase as temporary mitigation.",
+    "Long-term changes proposed: (a) modify fallback selection to use jittered round-robin when candidate_count small, (b) implement proactive KV/prefix seeding for fallback replicas on start, (c) tweak autoscaler to pre-warm replicas before marking them as eligible for fallback.",
+    "Action items: ENG-1229 (router fallback logic change), ENG-1230 (KV seeding job), OPS-441 (autoscaler prewarm tuning).",
+    "Follow-up: Monitor ScaleWrite pool for 24 hours and provide SLA impact report. If stable, close ticket; if regressions recur, roll additional mitigations."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "resolution_notes",
+    "comments",
+    "logs"
+  ],
+  "dataset_doc_uuid": "dsid_8a3205a0254a4d179af8e84f21704828"
+}

@@ -1,0 +1,35 @@
+{
+  "title": "Ephemeral FD leak & kube-scheduler heartbeat jitter - investigation notes",
+  "owner": "Ava Martinez",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/site-reliability-engineering/ephemeral-fd-leak-kube-scheduler-heartbeat-investigation.json",
+  "doc_type": "doc",
+  "created_at": "2026-02-18",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Ravi Patel",
+    "Elena G\u00f3mez",
+    "Ben Cho"
+  ],
+  "team": "eng-sre",
+  "status": "draft",
+  "tags": [
+    "kubelet",
+    "file-descriptors",
+    "scheduler",
+    "investigation",
+    "post-incident",
+    "wip"
+  ],
+  "linked_artifacts": [
+    "JIRA-OPS-1284",
+    "https://github.com/redwood-inference/cluster-ops/pull/482",
+    "slack: #sre-ops thread ts=1700000000.000200"
+  ],
+  "body": "Summary:\nWe observed repeated kube-scheduler pod scheduling latency spikes across 3 clusters (prod-us-east-1b, prod-us-west-2a, staging-eu) over a ~36 hour window. Correlated symptoms: increased Pending pods, slow leader-election cycles for controllers, and node kubelet logs showing 'too many open files' warnings. Hypothesis: transient file descriptor (FD) exhaustion on kubelet/processes handling CNI/native dataplane sockets leading to eviction-like behavior and scheduler heartbeat jitter (controllers perceive nodes as slow).\n\nKey signals observed (timeline):\n- 2026-02-17 03:12 UTC: first alert - scheduler p95 schedule latency > 8s (baseline ~55ms).\n- 2026-02-17 03:15 UTC: surge in node kubelet logs: repeated 'failed to open socket: EMFILE', 'accept: too many open files'.\n- 2026-02-17 03:21 UTC: etcd leader observed short a 500ms apply latency spike (likely unrelated root cause but amplified scheduling latency).\n- 2026-02-17 04:05 UTC: SRE oncall attached to node and ran lsof -p on kubelet and cni processes; per-process FD counts ~64k (open file limit 65k) for our custom dataplane agent; slab of /proc/net entries increased.\n- 2026-02-17 07:40 UTC: rolling restart of dataplane agent on affected nodes returned them to healthy FD levels and scheduler latency returned to baseline.\n\nRepro & investigative commands run:\n- kubectl get pods -A --field-selector=status.phase=Pending -o wide (tracked p95 pending age)\n- ssh node -> sudo systemctl status dataplane-agent kubelet\n- sudo lsof -nP -p <pid> | wc -l (count FDs)\n- procfs scan: ls -l /proc/<pid>/fd | wc -l\n- ss -s / netstat -an | grep TIME_WAIT (look for socket churn)\n- strace -p <pid> (short trace to confirm failing accept())\n- journalctl -u kubelet -o short-iso | grep -E 'EMFILE|too many open files|accept failed'\n\nQuick root-cause notes:\n- The dataplane-agent has a bug where retransmit retry paths open ephemeral sockets (UDP + raw ARP sockets) and don't close them under heavy churn from multi-tenant sidecar CNI flows. The agent's keepalive/reconnect logic retries aggressively and leaks socket fds during backoff.\n- Kernel FD table on affected nodes close to per-process RLIMIT_NOFILE (~65k) due to combination of: many conns from node-local proxies, ephemeral sockets left in TIME_WAIT, and leaking sockets from dataplane agent.\n- Kubelet and system services sometimes hit ENFILE/EMFILE when creating ephemeral sockets or opening files for pod lifecycle hooks -> causes probe failures and delayed node heartbeats. Scheduler sees nodes as slower and increases scheduling retries.\n\nMitigations applied (short-term):\n- Restart dataplane-agent on affected nodes (quick fix).\n- Applied a temporary systemd Drop-In to raise LimitNOFILE for dataplane-agent to 200000 on 03 clusters (helps headroom but not a fix).\n- Tightened CNI sidecar connection & idle timeouts for a handful of high-churn namespaces to reduce socket churn.\n\nObservations from metric deltas:\n- Node FD usage dropped from ~63k to ~8k after restarts in ~5 minutes.\n- Pod Pending p95 returned to baseline after ~20 minutes on average post-restart.\n- No increase in OOM or node-level CPU after restart (suggests leak was FD-specific).\n\nLonger-term action items (owner + ETA):\n- Fix leak in dataplane-agent reconnect path: PR reviewed by eng-networking (Ben Cho) -> patch scheduled, ETA 2026-02-25. (owner: Ben Cho)\n- Add per-process FD watermark alert (new SLO alert): when any critical process > 70% of soft limit for > 5m -> page oncall. (owner: Ravi Patel, ETA 2026-03-05)\n- Harden systemd service files for kubelet and dataplane: setLimitNOFILE to 200k and document reasoning in infra runbook. (owner: Elena G\u00f3mez, ETA 2026-03-12)\n- Add synthetic probe that creates short-lived connections to dataplane and validates immediate fd closure (unit test + cluster e2e). (owner: eng-sre/ci, ETA 2026-03-30)\n- Postmortem doc and RCA writeup for exec review (owner: Ava Martinez, ETA 2026-03-08 -> status: draft)\n\nOpen questions / TO INVESTIGATE:\n- Are there kernel-level tunables (tcp_tw_reuse / TIME_WAIT tuning) we can safely adjust in prod to reduce socket table pressure? pros/cons?\n- Is the dataplane-agent leak present on all versions or introduced post v1.9.3? Need bisect across canary nodes.\n- Should we move to global iptables/nft based rate limiting to dampen sidecar churn rather than changing all sidecars?\n\nPlaybook draft (emergency runbook steps for oncall):\n1) Alert triggers: scheduler.p95_schedule_latency > 3s AND Node.Kubelet.EMFILE log seen on >=2 nodes in a region -> escalate to SRE.\n2) Run quick triage: kubectl top nodes; check /proc/<kubelet_pid>/fd; check dataplane-agent fd count; check ss -s.\n3) If dataplane-agent FDs > 85% of soft limit: restart dataplane-agent on 2-3 nodes (rolling) + raise LimitNOFILE temporarily.\n4) If restart doesn't reduce FD counts within 10 min: cordon and drain 1 node and collect full traces (strace -ff, lsof -p, /proc/net/tcp).\n5) Apply temporary config (sidecar timeout) via kustomize to high-churn namespaces.\n6) After recovery: collect logs, take snapshots of /proc/<pid>/fd counts, attach to JIRA ticket, and start RCA.\n\nNotes to self (loose):\n- Avoid mass restarting kubelet except as last resort; restarting dataplane-agent is lower blast radius.\n- Need a small test harness to deliberately simulate 10k short-lived socket connections and watch FD accounting per process -> add to stress-suite.\n- Consider automating temporary LimitNOFILE bump with a safe guard (auto-quarantine if process continues leaking).\n\nRelated artifacts and links:\n- Heap of lsof outputs and node-specific traces attached to JIRA-OPS-1284 (see linked_artifacts).\n- Temporary systemd drop-in implemented: /etc/systemd/system/dataplane-agent.service.d/limitnofile.conf (patch in PR linked).\n\nConclusion:\nThis incident was caused primarily by an FD leak in our dataplane agent under high connection churn combined with conservative per-process FD limits. Immediate recovery is reliable via agent restart and temporary LimitNOFILE bump. We need code fix, alerts, harass tests, and runbook updates to avoid recurrence.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_70d4e3c538d84786aa31db026ac667d1"
+}

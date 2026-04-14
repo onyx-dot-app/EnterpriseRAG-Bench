@@ -1,0 +1,47 @@
+{
+  "key": "ENG-21407",
+  "team": "engineering",
+  "title": "Credit-led tier routing with region-aware fallbacks and model-variant chain",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-14",
+  "creator": "Asha Patel",
+  "assignee": "Miguel Santos",
+  "project": "smart-routing",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "due_date": "2026-03-28",
+  "labels": [
+    "routing",
+    "credit-pools",
+    "regions",
+    "fallbacks",
+    "slo"
+  ],
+  "release": "runtime-1.26",
+  "customer_impact": "medium",
+  "description": "Summary:\nWe need a robust tier-based routing algorithm that uses per-tenant credit pools (instead of opaque quotas) to prioritize traffic across Free, Paid, and Enterprise tiers while making region selection and model-variant fallback decisions. This ticket implements the core credit-led prioritization engine, region-aware placement hints, and a deterministic fallback chain of compatible model variants (e.g., full -> quantized -> distilled) when preferred variants are unavailable.\n\nGoals:\n- Honor tenant credit pools with a predictable, auditable deduction model (credits/time or credits/token depending on route).\n- Ensure Free traffic is deprioritized under contention but retains a bounded soft-fail experience (short grace windows before hard rejection).\n- Paid and Enterprise get priority lanes; Enterprise has overcommit/borrow window when capacity exists.\n- Region selection should prefer lowest-latency region with available capacity and sufficient credits; otherwise prefer cheaper region for Paid or Enterprise cost-optimized requests.\n- Model-variant chain must be compatible: the system must only fall back to a variant that preserves the API contract (same tokenizer/structured output).\n- Provide observability: per-tenant credit burn, evictions, fallback rates, per-region saturation, and SLO violations.\n\nDesign (high level):\n1) Data model: credits: {tenant_id, tier, available_credits, refill_rate, bucket_ts}. Credit pools are integer credits; different routes consume different credit costs configured per route-model pair.\n2) Decision flow (simplified):\n   - Step A: locate candidate regions sorted by policy (latency, cost, capacity). Each candidate has available capacity and per-region admission thresholds.\n   - Step B: for the highest-ranked region, evaluate tier lane: check tenant tier and available credits. If credits >= cost_threshold, accept into preferred lane.\n   - Step C: if insufficient credits, try: soft-grace (allow for up to grace_credits deficit for Free tier only, recorded as negative balance), or if Paid/Enterprise and enterprise_borrow enabled, allow borrow up to borrow_limit with elevated logging.\n   - Step D: if admission fails in that region, try next region. If no region admits, consult fallback model-variant chain for the chosen region: prefer same-region quantized variant, then distilled variant, then cross-region fast variant as last resort.\n   - Step E: if fallback variant chosen, recompute cost based on variant cost_multiplier and attempt admission again.\n3) Variant compatibility: ensure variant_metadata contains {tokenizer_id, api_contract_id}. Only fall back to variants with matching api_contract_id.\n4) Credit accounting semantics: strong-consistency for credit deduction is expensive; we adopt an optimistic reservation with short-lived holds (50ms) using the global credit ledger and vector-clock-style conflict resolution. If a conflict occurs, a rejection path returns to the client with retry-after or auto-retry if request idempotent.\n\nAdmission policies and parameters (initial):\n- Free tier: base_cost multiplier 0.5 per token; soft_grace = 200 credits; max_negative_balance = -500 credits (after which immediate HTTP 429).\n- Paid tier: base_cost multiplier 1.0; borrow_limit = 1000 credits (enterprise borrow not available to Paid); priority_weight = 2.\n- Enterprise tier: base_cost multiplier 0.9; borrow_limit = 5000 credits; priority_weight = 4; preemption_allowed = true (enterprise can preempt queued Free requests).\n- Region preference: prefer same-region; tiebreaker uses latency_estimate + (cost_penalty * region_cost_multiplier).\n- Fallback chain example for model X: [X-standard, X-8bit-quant, X-distilled, X-fast-crossregion]\n\nAPIs / Config changes:\n- New endpoint: POST /routing/evaluate with body: {tenant_id, route_id, model_family, seq_len_estimate, region_hint?}. Returns routing decision: {region, model_variant, lane, credit_cost, hold_id, reason}.\n- Admin dashboard: per-tenant credit history and manual top-ups, policy overrides.\n\nObservability & Metrics:\n- Metrics emitted: credit_burn_total{tenant, tier}, credit_balance{tenant}, fallback_rate{model, region}, admission_rejection{reason,tier}, region_saturation_ratio, preemption_events.\n- Alerts: fallback_rate > 5% sustained for 5m for a given production model -> paging to SRE. Region saturation > 90% for > 2m -> paging.\n\nTesting & Validation:\n- Unit tests: credit arithmetic, soft-grace behavior, borrow_limit enforcement, variant compatibility checks.\n- Integration tests: multi-region admission simulation with synthetic latency profiles and capacity constraints.\n- Load test: synthetic tenants across Free/Paid/Enterprise hitting different model families to validate fairness and SLO.\n- Chaos test: simulate region partition and verify graceful cross-region fallback and credit reconciliation.\n\nRollout plan:\n1) Feature flag gated in control plane (flag: credit_led_routing_v1).\n2) Deploy to staging and run synthetic tenancy load for 48h; validate metrics and invariants.\n3) Canary rollout to 5% of production tenants (prefer internal Redwood tenants). Monitor fallback_rate, credit_consistency_errors.\n4) Expand to 25% after 24h, then 100% after 72h if stable.\n\nBackward compatibility and client impact:\n- No client API changes required for normal inference calls. The evaluation endpoint is internal. Behavior changes are transparent; however, in edge cases clients may see more 429s for Free tier or receive responses from quantized variants with slightly different latency/quality profiles. These will be surfaced via per-request metadata (X-Model-Variant header).\n\nOpen decisions / trade-offs:\n- Strong vs optimistic credit reservations: chosen optimistic hold for latency, but we must add reconciliation jobs to correct drift.\n- Borrow semantics for Paid tenants: should Paid be allowed borrow like Enterprise? Current plan: No, to preserve Enterprise SLAs. Revisit after telemetry.\n- Metric dimensionality: we opted for tenant-level metrics + tier/model/region rollups to control cardinality.\n\nAcceptance criteria:\n- End-to-end routing decisions exercised in canary with credit accounting end-to-end and <0.1% reconciliation failures on hold release.\n- Observability dashboards populated with credit burn, fallback, and admission metrics.\n- No increase in 95th latency beyond 8% in canary workloads.\n\nLinks and artifacts:\n- Design doc (Confluence): https://redwood.atlassian.net/wiki/spaces/SR/pages/credit-led-routing-design\n- PR (control plane): https://github.com/redwood-inference/control-plane/pull/6421\n- PR (runtime admission): https://github.com/redwood-inference/runtime/pull/5019\n- Dashboard mock: https://app.redwood.internal/dashboards/credit-led-routing\n\nNext steps:\n- Implement admission endpoint and optimistic hold machinery (ENG pair: Miguel + Claire).\n- Add variant metadata check into model-catalog ingestion (owner: Applied ML).\n- Create reconciliation worker to periodically correct credit state after partition recovery.\n",
+  "comments": [
+    "2026-03-11 Miguel Santos: Spiked optimistic hold using Redis STREAM + Lua \u2014 initial latencies look good (p50 add ~3ms). Need to test conflict scenarios when many concurrent start-of-request holds happen.",
+    "2026-03-12 Claire Wong: Ran synthetic Free-heavy load in staging; observed negative balances reached soft_grace but preemption logic didn't evict queued Free requests consistently. Filing small follow-up (ENG-21432) for queue preemption fix.",
+    "2026-03-13 Asha Patel: Security review requested for admin top-up UI (sensitive operations). Ticket added to backlog: PM to coordinate SSO scoped RBAC. Marked security_review_required=true in parent project.",
+    "2026-03-14 Miguel Santos: Canary gate created (flag credit_led_routing_v1). Preparing canary rollout with internal tenants next week. Linked PRs for control plane and runtime under review."
+  ],
+  "dependencies": [
+    "ENG-21432",
+    "PM-412",
+    "ENG-20899"
+  ],
+  "links": [
+    "https://redwood.atlassian.net/wiki/spaces/SR/pages/credit-led-routing-design",
+    "https://github.com/redwood-inference/control-plane/pull/6421",
+    "https://github.com/redwood-inference/runtime/pull/5019"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_62db09372a7f40578cdcb67962a9cf73"
+}

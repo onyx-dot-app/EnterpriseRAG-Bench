@@ -1,0 +1,78 @@
+{
+  "key": "ENG-18675",
+  "team": "engineering",
+  "title": "Concurrent kernel fallback and KV prefetch invalidation causing softmax numerical drift",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "creator": "Emma Patel",
+  "assignee": "Rohit Gupta",
+  "project": "serving-runtime-stability",
+  "cycle": "2026-W11",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "kernel-selector",
+    "kv-cache",
+    "prefetch",
+    "numerical-drift",
+    "hotfix"
+  ],
+  "dependencies": [
+    "ENG-18400",
+    "ENG-18550"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.19",
+  "security_review_required": "false",
+  "description": "Summary: We observed a class of correctness regressions that manifest as small but reproducible token-variance/softmax instability and partial KV cache corruption when incoming requests concurrently trigger kernel fallback paths (quantized -> fallback FP kernels) while an asynchronous KV prefetch/invalidation is in flight. This ticket tracks investigation, short-term mitigations, and a planned patch release.\n\nContext: Changes from the recent kernel-selection refactor introduced heuristic fallback to float kernels for certain sequence-length/hardware combos when quantized kernels report failure or return numerical guard rails. The fallback is executed concurrently with KV cache prefetch for low-latency warmup. Under high concurrency the interplay can cause stale/partial KV page mappings and divergent softmax sums in a subset of model runs.\n\nWhy this is prioritized: Affected customers report token-level nondeterminism and elevated hallucination rates on production models when traffic spikes trigger fallback logic. Because this can change model outputs and is data-sensitive for enterprise customers, this is P0.",
+  "steps_to_reproduce": "1) Deploy runtime-1.19 candidate with the kernel-selection refactor enabled.\n2) Use a multi-client load generator (recommended: rl-client v0.8.1 harness) to send 120 concurrent prefill requests and 480 concurrent decode requests to the same model shard with batch_size=8 and seq_len=1024 distribution (50% short, 50% long).\n3) Enable KV prefetch=true and kernel_fallback_enabled=true.\n4) Capture a sample of ~200 request traces with full runtime logging (log_level=debug) and perf counters for kernel_id, fallback_flag, kv_prefetch_start/complete timestamps, and kv_page_version.\n5) Re-run with deterministic seeding and compare softmax outputs per layer between runs.\n6) Observe divergence and occasional KV page_version mismatch between prefill and decode phases.\n\nNotes: Repro is more likely on A100 40GB and Ampere variants with batched continuous decoding. Lower device memory or higher concurrency increases likelihood.",
+  "observed_behavior": "- Intermittent softmax sums diverging by ~1e-5 to 1e-3 at middle attention layers compared to baseline.\n- Some requests show mismatched kv_page_version between prefill and decode (e.g., prefill:v17 -> decode:v15) and missing entries in the per-request KV index map.\n- Kernel fallback traces show that fallback kernels sometimes run partially while original quantized kernel had already enqueued prefetch completion; both paths touched the same KV slot without proper ordering.\n- Resulting decoded tokens differ in 0.2% of tokens for affected runs; customers report higher downstream hallucinations in those sessions.\n- No GPU OOMs or crashes reported, but data correctness is impacted.",
+  "expected_behavior": "- Kernel fallback should be strictly linearized with respect to KV prefetch/invalidation for the same request so that either: (a) fallback path waits for in-flight prefetches to finish and reads consistent KV state, or (b) prefetch/invalidation is ordered after kernel selection and any kernel-specific KV format conversions.\n- Softmax numerical results should be consistent within float rounding bounds across retries when hardware/kernel routing differs.",
+  "investigation_notes": "- Collected 1k+ traces, perf counters and GPU timelines from three affected customers.\n- Replayed requests offline using deterministic scheduling; divergence reproduced when two conditions met: (1) fallback decision executed by background kernel-selector thread while prefetch completes on the IO thread, and (2) KV page_version update is non-atomic relative to per-request indices.\n- Review of kernel-selection code shows race where fallback_mark is set, fallback kernel launched, but prefetch callback can apply page_version updates without acquiring per-request spinlock because of a recent micro-optim change to reduce latency.\n- Floating-point drift is amplified because fallback kernels use accumulation in FP32 while quantized kernels reconstruct in BF16, leading to slightly different numeric paths; however the correctness issue comes from inconsistent KV contents, not FP alone.\n- Reproduction logs include timestamps where prefetch_complete (t=1001.237ms) is applied between fallback_launch (t=1001.230ms) and fallback_read_kv (t=1001.234ms), indicating out-of-order memory visibility between threads.\n- Memory barriers missing around PageVersion update in kv_store.c; also discovered optimistic swap in kv index map that doesn't update the per-request shadow index when fallback path copies a reshaped KV buffer.",
+  "root_cause": "Two interacting bugs: (1) A removed synchronization fence in kv_store prefetch path (micro-optimization from ENG-18290) caused non-atomic page_version visibility across threads, enabling fallback reads to see stale or partially-updated KV pages. (2) Kernel fallback path performs a shallow copy into a temporary KV view without updating the canonical per-request index atomically, so concurrent prefetch invalidation can leave the decode phase reading a mix of old/new KV slices. The resulting mixed KV entries produce softmax inputs that differ slightly; numerical drift compounds the difference but is not the primary cause.",
+  "short_term_mitigation": "- Roll out a canary patch to reintroduce a lightweight memory barrier (atomic update) around page_version updates in kv_store and make per-request shadow index updates atomic. Target runtime-1.19.1.\n- Disable kernel_fallback_enabled by default for high-concurrency clusters and add a dynamic feature flag to opt-in per-customer until fix is validated.\n- Add a server-side alert that tracks KV page_version mismatches between prefill and decode phases; fire P0 pager if mismatch rate > 0.01% over 5 minutes.\n- Notify affected customers with suggested mitigation (disable fallback flag) and offer priority patching windows.",
+  "long_term_plan": "- Redesign kernel selection to perform selection and any required KV format conversions synchronously on a request-affine worker thread to avoid cross-thread window where stale views can be read.\n- Introduce a transactional KV prefetch API: begin_prefetch -> commit_prefetch which updates page_version atomically with epoch counters.\n- Add deterministic end-to-end unit tests in the runtime test harness that simulate concurrent fallback and prefetch races with stress modes.\n- Evaluate moving certain KV housekeeping to the device-side (GPU) when available to remove host-induced races.\n- Post-mortem RFC to be written and reviewed by infra and runtime teams (due 2026-03-25).",
+  "tasks": [
+    "ENG-18676: Patch kv_store to use atomic page_version updates and add a per-request shadow index CAS (assignee: Rohit Gupta, estimate: 3)",
+    "ENG-18677: Add an integration stress test that fuzzes kernel_selector + kv_prefetch windows (assignee: Diego Mart\u00ednez, estimate: 3)",
+    "ENG-18678: Implement feature flag to disable kernel_fallback by default and gate by customer (assignee: Alice Chen, estimate: 2)",
+    "ENG-18679: Create alert dashboard and SLO guardrail for KV page_version mismatch (assignee: Lena S\u00f8rensen, estimate: 1)",
+    "ENG-18680: RFC for transactional KV prefetch API and kernel-selection rework (assignee: Emma Patel, estimate: 5)",
+    "ENG-18681: Release runtime-1.19.1 hotfix and coordinate enterprise rollouts (assignee: Release Team, estimate: 2)",
+    "ENG-18682: Customer communication and postmortem (assignee: Support Lead, estimate: 1)"
+  ],
+  "attachments": [
+    "gs://redwood-internal/logs/kv_race_2026-03-09.tar.gz",
+    "s3://redwood-artifacts/runtime-1.19/traces/trace_2026-03-09.jsonl",
+    "https://github.com/redwood-inference/runtime/pull/4312 (patch branch)"
+  ],
+  "links": [
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/INF/pages/123456789/Kernel+fallback+and+KV+race+postmortem",
+    "Playground repro harness: https://internal-redwood.dev/rl-client/harness/v0.8.1",
+    "Related ticket: ENG-18290 (micro-opt removal of memory barrier)"
+  ],
+  "comments": [
+    "2026-03-10 Emma Patel: Initial report from Customer X; attaching traces. Assigned to Rohit for triage.",
+    "2026-03-11 Rohit Gupta: Confirmed reproduce locally with stress harness. Patch underway to reintroduce atomic write for page_version. Observed that enabling stronger memory ordering fixes the mismatch in test harness.",
+    "2026-03-11 Diego Mart\u00ednez: Writing fuzz test to exercise fallback + prefetch concurrency windows. Early runs found a different failure mode when batch_size>16 \u2014 added to test matrix.",
+    "2026-03-12 Alice Chen: Preparing feature-flag rollout plan; disabling fallback for 3 high-traffic clusters as emergency mitigation.",
+    "2026-03-12 Emma Patel: Notifying customer success and starting RFC draft for long-term design."
+  ],
+  "original_location": "linear/engineering/ENG-18675-concurrent-kernel-fallback-prefetch-kvcache-invalidation-and-softmax-drift.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "investigation_notes",
+    "root_cause",
+    "short_term_mitigation",
+    "long_term_plan",
+    "tasks",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_e054466673684b0c8e622868f4fe4ca3"
+}

@@ -1,0 +1,37 @@
+{
+  "title": "Observability ingest snags - cribsheet",
+  "owner": "Aisha Patel",
+  "drive_area": "users",
+  "path": "users/obs-ingest-snags-cribsheet.json",
+  "doc_type": "doc",
+  "created_at": "2026-02-25",
+  "last_modified": "2026-03-12",
+  "collaborators": [
+    "Ethan Morales",
+    "Priya Srinivasan"
+  ],
+  "team": "eng-observability",
+  "status": "draft",
+  "tags": [
+    "observability",
+    "log-ingest",
+    "tracing",
+    "debug",
+    "otlp",
+    "kafka",
+    "hypothesis"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-OBS-234",
+    "JIRA-OPS-9876",
+    "https://redwood.slack.com/archives/C07OBSERV/p1658432100",
+    "github.com/redwood-inference/otel-collector/PR-412"
+  ],
+  "content": "Quick brain-dump / running notebook for the ingest drop that started ~2026-02-24 16:10 UTC.\n\nBackground (TL;DR):\n- Around 2026-02-24 16:10 UTC we observed a ~60% drop in log ingest rate to the observability pipeline (Logstash/Filebeat -> Kafka -> OTEL-Collector -> ES). Traces were partial: many spans missing service.name or dropped entirely. Metrics ingestion (Prom/Pushgateway) largely unaffected.\n- Affected customers: internal canaries + a handful of early Dedicated tenants.\n- Pattern: sudden drop, then intermittent bursts, never full recovery without manual intervention.\n\nWhat I observed (timeline):\n- 2026-02-24 16:07 UTC: alert firing CPU on otel-collector-0 (node 4) but CPU only 65%.\n- 2026-02-24 16:10 UTC: logs ingestion rate drops (see quick grep below).\n- 2026-02-24 17:00 UTC: I toggled a rolling restart on otel-collector ds in staging -> small improvement.\n- 2026-02-25 09:30 UTC: found repeated errors in collector: \"failed to encode export request: resource not found\" (snippet later).\n- 2026-02-25 11:00 UTC: increased kafka consumer parallelism (consumer-group scaling) \u2014 temporary bump.\n\nCommands/traces I ran (copy-pasta):\n- kafka consumer lag check:\n  kubectl exec -it deploy/kafka-tools -- /bin/sh -c \"kafka-consumer-groups --bootstrap-server kafka:9092 --describe --group obs-ingest\"\n  -> consumer lag stayed low for most topics, but topic obs-raw-logs had 30-40% lower throughput.\n\n- tail Collector logs (filtered):\n  kubectl -n observability logs ds/otel-collector -c otel-collector --since=2h | egrep \"error|warn|drop|failed\" -n | sed -n '1,200p'\n  sample lines: \n    [2026-02-25T09:29:58Z] WARN exporterhelper/queued_retry.go: Retrying export failed: failed to encode export request: resource not found\n    [2026-02-25T09:30:01Z] ERROR pipeline/trace: failed to send batch, status=UNAVAILABLE\n    [2026-02-25T09:31:20Z] WARN exporter/logging.go: Dropping 120 spans due to queue limit reached\n\n- otel-collector config diff (recent deploy):\n  git show --name-only origin/main:deploy/otel-collector.yaml | sed -n '1,200p'\n  noticed: sampling processor added (rate limiting), queue_size reduced from 5000 -> 500, batching timeout changed from 200ms -> 50ms.\n\n- Heap/FDs on collector pods:\n  kubectl exec -it otel-collector-0 -- sh -c \"ps aux | grep otel && cat /proc/$(pidof otelcol)/limits\"\n  -> no obvious fd exhaustion, RSS ~420MB (expected), but open files ~1024 (we typically run at 4096) -> ah, limits lowered.\n\n- Quick ES error scan (ingest index write errors):\n  curl -s -u es-user:XXXX 'https://es.internal/_cat/indices?v' | egrep obs-ingest\n  -> obs-raw-logs-2026.02.24 yellow, docs count stalled, health changed to yellow around 16:12 UTC.\n\nHypotheses (brainstorm):\n1) Otel-Collector config change (queue/batch/sampler) increased dropped spans under transient backpressure -> manifests as low ingest and drop warnings.\n2) Elasticsearch shard issues (unassigned primaries) causing exporter to see UNAVAILABLE -> Collector retries and queue overflows.\n3) Kafka broker throttle or network egress bottleneck between Filebeat -> Kafka causing flow control; rarer because kafka lag didn't spike.\n4) New sidecar (envoy) version rolled to nodes with default ulimit=1024 that reduced file descriptors so collectors hit queue limits sooner.\n5) OTLP exporter auth token rotated and some pods stuck with old token -> 401-like errors masked as resource not found.\n\nError snippets (copied):\n- \"failed to encode export request: resource not found\" (Collector exporterhelper)\n- \"Dropping 120 spans due to queue limit reached\"\n- \"write failed, transport error: context deadline exceeded\" (ES client)\n- \"bulk request conflicts: index primaries unassigned\" (ES bulk response)\n\nQuick experiments attempted and outcomes: (notes to self)\n- Increase otel-collector queue_size to 2500 in a canary -> immediate reduction in drop warnings but spikes in pod memory usage.\n- Temporarily redirect a small percentage (~5%) of logs to a fallback ES cluster (read-replica) -> those logs indexed fine, implies ES primary cluster partial issue.\n- Recovered one affected node by raising ulimit via daemonset -> collector on node had fewer drop messages but not full recovery cluster-wide.\n\nObservations about sampling & batching config: \n- The recent change (batch.timeout 50ms) was intended to reduce latency but likely increases number of small batches and higher exporter pressure -> with ES backpressure this amplifies.\n- sampling: tail-based sampler with lower threshold (5 spans) might be promoting more spans to be exported than before.\n\nImmediate next steps (practical):\n- TODO: Revert batch.timeout to 200ms in canary and monitor drop logs (owner: Aisha) (JIRA: JIRA-OPS-9876-A)\n- TODO: Open ES incident with infra team, share bulk error sample and time window (owner: Ethan)\n- TODO: Check KMS token rotation logs for otel exporter secrets on 2026-02-24 15:45-16:10 UTC (owner: Priya)\n- TODO: Add exporter's retry_on_http_5xx backoff jitter to reduce synchronized retries (owner: Aisha)\n- TODO: Add an alert specifically for \"Dropping .* spans due to queue limit reached\" to fire before downstream SLO impact (owner: eng-observability)\n\nLonger term notes (ideas):\n- Add a small local filesystem ring buffer for spans when exporter returns UNAVAILABLE (fallback to disk) to smooth spikes.\n- Add a single-sample telemetry endpoint on collectors to expose queue length, dropped_count, export_err_rate per 10s to Grafana.\n- Revisit default ulimits in base node images and enforce via clusterpolicy.\n\nRandom commands / snippets to re-run next time (for my notes):\n- kubectl -n observability exec -it ds/otel-collector -- cat /etc/otel-collector/config.yaml | sed -n '1,300p'\n- tcpdump -i eth0 port 4317 -w /tmp/otlp-dump.pcap (on affected node) then scp for offline analysis\n- curl -s 'https://es.internal/_cluster/allocation/explain' -u es-user:XXXX | jq '.'\n\nUnresolved questions (notes to chase in meetings):\n- Which rollout touched collectors/sidecars on 2026-02-24 15:30-16:00? (release-engineering changelog?)\n- Any infra autoscaling or maintenance windows at that time? (cloud provider ops?)\n- Did any tenant push a huge trace fanout / noisy instrumentation that triggered tail-sampling behavior around that time? (solutions-eng to check)\n\nNotes to self: keep this doc rough. If we find the root cause we can consolidate into a Confluence postmortem template. For now, capture steps that reproduced the symptom and the commands above so I don't forget the manual checks.\n\nEnd of cribsheet.",
+  "__notes": "informal scratchpad for debugging observability ingest issues",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_53d0b932674046c2920c65972a226bd7"
+}

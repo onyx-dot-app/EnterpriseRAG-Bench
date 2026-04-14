@@ -1,0 +1,35 @@
+{
+  "title": "P99 sampling and cache-warmup scratchpad",
+  "owner": "Maya Turner",
+  "drive_area": "users",
+  "path": "users/p99-sampling-log-maya.json",
+  "doc_type": "doc",
+  "created_at": "2024-11-05",
+  "last_modified": "2024-11-20",
+  "collaborators": [
+    "Jordan Li",
+    "Sanjay Patel"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "p99",
+    "latency",
+    "benchmark",
+    "kv-cache",
+    "batching",
+    "grpc",
+    "concurrency"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/812",
+    "JIRA-INF-457",
+    "slack://channel/eng-runtime/thread/CH12345"
+  ],
+  "body": "Objective:\n- Quick exploratory runs to understand why p99 jumps ~4\u20136x on steady-state traffic vs synthetic ramp. Trying to isolate cache warmup, batching, and grpc connection churn effects.\n\nHardware / infra:\n- Cluster: ded-nyc-prod-pool-3 (4x A100-sXM)\n- Deployment: model-instance-v2 (gpt-3.5-ish open model, 16k context, quantized int8)\n- Runtime commit: git@github.com:redwood-inference/serving-runtime@a1b2c3d (perf fixes + batch refactor)\n- Test harness: local loadgen (python, async), using grpc endpoint with keepalive on/off toggles\n\nTest configs tried (short names):\n- steady-50: constant qps 50, 4s gen time avg, concurrency auto-scaling off\n- burst-200: 30s burst to 200 qps then fall back to 50\n- incr-ramp: 10->200 qps over 5m\n- cache-warm: prewarm 1000 prefixes then start\n- cold-start: no prewarm, fresh container restart prior to test\n\nImportant vars:\n- batch_target_size: 8 (default)\n- batch_max_latency_ms: 20\n- kv_cache_enabled: true (local mem), kv_cache_shards: 1\n- connection pool: 16 per client; grpc keepalive: yes/no toggles\n\nRaw run results (key runs):\n1) steady-50 (no prewarm) - 2024-11-05\n   - p50: 68 ms\n   - p95: 220 ms\n   - p99: 1.9 s  <-- large tail, often correlated with occasional 10\u201312s outliers\n   notes: CPU on host spikes when tail happens, but GPU util stable.\n\n2) steady-50 (prewarm cache with 1k prefixes) - 2024-11-06\n   - p50: 66 ms\n   - p95: 210 ms\n   - p99: 420 ms  <-- big improvement after prewarm\n   notes: suggests KV cache cold misses driving some p99s.\n\n3) burst-200 (no prewarm) - 2024-11-07\n   - p50: 74 ms\n   - p95: 480 ms\n   - p99: 3.6 s\n   notes: during burst, CPU scheduler shows many syscalls; observed queuing at runtime dispatcher (batching backlog).\n\n4) increment-ramp (with keepalive off) - 2024-11-09\n   - p50: 80 ms\n   - p95: 600 ms\n   - p99: 4.1 s\n   notes: turning keepalive off increased connection churn and p99; suggests rpc-level overhead matters for tail under ramp.\n\n5) steady-50 (kv_cache disabled) - 2024-11-10\n   - p50: 70 ms\n   - p95: 230 ms\n   - p99: 1.8 s\n   notes: similar to no-prewarm case, confirms cache helps reduce tail.\n\n6) steady-50 (batch_target_size 16, prewarm) - 2024-11-12\n   - p50: 90 ms (increased due to larger batches)\n   - p95: 240 ms\n   - p99: 480 ms\n   notes: batching trade-off: p50 up slightly, p99 similar to batch 8 with prewarm.\n\nAd-hoc observations / hypotheses:\n- KV cache cold misses cause very heavy synchronous work paths (recompute KV, possibly triggering longer memory-bound ops) leading to multi-second p99. Prewarming reduces p99 drastically.\n- Connection churn (keepalive off or short TCP lifetime) coincides with increased RPC latencies at tail \u2014 investigate client pool sizing and grpc channel reuse.\n- Larger batch_target_size raises median latency (expected) but can also absorb variability if traffic spikes are smoothed; it doesn't remove cache-miss-driven multi-second ops.\n- Some p99 outliers correlate with host-level background processes (backup/cron). Need to repro on dedicated host with process isolation.\n\nQuick ascii chart (p99 across configs):\n- steady-50 (cold):   |********* (1900 ms)\n- steady-50 (prewarm): |***      (420 ms)\n- burst-200:           |************ (3600 ms)\n- incr-ramp no-keep:   |************* (4100 ms)\n- batch16 prewarm:     |****     (480 ms)\n\nDebug traces & logs I inspected:\n- runtime logs: occasional full-kv-serialization events at time of tail (trace id included in linked artifacts)\n- dmesg/host logs: I saw out-of-memory kills on a helper process once (not model process) around 2024-11-07 15:02 UTC\n- perf flame: CPU time concentrated in rpc/accept/dispatch stack during tails\n\nRepro steps to run before next sync (fast checklist):\n- [ ] Re-run steady-50 on isolated dedicated host with prewarm vs cold, collect perf (cpu, iowait, interrupts)\n- [ ] Turn grpc keepalive on vs off matrix with same traffic profile\n- [ ] Add a small synthetic tracer in KV path to time cache_load vs compute_miss\n- [ ] Run a long steady-50 (2h) to verify if p99 drift or stays stable after extended steady state\n\nProposed mitigations to test (short):\n- Eager prewarm path: on new container start, run lightweight sample of top prefixes from selector service (cheap but reduces misses)\n- Async miss handling: if miss path is heavy, consider returning incremental partials or offloading to a helper pool so main dispatch not blocked\n- Client pooling guidance: update SDK default to keepalive=true and pool_size >= 8 for sustained QPS\n\nQuestions / asks for Jordan/Sanjay:\n- Jordan: can you share the KV miss instrumentation branch? I want microsecond-level timers on cache_load and compute_miss.\n- Sanjay: any recent infra changes to cron/backup scheduling on ded-nyc-prod-pool-3 around Nov 7?\n\nNotes to self / loose thoughts:\n- This feels like multiple orthogonal issues (cache miss + client churn + host noise). Best move is to orthogonally test each axis.\n- Also consider adding p99 alerting for the route with a \"recent-cold-start\" tag so we can separate container lifecycle-induced tails from steady-state tails.\n\nAttachments / screenshots (copied links):\n- Grafana panel (latency heatmap): https://grafana.internal/d/latency/serving-runtime?panelId=9&from=1699219200000&to=1699305600000\n- Perf flame snapshot (s3): s3://redwood-perf/maya/nov07-flame.svg\n\nNext meeting: 2024-11-21 standup if I have reproducible script and perf captures.\n\nEnd of scratchpad.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_b5c40d48c0a446cca6895a09a73c7654"
+}

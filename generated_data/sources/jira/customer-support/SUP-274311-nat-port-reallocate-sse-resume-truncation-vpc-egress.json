@@ -1,0 +1,77 @@
+{
+  "key": "SUP-274311",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "NAT port reallocation during VPC egress causes SSE resume to lose terminal JSON fragment and final paragraph",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Maya Patel",
+  "assignee": "Diego Alvarez",
+  "severity": "Sev1",
+  "customer_company": "Finexa Bank",
+  "customer_tier": "private",
+  "components": [
+    "serving-runtime",
+    "networking",
+    "edge-proxy",
+    "sse"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "reconnect",
+    "vpc-nat",
+    "egress-timeout"
+  ],
+  "environment": "prod, us-east-1",
+  "affected_models": [
+    "redwood/longform-v2"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-14",
+  "linked_issues": [
+    "INT-4082"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood/release/commit/ab34f1c"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/SSE+Resume+Debugging+Runbook"
+  ],
+  "description": "Issue summary: Customer reports consistent loss of the final JSON chunk and trailing paragraph when an SSE streaming response is resumed after a short network interruption that coincides with outbound VPC NAT port reallocation. Impact: Multiple user sessions at Finexa Bank observing incomplete finalization for policy-generation jobs; customers see valid-looking JSON but the last element (\"conclusion\") is missing and the closing metadata block is not emitted. This causes downstream parsing failures and retries in their ingestion pipeline.\n\nEnvironment: Finexa Private deployment on Redwood Private (customer-managed VPC egress through NAT gateway + corporate proxy). Workload: batch policy generation using redwood/longform-v2 with streaming enabled (SSE). Frequency: ~0.6% of streams for this customer during business-hours burst (observed across three pods).\n\nSteps to reproduce (observed pattern):\n1) Client initiates SSE stream for longform generation (prompt ~1200 tokens).\n2) Stream produces multiple SSE data events and partial choices; client pauses reading intermittently (backpressure) for 10\u201315s during model synthesis.\n3) VPC NAT gateway deallocates ephemeral port due to TCP idle timeout; new outbound connection uses a different source port.\n4) Edge proxy sees the connection as a new TCP flow and performs a half-close/replace sequence with backend (haproxy/nginx flow detected).\n5) Client reconnects and sends a resume token; resume handshake completes but the server-side session emits the final SSE events minus a trailing JSON object containing final_choice metadata and the closing \"end\" event.\n\nObserved behavior: The stream ends with a closing-brace-truncated JSON (missing final_choice array and end marker). The client receives no explicit 5xx; the stream simply stops after a short keepalive. No application-level error logged by serving-runtime except a late ACK anomaly.\n\nLogs & artifacts attached: (embedded excerpts below)\n- edge-proxy access logs: sequence of two requests ~14s apart, second with new source port and a haproxy backend-reuse flag.\n- serving-runtime stdout: \"WARN: resume token validated, kv-cache miss on stream 0x7f3b2e\" followed by \"INFO: stream closed, graceful=true\" but no finalization record.\n- packet capture (customer-provided tcpdump): shows TCP FIN/ACK from intermediate NAT at t=+9s, new SYN from same client at t=+11s.\n\nCustomer impact: Customers parsing generator output get a JSONDecodeError when trying to load the final chunk. Ingest retries sometimes duplicate earlier paragraphs. Business impact: delayed downstream workflows and manual reconciliation required for ~0.6% of policy jobs during spikes.\n\nImmediate customer workaround: Requesting customer to disable client-side aggressive idle pauses and to keep SSE keepalive interval lower (10s) to avoid NAT idle deallocation. This mitigates but does not eliminate the phenomenon during heavy bursts.\n\nDesired outcome: Ensure resume flow retains/serializes closing metadata and final_choice even when outbound source-port changes occur. If impossible, return explicit non-2xx/structured resume-failure event so clients can handle robustly.",
+  "comments": [
+    "2026-03-12 - Maya Patel: Customer first reported at 08:37 UTC. Provided tcpdump and edge proxy logs. Customer notes issue reproduces reliably when their client pauses read for >8s.",
+    "2026-03-12 - Diego Alvarez: Acknowledged; started triage. Initial hypothesis: NAT port deallocation causing backend worker to consider resumed stream as new session without re-emitting finalization. Requested customer-side keepalive settings and run trace-id-collection on next repro.",
+    "2026-03-13 - Diego Alvarez: Reproduced in private staging by simulating NAT port churn using tc/netem and an intermediate proxy. Observed identical behavior: final metadata missing and serving-runtime logs indicate 'kv-cache miss on resume' followed by 'graceful close' without finalizer hook firing. Filed INT-4082 for deeper runtime trace insertion.",
+    "2026-03-14 - SRE (Arjun Menon): Captured heap profile and enabled debug streaming traces on two affected pods. Noted resume path assumes persistent connection context; reconnect path picks up a new ephemeral session id and skips finalization when kv-cache sequence numbers mismatch.",
+    "2026-03-14 - Product (Lena Zhou): Prioritizing a guarded fix that emits an explicit SSE 'resume_failed' control event when a resume token validation succeeds but sequence reconciliation fails. Backfilling a short-term mitigation in the edge-proxy: preserve active source port mapping via connection tracking tweak for affected customers.",
+    "2026-03-14 - Diego Alvarez: Communicated mitigation to customer (edge-proxy connection-tracking change + recommended client keepalive). Customer will validate over the next 48 hours; awaiting confirmation."
+  ],
+  "investigation_notes": [
+    "tcpdump indicates NAT gateway issues: FIN from NAT followed by SYN reuse, port change from 54321->60213 within 2 seconds.",
+    "Edge proxy (haproxy) shows backend reuse flag 'r' and stream-id mapping changes; backend logs show 'resume-token-valid' followed by missing finalize hook call.",
+    "Serving runtime: resume path tries to reconcile KV cache using last-seen sequence id. On mismatch, current code logs a warning but proceeds without triggering final choice aggregation; missing guard to emit an explicit error event to client.",
+    "Simulated repro in staging by artificially expiring ephemeral port and reproducing client pause; confirmed identical truncated final chunk in staging.",
+    "Related internal ticket INT-4082 created to add a resume-sequence reconciliation tracepoint and to force explicit resume-failure event emission during mismatches.",
+    "Hypothesis: When source-port changes, edge/proxy lifecycle causes worker to attach a new ephemeral stream context; resume validation succeeds superficially, but internal sequence pointers (kv-cache seq) are out-of-sync, causing final chunk to be skipped to avoid duplicate emission. Side-effect: no explicit error is returned to client."
+  ],
+  "resolution_notes": "In progress: SRE applied an edge-proxy connection-tracking tweak to reduce NAT-triggered port churn for Finexa flows (rolled out 2026-03-14). Developer change under review: modify serving-runtime resume handler to emit a 'resume_failed' SSE event containing structured reason and to not silently swallow finalization when sequence reconciliation cannot be satisfied. ETA for runtime patch: 2026-03-21. Customer has agreed to temporary client keepalive adjustment as mitigation.",
+  "postmortem_followup": [
+    "Add automated e2e test that simulates VPC NAT port reallocation and verifies SSE resume emits either final chunk or explicit resume_failed event.",
+    "Document recommended client keepalive guidance for Private customers behind NATs in the runbook (Confluence page linked above).",
+    "Consider conservative default: emit resume_failed control event on any resume with kv-cache sequence mismatch rather than silently continuing."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes",
+    "postmortem_followup"
+  ],
+  "dataset_doc_uuid": "dsid_5e22784138724442b7a583835a7d492e"
+}

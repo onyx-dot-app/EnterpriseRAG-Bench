@@ -1,0 +1,100 @@
+{
+  "key": "SUP-182547",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Multiplexed SSE session silence after OAuth reauth + LB backoff leads to incomplete finalization",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Leah Patel",
+  "assignee": "Ethan Brooks",
+  "customer_company": "NimbleDocs Inc.",
+  "customer_tier": "enterprise",
+  "environment": "prod (us-east)",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "lb-proxy",
+    "auth"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "reauth",
+    "multiplexing",
+    "partial-output"
+  ],
+  "affected_models": [
+    "redwood-1.2-large",
+    "mistral-v1-0"
+  ],
+  "affected_regions": [
+    "us-east",
+    "eu-west"
+  ],
+  "sla_due_at": "2026-03-12",
+  "linked_issues": [
+    "INT-847",
+    "SUP-314158"
+  ],
+  "related_github_prs": [
+    "github.com/redwood/inference-runtime/pull/427",
+    "github.com/redwood/proxy-fixes/pull/13"
+  ],
+  "related_confluence_pages": [
+    "Confluence: Stream-Rollback-Runbook",
+    "Confluence: LB-Connection-Handoffs"
+  ],
+  "description": "Issue summary: During high-frequency multiplexed SSE traffic for NimbleDocs (enterprise, prod/us-east) we observed a class of requests that delivered all prefix tokens but never emitted an end-of-stream/terminal event after the client underwent an OAuth reauth while the edge LB concurrently applied backoff. Impact: Customers see completed partial paragraphs without closing punctuation or final metadata (end marker), preventing consumers from marking responses as finished and causing downstream retries and duplicate UI cards. This affects both long and short responses intermittently and is customer-visible in ~0.3% of streaming sessions for this tenant. Environment: prod, behind corporate and cloud LBs with multiplexing enabled and auth token rotation every 5 minutes. Observed behavior: SSE stream continues to be readable (keepalive heartbeats) but terminal event is not emitted; server-side session shows worker completed choice generation and attempted to send an end marker but it disappears somewhere in proxy/reauth handoff. Expected behavior: end-of-stream marker and final metadata should be delivered atomically even if reauth or LB backoff occurs mid-flight.",
+  "steps_to_reproduce": [
+    "1) Start a multiplexed SSE session against /v1/chat/stream with client id header and a short-lived OAuth token (5m TTL).",
+    "2) Trigger a long response generation (seq length > 300 tokens) from the model pinned to redwood-1.2-large while leaving client idle for ~3\u20134 minutes, allowing token refresh to occur during streaming,",
+    "3) Simulate LB backoff by inducing a transient 502 then allowing the connection to re-establish via the same client id multiplexed channel,",
+    "4) Observe client receives prefix tokens and heartbeats but never receives the 'terminal' end event / final metadata entry; server shows generation completed and wrote end marker to worker socket."
+  ],
+  "logs": [
+    "2026-03-10T14:02:17Z | worker-3 | generation_complete | choice_id=ch_9a1 | tokens=312",
+    "2026-03-10T14:02:17Z | worker-3 | write_to_socket | bytes=1250 | status=OK",
+    "2026-03-10T14:02:17Z | lb-edge | conn=8471 | backoff=1s | action=retry",
+    "2026-03-10T14:02:18Z | auth-proxy | token_refresh | client_id=nimble-42 | new_token_issued",
+    "2026-03-10T14:02:18Z | api-gateway | session_rebind | client_id=nimble-42 | multiplex_id=5 | note=reauth-handshake-start",
+    "2026-03-10T14:02:18Z | api-gateway | session_rebind | multiplex_id=5 | end_marker_forwarded=false",
+    "2026-03-10T14:02:18Z | client | recv | last_prefix='...closing thought' | no_terminal_event_received"
+  ],
+  "investigation_notes": [
+    "Initial hypothesis: race between auth token rotate/reauth and LB backoff causes socket handoff path to drop the terminal control frame for multiplexed channels.",
+    "Reproducer run: able to reproduce reliably when reauth and LB retry overlap within a ~200ms window on local env with multiplexing enabled.",
+    "Packet capture between LB and api-gateway shows end-of-stream frame sent from worker but not present on gateway->client side after rebind sequence.",
+    "Telemetry: the 'end_marker_forwarded=false' flag was logged in gateway. This flag is set when rebind logic skips atomic flush for multiplexed sessions during connection migration.",
+    "Similar symptoms reported in linked ticket SUP-314158 but that one happened during HTTP2 priority shifts; likely related shared codepath in session rebind logic."
+  ],
+  "timeline": [
+    "2026-03-10 14:05 UTC - Customer reported intermittent incomplete responses; attached client logs and an example conversation.",
+    "2026-03-10 15:30 UTC - Support triaged as P1 and routed to Serving Runtime + Edge Teams.",
+    "2026-03-10 17:00 UTC - Edge team confirmed rebind path logs showing end_marker_forwarded=false.",
+    "2026-03-11 09:40 UTC - Reproducer created in staging with LB and short-lived tokens; race window identified.",
+    "2026-03-12 11:20 UTC - Patch candidate implemented to make end-marker flushing idempotent during rebind; integration tests added."
+  ],
+  "workaround": "Client-side: detect long-running streaming responses and, upon reauth or transient connection event, issue a small follow-up HTTP request to fetch any missing final metadata (server exposes /v1/stream/finalize?session_id=<id>). This is currently available behind a feature flag for enterprise tenants. Short-term: advise NimbleDocs to disable multiplexing or increase token TTL to avoid reauth during active streams.",
+  "resolution": "Root cause: session rebind logic in the gateway did an optimized path for multiplexed channels that skipped an atomic flush of control frames when a reauth/backoff pattern occurred. Fix: gateway rebind now ensures control frame flushing (end marker and final metadata) is ordered and retried before switching connection affinity. Patch rolled to canary as github.com/redwood/inference-runtime/pull/427. Monitoring added to surface 'end_marker_forwarded=false' at alerting thresholds. Planned full rollout to prod us-east on 2026-03-15 after soak.",
+  "comments": [
+    "Leah Patel (Support) 2026-03-10: Customer attached two sample conversations and a HAR file; symptoms reproducible for them ~1 in 300 streams.",
+    "Ethan Brooks (Eng) 2026-03-10: Prioritized; tracing shows rebind path sets skip_flush on multiplexed channels \u2014 scheduling debug session with edge team.",
+    "Maya Singh (Edge) 2026-03-11: We confirmed race on rebind handler; adding atomic flush and idempotent retry for end markers. Will push patch to canary tonight.",
+    "NimbleDocs (Customer) 2026-03-11: Accepted temp workaround (disable multiplexing). Will try with increased token TTL and report back."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "timeline",
+    "workaround",
+    "resolution",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_2aeaccbc71454a31af66c0c2daad0363"
+}

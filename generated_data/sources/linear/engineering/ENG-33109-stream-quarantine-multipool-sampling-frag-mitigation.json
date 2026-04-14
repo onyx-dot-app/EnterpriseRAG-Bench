@@ -1,0 +1,113 @@
+{
+  "key": "ENG-33109",
+  "team": "engineering",
+  "title": "Stream quarantine + multipool sampling to surface and mitigate cudaMallocAsync fragmentation",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-25",
+  "updated_at": "2026-03-12",
+  "creator": "Avery Chen",
+  "assignee": "Diego Morales",
+  "project": "runtime-memory-stability",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "labels": [
+    "kv-cache",
+    "cudaMallocAsync",
+    "memory-fragmentation",
+    "continuous-batching",
+    "investigation"
+  ],
+  "description": "Intermittent resident memory growth observed on long-lived inference workers under mixed small/large continuous-batching workloads. Symptoms look like fragmentation combined with retained per-stream arenas: GPU resident set increases over hours with no corresponding live allocation from the runtime. Goal: reproduce reliably, identify allocator behavior across cudaMallocAsync + mempool vs internal slab pools, propose mitigations that avoid throughput regressions.",
+  "steps_to_reproduce": [
+    "Deploy dedicated worker cluster with runtime-1.20 build (with experimental per-stream slab pools enabled).",
+    "Start steady continuous-batching traffic: 70% small prompt streams (seq len 32) and 30% occasional long sequences (seq len 2048) with KV cache enabled and prefetch enabled.",
+    "Enable verbose allocator malloc hooks and collect per-stream pool stats every 5 minutes.",
+    "Observe RTX A6000 nodes over 8+ hours for steady growth of 'reserved' memory and rising cudaMemPool event counts."
+  ],
+  "logs_and_artifacts": [
+    "s3://redwood-inference/alloc-debug/2026-02-24/worker-12/allocator-trace.log",
+    "perf-dashboard: runtime-1.20/memory/runtime-residency?from=2026-02-24T00:00&to=2026-02-25T00:00",
+    "github Gist: https://gist.github.com/redwood/frag-sample-026",
+    "heapshots: /artifacts/kv-cache/worker-12/heapshot-2026-02-24-18:00.txt"
+  ],
+  "investigation_summary": "Root cause appears to be interplay between per-stream slab quarantine (delayed free to avoid use-after-free across CUDA stream sync boundaries) and cudaMallocAsync's integration with the device mempool. When long sequences interleave with many small requests on the same streams, free events get quarantined and the mempool coalescing path is inhibited, leading to multiple small retained arenas and increased fragmentation. The CUDA mempool backpressure also delays returning underlying device memory to the OS, further boosting resident footprint.",
+  "findings": [
+    "Per-stream quarantine duration currently set to stream idle window of 300ms; under bursty traffic the quarantine accumulates objects from repeated small batches.",
+    "cudaMallocAsync uses device-level mempool that expects larger alignment/coalescing; mixing tiny allocations (32B-2KB) with large KV prefetch buffers (multiple MB) reduces coalescing efficiency.",
+    "Tuning mempool attributes (min_alloc_size) on the device improved coalescing in synthetic tests but had slight tail latency regressions for small ops.",
+    "Switching to a two-tier pool (small-object pool inside runtime + cudaMallocAsync mempool for large allocations) reduced fragmentation by 28% in lab runs without throughput loss.",
+    "There is evidence of per-stream arenas not being unlinked promptly due to missing event completion in the current stream-sync path (race where event recorded but host forgets to poll)."
+  ],
+  "hypothesis": [
+    "Long-lived per-stream arenas plus quarantine + mixed-size allocation pattern prevents the device mempool from merging freed ranges, causing progressive fragmentation.",
+    "A lightweight 'stream quarantine flush' on detecting alternating small/large sequence patterns would allow earlier reclamation while preserving correctness.",
+    "Introducing a small-object runtime cache (fixed-size slab of small buckets) that serves 64B-8KB requests can reduce pressure on cudaMallocAsync and improve coalescing for large allocations."
+  ],
+  "experiments": [
+    "A/B test 1: disable per-stream quarantine (force immediate record and host poll) on non-production canaries \u2014 result: memory stabilized but 95th percentile latency for tiny ops increased by 1.2ms.",
+    "A/B test 2: two-tier allocator where allocations < 8KB served from runtime slab, >= 8KB use cudaMallocAsync mempool \u2014 result: resident memory growth flattened, no measurable throughput impact.",
+    "Profiling: instrumented event polling path with counters increased event-poll rate and eliminated the race; validated with stress harness (2M small allocations over 1 hour).",
+    "Mempool tuning: increased min_alloc_size from 4KB to 32KB in device mempool \u2014 reduced fragmentation in synthetic, but increased peak committed memory for small-batch workloads."
+  ],
+  "proposed_fixes": [
+    "Implement adaptive stream-quarantine: detect stream allocation-mix and shorten quarantine to 50ms for high churn streams; keep default 300ms for steady streams.",
+    "Add runtime small-object slab (configurable bucket sizes up to 8KB) and route tiny allocations to it to avoid polluting the cuda mempool.",
+    "Fix event-poll race: ensure all recorded CUDA events have a guaranteed host-side polling path before un-linking per-stream arenas. Add oops-safe guard to re-check event completion on next allocation.",
+    "Introduce periodic background mempool coalescer task that heuristically attempts to merge free ranges when GPU usage is low (configurable window).",
+    "Expose two new knobs in runtime config: small_pool_max_bytes and stream_quarantine_ms (runtime defaults tuned conservatively)."
+  ],
+  "rollout_plan": [
+    "Phase 1 (canary): release runtime-1.21-canary with event-poll race fix only to 5% of Dedicated fleet for 48h. Monitor residency and tail latency.",
+    "Phase 2 (lab): enable two-tier allocator + adaptive quarantine in bench cluster and run 72h mixed-workload stress (continuous-batching harness).",
+    "Phase 3 (staged): roll to 25% of production Dedicated instances for 24h; if stable, expand to 100% over 48h.",
+    "Rollback criteria: >15% increase in 95th percentile latency for small requests OR >10% sustained increase in resident memory after 24h."
+  ],
+  "monitoring": [
+    "Add metric runtime.allocator.small_pool_utilization (gauge) and runtime.allocator.stream_quarantine_count (rate).",
+    "Add alert: sustained growth of runtime.gpu.resident_bytes > 5% over 2h for same model version and traffic profile.",
+    "Add dashboard panels comparing per-stream allocated vs reserved memory and mempool coalescing hits/misses.",
+    "Traces: tag allocation spans with \"allocator_tier\" (small|mempool) for latency correlation in Console."
+  ],
+  "acceptance_criteria": [
+    "No unbounded resident memory growth in 72h mixed-workload stress harness (<=5% net change).",
+    "95th percentile latency for small allocations not worse than baseline by >10%.",
+    "Unit and integration tests added for event-poll race and adaptive quarantine logic.",
+    "Configuration knobs documented in runtime ops guide and added to Console feature flags."
+  ],
+  "related_issues": [
+    "ENG-20347",
+    "ENG-24721",
+    "ENG-17455"
+  ],
+  "pr_links": [
+    "https://github.com/redwood-inference/runtime/pull/1428",
+    "https://github.com/redwood-inference/runtime/pull/1431"
+  ],
+  "notes_comments": [
+    "2026-02-26 Avery Chen: Initial triage - collected heapshots and confirmed pattern across two different GPU types (A100, A6000).",
+    "2026-03-02 Diego Morales: Reproduced locally with bench harness; saw per-stream quarantine counter increase linearly under bursty traffic.",
+    "2026-03-05 Priya Kapoor (PM): Prioritize fixes that don't require customers to recompile or change model code. Ops want knobs exposed in Console.",
+    "2026-03-10 Lena Rivest (SRE): Suggested adding background coalescer off-peak to avoid impacting hot inference lanes.",
+    "2026-03-12 Diego Morales: Implemented event-poll radware fix in PR 1428; canary scheduled for 2026-03-13.",
+    "Action items: implement small-object slab prototype (Diego), add metrics (SRE), write e2e stress job (QA)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "investigation_summary",
+    "findings",
+    "hypothesis",
+    "experiments",
+    "proposed_fixes",
+    "rollout_plan",
+    "monitoring",
+    "acceptance_criteria",
+    "notes_comments",
+    "logs_and_artifacts",
+    "pr_links",
+    "related_issues"
+  ],
+  "dataset_doc_uuid": "dsid_efbe709faa9b4a848df21ca5c4383380"
+}

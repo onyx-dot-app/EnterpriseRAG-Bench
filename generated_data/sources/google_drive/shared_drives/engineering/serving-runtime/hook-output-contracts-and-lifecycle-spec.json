@@ -1,0 +1,128 @@
+{
+  "title": "Hook output contracts and lifecycle spec",
+  "owner": "Maya Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/hook-output-contracts-and-lifecycle-spec.json",
+  "doc_type": "doc",
+  "created_at": "2025-06-12",
+  "last_modified": "2025-07-03",
+  "collaborators": [
+    "Ravi Patel",
+    "Sofia Martinez",
+    "Ethan Brooks"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "hooks",
+    "structured-output",
+    "kv-cache",
+    "scheduling",
+    "kernels",
+    "function-calling",
+    "runtime-contracts"
+  ],
+  "linked_artifacts": [
+    "confluence:SR-3456",
+    "github:inference/runtime#789",
+    "jira:INF-1023"
+  ],
+  "summary": "Draft spec describing the runtime-level contract for function/tool-calling hooks, the lifecycle events hooks must support, and how structured output constraints (JSON modes) interact with KV cache, batching/scheduling and kernel selection.",
+  "goals": [
+    "Define an unambiguous contract for runtime hooks invoked during model decoding when the model signals a function/tool call or structured output boundary.",
+    "Specify validation and graceful-fallback behavior for malformed or partial structured outputs (JSON modes).",
+    "Describe interactions with prefix/KV caching so cached responses remain correct when hooks are present.",
+    "Outline scheduling and kernel selection implications for low-latency streaming and batched inference when hooks require synchronous host-side processing.",
+    "Provide telemetry and rollout guidance to safely enable hooks across hosted and dedicated deployments."
+  ],
+  "background": "We currently support function/tool calling at the model layer but lack a standardized runtime contract for hook implementations that need to be invoked when the model emits a structured output token (eg. function_name, json_start). Unclear areas: how to validate JSON-like outputs mid-stream, whether to block token emission during synchronous host work, when to evict or bypass KV cache, and how kernel selection should adapt when function calling is expected.",
+  "design_principles": [
+    "Determinism: hook invocation points and the data passed must be deterministic given the same token stream.",
+    "Fail-safe: malformed or missing hook outputs should not crash serving; runtime must provide safe fallbacks and transparency to callers.",
+    "Low-latency default: synchronous host work should be minimized; default mode should favor streaming responses and eventual hook confirmation.",
+    "Cache-safety: caching must never surface stale tool-invocation outcomes to callers.",
+    "Pluggable: hooks must support multiple invocation models (fire-and-forget async, blocking sync for short ops, and transactional synchronous calls)."
+  ],
+  "hook_lifecycle": [
+    "pre_parse: runtime receives a token batch and inspects for hook trigger tokens (configured token signatures like <FUNC_CALL_START> or model-native markers).",
+    "emit_pause_point: when a trigger token is detected, runtime emits a consistent pause event to downstream stream (optional) and snapshots decoding state (sequence position, KV-cache keys, model KV cache pointer).",
+    "payload_assembly: runtime assembles the candidate payload from buffered tokens (configurable max lookahead) and serializes it into a stable canonical form for validation and caching checks.",
+    "validate_and_dispatch: run validation rules (see structured_output_contract). If valid and requires host processing, dispatch according to invocation mode (async, sync-with-timeout, transactional).",
+    "response_merge: after host processing, merge any tool outputs back into the decoding stream. If host output changes the model continuation tokenization, perform a reconciliation step with the model's KV cache (see kv_cache_interactions).",
+    "resume_decoding: resume token generation from the model, with optional fallback model variant if the hook resulted in a long wait or failure. Complete lifecycle by emitting final confirmation metadata to caller."
+  ],
+  "structured_output_contract": "The runtime will enforce a lightweight canonical contract for structured outputs used in function calling. Contract rules: 1) A structured output is delimited by explicit start and end markers; the runtime must be configured with one of: model-native markers or user-specified markers. 2) The runtime serializes the candidate structured section into UTF-8 and normalizes whitespace, escaping, and stable key ordering before validation. 3) Validation modes: 'strict' (reject if not valid JSON per RFC 8259), 'lenient' (attempt heuristic fixes: trailing commas, unquoted keys, single quotes), and 'passthrough' (no validation). 4) When validation fails in 'strict' mode, runtime emits a structured error token and invokes fallback policy. 5) The canonicalized payload is what is used for cache keys and tool dispatch. Note: the runtime does not require the model to output perfectly-formed JSON; the contract allows a configurable set of pre-parse heuristics to increase success rates while preserving determinism.",
+  "validation_and_fallback": [
+    "strict mode: if validation fails, abort host call, mark the hook as 'validation_error' in trace, and continue decoding using a pre-configured fallback continuation (e.g., prompt-specified fallback instructions or a model-variant that ignores tool calls).",
+    "lenient mode: attempt a sequence of heuristics (remove trailing commas, wrap in braces if markers were ambiguous, convert single quotes). Each applied heuristic is recorded in telemetry. If heuristics succeed, proceed; else escalate to strict fallback policy.",
+    "passthrough mode: dispatch candidate payload to host as-is; host is responsible for handling malformed content. Used for low-trust or experimental deployments.",
+    "timeboxed host calls: synchronous host calls are allowed but must be bounded by a configurable timeout (default 200 ms). If timeout expires, runtime records 'host_timeout' and continues with fallback continuation; host-side result may be applied later via a compensated event if durable semantics are required."
+  ],
+  "kv_cache_interactions": [
+    "snapshot_before_hook: on emit_pause_point, runtime snapshots the model KV cache pointer and current prefix key used by prefix caching; this snapshot is attached to the hook context so host processing can decide cache-affecting actions.",
+    "cache_keying: cached responses are keyed on canonicalized input that includes the prompt prefix, model version fingerprint, and the canonicalized structured payload when present. Host outputs are considered part of the effective prefix for subsequent decoding and therefore must be reflected in cache entries if applied synchronously.",
+    "invalidations: any host-side modification that could alter continuation semantics must either: 1) produce a new cache entry (if applied before resume), or 2) mark the current prefix entry as 'partial' and avoid reuse until reconciliation completes. Runtime will not serve cached continuations that were created without seeing a hook that should have fired.",
+    "bypass policy: for high-frequency ephemeral hooks (telemetry pings, noop checks), runtime may bypass caching via a per-route flag. By default, hooks that can change future tokens should not be bypassed.",
+    "lazy-apply model: where host processing is async and result not required to continue, runtime may tag the continuation with a 'pending_effects' marker and include compensation hooks to apply host results later (suitable for fire-and-forget external side effects)."
+  ],
+  "scheduling_and_batching": [
+    "hook-aware batching: batching windows should be aware of hook triggers. If a batch contains an emitter token for a hook, that request should be logically split into 'pre-hook' micro-batch and 'post-hook' micro-batch to avoid blocking unrelated requests.",
+    "priority lanes: short blocking hooks (<=200ms) can be executed on a fast path; long-running hooks should be moved to a background queue with a best-effort continuation fallback for the originating request.",
+    "streaming behavior: default is to stream pre-hook tokens immediately to clients. When a hook pause point is reached, runtime streams a deterministic marker and then either 1) block further streaming until host returns (sync mode) or 2) continue with a fallback continuation while host runs asynchronously (async mode).",
+    "batch scheduler constraints: scheduler must not combine requests with divergent hook policies into a single fused kernel launch that would make rollback or divergence reconciliation infeasible. Kernel-level fusion is allowed only when all members share identical hook expectations and timeouts."
+  ],
+  "kernel_selection_triggers": [
+    "sequence length and lookahead: if the model is expected to produce many tokens before a hook boundary, choose kernels optimized for long-context streaming. If hook triggers are frequent and short, prefer lower-latency kernels with faster step throughput.",
+    "attention pattern hints: model annotations indicating block-sparse or local attention around structured outputs should drive kernel choice to reduce memory and improve latency.",
+    "quantization compatibility: hooks that require synchronous host-side token parsing may prefer kernels that provide deterministic rounding/quantization behavior to avoid subtle tokenization drift across variants.",
+    "fallback variant selection: in case of host-timeout or repeated validation failures, router may switch to a model variant with 'hooks-disabled' profile. Kernel selection must respect the new variant's runtime properties."
+  ],
+  "telemetry_and_metrics": [
+    "hook_trigger_rate: tokens or requests per minute that hit hook pause points.",
+    "validation_success_rate: percent of structured payloads passing validation per mode (strict/lenient/passthrough).",
+    "host_latency_p50_p95: host processing latency broken down by invocation mode and route.",
+    "cache_hit_rate_post-hook: fraction of continuations served from cache after a hook boundary. Low values may indicate over-aggressive invalidations.",
+    "rollback_events: count of times we had to fall back to alternative continuation due to hook failures or timeouts."
+  ],
+  "examples": [
+    "Example 1 - strict mode synchronous: model emits <FUNC_CALL_START>...payload...<FUNC_CALL_END>. Runtime validates payload as JSON, dispatches to synced host endpoint. Host returns a short result within 120ms; runtime merges result and resumes decoding. A cache entry is written keyed on canonical payload + prefix.",
+    "Example 2 - lenient mode async: model emits an approximate JSON-like block with trailing commas. Runtime applies lenient heuristics, succeeds, forwards to async worker. Runtime streams a fallback continuation while worker runs; when worker result arrives, runtime emits a compensated update event to client via websocket hook if routing supports it.",
+    "Example 3 - passthrough: model outputs a tool call payload with custom serialization. Runtime forwards raw payload to external host. Validation and post-processing are host responsibilities; runtime only records telemetry and does not alter token stream."
+  ],
+  "migration_and_compatibility": [
+    "default route behavior for existing customers remains 'passthrough' unless they opt-in to structured validation to avoid regressions.",
+    "new routes can opt into 'strict' or 'lenient' and configure timeouts; a compatibility shim will expose a 'simulate' flag that runs validation and telemetry without enforcing failures for 72 hours before enforcement.",
+    "clients depending on exact token boundaries should be informed of possible minor shifts when switching kernel variants; we will provide a token-diffing utility in the SDK for migration testing."
+  ],
+  "open_questions": [
+    "What is the canonical set of heuristics for 'lenient' mode and should this be configurable per-tenant?",
+    "Do we need a formal on-disk representation for canonicalized payloads to allow cross-runtime cache sharing?",
+    "How should we surface compensated late-applied host results to streaming clients in a consistent API? Webhooks? Websocket events? Patch tokens?",
+    "Is the default 200 ms sync timeout acceptable for enterprise SLAs or should it be route-configurable at millisecond granularity?"
+  ],
+  "next_steps": [
+    "Review with SRE and Platform to validate scheduling and cache-invalidations (owner: Ravi).",
+    "Prototype a lightweight validator library implementing strict/lenient/passthrough heuristics (owner: Sofia).",
+    "Add telemetry instrumentation hooks and dashboard mocks for early visibility (owner: Ethan).",
+    "Run a two-week A/B where new behavior is simulated before being enforced on a small percentage of traffic."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "background",
+    "goals",
+    "design_principles",
+    "hook_lifecycle",
+    "structured_output_contract",
+    "validation_and_fallback",
+    "kv_cache_interactions",
+    "scheduling_and_batching",
+    "kernel_selection_triggers",
+    "telemetry_and_metrics",
+    "examples",
+    "migration_and_compatibility",
+    "open_questions",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_732bca9ef7124dfab646e8e54ca27d30"
+}

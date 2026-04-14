@@ -1,0 +1,52 @@
+{
+  "title": "TensorCore hybrid-LRU eviction + cooperative prefetch notes",
+  "owner": "Emily Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime",
+  "doc_type": "doc",
+  "created_at": "2024-02-15",
+  "last_modified": "2024-02-21",
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "collaborators": [
+    "Marco Alvarez",
+    "Sana Iqbal",
+    "Ravi Shah"
+  ],
+  "tags": [
+    "flashattention",
+    "paged-kv",
+    "cuda",
+    "tensorcore",
+    "eviction",
+    "prefetch",
+    "kernels"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/482",
+    "SERV-1234",
+    "JIRA:RT-879"
+  ],
+  "summary": "Working notes exploring a hybrid LRU eviction strategy for paged KV combined with cooperative cross-warp prefetching and TensorCore-friendly fused attention kernels. Goal: keep 99th latency SLOs under memory pressure while enabling tensor-core matmul paths for quantized models.",
+  "background": "We have several kernel experiments focused on paged KV + FlashAttention-style fused ops. Current problems: (1) Thrashing when multiple long-context queries interleave and cause repeated KV page faults; (2) TensorCore matmuls (FP16/INT8) are underutilized because we break compute into small kernels for prefetch/eviction coordination; (3) Eviction decisions are coarse-grained and don't account for short-lived hotspots. This doc sketches an approach that sits between fully LRU and purely recency-agnostic eviction: a hybrid LRU with hotspot detection and cooperative cross-warp prefetch to amortize paging latency.",
+  "design_notes": "1) Hybrid LRU with recency buckets:\n   - Maintain per-GPU lightweight recency buckets: hot / warm / cold. On page access, promote page into hot if accessed multiple times within a short epoch. Eviction prefers cold pages across all contexts.\n   - Use an approx counting bloom/tiny sketch per-page to detect hotspots (2-4 bit saturating counters) to avoid global LRU cost.\n\n2) Ephemeral hotspot windowing:\n   - Short window (e.g., 256-1024 requests or ~100ms) to consider a page 'ephemeral-hot'. Pages in ephemeral-hot get an eviction immunity timer. Purpose: avoid evicting pages that are repeatedly accessed in short bursts by e.g., a single conversation.\n\n3) Cooperative cross-warp prefetch:\n   - When kernel A (attention forward) detects an upcoming sequence length that will require a KV page not resident, it emits a prefetch intent into a lightweight shared queue in GPU L2/global mem.\n   - Subsequent warps/blocks check the queue and can prefetch a page proactively if they have spare cycles. This reduces stalls for the immediate warp and spreads bandwidth load.\n\n4) Kernel splitting for TensorCore throughput:\n   - Separate the compute into two logical kernels: a small control kernel (prefetch/kv-check + issuance) and a heavy compute kernel (tensor-core fused attention). The control kernel runs with a few threads per CTA to manage paging and decisions; the compute kernel assumes pages are resident.\n   - Use persistent-CTA style launch for compute kernel to keep TensorCores busy and issue worklets as pages become available.\n\n5) Quantization-aware tiling:\n   - For INT8/4 paths, tile matmuls to align warps/CTA to tensor-core shapes (e.g., 16x8 blocks) and ensure load/store coalescing even for spilled pages. Incorporate small dequantization-on-load when bringing a page in to avoid extra memory passes.",
+  "microbenchmarks": "Planned microbenchmarks:\n- Single-stream long-context (seq=32..16k): measure page fault frequency, avg page residency, 95/99 latency for token generation.\n- Multi-stream interleaved: 8-32 concurrent contexts with bursts; measure thrash rate and overall throughput.\n- Prefetch backpressure test: synthetic kernel that issues many prefetch intents to saturate PCIe/NVLink; measure queue growth and eviction cycles.\n- TensorCore utilization: instrument occupancy and tensor-core SM utilization with/without kernel split and with different tiling params.\n- Quantized paths: end-to-end latency for INT8 matmul vs FP16 for identical sequence shapes.\n\nMetrics to capture: page_faults_per_k_token, avg_page_fetch_time(ms), eviction_count/s, avg_eviction_age, tensorcore_sm_util, kernel_idle_cycles, PCIe_bandwidth_util.",
+  "implementation_sketch": "Pseudocode for prefetch intent emission (CUDA-ish pseudo):\n\n// control kernel (lightweight)\nif (!page_resident(pageId)) {\n  if (!prefetch_queue.push_if_space(pageId)) {\n    // fallback: synchronous fetch using async copy but limit concurrency\n    async_fetch_page(pageId);\n  }\n}\n\n// background cooperative worker (persistent CTA)\nwhile (work_remaining) {\n  id = prefetch_queue.pop();\n  if (id) {\n    async_fetch_page(id); // cudaMemcpyAsync into pinned staging buffer -> device page frame\n    update_page_table(id, resident=true);\n  }\n}",
+  "tradeoffs_and_risks": "- Extra complexity: introducing a queue and cooperative prefetch semantics increases code complexity and potential correctness issues (ordering between fetch and compute). Need strong asserts + debug builds.\n- PCIe/NVLink bandwidth pressure: prefetching can worsen congestion if not rate-limited. Must incorporate adaptive prefetch throttling based on measured bandwidth and queue depth.\n- Starvation: persistent worker CTAs should yield if compute demand is high; otherwise we may steal cycles from critical attention kernels.\n- Memory overhead: ephemeral immunity/tiny counters add ~5-8 bytes per page; acceptable but must be accounted for large models.\n- Performance variance: heuristic parameters (window size, bucket thresholds) likely model/workload-dependent; require autotuning or per-tenant profiles.",
+  "open_questions": "1) Should eviction decisions consider model/caller priority? (i.e., preempt low-priority tenant pages) -- ties into SLO-based routing.\n2) What is the right size for ephemeral window? start with 100ms heuristic but need benchmarks across workloads.\n3) How to safely coordinate across multiple GPUs for multi-GPU KV sharding? Shared queue needs to be per-GPU; cross-device prefetch expensive.\n4) Failure modes: if async_fetch_page fails or is very slow, how do we degrade? immediate fallback to smaller model variant?\n5) Can we integrate with existing trace/span framework to signal page-level cost into Console for per-route cost attribution?\n\nNotes: link to current page allocator PR above (linked_artifacts) - revisit allocator API to expose per-page counters.",
+  "short_todo": "- Prototype tiny-saturating-counter hotspot detector (Marco)\n- Add prefetch queue ringbuffer in device global memory (Sana)\n- Microbench harness for interleaved streams (Ravi)\n- Perf traces exporter hook to Console to record page fetch latency (me)\n- Schedule design review with SRE and infra next Tues\n\nTIMELINE: proto in 3 weeks, internal perf gate in 6 weeks.",
+  "notes_to_self": "Keep debug-only strong invariants: page_table checksum after each async fetch, eviction must not free a page marked in-use by a running kernel. If race observed, fallback to coarse-grain global lock in debug builds. Also add per-CTA telemetry counters to help root-cause thrash.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "background",
+    "design_notes",
+    "microbenchmarks",
+    "implementation_sketch",
+    "tradeoffs_and_risks",
+    "open_questions",
+    "short_todo",
+    "notes_to_self"
+  ],
+  "dataset_doc_uuid": "dsid_359d8065a9bd4037aee755fe41f21b3e"
+}

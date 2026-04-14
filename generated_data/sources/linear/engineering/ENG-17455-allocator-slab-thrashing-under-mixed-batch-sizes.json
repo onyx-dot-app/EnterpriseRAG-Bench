@@ -1,0 +1,97 @@
+{
+  "key": "ENG-17455",
+  "team": "engineering",
+  "title": "Allocator slab thrashing under heterogeneous batch sizes causing intermittent GPU memory regressions",
+  "status": "In Review",
+  "priority": "P1",
+  "created_at": "2025-02-10",
+  "updated_at": "2025-02-18",
+  "creator": "Riley Chen",
+  "assignee": "Lin Zhao",
+  "project": "serving-runtime-memory-stability",
+  "cycle": "2025-W06",
+  "estimate": "5",
+  "due_date": "2025-02-22",
+  "labels": [
+    "cudaMallocAsync",
+    "kv-cache",
+    "batching",
+    "memory-debug",
+    "postmortem"
+  ],
+  "description": "High-level: Production fleet observed several instances of growing GPU resident memory on nodes running continuous batching with mixed small/large request sizes. Symptoms were spikes in cudaMallocAsync allocations and slab pool churn followed by degraded throughput and out-of-memory restarts on a few Dedicated clusters. This ticket tracks investigation, root cause analysis, short-term mitigations, and long-term fixes.\n\nWhy this matters: These regressions increase unit cost (extra OOM restarts + degraded batching efficiency) and risk customer incidents for Dedicated customers with tight capacity commitments.",
+  "reproducer": "1) Start runtime v1.18-staging with continuous batching enabled and KV cache enabled.\n2) Feed synthetic traffic with a 70/30 mix of short (32 tokens) and long (2048 tokens) sequences at 200 qps.\n3) Observe resident GPU memory with nvidia-smi and internal allocator traces.\n4) After ~45-90 minutes, slab pool \"hot\" arena count increases and cudaMallocAsync calls spike. Memory does not free even after request patterns revert.\nLogs: allocator trace sample: \"arena 3: alloc 128KiB -> cudaMallocAsync(131072) stream A; delayed free on stream B; slab unmap deferred\"",
+  "observations": [
+    "CudaMallocAsync allocation count correlates with increased fraction of small allocations during mixed batch workloads",
+    "Slab allocator reports multiple small resident arenas marked as \"hot\" with fragmented free lists; total resident memory increases despite free() calls in the application path",
+    "KV cache pins buffer headers across model shards; eviction has been observed but does not immediately trigger unmap of slab-backed arenas",
+    "Stream synchronization mismatches: frees performed on a different CUDA stream from the allocs appear to delay actual release to the OS/driver until stream synchronization or GC triggers",
+    "Short-term regression first detected after runtime change that adjusted batching window heuristics (smaller micro-batch flush threshold)"
+  ],
+  "hypothesis_root_cause": "Fragmentation + delayed unmap: heterogeneous request size mix increases churn of small allocations from the serving runtime's per-thread slab pools. cudaMallocAsync creates device-side arenas that get partially used and then freed on different streams; because frees are asynchronous and we do not immediately call cuMemRelease/virtual unmap for small fragments, fragmentation accumulates. KV cache elements additionally pin small allocations and delay slab compaction. The combined effect is arena proliferation (resident memory growth) and periodic thrashing when the allocator chooses new arenas instead of reusing fragmented ones.",
+  "evidence": [
+    "Heap/profile dump from affected node (drive link) shows 18 arenas with high resident despite low active allocation count",
+    "Trace of allocator ops shows 70% of alloc/free pairs using different CUDA streams leading to cudaEventRecord/synchronization path being required for resource reuse",
+    "Compare to control workload (homogeneous long sequences) where arena count stays stable",
+    "Reproduction in staging when toggling batch-flush threshold: reducing threshold increases small-allocation churn and reproduces growth faster"
+  ],
+  "short_term_mitigations": [
+    "Backport patch: force slab freelist fast-path to attempt intra-arena compaction for subpage frees (PR: github.com/redwood-inference/runtime/pull/943)",
+    "Temporarily increase batching micro-window to favor fewer small allocations (config toggle applied to affected fleets)",
+    "Add a deferred background compaction job that attempts to release completely empty arenas back to CUDA after a quiet period (configurable 5m default)",
+    "Monitor: add allocator-derived metrics (active_arena_count, resident_arena_count, async_free_queue_depth) to Console dashboard and alert threshold > 10 arenas per device"
+  ],
+  "long_term_actions": [
+    "Redesign slab lifecycle: implement cross-stream free coalescing and explicit cudaStreamSynchronize optimization points to avoid leaving small fragments pinned indefinitely",
+    "KV cache change: switch to slab-aware cache entries that prefer larger consolidated buffers and allow multi-shard compaction without per-entry cudaFree churn",
+    "Investigate upstream libcudart behaviors and file driver bug reports for cudaMallocAsync arena eviction semantics; consider fallback to cudaMalloc for sub-allocations if fragmentation remains high",
+    "Add auto-tuner: runtime should adapt batching window heuristics based on observed allocator churn signals to avoid pathological mixes",
+    "Comprehensive regression test: add fuzzed mixed-batch workload to CI that tracks resident memory over 2h under randomized batch-size distributions"
+  ],
+  "timeline": [
+    "2025-02-10: Alert triggered by monitoring; initial triage by oncall SRE (Ava Patel). Allocator traces requested.",
+    "2025-02-11: Reproducer validated in staging by Lin Zhao; ruled out external driver upgrades",
+    "2025-02-12: Short-term config change rolled to two Dedicated clusters to reduce micro-batch flush frequency; early signs of stabilization",
+    "2025-02-14: PR 943 opened with fast-path compaction; unit tests added for intra-arena free ordering",
+    "2025-02-16: Background compaction introduced behind feature flag; ran for 24h on staging with positive results (resident down ~22%)",
+    "2025-02-18: Draft postmortem and plan posted; ticket moved to In Review for engineering and product sign-off"
+  ],
+  "attachments": [
+    "https://confluence.redwood.ai/display/MEM/ENG-17455+allocator-slab-thrashing+investigation",
+    "https://github.com/redwood-inference/runtime/pull/943",
+    "s3://redwood-logs/alloc-traces/2025-02-11-node-7-alloc-trace.log",
+    "grafana://dashboard/redwood/allocator-arena-metrics"
+  ],
+  "comments": [
+    "2025-02-11 - Ava Patel: Oncall notes: OOMs started appearing ~03:40 UTC, correlating with a config rollout that lowered micro-batch flush. Reproducer validated in staging. Adding Lin to investigate allocator traces.",
+    "2025-02-12 - Lin Zhao: Tried forcing cudaDeviceSynchronize after frees in a debug build; memory reclaimed immediately which supports stream-mismatch hypothesis. Will prototype compaction fast-path.",
+    "2025-02-14 - Diego Martinez (PM): Prioritize this for Dedicated customers hitting the regression; please estimate rollout risk and rollback plan for PR 943.",
+    "2025-02-16 - Lin Zhao: Background compaction run on staging reduced arena count from median 12 -> 9; still seeing intermittent re-growth under very bursty traffic. Planning long-term cross-stream coalesce design.",
+    "2025-02-18 - Riley Chen: Draft postmortem posted to Confluence. Recommend feature-flagged rollout to 10% of fleet after QA sign-off. Follow-up ticket to add CI fuzz test is ENG-17472 (linked)."
+  ],
+  "dependencies": [
+    "ENG-17472",
+    "ENG-17011"
+  ],
+  "parent_issue": [
+    "ENG-16800"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.19",
+  "security_review_required": "false",
+  "notes": "This ticket intentionally avoids immediate aggressive cudaDeviceSynchronize in production due to global perf impact; preference is to target allocator-level fixes and conservative background compaction. We'll keep the background compaction feature-flagged until long-term cross-stream free coalescing is validated in canary.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "reproducer",
+    "observations",
+    "hypothesis_root_cause",
+    "evidence",
+    "short_term_mitigations",
+    "long_term_actions",
+    "timeline",
+    "comments",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_da745946da4f4cd1af6537e3519aa5a0"
+}

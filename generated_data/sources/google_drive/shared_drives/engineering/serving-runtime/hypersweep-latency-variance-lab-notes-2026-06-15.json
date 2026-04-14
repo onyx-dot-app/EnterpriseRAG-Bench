@@ -1,0 +1,38 @@
+{
+  "title": "Hypersweep latency variance lab notes \u2014 mixed-seq stress experiments",
+  "owner": "Aisha Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/hypersweep-latency-variance-lab-notes-2026-06-15.json",
+  "doc_type": "doc",
+  "created_at": "2026-06-15",
+  "last_modified": "2026-06-16",
+  "collaborators": [
+    "Marco Li",
+    "Diego Romero",
+    "Priya Shah",
+    "Samir Khan"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "latency",
+    "benchmark",
+    "kv-cache",
+    "mixed-seq",
+    "eviction",
+    "tail-latency",
+    "hypersweep"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/1248",
+    "https://ci.internal.redwood/jobs/bench-20260615-raw",
+    "JIRA-10934",
+    "confluence://perf/hypersweep-lab-2026-06"
+  ],
+  "content": "Context:\nThis was a focused lab session to reproduce and triage intermittent p99 spikes observed in recent mixed-sequence shadow runs. The spike is most visible when workload mix includes a small fraction (~5%) of long-sequence (>1024 tokens) requests interleaved with many short requests. We ran a hypersweep over kv-cache settings, batch sizes, and kernel-selection flags to isolate the source.\n\nMeeting / lab details:\n- Date: 2026-06-15\n- Lab duration: 09:00-12:30 PT\n- Environment: staging-gpu-pool-7 (A100), runtime-build: v0.68.3-hypersweep, model-variant: gpt-open-8b-qa-v1\n- Workload generator: benchgen v2.1 (mixed-seq profile: 90% 32 tokens, 5% 256 tokens, 5% 2048 tokens), target QPS: 180\n- Orchestrator: local-runner + shadow routing to shadow-alloc-3\n\nAttendees:\nAisha Patel (owner), Marco Li, Diego Romero, Priya Shah, Samir Khan (SRE), + Slack observers from product-hosted-api\n\nAgenda:\n1) Review recent regression traces (JIRA-10934)\n2) Run controlled hypersweep (kv-cache: on/off; cache-cap: 1GB/4GB; eviction-policy: LRU/temperature)\n3) Kernel flags: use-optimized-attn true/false, fp16-accel true/false\n4) Capture traces, per-thread CPU, GPU timelines, and network IO\n5) Document any reproducible patterns and next steps\n\nSummary of experiments run (swept parameters):\n- Sweep matrix: 3 (kv-cache size) x 2 (kv-cache on/off) x 2 (eviction policy) x 2 (optimized-attn) x 2 (fp16-accel) = 48 runs, each 15m stable window\n- Collected: qps, p50/p95/p99 latency, token/sec, GPU utilization, PCIe memcpy counters, CPU steal, and perf traces\n- Run ids: bench-20260615-01 through bench-20260615-48 (see linked CI job for raw logs)\n\nKey observations (most reproducible):\n1) p99 spike correlates with \"kv-cache on\" + small cache-cap (1GB) + long-seq presence. When cache fills and we evict frequently, p99 increases by 2.6x compared to baseline (cache off or cache large).\n   - Example: baseline (cache off): p99=180ms; kv-cache small: p99=480ms at same qps.\n2) Spikes align with a burst of PCIe memcpy activity on GPU0 (captured in nvprof/trace windows). The memcpy bursts occur when large kv-cache entries are evicted and then long-seq requests require reloading large KV blocks.\n3) Enabling optimized-attn reduced p50/p95 marginally but did not eliminate p99 spikes; kernel selection added a short (5-15ms) overhead per token for long sequences in some runs.\n4) fp16-accel trades some tail stability for throughput; with fp16 on we observe slightly higher variance in p99 during eviction events (suspected due to extra validation/format conversion paths in runtime code).\n5) Eviction policy jitter: LRU produced more frequent small memcpy spikes; temperature-based eviction produced fewer, larger spikes. Temperature-based with larger cache-cap produced best overall tail profile.\n\nDiagnostic traces / artifacts notes:\n- Trace excerpt (bench-20260615-12): timeline shows request A (short) -> request B (long) starts at t=3.2s; at t=3.21s we observe kv-evict(0x7f..) followed by memcpy(2.3MB) -> memcpy stalls main serving thread for ~8ms; aggregated across concurrent requests this causes p99 amplification.\n- GPU metrics: GPU utilization steady (~64%) except during memcpy bursts where compute drops to ~12% for ~10-30ms.\n- CPU: one core saturates during eviction callbacks (python GC spikes pinned to eviction handler).\n\nHypotheses (ranked):\nA) Eviction-induced memcpy to/from host is the primary driver of p99 spikes when small cache-cap + mixed long sequences present. Memory traffic blocks compute and stalls other requests in the same worker.\nB) Eviction handler runs on main serving thread (or a hot path) causing CPU-side stalls that backpressure the request queue.\nC) Kernel-selection path for long sequences triggers a block copy fallback that is slower in fp16+optimized-attn interplay.\n\nQuick reproducer command (lab):\n- benchgen --profile mixed-seq --qps 180 --duration 900 --model gpt-open-8b-qa-v1 --kv-cache on --kv-cache-cap 1GB --eviction lru --flags use-optimized-attn=true,fp16-accel=true\n\nImmediate mitigations tested during the lab:\n- Increase kv-cache-cap to 4GB: eliminated most mid-run evictions, p99 reduced to ~220ms (still ~20ms above baseline).\n- Move eviction callbacks to background worker thread (local patch): reduced CPU-side GC spikes; p99 improved by ~30% in patched runs (bench-20260615-33/34).\n- Throttle long-seq injection rate in generator to 1%: p99 approaches baseline; confirms sensitivity to long-seq fraction.\n\nAction items and owners:\n- Aisha: Draft follow-up PR to make eviction handler asynchronous and add metrics for memcpy bytes and eviction counts per worker (target PR by 2026-06-18). Linked PR draft: github PR 1248.\n- Marco: Run additional hypersweep with on-host pinned DMA buffers to measure memcpy overhead without CPU involvement (due 2026-06-17).\n- Diego: Profile kernel selection codepath and add instrumentation for fallback copy vs zero-copy to confirm hypothesis C (due 2026-06-19).\n- Priya: Add synthetic test to CI that injects 2% long-seq requests to catch regressions in p99 (due 2026-06-22).\n- Samir: Validate SLOs for dedicated pools and draft SRE runbook entry for eviction-induced stalls (due 2026-06-20).\n\nOpen questions / decisions needed:\n- Do we prefer larger default kv-cache-cap on hosted for mixed workloads at cost of memory footprint? (Product tradeoff)\n- Should eviction callbacks be moved out-of-process entirely (cost/complexity)?\n- Is there a quick kernel-level optimization for long-seq path to avoid extra copies when fp16-accel is enabled?\n\nNotes / misc:\n- This lab produced a reliable repro within our staging pool; we should schedule a short shadow run on prod-dedicated with the async-evict patch before rolling to all customers.\n- Observers from hosted-api suggested flagging long-seq customers to the routing policy (route long sequences to pools with larger cache capacity) as an immediate policy mitigation.\n\nReferences:\n- bench run logs: https://ci.internal.redwood/jobs/bench-20260615-raw (see bench-20260615-12,33,34)\n- JIRA ticket: JIRA-10934 (investigations + traces attached)\n\nNext sync: 2026-06-18 10:00 PT (sync to review PRs and additional sweep results)\n\nEnd of notes.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_687c80b0654b412b8cf735692f2d1f26"
+}

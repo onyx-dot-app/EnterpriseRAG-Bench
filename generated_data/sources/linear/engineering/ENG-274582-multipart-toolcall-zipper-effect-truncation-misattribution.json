@@ -1,0 +1,47 @@
+{
+  "key": "ENG-274582",
+  "team": "engineering",
+  "title": "Multipart toolcall zipper-effect causes field truncation and misattribution (customer escalation)",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-14",
+  "creator": "Aisha Patel",
+  "assignee": "Marco Chen",
+  "project": "runtime-stability",
+  "cycle": "2026-W11",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "customer-escalation",
+    "tool-calling",
+    "streaming",
+    "parsing",
+    "hosted",
+    "dedicated",
+    "private"
+  ],
+  "parent_issue": [
+    "ENG-261999"
+  ],
+  "dependencies": [
+    "ENG-268210",
+    "ENG-269003"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.23",
+  "security_review_required": "false",
+  "body": "Summary:\nA high-severity customer escalation reported that multipart tool/function call responses are occasionally 'zipped' together when passing through proxies or coalescing layers, causing token truncation and field misattribution in structured tool outputs. We observed occurrences across Hosted, Dedicated, and Private deployments (different proxy/sidecar stacks) with slight variance in failure modes, but the underlying symptom is the same: adjacent streaming fragments for separate logical tool outputs are merged without a preserved boundary, producing concatenated JSON segments that break our structured-output parser.\n\nImpact:\n- Affected customers: 3 enterprise customers reported production incidents in the last 10 days (one Hosted, one Dedicated, one VPC Private).\n- Visible failures: truncated arguments to downstream tool invocations, wrong tool payload associated with the wrong invocation id, and in some cases consumer applications received malformed JSON and failed to recover.\n- Severity: P0 (external outages / customer-facing data corruption).\n\nObserved differences across deployment modes:\n- Hosted: Failures often originate from a fronting CDN/proxy coalescing small chunks during TLS session reuse. Coalesced frames arrive to the runtime in a different segmentation pattern than sent.\n- Dedicated: Internal pooling/proxy that batches tenant streams can reorder or concat fragments when retry/backpressure occurs.\n- Private: Sidecar implementations (Envoy filters) with custom TCP buffering show zipper-like merging when adjacent buffers are flushed on a retry.\n\nReproduction steps (local + minimal):\n1) Use a test harness that emits two tool responses in rapid succession: first a short JSON payload with trailing delimiter, second a larger JSON payload.\n2) Introduce artificial small MTU-like chunking at the TCP layer (socat with --send-buffer / --recv-buffer variations or iptables TOS tests) and a proxy that will retry or coalesce on slow readers.\n3) Observe parser failures when the two logical payloads are delivered in a merged byte stream without our expected chunk delimiter.\n\nLogs and evidence:\n- Hosted customer logs: request_id=hosted-99a1, attached_raw_stream shows \"...}\\n{\\\"function\\\":\\\"search\\\",\\\"args\\\":{...\" + \"{\\\"result\\\":\\\"...\\\"}\" (concatenated mid-field).\n- Dedicated trace: trace_id=ded-13f, proxy logs show \\\"coalesce_buffer=1 flush_on_retry=1\\\" and backpressure metrics spiked concurrently.\n- Private sidecar: Envoy filter debug shows adjacent write spans being merged on EOB flush.\n\nRoot cause hypothesis:\nWe believe a combination of: 1) lack of explicit framing for multipart toolcall streaming payloads at the transport level (we rely on delimiters that are not preserved under some proxy coalescing), and 2) attempts by intermediary proxies to coalesce small writes during retry/flush events. The parser currently treats delimiter tokens heuristically and can mis-align when fragments are merged without a clear separator.\n\nShort-term mitigations implemented:\n- Added an emergency config for affected tenants to enable strict delimiter injection at the runtime output layer (forces a fixed-length envelope header per-fragment) \u2014 rolled out to two affected customers; dropped incidents while enabled. (Config key: runtime.strict_fragment_framing=true)\n- Ops applied proxy tuning guidance to reduce coalescing and disable certain coalescing heuristics in dedicated/private environments.\n- Temporary alert created: alert/toolcall-fragment-merge fires at 5 occurrences / 5m.\n\nProposed long-term fix (engineering plan):\n1) Implement an explicit per-fragment envelope with sequence number and length-prefix on the runtime streaming output protocol (binary-length prefix + 1-byte version). This makes boundaries robust to proxy coalescing and reassembly.\n2) Extend the server-side parser to accept both the legacy delimiter format and the new length-prefixed envelope during a migration window. The runtime will advertise supported framing via a handshake header for private/dedicated control-plane when possible.\n3) Update SDKs and proxy adapters to prefer length-prefix framing; add a compatibility mode for older clients.\n4) Add end-to-end tests simulating proxy coalescing, retries, and sidecar buffering to CI.\n\nImplementation notes & trade-offs:\n- Length-prefix adds 1-5 bytes of overhead per fragment but eliminates ambiguity and significantly reduces parser complexity and bug surface.\n- Backwards compatibility: We will implement dual-mode parsing for a 3-release migration window. Need coordination with client SDKs and console features that parse streams.\n- Rolling upgrades: staged rollout starting with Hosted (A/B), then Dedicated clusters, then Private (customer opt-in) to avoid breaking older client integrations.\n\nAcceptance criteria:\n- No more zipper-effect incidents in production 48h after rollout to an affected tenant with strict-framing enabled.\n- Automated fuzz tests exercising merged-chunk scenarios pass consistently in CI.\n- End-to-end latency impact <2% for typical workloads after framing implemented.\n\nPlan / Timeline:\n- 2026-03-14: Spike and prototype length-prefixed envelope in runtime (Marco).\n- 2026-03-16: Internal review & design doc (link below) + API handshake patch.\n- 2026-03-18: Feature branch + unit tests.\n- 2026-03-20: Canary rollout to Hosted tenants (5% traffic), monitor alert/toolcall-fragment-merge and parsing-errors.\n- 2026-03-24: Rollout to Dedicated clusters and coordinate with 2 impacted Dedicated customers.\n- 2026-03-28: Provide Private package and migration guide for sidecar/envoy configs.\n\nLinks and artifacts:\n- Design doc (internal): https://confluence.redwood.ai/display/RUNTIME/Multipart+Framing+Proposal\n- Spike PR: https://github.com/redwood-inference/runtime/pull/5821 (draft)\n- Customer support threads: https://drive.redwood.ai/escals/zipper-effect-2026\n- Monitoring dashboard: https://grafana.redwood.ai/d/abc123/toolcall-fragment-metrics\n\nNext steps / owner action items:\n- Marco: finish prototype and open PR for length-prefix framing (ETA 2026-03-16).\n- Ops (Liu): continue proxy tuning for affected tenants and provide rollback knobs.\n- SDK owners: prepare parsing compatibility updates and tests.\n- PM (Sofia): communicate timeline and migration plan to impacted customers; collect acceptance criteria from customer teams.\n\nPostmortem / follow-ups after fix deploy:\n- Root-cause writeup covering which intermediary(s) coalesced fragments and why (attach packet captures).\n- Add a regression test for the exact failure vectors reported by customers to the production test suite.\n- Evaluate whether stronger invariants (sequence number + checksum) are warranted for higher-security tenants.\n\nNotes: This ticket is high-priority because the current heuristic parsing has repeatedly failed under real-world proxy behavior. The length-prefixed envelope design should be implemented as the canonical framing for toolcall structured output to avoid similar classes of bugs going forward.",
+  "comments": [
+    "2026-03-10 Marco Chen: Investigated hosted customer's raw stream. Observed two JSON fragments concatenated without newline. Added temporary strict_fragment_framing flag for their tenant.",
+    "2026-03-11 Aisha Patel: Ops applied proxy coalescing config to Dedicated cluster 'ded-us-east-2' as a mitigation; reduced incident rate for that tenant.",
+    "2026-03-13 Sofia Martinez: Informed customers of workaround and collected logs. One customer requested an expedited permanent fix and test coverage proof.",
+    "2026-03-14 Marco Chen: Prototype initial length-prefixed envelope in runtime/pipeline. Draft PR opened (link in artifacts)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_d8954b42496b43ed9a965bd69499fc65"
+}

@@ -1,0 +1,70 @@
+{
+  "repo": "redwood",
+  "pr_number": "256891",
+  "title": "attn-probe-fusion-microkernel: introduce probe-fusion kernel with rope-handshake prefetch",
+  "author": "Aisha Patel",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-03-05",
+  "merged_at": "2026-03-05",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/attn-probe-fusion-rope-handshake",
+  "reviewers": [
+    "Linnea O'Connor",
+    "Devon Kim",
+    "Rajesh Menon"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "kv-cache",
+    "scheduling",
+    "redwood"
+  ],
+  "linked_linear": [
+    "ENG-3265",
+    "ENG-3301"
+  ],
+  "linked_jira": [
+    "SUP-7120"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "9",
+  "additions": "1472",
+  "deletions": "389",
+  "breaking_change": "false",
+  "release_notes": "Improves attention kernel latency and KV-cache warmup for medium-length sequences (16-512), ~18-28% tail latency reduction for mixed RT workloads. No API changes. Refer rollout notes for canary strategy.",
+  "description": "Motivation: Live inference workloads at Redwood show suboptimal tail latency for mixed interactive and streaming traffic where short-chat prefixes are common but occasional long completions occur. Existing fused kernels are tuned for either very short or very long windows; the 'probe-fusion' microkernel introduced here targets the mid-range (seq_len 16-512) where a light-weight probe + rope-handshake prefetcher can significantly reduce first-token latency and smooth KV warming costs.\n\nWhat this PR does: single continuous change that introduces a new attn-probe microkernel plus scheduler hints and a KV snapshotting shim: (1) attn/probe_fusion.{cu,h}: compact fused QK / rotary-probe path that probes lane occupancy before launching GEMM, reducing wasted warps on sparse rotary offsets; (2) runtime/scheduler: add RouteHint::ProbePreferred and a lightweight async prefetch worker that issues rope-handshake hints to the device for upcoming rotary offsets; (3) kv/cache: KV snapshotting and quick-commit path so probe-prefetch can pre-populate small hot KV slabs without triggering full eviction heuristics; (4) tests/bench: new bench targets and microbench harness to validate latency distribution across mixed batches.\n\nTechnical notes: The probe-fusion kernel implements a two-stage flow: small vectorized probe that inspects rotary offset alignment and active head occupancy, followed by a conditional fused QK path that either runs a packed QK+softmax GEMM for densely-aligned lanes or falls back to the standard interleaved QKV kernel for misaligned/fragmented cases. The rope-handshake prefetch is a non-blocking enqueue that sigils upcoming rotary rotation maps so the device can remap threads to contiguous memory ranges for better coalescing. KV snapshotting keeps a 4-way MRU slab for hot prefixes to avoid repeated allocation churn when probe triggers warmups.\n\nBenchmarks: Microbench on c6g/gpu-rt instances; median improvements for representative workloads:\n- Chat small (avg seq 40): 20% median latency, 28% 99th latency\n- Streaming mixed (prefix 24, tail variable): 12% median, 18% 95th\n- Long-only (seq 1024): neutral (-1% to +2%), measured to ensure no regressions\nCost: small increase in kernel variants (~120KB of binary), runtime memory overhead for KV snapshot ~2-6MB per model shard.\n\nCompatibility and rollout: Default is gated behind a runtime config flag 'probe_fusion.enabled=false' in main; rollout plan: enable in Dedicated canaries, then 5% Hosted traffic for models with median seq in target range, monitor latency and errors for 72h, then expand. No public API surface changes.\n\nChecklist:\n- [x] Kernel implementation and unit tests\n- [x] Scheduler hooks and backpressure handling\n- [x] KV snapshot shim and eviction safety checks\n- [x] Microbench and system-level benchmarks\n- [x] Docs stub and feature flagging\n\nRelated: builds on RFC from ENG-3265 (probe-based scheduling) and pairs with ENG-3301 (kv-snapshotting). See design doc: https://linear.app/redwood/issue/ENG-3265/probe-fusion-design (internal).\n\nRisks and mitigations: The primary risk is increased kernel complexity leading to subtle misalignments on older GPU drivers; mitigations: runtime feature gate, explicit driver version check in the runtime that refuses to enable probe_fusion on known-bad drivers, and a conservative default fallback to the standard fused path.\n\nRollout notes: Use canary config profile 'probe-fusion-canary' in Dedicated and Hosted. Observability: new metrics attn_probe_hits, attn_probe_misses, rope_handshake_latency, kv_snapshot_hot_rate. Alert thresholds included in observability-pack PR (linked).\n",
+  "commits": "4 commits:\n- a1c3e7b: introduce attn probe microkernel sources and build rules\n- b4f9d33: runtime: add RouteHint::ProbePreferred and prefetch worker skeleton\n- c27d8a1: kv: snapshotting shim + quick-commit path\n- d9512f5: tests/bench: add probe_fusion microbench and CI smoke tests",
+  "files_changed": [
+    "attn/kernel/probe_fusion.cu",
+    "attn/kernel/probe_fusion.h",
+    "runtime/scheduler/route_hints.h",
+    "runtime/scheduler/probe_prefetcher.cc",
+    "kv/cache/snapshot_shim.cc",
+    "kv/cache/snapshot_shim.h",
+    "tests/bench/probe_fusion_bench.cc",
+    "docs/feature_flags.md",
+    "build/CUDA.cmake"
+  ],
+  "patch_snippets": [
+    "diff --git a/attn/kernel/probe_fusion.cu b/attn/kernel/probe_fusion.cu\n+__global__ void probe_fusion_qk(... ) { /* probe lane occupancy, then branch to packed_qk or fallback */ }",
+    "diff --git a/runtime/scheduler/probe_prefetcher.cc b/runtime/scheduler/probe_prefetcher.cc\n+void Prefetcher::enqueue_rope_handshake(ModelShard *shard, const RopeMap &map) { /* non-blocking enqueue */ }"
+  ],
+  "review_comments": "Linnea: Great design, can we add a safety timeout on the prefetcher queue to avoid unbounded growth?\nAuthor (Aisha): Added a timeout and metric 'prefetch_queue_drop' in second commit.\nDevon: Bench results look promising; did you verify driver compatibility on older 11.x stacks?\nAuthor: Yes - runtime will refuse to enable probe_fusion on CUDA<11.8 and driver versions with known warp-atomic bugs.\nRajesh: KV snapshotting looks risky for multi-model hosts, please add per-model memory caps.\nAuthor: Added caps and eviction hooks; default cap is 8MB per shard.\nQA: Found flaky failure in probe_fusion_bench on small GPUs; fixed race in prefetcher where worker could access freed shard during shutdown.\nApprovals: Linnea approved, Devon approved after driver checks, Rajesh approved after caps. Merge method: squash and merge.",
+  "ci_summary": "Initial CI: linux-build (pass), cuda-build (fail: flaky timing test), unit-tests (pass), bench-smoke (fail on AMI with older driver). Reran with pinned test timeouts and driver check: all green. Final status: pass.",
+  "merge_outcome": "squash and merge to main. PR merged by Aisha Patel after approvals and green CI.",
+  "notes_for_release": "Feature gated; enable in production via runtime flag. Observe metrics attn_probe_hits/misses and kv_snapshot_hot_rate. If probes show high miss rate (>60%) revert via probe_fusion.enabled=false. See rollout playbook in docs/feature_flags.md.",
+  "qa_steps": "1) Enable probe_fusion in dedicated canary pool. 2) Run representative traffic for 72h, collect latency histograms and attn_probe metrics. 3) Verify no increase in OOMs, confirm kv_snapshot memory usage under per-shard cap. 4) If regressions observed, flip feature flag and collect traces for root cause.",
+  "backport": "none",
+  "changelog_category": "performance",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_comments",
+    "ci_summary",
+    "notes_for_release",
+    "qa_steps"
+  ],
+  "dataset_doc_uuid": "dsid_d4e54f485eee4a129c26aece05447546"
+}

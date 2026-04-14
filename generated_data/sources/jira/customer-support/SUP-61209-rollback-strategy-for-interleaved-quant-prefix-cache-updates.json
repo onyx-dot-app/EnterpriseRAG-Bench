@@ -1,0 +1,101 @@
+{
+  "key": "SUP-61209",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Rollback strategy for interleaved quantization profile + prefix/KV cache updates causing tail latency spikes",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-11",
+  "updated_at": "2026-03-13",
+  "reporter": "Ava Kim",
+  "assignee": "Marcus Chen",
+  "customer_company": "BrightLens AI",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "optimizer",
+    "kv-cache",
+    "config-service",
+    "routing"
+  ],
+  "labels": [
+    "rollback-playbook",
+    "quantization",
+    "kv-cache",
+    "tail-latency",
+    "high-priority"
+  ],
+  "environment": "prod | us-east",
+  "affected_models": [
+    "vicuna-13b-v1",
+    "redwood-v2-small-v2"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "linked_issues": [
+    "SUP-42760",
+    "INT-1849"
+  ],
+  "related_github_prs": [
+    "github.com/redwood/serving-runtime/pull/4876"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/Optimizer+Rollout+Guide"
+  ],
+  "sla_due_at": "2026-03-12",
+  "first_response_due_at": "2026-03-11",
+  "description": "Issue summary:\nCustomer BrightLens reported a production tail-latency regression after a combined rollout that changed the quantization profile and enabled aggressive prefix/KV cache prefetching for several dedicated pools. The change was deployed as a single staged rollout targeting the dedicated us-east pools; after the rollout completed, a subset of requests began to show 2--5x tail latency increases and intermittent 502s for long streaming responses.\n\nImpact:\n- User-facing: slow responses and occasional failed streams for ~9% of requests in the affected pools.\n- Business: impacts BrightLens' inference SLAs for their internal quota-bearing tenant.\n\nEnvironment:\n- Dedicated GPU pool: brightlens-prod-us-east (NVIDIA H100, 8 gpus per node)\n- Serving runtime: 2026.02.2-build\n- Config service snapshot: snap-2026-03-10-21:18\n\nSteps to reproduce (observed on prod metrics):\n1) Send a 2k token streaming request to the chat endpoint pinned to vicuna-13b-v1 for the brightlens tenant.\n2) Observe initial streaming tokens, then a stall where latency for token N+1000 increases dramatically compared to baseline.\n3) Check request logs and see 502 or incomplete stream in ~1 out of 12 failing traces.\n\nExpected behavior:\n- No substantial change in P95/P99 latency for streaming long-context requests after optimizer/profile rollout.\n- No 502s introduced by optimizer changes.\n\nActual behavior:\n- P95 increased from ~180ms to ~480ms; P99 up to ~1.8s on large-context streaming requests in affected pool.\n- 502s appear tied to internal timeouts during KV-cache prefetch + quantized kernel path for certain shard placements.\n\nImmediate ask:\nGuidance for a safe rollback plan that avoids data loss (preserve warmed KV cache where possible), minimizes customer downtime, and provides verification steps. Customer specifically requests a recommended sequence because quant profile and KV-cache toggles were interleaved in one change set.",
+  "comments": [
+    "2026-03-11 09:05 - Ava Kim: Created ticket after first customer support call; assigned to Marcus for owned rollback plan.",
+    "2026-03-11 10:12 - Marcus Chen: Acknowledged. Initial hypothesis: quantization change introduced slower kernel for long sequences on some shards; combined with aggressive KV cache prefetch load caused sporadic routing backpressure and timeouts. Will assemble playbook and coordinate with SRE for controlled rollback.",
+    "2026-03-11 14:28 - SRE Oncall (Priya Singh): Confirmed transient pod restarts in brightlens-prod-us-east starting 2026-03-11T13:40Z. Noticed elevated kernel fusion stall counters on nodes hosting model shard group G-3. Pinning network I/O looked normal.",
+    "2026-03-12 08:00 - Marcus Chen: Drafted stepwise rollback (see investigation notes). Requested customer permission to perform staged rollback during off-peak window 2026-03-12 23:00-01:00 UTC. Customer approved.",
+    "2026-03-13 02:14 - Marcus Chen: Performed initial rollback of quant profile on 20% of the pool and adjusted traffic split. Observed immediate drop in P99 for those hosts. Continuing phased rollback."
+  ],
+  "investigation_notes": [
+    "Hypothesis 1: Quantization profile changed kernel selection causing a slow path at long attention windows on certain devices (H100 firmware + selected GEMM kernel mismatch).",
+    "Hypothesis 2: KV cache prefetch aggressive setting increased memory pressure and concurrent IO which amplified kernel stalls, leading to internal timeouts in the streaming pipeline.",
+    "Metric evidence: Correlation between hosts where quant profile flip occurred and elevated 'attention_kernel_slow' counter. Hosts with both quant flip and prefetch enabled showed highest error rates.",
+    "Log excerpts: timeouts in stream-writer: \"write timeout after 120s\"; serving-runtime stack traces show stalled kernel invocation during decode loop for sequence positions > 1024.",
+    "A/B rollback sanity check: Reverting only quant on a small subset returned P99 to baseline; reverting only KV-cache prefetch reduced 502s but did not fully restore P99. Suggests interaction effect."
+  ],
+  "recommended_rollback_steps": [
+    "1) Take a config snapshot: config-service create-snapshot --pool brightlens-prod-us-east --tag pre-rollback-2026-03-13",
+    "2) Phase A - Quant profile soft rollback: use gradual traffic split to move 30% of traffic off new quant profile to previous profile for vicuna-13b-v1. Command: redwoodctl rollout traffic --pool brightlens-prod-us-east --model vicuna-13b-v1 --from-profile quant-new-2026-03-10 --to-profile quant-stable-2026-02-28 --percent 30 --wait 60s",
+    "3) Monitor P95/P99, kernel stall counters, and 5xx rate for 15 minutes. If P99 reduction observed, continue to 60% then 100% in 20m increments.",
+    "4) If quant rollback alone does not fully resolve 502s, Phase B - KV cache pref instead of full flush: disable aggressive prefix prefetch at pool level (toggle to conservative prefetch) to avoid flushing warmed caches: redwoodctl config set --pool brightlens-prod-us-east --kv-prefetch conservative",
+    "5) If disabling prefetch is insufficient, perform controlled KV cache eviction on a single node to ensure a clean warm path: redwoodctl node evict-kv --node <node-id> --pool brightlens-prod-us-east, then observe behavior for that node before wider action.",
+    "6) Avoid doing both full-quant rollback and full cache flush simultaneously. Prefer quant rollback first, then conservative prefetch toggle, then targeted node-level evictions if needed.",
+    "7) Post-rollback validation: run a standardized set of long-context streaming synthetic requests (provided in runbook) and confirm P95/P99 are within 10% of baseline for 30 minutes; inspect streaming completeness and absence of 502s.",
+    "8) After verification, create a postmortem runbook item and schedule a follow-up config change that separates quant profile changes from cache prefetch toggles in future rollouts (no interleaved changes)."
+  ],
+  "resolution": [
+    "Workaround applied: Gradual rollback of quant profile to stable for vicuna-13b completed at 2026-03-13T03:12Z. P99 on rolled hosts dropped back to baseline within 2 minutes.",
+    "Customer-facing outcome: BrightLens confirmed improved response latency and reduced failed streams during their peak across the affected pool segments.",
+    "Permanent fix path: Recommend splitting future optimizer rollouts into two distinct steps with canary windows: (A) quant/profile changes validated on isolated shards; (B) KV-prefetch changes applied after at least 24h stable telemetry. Engineering to add a preflight check for 'kernel_slow' counters before promoting quant profiles.",
+    "Follow-up: ENG-OPS action item created to add health-check gating in the config-service for combined optimizer changes. Scheduled change review with BrightLens on 2026-03-18."
+  ],
+  "attachments": [
+    "prod-metrics-2026-03-11-13-00-15.zip",
+    "example-failing-trace-789243.log",
+    "config-snapshot-predeploy.txt"
+  ],
+  "follow_up_actions": [
+    "ENG: Implement kernel-slow preflight check in config-service (owner: @marcus). Target ETA: 2026-03-20.",
+    "SRE: Add automated alert that fires when 'attention_kernel_slow' counter increases > 3x baseline in a pool for 10m (owner: @priya).",
+    "CS: Coordinate BrightLens verification window and sign-off (owner: @ava).",
+    "PM: Update rollout playbook to disallow interleaved optimizer and cache changes in the same config snapshot."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "recommended_rollback_steps",
+    "resolution",
+    "follow_up_actions"
+  ],
+  "dataset_doc_uuid": "dsid_b5713ea8303e4e458e372fe8a520fd06"
+}

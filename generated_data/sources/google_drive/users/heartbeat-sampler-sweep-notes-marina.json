@@ -1,0 +1,33 @@
+{
+  "title": "heartbeat-sampler-sweep-notes-marina",
+  "owner": "Marina Kovac",
+  "drive_area": "users",
+  "path": "users/heartbeat-sampler-sweep-notes-marina.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-18",
+  "last_modified": "2026-02-22",
+  "collaborators": [
+    "Ellen Park",
+    "Ravi Menon"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "burst",
+    "heartbeat",
+    "pacing",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-8421",
+    "JIRA-INF-2932",
+    "https://github.com/redwood-inference/serving-runtime/pull/418"
+  ],
+  "content": "Goal:\n- quick exploratory sweep of heartbeat-based pacing (local \"tick\" every X ms) to dampen microbursts and reduce p99 amplification during short spikes. want a cheap mitigation that doesn't require global queue re-architecture.\n\nTest summary (informal):\n- harness: synthetic client emulating real product trace (zipf-ish user session arrivals), but intentionally inject short 1-3s microbursts (50\u2013200 qps above baseline).\n- target model: llama-2-7b-quant (local dev flavor), seq=512, typical token output ~40 tokens.\n- HW: single dedicated GPU (A10G) on dev cluster (shared pool), 8 worker threads in runtime, kv cache warm for steady-state.\n- baseline: no heartbeat/pacing, dynamic batching on with 20ms batch timeout, max batch size 32.\n\nSweep knobs:\n- heartbeat interval: [10ms, 25ms, 50ms, 100ms]\n- heartbeat strategy: soft-delay (hold short window before enqueuing), immediate-priority-resume (drops into fast lane after quiet period), aggregate-window (coalesce arrivals into small buckets)\n- aggressive-throttle: on|off (boolean switch to simulate quick backoff)\n\nMetrics captured (per-run):\n- p50/p90/p95/p99 latency (server-side token generation latency)\n- observed qps during burst windows\n- batch size distribution\n- KV-cache hit rate\n- request drops / tail-off events\n\nRepresentative run data (abbrev; numbers are median-of-3 runs, small harness variance):\n1) baseline (no heartbeat) -- burst +50 qps for 2s:\n   p50: 56ms, p90: 140ms, p95: 220ms, p99: 520ms\n   avg batch size: 15, kv-hit: 0.92, observed peak qps: 250\n   notes: clear p99 spikes at burst onset; many small batches while workers ramp.\n\n2) heartbeat=50ms, soft-delay:\n   p50: 64ms, p90: 120ms, p95: 170ms, p99: 260ms\n   avg batch size: 20, kv-hit: 0.90, observed peak qps: 240\n   notes: p99 reduced ~2x vs baseline; slight p50 increase (added delay). good tradeoff for interactive apps.\n\n3) heartbeat=25ms, aggregate-window:\n   p50: 70ms, p90: 110ms, p95: 150ms, p99: 210ms\n   avg batch size: 23, kv-hit: 0.88, observed peak qps: 235\n   notes: better smoothing; lower p95/p99. small throughput loss due to coalescing but acceptable.\n\n4) heartbeat=10ms, immediate-priority-resume + aggressive-throttle=on:\n   p50: 48ms, p90: 100ms, p95: 190ms, p99: 470ms\n   avg batch size: 14, kv-hit: 0.93, observed peak qps: 255\n   notes: fast resume keeps p50 small but p99 still bad \u2014 likely due to contention when throttle flips back and forth (thrashing).\n\nObservations / hypotheses:\n- middle-range heartbeat (25-50ms) seems to give best p99 reduction without large p50 penalty.\n- aggregate-window strategies that intentionally coalesce arrivals into micro-batches increase batch size and reduce tail, at cost of added latency for very low qps clients.\n- immediate-resume heuristics can undo benefits by creating oscillation (rapid enter/exit), especially when aggressive throttle is toggled; need hysteresis.\n- kv-cache hit rate dips slightly with larger coalescing \u2014 maybe because session affinity windows misaligned; investigate sticky-worker assignment / cache TTL interplay.\n\nQuick ASCII sparkline (p99 across knobs, lower is better):\n- baseline:    \u2587\u2587\u2587\u2587\u2587\u2587\u2587\u2587\u2587\u2587 (520)\n- hb=50 soft:  \u2587\u2587\u2587\u2587\u2587\u2587\u2587\u2587    (260)\n- hb=25 agg:   \u2587\u2587\u2587\u2587\u2587\u2587      (210)\n- hb=10 resume:\u2587\u2587\u2587\u2587\u2587\u2587\u2587\u2587\u2587  (470)\n\nAnomalies spotted:\n- run #2 had one anomalous p99 spike at minute 4; correlate with infra-level preemption log (node heartbeats show transient GC pause). need to rerun with node isolation.\n- small number of requests got 503 during early bursts in aggregate-window tests. root cause: our enqueue-buffer overflow threshold too low; bump to 512 or implement spill-to-disk in future.\n\nNext experiments (prio order):\n1) add hysteresis to immediate-resume: require quiet period >= 2*hb before fast lane re-enable. rerun hb=10/25 to compare.\n2) isolate run on dedicated dev node (no other tenants) to rule out infra noise; reproduce best config (hb=25 agg).\n3) test longer bursts (10s) and varying output token lengths (20, 80) to see batch dynamics.\n4) instrument per-worker KV-cache metrics and session stickiness to understand hit-rate dip.\n\nImplementation notes / ideas for prod:\n- make heartbeat config per-route (low-latency routes: keep hb=10 with higher resources; bursty batch routes: hb=25-50 to save p99).\n- expose simple client-side hint header (x-rw-heartbeat: prefer-coalesce) for apps that can tolerate small delay.\n- add a lightweight telemetry event when heartbeat delays a request (so product teams can see user-facing latencies introduced).\n\nQuick decision note (for later):\n- default server-side policy: \"hb=25ms, aggregate-window, enqueue-buffer 512, immediate-resume with 2x hysteresis\" as a starting safe default for multi-tenant hosted API.\n\nLoose TODOs (personal):\n- write small harness script to vary burst shape programmatically (sin / square / single-impulse).\n- capture raw batch size time-series and dump to S3 for plotting (I used local csvs today \u2014 move to central).\n- sync with Ravi on PR approach for enqueue-buffer bump and add unit tests for drop behavior.\n\nNotes-to-self:\n- keep runs reproducible: seed client RNG, store full args in metadata file (date/time, git sha of runtime).\n- remind: double-check that quantized model build used the same kernel selection flags as prod (I used -O2 local build, prod uses -O3). kernel differences change latency distribution.\n\nReferences / where I stored artifacts:\n- local csvs: /mnt/devbench/heartbeat-sweep/20251118/*.csv\n- flamegraphs + perf reports: s3://dev-artifacts/heartbeat-sweep/20251118\n\nEnd of scratchpad.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_1e063071d415444485674989f836c3e3"
+}

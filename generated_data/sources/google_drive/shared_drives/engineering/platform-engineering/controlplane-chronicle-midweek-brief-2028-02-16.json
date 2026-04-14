@@ -1,0 +1,36 @@
+{
+  "title": "Control Plane Chronicle \u2014 Midweek Brief: routing/auth/quotas",
+  "owner": "Miguel Ortega",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/platform-engineering/controlplane",
+  "doc_type": "doc",
+  "created_at": "2028-02-16",
+  "last_modified": "2028-02-17",
+  "collaborators": [
+    "Dana Kim",
+    "Ethan Zhao",
+    "Priya Menon"
+  ],
+  "team": "platform-engineering",
+  "status": "draft",
+  "tags": [
+    "routing",
+    "auth",
+    "quotas",
+    "controlplane",
+    "canary",
+    "fallthrough"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-PLTFM-ARCH-57",
+    "JIRA-PLTFM-8421",
+    "JIRA-PLTFM-8476",
+    "github.com/redwood-inference/controlplane/pull/911"
+  ],
+  "body": "Midweek micro-chronicle from the control plane bench. This is intentionally informal \u2014 greasepaint notes, quick sketches, and action items \u2014 for the routing/auth/quotas slice. Use this for handoffs and follow ups; formal write-up will happen if we decide to push changes to mainline config or runbook.\n\nAttendees: Miguel (owner), Dana (routing), Ethan (auth), Priya (quotas), + quick check-ins from SRE (Anika) and infra (Jon).\n\nContext / why this matters:\n- Last Friday\u2019s incident (JIRA PLTFM-8399) showed path fallthrough and quota bump interplay caused brief latency spikes for low-tier customers during a surge. Need to harden fallthrough ordering + quota admission so that fallback routing does not bypass token-bucket smoothing and cause transient overloads.\n- We\u2019re mid-canary for route-priority changes (pcp-route-priority-v2). Current canary window ends Fri 2028-02-18. Observability dashboards look ok but there are micro-spikes during TTL refreshes.\n\nQuick metrics snapshot (observed during canary window):\n- 95p latency for control plane lookup: 42ms (baseline 38ms)\n- auth token validation error rate: 0.02% (baseline 0.01%) \u2014 small, but correlated to a new JWKS rotation pattern\n- quota enforcement throttles (per-second rejects) up by ~7% during peak prefix-cache churn periods\n\nNotes from discussion (raw):\n- Routing (Dana):\n  - Fallthrough tree: current algorithm picks next-compatible variant without re-evaluating quotas. Propose inserting an admission step when a fallback is chosen to consult quota/admission cache (cheap check) before routing commit.\n  - Suggested cheap admission cache: 1s sliding window counts keyed by (customer_id, route_group) stored in local ephemeral cache on control plane node. If over threshold, route to degraded model variant or queue.\n  - Concern: introducing a synchronous admission check could add ~3-6ms to the critical path. Need async fast-path + deferred enforcement for best-effort fallthroughs.\n\n- Auth (Ethan):\n  - JWKS rotation pattern from external IdP triggered a flurry of cache misses in our verifier layer; we should: (a) add a short-lived grace window for old keys (configurable), (b) pre-warm JWKS when rotation event seen in webhook.\n  - Also noticed an edge where token introspection timeouts bubble up as 500 and cause route retry loops; add better retry budget and degradations (return 429 vs 500) to callers.\n\n- Quotas (Priya):\n  - Token-bucket elasticity feels brittle under prefix cache churn \u2014 when many TTLs expire at once, quota backend gets bursts of replenishment calls. Proposal: jitter TTL expiry across nodes + add small randomized lease extension (10-50ms) to smooth replenishment storms.\n  - For Dedicated customers, add a fast-path bypass that uses local reserved tokens before contacting central quota store (safety: local reserve refilled async and audited).\n\nDecisions / consensus (today):\n- Short-term mitigations (this sprint):\n  1) Add admission cache hook into fallthrough flow but keep it on the fast-path with a 1ms budget \u2014 if admission cache miss (or timeout) assume conservative allow until we have a full fast-path implementation. (Owner: Dana, ticket JIRA-PLTFM-8476, due 2028-02-23)\n  2) Implement JWKS pre-warm webhook and 5-min old-key grace window in verifier. (Owner: Ethan, ticket JIRA-PLTFM-8468, due 2028-02-20)\n  3) Roll out TTL jitter in quota client libraries (server-side jitter config default 30ms). (Owner: Priya, ticket JIRA-PLTFM-8469, due 2028-02-21)\n\n- Longer-term items (research / follow-up):\n  - Evaluate async admission model: perform admit-by-proxy where the route is tentatively selected and an admission job runs on background queue, with either a mitigator path if the job fails. Complexity: more consistency handling and user-visible behavior. (Champion: Miguel)\n  - Quota local-reserve for Dedicated: prototype design doc needed describing audit reconciliation and safety windows. (Champion: Priya)\n\nAction items (concrete):\n- Dana: prototype admission cache hook + micro-benchmark (latency overhead) and a canary rollout plan. Put results in PR and link to canary dashboard. (JIRA-PLTFM-8476).\n- Ethan: implement JWKS pre-warm and grace window; add metrics for cache-warm hits and token-introspect timeouts. Add a small test harness that simulates IdP rotation. (JIRA-PLTFM-8468).\n- Priya: add TTL jitter in quota client and coordinate with SRE to enable on 2 nodes first; measure throttles/replenish spikes. (JIRA-PLTFM-8469).\n- Anika (SRE): add a synthetic load test that simulates 10k tenants with staggered prefix TTLs to validate jitter smoothing. Provide baseline graphs for next sync.\n- Jon (Infra): validate that local ephemeral caches have memory caps and LRU policies; ensure admission cache will not OOM under sudden cardinality.\n\nParking lot / open questions:\n- If admission cache introduces false negatives (over-blocking), what's the rollback plan? We should be able to flip to permissive via feature-flag remotely, and degrade to existing fallthrough logic.\n- How do we provide observability on per-customer admission rejections without exploding cardinality in metrics? Consider sampled telemetry + per-tenant rollups.\n\nNotes on rollout / risk management: \n- Any change in routing fallthrough ordering is risky during high-traffic events; keep a short canary window (24\u201372h) and define clear rollback triggers (5xx increase >0.5% or 95p latency +10ms sustained).\n- Add a canary tag in the trace span for admission-check so we can quickly query traces for overheads.\n\nNext sync: Friday 2028-02-18, 10:30am PT. Objective: review prototypes + canary telemetry and decide on enablement plan for global rollout.\n\nAppendix: quick sketches (text blob) \u2014 lab vignette ideas:\n- \"Admit-by-proxy\" flow: request -> tentative route -> enqueue admission job -> return cached fallback with short TTL -> admission job either confirms or writes correction event (control plane pushes correction to edge; edge invalidates fallback).\n- \"Local reserve\" for Dedicated: each node maintains N tokens per customer_id; when exhausted, it talks to central quota store; reconciliation runs every minute. Audit events to central store with per-node sequence numbers.\n\nIf anything is missing or you want to push formal docation, flag and I will convert this greasepaint into a PRD + runbook draft.\n\n-- Miguel\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_ae2e8dcdfaf74d1991891480d4773f42"
+}

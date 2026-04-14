@@ -1,0 +1,67 @@
+{
+  "key": "ENG-30109",
+  "team": "engineering",
+  "title": "Rate policy clock offset & accumulator corruption causing quota miscounts",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-28",
+  "updated_at": "2026-03-13",
+  "creator": "Aisha Navarro",
+  "assignee": "Ravi Menon",
+  "project": "quota-and-metering-reliability",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "billing",
+    "rate-limiter",
+    "investigation",
+    "sev1",
+    "redis",
+    "distributed-systems"
+  ],
+  "parent_issue": [],
+  "dependencies": [
+    "ENG-24011",
+    "ENG-20111"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.21",
+  "security_review_required": "false",
+  "description": "Summary:\nWe are seeing intermittent quota miscounts and unexpected throttles across per-key / per-org / per-route rate policies. The pattern correlates with cluster node restarts and NTP / clock adjustments: counters are sometimes double-counted or reset leading to both over-throttling and quota underspend.\n\nObserved behavior:\n- bursty client traffic that historically fit within quota windows is getting throttled for several seconds after node failover or time sync events.\n- other times, requests bypass limits for a short period, producing overage metering.\n- affected metrics: rate_enforcer.counter_delta, quota_window_start, redis_window_ttl_mismatch, enforcer_leader_elections.\n- root traces show window IDs that differ by +/- 1 between nodes for the same org+route during leader handoff.\n\nHypothesis / root cause (initial):\n- Window IDs are computed using system wall-clock derived epoch seconds. When node A and node B have small clock offsets (NTP adjustments, VM suspend/resume), they can compute adjacent window IDs for the same logical time slice.\n- The aggregator/accumulator writes deltas to a shared backing store (Redis), but window id mismatch causes node B to create a new window key while node A continues writing to the old key. Later reconciliation merges with mis-ordered writes, producing negative deltas or duplicated counts.\n- A secondary race comes from leader election: the newly elected enforcer sometimes reinitializes an accumulator without reading pending in-flight delta buffers, losing transient tokens.\n\nReproduction steps (dev env):\n1) Start two enforcer pods against a shared Redis instance in staging with traffic replay of a steady per-route usage pattern (100 r/s).\n2) Pause Pod B (simulate stop), let Pod A handle traffic for 20s.\n3) Resume Pod B and force a clock skew on Pod B process (simulate ntp adjustment) or restart the container so it gets a slightly different wall-clock.\n4) Observe quota_window_start and counter_delta logs: Pod B computes window id differing by 1; Redis ends up with both keys; enforcer aggregates produce transient negative deltas.\n\nLogs / examples (sanitized):\n- enforcer[2026-03-03T14:42:12Z] INFO window_id=1700_164 start=1700_120 delta=+120 org=acme route=/generate\n- enforcer[2026-03-03T14:42:13Z] WARN reconcile: fetched stale_window=1700_120 found_buffer=+90 merging->result=-30\n\nImpact:\n- Customer-facing: some production tenants saw 10-20s windows with unexpected 429s; others saw short bursts that exceeded quota and were billed in the following cycle.\n- Internal: alert flapping in quota-health dashboards; inaccurate cost attribution for a subset of requests.\n\nProposed remediation plan:\n1) Short-term mitigation (hotfix): switch window id generation to use monotonic process uptime + logical epoch anchor rather than wall-clock seconds; ensure window ids are computed deterministically using the leader's epoch. Deploy as a canary to Dedicated and Hosted control planes.\n2) Medium-term: add an idempotent reconciliation step in the accumulator that detects negative deltas and replays missing in-flight buffers before committing to Redis. Add a compare-and-swap (CAS) write path for per-window accumulators.\n3) Long-term: migrate the windowing to a leader-driven epoch coordinator: leader publishes window epoch tokens to Redis with TTL; followers accept/attach to the token rather than computing windows locally.\n\nTesting / validation:\n- unit tests for monotonic-window-id generator covering NTP jumps and container restarts.\n- integration: 2+ enforcer pods with artificial clock skew test harness (script included in repo under tools/clock-test).\n- load test: replay production trace (12m) with rolling restarts to validate no miscounts.\n\nRollout plan:\n- Stage: deploy hotfix to staging cluster with traffic replay and synthetic clock-jump tests (48h).\n- Canary: deploy to 5% of Hosted, and 1 Dedicated customer pool for 24h with increased counters and alert thresholds.\n- Full: 100% rollout after 72h canary and zero negative-delta incidents.\n\nRollback plan: revert code path and restore previous accumulator behavior; fallback route: redirect traffic to read-only enforcement (fail-open) for 30s while we fix the state in Redis using recovery script.\n\nMigration/healing script: a small script will scan Redis window keys for overlapping epoch pairs and attempt a safe merge heuristic: prefer higher-sum window or re-run reconciliation using per-request logs (if available). This will be opt-in and run under a debug flag.\n\nObservability changes (blocked until fix):\n- new metric: window_id_skew_count (per-node, per-org)\n- alert: window_id_skew_count > 5 in 1m triggers P0 page and auto-canary rollback\n- dashboard: side-by-side queue times and negative_delta_rate\n\nOwners / reviewers:\n- owner: Ravi Menon (assignee)\n- code owners: src/enforcer/* (primary: @ravi, secondary: @julia-lam)",
+  "comments": [
+    "2026-02-28 - Aisha Navarro: Created ticket after correlating several customer incidents and internal metric anomalies. Assigned to Ravi for triage.",
+    "2026-03-01 - Ravi Menon: Reproduced locally with two pods + clock skew. Confirmed window id mismatch. Captured reenactment logs and uploaded to Drive: https://drive.redwood.ai/drive/fake-link/clock-skew-repro-0301",
+    "2026-03-02 - Julian Park (oncall): Deployed temporary mitigation: increased tolerance for window id difference in aggregator (accept +/-1) to reduce 429s. This reduced customer impact but produced billing inaccuracies. Logged change as config flag 'enforcer.window_tolerance=1'.",
+    "2026-03-04 - Engineering Review: Decided against permanent +/-1 tolerance because it masks correctness issues. Agreed on monotonic-window-id hotfix and reconciliation path. PR drafted: https://github.com/redwood-inference/enforcer/pull/1823",
+    "2026-03-08 - QA: Integration harness added under tools/clock-test, tests passing in CI. Still failing a flaky case where pod resume loses in-flight buffer; added explicit flush on leader handoff.",
+    "2026-03-10 - Security: Reviewed PR for data exposure. No PII concerns. Security review not required for this fix.",
+    "2026-03-12 - PR Merge: enforcer PR #1823 merged to canary branch. Canary rollout to 5% scheduled for 2026-03-13. Monitoring alerts created: infra.alerts#window_skew, infra.metrics#negative_delta_rate."
+  ],
+  "decision_notes": [
+    "Prefer monotonic timebase over wall-clock for window ids to avoid NTP and VM suspend-related skew.",
+    "Add CAS semantics for per-window accumulator writes to prevent lost updates during leader handoff.",
+    "Reconciliation should be conservative: on negative delta, pause commit and attempt to fetch in-flight buffers up to 5s back before forcing a merge."
+  ],
+  "action_items": [
+    "Ravi: land hotfix to canary and monitor (ETA 2026-03-13)",
+    "Julia: add unit tests for monotonic id generator (ETA 2026-03-14)",
+    "SRE: provision canary alerting and dashboards (ETA 2026-03-13)",
+    "Data: run retrospective on billing windows to estimate affected customers and amounts (ETA 2026-03-17)"
+  ],
+  "references": [
+    "https://github.com/redwood-inference/enforcer/pull/1823",
+    "https://drive.redwood.ai/drive/fake-link/clock-skew-repro-0301",
+    "dashboard://quota-health/2026-03-01",
+    "ENG-24011",
+    "ENG-20111"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "decision_notes",
+    "action_items"
+  ],
+  "dataset_doc_uuid": "dsid_dd07a420a1f148f0be10c79edbcb4a82"
+}

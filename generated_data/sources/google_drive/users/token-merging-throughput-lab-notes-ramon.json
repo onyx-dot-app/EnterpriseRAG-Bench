@@ -1,0 +1,32 @@
+{
+  "title": "Token-merging throughput lab notes (scratch)",
+  "owner": "Ramon Alvarez",
+  "drive_area": "users",
+  "path": "users/token-merging-throughput-lab-notes-ramon",
+  "doc_type": "doc",
+  "created_at": "2025-11-18",
+  "last_modified": "2025-11-20",
+  "collaborators": [
+    "Mira Chen",
+    "Samir Gupta"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "throughput",
+    "latency",
+    "token-merging",
+    "quantization",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/834",
+    "RWD-1247"
+  ],
+  "content": "Goal:\n- Quick probe to see whether token-merging (cheap compressing of similar tokens in prefix) improves steady-state throughput and p99 tail for medium-length chat workloads (avg seq 512-1024).\n\nHypothesis:\n- Token-merging reduces KV cache size and per-token attention work for repeated-token spans (e.g., system prompt + few-turn context), improving tokens/sec by ~10-25% at the cost of occasional alignment overhead. Expect p50 improvement and some p99 volatility during merge/unmerge boundary.\n\nEnvironment:\n- Model: gpt-ish open-model variant; local test build (llama-compat v2, quant q4_0)\n- Model binary: /opt/models/llama-v2-13b-q4_0-20251114\n- Hardware: single A100-40GB (40GB), CUDA 12.1, cuBLAS/cuDNN standard\n- Runtime: serving-runtime branch token-merging-experiment (PR 834)\n- Batcher config: max_batch_tokens=65536, max_batch_size=64, window_ms=6, early_flush_ms=2\n- Concurrency driver: k6-based replay harness (see repo link)\n- Workload: synthetic mixed chat traces derived from production traces (anonymized). Arrival pattern: bursty Poisson with diurnal baseline, mean qps 180, peak 320. Prompt length distribution: 10% short (<64), 70% medium (128-512), 20% long (512-1024). Response target: ~150 tokens.\n\nMetrics captured:\n- p50/p90/p95/p99 latency (server-side, generation end)\n- tokens/sec (aggregate across requests)\n- GPU utilization and PCIe bandwidth (nvidia-smi sampling)\n- KV cache memory footprint (est), merge/unmerge counts per minute\n- Error rate (timeouts/failed requests)\n\nRuns summary (stable window: 10m after warmup):\n1) baseline (no token-merging), 3x 10m runs:\n   - avg tokens/sec: 215, 220, 212 -> median 215 tps\n   - p50 latency: 20ms, 19ms, 21ms -> ~20ms\n   - p95 latency: 78ms, 81ms, 76ms -> ~79ms\n   - p99 latency: 192ms, 205ms, 190ms -> ~195ms\n   - GPU util avg: 72%\n   - KV footprint (est): 11.4GB\n\n2) token-merging enabled (merge-threshold=0.85, max-merge-span=64), 3x 10m runs:\n   - avg tokens/sec: 250, 244, 258 -> median 250 tps (+16% vs baseline)\n   - p50 latency: 16ms, 15ms, 17ms -> ~16ms (improved)\n   - p95 latency: 75ms, 76ms, 73ms -> ~75ms (slight improvement)\n   - p99 latency: 210ms, 430ms, 198ms -> median ~210ms (wider variance; one run had spikes)\n   - GPU util avg: 81% (higher packing)\n   - KV footprint (est): 8.7GB (reduction ~24%)\n   - merge/unmerge events: 420/min, unmerge penalty spikes correlated with p99 spikes\n\n3) token-merging, conservative settings (threshold=0.92, max-span=32), 2x 10m runs:\n   - avg tokens/sec: 232, 238 -> ~235 tps (+9% vs baseline)\n   - p50: 18ms\n   - p95: 77ms\n   - p99: 205ms, 198ms -> safer tail than aggressive config\n   - KV footprint: 9.6GB\n\nObservations / quick notes:\n- Baseline is stable; token-merging yields solid TPS gains but introduces occasional unmerge-induced compute bursts causing tail spikes (one bad run showed p99 ~430ms).\n- Spikes often align with requests that had long overlapping merge spans that later needed to be materialized (unmerge). The runtime currently applies unmerge synchronously at materialization time which stalls generation on the request thread.\n- GPU utilization increases, which explains tps gains, but also raises variance in scheduling (preemption/backpressure on worker threads).\n- KV reduction is as-expected and should help memory-limited multi-tenant packs.\n\nHeap of raw observations (for follow-up):\n- When the driver injects a short burst (200 qps for 10s), merge aggressive config shows ~30% drop in success for long requests due to timeouts (need better admission control).\n- PCIe bandwidth correlates with unmerge spikes; profile shows memcpy spikes at unmerge time.\n- Low-level profiler (nvtx) indicates unmerge path triggers extra kernel launches for scatter/gather that aren't fused.\n\nImmediate mitigations to try:\n- Make unmerge asynchronous: enqueue materialize op on worker, stream partial tokens while materialize continues if possible (fast-path if merge didn't cross prompt boundary).\n- Add a heuristic to bypass merging if expected unmerge overhead > X ms (estimate from span length).\n- Throttle admission during known heavy unmerge periods (backpressure to frontend).\n\nAction items / next steps:\n- [ ] Open a small RFC for asynchronous unmerge flow (assign to @Mira) \u2014 link draft PR in repo (PR 834)\n- [ ] Add telemetry counters for per-request merge-span length and estimated unmerge cost (Samir to add)\n- [ ] Run multi-tenant packing test (2 tenants, mixed qps) with conservative merging to validate memory wins without tail regressions\n- [ ] Create synthetic trace with targeted long-span merges to reproduce 430ms spike in a deterministic harness\n\nNotes to self (scratch):\n- Try GPU kernel fusion on scatter/gather path \u2014 ask infra for help or check existing fused ops in kernels repo.\n- Consider model-level hinting: model exporter could mark segments safe-to-merge (e.g., BOS/system prompt) so runtime can be more conservative around untrusted spans.\n\nReferences and links:\n- PR: https://github.com/redwood-inference/serving-runtime/pull/834\n- Jira: RWD-1247 (token-merging experiment)\n- Local harness: infra/perf/harnesses/token-merge-replay (branch: perf-tokenmerge)\n\nConclusion (working):\n- Token-merging is promising for throughput and memory, but tail risk needs engineering controls (async unmerge, heuristics, admission control). For Dedicated customers where memory is tight, conservative token-merging may be net-positive. For hosted low-latency tiers, avoid aggressive merge until unmerge path is non-blocking.\n\n-- Ramon\n(quick scratchpad; will move to a proper runbook if we decide to prod-ship)",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_e8b24c1664ad465e9d249bcc32ef18de"
+}

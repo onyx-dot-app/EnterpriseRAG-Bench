@@ -1,0 +1,79 @@
+{
+  "key": "ENG-73509",
+  "team": "engineering",
+  "title": "Fix shared rate-limiter counters leaking between subprojects during API gateway key handoff",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-03-12",
+  "creator": "Sofia Martinez",
+  "assignee": "Ravi Patel",
+  "project": "multi-tenant-usage-correctness",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "billing",
+    "rate-limiter",
+    "multi-tenant",
+    "incident",
+    "hotfix"
+  ],
+  "parent_issue": [
+    "ENG-61432"
+  ],
+  "dependencies": [
+    "ENG-50321",
+    "ENG-37645"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.21",
+  "security_review_required": "false",
+  "description": "Summary: After several customer reports of sudden quota exhaustion and unexpected 429s following API key reassignments between subprojects, we discovered rate-limiter counters and meter attributions are occasionally applied to the wrong project during the API gateway key handoff flow. This leads to incorrect billing/quotas and spurious throttling for both the source and destination projects.\n\nSymptoms:\n- Customers saw burst 429s on destination projects immediately after key handoff events.\n- Source projects observed unexplained usage drops while destination projects had sudden spikes.\n- Metrics show rate_limiter_shard counters not being namespace-isolated for a ~5s window during the handoff.\n\nRepro steps (staging):\n1) Create two projects A and B and a key bound to A.\n2) Generate continuous traffic against the key to increment per-project counters.\n3) Trigger key rebind from A -> B via the API gateway's key-reassign endpoint.\n4) Observe per-project rate-limiter counters and billing attribution in the metering dashboard.\n5) Intermittently the counters are applied to A or to both, rather than being atomically moved to B.\n\nRoot cause hypothesis: During a key handoff the gateway issues a lease to the key-binding service and simultaneously updates the attribution mapping in the attribution-resolver. A race exists: shard counter writes are keyed by the binding ID; when binding ownership transfers, there is a short window where writers use the old binding id but the attribution-resolver has already returned the new owner. Rate limiter shards do not currently check binding generation or handoff markers, so increments can be applied under the wrong project namespace. Additionally, current handoff code performs a best-effort counter migration that reuses shared in-memory shard objects, and an unguarded reset path causes counters to merge rather than move.\n\nImpact: High for customers who frequently rebind keys between subprojects (platforms migrating tenants, automation, subaccount reorganizations). Incorrect billing and unintentional throttling have caused support tickets and a few paused deployments.\n\nProposed fix: Implement atomic handoff contract across gateway, attribution-resolver, and rate-limiter shards: when a handoff begins, the gateway will emit a handoff_id and handoff_generation; the rate-limiter will buffer increments keyed by handoff_generation until the attribution-resolver confirms commit. On commit, an atomic swap moves buffered counts to the new namespace; on abort the buffer is drained back to the original namespace. Add a small TTL-based fallback for orphaned buffers. Ensure the counter migration runs in the same transaction as the attribution update for durable correctness.\n\nNon-goals: This ticket does not refactor global shard allocation logic (planned separately) and does not change per-token billing granularity beyond attribution correctness.",
+  "acceptance_criteria": [
+    "Per-project rate-limiter counters remain correct after simulated key handoff in staging (deterministic test harness)",
+    "No increase in 429s attributable to misattribution during a 48h canary in production for handoff-heavy customers",
+    "Unit tests covering handoff buffer, abort and commit code paths with generation markers",
+    "Integration test that replays production handoff traces and asserts billing attribution matches expected project IDs",
+    "Monitoring: new metric rate_limiter.handoff_buffer_size and handoff.commit_latency exist and are tracked in the console dashboard"
+  ],
+  "implementation_notes": [
+    "Add handoff_id and generation headers to gateway -> attribution-resolver and propagate to rate-limiter RPCs",
+    "Introduce in-rate-limiter buffer keyed by (binding_id, generation, handoff_id) with atomic swap APIs: ReserveBuffer, CommitBuffer, AbortBuffer",
+    "Make attribution-resolver update and CommitBuffer in a single two-phase commit guarded by leader election for the key-binding service",
+    "Ensure buffers are small and TTLed (default 30s) to protect memory on hot rebinds",
+    "Add metrics and tracing: handoff_id on traces, handoff result tag (commit/abort/timeout)",
+    "Backward compatibility: rate-limiter should accept missing generation and fall back to legacy behavior while flag enabled; feature flag runtime.handoff-atomic = on by default for canary"
+  ],
+  "qa_steps": [
+    "Staging: run provided repro script with 3 rebind cycles and assert each project's token counts are stable post-handoff",
+    "Unit tests: run 'make test' and verify handoff buffer unit tests pass locally and in CI",
+    "E2E: deploy to staging with runtime.handoff-atomic=true and run production-handling replay harness (scripts/replay/handoff-replay) and confirm no misattribution",
+    "Canary: enable feature for 10% of gateway nodes, run synthetic traffic for 4 hours, verify metrics and absence of new 429 alerts",
+    "Manual verification: use per-key attribution query API to assert attribution history contains handoff_id markers and correct owner resolution"
+  ],
+  "rollout_plan": "1) Merge patch behind runtime.handoff-atomic flag. 2) Deploy to staging and run replay harness. 3) Canary on 10% of gateway nodes for 4h and validate metrics+alerts. 4) Expand to 50% for 24h. 5) If stable, flip flag cluster-wide and monitor for 48h. 6) Post-rollout, run billing reconciliation job to reattribute any small windows of historical misattribution in the last 7 days for affected customers.",
+  "links": [
+    "https://confluence.redwood.ai/display/INF/ENG-73509+-+handoff-contract-spec",
+    "https://github.com/redwood-inference/runtime/pull/1428",
+    "https://grafana.redwood.ai/d/usage/rate-limiter-handoff?orgId=1",
+    "https://drive.redwood.ai/Shared%20Drives/Platform/hand_off_repro_script.sh"
+  ],
+  "comments": [
+    "2026-02-21: Triage complete. Repro verified in staging; assigned to Ravi. Initial mitigation: temporarily block automated mass rebinds via policy to reduce customer impact.",
+    "2026-02-24: Mitigation deployed \u2014 gateway now delays non-critical rebinds by 30s and funnels them through a single-threaded migration worker. Observed ~70% reduction in immediate misattribution reports.",
+    "2026-03-01: Design review held with runtime and gateway teams. Agreed on handoff_id + generation approach and two-phase commit for CommitBuffer. Security reviewed the plan; no crypto changes required but audit logging requested.",
+    "2026-03-08: PR opened (runtime/pull/1428). Patch implements buffer and RPC changes behind feature flag. CI flaky on a non-related metric test; rerunning CI.",
+    "2026-03-12: Canary started on 10% of gateway nodes. Early signals: handoff_buffer_size metric stable, no new 429 alert spikes for canary customers. Continuing monitoring for full canary window."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "implementation_notes",
+    "qa_steps",
+    "rollout_plan",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_26e4b99cb8de4f9fb5a874f1ce274971"
+}

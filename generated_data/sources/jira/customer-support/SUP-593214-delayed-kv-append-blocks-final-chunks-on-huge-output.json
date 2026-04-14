@@ -1,0 +1,79 @@
+{
+  "key": "SUP-593214",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Final token stream stalls while background KV-append delays cause client timeout on very large max_tokens",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-05",
+  "reporter": "Priya Kapoor",
+  "assignee": "Ethan Zhang",
+  "customer_company": "ScribeCo",
+  "customer_tier": "dedicated",
+  "environment": "prod us-east-1",
+  "components": [
+    "serving-runtime",
+    "kv-cache",
+    "api-gateway",
+    "streaming"
+  ],
+  "labels": [
+    "long-context",
+    "kv-append",
+    "timeout",
+    "streaming-hang"
+  ],
+  "affected_models": [
+    "redwood/llama-70b-q4",
+    "open-gptj-30b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-01T12:30:00Z",
+  "first_response_due_at": "2026-03-01T10:45:00Z",
+  "linked_issues": [
+    "SUP-53721",
+    "SUP-29541"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood/runtime/pull/9291",
+    "https://github.com/redwood/serve/pull/9420"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SRE/KV+Cache+Runbook",
+    "https://confluence.redwood.ai/display/ENG/Streaming+Timeout+Postmortem+Template"
+  ],
+  "description": "Issue summary:\nCustomer ScribeCo reports repeated client-side timeouts when requests ask for very large max_tokens (>=200k) with a long system prompt + conversation history. Requests begin streaming tokens, but the final portion of the response pauses for multiple seconds before finishing; client HTTP connection reaches its timeout and the app sees truncated output.\n\nImpact:\n- Multiple production customers on dedicated pods experiencing truncated responses and increased retry churn.\n- Visible spike in 5xx and 504s for affected tenant.\n- Customer reports content loss leading to downstream UX failures.\n\nEnvironment:\n- Dedicated Redwood Dedicated pool (tenant ScribeCo), prod, us-east-1.\n- Serving runtime version: v1.18.2 (release-2026-02-15).\n- Kernel/runtime flags: continuous-batch=true, kv_append_in_background=true, quant-profile=auto.\n\nSteps to reproduce:\n1. Configure a request with very large prefix (~150k tokens) + max_tokens=220000 and streaming enabled.\n2. Send the request via the Redwood SDK with default client-side timeout (90s).\n3. Observe streaming chunks for ~60\u201385s, then a prolonged stall >10s before final token arrival.\n4. Client times out at 90s and reports truncated output; server logs show worker still finalizing KV state.\n\nExpected behavior:\n- Streaming continues until completion without multi-second stalls on final token emission; total latency proportional to token budget.\n\nActual behavior:\n- Finalization step triggers a background KV-append that competes for GPU/memory and blocks the final token flush to the streaming pipeline, causing client timeouts.\n\nRelevant logs (excerpt):\n- serving-runtime stdout: \"[2026-03-01T09:48:12Z] INFO finalizer: flushing KV-append async task (size 1.6GB)\"\n- worker stderr: \"OOM-suspect: kernel-swap requested during kv-serialize\"\n- proxy access log: repeated 502/504 entries for the tenant around the timeout window.\n\nAttachments: stacktrace snippets, sample request payload, and customer SDK trace uploaded to ticket attachments.",
+  "comments": [
+    "2026-03-01 | Support (Avery Collins): Initial triage done \u2014 confirmed reproducible in our staging dedicated cluster with tenant config. Escalating to SRE for memory/serialization review.",
+    "2026-03-01 | SRE (Diego Morales): Observed long tail in finalizer queue on nodes hosting heavy long-context workloads. GPU memory pressure correlates with spikes. Dumped runtime metrics to Grafana panel: https://grafana.redwood.ai/d/kv-ops/kv-finalizer?orgId=1",
+    "2026-03-02 | Eng (Ethan Zhang): Ran targeted repro with instrumentation. Found that kv-append_in_background causes a synchronous fallback path when serialization exceeds 1.2s which blocks emission thread. Creating a short-term config patch to lower concurrency of KV serialization.",
+    "2026-03-04 | Customer (ScribeCo - Jane Miller): We tried the suggested client-side lower max_tokens to 150k and saw immediate improvement but our workflow requires the larger budget. Please advise permanent fix timeline.",
+    "2026-03-05 | Eng (Ethan Zhang): Deploying a mitigative config change that disables background KV-append for requests with >100k prefix length; rollout scheduled to affected dedicated pool at 2026-03-05T16:00Z. Monitoring will be active for 48h."
+  ],
+  "investigation_notes": [
+    "Hypothesis: Large KV append operations cause temporary serialization windows that contend with the streaming emitter thread, especially when combined with kernel swap activity on nodes under memory pressure.",
+    "Metrics: finalizer_queue_latency P99 rose from 120ms to 6.4s on the affected nodes during repro. gpu_mem_used increased by ~18% during KV serialize windows.",
+    "Repro commands: kubectl -n serve logs <pod> -c runtime --since=2h | grep finalizer; perf trace of serialization; capture nvml metrics during run.",
+    "Partial fix tested: forcing KV append to run in an isolated CPU class reduced blocking events in the emitter by ~80% in staging, but serialization still spikes on extremely large state sizes.",
+    "Related: similar behavior observed in SUP-53721 where background finalizer queueing caused 504s with large max_tokens."
+  ],
+  "resolution": "Mitigation deployed: rolled config v1.18.2-hotfix-1 to affected dedicated pods that disables background KV append for requests with prefix_length > 100k and lowers max concurrent KV-serializers from 4 to 1. Workaround for customers: reduce max_tokens to <160k or disable kv_append_in_background in tenant config.\n\nRoot cause (interim): KV serialization tasks occasionally triggered kernel-swap and CPU contention on nodes with high memory footprint for very large context sizes, which blocked the streaming emission path and caused client timeouts.\n\nPermanent next steps:\n- Engineering to implement an asynchronous non-blocking KV flush path (epic planned, INT-9012).\n- Add admission control to reject/queue requests with expected KV-serialize > threshold rather than allowing them to proceed unsafely.\n- Improve observability: new Grafana panels for kv-serialize-duration per tenant and emitter-block-duration.\n- Follow-up PRs: https://github.com/redwood/runtime/pull/9503 (non-blocking-flush prototype) and https://github.com/redwood/serve/pull/9530 (admission-control thresholds).\n\nTicket status: monitoring post-hotfix; customer updated with workaround. Leave open for verification window (48h) and until INT-9012 is scheduled.",
+  "follow_up_tasks": [
+    "INT-9012: Implement non-blocking KV flush path (Engineering Epic)",
+    "Create stricter admission controls for large-context requests and surface clear error for oversized requests",
+    "Add automated alert on finalizer_queue_latency P95 > 2500ms for dedicated pools"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution",
+    "follow_up_tasks"
+  ],
+  "dataset_doc_uuid": "dsid_d7880d011b6f45f1bd79aca1d37b6698"
+}

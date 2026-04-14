@@ -1,0 +1,69 @@
+{
+  "key": "ENG-4430",
+  "team": "engineering",
+  "title": "Fix token double-counting when server-side retry/fallback occurs (esp. streaming)",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2026-02-08",
+  "updated_at": "2026-02-26",
+  "creator": "Logan Wright",
+  "assignee": "Cole Summers",
+  "project": "Metering integrity + pricing guidance (Feb 2026)",
+  "cycle": "2026-W07",
+  "estimate": "5",
+  "due_date": "2026-02-21",
+  "labels": [
+    "billing",
+    "metering",
+    "retry",
+    "streaming",
+    "idempotency",
+    "customer-dispute",
+    "shadow-billing"
+  ],
+  "dependencies": [
+    "ENG-4410",
+    "ENG-4415",
+    "ENG-4421",
+    "ENG-27555"
+  ],
+  "customer_impact": "high",
+  "release": "metering-2026.02",
+  "security_review_required": "false",
+  "description": "Problem\n- We are double-counting tokens on some server-side retry/fallback paths, most visible for streaming responses. A single customer request can produce >1 usage_event rows (or >1 metered aggregation) when:\n  1) upstream model backend times out mid-stream and we retry on same model pool, or\n  2) smart router falls back to a compatible model variant/region, or\n  3) gateway retries after a partial write / transient billing hook error.\n- Result: billed_tokens (and sometimes request_count) exceed what customer sees in the Usage API export or what the model actually produced. This is already causing dispute tickets and undermines current pricing experiments.\n\nScope\n- Hosted API token metering for chat/completions endpoints (OpenAI-compatible + Redwood native).\n- Focus on server-side retry/fallback only. Client-side retries should be attributed to distinct request_ids unless they reuse idempotency key (separate ticket).\n\nSymptoms / signals\n- Duplicate usage events with same: account_id + external_request_id + route + minute bucket, but different internal attempt_id.\n- Drift: ledger > usage_events_agg by account/day/model for a small subset of accounts with high streaming usage.\n\nReferences\n- Support ticket: SUP-28463 \"Double charged for retries\" (linked by Support) \n- Slack: sources/slack/support/1770083321-customer-reporting-double-charged-retries.json\n- Slack: sources/slack/eng-platform/1770094420-usage-event-idempotency-design.json\n- Pricing/metering initiative context: meter fixes must be segmented pre/post for experiment readouts.\n\nRoot cause (current best understanding)\n- The billing hook currently emits a usage_event per attempt and relies on downstream dedupe that keys on (request_id, event_type, emitted_at). For streaming attempts, request_id is stable but emitted_at differs; attempt_id differs; dedupe does not collapse.\n- For partial streams, we also emit an interim 'stream_progress' usage record that is incorrectly included in billed token aggregation for some code paths (query bug + missing event_type filter) \u2014 this magnifies the issue.\n\nProposed fix\n- Introduce a single 'billing_idempotency_key' that is stable across server-side retries/fallback for the same external request. Compute as:\n  billing_idempotency_key = sha256(account_id + external_request_id + api_endpoint + finalized_response_hash_salt_v1)\n  where external_request_id is derived from:\n    - explicit Idempotency-Key header when present (preferred)\n    - else gateway request UUID (stable for server-side retries)\n- Only emit billable usage once per billing_idempotency_key for final response (event_type='usage_final').\n- Ensure streaming interim events are labeled non-billable (event_type='stream_progress') and excluded from billing aggregation/export.\n- When fallback causes model/region change, attribute model/region to the final successful attempt only (aligns with how output is produced + how cost is incurred). Keep attempt-level debug logs elsewhere (non-billing dataset).\n\nNon-goals\n- Do not change customer-facing semantics for what a 'token' is in this ticket.\n- Do not retroactively re-rate past invoices without Finance/Legal approval (see backfill decision below).\n\nRisks / watchouts\n- Need to preserve auditability: it must remain possible to show the retry attempts in internal logs without billing them.\n- Must not undercount when a request truly creates multiple distinct completions (e.g., customer intentionally replays without idempotency). This is why we key on external_request_id; if absent we key on gateway request UUID which should differ for separate client calls.\n\nOwner(s)\n- Eng: Cole Summers (billing hooks)\n- Reviewer: Nadia Rahman (metering spec/attribution)\n- Consulted: Mei Lin (recon tables), Aisha Bello (alerts/SLO), Emily Stone (RevRec policy impacts)",
+  "acceptance_criteria": "1) For a request that triggers server-side retry/fallback, billed_tokens are recorded exactly once per external request.\n2) request_count increments exactly once per external request.\n3) Streaming partial/interim events are never included in billable token aggregates (ledger, customer usage API export, experiment datasets).\n4) Shadow-billing compare shows <=0.05% delta in total billed tokens for accounts without retries, and a negative delta concentrated in known retry-heavy cohorts.\n5) Perf-canary scenario \"stream + forced retry\" passes and fails on regression.\n6) Reconciliation: daily drift (usage_events_final vs billing_ledger) falls below agreed threshold for duplicate-event rate (see PM-1842 KPI targets).",
+  "validation_plan": "Repro / test cases\n- Unit:\n  - Given 2 attempts with same external_request_id, only the last successful attempt emits usage_final with billed_tokens.\n  - Given stream_progress events, aggregator excludes them regardless of billed_tokens field presence.\n- Integration (staging):\n  - Force upstream timeout at token N during streaming; verify exactly one ledger line item for tokens, and internal attempt logs show 2 attempts.\n  - Force fallback routing to secondary region/model; verify billed model/region reflect final attempt.\n- Data validation:\n  - Run SQL sanity checks on staging and a small production shadow slice:\n    - duplicate rate by billing_idempotency_key\n    - billed_tokens_sum(final) vs billed_tokens_sum(all)\n    - ledger drift by account/day/model/region\n- Perf-canary:\n  - Add scenario with deterministic retry injection + stream disconnect; assert invariant: sum(billed_tokens) == tokens_in_final_output.\n\nSign-offs required\n- Finance/RevRec (Emily Stone): confirm no retroactive invoice changes; forward-only fix ok.\n- Product (Nikhil Sharma): confirm experiment analysis will segment pre/post deploy window.\n- SRE/On-call (Aisha Bello): confirm alert thresholds and runbook links exist.",
+  "rollout_plan": "1) Land code behind flag: billing_dedupe_v2 (default OFF).\n2) Enable shadow-billing compare in production for 7 days:\n   - Compute old vs new billed token totals per account/day/route; do not change invoicing.\n   - Alert if new > old by >0.1% for any account-day (should not happen).\n3) Enable billing_dedupe_v2 for internal accounts + 1-2 friendly customers.\n4) Gradual ramp: 10% -> 50% -> 100% of Hosted API traffic.\n5) Post-deploy monitoring:\n   - duplicate-event rate\n   - drift vs ledger\n   - support ticket volume tagged 'retry double charge'\n6) Comms:\n   - Update internal FAQ pointers for Support/Sales (handled in PM-1860/Docs PR).",
+  "backfill_decision": "Decision: No invoice-impacting backfill at this time. Forward fix only.\nRationale:\n- Finance/Legal constraint: avoid retroactive invoice changes without explicit approval and customer comms.\n- Materiality unknown until shadow-billing compare completes.\nAction items:\n- Produce a list of accounts impacted >$250 (or >1% of monthly spend) during Feb window based on shadow-billing deltas.\n- If any are material or already disputed, Finance will decide case-by-case whether to issue credits (preferred) vs reissue invoices.\n- Keep audit trail: store shadow outputs and queries used to compute deltas for at least 90 days (per metering audit requirements).",
+  "linked_artifacts": [
+    "GitHub: sources/github/redwood/pr-27463-fix-double-counting-on-stream-retry.json",
+    "Perf-canary: sources/github/perf-canary/pr-912-add-billing-meter-regression-scenarios.json",
+    "SRE alerts/runbooks: sources/github/redwood/pr-27574-add-meter-drift-sre-runbook-links.json",
+    "Support: sources/jira/customer-support/SUP-28463-double-charged-for-retries.json",
+    "Slack triage: sources/slack/support/1770083321-customer-reporting-double-charged-retries.json"
+  ],
+  "comments": [
+    "2026-02-08 10:14 Logan Wright (creator): Seeing multiple invoice disputes mention 'charged twice after a timeout'. Creating P0. Cole/Nadia please triage and propose dedupe key strategy. Link: SUP-28463 + Support Slack thread.",
+    "2026-02-08 13:02 Cole Summers: Confirmed in staging with forced retry: we emit usage_event on attempt-1 (partial stream) and attempt-2 (success). Aggregation query is including both because event_type filter is missing for one code path. Two fixes needed: (a) classify stream_progress as non-billable, (b) enforce idempotency for usage_final.",
+    "2026-02-09 09:37 Nadia Rahman: +1 on separating attempt telemetry vs billing telemetry. For spec consistency, the only billable record should be a finalized usage event. Attempt-level should go to internal 'request_attempts' table, not usage exports. Please ensure model/region attribution is final attempt only; Finance wants margin attribution to match cost.",
+    "2026-02-10 16:21 Mei Lin: Added a quick query to quantify impact: ~0.18% of streaming requests have >1 usage_final today, but within those impacted accounts the overcount can be 2\u20136% depending on fallback frequency. Suggest shadow-billing compare to measure before deciding on credits/backfill.",
+    "2026-02-12 11:03 Cole Summers: Implementation plan: add billing_idempotency_key and enforce uniqueness at write time (upsert) for usage_final. Will keep stream_progress events but mark billable=false. Draft PR up today.",
+    "2026-02-13 18:40 Cole Summers: PR up: pr-27463. Includes regression tests for stream retry + fallback. Also fixes missing event_type filter in aggregator. Requesting review from Nadia + Aisha.",
+    "2026-02-14 09:18 Aisha Bello: Reviewed. Please add a metric: billing.usage_final_upsert_conflicts (should be >0 for retries, but monitored). Also ensure we can alert if conflicts spike (could indicate accidental key collision).",
+    "2026-02-15 14:27 Nadia Rahman: Approved with nits: document the key derivation and guarantee it uses gateway request UUID when Idempotency-Key absent. Also please add note that client retries without idempotency header are counted as distinct (expected).",
+    "2026-02-17 12:05 Cole Summers: Merged. Deployed to staging. Shadow-billing compare enabled for 5% production slice (no invoice impact). Early read: deltas all negative, concentrated in retry-heavy cohort. No accounts showing new>old anomalies.",
+    "2026-02-20 17:10 Emily Stone: Finance ok with forward-only fix. For Feb disputes, prefer credits if needed; do not reissue invoices unless Legal signs off. Please keep evidence (shadow deltas per account) for audit trail.",
+    "2026-02-24 10:56 Connor O'Brien: Ramp plan executed: 10% -> 50% (2h) -> 100%. Monitoring looks good. Duplicate event rate dropped materially; no increase in billing write errors.",
+    "2026-02-26 15:33 Cole Summers: Closing as Done. Follow-up: ensure PM-1860/Docs/Support enablement reflects 'we do not bill partial streams / retries; only final successful response is billed'. Also suggest adding dashboard tile for usage_final_upsert_conflicts (ENG-4421)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "validation_plan",
+    "rollout_plan",
+    "backfill_decision",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_447a67dce0454d63bce9c544f7fa2cd3"
+}

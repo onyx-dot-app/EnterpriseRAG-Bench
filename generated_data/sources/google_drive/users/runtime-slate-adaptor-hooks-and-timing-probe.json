@@ -1,0 +1,35 @@
+{
+  "title": "Runtime slate adaptor hooks and timing probe - personal sketch",
+  "owner": "Ethan Brooks",
+  "drive_area": "users",
+  "path": "users/runtime-slate-adaptor-hooks-and-timing-probe.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-02",
+  "last_modified": "2026-03-05",
+  "collaborators": [
+    "Marta Kovacs",
+    "Priya Nair"
+  ],
+  "team": "eng-developer-experience",
+  "status": "draft",
+  "tags": [
+    "prefill",
+    "slate",
+    "hooks",
+    "telemetry",
+    "runtime",
+    "probe",
+    "cache"
+  ],
+  "linked_artifacts": [
+    "https://linear.app/RED/issue/DEV-2145",
+    "https://github.com/redwood-inference/runtime/pull/812",
+    "slack:#runtime-prefill"
+  ],
+  "content": "Summary:\\n\\nA freeform sketch for a small runtime \\\"slate adaptor\\\" layer and a lightweight timing probe used to evaluate prefill effectiveness and warmup latency across client-side and server-side caches.\\n\\nGoal:\\n- Provide an extensible hook surface that can sit between ingress (client SDK or edge proxy) and the serving runtime to:\\n  - attach/validate slate metadata (compact prefill bundles),\\n  - orchestrate prefill warming (KV cache priming, local prefix caching),\\n  - emit fine-grained timing and outcome telemetry without blocking the main request fast path.\\n\\nWhy this?\\n- We see high variance in cold-start token latency when prefill bundles are either missing or partial.\\n- Need to measure the cost/benefit of prefill strategies (client prefill vs runtime prefill) in the wild with minimal signal noise.\\n- Want to be able to A/B different prefill heuristics and tie them to cost metrics per-route.\\n\\nHigh-level design (text diagram):\\n\\n[Client/Edge] -> [Ingress Router] -> [Slate Adaptor Hooks & Probe] -> [Serving Runtime] -> [Model]\\n                         |                          ^\\n                         v                          |\\n                    (async warmers) -----------------\\n\\nKey components:\\n1) Slate Adaptor Hooks (sync):\\n   - validate_slate(slate_meta): quick rules (size, TTL, signature)\\n   - classify_prefill_intent(slate_meta): {required, suggested, hint-only}\\n   - rewrite_context_for_runtime(context, slate_meta): attach minimal control headers\\n\\n   Requirements:\\n   - Must be <500us median on hot path for 99th-percentile latency-sensitive routes.\\n   - No heavyweight crypto on hot path; signature verification can be deferred to async path for non-critical cases.\\n\\n2) Timing Probe (sync + async telemetry):\\n   - Emit event markers: ingress_receive, slate_validation_done, prefill_triggered, runtime_prefill_hit, runtime_prefill_miss, model_stream_start, model_stream_end.\\n   - Probe should support sampling (per-route and reservoir sampling) and must attach lightweight correlation ids to trace.\\n\\n3) Async Warmers (fire-and-forget):\\n   - If slate classified as \\\"suggested\\\" and runtime cache missing, enqueue a warmer to prime KV / prefix cache.\\n   - Warmers run in separate worker pool with backpressure and cost budget.\\n   - Warmers must report \\\"warmer_result\\\" events for later attribution.\\n\\nAPI shape sketches (example wire formats as plain text):\\n\\n- Slate metadata header (compact, base64-like payload):\\n  X-Redwood-Slate: v1:sz=1024;ttl=3600;hint=topic:refund;sig=ABCD1234\\n\\n- Lightweight slate manifest (payload for async warmers):\\n  {\\\"slate_id\\\":\\\"s_123\\\",\\\"items\\\":[{\\\"type\\\":\\\"prefix\\\",\\\"hash\\\":\\\"h1\\\",\\\"len\\\":128},{\\\"type\\\":\\\"kv\\\",\\\"key\\\":\\\"k_user_42\\\"}],\\\"scoring\\\":{\\\"priority\\\":5}}\\n  (this JSON is stored in async queue only; not sent inline on hot path)\\n\\n- Timing probe beacon (sync header for correlation):\\n  X-Redwood-Probe: id=trace-xxxxx;sample=1\\n\\nOperational knobs (config sketch):\\n- per_route: { sampling_rate, async_warmer_budget_tokens_per_min, max_prefill_items, prefer_client_prefill }\\n- global: { max_concurrent_warmers, cold_hit_threshold_ms, validation_timeout_ms }\\n\\nExample config snippet (informal):\\n- route:/chat/complete -> sampling_rate=0.02, async_warmer_budget_tokens_per_min=5000, prefer_client_prefill=true\\n- route:/assistant/summary -> sampling_rate=0.1, async_warmer_budget_tokens_per_min=20000, prefer_client_prefill=false\\n\\nTelemetry / metrics to record (important for experiments):\\n- prefill_attempts_total (by route, type:client/runtime/async)\\n- prefill_hits_runtime (by slab key/prefix)\\n- prefill_warmer_runs_success/failed\\n- warmup_latency_ms (distribution)\\n- added_tokens_served_due_to_prefill (estimate)\\n- per-request extra_latency_ms_due_to_validation (p50/p95/p99)\\n\\nOpen questions / tradeoffs (notes to self):\\n- signature verification: do we move all signature checks to async and accept a small risk on hot path? Where are customers that require strict attestation?\\n- eviction semantics: if warmers prime lots of items we might thrash runtime KV; need a tenant quota and ttl-slope policy.\\n- cost attribution: how to attribute warmer cost if warmed but never used? Propose a 24h attribution window and probabilistic amortization.\\n- client vs runtime prefill: sometimes client prefill is stale; we need heuristics to compare freshness and favour runtime if stale > X seconds.\\n- provenance: include a provenance header that indicates who initiated prefill (client/user/automated-warner) to aid forensics.\\n\\nMini experiment plan (quick A/B):\\n- A: no runtime warmers, client only prefill (sampling 1%).\\n- B: enable runtime warmers for suggested slates, sampler 1%, warmers budget 1000 tokens/min.\\n- Metric: model_stream_start latency p95 and 24h extra tokens billed. Secondary: prefill_warmer_runs_success rate.\\n\\nImplementation notes / TODOs:\\n- Build adaptor hooks as a small module inside ingress router (so it can be toggled per-tenant).\\n- Add lightweight probe integration to existing tracing library (open-telemetry).\\n- Wire an async queue (existing runtime-warmers) and extend worker to accept slate manifests.\\n- Add per-route config to Console (feature flag initial rollout).\\n\\nReferences (internal):\\n- Linear: DEV-2145 (measurement harness for prefill warmers)\\n- GH: runtime PR #812 (initial warmers worker)\\n- Slack thread: #runtime-prefill (thread: \\\"prefill budget vs latency\\\")\\n\\nQuick sketches / mental model (one-liners):\\n- \\\"Slate\\\": compact hint bundle about context segments worth preloading.\\n- \\\"Adaptor hooks\\\": safety belt that keeps validation cheap and delegates heavy lifting off the hot path.\\n- \\\"Warmers\\\": asynchronous priming agents that must be budgeted and sampled.\\n\\nNotes to self: keep the hot path tiny. This is a measurement-first feature; iterate quickly with sampling on a few low-risk routes before wide rollout.\\n\\nUnresolved: who owns per-tenant warmer budget in Console? product or infra? Ask @Marta in next sync.\\n\\n-- end of sketch --\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_bf36f3f30e8143d6917e1e6532d167e1"
+}

@@ -1,0 +1,45 @@
+{
+  "repo": "redwood",
+  "pr_number": "85873",
+  "title": "handshaken cudagraphs: segmented capture handshake and kernel probing to reduce warmup regressions",
+  "author": "Aisha Kumar",
+  "created_at": "2025-01-18",
+  "updated_at": "2025-02-04",
+  "merged_at": "2025-02-04",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/handshaken-cudagraphs",
+  "reviewers": [
+    "Miguel Ortiz",
+    "Lena Zhou",
+    "Priya Desai"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "cudagraphs",
+    "kv-cache",
+    "scheduling"
+  ],
+  "linked_linear": [
+    "ENG-1789",
+    "ENG-1820"
+  ],
+  "linked_jira": [
+    "SUP-4043"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "1280",
+  "deletions": "312",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "release_notes": "Implements a handshake-based segmented capture flow with conservative kernel probing to reduce warmup flaps for mixed-shape continuous batching. Improves KV cache alignment during capture and adds telemetry and feature gate for rollouts.",
+  "description": "Motivation: We continue to see intermittent warmup regressions when switching to CUDA graph replay under mixed-shape continuous batching workloads. Root causes in the field include: (1) captures that start too eagerly for upstream kernels that will subsequently migrate to a different kernel variant mid-capture, (2) KV-cache alignment mismatch between the capture input sequence and the replay path, and (3) races between capture completion and in-flight scheduling decisions. This PR implements a handshake-based segmented capture flow plus a lightweight kernel probing phase to make capture decision boundaries explicit and to align KV cache state before finalizing a graph capture.\n\nWhat this PR does (high level):\n- Introduces a \"capture handshake\" state that splits capture into discovery, probe, and finalize phases. Discovery collects a small sample of incoming shapes/seq lengths without committing a capture. Probe runs a conservative lightweight single-batch kernel invocation on a reserved ephemeral stream to validate kernel selection and KV cache behavior for the observed shape bucket. Finalize commits the cuDAGraph once probe metrics meet thresholds.\n- Segmented capture: long-running sequences are candidate-sliced into segment windows (configurable window_ms) so a single long sequence that changes kernel characteristics doesn't lock in an inappropriate capture.\n- Kernel probing: a best-effort, non-blocking poke that checks for kernel compatibility and key cache alignment (KV index offsets). Probe results are scored and used to gate finalize. Probe failures trigger a backoff and continue serving via fallback dynamic kernel path.\n- KV cache alignment: adds a pre-finalize reconciliation step that ensures replay will reuse the expected KV pointers; if reconciliation fails we fall back and mark the segment as \"no-capture\" for a TTL.\n- Observability: emits new metrics (cudagraph.handshake.probe_latency_ms, cudagraph.handshake.probe_score, cudagraph.segment.finalize_rate) and structured logs with probe outcomes.\n- Feature gate: handshake is behind runtime flag \"handshaken_cudagraphs\" allowing progressive enablement on Dedicated clusters.\n\nChecklist: \n- [x] Design doc linked (Linear ENG-1789)\n- [x] Unit tests for handshake state transitions and probe scoring\n- [x] Integration test covering segment boundary correctness with continuous batching harness\n- [x] E2E smoke on a 2xA100 Dedicated stack (manual)\n- [x] Telemetry and logging added\n- [x] Feature gate implemented\n\nCommits (summary):\n- feat(runtime): add handshake state machine and segmented capture coordinator\n- feat(runtime): implement kernel probe runner and scoring heuristics\n- fix(runtime): KV cache reconciliation and pointer-safety checks\n- test(runtime): add unit/integration tests for capture handshake\n- ci: expand e2e smoke job to include handshake enabling toggles\n\nFiles changed (high level):\n- runtime/cudagraph/handshake_coordinator.cc (+420/-58) \u2014 state machine and segment windowing\n- runtime/cudagraph/kernel_probe_runner.cc (+240/-12) \u2014 probe executor and scoring\n- runtime/cudagraph/kv_reconciler.cc (+180/-30) \u2014 KV alignment checks and fallbacks\n- runtime/cudagraph/feature_flags.h (+8/-0) \u2014 gate for rollout\n- runtime/cudagraph/metrics_registry.cc (+34/-6) \u2014 new metrics\n- tests/cudagraph/handshake_unit_test.cc (+210/-0) \u2014 state transition tests\n- tests/cudagraph/handshake_integration_test.cc (+160/-0) \u2014 segment boundary and probe scenarios\n- tools/telemetry/metrics_mappings.yaml (+22/-0) \u2014 map new metrics\n- docs/ops/feature_gates.md (+10/-2) \u2014 rollout instructions\n- ci/presubmit/e2e_handshake_smoke.yml (+22/-0) \u2014 presubmit job adjustments\n- examples/bench/continuous_batch_handshake.py (+174/-14) \u2014 local repro harness and flags\n\nBehavioral details and rationale: \n- Conservative defaults: handshake is opt-in; probe sample size defaults to 4 requests; probe timeout is intentionally short (default 12ms) to keep tail latency bound. Segment window defaults to 100ms which we empirically found reduces capture thrash on common user traces.\n- Backoff policy: failed probes cause exponential backoff per segment bucket (2, 4, 8s) to avoid repeated capture churn for unstable workloads.\n- Fallback: on any persistent probe failure or KV mismatch, the system keeps serving using the dynamic kernel path (no capture) and marks the segment as ineligible for capture for a TTL. This preserves latency SLOs at the expense of lost cuDAGraph throughput gains for that bucket.\n\nReview conversation (trimmed):\n- Miguel Ortiz (reviewer): \"Nice incremental approach. Please make sure probe runner can't starve the main compute stream \u2014 would prefer an ephemeral stream with hard CPU/GPU budget.\"\n- Author (Aisha): \"Agreed. Probe runs on a reserved ephemeral stream; I've added a watchdog and a hard cap on concurrent probes per GPU. See kernel_probe_runner.cc lines ~120-170.\"\n- Lena Zhou: \"Can we add a small unit test that simulates a kernel migration mid-segment and ensure handshake rejects finalize?\"\n- Author: \"Added handshake_integration_test.cc that replays a synthetic migration trace; finalize is rejected and fallback is observed.\"\n- Priya Desai: \"Telemetry looks good \u2014 can you include a metric to measure 'probe-induced-fallbacks' so we can track rollouts?\"\n- Author: \"Added cudagraph.handshake.probe_fallback_count and exposed it in metrics_mappings.yaml.\"\n- Miguel: \"Approve after minor naming nit (probe_score -> probe_confidence).\"\n- Author: \"Renamed metric and updated mapping; thanks.\"\n\nCI summary: \n- Unit tests: pass\n- Integration tests (presubmit harness): pass on linux-gcc-11\n- E2E smoke: manual 2xA100 run shows 6-9% median p99 token latency improvement for stable segments and elimination of recurring warmup spikes on our repro traces.\n\nPerformance notes: \n- On mixed-shape continuous batching benchmark (bench/continuous_batch_handshake.py) we observed:\n  - baseline (no cuDAGraph capture): baseline throughput T0\n  - prior autotriggers: average p99 token latency regressed on 8% of traces due to capture churn\n  - with handshaken cudagraphs: throughput increased by +14% for capture-eligible segments and warmup regression incidence dropped to <1% of traces in our suite.\n  - overhead: probe traffic adds ~0.6% CPU and ~1-2ms median additional scheduling work for candidate requests (configurable knobs present).\n\nRollout plan: \n- Stage 1: enable feature gate on internal Dedicated clusters for 2 weeks, collect probe_confidence and probe_fallback_count metrics.\n- Stage 2: Canary in selected customer clusters owned by L4 accounts with tight SLAs (opt-in).\n- Stage 3: Gradual ramp if probe_fallback_count remains low and finalize_rate increases.\n\nBackward compatibility and risk: \n- Default is no-op if feature gate disabled.\n- Risk areas: inaccurate probe scoring could prevent beneficial captures; we mitigated with conservative thresholds and a visible rollout path.\n\nFollow-ups (future work): \n- Adaptive probe sizing based on seq-latency distribution (ENG-1820).\n- Merge with existing replay-throttler heuristics to reduce duplicated gating logic.\n- Explore hardware-specific optimization for multi-instance GPUs when ephemeral probe streams contend.\n\nMerge outcome: Squash-merged into main. Post-merge: created a rollout checklist in Linear ENG-1789 and assigned to runtime-oncall for initial 48h monitoring.\n\nIf you'd like, I can extract a minimal RFC doc from the description for ops runbook consumption.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_771ac3b070e34e1092f0b077cf03cad8"
+}

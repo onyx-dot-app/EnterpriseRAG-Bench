@@ -1,0 +1,34 @@
+{
+  "title": "Handoff entropy debugging scratchpad",
+  "owner": "Priya Desai",
+  "drive_area": "users",
+  "path": "users/handoff-entropy-debug-scratchpad.json",
+  "doc_type": "doc",
+  "created_at": "2026-02-18",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Ethan Moore",
+    "Sofia Alvarez"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "routing",
+    "fallback",
+    "regional-failover",
+    "kv-cache",
+    "investigation",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "CON-2038",
+    "GH#4127",
+    "https://confluence.redwood.ai/display/ENG/route-election-design"
+  ],
+  "content": "Context:\n- Intermittent client-facing latency spikes and a handful of 504s last week during AZ flaps. Not strong enough to be a full outage, but saw unusual handoff churn between regional pools (us-east-1a -> us-east-1b -> us-east-1a) within single user sessions.\n- Hypothesis: handoff selector entropy + short TTL on route-cached keys => repeated cold KV-cache warmups causing tokens to spike and some requests to miss SLO.\n\nWhat I observed (raw breadcrumbs):\n- 2026-02-25 03:12 UTC: spike in p95 from 210ms -> 780ms (10m window), error rate 0.7% 504s. Traces show majority of slow requests had handoff=true in headers.\n- Traces: x-redwood-routing: {policy:prefer-region, picked_pool:us-east-1b, fallback_pool:us-east-1a, handoff_attempts:2}\n- Application logs (snippet):\n  [2026-02-25T03:12:17Z] req=abc123 route=chat-v2 handoff=1 selected=us-east-1b kv_cache_miss=true warmup_ms=320\n  [2026-02-25T03:12:17Z] req=abc123 attempt=2 selected=us-east-1a kv_cache_miss=true warmup_ms=290\n- KV cache size on us-east-1b small at moment of spike (evictions high). Noted concurrent kernel preemption on some hosts (dmesg logs show gpu watchdog soft-ops).\n\nCommands I ran / artifacts I checked (notes + outputs):\n- kubectl (on platform infra cluster)\n  kubectl logs -n redwood serving-runtime-guard-7f8 -c router | grep abc123  # saw the handoff headers above\n\n- curl to routing policy evaluation endpoint (local dev):\n  curl -s -X POST http://localhost:9000/eval -d '{\"region\":\"us-east-1\",\"policy\":\"prefer-region\",\"session_id\":\"abc123\"}' | jq .   # returned pick: us-east-1b, score:0.82, rand:0.47\n\n- redis-cli info (chain of route-caches)\n  # us-east-1b: connected_clients:42, used_memory_human: 1.1G, evicted_keys: 12984, keyspace_hits: 11254, misses: 2041\n\n- curl to model pool health endpoints:\n  curl -s https://pool-us-east-1b.internal/health | head -n1 -> {\"status\":\"ok\",\"workers\":12,\"pending\":18}\n  curl -s https://pool-us-east-1a.internal/health | head -n1 -> {\"status\":\"ok\",\"workers\":16,\"pending\":3}\n\n- Observed bump in worker pending queues on pool us-east-1b right when handoffs started.\n\nError snippets copied from router logs: (redacted)\n- ERROR route-handoff: failed to allocate transient-kvspace: insufficient-memory (code=OOM_KV)\n- WARN policy-eval: tie-breaker entropy increased beyond threshold -> randomized selection used\n- INFO handoff: attempt=1 dest=us-east-1b reason=policy-weight-threshold-exceeded retry_delay=120ms\n\nHypotheses (ranked):\n1) Entropy-induced oscillation: tie-breakers when pools have similar policy scores cause stochastic picks; with small routing-ttl, subsequent requests in same session can be routed to different pools which each incur KV cold-starts => latency spike.\n2) Backpressure mismatch: some pools (1b) are experiencing queueing; policy detects this and sometimes prefers local but fallbacks are noisy -> retries/handoffs exacerbate load.\n3) KV cache eviction pressure on smaller pools causing repeated warmups after handoff; eviction threshold tuned too aggressively.\n4) Sticky session affinity not honored for multi-attempt flows (edge handshake loses session tag), so handoff attempts don't carry cache hints.\n\nExperiments to try (quick ideas):\n- Short term rollback: increase routing-ttl for session keys from 30s -> 300s for chat flows to test reduction in pool oscillation.\n  Commands:\n    # update local policy (dev only)\n    PUT /api/policies/chat-v2 {\"routing_ttl_s\":300}\n\n- A/B test: disable randomized tie-breaker for prefer-region policy (force deterministic pick by weight) for one hour to observe p95.\n- Increase KV cache size on pools flagged with high evictions (us-east-1b) and monitor eviction_rate.\n- Add a session-affinity header propagation test to ensure handoff carries cache-hint: set X-Session-KV: true and verify in pool logs.\n\nNotes on instrumentation gaps:\n- Router traces include 'rand' but not seed; need persistent seed in traces to correlate selections across attempts.\n- No current metric that measures \"session-level pool-switches per 5m\" \u2014 would be valuable.\n- KV warmup time currently only logged as 'warmup_ms' in debug; should be aggregated to show p95 warmup per pool.\n\nShort term mitigation plan (if we see immediate reoccurrence):\n- Increase routing_ttl for high-traffic chat routes to 2m, pin on-host KV cache increase + alert on eviction_rate > 1000/min.\n- Temporarily bias prefer-region policy weight +10% for pools with low pending queue.\n\nThings to watch (dashboard queries):\n- rate( router.handoff.count[5m] ) broken down by dest_pool\n- p95( request.latency ) filter handoff=true and by selected_pool\n- redis.evictions per pool\n- worker.pending queue length per pool\n\nOpen questions / TODOs:\n- Is there any cross-region KV replication for route keys? (I think no \u2014 only local per-pool caches.)\n- If we bias policy to favor pools with lower pending, do we risk overloading the 'healthy' pool? Need canary config.\n- Ask SRE to check for kernel preemption reports on the hosts in us-east-1b during the window.\n\nImmediate next steps (my plan):\n- 2026-03-10: create a short-lived policy change in staging to increase session TTL for chat-v2 and run for 6 hours. (PR: GH#4127)\n- Add a Grafana panel showing session-level pool-switches (metric design doc: CON-2038)\n- Sync with Ethan and Sofia: share these scratch notes + meet Wed 10:00 to run controlled replay.\n\nRandom scribbles / helpful commands to reproduce locally:\n- produce a high-entropy policy decision trace:\n  python tests/route_sim.py --policy prefer-region --seed 42 --clients 200 --pools us-east-1a,us-east-1b\n\n- force handoff from router container:\n  echo '{\"req_id\":\"scratch\",\"route\":\"chat-v2\",\"session\":\"sess-42\"}' | nc -q 1 router.internal 12345\n\nEnd of scratchpad.\n\n-- Priya D.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_ac34a8d2174f4068ba3290ea4fe12145"
+}

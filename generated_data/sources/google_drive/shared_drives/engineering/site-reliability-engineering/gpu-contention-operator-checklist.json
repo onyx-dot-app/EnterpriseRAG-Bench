@@ -1,0 +1,36 @@
+{
+  "title": "GPU contention: operator checklist & post-incident notes",
+  "owner": "Priya Natarajan",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/site-reliability-engineering/",
+  "doc_type": "doc",
+  "created_at": "2024-11-13",
+  "last_modified": "2024-12-02",
+  "collaborators": [
+    "Ava Chen",
+    "Diego Martinez",
+    "Liam O'Connor",
+    "Maya Patel"
+  ],
+  "team": "eng-site-reliability",
+  "status": "in_review",
+  "tags": [
+    "gpu",
+    "capacity",
+    "containment",
+    "runbook-draft",
+    "postmortem"
+  ],
+  "linked_artifacts": [
+    "JIRA-ENG-1987",
+    "PR#892-eviction-fix",
+    "confluence:gpu-pools-ops-notes",
+    "slack:#sre-oncall"
+  ],
+  "content": "TL;DR: During a mid-day maintenance window we observed a progressive perf regression in a single GPU pool (pool-eu-west-3). Root cause appears to be a set of heavy batch training pods accidentally labeled to the low-latency pool; these pods used large batch sizes and pinned large amounts of GPU memory resulting in elevated kernel run queues and reduced inference throughput. Immediate mitigations (cordon + migrate) restored 80-90% of normal p95 latency within 12 minutes. This doc is an operator checklist + investigation notes + a draft runbook for future containment.\n\nSymptoms and detection:\n- Customer-facing alerts: p95/token-latency inference route /gpt-serve exceeded 600ms at 12:07 UTC.\n- SRE oncall (Ava) saw repetitive 503s from host-level OOM kill logs.\n- Prometheus signals: GPU_utilization_avg (per-node) jumped from ~30% to 92% on 6 nodes in pool-eu-west-3 between 11:55-12:05.\n- Node-level memory pressure and increased swap activity on those nodes (dmesg: \"Out of memory: Kill process\").\n\nQuick timeline (high level):\n- 11:40 - rolling node maintenance begins (kpatch updates), autoscaler bumped nodes as expected.\n- 11:48 - a staging job (train/large-batch) with affinity label pool:low-latency was mistakenly scheduled to pool-eu-west-3.\n- 11:55 - GPU mem usage climbs on 6 nodes; queueing shows long kernel launch latencies.\n- 12:07 - customer alert firing; SRE pages.\n- 12:12 - cordon affected nodes and drain non-critical pods.\n- 12:20 - migrate batch jobs to backup pool; p95 recovers gradually.\n- 12:40 - restore scheduling constraints and rollback affinity tag change in CI.\n\nInitial Mitigation checklist (fast actions for oncall):\n1) Identify impacted pool: `kubectl get nodes -l pool=eu-west-3 -o wide` and compare GPU metrics in grafana.\n2) Throttle/remove heavy pods: `kubectl top pods -n training --sort-by=cpu` then `kubectl scale deployment/<batch-dep> --replicas=0` for immediate relief.\n3) Cordon + drain nodes (avoid evicting critical inference pods):\n   - `kubectl cordon <node>`\n   - `kubectl drain <node> --ignore-daemonsets --delete-local-data --max-pods=10`\n4) Re-route traffic if necessary: flip routing policy to fallback-pool via console (route /gpt-serve -> pool-eu-west-2).\n5) Patch autoscaler template (if mis-scaling): update `cluster-autoscaler` configmap and reload.\n\nInvestigative queries (PromQL snippets):\n- Identify nodes with rising GPU memory: `sum by (instance) (nv_gpu_memory_used_bytes) / sum by (instance) (nv_gpu_memory_total_bytes)`\n- Check kernel queue delays: `histogram_quantile(0.99, rate(gpu_kernel_launch_latency_seconds_bucket[5m]))`\n- Pods with large allocation requests: `kube_pod_container_resource_requests{resource=\\\"nvidia.com/gpu\\\"}` + inspect mem/cpu requests.\n\nHypothesis (why it happened):\n- CI job template changed (accidentally) to include label `pool=low-latency` after a naming clean-up; this allowed heavy training workloads to be scheduled to the low-latency inference pool.\n- During rolling maintenance more capacity was temporarily allocated which increased bin-packing pressure and allowed these jobs to land together on a small set of nodes, amplifying contention.\n\nPermanent fixes recommended (prioritized):\n- Short-term (P0/P1):\n  - Add admission webhook to reject any job with `batch-type: training` that targets low-latency pools. Owner: Diego. ETA: 2024-12-09.\n  - Add explicit taint on low-latency pool nodes (e.g., `dedicated=inference:NoSchedule`) and require tolerations from trusted inference deployments. Owner: Liam. ETA: 2024-12-02.\n- Mid-term (P2):\n  - Autoscaler safety caps: prevent sudden bin packing by limiting simultaneous node additions to 2 per 10m for low-latency pools. Owner: SRE infra. ETA: 2025-01-10.\n  - Inventory and remove ambiguous labels in CI templates; add unit tests to prevent label regressions. Owner: Platform Eng. ETA: 2024-12-20.\n- Long-term (P3):\n  - Scheduling simulator: run pre-deploy simulations for maintenance windows to detect unsafe placements. Owner: Applied ML. ETA: 2025-Q2.\n\nDraft runbook section: \"Isolate noisy GPU workload\" (for oncall)\n1) Detect: confirm p95 token latency > baseline and check `nv_gpu_memory_used_bytes` across pool nodes.\n2) Contain: `kubectl cordon` the most affected nodes (choose those with >85% GPU mem).\n3) Evacuate non-critical batch pods: identify by label `batch=true` and scale down.\n4) If pods refuse to terminate (OOM loop), force delete and recreate in backup pool.\n5) If traffic still impacted, update service routing to fallback pool and post incident notice in customer channels.\n\nNotes to self / open questions (rough):\n- Can we safely add tolerations to a small number of model-serving daemons without changing their deployment YAMLs? risk analysis needed.\n- How many customers hit the degraded pool vs. were routed to fallback? need per-route token counts.\n- Is there any correlation with specific kernel driver version after the kpatch? did the maintenance coincide with a subtle driver regression?\n\nOpen action items:\n- [PR#892] Eviction behavior improvement (Ava) - follow up with code review. due 2024-11-20.\n- Add admission webhook (Diego) - draft ready, needs testing. due 2024-12-09.\n- Taint low-latency pool nodes (Liam) - cluster change scheduled. due 2024-12-02.\n- Run scheduling simulation for next maintenance (Maya) - add to runbook. due 2025-01-15.\n\nAppendix: useful links and commands\n- Grafana dashboard: grafana.redwood/s/dedicated-gpu-pools\n- Kibana logs: kibana.redwood/app/logs#/discover?_a=(query:(match:(message:(query:\\\"OOM\\\"))))\n- Quick command to find heavy pods on GPU nodes: `kubectl get pods --all-namespaces -o custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,CPU:.spec.containers[*].resources.requests.cpu,GPU:.spec.containers[*].resources.requests.nvidia.com/gpu --field-selector=status.phase=Running`\n\nIf this is useful, I'll consolidate the runbook into the canonical ops handbook and create a short playbook card for the oncall run deck. For now this is rough \u2014 please add notes inline or ping me in slack.\n\n-- Priya\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_302aa57cfabd402b9f29c81539c6405f"
+}

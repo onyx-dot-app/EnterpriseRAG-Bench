@@ -1,0 +1,64 @@
+{
+  "key": "ENG-51876",
+  "team": "engineering",
+  "title": "Investigate intermittent pinned host staging spike during continuous batching with delayed async frees",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-15",
+  "updated_at": "2026-03-02",
+  "creator": "Ava Martinez",
+  "assignee": "Kunal Shah",
+  "project": "runtime-memory-stability",
+  "cycle": "Cycle 54",
+  "estimate": "5",
+  "due_date": "2026-03-10",
+  "labels": [
+    "cuda",
+    "allocator",
+    "kv-cache",
+    "memory-leak",
+    "continuous-batching",
+    "investigation"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.24",
+  "security_review_required": "false",
+  "description": "Summary: Intermittent growth in pinned host staging allocations observed on self-hosted nodes serving continuous batching traffic. Appears as long-lived HOST_PINNED allocations that are not returned to the OS and correlate with periods of sustained batching and KV cache prefetch. This ticket ties to tracing, repro, and a short-term mitigation for customer clusters experiencing OOM near peak throughput.\n\nContext: We use pinned host staging buffers as part of our pinned-IO path to accelerate host<->device transfers when cudaMallocAsync falls back or when using staging buffers for non-contiguous tensors. During aggressive continuous batching (large numbers of small requests), we observe pinned allocation residency rising over minutes and not falling even after load subsides. GPU device memory stays stable but host pinned memory saturates and can cause swap or node pressure in dense clusters.\n\nScope: This is not the classic GPU slab fragmentation (many ENG tickets exist for that). Here the symptom is pinned host allocations (mallocHost / cudaHostAlloc) not being freed due to delayed stream-ordered release and an interaction with our \"FreeWave\" delayed-free queue that batches frees on stream completion. The investigation should produce: repro harness, flame/alloc traces, root cause hypothesis, short-term mitigation (config or guardrail), and a follow-up patch with tests and perf validation.",
+  "steps_to_reproduce": "1) Deploy runtime-1.24 with continuous-batching enabled and kv-prefetch configured (prefetch_size=4).\n2) Run mixed chat workload with average request length 180 tokens, burst concurrency 40, per-request prompt prefixes that hit KV cache prefetch.\n3) Measure host pinned RSS (nvidia-smi --query) and system /proc/meminfo before, during, and after 30 minutes of load.\n4) Capture CUDA mem logs with env CUDA_LAUNCH_BLOCKING=0 and our internal alloc instrumentation (ALLOC_TRACE=1).\n5) Observe pinned allocations growing during first 10-15 minutes and not decreasing within 10 minutes after load stops.",
+  "observations": "- Host pinned RSS increases steadily ~50-150MB/min for first 10 minutes under heavy continuous batching.\n- GPU device memory footprint stable; no device OOMs.\n- Traces show many cudaHostAlloc calls on the host staging pool followed by cudaFreeHost deferred via a FreeWave worker that batches frees until stream completion.\n- FreeWave worker shows backlog growth and timestamps indicate stream completion events occasionally delayed (stream callback latency spikes).\n- When we force synchronous cudaStreamSynchronize, pinned RSS returns to baseline promptly.\n- Affected nodes predominantly use NICs with high packet steering and high NVHost throughput; possible driver interactions with stream callbacks on host threads.\n- Reproduces reliably on a c6-gpu-like lab node but not on smaller dev machines (suggests sensitivity to concurrency and driver scheduling).",
+  "hypothesis": "1) FreeWave delayed-free batching defers host frees until associated stream callbacks execute; under sustained concurrency these callbacks are queued to a host worker thread which experiences backpressure due to CPU scheduling or driver callback ordering, allowing pinned host allocations to accumulate.\n2) Additionally, certain KV-prefetch code paths pin host buffers longer (re-using staging buffers across multiple micro-batches) and incrementally increase residency because eviction policy in the staging pool only runs on FreeWave drain.\n3) A secondary factor: some streams are using non-blocking event polling backed by a poller that can starve the callback worker when NVML/NVTX instrumentation is enabled, lengthening the callable path.",
+  "experiments": "- Experiment A: Disable FreeWave batching (immediate free on stream callback) -> rapid decrease in pinned RSS observed in lab. Performance impact: +0.8% latency p95.\n- Experiment B: Reduce FreeWave drain interval from 100ms to 10ms -> mitigates backlog and keeps pinned RSS stable; latency impact negligible.\n- Experiment C: Force a dedicated callback thread with higher priority in the runtime -> backlog disappears in reproducer; confirms scheduling sensitivity.\n- Experiment D: Add a safety TTL for staging buffers (max_residency_ms) to force reclamation if not drained -> prevents long-lived pins but increases host churn.\n- Perf artifacts stored in attachments (alloc flamegraphs, callback histograms).",
+  "proposed_fix": "Short-term: Add a runtime flag 'allocator.freewave.max_drain_ms' defaulting to 25ms for runtime-1.24 customers on Dedicated / Private to reduce pinned accumulation for heavy continuous-batching workloads.\nMedium-term: Rework FreeWave to 1) accelerate drain on backlog (adaptive backoff/drain on queue depth), 2) optionally perform eager host frees for staging buffers older than TTL, and 3) provision a dedicated callback processing thread pool pinned to close CPUs to avoid scheduling stalls.\nLong-term: Evaluate moving host staging buffers to a per-stream arena with stricter lifetime tracking and a hybrid approach that prefers memory re-use over indefinite pinning.\n\nRisks: Lowering drain interval increases CPU overhead and may slightly increase latency jitter under light loads. Eager free TTL could slightly increase allocations if buffers are frequently re-created. Need to benchmark on production-like workloads before flip.",
+  "acceptance_criteria": "- Reproducer no longer shows >50MB pinned RSS growth over 15 minutes under baseline test with new default flags.\n- Added unit/integration tests that simulate callback backlog and assert reclaim within TTL.\n- Performance regression <2% p95 latency across benchmark suite.\n- Code landed with feature flag and rollout plan; ops runbook updated with temporary mitigation steps.",
+  "next_steps": "1) Create a small runtime patch adding allocator.freewave.max_drain_ms flag and config read. (Kunal)\n2) Run canary on two Dedicated clusters and measure pinned RSS and p95 latency over 48 hours. (SRE pairing)\n3) If canary passes, ship flag in runtime-1.24.1 as opt-in; prepare rollout notes. (Release/PM)\n4) Schedule medium-term refactor in Cycle 55 with 3-point estimate. (Owner: Kunal + Elena)\n5) Postmortem doc if mitigation required for any customer clusters.",
+  "related_issues": [
+    "ENG-36142",
+    "ENG-20347",
+    "ENG-49821"
+  ],
+  "attachments": [
+    "https://redwood.internal/dashboards/pinned-rss-spike-2026-02-15",
+    "https://github.com/redwood-inference/runtime/pull/2898",
+    "s3://redwood-perf/alloc_traces/2026-02-15-freewave-flame.svg"
+  ],
+  "comments": [
+    "2026-02-16 - AM: Initial triage completed; confirmed host pinned growth on lab reproducer. Captured alloc traces and callback histograms. Assigned to Kunal.",
+    "2026-02-18 - KS: Reproduced locally with the harness. Experiment A (disable batching) shows immediate reclamation. Preparing quick flag patch for drain tuning.",
+    "2026-02-22 - KS: Patch for allocator.freewave.max_drain_ms created and PR opened (see attachments). Running canary in lab cluster. Noted a small increase in CPU ticks on callback thread under 25ms drain.",
+    "2026-02-26 - ES (SRE): Canary run on dedicated cluster for 12h shows pinned RSS stable and p95 latency within acceptable bounds. SRE requests extra 48h before prod rollout.",
+    "2026-03-02 - PM (Liam Chen): Agreed to ship opt-in flag in 1.24.1 and schedule refactor in next cycle. Updated release notes draft and customer advisory template."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observations",
+    "hypothesis",
+    "experiments",
+    "proposed_fix",
+    "acceptance_criteria",
+    "next_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_077ca03ac5e545e8b9c111bbd2aeaed0"
+}

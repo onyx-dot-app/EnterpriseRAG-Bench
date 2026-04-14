@@ -1,0 +1,52 @@
+{
+  "key": "ENG-4825",
+  "team": "engineering",
+  "title": "Export runtime saturation signals (queue depth, token/sec saturation, memory pressure proxy) with bounded cardinality",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-10-28",
+  "updated_at": "2025-11-21",
+  "creator": "Christine Wong",
+  "assignee": "Julian Moore",
+  "project": "Hosted circuit breakers + load shedding (Reliability Program)",
+  "cycle": "2025-W45",
+  "estimate": "8",
+  "due_date": "2025-11-27",
+  "customer_impact": "high",
+  "release": "runtime-1.18",
+  "labels": [
+    "reliability",
+    "runtime",
+    "overload-protection",
+    "observability",
+    "metrics",
+    "cardinality-guardrails",
+    "hosted-api"
+  ],
+  "dependencies": [
+    "ENG-4823",
+    "ENG-4826"
+  ],
+  "description": "## Context\nOverload protection (circuit breakers + load shedding) needs *runtime* signals that are both:\n1) predictive of saturation (so we can shed early and avoid tail-latency blowups), and\n2) safe to operate at scale (bounded cardinality, stable units, consistent semantics).\n\nThis ticket adds a minimal, high-signal set of saturation metrics exported from the serving runtime + scheduler. These metrics will be consumed by:\n- Gateway admission/policy engine (ENG-4823) via the existing routing/control-plane signal path\n- Dashboards + alerting (ENG-4826)\n- Game day scenarios + capacity tuning sheets (Drive tuning sheet)\n\nReferences:\n- Confluence: Runtime architecture notes \u2014 runtime-backpressure-and-saturation-signals\n- Drive: runtime-saturation-signals-notes\n- Observability plan: overload-metrics-and-alerts-plan\n\n## Goals\n- Export queue depth and queueing delay proxies for both prefill and decode paths.\n- Export token/sec saturation (actual vs target) as a stable, low-cardinality signal.\n- Export a practical memory pressure proxy (KV cache pressure + allocator fragmentation proxy) without per-model-instance blowups.\n- Enforce bounded metric cardinality by design (dim allowlist + runtime-side aggregation).\n- Ensure signals are actionable for load shedding decisions (monotonic with saturation, low noise, well-documented).\n\n## Non-goals\n- Full per-GPU/per-worker introspection in default metrics (too high cardinality). We can keep deep diagnostics behind debug endpoints or sampled logs.\n- Per-request tracing additions (handled elsewhere).\n\n## Proposed signals (MVP)\nAll metrics exported as Prometheus (or OTLP->Prom bridge) from runtime pods, then aggregated.\n\n### 1) Queue depth (prefill/decode)\n**Metric names (proposal; align w/ observability naming conventions):**\n- `redwood_runtime_scheduler_queue_depth{phase=\"prefill\"}` (gauge)\n- `redwood_runtime_scheduler_queue_depth{phase=\"decode\"}` (gauge)\n\n**Definition:** number of requests waiting to be scheduled for the phase.\n\n### 2) Queue time proxy (optional but preferred)\n- `redwood_runtime_scheduler_queue_wait_ms_p50{phase=...}` (gauge)\n- `redwood_runtime_scheduler_queue_wait_ms_p95{phase=...}` (gauge)\n\n**Definition:** moving window estimate over last N seconds for queue wait time. If histograms are too expensive/cardinal, export pre-aggregated p50/p95 gauges computed runtime-side.\n\n### 3) Token/sec saturation\n- `redwood_runtime_decode_tokens_per_sec` (gauge)\n- `redwood_runtime_decode_tokens_per_sec_target` (gauge)\n- `redwood_runtime_decode_utilization_ratio` (gauge; computed as actual/target; clamp [0, 2])\n\n**Notes:**\n- \u201ctarget\u201d should be configured per hardware profile/pool and updated with runtime config rollouts.\n- If \u201ctarget\u201d is unknown, export only `tokens_per_sec` and leave ratio disabled.\n\n### 4) Memory pressure proxy\nMVP should avoid raw allocator internals with high variance. Export a composite set:\n- `redwood_runtime_kv_cache_bytes_in_use` (gauge)\n- `redwood_runtime_kv_cache_bytes_capacity` (gauge)\n- `redwood_runtime_kv_cache_pressure_ratio` (gauge; in_use/capacity)\n- `redwood_runtime_memory_pressure_score` (gauge; 0..100)\n\nWhere `memory_pressure_score` is a weighted score from:\n- KV cache pressure ratio\n- OOM/alloc-failure counters (rolling)\n- optional fragmentation proxy (if available) such as \u201clargest_free_block / total_free\u201d (exported as ratio)\n\n### 5) Backpressure events / shedding hints\n- `redwood_runtime_backpressure_events_total{reason=...}` (counter)\n\nReason enum must be a *closed set* (e.g., `kv_pressure_high`, `decode_queue_high`, `prefill_queue_high`, `oom_recent`, `scheduler_overloaded`). No free-form strings.\n\n## Cardinality rules (hard requirements)\nWe must be able to run this across hosted fleets without blowing up Prometheus/OTLP costs.\n\n### Allowed dimensions (MVP)\n**Allowed labels only:**\n- `phase` (enum: prefill|decode)\n- `region` (small set; injected by env)\n- `pool` (GPU pool / capacity tier; injected by env)\n- `model_family` (OPTIONAL; only if we can keep it to a tiny allowlist like llama|qwen|mistral and not per-version)\n\n**Explicitly disallowed labels:**\n- model name/version (anything like `llama-3.1-70b-instruct-2025-xx`)\n- tenant/org/customer\n- pod name, node name, gpu_uuid\n- request_id, route, endpoint\n- arbitrary error strings\n\n### Aggregation strategy\n- Runtime exports per-pod gauges/counters with only allowed dimensions.\n- For any metric that would otherwise require high-cardinality (e.g., per-worker queue depth), aggregate inside the runtime process to a single value per phase.\n\n### Sampling / update rate\n- Gauges should update at ~1s (or 2s) cadence.\n- Any expensive stats (p95 queue wait) computed over rolling window (10s) and updated every 5s.\n\n## Acceptance criteria\n- [ ] Runtime exposes the above metrics on `/metrics` for hosted runtime pods.\n- [ ] Metrics include only allowed labels; unit tests enforce label allowlist.\n- [ ] A \u201ccardinality budget\u201d check exists in CI (simple regex/allowlist-based) to prevent introducing new labels without review.\n- [ ] Metrics documented in a short internal README / Confluence snippet: definitions, units, expected ranges, and caveats.\n- [ ] Dashboards can graph queue depth + utilization ratio + kv pressure and correlate with 429/503 overload responses (ENG-4826).\n- [ ] Verified in staging load test that metrics track saturation (increase monotonically under burst scenarios) and do not spam time series.\n\n## Implementation notes\n- Prefer implementing metric registration in the scheduler module (single owner of queue state).\n- Ensure counters don\u2019t reset unexpectedly across hot reloads (process restart is fine; alerting should use rate()).\n- For `memory_pressure_score`, keep the computation deterministic and documented; it\u2019s a policy input and will be tuned later.\n\n## Risks / open questions\n- Histogram cardinality: if we use Prom histograms for queue wait times, bucket count * labels * pods may be expensive. Default to runtime-computed p50/p95 gauges.\n- \u201cTarget tokens/sec\u201d ownership: needs a config source of truth (likely pool-level config). If not ready, ship `tokens_per_sec` only in MVP and add ratio in follow-up.\n- Model_family label: only include if we can guarantee it doesn\u2019t explode as models are onboarded.\n\n## Follow-ups\n- Add a debug endpoint with per-worker details gated behind auth for deep incident triage (separate ticket).\n- Tie `memory_pressure_score` into policy engine thresholds once we have tuning data.\n\nLinks:\n- Linear epic: ENG-4821 Hosted circuit breakers\n- Docs/notes: `sources/confluence/eng-serving-runtime/runtime-architecture/runtime-backpressure-and-saturation-signals.json`\n- Notes: `sources/google_drive/shared_drives/engineering/serving-runtime/runtime-saturation-signals-notes.json`\n- Observability plan: `sources/google_drive/shared_drives/engineering/observability/overload-metrics-and-alerts-plan.json`",
+  "sub_issues": [
+    "ENG-4912",
+    "ENG-4913"
+  ],
+  "security_review_required": "false",
+  "comments": [
+    "2025-10-28 (Christine Wong): Creating this as the runtime-side prerequisite for gateway admission + SRE dashboards. Strong preference from SRE to keep cardinality extremely bounded; we should assume hosted fleet scale (thousands of pods) and avoid per-model/per-tenant labels.",
+    "2025-10-30 (Sofia Ivanova): Queue depth alone is OK but we also need a queueing *delay* proxy to avoid false positives when queue depth is high but draining quickly. Suggest computing rolling p50/p95 queue wait time in scheduler (no histograms exported).",
+    "2025-11-01 (Logan Wright): Please do NOT add pod/node/gpu labels. If we need drill-down, do it via exemplars or separate debug endpoint. Also request: add unit tests enforcing label allowlist to prevent regressions.",
+    "2025-11-04 (Julian Moore): Drafted metric names + minimal label set. Plan: export per-process aggregated scheduler stats, updated every 1s; queue wait p95 computed over 10s rolling window updated every 5s.",
+    "2025-11-07 (Omar El-Sayed): For memory pressure, KV cache pressure ratio is the cleanest and correlates well with decode slowdowns. Fragmentation proxy is noisy; ok to include only as part of `memory_pressure_score` but please keep raw fragmentation metric behind a flag.",
+    "2025-11-12 (Aisha Bello): For dashboards/alerts we need stable semantics: document units and expected ranges. Please ensure queue_depth is an integer gauge (not cumulative) and that tokens/sec is decode-only to start; we can add prefill tokens/sec later.",
+    "2025-11-18 (Julian Moore): Implementation in progress on runtime branch `runtime/metrics-saturation-mvp`. Added label allowlist helper + CI test. Remaining: wire kv cache capacity/in_use; currently only queue metrics are live in staging.",
+    "2025-11-21 (Julian Moore): Staging load test shows queue_depth + queue_wait_ms_p95 track burst ramp; no cardinality growth observed (time series count stable). Need to confirm memory metrics and then hand off to ENG-4826 for dashboard wiring."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_5d5d4c882a794bbdb9aaf13a3bff6e37"
+}

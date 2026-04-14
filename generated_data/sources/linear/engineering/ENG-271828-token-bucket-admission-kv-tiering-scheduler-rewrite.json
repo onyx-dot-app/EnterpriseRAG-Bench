@@ -1,0 +1,63 @@
+{
+  "key": "ENG-271828",
+  "team": "engineering",
+  "title": "Token-bucket admission + KV tiering + work-stealing scheduler cleanup",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-02-15",
+  "updated_at": "2025-03-04",
+  "creator": "Alex Kim",
+  "assignee": "Maya Patel",
+  "project": "Serving Runtime Modernization",
+  "cycle": "2025-W07",
+  "estimate": "8",
+  "labels": [
+    "tech-debt",
+    "performance",
+    "kv-cache",
+    "scheduler",
+    "refactor"
+  ],
+  "description": "This ticket consolidates three related tech-debt efforts into a single coordinated refactor: (1) replace the current continuous-batcher admission policy with a token-bucket based admission controller to reduce head-of-line blocking; (2) introduce a hot/warm/cold tiering layer in the KV cache so that large KV footprints do not degrade tail latency; (3) replace the custom round-robin scheduler codepath with a work-stealing executor to improve CPU utilization and reduce long-tail stalls. Goal: simplify reasoning about admission/backpressure, reduce 95th/99th percentile latency variance, and make the cache lifecycle explicit for operational tuning.",
+  "background": "Our serving runtime has accumulated overlapping ad-hoc backpressure and cache heuristics over several projects. Continuous batching logic intermixes admission, coalescing, and prefetch hooks in the same module; the KV cache is a flat LRU-like store that stores everything on a single tier; the scheduler uses coarse lane-based allocation and periodically stalls under imbalanced workloads. Recent incidents showed spikes in tail latency when large KV working sets were loaded and when a single model with long sequences monopolized worker lanes. Several prior tickets addressed slices of the problem (slot prewarm, lease coordinator), but we need a cohesive design to avoid repeated patches.",
+  "proposal": "- Implement token-bucket admission at ingress: each model-route and client-tier has a token bucket configured by throughput SLO. Tokens are refilled on a time window to smooth bursts. Requests that cannot acquire tokens within a short timeout are rejected or routed to a lower-cost fallback model.\n- Introduce explicit KV cache tiers: hot (in-memory, pinned), warm (in-memory, probabilistic sampling), cold (on-disk mmap with async promotors). Add async populators and background demotion to avoid blocking the critical path.\n- Replace lane-based round-robin scheduler with a work-stealing executor: per-worker deques with steal-on-empty semantics. This reduces global contention and provides better latency isolation for long-running tasks.\n- Provide a compatibility shim so existing instrumentation and lease/heartbeat logic keeps working during rollout.",
+  "technical_design": "Key components:\n1) Admission controller (token-bucket):\n   - Config: tokens_per_sec, burst_capacity, acquire_timeout_ms, fallback_policy.\n   - Fast-path: try_acquire() is a single atomic op; if success, request proceeds to batching.\n   - Slow-path: if token unavailable, consult fallback policy (queue short wait, drop, or route-to-fallback-model).\n2) KV tiering:\n   - Hot: ~small set of pinned entries with fast eviction hooks; used for popular prefixes and cache hotkeys.\n   - Warm: compacted in-memory region with probabilistic admission; LRU windowing; async promotors sample incoming access and elevate to hot.\n   - Cold: memory-mapped backing store for full entries; async read-ahead for predicted next-token accesses.\n   - API: tiered_get(key) returns a status (HIT_HOT/HIT_WARM/HIT_COLD/MISS) + latency hints for SLO attribution.\n3) Work-stealing scheduler:\n   - Per-worker deque, push/pop local; pop-bottom, steal-top.\n   - Long-running CPU-bound tasks tagged so workers avoid stealing unless idle threshold reached.\n   - Integrate with existing slot/lease system via a thin adapter that converts slot leases into task tokens.\n4) Observability:\n   - New metrics: token_acquire_latency_ms, admission_rejections, kv_tier_hit_rate_{hot,warm,cold}, steal_ops, worker_idle_time.\n   - Trace spans: admission.acquire, kv.tier_lookup, scheduler.steal_attempt.\n5) Config and rollout: feature-flagged per-cluster and per-model.\n",
+  "migration_plan": "Phased rollout to minimize risk:\n- Phase 0 (lab): implement modules behind flags; unit tests and integration tests.\n- Phase 1 (canary): enable token-bucket admission only for non-critical routes with detailed metrics. Monitor rejection rates and latency.\n- Phase 2 (cache tiering): enable warm-tier reads for a controlled subset of models, keep promotors conservative.\n- Phase 3 (scheduler): enable work-stealing on a small set of worker pools; run with a compatibility shim for lease/slot accounting.\n- Phase 4: full switch, deprecate legacy code. Rollback plan: flags to revert each component; circuit-breakers for admission fallback.\n",
+  "benchmarks": "Baseline synthetic (mixed short/long sequences):\n - p50 token gen latency: 45ms\n - p95: 320ms\n - p99: 1.2s\nAfter lab changes (token-bucket + warm-tier reads) on a small cluster:\n - p50: 44ms\n - p95: 220ms (improvement ~31%)\n - p99: 760ms (improvement ~37%)\nWork-stealing reduced CPU tail stalling by ~20% in stress tests. Full cluster numbers TBD during canary. Bench harness and raw results stored at: https://confluence.redwoodinfra/internal/serving/ENG-271828/benchmarks",
+  "decisions": "- Use token-bucket (leaky-bucket alternative considered but token-bucket chosen for better burst control).\n- Implement KV tiers in-process with mmap cold tier; ruled out external cache service to avoid network variability.\n- Work-stealing chosen over coroutine-based green scheduling to keep compatibility with existing native code paths.\n- Metrics and traces added up-front to allow SLO alerting during canary.",
+  "open_questions": "- Optimal hot-tier size heuristics: should we auto-scale per-model or centralize?\n- How aggressive should the warm->hot promotion policy be to avoid thrashing?\n- Integration with Dedicated: are cluster-level token budgets appropriate for reserved capacity customers?\n- SSO/security review for mmap cold tier storing partial secrets (pending sec review).",
+  "dependencies": [
+    "ENG-33109",
+    "ENG-30712"
+  ],
+  "related_links": [
+    "https://github.com/redwood-inference/serving/pull/4821",
+    "https://confluence.redwoodinfra/internal/serving/tech-debt/token-bucket-design",
+    "https://github.com/redwood-inference/benchmarks/compare/ENG-271828"
+  ],
+  "acceptance_criteria": "- Token-bucket admission implemented and feature-flagged.\n- KV tiering implemented with metrics emitting tier hit rates.\n- Work-stealing scheduler adapter passes integration tests and shows no regression in p50/p95 for baseline routes.\n- Canary passes for at least 72 hours with stable error budget and no >10% increase in client-facing errors.\n- Documentation updated (Runbook + Confluence) and runbook drills rehearsed.\n",
+  "risks": "- Misconfigured token buckets may increase client errors; mitigate via conservative defaults and short acquire timeouts.\n- KV tiering introduces complexity and potential correctness bugs (staleness) \u2014 add strict invariants and tests.\n- Scheduler change could reveal hidden assumptions; maintain compatibility shim and slow rollout.\n",
+  "comments": [
+    "2025-02-16 - Alex Kim: Spiked a prototype of the token-bucket; single-atom path is microsecond-level. Observability hooks added.",
+    "2025-02-20 - Maya Patel: Design review done with infra and product. Agreed to conservative default configs and a canary gating metric set.",
+    "2025-02-25 - Eng Review: PR #4821 opened for admission controller core. Needs tests for fallback routing behavior.",
+    "2025-03-01 - Performance: Lab runs show p95 drop; found a race in warm-tier promotors under synthetic hammer - fixed in PR #4857.",
+    "2025-03-04 - PM (Jordan Lee): Confirming canary windows and alert thresholds. Scheduling canary next week after security signoff.",
+    "Next steps: finalize mmap permissions with security, run dedicated-cluster canary, and add alert rules for admission_rejections metric."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "background",
+    "proposal",
+    "technical_design",
+    "migration_plan",
+    "benchmarks",
+    "decisions",
+    "open_questions",
+    "acceptance_criteria",
+    "risks",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_1d2c4734aed84c93bf60a358b26a9728"
+}

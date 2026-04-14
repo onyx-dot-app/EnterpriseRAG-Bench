@@ -1,0 +1,75 @@
+{
+  "repo": "redwood",
+  "pr_number": "19440",
+  "title": "Fix KV compaction relocation edge case on cancelled requests (page leak + transient stalls)",
+  "author": "Samir Qureshi",
+  "created_at": "2026-01-27",
+  "updated_at": "2026-01-28",
+  "merged_at": "2026-01-28",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "bugfix/kv-compaction-cancelled-requests",
+  "reviewers": [
+    "Omar El-Sayed",
+    "Noah Patel",
+    "Sofia Ivanova",
+    "Anika Gupta"
+  ],
+  "labels": [
+    "runtime",
+    "kv-cache",
+    "bug",
+    "correctness",
+    "perf"
+  ],
+  "linked_linear": [
+    "ENG-4827",
+    "ENG-4823"
+  ],
+  "linked_jira": [
+    "SUP-28433"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "11",
+  "additions": "392",
+  "deletions": "97",
+  "merge_method": "squash",
+  "description": "Context: During KV cache compaction we relocate a sequence\u2019s KV pages from a fragmented region into a contiguous span. Under stress (high churn + streaming cancels), we hit an edge case where the request is cancelled while the sequence is mid-relocation. Two bad outcomes were observed depending on timing: (1) page leak: old pages were removed from the sequence map but never returned to the arena free-list because cancellation short-circuited the relocation finalizer; (2) transient stalls: scheduler would spin waiting for relocation to \u201ccomplete\u201d because the sequence state remained in RELOCATING with no owning request after cancellation.\n\nRepro: Anika\u2019s stress test (ENG-4827) found this ~1/20 runs with aggressive cancellation (client disconnect) while compaction budget is non-zero in decode. The minimal repro is a mixed-length burst workload with ~30\u201340% cancellations within 10\u201350ms after decode starts. Logs show: sequence enters RELOCATING, pages_copied=N, then cancel triggers cleanup that freed the request context but left relocation bookkeeping intact.\n\nFix (high level):\n- Make relocation completion/cancellation idempotent and owned by the sequence, not the request object.\n- Introduce a relocation \u201ctransaction\u201d struct (RelocationTxn) stored on SequenceState with an explicit lifecycle: INIT -> COPYING -> COMMITTING -> DONE or ABORTED.\n- On cancellation, mark txn as ABORT_REQUESTED and let the compaction worker finalize ABORT on the next scheduler/worker tick (bounded by the existing compaction budget gates). This avoids doing heavyweight frees/copies on the cancellation path.\n- Ensure both COMMIT and ABORT always execute the same page accounting operations (return old pages to free-list, decrement pin/ref counts, clear relocation pointers) behind a single finalize() that is guarded by an atomic once-flag.\n- Add a \u201cno-owner\u201d fast path: if a sequence is RELOCATING and has no active request, the scheduler will either (a) drive the txn to ABORT (preferred) or (b) drive COMMIT if copy already completed and safe, then immediately clear RELOCATING so the sequence doesn\u2019t block other work.\n\nDetails:\n- allocator/kv_arena: add Arena::free_pages_batch() to amortize free-list lock acquisition during finalize.\n- kv/sequence_map: sequence page-table swap now happens only in COMMITTING under seq_lock; cancellation cannot leave the map half-swapped.\n- compaction_worker: relocation steps check txn.state and bail quickly if ABORT_REQUESTED; finalize is budgeted (bytes/time) like other compaction work.\n- scheduler: when selecting work, treat RELOCATING sequences with no active request as eligible for a tiny \u201cmaintenance step\u201d (<= 50us) to advance txn state and clear flags; this prevents p99 spikes from repeated futile scheduling.\n\nUser impact: Correctness-only bugfix; no API surface changes. Primary effect is preventing rare OOMs/leaks under churn and removing a small tail-latency spike mode where the scheduler loops on orphaned relocation state.\n\nTesting:\n- New unit tests for relocation finalize idempotency (commit twice / abort twice / commit then abort).\n- New stress regression test that injects cancellation at randomized points in COPY/COMMIT (seeded RNG, runs in CI short mode with 200 iterations).\n- Bench sanity: no measurable throughput regression on A100/H100 microbench; relocation finalize path is cold and still budgeted.\n\nRollout/notes:\n- Safe behind existing KV compaction feature flag. This fix is required for expanding canary cohorts (see Slack thread eng-runtime/1767995033). I\u2019d like to backport to release/runtime-1.22 after this lands (follow-up PR).\n\nChecklist:\n- [x] Added tests covering the edge case\n- [x] Verified allocator accounting (free pages, bytes in use) matches before/after cancellation\n- [x] Tracing spans include relocation_abort and relocation_finalize events\n- [x] No additional work on cancellation hot path beyond state flip\n\nRefs: ENG-4827, ENG-4823; related incidents/support signal: SUP-28433 (OOM during high churn) correlates with leaked pages in allocator snapshots.",
+  "commits": [
+    "kv: persist relocation txn on sequence state; make finalize idempotent",
+    "kv_arena: add batched free for relocation finalize",
+    "scheduler: drive orphaned relocation txns to completion/abort",
+    "tests: randomized cancellation injection during relocation",
+    "tracing: add relocation_abort + finalize spans and counters"
+  ],
+  "changed_files": [
+    "runtime/kv/compaction/compaction_worker.cc",
+    "runtime/kv/compaction/compaction_worker.h",
+    "runtime/kv/sequence_state.cc",
+    "runtime/kv/sequence_state.h",
+    "runtime/kv/sequence_map.cc",
+    "runtime/kv/allocator/kv_arena.cc",
+    "runtime/kv/allocator/kv_arena.h",
+    "runtime/scheduler/scheduler_loop.cc",
+    "runtime/telemetry/kv_metrics.cc",
+    "runtime/tests/kv/kv_compaction_cancel_stress_test.cc",
+    "runtime/tests/kv/kv_relocation_finalize_unit_test.cc"
+  ],
+  "ci_checks": [
+    "build (linux-gpu) \u2014 pass",
+    "unit-tests \u2014 pass",
+    "kv-allocator-tests \u2014 pass",
+    "stress (short) \u2014 pass",
+    "perf-smoke (A100) \u2014 pass",
+    "lint/clang-format \u2014 pass"
+  ],
+  "review_conversation": "Omar El-Sayed: Can you confirm we never free pages from the cancellation thread now? I\u2019m worried about doing arena ops while holding request locks. Samir Qureshi: Yep\u2014cancellation just flips txn.state to ABORT_REQUESTED under seq_lock and returns. Actual frees happen in compaction_worker finalize() under the existing arena lock ordering.\n\nNoah Patel: The sequence_map swap needs to be atomic w.r.t. readers. Are there any windows where a reader can observe a partially swapped page table? Samir Qureshi: No\u2014swap only happens in COMMITTING while holding seq_lock; readers either see old table or new table. I also added an invariant check that page_table_ptr != nullptr whenever state != DONE.\n\nSofia Ivanova: The scheduler \u201cmaintenance step\u201d worries me\u2014could it starve decode if we have many orphaned sequences? Samir Qureshi: It\u2019s bounded (<=50us per tick) and only runs when we already selected the sequence for servicing; it also respects compaction budget gates. Added a counter orphan_relocation_drives to watch for pathological rates.\n\nAnika Gupta: Repro looks good. Can we make the stress test fail fast if allocator bytes-in-use doesn\u2019t return to baseline after cancellations? Samir Qureshi: Added assert on arena.allocated_pages() delta and free-list consistency after each iteration; it catches the leak in the old code.\n\nOmar El-Sayed: Approving with request to add a comment explaining why ABORT is deferred. Samir Qureshi: Added comment in SequenceState::request_cancel() and in compaction_worker.\n\nApprovals: Omar El-Sayed \u2705, Noah Patel \u2705, Sofia Ivanova \u2705, Anika Gupta \u2705",
+  "merge_outcome": "Merged to main via squash on 2026-01-28. Follow-up requested to backport to release/runtime-1.22 once canary branch is cut.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_conversation",
+    "merge_outcome"
+  ],
+  "dataset_doc_uuid": "dsid_fb3fdc41e116404abac8ef374111b61e"
+}

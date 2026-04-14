@@ -1,0 +1,76 @@
+{
+  "key": "SUP-458271",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Unexpected 5xx delta after large embedding upload: GPU driver soft-reset correlated with apigw overload",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Asha Patel",
+  "assignee": "Diego Morales",
+  "customer_company": "Nimbus Financial",
+  "customer_tier": "enterprise",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "scheduler",
+    "embeddings"
+  ],
+  "labels": [
+    "5xx",
+    "dedicated",
+    "gpu-driver",
+    "embedding-burst",
+    "investigating"
+  ],
+  "environment": "prod | us-east",
+  "affected_models": [
+    "embedder-large-v2"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-10",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "INT-883"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/412"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.com/display/OPS/Embedding+Burst+Investigation"
+  ],
+  "related_incident_id": "INC-20260310-001",
+  "customer_impact_summary": "Customer Nimbus experienced elevated error rates (5xx) on their dedicated cluster during a large embedding upload that impacted production payment risk scoring. Approximately 8-12% of requests returned 5xx between 10:12\u201310:56 UTC, causing timeouts and failed batched scoring jobs.",
+  "description": "Issue summary:\nNimbus Financial reported a sudden rise in 5xx responses for their dedicated deployment while performing a large embedding upload and concurrent chat/embedding traffic. The wave began ~2026-03-10 10:12 UTC and subsided after 10:56 UTC.\n\nImpact:\n- Enterprise customer production latency and error budget hit; some scoring pipelines failed and were retried by the customer's orchestrator.\n- Customer reported degraded UX for internal dashboards tied to inference results.\n\nEnvironment:\n- Dedicated cluster (tenant: nimbus-prod) in us-east-1\n- Serving runtime version: 2026.02.3\n- GPU image: rwinf/dedicated-gpu:2026-02-12 (NVML v460-driver)\n- API gateway cluster version: apigw-3.1.1\n\nSteps to reproduce (approx):\n1) Customer uploaded a ~1.8M-vector embedding batch (multipart upload) at 10:10 UTC.\n2) Simultaneous live chat traffic persisted to the same tenant (~120 concurrent streams).\n3) Within ~2 minutes, apigw accept queue length increased and 502/503 responses started to spike.\n4) Multiple serving runtime replicas reported NVML soft-resets and then restarts; apigw observed upstream resets and returned 502s.\n\nObserved behavior:\n- Apigw 502/503/504 spike correlated with GPU driver soft-reset spikes in telemetry.\n- Keepalive counts dropped for upstream runtime sockets; accept queue grew.\n- Prefetch cancellations and embedding shard rebalancer ran while the driver reset sequence occurred, leading to increased downstream retries and backpressure.\n\nExpected behavior:\n- Large embedding uploads should be rate-limited and isolated by the scheduler to avoid cascading soft-resets on shared GPUs. Runtime restarts should not cause sustained apigw 5xx floors.\n\nTemporary workaround provided to customer:\n- We advised the customer to stagger their large embedding upload and reduce chunk concurrency.\n- Support temporarily pinned their tenant to a separate dedicated GPU pool while investigation proceeds.",
+  "logs": "[2026-03-10T10:14:02Z] runtime-42 NVML_SOFT_RESET detected GPU0\n[2026-03-10T10:14:03Z] runtime-42 heartbeat lost, restarting worker\n[2026-03-10T10:14:04Z] apigw-2 upstream-reset upstream=runtime-42 status=502 accept_queue=115\n[2026-03-10T10:15:10Z] scheduler prefetch-cancel tenant=nimbus-prod shard=12 reason=worker-unavailable\n[2026-03-10T10:16:30Z] kernel-selection-fallback: quant-kernel -> slow-path (incr latency)\n",
+  "investigation_notes": "Initial triage (Asha): correlated apigw 5xx spike with NVML soft-reset bursts across three runtime pods. Dashboard (grafana/embed-prod) shows NVML reset rate jumped at 10:13.\nSRE (Diego): observed accept_queue growth on apigw and half-open upstream sockets; apigw timed out on hedged requests, amplified by client's retry logic.\nRuntime team: driver logs show a pattern consistent with a long-running NVMe GC on host combined with a GPU watchdog throttle triggering soft-resets during heavy NVMe IO. Embedding upload triggered heavy NVMe writes for checkpointing embedding shards, which coincided with GPU driver scheduling delays.\nScheduler team: the dedicated scheduler allowed high multipart concurrency (default burst=20) for this tenant; this allowed many simultaneous GPU-intensive shard writes causing IO and GPU contention.\nHypothesis: a combined IO/GPU contention window caused NVML soft-resets; the restarts reduced available upstream capacity which pushed apigw into accept-queue saturation and 5xx responses. Hedged retries and the customer's upload concurrency amplified the backpressure.\nEvidence: NVML reset timestamps align within 10s of apigw 502 spikes; NVMe iowait metrics increased ~5x during the window.\nNext diagnostic steps: capture full runtime nvml logs, collect host dmesg, and reproduce with controlled embedding-burst in staging with same image and scheduler settings.",
+  "comments": [
+    "2026-03-10 11:05 - Diego Morales: Confirmed NVML soft-reset spikes across 3 replicas; opened INT ticket INT-883 to capture host-level kernel logs and NVMe stats.",
+    "2026-03-10 12:22 - Samantha Kim (Customer Success): Nimbus accepted temporary pin to separate GPU pool; they reported immediate reduction in 5xx. Customer requested root cause and mitigation plan.",
+    "2026-03-11 09:18 - Priya Nair (Runtime): Reproduced partial behavior in staging when running multipart embed upload + concurrent chat load; NVMe iowait increased and NVML reset observed after ~90s. Collecting strace + nvml traces."
+  ],
+  "resolution_notes": "Mitigation applied (2026-03-11):\n- Temporarily moved Nimbus to isolated dedicated pool to restore production traffic.\n- Reduced default multipart upload concurrency for dedicated scheduler to 6 for customers with >1TB shard activity.\n- Released runtime image patch v2026.02.4 that adds guarded NVML watchdog backoff and better checkpoint IO yielding.\n- Configured apigw to increase upstream keepalive timeout and reduce immediate hedged retry for affected tenant.\n\nStatus: Partial fix deployed (driver/ runtime patch + scheduler conservative defaults). Full RCA pending after host-level logs analyzed and NVMe mitigation validated. Follow-up owner: Priya Nair.\n",
+  "follow_up_actions": [
+    "Backport runtime patch v2026.02.4 to all dedicated GPU images (owner: Priya Nair)",
+    "Add alert: NVML_soft_reset_rate > 3/min for any tenant -> paging SRE (owner: Diego Morales)",
+    "Audit scheduler burst defaults for dedicated clusters and create a safer default policy (owner: Scheduler team)",
+    "Run controlled embedding-burst test in staging with NVMe IO profiling and document threshold (owner: Runtime + Perf)",
+    "Confluence: write postmortem and guidance for customers on safe large-embedding uploads (owner: Customer Success)",
+    "Follow up with Nimbus on billing credits and confirmation their pipelines are healthy (owner: Samantha Kim)"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "customer_impact_summary",
+    "description",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution_notes",
+    "follow_up_actions"
+  ],
+  "dataset_doc_uuid": "dsid_65b54102ba484e8c8457c252c078e778"
+}

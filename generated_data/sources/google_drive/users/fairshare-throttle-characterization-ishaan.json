@@ -1,0 +1,33 @@
+{
+  "title": "Fairshare throttle characterization lab notes",
+  "owner": "Ishaan Mehta",
+  "drive_area": "users",
+  "path": "users/fairshare-throttle-characterization-ishaan.json",
+  "doc_type": "doc",
+  "created_at": "2025-01-08",
+  "last_modified": "2025-01-15",
+  "collaborators": [
+    "Mira Chen",
+    "Luca Rossi"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "throughput",
+    "latency",
+    "multi-tenant",
+    "fairshare",
+    "preemption",
+    "kv-cache"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/483",
+    "JIRA-INF-2174"
+  ],
+  "content": "Goal: sketch experiments to quantify how the fairshare-based throttle and tenant preemption interact when the fleet is near capacity. I want quick numbers (p50/p95/p99 and qps) for a few knobs: fairness weights, soft-preempt delay, and idle-burst window. Use as a short-running lab notebook to decide whether we: (a) tighten soft-preempt, (b) expose a per-tenant burst budget, or (c) change KV-cache eviction policy under multi-tenant pressure.\n\nEnvironment:\n- Cluster: 4x a100-80gb (prod-sim), 8 pods behind gateway-proxy, serving-runtime v0.64 (branch: ishaan/fairshare-smoke).\n- Synthetic clients: loader-1 (high qps), loader-2 (background low-pri), 10 concurrent workers each.\n- Models: llama-7b quantized (fp16 path) and llama-2-13b-raw for cold-path tests.\n- Cache: per-tenant KV cache enabled; cache-size 1e6 entries total, leak rate 0.1/s emulated.\n- Measurement: Prometheus scrape @5s, collect traces with jaeger sampler=0.1.\n\nTest matrix (short):\n- Fairness weight ratios: [1:1, 2:1, 5:1] (loader-1 : loader-2).\n- Soft-preempt-delay: [0s, 200ms, 1s].\n- Idle-burst-window: [100ms, 500ms].\nRun length: 10m steady after 3m warmup. Cold-cache run appended for one config.\n\nKey commands (how I executed):\n- start servers: ./deploy/localish.sh --nodes 4 --image serving-runtime:v0.64-fairshare\n- spawn load: python tools/multi_load.py --clients 2 --concurrency 10 --mix \"high:0.8,low:0.2\" --qps 1200 --duration 600\n- collect: prometheus_query.py 'histogram_quantile(0.99, sum(rate(request_latency_bucket[1m])) by (le))' --out p99.txt\n\nNotes / observations (raw):\n- with 1:1 weights, as qps approaches 1000 the background loader (low-pri) drops to ~10% throughput; high-pri p99=240ms stable.\n- with 5:1 weights the high-pri gets >70% of tokens but p99 climbs to ~420ms once preemption starts kicking in: preemption spike correlated with KV-cache evictions (~15k evict/s).\n- soft-preempt-delay of 1s smooths p95 but increases average latency by ~30ms (extra scheduling window).\n- idle-burst-window=500ms allowed short bursts from background tenant without triggering reclaim, reduced request failures by ~35% for low-pri but increased high-pri p99 by ~60ms.\n\nRepresentative numeric snapshot (steady-state, avg over final 5m):\n\nConfig                       | total qps | high-pri qps | low-pri qps | p50 | p95 | p99\n---------------------------- | ---------: | -----------: | ----------: | ---:| ---:| ---: \nfair=1:1, preempt=0s, burst=100ms | 1100      | 920          | 180         | 38ms | 210ms | 260ms\nfair=5:1, preempt=0s, burst=100ms | 1080      | 760          | 320         | 45ms | 320ms | 420ms\nfair=5:1, preempt=1s, burst=500ms | 1120      | 790          | 330         | 52ms | 280ms | 340ms\n\nCold-cache single-run (fair=1:1): p95 jumped to ~1.4s for llama-2-13b-raw; KV-cache miss rate 0.93 -> big contributor.\n\nInterpreting the signals:\n- Main pain: eviction storms when high-pri traffic ramps. Evictions coincide with preemption cycles; reclaimed memory forces model kernels to rehydrate or recompile less often but still penalty.\n- Fairshare itself enforces token allocation correctly but doesn't account for cache locality. So tenants with higher weight can indirectly penalize others by thrashing shared KV cache.\n\nQuick hypotheses to test next (ordered):\n1) Add tenant-aware KV-cache partitioning (soft partition) that reserves N% per tenant; run same matrix and compare p99. Hypothesis: reduces eviction spikes and lowers collateral latency for low-pri without hurting high-pri much.\n2) Introduce burst tokens per tenant (budget) with decay; allow <burst> requests to bypass fairness briefly. Hypothesis: reduces small tail failures for background tenants.\n3) Tune soft-preempt-delay to 250ms for smoothness; measure loss in throughput.\n\nFailures / anomalies seen during run:\n- One worker pod OOM-killed at t=12:45 in 5:1 runs; log shows cache allocation surge triggered by an internal meta-request. Need to capture exact payloads.\n- Jaeger traces show request fanout: 1 request -> 3 subcalls to tokenizer service; tokenizer latency amplified under eviction. Consider adding local tokenizer cache.\n\nOperational notes for reproducibility:\n- Use --sample-seed=2837 for multi_load to reproduce the arrival pattern used here.\n- To snapshot cache state: curl http://node:8080/debug/cache?tenant=<id> -> dumps counts and last-touch timestamps.\n\nNext actions (short):\n- Run 3 more repeats with tenant-cache-partition=soft (0.2/0.8) and record p99 deltas (assign to Mira).\n- Add instrumentation to correlate eviction events with kernel selection logs (Luca).\n- Draft a short proposal for a short-term mitigant: per-tenant burst budget + 250ms soft-preempt. If it shows improvement in the repeats, prepare a small RFC.\n\nBullet takeaways (one-liners):\n- Fairshare works for token distribution but not for cache locality; cache thrash is the main culprit for collateral p99 inflation.\n- Modest soft-preempt delay reduces spikes but can't eliminate eviction-induced tails.\n- Tenant-aware cache partitioning or burst budgets look promising and cheap to prototype.\n\nScratchpad: sample prometheus queries used:\n- request_qps: sum(rate(requests_total[1m])) by (tenant)\n- kv_evictions: increase(kv_cache_evictions_total[5m])\n- p99: histogram_quantile(0.99, sum(rate(request_latency_bucket[1m])) by (le))\n\nMisc notes to self:\n- record exact pod OOM logs and attach to JIRA-INF-2174.\n- rerun the cold-cache sequence with only llama-7b to isolate model size contribution.\n- remind infra to not rotate nodes during these runs (caused one flake last time).\n\nEnd of note.\n\n-- Ishaan\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_fcd935cdff0c40269d95a5b7e7e4eb3f"
+}

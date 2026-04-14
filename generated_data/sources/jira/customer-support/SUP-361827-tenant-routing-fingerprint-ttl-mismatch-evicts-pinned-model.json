@@ -1,0 +1,95 @@
+{
+  "key": "SUP-361827",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "routing-fingerprint-ttl-mismatch-evicts-pinned-model-for-tenant-leading-to-canary-fallback",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "customer_company": "BrightTutor Inc.",
+  "customer_tier": "dedicated",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Samantha Ortiz",
+  "assignee": "Ethan Zhang",
+  "components": [
+    "serving-runtime",
+    "edge-proxy",
+    "routing-mesh"
+  ],
+  "labels": [
+    "pinning",
+    "canary",
+    "routing-ttl",
+    "investigation-needed"
+  ],
+  "environment": "prod | us-east",
+  "affected_models": [
+    "redwood-open-3b-v2"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-12",
+  "description": "Issue summary:\nCustomers (BrightTutor) observed intermittent mixed-model outputs during a scheduled canary rollout. Investigation shows the tenant's pinned model was being evicted from routing and traffic was sporadically routed to the canary variant for 10-30s windows, causing grading regressions and increased token costs.\n\nImpact:\n- Several hundred requests within the tenant saw responses from the canary model instead of the pinned model.\n- Outputs deviated from expected policy (grading tests flagged quality drops).\n- Customer reported potential billing anomalies due to different tokenization between variants.\n\nHigh-level hypothesis: routing uses a per-tenant fingerprint TTL (edge cookie/hash) to keep session affinity for pinned versions. The fingerprint TTL was shorter than the pin commitment/lease TTL in the orchestrator leading to the orchestrator believing the pin should remain while the edge lost affinity and allowed fallback routing to canary. This mismatch coincided with a short edge revalidation spike (healthprobe + cache eviction) which opened a window where the pin didn't bind at the edge and routing sent requests to canary variants.",
+  "steps_to_reproduce": [
+    "1) Create tenant with model_pin set to redwood-open-3b-v2 and pin_lease configured for 5 minutes.",
+    "2) Start a gradual canary promotion of redwood-open-3b-v2-quant with 5% traffic weight in us-east.",
+    "3) Simulate an edge cookie refresh / fingerprint regeneration by forcing a synthetic edge revalidation (curl to /health causing sidecar probe behavior) on the same client IPs.",
+    "4) Observe routing logs at ingress \u2014 requests from the tenant occasionally map to canary variant for 10-30s windows while orchestrator still shows pin active.",
+    "5) Reproduce locally against staging routing-mesh with shorter TTL config to speed trigger."
+  ],
+  "observed_logs": [
+    "[edge-proxy] 2026-03-10T14:12:03Z INFO route-assignment tenant=brighttutor fingerprint_evicted=true fingerprint_ttl=18s",
+    "[orchestrator] 2026-03-10T14:12:03Z INFO pin-lease tenant=brighttutor pin=redwood-open-3b-v2 lease_expires=2026-03-10T14:17:03Z",
+    "[router] 2026-03-10T14:12:04Z WARN fallback toVariant=redwood-open-3b-v2-quant reason=edge-no-affinity",
+    "[ingress] 2026-03-10T14:12:15Z DEBUG selected_variant=quant predicted_latency=86ms actual_latency=120ms"
+  ],
+  "comments": [
+    "2026-03-10 15:05 - Support (Samantha Ortiz): Customer reached out via support chat \u2014 they see inconsistent grading results after our canary started. Attached sample request IDs.",
+    "2026-03-10 15:30 - ENG (Ethan Zhang): Reproduced at low volume in staging by shortening fingerprint TTL. Initial hypothesis: edge fingerprint TTL shorter than orchestrator pin lease. Creating instrumented trace for affected requests.",
+    "2026-03-10 17:10 - CS (Maria Gonzales): Customer confirms timeframe of regressions aligns with their canary window. They require an immediate mitigation while we investigate root cause.",
+    "2026-03-11 09:22 - SRE (Ibrahim Noor): Noted a spike in edge revalidation logs around the same timestamps (healthprobe flapping due to noisy healthcheck cluster). Working with infra to stabilize probes.",
+    "2026-03-12 11:48 - ENG (Ethan Zhang): Rolled temporary config change to extend edge fingerprint TTL to match pin lease for BrightTutor tenant. Asking QA to monitor for mixed outputs."
+  ],
+  "investigation_notes": [
+    "Edge keeps per-client routing fingerprint (cookie/hash) with TTL configurable at proxy layer. If fingerprint is evicted, subsequent requests are subject to standard routing selection and fallback rules, which can pick canary variants if weights allow.",
+    "Orchestrator maintains pin_lease independent of edge fingerprint. There was no cross-check during request routing to re-assert pin ownership when edge fingerprint regenerated.",
+    "Observed correlation between edge healthprobe flaps (short burst of 500ms probe failures) and fingerprint_evicted events. Likely the sidecar reset cleared in-memory fingerprint cache under some load patterns.",
+    "Reconstructed trace for request sample IDs shows: orchestrator pinned -> edge lost fingerprint -> routing mesh consulted weights -> fallback to canary -> orchestrator still considered pin active. No retry/resync occurred until a new pin explicit header was present.",
+    "Metrics impacted: tenant_pin_mismatch_count, edge_fingerprint_evictions, canary_routed_requests_by_tenant increased during incident window.",
+    "Related config: default edge_fingerprint_ttl=20s, default pin_lease=5m for dedicated tenants. This mismatch is intentional for global scaling but not safe when pin must be strict for some tenants.",
+    "Checked for linked code changes: recent PR that optimized sidecar memory reclamation (GH #5429) coincided with timing but does not directly evict fingerprint cache; however, it lowered cache retention pressure which may make TTL expirations more frequent under load."
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/edge-proxy/pull/5429",
+    "github.com/redwood-inference/routing-mesh/pull/2142"
+  ],
+  "related_confluence_pages": [
+    "Confluence:Runbooks/Pinning-and-Affinity-Design",
+    "Confluence:Postmortems/2026-01-edge-healthprobe-flap"
+  ],
+  "linked_issues": [
+    "SUP-1100246",
+    "SUP-302118"
+  ],
+  "resolution": "Temporary mitigation applied: extended edge fingerprint TTL to 6 minutes for tenant BrightTutor and adjusted sidecar healthprobe backoff to reduce revalidation spikes. Short-term config change removed 20s->6m mismatch and eliminated observed canary cross-routing.\n\nPermanent fix planned: (1) add server-side reconciliation during request handling to prefer orchestrator pin when pin_lease is active (safeguard against fingerprint eviction), (2) add telemetry and alerting for fingerprint_eviction_rate vs pin_lease_mismatch, and (3) update sidecar caching behavior to decouple memory reclamation from fingerprint retention.\n\nCustomer update: Informed BrightTutor of mitigation and requested validation. Customer has accepted mitigation as workaround pending permanent fix.",
+  "follow_up_tasks": [
+    "ENG-2381: Implement pin-precedence check in routing-mesh to honour active orchestrator pins even if fingerprint is missing.",
+    "SRE-1120: Harden sidecar healthprobe backoff and add circuit-breaker to avoid short probe flaps under load.",
+    "QA-764: Add regression test that simulates fingerprint eviction during active pins and asserts no canary routing occurs for pinned tenants.",
+    "OBS-404: Create dashboard tile showing edge_fingerprint_evictions / tenant_pin_mismatch_count and alert when ratio > 0.01 over 5m.",
+    "Docs-90: Update customer-facing notes about model_pin semantics and known TTL interactions for dedicated tenants."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_logs",
+    "investigation_notes",
+    "comments",
+    "resolution",
+    "follow_up_tasks"
+  ],
+  "dataset_doc_uuid": "dsid_dfea5acbfdd847ce943a91751522928e"
+}

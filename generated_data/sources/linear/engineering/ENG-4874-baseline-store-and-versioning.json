@@ -1,0 +1,66 @@
+{
+  "key": "ENG-4874",
+  "team": "engineering",
+  "title": "Perf canary baseline store + versioning (per model/version/SKU) and update policy",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2026-01-08",
+  "updated_at": "2026-02-14",
+  "creator": "Nadia Rahman",
+  "assignee": "Noah Patel",
+  "project": "Prod Perf Regression Canary",
+  "cycle": "2026-W03",
+  "estimate": "8",
+  "due_date": "2026-02-07",
+  "labels": [
+    "perf-canary",
+    "baselines",
+    "telemetry",
+    "runtime-perf",
+    "sre-signal",
+    "config-service"
+  ],
+  "dependencies": [
+    "ENG-4873",
+    "ENG-4872",
+    "ENG-4875",
+    "ENG-4876"
+  ],
+  "sub_issues": [
+    "ENG-4882"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.18",
+  "security_review_required": "false",
+  "description": "Implement baseline storage strategy for perf-canary regressions. Baselines must be stable and queryable per model + model version + runtime version + hardware SKU (and optionally region/tier), with an explicit update/promotion policy to avoid drift-induced alert storms. Includes decisions on where baselines live (object storage vs config service), versioning scheme, retention, and how to handle seasonality/slow fleet changes.",
+  "acceptance_criteria": [
+    "Baseline artifacts can be fetched by perf-canary given a stable lookup key (model + model_version + runtime_build + kernel_tag + hardware_sku + workload_profile + region(optional)).",
+    "Baselines are immutable once written; new baselines are created as new versions and promoted explicitly.",
+    "Promotion flow is auditable (who/when/why) and supports rollback to a prior baseline.",
+    "Policy defined for when to create vs reuse baselines across runtime releases, kernel changes, and fleet/driver changes.",
+    "Noise controls: minimum sample sizes and smoothing assumptions documented; baseline drift/seasonality risks explicitly addressed.",
+    "Operational runbook notes added for baseline refresh/backfill and emergency freeze."
+  ],
+  "content": "Context\n- perf-canary will continuously issue synthetic requests against a curated model set to detect regressions in p95 latency and tokens/sec. This ticket covers baseline persistence + versioning so that:\n  (1) comparisons are apples-to-apples (same model/version/workload/hardware)\n  (2) we can evolve baselines safely without baseline drift creating false positives\n  (3) SRE/runtime can quickly attribute changes to runtime builds/kernels/fleet\n\nProblem statement\n- We need to compare observed canary metrics against a \"known-good\" baseline distribution per model. If baselines update implicitly (rolling), slow infra changes (driver, GPU mix, noisy neighbors) can shift baseline and either mask real regressions or generate alert storms.\n- Baseline cardinality can blow up if we key on too many labels (region x tier x sku x runtime x model x prompt bucket). We need a principled key and promotion policy.\n\nDecision summary (aligned w/ ADR: perf-canary baseline + thresholds)\n1) Baseline artifacts are stored in object storage (baseline-bucket) as immutable, versioned JSON artifacts.\n   - Rationale: cheap, immutable, supports large payloads (histograms/quantiles), can be produced by benchmark-lab job and consumed by perf-canary.\n2) Control plane stores only a pointer (baseline_ref) per canary target with an explicit \"promoted\" baseline version.\n   - Rationale: control plane config is the audited source of truth for what baseline is currently used for alerts/gates, without stuffing large artifacts into config.\n3) Baselines are versioned and promoted explicitly (no automatic rolling baseline in MVP).\n   - We may add a \"rolling candidate\" baseline later for visualization only, but alerts/gates use the promoted baseline.\n4) Key dimensions for baseline lookup:\n   Required:\n   - model_id (canonical registry name)\n   - model_version (registry version / digest)\n   - runtime_build_id (or runtime_semver + build hash)\n   - hardware_sku (e.g., a100-80gb, h100-sxm)\n   - workload_profile_id (synthetic prompt distribution version, e.g., canary-v0)\n   Optional (configurable):\n   - region (enabled only where we have known region-level perf deltas; default off)\n   - capacity_tier (hosted|dedicated) (default off for MVP; use separate workload profiles if needed)\n   - kernel_tag (stored in artifact metadata; NOT part of primary key in MVP to avoid explosion)\n\nBaseline artifact schema (stored in object storage)\n- filename convention:\n  baselines/{model_id}/{model_version}/{hardware_sku}/{workload_profile_id}/{runtime_build_id}/baseline-{created_at}-{baseline_version}.json\n- top-level fields (informational; exact structure in artifact):\n  - baseline_version: monotonically increasing integer per key\n  - created_at\n  - created_by (service or human promotion)\n  - source_run_id (benchmark-lab job id) + links\n  - window: sample count, duration, environment notes\n  - telemetry_schema_version\n  - metrics:\n    - e2e_latency_ms: p50/p95/p99 + histogram buckets\n    - runtime_latency_ms (if available)\n    - queue_time_ms\n    - prefill_ms / decode_ms\n    - tokens_per_sec: mean + p50/p95 + distribution summary\n    - batch_size distribution\n    - kv_cache_hit_rate (optional; recorded when emitted)\n  - tags: runtime_build_id, kernel_selection_id (if present), driver version (if available), fleet annotation\n\nPromotion policy\n- Two-step process:\n  A) Create baseline artifact from controlled load (benchmark-lab) or approved canary capture window.\n  B) Promote baseline by updating control-plane canary config (baseline_ref -> new baseline_version).\n- Promotion requirements:\n  - Minimum N samples per prompt bucket and aggregate (exact N in ADR; enforced by baseline generator).\n  - Must run on the target hardware SKU with the target runtime build.\n  - Must pass sanity checks: p95 within expected bounds vs prior baseline (guardrail, not strict).\n- Rollback:\n  - Control-plane config keeps last 3 promoted versions; rollback is a config change to previous baseline_ref.\n\nHandling drift and seasonality\n- The canary uses synthetic prompts and fixed QPS caps. This intentionally reduces seasonality vs customer traffic.\n- Known drift vectors we must account for:\n  1) Fleet composition changes (mixed GPU stepping, BIOS/driver updates)\n  2) Runtime scheduling heuristic updates affecting batch size distribution\n  3) Kernel selection auto-changes\n- MVP approach:\n  - Do NOT update baseline automatically; baseline changes only when we deliberately promote.\n  - Add annotation fields in the artifact to capture driver/fleet context when available; use them in triage.\n  - Optional region-specific baselines remain off by default; enable only for regions with consistent deltas and enough sampling.\n- Follow-up (ENG-4882):\n  - Consider \"dual baseline\" (promoted baseline for paging + rolling candidate for dashboards) to detect slow drift without breaking alert stability.\n  - Explore SKU-aware thresholds rather than region-aware baselines where possible.\n\nIntegration points\n- perf-canary baseline fetch + evaluator: perf-canary PR-19218 will read baseline_ref from config and fetch artifact from baseline-bucket.\n- baseline generation job: benchmark-lab PR-18990 outputs artifacts in the expected path and writes a manifest for promotion.\n- telemetry schema: relies on runtime build tags + kernel identifiers (redwood PR-19193) and model version tags (model-registry PR-18577).\n\nOperational notes\n- Access control: perf-canary service account has read-only access to baselines bucket path(s) for its region + environment; baseline generator has write access.\n- Retention: keep all baseline artifacts for 180 days (or longer for top models); promoted baselines pinned (never GC\u2019ed) while referenced by config.\n- Emergency freeze: if alert storm suspected due to a bad baseline promotion, revert baseline_ref and disable new promotions until incident is resolved.\n\nOpen questions / follow-ups\n- Do we need to include kernel_tag in the primary key once kernel auto-selection becomes more dynamic? (Current stance: no; store as metadata + rely on canary attribution metrics.)\n- Should dedicated capacity pools have their own baselines even on same SKU? (Likely yes via workload_profile_id/tier split, but defer until phase-2 coverage.)\n\nLinks\n- Confluence ADR (baselines/thresholds): sources/confluence/architecture-and-standards/decision-records/adr-perf-canary-baseline-and-thresholds.json\n- Kickoff notes: sources/google_drive/shared_drives/engineering/serving-runtime/perf-canary-kickoff-notes.json\n- Cardinality audit: sources/google_drive/shared_drives/engineering/observability/perf-canary-metrics-cardinality-audit.json\n- Related PRs: perf-canary/pr-19218, benchmark-lab/pr-18990, redwood/pr-19193, redwood-model-registry/pr-18577",
+  "comments": [
+    "2026-01-08 (Nadia Rahman): Created. Baseline storage is the critical dependency for canary evaluator. Proposal: immutable artifacts in object storage + promoted pointer in control plane config. Avoid rolling baseline initially to prevent drift masking regressions.",
+    "2026-01-10 (Logan Wright): +1 to object storage for artifacts; please keep config payload small. Also: ensure we don't key on region by default\u2014too much cardinality and different retention costs per region.",
+    "2026-01-12 (Noah Patel): Added proposed key dimensions. Pushing back on kernel_tag in key for MVP; we'll rely on kernel_selection_id as attribution metric + metadata. If we key on kernel_tag we\u2019ll explode baselines during auto-selection experiments.",
+    "2026-01-15 (Sofia Ivanova): From scheduler side: baselines should include batch size distribution and queue_time_ms; otherwise we can't tell scheduler regressions vs GPU execution regressions. Please ensure these are in artifact schema even if not all models emit KV cache signals.",
+    "2026-01-18 (Hiro Tanaka): Agree with keeping kernel_tag out of key. But baseline artifact must store kernel_selection_id (or equivalent) so when we see a regression we can correlate quickly to kernel rollouts. Otherwise triage will be slow.",
+    "2026-01-22 (Allison Grant): Alert hygiene: explicit promotion + rollback is mandatory. Please also document that promoted baselines should not be overwritten (immutability) and that baseline promotions are change-managed like any other prod config.",
+    "2026-01-27 (Nadia Rahman): Implemented artifact path convention and manifest format in benchmark-lab job. Added sanity checks: min sample size, stable p95 within guardrail vs previous baseline (non-blocking warning).",
+    "2026-01-31 (Noah Patel): Wired perf-canary baseline fetch to baseline_ref pointer in control plane (pending PR-19218). Added caching of baseline artifacts in-memory with TTL to avoid hammering bucket.",
+    "2026-02-03 (Sean Gallagher): Concern: region deltas are real for some fleets. OK to keep region out of key, but please make it config-toggleable for phase-2 so we can opt-in where needed.",
+    "2026-02-07 (Noah Patel): Marking as ready. Baseline artifacts immutable + promoted pointer path done. Added runbook note: rollback baseline_ref first if alert storm starts immediately after promotion.",
+    "2026-02-14 (Nadia Rahman): Closed as Done after us-east phase-1. Follow-up ENG-4882 filed for drift detection (rolling candidate baseline) and region-specific thresholds vs baseline explosion."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "content",
+    "acceptance_criteria",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_ad63933bfe7f41a9b3101165047d26c9"
+}

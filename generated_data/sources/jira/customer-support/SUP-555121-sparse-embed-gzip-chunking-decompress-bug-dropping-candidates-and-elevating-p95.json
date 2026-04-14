@@ -1,0 +1,76 @@
+{
+  "key": "SUP-555121",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Sparse-embedding + gzip chunking causes truncated frames, dropped candidates, and elevated rerank p95",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Kapoor",
+  "assignee": "Luis Morales",
+  "customer_company": "Lexicon Labs",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "proxy",
+    "ingest-worker"
+  ],
+  "labels": [
+    "embeddings",
+    "rerank",
+    "compression",
+    "high-priority",
+    "investigating"
+  ],
+  "environment": [
+    "prod-us-east"
+  ],
+  "affected_models": [
+    "open-embed-v1",
+    "open-embed-sparse-v1"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-13",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-402333",
+    "SUP-834777"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/3821"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SUPPORT/embedding-ingest-validation-runbook"
+  ],
+  "description": "Issue summary: Several customers using sparse embedding payloads report intermittent empty candidate sets and large p95 rerank latencies after switching to client-side gzip compression. Impact: production traffic to the rerank endpoint returns empty candidate arrays for ~0.3% of requests and p95 token latency increases from ~120ms to ~1.3s during these windows. Environment: Dedicated cluster for Lexicon Labs (prod-us-east). This started after the customer's SDK rolled out gzip-by-default for embedding uploads two days ago. Observed with both open-embed-v1 and open-embed-sparse-v1.\n\nObserved behavior: When client sends sparse CSR-like binary frames compressed with Content-Encoding: gzip over HTTP/2 multiplexed connections, the gateway's chunking layer miscalculates frame boundaries for small trailing chunks. The downstream ingest worker interprets a truncated sparse index block as zero-length or wrong-dimension vector, leading to either: (a) candidate suppression (empty result) or (b) a fallback path that converts to dense with zero-padding which causes ANN index fallback and queueing, increasing p95.\n\nExpected behavior: Gateway should correctly decompress and reassemble gzip-compressed frames over HTTP/2 and hand a full, validated embedding payload to the ingest worker. Serving should reject invalid-length embeddings with a 4xx and clear error message rather than silently dropping candidates or falling back to expensive CPU paths.",
+  "steps_to_reproduce": "1) Use the Lexicon SDK with sparse-embed flag enabled and gzip compression on.\n2) Send a batch of mixed-size embedding uploads over HTTP/2 to the embedding endpoint with Content-Encoding: gzip and Accept-Encoding headers.\n3) Immediately issue a rerank request referencing the new embeddings.\n4) Repeat at 200 QPS for 5 minutes to reproduce tail behavior.\n5) Observe 503s or empty candidate arrays in ~0.2-0.5% of requests and p95 spikes in serving-runtime.\n\nDeterministic repro in staging: enabled SDK gzip + sparse flag against staging-gateway with http2 multiplexing reproduces sample within 1000 requests. Logs attached below include truncated frame offsets and decoder exceptions.",
+  "logs": "[2026-03-10T13:04:12Z] gateway-01 ERROR chunk_reassembly: expected 8192 bytes, got 6104, stream_id=0x7f2a\n[2026-03-10T13:04:12Z] ingest-worker WARN sparse-decoder: index-block-truncated, fallback_to_dense=true, embed_id=lex-usr-3482\n[2026-03-10T13:04:12Z] serving-runtime ERROR ann-fallback-queueing: worker-saturation, request=rerank/lex-usr-3482, p95=1270ms\n[2026-03-10T13:04:13Z] api-gateway INFO request: client-ip=35.200.122.8, method=POST, path=/v1/embeddings, content-encoding=gzip, content-length=0\n\nNote: logs show a content-length mismatch at the gateway (0 after decompress attempt) which correlates to how the HTTP/2 chunking layer interacts with our gzip streaming decoder for small final chunks.",
+  "comments": [
+    "Aisha Kapoor (Support) - 2026-03-10: Customer reported sudden regressions after SDK change. Provided initial logs and sample request. Requested immediate triage.",
+    "Luis Morales (SRE) - 2026-03-10: Reproduced in staging by toggling SDK gzip. Observed truncated index-blocks at gateway; suspect interaction between http2 chunk framing and our in-house gzip streaming wrapper. Kicked to serving-runtime and gateway owners.",
+    "Priya Nair (Serving Eng) - 2026-03-11: Found decoder state machine bug when final gzip block size < 1024 bytes under HTTP/2 multiplex path. Created local repro and unit test. Preparing patch to fully buffer final block before handing to sparse decoder.",
+    "Aisha Kapoor (Support) - 2026-03-11: Shared workaround to Lexicon Labs: disable SDK gzip or set X-Embed-Format: dense-fp32. Customer applied workaround and saw immediate reduction in empty candidates. Confirmed temporary mitigation acceptable while we push patch.",
+    "Luis Morales (SRE) - 2026-03-12: Hotfix PR opened and tested against staging with canary. No regression on dense endpoints. Planning production canary tomorrow (2026-03-13) during low traffic window."
+  ],
+  "investigation_notes": "Root cause: gzip streaming wrapper in gateway attempted to stream-decompress and incrementally hand bytes to chunk-reassembler for HTTP/2 streams. For sparse payloads (small index blocks appended at the end) the streaming decompressor reports available bytes but final flush sequence was invoked on a later HTTP/2 frame; our chunker considered the frame boundary complete and forwarded a partial payload to the sparse decoder. Sparse decoder treats truncated index blocks as either invalid (silently drop candidate) or attempts CPU fallback by padding to expected length.\n\nWhy it's customer-visible: Lexicon uses sparse embedding format that places small index metadata at the tail of the compressed stream; when tail fragments arrive in very small final frames the bug is triggered. Dense embeddings amortize the issue because final blocks are larger. The HTTP/1 path isn't affected; this is limited to HTTP/2+gzip+small-final-frame sequence.\n\nRepro note: Adding an explicit flush in client (larger buffer) or disabling gzip prevents the race. Unit tests added to capture the <1024 byte final-block case for HTTP/2 streams.",
+  "resolution_notes": "Short-term mitigation: advised customer to disable client gzip and provided SDK flag to force dense format (X-Embed-Format: dense-fp32). Long-term fix: gateway patch to buffer final decompressed block until Content-Encoding flush confirmed and to validate embedding lengths before forwarding to ingest-worker. PR https://github.com/redwood-inference/serving-runtime/pull/3821 created by Priya Nair. Staging canary passed (2026-03-12). Production canary scheduled for 2026-03-13 03:00 UTC; rollback strategy documented in the linked Confluence runbook. Post-deploy actions: add monitoring alert for chunk_reassembly errors and a synthetic test that sends small-trailing-frame gzip-sparse payloads to staging/production canaries.",
+  "attachments": [
+    "s3://support-attachments/SUP-555121/gateway-trace-2026-03-10.log",
+    "s3://support-attachments/SUP-555121/repro-client.zip"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_3d50f9e61b674dae9d03f9dd3133d6d4"
+}

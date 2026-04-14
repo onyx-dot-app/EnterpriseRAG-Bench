@@ -1,0 +1,33 @@
+{
+  "title": "Slot-slicing warmup variance notes",
+  "owner": "Elara Chen",
+  "drive_area": "users",
+  "path": "users/slot-slicing-warmup-variance-notes-elara.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-04",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Ravi Kumar",
+    "Marta Alvarez"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "warmup",
+    "slot-slicing",
+    "benchmark",
+    "p99",
+    "kv-cache"
+  ],
+  "linked_artifacts": [
+    "https://redwood.atlassian.net/browse/INF-2143",
+    "https://github.com/redwood-inference/serving-runtime/pull/812",
+    "drive:charts/slot-slice-warmup-2025-11-04.png"
+  ],
+  "content": "Context / quick goal:\n- Trying to understand why cold-to-warm latency variance is high for multi-tenant pools when we attempt to pre-warm by 'slot slicing' (small warmup-only batches assigned to different logical slots on the GPU).\n- Experiment objective: 3 controls (no-slicing baseline, fixed-slice, adaptive-slice) across two arrival patterns (zipf-ish spikes, steady ramp). Measure p50/p95/p99 tail behavior during first 60s after capacity scale-up and under mixed KV-cache hit rates.\n\nHypothesis:\n- Slot-slicing reduces steady-state contention during warmup but increases variance in early p99 because slices race for kernel init + KV cache priming. Adaptive slice (grow slice size on measured latency) should trade-off and reduce p99.\n\nSetup summary (notes to self):\n- Model: open-llama-13B-ish quantized fp16 -> served with baseline kernels.\n- Fleet: 2x A100-80GB equivalent (shared test cluster on dev pool), single node per run for easier telemetry mapping.\n- Runtime flags: --continuous-batching on, --slot-slicing=[none|fixed:8|adaptive], --kv-cache-prefill=[true|false], --batch-window-ms=6\n- Workload generator: synthetic client that sends 1\u20138 request bundles (tokens 50\u2013250) with Poisson arrivals. Two scenarios:\n  * Spike: background qps 40, spike to 420 for 12s at t=10s\n  * Ramp: linear ramp 0 -> 300 qps over 30s\n- Each experiment repeated 6 times, random seed rotated, collect per-request latencies + sampling of GPU metrics every 5s.\n\nKey config variants run (note ids):\n- B0: baseline (no slot slicing, kv-cache-prefill=false)\n- B1: baseline + kv-cache-prefill=true\n- S8: fixed slice size 8 (8 logical slots), kv-cache-prefill=false\n- SA: adaptive slice, initial slice=4, grow factor=1.5, kv-cache-prefill=false\n- SA+prefill: adaptive + kv-cache-prefill=true\n\nRepresentative results (aggregated across runs; numbers are median of medians; see attached CSVs):\n\nASCII table (first 60s window):\n\n| Run    | p50 (ms) | p95 (ms) | p99 (ms) | max (ms) | QPS peak | GPU util (%) | KV hit (%) |\n|--------|----------|----------|----------|----------|----------:|--------------:|-----------:|\n| B0     | 18       | 120      | 480      | 1200     | 420       | 62           | 12         |\n| B1     | 16       | 95       | 260      | 520      | 420       | 65           | 78         |\n| S8     | 22       | 140      | 820      | 2500     | 420       | 58           | 22         |\n| SA     | 19       | 110      | 310      | 730      | 420       | 61           | 20         |\n| SA+prefill | 17   | 102      | 280      | 600      | 420       | 64           | 80         |\n\nObservations / interpretation:\n- KV cache prefill (B1, SA+prefill) is the single biggest win for p99 during cold-to-warm windows; consistent with hypothesis that priming KV items eliminates expensive mem copies and repeated kernel setups.\n- Fixed small slices (S8) worsen p99 significantly \u2014 likely due to more frequent kernel context switches and multiple independent attempts to initialize attention buffers. Max latencies (2500ms) show repeated stalls from kernel warmup + GPU page faults (see GPU logs).\n- Adaptive slice reduced worst-case p99 by ~2.6x vs S8 and approaches baseline+prefill when combined with prefill. The growth policy allowed fewer racing slice inits while retaining concurrency benefits.\n- p95 improvements were smaller; slot slicing trades median latency for isolation at high qps but only if prefill is enabled.\n- GPU util reported dips during the first 15s for S8 runs \u2014 looks like under-utilization due to per-slice throttling.\n\nRun notes / debugging traces to pull:\n- GH PR 812 includes the runtime hooks I used to toggle slice behavior; Instrumentation TODO: add per-slice kernel init timestamps (not present in current builds).\n- Attachments: drive:charts/slot-slice-warmup-2025-11-04.png (time-series p99 + KV hit), drive:csvs/slot-slice-runs-2025-11-04.csv\n- Jira INF-2143 contains the incident notes where customer pool saw p99 spikes after autoscale (useful context).\n\nQuick micro-checks I ran (manual):\n- Repeat S8 with batch-window-ms=12 -> p99 drops ~20% but p50 rises 6% (longer batch window reduces context switches).\n- Swap kernel selection to 'fallback-fast' mode -> S8 p99 improved slightly, which implies kernel selection jitter contributes to variance.\n\nOpen questions / next experiments:\n- Can we pre-warm kernels lazily (background kernel init) when autoscaler is provisioning nodes? Risks: extra memory + startup time. Idea: dedicate a tiny 'bootstrap' thread that runs a reduced synthetic forward to trigger kernel paths and KV touch.\n- Add per-slice backoff jitter to reduce synchronized races for kernel init. How to pick distribution? (log-normal vs uniform).\n- Correlate p99 spikes with memory page fault counters and driver-level 'cudaMalloc' slow paths \u2014 need deeper infra hooks.\n- Evaluate effect across heterogeneous GPUs (RTX-ish vs A100) \u2014 does fixed slicing behave worse on smaller-memory GPUs?\n\nActionable next steps (owner in parens):\n- Add per-slice kernel init tracing (Elara)\n- Prototype background kernel pre-warm worker on new nodes (Ravi)\n- Run longer 5-minute runs to see steady-state transition behavior (Marta + Elara)\n- Schedule a short sync with Runtime + SRE to review INF-2143 overlap and share artifacts (invite list: runtime, sre, solutions-eng)\n\nNotes to self / rough TODOs:\n- Compress CSVs and upload to drive, add a short deck for run leads.\n- Check crash logs on node-a3 for S8/rep3 (driver OOM warnings present).\n- If adaptive slice policy looks stable, consider a small canary on staging dedicated pools.\n\nClosing thought: slot-slicing is promising for steady isolation but it's fragile during warmup unless we either prefill caches or coordinate kernel initialization. Prefill seems the highest-ROI change with lowest runtime complexity.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_0d35b2d7d4cf417794a1225365b22921"
+}

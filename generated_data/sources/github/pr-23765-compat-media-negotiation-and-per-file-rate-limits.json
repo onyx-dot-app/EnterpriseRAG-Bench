@@ -1,0 +1,91 @@
+{
+  "repo": "redwood",
+  "pr_number": "23765",
+  "title": "compat: strict media negotiation + per-file ingestion-rate-limits for tool attachments",
+  "author": "Rohan Patel",
+  "created_at": "2026-02-28",
+  "updated_at": "2026-03-05",
+  "merged_at": "2026-03-05",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/compat-media-negotiation-file-rate-limits",
+  "reviewers": [
+    "Ava Chen",
+    "Marta Novak",
+    "Diego Alvarez"
+  ],
+  "labels": [
+    "api",
+    "compat",
+    "security",
+    "streaming",
+    "perf"
+  ],
+  "linked_linear": [
+    "ENG-2330",
+    "PM-411"
+  ],
+  "linked_jira": [
+    "SUP-981"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "812",
+  "deletions": "214",
+  "breaking_change": "false",
+  "release_notes": "Adds stricter media-type negotiation in the OpenAI-compat layer for tool/file attachments, plus configurable per-file ingestion rate limits to protect streaming and tool-call stability. No breaking changes for well-formed clients; some malformed/ambiguous uploads will now be rejected instead of auto-coerced.",
+  "description": "Context: Our OpenAI-compat layer has had recurring issues when clients upload ambiguous or binary attachments without clear content-type or length headers. These cause parsing retries, confused streaming boundaries, and occasional function_call failures when tool runtimes receive corrupted payloads. This PR introduces two complementary protections: (1) deterministic media negotiation and normalization so the compat layer always annotates attachments with a canonical content-type + checksum; (2) per-file ingestion rate limits and adaptive chunk checks to prevent slow/bursty clients from overwhelming streaming parsers and downstream tool runtimes.\n\nWhat this changes (high level):\n- Compat layer now enforces an Accept/Content-Type negotiation step for incoming attachments. Preferred content-types for tool calls are application/json (pointer/meta), application/octet-stream (binary payloads), and multipart/form-data for multi-part uploads. Ambiguous cases (e.g. text/plain without charset for likely binary data) are rejected with a 400 and a clear error that lists accepted types.\n- Attachments without a declared content-type will trigger a lightweight sniff: if first 512 bytes look like UTF-8 JSON/text we label application/json or text/plain; otherwise we label application/octet-stream. Sniffing is deterministic and logged for audits.\n- Each file stream now carries an enforced per-file ingress rate limit (configurable per-customer and per-route). By default set to 4 MB/s for hosted API and 8 MB/s for Dedicated. Exceeding the rate returns a 429 with Retry-After and a hint header (X-File-Rate-Limit).\n- For streaming uploads we added a small windowing protocol: the compat proxy tolerates out-of-order chunk arrival within a 500ms reorder window, but rejects incremental chunks that lack proper boundary markers when rate limits are tripped. This significantly reduces repeated partial-parsing in the serving runtime.\n- For function/tool calls that reference files, we now require file metadata (content_type, size, sha256) in the function_call arguments. If missing, the compat layer computes sha256 and injects metadata before handing to the tool runtime. This prevents tool runtimes from having to re-read streams and reduces platform I/O.\n\nWhy this is safe and backward compatible:\n- Well-formed clients that already send content-type and standard multipart/form-data will be unaffected.\n- Clients that relied on opaque coercion of text/plain->binary will now get a clear error and guidance to set Content-Type or wrap the file as base64 in JSON. The error message includes a one-line migration hint to keep developer friction low.\n\nTests & validation included:\n- Unit tests for negotiation logic, sniff heuristics, and sha256 injection.\n- Integration tests that exercise multipart uploads, chunked transfer-encoding streams, and slow-client scenarios using our perf-canary harness.\n- End-to-end tests: function_call with file refs across redwood (compat) -> runtime -> tool-invoker. Added a compatibility matrix test that runs against a matrix of SDK versions (python:1.x/2.x, ts:1.x) to ensure we don't regress client expectations.\n\nChecklist: \n- [x] Implement negotiation + sniffing code in compat proxy\n- [x] Add per-file rate-limiter middleware with config knobs on route/customer level\n- [x] Compute and inject file metadata (sha256, content_type) for function_call refs\n- [x] Add logging + audit events for sniffing decisions\n- [x] Add unit/integration/e2e tests\n- [x] Update docs/compat-guide (short migration blurb)\n\nRelated: ENG-2330 (rate limiting webhooks influenced design), PM-411 (docs/migration text), SUP-981 (customer incident that motivated stricter errors).",
+  "commits": [
+    "b1e9c5f: compat: add media negotiation runner and sniff heuristics",
+    "9f4a8d2: middleware: per-file rate limiter + config hooks",
+    "6c7d3a1: inject: compute sha256 for files referenced in function_call payloads",
+    "2a4b7e9: tests: add e2e compat matrix and slow-client scenarios",
+    "d8f1a0b: docs: compatibility guide and migration hint"
+  ],
+  "changed_files": [
+    "services/compat/proxy/media_negotiation.go",
+    "services/compat/proxy/rate_limiter.go",
+    "services/compat/handler/function_call_normalizer.go",
+    "services/compat/tests/compat_matrix_test.go",
+    "services/compat/tests/slow_client_e2e.test",
+    "docs/compatibility/attachments.md",
+    "pkg/audit/events/attachment_sniffed_event.go",
+    "pkg/observability/metrics/attachment_rate_metrics.prom",
+    "pkg/serving/runtime/file_ingest_validator.go",
+    "examples/compat/attachment_migration_snippet.md",
+    "infra/config/defaults.yaml",
+    "sdk/python/examples/file_call_example.py"
+  ],
+  "diff_snippets": [
+    "--- a/services/compat/proxy/media_negotiation.go\n+++ b/services/compat/proxy/media_negotiation.go\n@@ -12,6 +12,22 @@\n func negotiate(r *http.Request) (string, error) {\n+    // prefer explicit header\n+    ct := r.Header.Get(\"Content-Type\")\n+    if ct != \"\" {\n+        return normalize(ct), nil\n+    }\n+    // fallback to first-512-bytes sniff\n+    buf := make([]byte, 512)\n+    n, _ := io.ReadFull(r.Body, buf)\n+    r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), r.Body))\n+    if looksLikeJSON(buf[:n]) { return \"application/json\", nil }\n+    return \"application/octet-stream\", nil\n }",
+    "--- a/services/compat/proxy/rate_limiter.go\n+++ b/services/compat/proxy/rate_limiter.go\n@@ -1,6 +1,28 @@\n+// per-file rate limiter: default 4MB/s hosted, 8MB/s dedicated\n+type FileRateLimiter struct {\n+    limitBytesPerSec int64\n+}\n+\n+func (l *FileRateLimiter) Allow(stream io.Reader) error {\n+    // token-bucket style window. if exceeded return ErrRateLimit\n+}\n",
+    "--- a/services/compat/handler/function_call_normalizer.go\n+++ b/services/compat/handler/function_call_normalizer.go\n@@ -7,6 +7,22 @@\n func normalizeFunctionCall(req *CompatRequest) error {\n+    for _, f := range req.FileRefs {\n+        if f.Sha256 == \"\" {\n+            f.Sha256 = computeSha256(f.Stream)\n+            // attach size and content_type if missing\n+            if f.ContentType == \"\" { f.ContentType = sniffContentType(f.Stream) }\n+        }\n+    }\n     return nil\n }"
+  ],
+  "review_conversation": [
+    "Ava Chen (reviewer): Please add a short migration note in docs/compatibility that callers should set Content-Type or base64-encode ambiguous files. Also call out default rate limits for Hosted vs Dedicated.",
+    "Rohan Patel (author): Added docs/compatibility/attachments.md and included default values in infra/config/defaults.yaml. I also added audit events when sniffing is used so we can count how often clients omit Content-Type.",
+    "Marta Novak (reviewer): Reasonable. Please add a unit test that specifically asserts that text/plain short snippets are not misclassified as binary when the first bytes are ASCII but content-length is > 1MB.\n",
+    "Rohan Patel (author): Added TestSniffLargeAsciiInBinary to services/compat/tests/sniff_test.go and updated the heuristics to consider size heuristics for ASCII-only streams. CI green after change.",
+    "Diego Alvarez (approver): Verified e2e with dedicated config. Metrics look stable and there is a small perf win from avoiding re-reads in runtime. Approving for squash-merge."
+  ],
+  "ci_checks": [
+    "unit-tests: pass",
+    "integration-e2e: pass",
+    "compat-matrix: pass",
+    "lint: pass",
+    "perf-canary: pass"
+  ],
+  "merge_method": "squash",
+  "testing_summary": [
+    "Unit: 72 new tests covering sniff heuristics, edge cases for content-type absence, and per-file limiter behavior (including burst and slow-client tests).",
+    "Integration: multi-part uploads + streaming chunk reorder scenarios exercised in a mock runtime that simulates slow disk and intermittent network.",
+    "E2E: compatibility matrix runs across python/ts SDK versions and a Dedicated profile run validating higher default rate-limit."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes",
+    "review_conversation"
+  ],
+  "dataset_doc_uuid": "dsid_5c1e3a5f44c345ccb96e4159252eb660"
+}

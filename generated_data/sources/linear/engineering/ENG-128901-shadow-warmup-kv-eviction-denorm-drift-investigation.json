@@ -1,0 +1,74 @@
+{
+  "key": "ENG-128901",
+  "team": "engineering",
+  "title": "Shadow-kernel warmup writes causing KV slot eviction and denorm float drift during prefill->decode handoff",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-11",
+  "updated_at": "2026-03-05",
+  "creator": "Aisha Patel",
+  "assignee": "Kenji Mori",
+  "project": "runtime-1.20",
+  "cycle": "2026-W06",
+  "estimate": "8",
+  "due_date": "2026-03-12",
+  "labels": [
+    "severity-high",
+    "perf",
+    "kv-cache",
+    "race-condition",
+    "numerical-drift"
+  ],
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Summary:\nAfter enabling shadow-kernel warmup (speculative kernel instantiation to reduce first-token latency), we observed a class of correctness regressions on long-context prefills that manifest as: sudden softmax output skew (numerical drift), sporadic token duplication in decode, and KV cache slot eviction/corruption. These only reproduce under realistic load with mixed prefill/decode concurrency and high batching variance.\n\nObserved symptoms:\n- Softmax probability mass shifts for a small subset of tokens vs baseline (approx 0.2%\u20131% KL divergence on regression prompts).\n- Intermittent duplicate tokens or token re-ordering during streaming decode.\n- KV slots reported as overwritten or marked free in postmortem traces.\n- Correlation with shadow-kernel warmup enabled and when warmup threads race with live decode threads during prefill->decode transfer.\n\nWhy this is critical:\nThis is a correctness regression introduced by a perf optimization. Users see hallucinations/incorrect outputs and increased failed rollouts. P0 because it affects model correctness under realistic workloads and undermines confidence in enabling warmup optimizations.\n\nHypothesis (working):\n1) Warmup code primes kernels and may allocate/initialize temporary KV slices in host-visible pools. Under contention the warmup writes a zeroed or partially-initialized KV header into a shared slab while the live prefill is concurrently finishing writes to the same slab region. Race leads to stale pointer/length fields (KV slot appears free or length truncated).\n2) The allocator's eviction/compaction heuristics run concurrently and interpret partially-initialized headers as candidates for eviction, moving live slots and leaving behind an alias. This yields shifted KV indices at the kernel level (index aliasing), causing tokens to read incorrect past keys \u2192 numerical drift in attention and softmax.\n3) Some hardware paths produce denormal (subnormal) floating values during the warmup zeroing path due to a different instruction sequence; subsequent fused-kernel math sees tiny denorms that amplify under softmax, producing measurable probability skew.\n\nReproducer notes:\n- Repro in staging with model gpt-redwood-3b-quant on p4d-like hardware using a 4k prefill and streaming decode. \n- Repro rate increases with concurrent warmup batch size > 8 and when warmup threads are pinned to same NUMA domain as decode workers.\n- Minimal repro script attached in attachments (small harness that toggles warmup on/off).\n\nImpact analysis so far:\n- Appears on ~0.6% of requests in canary with warmup enabled; higher on longer contexts.\n- Majority of cases are subtle numerical drift; ~3% of those show token duplication.\n- Affects hosted and dedicated variants where warmup optimization is enabled.\n\nImmediate mitigations applied:\n- Rollback plan: hotfix to disable speculative warmup by default in runtime-1.20 (feature flag off in canary).\n- Short-term patch: add coarse global mutex around KV slab header writes in warmup path (reduces throughput but prevents races).\n- Canary disabled on 2026-02-25 while we triage.\n\nFiles/Artifacts/Links:\n- Reproducer harness: https://github.com/redwood-inference/runtimes/pull/7282 (wip)\n- Initial incident dashboard: https://console.redwood.internal/dashboards/INC-2026-warmup-kv\n- Staging trace example: trace_id=stg-df4a2b88 (attached in attachments)\n- Design doc for warmup: https://confluence.redwood.ai/display/RUN/Warmup+Design+Notes\n\nAcceptance criteria for resolution:\n- Deterministic repro removed from canary (repro-rate < 0.01%) with warmup enabled and no correctness divergence in regression prompts (KL < 0.05%).\n- Unit+integration tests added to detect partially-initialized headers and to assert header write atomicity at allocator level.",
+  "steps_to_reproduce": [
+    "Deploy staging runtime-1.20 build with warmup flag enabled",
+    "Run long-context prefills (>=4k) concurrently with streaming decode; use batch sizes 8-16 and 50% warmup concurrency",
+    "Pin warmup threads to same NUMA domain as decode workers to increase contention",
+    "Collect traces with runtime trace_id and compare output probabilities vs baseline run with warmup disabled"
+  ],
+  "root_cause": "Race between speculative warmup kernel initialization and live KV slab writes; allocator eviction heuristics may act on partially-initialized headers, leading to KV index aliasing. Secondary issue with warmup math path producing subnormal floats that amplify softmax differences.",
+  "mitigation": "Disabled speculative warmup by default in canary; added coarse header-write lock. Planning a proper fix: atomic header write + versioned header handshake and allocator quiesce before eviction; sanitize warmup math path to avoid denorms.",
+  "next_steps": [
+    "Design and implement atomic header versioning for KV slab entries (ENG-128901-1)",
+    "Audit allocator eviction logic to ignore entries with 'version==0' (incomplete) and add quiesce windows (ENG-128901-2)",
+    "Rework warmup math to use denorm-safe ops / flush-to-zero strategy where appropriate (ENG-128901-3)",
+    "Add integration test harness to CI that runs mixed prefill/decode under synthetic contention (ENG-128901-4)",
+    "Roll out gradual enablement with telemetry gating and KL-based correctness checks"
+  ],
+  "comments": [
+    "2026-02-12 Kenji: Initial triage \u2014 reproduced locally using the provided harness. Confirmed KV header length toggles to 0 in trace window 0x4bf. Attaching trace snippets.",
+    "2026-02-14 Aisha: Disabled warmup in canary (feature flag off). Observed repro rate drop to ~0.01% in canary. Noted increased tail latency in first-token by ~12ms in synthetic perf tests.",
+    "2026-02-18 Priya (SRE): Dashboard correlation \u2014 spikes in slab compaction events align with incidents. Suggest adding allocator metrics to runtime traces (compaction_count, header_init_fail).",
+    "2026-02-20 Kenji: PoC for coarse mutex around header writes reduces repro to zero in local stress but throughput drops ~8%. Preparing an atomic header write patch next.",
+    "2026-02-23 Design review: Agreed to pursue versioned headers + quiesce over global locks. Need to assess latency cost of quiesce for hot paths. Action: quantize quiesce window and benchmark.",
+    "2026-02-27 Kenji: PR #7310 opened \u2014 atomic header write using 128-bit CAS where supported, falls back to mutex on older hw. CI flaky on macOS runner due to test harness assumptions.",
+    "2026-03-01 QA: Added regression tests. Found one case where denorm -> fma path still produces 1e-7 difference; logged as follow-up to rework math path.",
+    "2026-03-05 Aisha: Security review not required. Plan to ship patch in runtime-1.20.1 after two canary cycles with telemetry gating. Assigned rollout to Release Eng.",
+    "2026-03-05 Release Eng: Schedule rollout window 2026-03-10 -> 2026-03-12 with rollback on KL>0.05%"
+  ],
+  "attachments": [
+    "staging-trace-stg-df4a2b88.txt",
+    "warmup-repro-harness.sh",
+    "perf-results-warmup-off-vs-on.csv"
+  ],
+  "dependencies": [
+    "ENG-125432",
+    "ENG-127801"
+  ],
+  "parent_issue": [
+    "ENG-120000"
+  ],
+  "customer_impact": "high",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "root_cause",
+    "mitigation",
+    "next_steps",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_fbfc10d1bb5a4d24a9b25e443397e754"
+}

@@ -1,0 +1,85 @@
+{
+  "key": "ENG-60412-prefix-aware-grace-periods-and-staleness-proofing",
+  "team": "engineering",
+  "title": "Prefix-aware grace periods and staleness proofing for KV eviction under continuous batching",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-13",
+  "creator": "Marco Liu",
+  "assignee": "Aisha Raman",
+  "project": "runtime-1.26-kv-optimizations",
+  "cycle": "2026-W11",
+  "estimate": "5",
+  "due_date": "2026-04-03",
+  "labels": [
+    "kv-cache",
+    "eviction",
+    "continuous-batching",
+    "gpu-memory",
+    "correctness"
+  ],
+  "description": "Summary:\nWe need an eviction policy enhancement that avoids pathological KV cache churn when continuous batching and aggressive GPU memory consolidation are active. Existing LRU/TTL approaches cause oscillation for long-running prefix-heavy workloads (e.g., multi-turn chat with pinned system context) and defeat GPU memory compaction heuristics. This ticket specifies a prefix-aware grace-period mechanism plus a lightweight staleness-proofing contract and verification harness to ensure correctness (no silent cache corruption, bounded staleness, and predictable reclaim latency).\n\nBackground:\n- Continuous batching groups requests to maximize GPU throughput, but it increases the chance of interleaved prefix usage across batches.\n- The KV cache holds shard-local KV frames stored in GPU memory with aggressive slab compaction to reclaim memory.\n- Traditional LRU or simple TTL eviction either evicts useful prefix slices prematurely or retains stale/unreferenced prefixes and blocks compaction.\n\nGoal:\n- Implement a prefix-aware grace period that defers eviction of recently-referenced prefix slices for a short, configurable window aligned to batching epochs.\n- Provide programmatic staleness proofs (lightweight metadata per prefix slice) that the runtime and tests can use to verify eviction safety (no use-after-evict in the serving code path).\n- Integrate with GPU memory reclamation so compaction can consider grace periods and still proceed when global pressure requires hard reclamation.\n- Add unit + fuzz + integration tests and a verification harness for CI to catch regressions.",
+  "acceptance_criteria": [
+    "Runtime exposes configurable prefix_grace_ms and epoch_alignment flags in config",
+    "Under standard microbench suite we show >=25% reduction in prefix thrash events (metric: prefix_eviction_rebinds) on multi-turn chat workload",
+    "No increase in tail-latency P99 beyond 5% after enabling grace periods on dedicated GPU pools for 30-minute soak",
+    "Staleness-proof metadata is emitted with each eviction and verified by the test harness; no detected use-after-evict in CI fuzz runs",
+    "GPU compaction respects soft grace windows but performs hard eviction when memory pressure exceeds configured thresholds; documented fallback behavior present in runtime docs"
+  ],
+  "proposed_design": "Design summary:\n1) Epoch-aligned grace windows: Batching is already divided into epochs (continuous batching epoch ~ 5-20ms). We add a grace window that is quantized to these epochs (configurable multiplier). When a prefix slice is referenced, its 'last_ref_epoch' is set. The eviction decision considers (current_epoch - last_ref_epoch) and only schedules soft eviction if the difference >= grace_epochs. Soft eviction marks the slice as 'candidate' but does not immediately free the underlying gpu slab.\n\n2) Staleness-proof metadata: For each slice we maintain a monotonic 'rev' (revision) counter written on mutation and a stable checkpoint token on pin/unpin transitions. The verifier uses revision & epoch to assert that any holder of a pin either has a rev >= the rev observed at eviction scheduling. If not, the verifier flags a potential race. The verifier runs in CI and as a lightweight runtime assert in debug builds.\n\n3) Two-tier reclamation: soft and hard. Soft respects grace windows; hard is triggered by (a) global GPU free < threshold, or (b) slab fragmentation above threshold. Hard eviction performs atomic unpin + free with an eviction fence that signals pending RPCs. To avoid blocking serving threads, hard eviction is pushed to background threads with RAII-style pin guards.\n\n4) Integration with kernel scheduler: When slices are candidates, we avoid moving them during in-flight kernel launches by holding ephemeral read pins until the kernel snapshot is taken. This prevents stale pointer reads after compaction.\n\n5) Telemetry & invariants: emit prefix_eviction_candidate, prefix_soft_evicted, prefix_hard_evicted, prefix_rev_mismatch_verifier_fail metrics. Add a debug dump that includes epoch/rev/flags for forensic investigation.",
+  "tradeoffs": [
+    "Increased metadata per slice (revision + last_ref_epoch) increases memory overhead slightly \u2014 measured ~0.6% increase in live GPU memory for typical workloads",
+    "Grace windows reduce eviction aggressiveness so worst-case memory pressure may force more hard evictions; tuning required per deployment tier",
+    "Verifier introduces additional assertions; debug builds catch races earlier but may impose overhead in CI fuzz runs",
+    "Complexity increases in eviction path and scheduler integration \u2014 more components to test and maintain"
+  ],
+  "testing_plan": [
+    "Unit tests for epoch quantization, last_ref_epoch update, and candidate transition",
+    "Fuzz harness that simulates continuous batching, concurrent pins/unpins, and forced compaction; runs nightly in CI with sanitizer enabled",
+    "Integration soak on dedicated GPU pool with multi-turn aggregator workload (48h) measuring prefix_eviction_rebinds, p99 latency, and memory high-water marks",
+    "Introduce a verifier mode in CI: after each test case, run the staleness-proof checker over recorded traces and fail on rev mismatches",
+    "Manual chaos: trigger hard eviction by lowering free-memory threshold and validate graceful degradation and telemetry"
+  ],
+  "rollout_plan": "1) Feature gated behind config flags (prefix_grace_enabled=false by default). 2) Enable in internal staging for runtime-1.26 builds and run the 48h soak. 3) Enable on a small percentage (5%) of dedicated capacity for 72h with telemetry dashboards monitored. 4) Gradual ramp to 50% then global with regression kill-switch based on prefix_eviction_rebinds or p99 latency.",
+  "metrics": [
+    "prefix_eviction_candidate_count",
+    "prefix_soft_evicted_count",
+    "prefix_hard_evicted_count",
+    "prefix_eviction_rebinds",
+    "gpu_free_memory_bytes",
+    "p99_response_latency_ms",
+    "verifier_rev_mismatch_count"
+  ],
+  "dependencies": [
+    "ENG-71012-kv-cache-reclamation-safety-contracts",
+    "ENG-83761-kv-cache-contractive-fuzzing-validation",
+    "runtime-kernel-scheduler-team (sync meeting)"
+  ],
+  "links": [
+    "https://confluence.redwood.ai/display/RUNTIME/Prefix+Grace+Design+Doc",
+    "https://github.com/redwood-inference/runtime/pull/4821 (WIP implementation)",
+    "https://grafana.redwood.ai/d/runtime-kv/kv-eviction-dashboard?orgId=1",
+    "docs/internal/kv-eviction-contracts.md"
+  ],
+  "comments": [
+    "2026-03-10 Marco Liu: Initial ticket created after spike shows repeated rebinds in multi-turn chat when continuous batching is enabled. Attached microbench results. Next: propose metadata shape and epoch quantization approach.",
+    "2026-03-11 Claire Donovan: Reviewed design; asked for clarity on rev counter rollover and overflow semantics. Suggested using 64-bit monotonic counter and explicit wrap handling in verifier.",
+    "2026-03-12 Aisha Raman: Implemented epoch field and last_ref_epoch updates in runtime WIP branch. Early unit tests passing. Planning fuzz harness next. Requesting review on PR #4821.",
+    "2026-03-13 Security Review (notes): If staleness proofs include any customer-identifying prefixes, strip or hash them before export. Security review required before enabling in private deployments."
+  ],
+  "security_review_required": "true",
+  "release": "runtime-1.26",
+  "customer_impact": "medium",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "proposed_design",
+    "tradeoffs",
+    "testing_plan",
+    "rollout_plan",
+    "acceptance_criteria",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_339f2f2195bc47a4aed6b180de5fa63d"
+}

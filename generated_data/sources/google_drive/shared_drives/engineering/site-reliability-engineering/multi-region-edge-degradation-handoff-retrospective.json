@@ -1,0 +1,99 @@
+{
+  "title": "Multi-region edge degradation handoff retrospective",
+  "owner": "Ava Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/site-reliability-engineering/multi-region-edge-degradation-handoff-retrospective",
+  "doc_type": "doc",
+  "created_at": "2025-11-03",
+  "last_modified": "2025-11-05",
+  "collaborators": [
+    "Marcus Patel",
+    "Lena Ortiz",
+    "Tom\u00e1s Garc\u00eda",
+    "Elliot Nguyen"
+  ],
+  "team": "eng-sre",
+  "status": "in_review",
+  "tags": [
+    "multi-region",
+    "failover",
+    "dns",
+    "traffic-shift",
+    "warm-standby",
+    "runbook",
+    "postmortem"
+  ],
+  "linked_artifacts": [
+    "JIRA:SRE-4321",
+    "https://github.com/redwood-inference/infra/pull/298",
+    "confluence:multi-region-failover-playbook-2025",
+    "slack:#sre-incident-2025-11-02"
+  ],
+  "summary": "On 2025-11-02 we observed progressive degradation across an edge POP (eu-west-2-edge-3) that manifested as elevated 502/504 rates and increased token latency for a subset of hosted API endpoints. Traffic was automatically weight-shifted toward the warm-standby region (eu-central) via our routing layer and Route53 weighted records. The automatic handoff worked but exposed gaps: our kvcache preseed process was incomplete, causing a spike in cold-cache misses and doubling tail latency for warm-standby replicas. The provider-level route flaps exacerbated control-plane noise and a mis-set autoscaler cooldown prevented timely scale-up of dedicated nodes, contributing to sustained user-impact for ~28 minutes.",
+  "incident_timeline": [
+    "2025-11-02T09:12Z: First alert \u2014 5xx rate increase from eu-west-2-edge-3 POP (monitoring: api-5xx-rate > 3x baseline)",
+    "2025-11-02T09:14Z: SRE on-call paged; quick triage shows BGP adjacencies flapping at edge provider for that POP",
+    "2025-11-02T09:17Z: Automated routing policy reduced weight to eu-west primary and shifted ~60% traffic to eu-central warm-standby",
+    "2025-11-02T09:18Z: Heatmap shows cache miss rate spike on eu-central replicas (kvcache miss rate +240%)",
+    "2025-11-02T09:22Z: Manual increase of weight to eu-central to protect user traffic; however, autoscaler cooldown prevented node spin-up until 09:30Z",
+    "2025-11-02T09:30Z: Nodes in eu-central came up, but initial request latency remained elevated due to cold KV loads",
+    "2025-11-02T09:40Z: Steady-state restored; routing weights gradually moved back over next 20 minutes as edge POP stabilized",
+    "2025-11-02T10:05Z: Post-incident ops call initiated; mitigation actions documented"
+  ],
+  "impact": "Approximately 18% of global requests experienced >=2x tail latency for the ~28 minute interval. About 3 enterprise customers reported degraded throughput on integration tests; no data loss. Internal SLIs affected: p95 latency, error-rate SLO burn (short window).",
+  "root_cause_analysis": "Primary trigger: provider-level BGP instability at a single edge POP causing intermittent egress failures and elevated 502/504 responses. Secondary factors increased customer-visible impact: 1) Warm-standby replicas were not fully warmed (kvcache preseed incomplete), so weight-shift caused large cold-cache pressure; 2) Autoscaler cooldown and min-replica floor configuration prevented fast vertical capacity addition in warm region; 3) DNS TTLs and Route53 propagation were set conservatively, leading to uneven distribution during automated weights change. Additionally, our healthcheck aggregation window hid early signs of degradation because a minority of POPs were failing but cluster-level aggregation threshold was not sensitive enough.",
+  "mitigations": [
+    "Immediate: Manually adjust Route53 weights to move traffic away from affected POP while preserving session affinity for critical customers",
+    "Immediate: Triggered ad-hoc kvcache preseed job to prime hot keys in eu-central (short-term fix)",
+    "Short-term: Lowered autoscaler cooldown and adjusted min-replica floor for warm-standby to allow faster scale-up during handoffs",
+    "Long-term: Work with edge provider to get BGP adjacencies stabilized and demand better incident transparency"
+  ],
+  "runbook_draft": "Objective: provide a concise, operator-friendly series of steps for a region-level edge degradation that requires shifting traffic to warm-standby. Preconditions: warm-standby region health checks passing (healthcheck >= 99.5%), kvcache seeds available, runbook IAM role. Steps: 1) Confirm degradation is localized to a POP/region (check edge-pop-5xx metric by POP). 2) Validate warm-standby readyness: check kvcache hit-rate, node CPU, disk I/O, and 'warm-standby-ready' tag on instances. 3) If automatic route weight policy triggers, monitor kvcache miss rate in warm region; if miss rate > 150% baseline, trigger preseed. 4) Run kvcache preseed: trigger job id 'preseed-<timestamp>' and monitor unfinished keys; wait until hot key miss rate falls below threshold. 5) Adjust DNS/route weights gradually: test 10% increments every 2 minutes and verify p95/p99 latency and error-rate signals. 6) If latency remains elevated after 3 increments, pause and scale up replicas manually. 7) Once steady-state achieved, document exact weights and times and notify CS for customer comms. 8) Post-incident: run the kvcache integrity check and create follow-up tickets for any keys that failed to preseed. Notes: prefer weight adjustments over single-step failovers, keep DNS TTL at 30s for critical records during incident windows, snapshot kv seeds before drastic traffic shifts.",
+  "playbook_commands": [
+    "# check POP-level 5xx by POP\nkubectl --context=prod exec -it deploy/edge-metrics -- curl -s http://localhost:9090/api/v1/query?query=pop_5xx_rate",
+    "# manual Route53 weighted change (example)\naws route53 change-resource-record-sets --hosted-zone-id Z12345 --change-batch '{\"Changes\": [{\"Action\": \"UPSERT\", \"ResourceRecordSet\": {\"Name\": \"api.redwood.ai\", \"Type\": \"A\", \"SetIdentifier\": \"eu-central-weight\", \"Weight\": 700, \"TTL\": 30, \"ResourceRecords\": [{\"Value\": \"203.0.113.10\"}]}}]}'",
+    "# trigger kvcache preseed job\n./ops/bin/preseed_kvcache --region eu-central --job-id preseed-$(date +%s)",
+    "# check preseed progress\nkubectl -n infra logs job/preseed-<id> --follow",
+    "# scale replica set in warm region\nkubectl --context=eu-central scale rs/api-serving --replicas=8",
+    "# quick healthcheck to a sample host\ncurl -v https://eu-central-api-1.redwood.ai/health | jq .status",
+    "# reduce autoscaler cooldown (temporary)\n./ops/bin/update-autoscaler --policy serving --region eu-central --cooldown 30s"
+  ],
+  "monitoring_metrics": [
+    "api.pop.5xx_rate (by POP)",
+    "kvcache.miss_rate (region)",
+    "serve.p95_latency (region)",
+    "node.cpu_utilization (region)",
+    "autoscaler.pending_pod_count",
+    "route.propagation_delay",
+    "route.weighted_shift_events"
+  ],
+  "action_items": [
+    "(Ava) Update multi-region failover runbook to include explicit preseed checklist and example commands \u2014 due 2025-11-12",
+    "(Marcus) Add POP sensitivity to aggregated healthchecks so alerts trigger on minority-POP failures \u2014 due 2025-11-19",
+    "(Lena) Work with provider account manager to request BGP root-cause details and SLA credits for the affected POP \u2014 due 2025-11-10",
+    "(Tom\u00e1s) Implement an automated preseed trigger in the routing controller when weight shift > 30% \u2014 due 2025-12-01",
+    "(Elliot) Run a chaos test simulating POP-level egress failures and validate warm-standby performance under load \u2014 schedule by 2025-12-15"
+  ],
+  "retrospective_notes": "Key takeaway: automated routing policies do the right thing by protecting customers quickly, but they surface downstream capacity and cache priming issues that produce secondary user-visible pain. We should move from reactive to proactive: automated preseed + conservative ramping + improved pop-level sensitivity in alerts. Communication: improve CS templating for short-duration latency incidents so customers see consistent messaging. Also revise SRE on-call runbooks to emphasize pre-checks for warm-standby readiness before increasing weight beyond a small step.",
+  "reference_links": [
+    "https://status.edge-provider.example/incidents/2025-11-02",
+    "https://confluence.redwood.ai/pages/viewpage.action?pageId=42342 (previous warm-standby runbook)",
+    "JIRA:SRE-3987 (kvcache preseed infra work)",
+    "https://grafana.redwood.ai/d/abcd1234/multi-region-svc-overview?orgId=1"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "incident_timeline",
+    "impact",
+    "root_cause_analysis",
+    "mitigations",
+    "runbook_draft",
+    "playbook_commands",
+    "monitoring_metrics",
+    "action_items",
+    "retrospective_notes",
+    "reference_links"
+  ],
+  "dataset_doc_uuid": "dsid_cee474d35ec14c55a78a3165b22293cb"
+}

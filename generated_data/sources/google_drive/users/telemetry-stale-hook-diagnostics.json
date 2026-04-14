@@ -1,0 +1,33 @@
+{
+  "title": "Telemetry stale hook diagnostics",
+  "owner": "Samir Gupta",
+  "drive_area": "users",
+  "path": "users/telemetry-stale-hook-diagnostics.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-03",
+  "last_modified": "2025-11-06",
+  "collaborators": [
+    "Marco Alvarez",
+    "Li Wang"
+  ],
+  "team": "eng-observability",
+  "status": "draft",
+  "tags": [
+    "tracing",
+    "ingest",
+    "firehose",
+    "debug",
+    "metrics"
+  ],
+  "linked_artifacts": [
+    "OBS-4821",
+    "https://github.com/redwood-inference/observability/pull/782",
+    "confluence:obs-hooks-arch"
+  ],
+  "content": "Context:\n- Intermittent period (~03:12\u201303:18 UTC) where tracing hooks and a subset of telemetry metrics went 'stale' for customer-facing routes. Grafana panel showed a sharp drop in `tracehook.received` and `tracehook.latency` while application logs still carried normal request rates.\n- Suspected regression after the forwarder batcher change deployed 2025-11-02 (PR 782).\n\nSymptoms observed:\n- Dashboard (panel id: traces-main) shows ~80% drop in tracehook ingestion for a 6 minute window.\n- Loki query for hook-forwarder container shows repeated \"batch send retry\" lines starting at 03:11:48 UTC.\n- Sentry alert: SENTRY-obs-12345 triggered: \"hook-forwarder: API 503 spike\".\n- Some traces arrive delayed (10s\u201340s) after the request; others don't appear at all.\n\nReproduction approach tried (local/in-cluster):\n1) Replay minimal synthetic traffic to the hook endpoint:\n   curl -v -H \"X-Trace-Context: t=abc123;span=1\" http://obs-collector.internal/v1/hooks/test -d '{\"event\":\"ping\"}'\n   -> Observed 202 Accepted quickly when run from ingress-side pod; when run from forwarder pod namespace result sometimes 504.\n\n2) Tail forwarder logs while replaying:\n   kubectl -n observability logs -f deploy/hook-forwarder -c forwarder | grep -i send\n   Sample output: \"WARN 2025-11-03T03:11:50Z batcher.go:186: send attempt failed: upstream 503, retrying (1/5)\"\n\n3) Check queue depth metrics (promql):\n   rate(hook_forwarder_queue_length[1m]) => spike from 12->240 between 03:10 and 03:12\n   histogram_quantile(0.99, sum(rate(hook_forwarder_send_duration_seconds_bucket[5m])) by (le)) => tail latency moved from 120ms to 2.8s\n\n4) Simple tcpdump on forwarder pod to verify network egress:\n   kubectl exec -it pod/hfwd-57 -- tcpdump -nn -s0 -A port 443 and host upstream-ingest.api | sed -n '1,120p'\n   Result: TLS handshake established for some batches; several attempts show \"RST\" from upstream.\n\nObserved error snippets (collected):\n- forwarder logs:\n  \"ERROR batcher: failed to flush 238 events: rpc error: code = Unavailable desc = connection closed\"\n  \"WARN 2025-11-03T03:12:01Z batcher.go:162: send attempt failed: upstream 503, retrying (2/5)\"\n- ingestion upstream (partial):\n  \"2025-11-03T03:12:02Z WARN http: timeout waiting for request body\"\n- occasional Python stack (from test harness):\n  Traceback (most recent call last):\n    File \\\"/app/ingest_worker.py\\\", line 218, in flush_batch\n      resp = session.post(url, json=payload, timeout=6)\n  requests.exceptions.ReadTimeout: HTTPSConnectionPool(host='upstream-ingest.api', port=443): Read timed out.\n\nHypotheses (ranked):\n1) Upstream (ingest) had a brief partial outage (503s, RSTs) and forwarder batcher queue grew, causing sampling/backpressure to drop traces. The new batcher retry behavior amplified the effect.\n2) TLS or load-balancer connection churn (RST) resulted in retry storms that overwhelmed a small pool of connections in forwarder -> upstream path.\n3) Regression in PR 782: batched send size increased and triggered upstream request timeouts under load, leading to drops rather than graceful backoff.\n4) Misconfigured healthcheck or aggressive circuit-breaker in upstream that started rejecting batched pushes at scale.\n\nCommands/data that support/contradict each hypothesis:\n- Support for 1 & 2: cluster TCP RSTs + upstream 503s in logs. queue_length spike aligns with the time window.\n- Contradict 1: some individual batches did succeed fast; not a complete outage. Points to partial degradation.\n- Support for 3: PR 782 changed default batch size from 32 -> 128 and reduced per-batch timeout from 10s -> 6s. This correlates with observed ReadTimeout exceptions.\n\nQuick checks to run next (prioritized):\n- Roll-forward a tiny revert of PR 782 in staging (set batch_size=32, timeout=10) and replay the 30s spike to verify latency and queue behavior.\n- Add a temporary circuit-breaker metric and per-batch telemetry in forwarder (batch_size, payload_bytes, attempt_count) if not already emitted.\n- Run `curl --resolve` to force requests through specific upstream LB node to reproduce RST behavior.\n- Query JAeger for traces with missing child spans: `traceid:*` filter for times 03:10\u201303:20 and count span gaps.\n\nImmediate mitigation applied during incident (notes):\n- Rolled traffic to alternate ingest region for ~20m at 03:20 UTC; traces partly recovered.\n- Manually lowered forwarder batch_size to 64 for the hot path at 03:28 UTC.\n- Alert rule adjusted: `tracehook.received` threshold decreased to reduce noisy pages.\n\nLonger-term actions / follow-ups:\n- Backfill telemetry: ensure per-batch telemetry is captured (size, resp_code, attempts) and retained for 7d.\n- Add regression test in CI that replays variable batch sizes against a flaky upstream mock to catch similar timeouts.\n- Review PR 782 behavior: consider adaptive batch sizing (reduce size on 5xx) and exponential backoff with jitter.\n- Run a canary of the forwarder change across 1% of traffic for 48h before wider rollout.\n\nNotes to self / breadcrumbs for followup debugging:\n- Check LB health logs for 03:09\u201303:20 in prod-frontend, prod-ingest-01.\n- Confirm whether any deploys to upstream-ingest occurred in the same window (deploy tags).\n- Ask infra: were there noisy GC/OOM events on any upstream nodes?\n- Attach full forwarder log slice and tcpdump pcap to OBS-4821.\n\nUnresolved questions:\n- Why did some batches succeed while others got RSTs? (hint: likely per-connection limits on LB or per-client throttling)\n- Does the upstream service treat large batched payloads differently (e.g., route to a worker pool with lower capacity)?\n\nTL;DR: brief window of upstream instability + a larger batch size + reduced timeout produced a queueing + retry storm in the forwarder. Short-term rollback/batch-size tune mitigated; need telemetry, CI tests, and adaptive batching to prevent recurrence.\n\n--- end of notes ---\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_da261a95a9db417284460a569482f3ea"
+}

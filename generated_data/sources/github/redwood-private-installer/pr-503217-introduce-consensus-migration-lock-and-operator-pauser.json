@@ -1,0 +1,83 @@
+{
+  "repo": "redwood-private-installer",
+  "pr_number": "503217",
+  "title": "Introduce consensus-backed migration lock + operator pauser for safe in-place schema transforms",
+  "author": "Ava Martinez",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-03-02",
+  "merged_at": "2026-03-02",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/consensus-migration-lock-operator-pauser",
+  "reviewers": [
+    "Jonah Keene",
+    "Priya Desai",
+    "Luca Moretti"
+  ],
+  "labels": [
+    "private-installer",
+    "upgrade",
+    "sre",
+    "helm",
+    "terraform",
+    "migration"
+  ],
+  "linked_linear": [
+    "ENG-3421",
+    "ENG-3498"
+  ],
+  "linked_jira": [
+    "SUP-1182"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "12",
+  "additions": "1024",
+  "deletions": "312",
+  "breaking_change": "false",
+  "merge_method": "squash",
+  "description": "Problem: Private deployments performing in-place schema changes or operator-driven upgrades can race (multiple CI/CD runs, manual operator actions, or automated patchers) which leads to partially-applied migrations and mismatched tenant state. We need a robust guard that: 1) prevents concurrent migrations across controller replicas and automation runs, 2) provides an operator-level pause to quiesce requests for targeted tenants during a migration window, and 3) verifies that pre-upgrade backups are intact and restorable before allowing schema application.\n\nThis PR introduces a consensus-backed migration lock (based on the cluster's etcd/consensus layer where available, falling back to a tenant-scoped leader election CRD) and an operator pauser that quiesces inbound tenant traffic during schema transforms. It also wires a preflight backup verifier that computes and records checksum manifests for logical PostgreSQL dumps before migrations proceed. The goal is safe in-place schema transforms with deterministic, reversible steps and clear operator controls.\n\nChanges: single continuous description of what was done (checklist): \n- implement a MigrationLock CRD and controller that acquires a cluster-scoped consensus lease with retry/backoff and TTL metadata\n- add a TenantQuiesce subcontroller that annotates ingress proxies (helm chart hook) and toggles a feature-flag on the operator to pause new requests for a tenant during the migration window\n- add a migration preflight command to the installer CLI: `installer migrate --tenant <id> --dry-run/--apply --backup-checksum <auto|path>`\n- wire automatic logical backup creation (pg_dump) into the migrate flow and record checksum + object path in BackupManifest CRD\n- add a `migration.dry_run=true` path that executes schema transformations in a sandbox (helm test job) and reports a rollout readiness score\n- introduce terraform module inputs for `migration_lock_ttl` and `operator_pause_grace_seconds` and document defaults\n- Helm chart: add pre-upgrade hook that waits for MigrationLock and runs the backup verifier, and a post-failure hook that triggers an automatic unlock with a diagnostic bundle\n- add metrics (migration_lock_acquired_total, backup_verification_status) and tracing spans for the lock lifecycle\n- tests: unit tests for lock backoff, e2e test using a two-controller race scenario, and a restore smoke test that validates checksum match after a simulated restore\n\nCommits: [summaries] \n- feat(migration): add MigrationLock CRD + controller with TTL and renewals\n- feat(operator): add TenantQuiesce controller and operator pause flag\n- feat(installer): add `migrate` CLI flow, backup verifier and checksum manifest wiring\n- feat(helm): helm hooks for pre-upgrade backup-check and post-failure diagnostics\n- tf(migration): terraform inputs and docs for migration lock config\n- test(e2e): race-condition e2e harness and restore smoke test\n- chore: docs and README updates for private-installer migration flow\n\nFiles changed (high level):\n- chart/private-installer/templates/hooks/pre-upgrade-backup-check.yaml (new helm pre-upgrade hook that blocks until backup verification passes)\n- api/v1/migrationlock_types.go, controllers/migrationlock_controller.go (CRD + controller)\n- controllers/tenantquiesce_controller.go (operator-pauser logic)\n- cli/installer/cmd/migrate.go (installer migrate CLI + flags)\n- docs/migration-runbook.md (runbook for operators + rollback steps)\n- terraform/modules/installer/variables.tf (migration_lock_ttl, operator_pause_grace_seconds)\n- tests/e2e/migration_race_test.go, tests/e2e/restore_smoke_test.go\n\nMigration flow and rollback plan (operator runbook summary):\n1) Run `installer migrate --tenant T123 --dry-run` to exercise the dry-run path. The dry-run creates a namespaced sandbox job in the cluster and reports schema diffs and a readiness score.\n2) Create a pre-upgrade backup via `installer migrate --tenant T123 --run-backup` (this is automatic if `--run-backup` not suppressed). The BackupManifest CRD will contain checksum and signed metadata (GPG optional).\n3) Acquire the MigrationLock (controller will attempt consensus lease). If lock acquisition fails, operator may retry or abort; UI surfaces owner and TTL.\n4) Operator toggles TenantQuiesce; ingress will start returning 503 for new session requests for the target tenant while allowing inflight requests to drain within `operator_pause_grace_seconds`.\n5) Apply schema transforms. The helm pre-upgrade hook ensures the backup-check passed before hitting migrations.\n6) On success, release MigrationLock and unquiesce the tenant.\n7) On failure or timeout, the post-failure hook collects diagnostics, performs an automatic unlock (with TTL), and can optionally trigger a restore job using the BackupManifest. The runbook includes steps for manual failback when automatic restore is insufficient.\n\nTesting and verification notes: \n- e2e race test simulates two parallel migrators and asserts that only one succeeds and the other receives a clear backoff error + owner metadata.\n- restore_smoke_test verifies that BackupManifest checksum can be fetched and used to validate a restored dump; smoke test runs pg_restore in a sandbox and compares row counts for a sample table.\n- Unit tests cover TTL expiry, renewals, and operator pause grace period.\n- CI: initial runs failed on a flaky race in the e2e harness (timing assumptions around controller leader election). I adjusted the harness backoff and added a deterministic latch; rerun passed (CI status: pass).\n\nReview conversation (summary): \n- Jonah Keene: \"This general approach looks good. Two asks: 1) show how we avoid lockholder loss on controller restart (lease renewal semantics), 2) ensure BackupManifest is immutable once created to avoid TOCTOU on restore.\"\n- Ava (author): \"Added deterministic renewals and a manifest immutability controller check that rejects updates after creation. See controller tests in migrationlock_controller_test.go and backupmanifest_immutability_test.go.\"\n- Priya Desai: \"Operator pauser is needed but we should make the ingress quiesce pluggable for on-prem customers who use different proxies.\"\n- Ava: \"Pauser is implemented as an interface with a default implementation for our nginx/ambassador overlays; added a `QuiesceProvider` interface and docs for implementing custom providers.\"\n- Luca Moretti: \"Terraform defaults look sane; recommend exposing `migration_lock_namespace` for constrained clusters.\"\n- Ava: \"Added `migration_lock_namespace` with default `redwood-system` and documented implications for multi-tenant clusters.\"\n- Jonah: \"Approve after a small nits patch to improve logging on lock acquisition failure.\"\n- Ava: \"Addressed logging nits in the last commit.\"\n\nCI and gating: \n- Unit: pass\n- Integration: pass\n- E2E: initially fail, rerun pass\n- Lint/docs: pass\n\nRelease notes: \"Add consensus-backed MigrationLock and TenantQuiesce operator to improve safety for in-place schema changes. Adds installer `migrate` flow with automatic backups and checksum verification, a Helm pre-upgrade backup check hook, and Terraform knobs for migration tuning.\"\n\nNotes for operators/upgrade owners: \n- This change is additive and opt-in; `migrate` is only invoked by operator action or explicit installer CLI. Default config will not quiesce tenants unless `--quiesce`/`operator_pause` is enabled.\n- Recommended rollout: apply helm chart update to a staging cluster, exercise `--dry-run` for a representative tenant, validate BackupManifest and restore smoke test, then flip to `--apply` on production tenants during a low-traffic window.\n- Observability: migration_lock_acquired_total and backup_verification_status show up in the operator metrics group; dashboard and alert playbooks added to docs/migration-runbook.md.\n\nRelated work: ENG-3421 (migration safety redesign), ENG-3498 (installer CLI improvements), SUPPORT ticket SUP-1182 (customer reported partial migration during previous hotfix).",
+  "commits": [
+    "feat(migration): add MigrationLock CRD + controller with TTL and renewals",
+    "feat(operator): add TenantQuiesce controller and operator pause flag",
+    "feat(installer): add migrate CLI flow, backup verifier and checksum manifest wiring",
+    "feat(helm): helm hooks for pre-upgrade backup-check and post-failure diagnostics",
+    "tf(migration): terraform inputs and docs for migration lock config",
+    "test(e2e): race-condition e2e harness and restore smoke test",
+    "docs: migration runbook and README updates"
+  ],
+  "files_changed": [
+    "chart/private-installer/templates/hooks/pre-upgrade-backup-check.yaml",
+    "api/v1/migrationlock_types.go",
+    "controllers/migrationlock_controller.go",
+    "controllers/tenantquiesce_controller.go",
+    "cli/installer/cmd/migrate.go",
+    "terraform/modules/installer/variables.tf",
+    "tests/e2e/migration_race_test.go",
+    "tests/e2e/restore_smoke_test.go",
+    "docs/migration-runbook.md",
+    "chart/private-installer/values.yaml",
+    "backup/backupmanifest_types.go",
+    "charts/README.md"
+  ],
+  "review_thread": [
+    "Jonah Keene: 'This general approach looks good. Two asks: show how we avoid lockholder loss on controller restart and ensure BackupManifest is immutable.'",
+    "Ava Martinez: 'Added deterministic renewals and a manifest immutability controller check; tests added.'",
+    "Priya Desai: 'Make ingress quiesce pluggable for on-prem customers.'",
+    "Ava Martinez: 'QuiesceProvider interface added with docs for custom providers.'",
+    "Luca Moretti: 'Recommend exposing migration_lock_namespace for constrained clusters.'",
+    "Ava Martinez: 'Added migration_lock_namespace; updated terraform docs.'",
+    "Jonah Keene: 'Approve after logging nits.'",
+    "Ava Martinez: 'Addressed nits in final commit.'",
+    "CI: 'E2E failed on first run due to harness timing; rerun passed.'"
+  ],
+  "release_notes": "Add consensus-backed MigrationLock and TenantQuiesce operator for safer in-place schema changes; installer migrate flow with automatic backup+checksum verification; Helm pre-upgrade hook to block until backup is verified; Terraform knobs for migration tuning.",
+  "notes": "This PR is intentionally conservative: default behavior is opt-in. Operators should exercise dry-run flow and the restore smoke test before enabling auto-apply in production. The MigrationLock falls back to a namespaced leader election when a cluster consensus store is unavailable.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_thread",
+    "release_notes",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_34423269eac54eb18c002154b09471e8"
+}

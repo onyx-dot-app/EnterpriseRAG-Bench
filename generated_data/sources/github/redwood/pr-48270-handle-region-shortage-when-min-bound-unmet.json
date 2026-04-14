@@ -1,0 +1,74 @@
+{
+  "repo": "redwood",
+  "pr_number": "48270",
+  "title": "Dedicated autoscaler: handle region capacity shortage when min bound cannot be met",
+  "author": "Keiko Yamamoto",
+  "created_at": "2025-07-28",
+  "updated_at": "2025-07-31",
+  "merged_at": "2025-07-31",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/dedicated-min-bounds-region-shortage",
+  "labels": [
+    "dedicated",
+    "autoscaling",
+    "sre",
+    "reliability",
+    "observability"
+  ],
+  "reviewers": [
+    "Vanessa Ortiz",
+    "Rafael Mendes",
+    "Jordan Lee",
+    "Allison Grant"
+  ],
+  "linked_linear": [
+    "ENG-22151",
+    "ENG-22140",
+    "ENG-22143"
+  ],
+  "linked_jira": [
+    "SUP-28452"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "19",
+  "additions": "612",
+  "deletions": "147",
+  "description": "Context: With min/max bounds enabled for Dedicated, the autoscaler must never *request* less than min, but in practice the fleet may be unable to *provision* the requested min due to regional GPU shortages (insufficient capacity, placement failures, or temporary allocator degradation). Prior behavior was ambiguous: the loop would repeatedly attempt to reach min every tick, spamming allocator calls/events and leaving customers/SRE without a deterministic surfaced state.\n\nThis PR adds explicit handling for \"min bound unmet\" scenarios:\n- Surfaces a degraded capacity condition on the deployment when min cannot be provisioned, including reason + last allocator error (sanitized) and an estimate of missing replicas.\n- Adds backoff/jitter on repeated provisioning attempts when the failure reason indicates regional shortage, to prevent thundering herd and noisy logs.\n- Emits metrics and structured logs so SRE can alert on sustained unmet-min and so Console can display a clear \"Degraded (min unmet)\" status.\n\nBehavioral semantics (aligned with ADR draft + ENG-22151):\n- Hard invariant remains: desired capacity is clamped to [min, max] *as a policy decision*.\n- If allocator cannot satisfy min, we record two values: policy_desired_replicas=min (bounded desired), provisioned_replicas=<actual>, and we mark the deployment as Degraded with condition MIN_CAPACITY_UNMET.\n- Reactive signals still influence policy_desired within bounds, but they cannot hide the fact that min is not currently achievable.\n- Once provisioning recovers (allocator starts returning capacity), the degraded condition automatically clears after N consecutive successful ticks.\n\nImplementation summary:\n1) Autoscaler loop: detect shortage-class errors from FleetAllocator (InsufficientCapacity, PlacementUnavailable, RegionUnavailable).\n2) Backoff: per-deployment exponential backoff (min 15s, max 10m) with +/-20% jitter, only applied for shortage-class failures; non-shortage failures continue to retry each tick (to catch transient bugs quickly).\n3) Status propagation: extend internal CapacityStatus payload with `min_target_replicas`, `min_unmet_replicas`, `min_unmet_since`, `shortage_reason` and `last_shortage_error_code`. This is emitted to the control plane status writer used by Console.\n4) Observability: new counters/gauges + structured event \"dedicated_autoscaler_min_unmet\" with reason and bounded/provisioned values. (Alert rules are in a separate observability-pack PR; this PR provides the signals.)\n\nTesting:\n- Unit tests for shortage classification + backoff behavior.\n- Integration-ish test using fake allocator: simulate sustained shortage then recovery, verify condition set/cleared and that allocator call rate drops under backoff.\n- Golden log snapshot for auditability of the decision record: requested_desired, bounded_desired, provisioned, reason.\n\nRollout notes:\n- Code paths are gated behind the existing bounds feature flag; for accounts without bounds enabled, no behavior change.\n- The degraded condition is additive; it will appear in internal admin tooling immediately, and Console will surface it once the UI reads the new status fields.\n\nFollow-ups:\n- Hook this condition into Smart Routing signals (so routing can degrade gracefully when min is unmet) is tracked separately.\n- SRE alert thresholds and runbook links: see ENG-22145 / dedicated-autoscaler troubleshooting runbook updates.\n\nRefs: ENG-22151, SUP-28452, discussion in eng-sre about shortage visibility and paging noise.",
+  "commits": [
+    "autoscaler: classify allocator errors as shortage vs transient",
+    "autoscaler: add per-deployment backoff + jitter for shortage retry loop",
+    "control-plane status: include min target/unmet fields in capacity status",
+    "observability: emit min_unmet metrics + structured logs",
+    "tests: fake allocator shortage/recovery scenarios"
+  ],
+  "changed_areas": [
+    "services/dedicated-autoscaler/reconcile/reconcile.go",
+    "services/dedicated-autoscaler/allocator/error_classification.go",
+    "services/dedicated-autoscaler/backoff/backoff.go",
+    "services/control-plane/capacity_status/status_writer.go",
+    "pkg/observability/metrics/dedicated_autoscaling.go",
+    "services/dedicated-autoscaler/reconcile/reconcile_test.go"
+  ],
+  "notable_snippets": [
+    "Added MIN_CAPACITY_UNMET condition emission: condition is set when provisioned_replicas < min_target_replicas AND last error is shortage-class; clears after 3 consecutive successful reconciles with provisioned >= min_target.",
+    "Backoff key is (deployment_id, region). Backoff only applies to allocator Provision() calls; status writing still happens every tick to keep timestamps fresh."
+  ],
+  "review_conversation": "Vanessa Ortiz (review): Can we confirm we\u2019re not accidentally suppressing retries for non-shortage allocator errors (e.g., auth, bad request)?\nKeiko Yamamoto (author): Yep \u2014 backoff is only applied for InsufficientCapacity/PlacementUnavailable/RegionUnavailable. Everything else retries per tick and increments `dedicated_autoscaler_provision_error_total{class=\"non_shortage\"}`.\n\nRafael Mendes (review): Please add explicit \"unmet since\" timestamp so on-call can correlate to regional incidents, and ensure logs are rate-limited.\nKeiko Yamamoto (author): Added `min_unmet_since` in status + structured log emitted only on state transitions (healthy->unmet, unmet->healthy) and once every 10m while unmet.\n\nAllison Grant (review): Metric naming: align with metric naming standards (no high-card labels, keep reason as low-card enum). Also add a gauge for unmet replicas.\nKeiko Yamamoto (author): Updated metrics to `dedicated_autoscaler_min_unmet_replicas` (gauge) and `dedicated_autoscaler_min_unmet_total` (counter) with `reason_code` as an enum; no raw error strings in labels.\n\nJordan Lee (review): Status schema change \u2014 is this backwards compatible for old Console? Make sure default/empty values won\u2019t break parsing.\nKeiko Yamamoto (author): Fields are additive and optional; writer populates zero values when missing. Console backend ignores unknown fields; UI update will come later.\n\nVanessa Ortiz (approval): Looks good after the backoff jitter + transition-only logging changes. Ship it behind the bounds flag.\nRafael Mendes (approval): Approved with the condition clear hysteresis; please link the runbook in the follow-up PR.\nAllison Grant (approval): Approved once metrics names updated.",
+  "ci_checks": [
+    "build (bazel): pass",
+    "unit tests: pass",
+    "lint (golangci-lint): pass",
+    "integration (dedicated-autoscaler fake-allocator suite): pass",
+    "security scan (deps): pass"
+  ],
+  "merge_outcome": "Merged via squash",
+  "release_notes": "Internal: Dedicated autoscaler now surfaces a Degraded condition when regional GPU shortages prevent meeting configured min capacity, with retry backoff and new observability signals (behind bounds feature flag).",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "review_conversation",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_29fc780bb57b4e80a3a4a9baea920379"
+}

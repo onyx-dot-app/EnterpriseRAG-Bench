@@ -1,0 +1,82 @@
+{
+  "repo": "redwood",
+  "pr_number": "40215",
+  "title": "low-latency-attention-microkernel-with-streaming-prefetch-and-fp16-accumulation",
+  "author": "Maya Chen",
+  "created_at": "2026-02-15",
+  "updated_at": "2026-02-23",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/attn-microkernel-prefetch",
+  "description": "Motivation: Reduce tail latency and kernel-launch overhead for short and mid-length sequences while keeping continuous batching compatibility and KV cache semantics. This PR introduces a compact attention microkernel that performs streaming prefetch of Q/K/V tiles, uses FP16 accumulation with optional FP32 finalization (configurable via runtime flag), and exposes a scheduler hint so the request router can warm up KV cache lanes before a burst. Changes are conservative by default (feature gated) and include performance telemetry to validate improvements. High level: 1) New CUDA microkernel 'attn_stream_k' that: - streams query blocks into shared memory and prefetches corresponding key/value tiles via async copies, - performs k-v accumulation in FP16 with pairwise FP32 accumulation when use_fp32_accum=true, - emits KV cache writes in tiled batches to reduce global memory transactions, - supports in-place rotary/rope decoding transforms to avoid extra transposes and reduce memory traffic. 2) Router/scheduler integration: - scheduler hint prefetch.kv=true enables request routing to annotate requests that should trigger warmup prefetch of KV cache lines (used by Dedicated autoscaler and continuous-batching pipeline), - continuous-batcher updated to respect windowed prefetch hints and to coalesce prefetch work with existing batches. 3) KV cache: - updated eviction policy to prefer spill-on-large-commits and to mark prefetched lanes with reduced eviction penalty so warmups are preserved for expected bursts, - telemetry added to track prefetch hit rate and post-prefetch latency delta. 4) Runtime flags and safety: - feature gate runtime.attn_microkernel_enabled (default false), - runtime.attn_fp32_accumulation (default false), - fallback path remains the existing fused-kernel code path if kernel fails or feature is off. Benchmarks: Microbenchmark on A100 80GB (pytorch-like workload): - 1-token streaming latency down 19% median, 34% p95 for seq_len<=64 with batch sizes 1-8. - Throughput for continuous batching workloads improved 12% at tail latency SLO of 100ms. - KV-prefetch warmup shows 45% reduction in first-token latency for short-lived sessions in Dedicated. Performance notes: Measurements include kernel selection overhead; for long sequences (>1024) gains are small and scheduler falls back to existing high-throughput kernel. Related Linear: ENG-4982 (attn microkernel spike), ENG-5019 (continuous batching warmup). Checklist: - [x] Implementation of CUDA microkernel and fallback stub - [x] Router flag and continuous-batcher integration - [x] KV cache eviction policy adjustments and telemetry - [x] Unit tests for prefetch logic and scheduler hint propagation - [x] Perf canary and bench scripts added - [x] Docs: console runtime flags documented - [x] Safety: feature gated and feature flag off by default Rollout plan: canary on perf-canary fleet for 48h, watch prefetch_hit_rate and token latency regression alert; if >5% regression revert. If stable, enable for Dedicated as opt-in and then opt-out rollout. Risks and mitigations: - Incorrect prefetched KV could increase memory pressure; mitigated with lane marking and soft-eviction policy. - FP16 accumulation may cause minor numerical differences; gate and tests compare to FP32 baseline and allow only small KL divergence on logits. Notes: patch includes small refactor of the kernel dispatch table to let runtime choose microkernel by hint. Implementation details are in commits and the short patch snippets below.",
+  "commits": [
+    "feat(attn): add attn_stream_k CUDA microkernel with prefetch loop",
+    "perf(scheduler): expose prefetch hint and wire to continuous-batcher",
+    "kv: add prefetched_lane token and eviction weight update",
+    "test: add unit tests for prefetch propagation and fallback",
+    "docs: document runtime.attn_microkernel_enabled and fp32 accumulation flags"
+  ],
+  "files_changed": [
+    "src/runtime/attn/kernels/attn_stream_k.cu",
+    "src/runtime/attn/dispatcher.cc",
+    "src/runtime/attn/dispatcher.h",
+    "src/runtime/scheduler/prefetch_hint.cc",
+    "src/runtime/batcher/continuous_batcher.cc",
+    "src/runtime/kv/cache_manager.cc",
+    "src/runtime/kv/eviction_policy.h",
+    "tests/attn/test_prefetch.cpp",
+    "bench/perf/attn_stream_bench.py",
+    "docs/runtime_flags/attn_microkernel.md"
+  ],
+  "files_changed_count": "10",
+  "additions": "412",
+  "deletions": "98",
+  "reviewers": [
+    "Ethan Brooks",
+    "Sara Alvarez",
+    "Noah Kim"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "batching",
+    "perf-canary",
+    "docs"
+  ],
+  "linked_linear": [
+    "ENG-4982",
+    "ENG-5019"
+  ],
+  "ci_status": "pass",
+  "ci_checks": [
+    "build:linux-gcc (passed)",
+    "unit-tests (passed)",
+    "integration-tests (passed)",
+    "perf-canary (bench initial failed - rerun passed)",
+    "lint (passed)",
+    "cuda-compat (passed)",
+    "security-scan (passed)"
+  ],
+  "review_comments": [
+    "Ethan Brooks: Nicely scoped microkernel; can you add a safety net for device memory pressure? Consider tracking total prefetched bytes per-stream and capping it.",
+    "Maya Chen (author): Added stream-prefetch cap and dynamic backoff when device free memory < 10%; updated telemetry to surface backoff events.",
+    "Sara Alvarez: The FP16 accumulation path introduces tiny divergence in logit scale for some models. Please add a regression test comparing logits on small prompt sets and a config to force FP32 accumulation for model families that are sensitive.",
+    "Maya Chen (author): Added regression test that runs on perf canary with a 1k sample prompt matrix; added runtime.attn_fp32_accumulation flag and set to false by default.",
+    "Noah Kim: Small nit on dispatcher API naming; otherwise LGTM. Please squash the kernel commits into a single change and keep scheduler commit separate.",
+    "Maya Chen (author): Squashed kernel commits and rebased on main as requested."
+  ],
+  "merge_method": "squash",
+  "merged_at": "2026-02-23",
+  "release_notes": "Introduces a new feature-gated attention microkernel (attn_stream_k) with streaming prefetch and optional FP16 accumulation that reduces tail latency for short sequences and improves continuous-batching throughput. Disabled by default; opt-in via runtime.attn_microkernel_enabled. Adds scheduler hint for KV warmup and telemetry to measure prefetch effectiveness.",
+  "breaking_change": "false",
+  "patch_snippet": "--- a/src/runtime/attn/dispatcher.cc\n+++ b/src/runtime/attn/dispatcher.cc\n@@ -42,6 +42,12 @@ KernelDispatcher::select(...) {\n+  if (runtime.flags.attn_microkernel_enabled && hint.prefetch) {\n+    return &AttnStreamK::dispatch;\n+  }\n   if (seq_len > 1024) return &HighThroughputKernel::dispatch;\n   return &FusedAttnKernel::dispatch;\n }",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "commits",
+    "review_comments",
+    "release_notes",
+    "patch_snippet"
+  ],
+  "dataset_doc_uuid": "dsid_b08cb12c4057474b8733b7622f145fd0"
+}

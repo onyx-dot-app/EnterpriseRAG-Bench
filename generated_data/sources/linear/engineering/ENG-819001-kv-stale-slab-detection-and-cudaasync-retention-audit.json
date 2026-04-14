@@ -1,0 +1,112 @@
+{
+  "key": "ENG-819001",
+  "team": "engineering",
+  "title": "KV stale slab detection and cudaAsync retention audit",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-02-12",
+  "updated_at": "2025-03-01",
+  "creator": "Aisha Desai",
+  "assignee": "Miguel Torres",
+  "project": "runtime-memory-stability",
+  "cycle": "2025-W08",
+  "estimate": "5",
+  "due_date": "2025-03-15",
+  "labels": [
+    "kv-cache",
+    "cudaMallocAsync",
+    "allocator",
+    "investigation",
+    "slo-risk"
+  ],
+  "parent_issue": [
+    "ENG-811200"
+  ],
+  "dependencies": [
+    "ENG-802345",
+    "ENG-815600"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.24",
+  "security_review_required": "false",
+  "description": "Summary: Several production deployments (hosted + dedicated) show gradual GPU memory growth over multi-hour windows when continuous batching with KV cache prefetching is enabled. Hypothesis: cudaMallocAsync pooling + allocator slab residency combined with long-tail KV entry reuse patterns yields 'stale slab' residue \u2014 allocations become resident and are not reclaimed quickly because frees are happening on non-fenced streams or are deferred, causing slab fragmentation and steady RSS increase. Goal: discover root cause, add fine-grained telemetry to detect stale slabs, and implement mitigations that reclaim ghost residency without regressing tail latency.",
+  "steps_to_reproduce": [
+    "1) Deploy runtime-1.24 with KV prefetch enabled and continuous batching profile B3 (mix of 1-8 sequence lengths).",
+    "2) Load synthetic workload: 60 QPS steady, with 10% of requests hitting cold KV keys; batcher configured with flush_timeout=6ms, max_batch_tokens=4096.",
+    "3) Observe GPU RSS over 6+ hours; capture periodic cudaMallocAsync pool stats via NVML and allocator histograms.",
+    "4) Correlate growth with KV cache hit/miss timelines and stream ids in tracing."
+  ],
+  "observations": [
+    "- Memory increase is gradual (2-5% GPU RSS over 6 hours) and correlates with windows of high KV miss activity.",
+    "- nvprof/NVML snapshots show growing number of resident arenas with low recent allocation activity (last touch > 30 minutes).",
+    "- cudaMallocAsync free paths often run on 'worker' streams; we observed async_free latency spikes and occasional deferred-return semantics tied to stream lifetimes.",
+    "- When we force a full allocator trim (dev-run script that synchronizes and calls cudaMemTrim where available) RSS drops ~12% but trimmed buffer returns disrupt in-flight batch latencies (p99 +200ms)."
+  ],
+  "investigations_and_experiments": [
+    "Exp A: Enabled 'fenced-free' (synchronous cudaFreeAsync with streamFence) for KV eviction flow in a dev cluster. Result: resident arena count stabilized; slight p99 latency increase for cold-miss requests. PR: github.com/redwood/infra/pull/4821",
+    "Exp B: Introduced per-slab last_touch_ts and heap-tagging to allocator metadata, sampled every 5 minutes. Found ~30% of resident slabs had last_touch > 45m. Added dashboard: /dashboards/kv-slab-age (Grafana).",
+    "Exp C: Adjusted async-pool retention window (from 20s -> 5s) and increased reuse_threshold. Result: transient increase in allocation churn but reduced long-tail resident slabs by ~9% in smoke runs.",
+    "Exp D: Instrumented batcher to avoid prefetching for keys that have not been seen in last 2 hours (soft-TTL). Result: lower KV miss prefetch frequency; reduced slab growth in long-running experiments but small drop in cold-miss recall latency improvement provided by prefetch.",
+    "Exp E: Run allocator stress with synthetic fragmentation generator (mix of 64B - 256KB alloc patterns). Reproducer: internal/alloc-fuzz/frag-gen (link in attachments)."
+  ],
+  "findings": [
+    "1) Root contributors appear to be: (a) KV prefetching creating low-touch hot allocations that become resident in separate streams, (b) cudaMallocAsync deferred freeing semantics where free completions are tied to stream completion and can be delayed significantly, (c) pool retention heuristics that keep slabs alive beyond useful TTL.",
+    "2) A simple 'force-trim' is effective but unsafe for production due to increased p99 and potential kernel stalls.",
+    "3) Best tradeoff is to: add observability, implement a conservative reclamation path that uses a stream-fenced free for slabs with last_touch_ts > X and reference_count==0, and tune pool retention thresholds per workload class.",
+    "4) Early canary (Exp A) shows success reclaiming ghost slabs with acceptable tail latency impact when fenced-free is gated and can be rate-limited."
+  ],
+  "proposed_solution": "1) Add new allocator metrics: slab_last_touch_seconds, slab_resident_bytes, slab_alloc_origin (kv-prefetch | model-kv | runtime), async_free_latency_ms (histogram). 2) Implement a 'stale-slab sweeper' component: runs periodically, selects candidate slabs with last_touch > STALE_TTL && resident && refcount==0, issues a fenced-free on a dedicated reclamation stream with rate-limiting and backoff. 3) Reduce default cudaMallocAsync retention window for KV-prefetch pool and expose config knobs per deployment class. 4) Add guardrails: feature-flag, canary rollout, dashboard + alert when reclamation frees > 10% memory or causes p99 increases > 10% over baseline. 5) Add unit + integration tests and a chaos scenario to validate no double-free or use-after-free on edge cases.",
+  "acceptance_criteria": [
+    "- New metrics are available in Grafana and show slab age histograms for KV pool.",
+    "- Canary run (dedicated pool with 5% traffic) shows sustained RSS stabilization over 72h without p99 > baseline + 12%.",
+    "- No increase in allocator-related crashes in staging (0 crashes for 72h).",
+    "- PRs merged with code and unit tests; rollout plan documented in Confluence (link in attachments)."
+  ],
+  "risks_and_tradeoffs": [
+    "- Fenced frees add synchronization that can increase p99 latency for cold requests; must be rate-limited and targeted only at candidate slabs.",
+    "- Aggressive reduction of pool retention could increase allocation churn and GPU kernel overhead, raising steady-state CPU/GPU utilization.",
+    "- Complexity of allocator changes increases maintenance burden and regression surface (need thorough testing)."
+  ],
+  "rollout_plan": [
+    "Phase 1: Add telemetry + dashboard (no behavior change). Run 2 weeks across internal canaries. Owners: @miguel",
+    "Phase 2: Deploy stale-slab sweeper behind a feature flag to 5% of dedicated clusters. Monitor memory, p99, and allocator errors for 72h. Owners: @miguel, @aisha",
+    "Phase 3: If canary stable, gradually scale to 50% and then full rollout with runtime-1.24-patch1. Owners: infra release eng.",
+    "Rollback: feature flag off. Ensure automatic revert playbook exists (Confluence)."
+  ],
+  "attachments": [
+    "https://confluence.redwood.ai/display/RUNTIME/kv-slab-retention-audit",
+    "https://github.com/redwood/infra/pull/4821",
+    "https://grafana.redwood.ai/d/allocator/kv-slab-age",
+    "internal/alloc-fuzz/frag-gen (repo link)"
+  ],
+  "comments": [
+    "2025-02-13 - Aisha Desai: Initial report from hosted-prod alert (memory-trend-1) after multi-hour run. Attached NVML snapshots; suspected kv-prefetch involvement.",
+    "2025-02-15 - Miguel Torres: Reproduced locally with frag-gen. Starting instrumentation for slab_last_touch and async_free_latency.",
+    "2025-02-19 - SRE (Lena Zhou): Observed similar pattern on dedicated-asia cluster; provided heap dump and batch traces.",
+    "2025-02-22 - Miguel Torres: Exp A results: PR created. Fenced-free reduces resident slabs but increases p99 on long tail. Need rate-limit and target only >TTL slabs.",
+    "2025-02-25 - Design Review (Rory Patel): Agreed on telemetry-first approach; suggested adding visualization of allocation origins to help product tradeoffs on prefetch defaults.",
+    "2025-02-28 - QA (Priya Menon): Canary smoke passed for 48h for Exp C (pool retention tweak), no allocator crashes. Noted slight CPU increase.",
+    "2025-03-01 - Miguel Torres: Pushing instrumentation and initial sweeper prototype for internal review. Linking PR and dashboard."
+  ],
+  "next_steps": [
+    "- Merge telemetry PR and provision Grafana panels (owner: Miguel).",
+    "- Finalize sweeper prototype: implement rate limits and candidate selection heuristics (owner: Miguel, estimate 3).",
+    "- Run 72h canary with the sweeper on a dedicated cluster; collect traces and compare against baseline (owner: SRE).",
+    "- Prepare release notes and rollback playbook (owner: Release Eng)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observations",
+    "investigations_and_experiments",
+    "findings",
+    "proposed_solution",
+    "acceptance_criteria",
+    "risks_and_tradeoffs",
+    "rollout_plan",
+    "comments",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_f4e99ac2cce34e469ad48ed6afbba23f"
+}

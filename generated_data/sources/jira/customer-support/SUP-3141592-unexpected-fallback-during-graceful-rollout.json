@@ -1,0 +1,84 @@
+{
+  "key": "SUP-3141592",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Unexpected fallback to degraded variant during staged graceful rollout despite model pin and prewarm success",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Maria Gomez",
+  "assignee": "Ian Park",
+  "customer_company": "Horizon Analytics",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "orchestrator",
+    "edge-proxy"
+  ],
+  "labels": [
+    "canary",
+    "rollout",
+    "fallback",
+    "model-pinning",
+    "prod-impact"
+  ],
+  "environment": "prod-us-west",
+  "affected_models": [
+    "horizon/gpt-7b-quantized-v2"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-14",
+  "first_response_due_at": "2026-03-13",
+  "linked_issues": [
+    "SUP-420420",
+    "SUP-202406"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/orchestrator/pull/1549"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/pages/RW-Canary-Runbook"
+  ],
+  "description": "Issue summary: Customer reported that during a scheduled staged rollout (graceful promote) of h-gpt-7b-quantized-v2 the tenant traffic unexpectedly diverted to the degraded fallback variant for ~6 minutes despite the tenant being explicitly pinned to the new version and prewarm checks returning healthy.\n\nImpact: Horizon Analytics (dedicated) observed elevated error rates and lower-quality completions for a subset of sessions affecting two production cohorts. Business impact: several active inference pipelines returned degraded outputs, increasing latency and manual retries. Estimated affected requests: ~4.2k during window.\n\nEnvironment: production (us-west-2), dedicated capacity pool ID: ded-pool-05, orchestrator release tag: v2026.03.10-canary, edge-proxy version: 1.18.2.\n\nObserved behaviour: explicit model pin for tenant T-98765 was present in control plane; the serving runtime reported KV-cache warmed; prewarm probes returned 200/OK. Despite that, routing logs show a switch to fallback variant serving-degraded-1 for requests that previously had pinned affinity. Edge retry traces show a short spike of 503 from a single host at 15:21:12 UTC then a cohort-wide redirect to degraded variant until the orchestrator snapshot reconciliation corrected routing at 15:27:42 UTC.\n\nExpected behaviour: with explicit tenant pin and successful prewarm, traffic should remain pinned to h-gpt-7b-quantized-v2 for the session until explicit unpin or TTL expiry; fallback to degraded variant should only occur if the primary variant is unreachable or healthcheck fails across a quorum of hosts.\n",
+  "steps_to_reproduce": "1) Schedule a staged canary promote for a dedicated pool with a small initial weight and tenant pin set for a test tenant.\n2) Ensure prewarm completes and servicing runtime reports warmed KVCACHE.\n3) Induce a transient single-host 503 from a healthcheck probe (simulated) on one node in the pool around the time of weight increase.\n4) Observe routing decisions and edge logs for tenant-bound requests.\n\nNote: We reproduced locally in a staging replica by simulating probe latency + single-host 500s and saw candidate fallback in the orchestrator under certain snapshot-merge timings.",
+  "logs_and_traces": "- Edge log excerpt: [2026-03-12T15:21:12.203Z] edge-proxy-23: tenant=T-98765 requestId=64a8... -> upstream=primary-07 status=503 error=connection-reset\n- Orchestrator event: [2026-03-12T15:21:13Z] snapshot-apply: merge_id=sn-9215 stage=prewarm_success target=h-gpt-7b-quantized-v2 pinned_tenants=[T-98765]\n- Routing decision trace: [2026-03-12T15:21:14Z] route-eval tenant=T-98765 -> chosen_variant=\"serving-degraded-1\" reason=\"fallback-path-elected\"\n- Control plane log: [2026-03-12T15:27:42Z] reconcilier: snapshot-consensus achieved, pinned_affinity reconciled for tenants: [T-98765]\n- Customer supplied transcript: \"responses started returning short generic completions at 15:21:30 UTC\"\n",
+  "customer_message": "Customer reported in support email: \"We pinned our tenant to the new model and saw it warm successfully, but at 15:21 requests started returning low-quality completions and some 5xx accompanied by our monitoring alerts. We need to know why the system ignored the pin and how to prevent recurrence.\"",
+  "comments": [
+    "Support (Maria): Received customer alert at 15:34 UTC. Opened ticket and escalated to SRE. Assigned Ian for triage.",
+    "SRE (Ian): Initial triage shows single host 503 around 15:21; orchestrator snapshot merge log indicates a concurrent snapshot replace. Suspect race between snapshot replace and in-flight pin commit.",
+    "Customer (Horizon): We did not change our client-side token or session parameters. We need confirmation that pinned sessions won't divert during canary promotions.",
+    "Eng (Priya, Orchestrator): Looked at PR history: PR #1549 modified snapshot apply ordering to reduce wait on prewarm. There is a path where in-flight snapshot replace can update routing epoch before pinned-commit acknowledgement reaches edge caches.",
+    "SRE (Ian): Applied a temporary mitigation: increased pin TTL and launched a targeted reconcile job to force reassertion of pin affinity for affected tenants. Customer reporting restored fidelity at 15:28 UTC.",
+    "Support (Maria): Notified customer of mitigation and asked if they observed resumed normal behaviour. Customer confirmed outputs normalized at 15:28 and requested root cause analysis.",
+    "Eng (Priya): Propose follow-up: add atomicity to snapshot commit that includes pinned-affinity writes, or hold snapshot epoch advancement until pinned-commit ack from edge caches. Filed ENG follow-up task.",
+    "SRE (Ian): Will deploy temporary config to delay ephemeral snapshot promotion in the dedicated pool until we have a pin-consensus metric above threshold.",
+    "Support (Maria): Will keep ticket open until postmortem and code fix are scheduled and customer accepts resolution plan."
+  ],
+  "investigation_notes": "Hypotheses considered: (1) pin commit reached control plane but edge cache TTL/stale entries caused edge-to-orchestrator mismatch, (2) orchestrator advanced routing epoch before pin-affinity persisted in snapshot leading to fallback election, (3) single-host health flapping triggered fallback policy that didn't respect explicit pin in certain race windows.\n\nFindings: - Pin entry present in control-plane snapshot at time T+1s after prewarm. - Edge cache entries showed stale variant mapping for tenant until forced reconcile at 15:27:42. - Orchestrator snapshot-merge ordering indicates that snapshot A (contains pin) applied, then snapshot B (promote with weight change) applied quickly; an edge process reading snapshot B without waiting for pinned-affinity commit elected fallback when health of a host in B's target set dipped.\n\nReproduction summary: reproduced in staging when snapshot B's epoch advanced while an edge node returned 503 for a small window and edge cache had not yet refreshed pinned-affinity mapping.\n\nRelevant artifacts: orchestration logs, edge cache dump (attached link in confluence), and PR 1549 which altered prewarm wait semantics.",
+  "resolution_summary": "Mitigation applied: forced reconcile to reassert tenant pin (ran at 15:25 UTC) which restored routing; increased pin TTL and added transient delay to snapshot epoch advancement on dedicated pool ded-pool-05.\n\nPermanent plan: engineering to implement atomic pin-and-snapshot-commit (ENG-4821) so that routing epoch cannot advance to promoted snapshot until pinned-affinity writes are durable across control plane and edge caches. Also add a preflight check that prevents fallback election for explicitly pinned tenants unless a majority of serving hosts return unhealthy.\n\nCustomer communication: Horizon Analytics informed of mitigation and permanent plan; provided timeline and asked to be notified of ENG-4821 schedule. They accepted the mitigation but requested a follow-up review of rollout gating thresholds.\n\nFollow-ups: ENG to scope and schedule fix (ENG-4821), SRE to run canary for delayed-epoch config across 3 dedicated pools, Support to update customer after code fix release.",
+  "resolution_at": "",
+  "postmortem_link": "",
+  "next_steps": [
+    "ENG: Create design doc for atomic pin-and-snapshot commit and list backward compatibility considerations (owner: Priya).",
+    "ENG: Implement and land fix behind feature flag; include unit and integration tests (PR tracker: ENG-4821).",
+    "SRE: Run staged canary with delayed-epoch config in ded-pool-05 and two additional pools, observe routing coherence metrics for 48h.",
+    "Support: Schedule a follow-up call with Horizon Analytics to review rollout gating and confirm acceptance of fix timeline.",
+    "All: Add a monitoring alert that flags divergence between control-plane pin records and edge cache mapping for any tenant for >2m."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs_and_traces",
+    "customer_message",
+    "comments",
+    "investigation_notes",
+    "resolution_summary",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_86783f1b3d154ac7b57c6d3d71bb5efc"
+}

@@ -1,0 +1,76 @@
+{
+  "key": "ENG-39107",
+  "team": "engineering",
+  "title": "In-flight kernel switch causing KV-slot misalignment and subtle numeric scaling drift",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-03-12",
+  "creator": "Marisol Vega",
+  "assignee": "Ayaan Patel",
+  "project": "runtime-performance-2026",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "kv-cache",
+    "kernel-selection",
+    "prefill-decode",
+    "bug",
+    "high-priority"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.24",
+  "security_review_required": "false",
+  "description": "Summary: During high-concurrency workloads where the serving runtime dynamically switches between quantized int8 kernels and bf16 kernels mid-request, we observed rare cases of KV cache slot misalignment paired with a small but compounding floating-point scaling mismatch. Symptoms include duplicated tokens at the tail of long generations, subtle token shifts in otherwise deterministic prompts, and divergence between runs that were previously bit-equivalent. This appears after a kernel switch that happens while prefill and decode streams overlap for the same session (e.g., long-context chat where prefill continues while decode fetches KV slots).",
+  "steps_to_reproduce": "1) Deploy a model variant with both int8 and bf16 kernels enabled (quantization fallback enabled).\n2) Configure worker pool with mixed kernel-capable GPUs and set kernel-swap threshold low to force in-flight switching.\n3) Issue a long-context chat request that triggers background prefill writes while decode is reading KV (e.g., history length > 8k tokens, streaming enabled).\n4) Run the same request multiple times under concurrency (10+ concurrent sessions).\n5) Observe occasional generation mismatch: token duplication or shift in output.\nRepro rate: ~1-2% on our perf harness on p4d cluster under synthetic load; increases with request concurrency and sequence length.",
+  "observed_behavior": "- Duplicated final token(s) in generation or an extra separator token.\n- Non-deterministic divergence between consecutive identical requests.\n- Small difference in softmax/attention logits (1e-5 to 1e-3) immediately after kernel-switch boundary in logs.\n- KV index audit shows a hole or overlapping write in ~30% of affected traces.",
+  "expected_behavior": "Kernel switching should be functionally transparent: no KV slot misalignment, no inter-run divergence, and numeric differences limited to acceptable roundoff that do not change argmax decisions for tokens.",
+  "investigation_notes": "- Initial alerts came from our production canary (canary-8) on 2026-02-09 after an infra change to lower kernel-swap latency.\n- Collected 120 failing traces and 10k successful traces for comparison.\n- Correlated failures with: (a) interleaved prefill writes overlapping decode reads, (b) kernel selection decision executed in worker thread A while worker B was performing decode on same session, (c) presence of small scheduling jitter (10-50us) at prefill/decode handoff.\n- Binary search narrowed source to the kernel-selector + KV reservation code path introduced in PR #14290.\n- Heap snapshots show KV ring index incremented twice in one code path when a kernel-swap callback raced with prefill completion.\n- FP logs: scaling factor applied by int8-dequant path differs by ~1e-3 from bf16 kernel path in some tensor lanes; divergence amplified by attention softmax and causes different top-1 token in edge cases.",
+  "logs_samples": "[2026-02-09T21:34:12.831Z] session=abc123 kernel=bf16 decode_step=45 status=reading_kv idx=1023\n[2026-02-09T21:34:12.840Z] session=abc123 kernel_switch=int8 reason=throughput_estimate\n[2026-02-09T21:34:12.842Z] session=abc123 prefill_write idx=1023 -> idx=1024 (hole created)\n[2026-02-09T21:34:12.846Z] session=abc123 decode_read idx=1024 value=... (unexpected)\nSoftmax-delta: 2.7e-4 on token logits at step 46",
+  "hypothesis": "A race between the kernel-selector callback and the KV reservation/write path can cause the ring buffer index to be updated inconsistently. When the worker switches kernels mid-request, the dequant/scaling semantics differ slightly; combined with a mis-ordered KV index update this leads to reading stale/shifted KV slices and small numeric differences that in edge cases flip token selection. The root causes are (1) non-atomic KV slot reservation across kernel-change boundary and (2) missing normalization parity between int8 dequant path and bf16 kernels for cross-kernel handoff.",
+  "temporary_mitigation": "1) Disable dynamic in-flight kernel switching by default for affected model families (toggle via runtime flag: disable_inflight_kernel_swap=true).\n2) Add a conservative lock around KV slot reservation code when kernel swap is pending.\n3) Re-enable deterministic kernel selection in Dedicated clusters until fix is validated.",
+  "proposed_fixes": "1) Make KV slot reservation and index increment atomic with respect to kernel-switch events (use small critical section or CAS on the ring index).\n2) Standardize scaling factors at kernel boundary: ensure int8->fp path applies the same normalization constants as bf16 kernel, add unit tests comparing per-lane post-attn sums.\n3) Add scheduling barrier that drains prefill writes for the session before committing a kernel change for that session (prefer fence over global lock).\n4) Add targeted regression tests in the perf harness that simulate interleaved prefill+decode with kernel-swap enabled.",
+  "action_items": "- Ayaan: implement atomic KV reservation (3 days).\n- Priya: add cross-kernel normalization unit tests + numeric fuzz cases (2 days).\n- Tomas: extend perf harness to reproduce at scale + create canary job (2 days).\n- Marisol: coordinate rollout of runtime flag and monitor metrics (1 day).\n- Create PRs and get reviewers: ENG/runtime, ENG/kv-cache, QA/perf.\n- Target merge window: 2026-03-18 for runtime-1.24 patch.",
+  "linked_prs": [
+    "https://github.com/redwood-inference/runtime/pull/14290",
+    "https://github.com/redwood-inference/runtime/pull/14356 (WIP - atomic-kv-reserve)",
+    "https://github.com/redwood-inference/perf-harness/pull/628"
+  ],
+  "related_docs": [
+    "https://confluence.redwood.ai/display/RUNTIME/KV+ring+design",
+    "https://confluence.redwood.ai/display/RUNTIME/Kernel+selection+design+notes"
+  ],
+  "dependencies": [
+    "ENG-38750",
+    "ENG-38912"
+  ],
+  "reviewers": [
+    "Evan Chung",
+    "Priya Rao",
+    "Tomas Nilsson"
+  ],
+  "comments": [
+    "2026-02-11 - Evan Chung: Assigned to Ayaan. Initial triage suggests causal link to PR #14290.\n",
+    "2026-02-18 - Priya Rao: Added numeric-comparison unit tests; found desync when int8 scale != bf16 implicit scale.\n",
+    "2026-02-26 - QA/perf: Reproduced locally with perf-harness config long_context_v2; repro rate ~1.4%.\n",
+    "2026-03-04 - Ayaan Patel: Pushed WIP PR for atomic KV reserve; need feedback on CAS primitive.\n",
+    "2026-03-10 - Marisol Vega: Enabled runtime flag in canaries; observability shows drop to zero customer-facing errors but internal perf cost +2% on tail latency.\n",
+    "2026-03-12 - Tomas Nilsson: Perf harness added stress scenario; reruns scheduled across p4d and a100 farms."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "investigation_notes",
+    "logs_samples",
+    "hypothesis",
+    "temporary_mitigation",
+    "proposed_fixes",
+    "action_items",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_b1f65842d3b74af89720f9d78aac43c6"
+}

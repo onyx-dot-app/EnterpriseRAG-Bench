@@ -1,0 +1,34 @@
+{
+  "title": "Stochastic surge resample notes",
+  "owner": "Kevin Liu",
+  "drive_area": "users",
+  "path": "users/stochastic-surge-resample-notes-kevin.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-03",
+  "last_modified": "2026-02-28",
+  "collaborators": [
+    "Maya Patel",
+    "Ibrahim Noor"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "throughput",
+    "surge",
+    "resample",
+    "kv-cache",
+    "batching"
+  ],
+  "linked_artifacts": [
+    "GH: redwood/runtime#482",
+    "JIRA: PERF-317",
+    "gist:5a1c2b9-resample-config"
+  ],
+  "body": "Context:\nQuick scratchpad for resample-based microburst experiments. Trying to reproduce noisy tails we saw in production when ingress arrivals deviate from Poisson (heavy clustering / re-sampling of past inter-arrival patterns). Goal is to find knobs (batch timeout, cold-cache fraction, dynamic vs static batching) that reduce p99 without blowing up p50 or cost.\n\nEnvironment:\n- Runtime image: redwood/inference-runtime:2026-02-15-rc (commit sha a1b2c3d)\n- Hardware: 4xA100-40GB (dedicated small pool), 32 vCPU bench driver machine\n- Model: gpt-j-6B-quant (q4_0), seq_len 1024, kv-cache enabled\n- Loadgen: bench/arrival_resampler.py (local), version: v0.9.1\n- Important flags used in bench runs: --qps, --burst-profile, --cold-cache-pct, --batch-timeout-ms, --batching-mode, --duration\n\nExperiment design (high level):\n1) Resample a 10-minute trace collected from Prod ingress (traceA). Create 3 resample variants: R_small (short clusters), R_med, R_heavy (high temporal clustering). Each resample repeats contiguous windows (bootstrap) to create microbursts.\n2) Sweep cold-cache fraction: 0%, 20%, 50% (simulates cache priming failure due to prior evictions).\n3) Sweep batch timeout: 8ms, 16ms, 32ms. Compare batching_mode: dynamic (auto batch) vs static (fixed batch 32 tokens).\n4) Keep overall QPS same (125 QPS) for baseline comparability; duration = 20m each.\n\nCommand used (example):\n./bench/arrival_resampler.py \\\n  --model gptj-6b-q4 \\\n  --qps 125 \\\n  --duration 1200 \\\n  --burst-profile profiles/R_med.json \\\n  --cold-cache-pct 20 \\\n  --batch-timeout-ms 16 \\\n  --batching-mode dynamic \\\n  --max-batch-tokens 4096 \\\n  --log-level debug\n\nRaw perf summary (selected runs, median of 3 repetitions):\nNote: p50/p95/p99 in ms, errors = % requests with non-200\n\nRun A - R_small, cold_cache=0%, batching=dynamic, timeout=16ms:\n- p50: 24 ms\n- p95: 94 ms\n- p99: 210 ms\n- avg tokens/sec (observed): 420k tokens/s from pool\n- errors: 0.07%\n- notes: smooth tail, KV cache hit rate ~98% from logs\n\nRun B - R_med, cold_cache=20%, batching=dynamic, timeout=16ms:\n- p50: 26 ms\n- p95: 140 ms\n- p99: 740 ms\n- errors: 0.8% (mostly timeouts during spike windows)\n- notes: p99 spikes coincide with simultaneous cold cache misses and queues forming; observed batching jitter (one long queueing event ~850ms)\n\nRun C - R_heavy, cold_cache=50%, batching=dynamic, timeout=16ms:\n- p50: 28 ms\n- p95: 320 ms\n- p99: 2,100 ms\n- errors: 3.5% (timeouts/retries)\n- notes: catastrophic tail when cache is cold and many requests hit same prefix; dynamic batching increased batch sizes during spikes -> higher queueing latency for some requests\n\nRun D - R_med, cold_cache=20%, batching=static(size=16), timeout=N/A:\n- p50: 34 ms\n- p95: 220 ms\n- p99: 540 ms\n- errors: 0.9%\n- notes: static batching trades throughput for tighter tail; p50 higher but p99 reduced vs dynamic in same config\n\nRun E - R_med, cold_cache=20%, batching=dynamic, timeout=8ms:\n- p50: 22 ms\n- p95: 170 ms\n- p99: 980 ms\n- notes: lower timeout reduces queue formation but increases model kernel inefficiency (less amortized tokens)\n\nQuick percentile table (R_med, cold_cache=20%):\n- timeout=8ms dynamic: p50 22ms / p95 170ms / p99 980ms\n- timeout=16ms dynamic: p50 26ms / p95 140ms / p99 740ms\n- static(16): p50 34ms / p95 220ms / p99 540ms\n\nObservations / hypotheses:\n- Cold cache fraction is the dominant factor for tail growth. When >20% of requests miss the KV cache, p99 skyrockets during bursts.\n- Dynamic batching is great for amortizing cost and lowering p50 but can worsen p99 if bursts cause large backlogs (queueing penalty).\n- Static batching or artificially capping max batch size during burst windows creates a predictable tail at the cost of some higher median latency and slightly higher unit cost.\n- Lower batch timeout reduces queue build-up but increases compute inefficiency. There's a sweet spot around 12-18ms for this model/seq_len in these hardware constraints.\n- Errors/timeouts are correlated with scheduler preemption and GPU warmup penalties during heavy cold-cache windows.\n\nNotable logs/traces to inspect (ids):\n- trace_run_B_2026-02-12.tgz (driver logs + runtime traces)\n- flame_R_med_cold20_runB.html (flamegraph of request timeline)\n\nImmediate actionable ideas:\n- Implement a small \"cold-cache fast-lane\" heuristic: requests flagged as likely cold (based on prefix frequency probe) get routed to a low-latency lane with bounded batch size and higher per-request cost. Try a simple heuristic: if prefix frequency < 500 in last 10m -> fast-lane.\n- Add adaptive batch cap: if queue depth > X for >Y ms, cap batch size to 32 for next T seconds (bypasses dynamic growth)\n- Improve cache warming: proactive prefill for top-K prefixes before expected surge windows (trace-driven).\n\nNext experiments (ordered):\n1) Implement adaptive batch cap in bench harness (simulate cap) and rerun R_med/cold20 with timeout=12ms.\n2) Fast-lane simulation: route 10% cold candidates to fast-lane, measure p99 and cost delta.\n3) Sweep QPS 100->200 to validate generalization.\n4) Repeat on 2xA100 vs 4xA100 to measure scaling behavior of tail under same bucketed load.\n\nOpen questions / things to sanity-check:\n- Are timeouts coming from app-level (bench driver) or internal runtime scheduling? Need to correlate bench client traces with runtime request ids.\n- Is KV cache eviction pattern (LRU vs CLOCK) amplifying cold windows? Check eviction logs.\n- Cost impact: static/exclusive lanes will increase unit cost; quantify against SLA benefit.\n\nNotes to self / TODO:\n- Upload flamegraphs and the exact resample profiles to Gist (link above).\n- Pair with Maya next week to prototype fast-lane simulation (block on her calendar).\n- Add a short write-up for product about tradeoffs (1 pager): static batch vs dynamic for p99-sensitive endpoints.\n\nEnd of scratchpad.\n\n-- Kevin\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_b2b20d3be00d42638b650fb42ed568b0"
+}

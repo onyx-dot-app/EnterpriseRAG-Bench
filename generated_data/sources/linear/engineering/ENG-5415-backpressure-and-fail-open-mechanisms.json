@@ -1,0 +1,58 @@
+{
+  "key": "ENG-5415",
+  "team": "engineering",
+  "title": "Backpressure + circuit breaking for shadow traffic (fail-open + graceful degradation)",
+  "status": "In Review",
+  "priority": "P0",
+  "created_at": "2026-01-16",
+  "updated_at": "2026-02-11",
+  "creator": "Sean Gallagher",
+  "assignee": "Vikram Singh",
+  "project": "Shadow traffic tool for eval metrics",
+  "cycle": "2026-W06",
+  "estimate": "8",
+  "due_date": "2026-02-14",
+  "labels": [
+    "shadow-traffic",
+    "reliability",
+    "sre-reviewed",
+    "backpressure",
+    "circuit-breaker",
+    "fail-open",
+    "telemetry",
+    "scoring-pipeline"
+  ],
+  "dependencies": [
+    "ENG-5402",
+    "ENG-5404",
+    "ENG-5405",
+    "ENG-5412",
+    "ENG-5410"
+  ],
+  "parent_issue": "PM-1842",
+  "sub_issues": [
+    "ENG-5415-A",
+    "ENG-5415-B",
+    "ENG-5415-C"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.18",
+  "security_review_required": "false",
+  "description": "Context\nShadow traffic must be strictly fail-open: if shadow target or scoring/ingestion is unhealthy, the user (control) request path must remain unaffected (latency/throughput/errors). During dogfood we saw scoring queue lag (see Slack incident thread: sources/slack/incidents/1768180020-shadow-scoring-queue-backlog.json). We need explicit backpressure and circuit breaking across (1) routing mirroring, (2) telemetry ingestion, and (3) scoring pipeline so we degrade gracefully instead of amplifying load or causing cardinality/infra alerts.\n\nProblem statement\nToday the shadow path will continue attempting mirrors and producing telemetry even when downstream components (shadow target, ingestion, scoring) are saturated. This can:\n- increase CPU/network overhead on the data plane\n- increase metrics/telemetry load when pipelines are already behind\n- create delayed/incorrect dashboards (stale deltas) with poor operator visibility\n- lead to cascading failures (queue growth -> worker saturation -> further lag)\n\nGoals\n- Enforce fail-open guarantees: shadow path failures never block/slow the control response.\n- Add explicit backpressure at each hop (mirror -> emit -> ingest -> score) with clear shedding behavior.\n- Introduce circuit breakers that automatically stop shadowing when health signals indicate risk.\n- Provide observable signals (metrics + logs) to debug why shadow is not running (dropped due to breaker, quota, lag, etc.).\n- Integrate with feature flags + kill switches so oncall can disable quickly.\n\nNon-goals\n- Perfect delivery of all shadow samples (best-effort only).\n- Customer-configurable circuit breaker logic in v1 (we ship sane defaults; later expose knobs).\n\nProposed design (v1)\n1) Data plane mirroring backpressure (inline)\n- Hard per-request budgets:\n  - max shadow time budget: 150ms (configurable) for establishing request + first token/ack (streaming uses separate semantics per ENG-5414).\n  - strict concurrency cap per instance for shadow outbound requests (e.g., semaphore).\n  - strict memory cap for buffering shadow request bodies (avoid large prompts causing buffering spikes).\n- If budgets are exceeded, drop shadow attempt with reason code; continue control path unaffected.\n- Emit a single lightweight drop metric and sample log (rate-limited) rather than full telemetry.\n\n2) Circuit breaker: shadow target health\n- Breaker inputs:\n  - rolling error rate to shadow target (5xx/timeout) over 1m/5m windows\n  - p95 shadow target latency over 1m\n  - local concurrency saturation (shadow semaphore at >90% for >N seconds)\n- Behavior:\n  - OPEN: stop attempting mirroring for that shadow target (still allow control path)\n  - HALF_OPEN: allow limited probes (e.g., 1% of eligible samples) to test recovery\n  - CLOSED: normal mirroring\n- Scope: breaker keyed by (route_id, shadow_target_id, region) to avoid global impact.\n- Hysteresis and minimum sample counts to avoid flapping.\n\n3) Telemetry emission shedding\n- When breaker is OPEN or when local backpressure triggers, emit only:\n  - counter: shadow_mirror_dropped_total{reason=..., target=...}\n  - gauge: shadow_breaker_state{target=...}\n- Avoid emitting per-request rich events (shadow pair artifacts) when downstream ingestion is unhealthy.\n- Use sampling + rate limits for logs to prevent log storms.\n\n4) Ingestion/scoring pipeline backpressure\n- Inputs:\n  - scoring queue lag seconds (age of oldest message)\n  - queue depth\n  - worker saturation (utilization)\n  - ingestion processing lag (Kafka/stream lag)\n- Behavior:\n  - When lag exceeds threshold (e.g., >10m), automatically reduce shadow sampling rate at the policy-enforcement layer to a minimum floor (e.g., clamp to 0.1% or 0% depending on severity).\n  - When lag exceeds critical threshold (e.g., >30m), set a global \u201cscoring degraded\u201d flag that:\n    - turns off rich event emission\n    - disables shadow scoring jobs creation (store minimal metadata only)\n- Note: rate clamp must preserve deterministic bucketing semantics (ENG-5403): implement \u201ceffective_sampling_rate\u201d applied after bucketing decision so a request remains eligible but may be dropped uniformly by second-stage Bernoulli.\n\n5) Operator controls\n- Feature flags:\n  - shadow_mirroring_enabled (global)\n  - shadow_scoring_enabled (global)\n  - shadow_rich_telemetry_enabled (global)\n- Kill switch surfaced in internal ops (and available to SRE oncall): immediate OPEN breakers + disable mirroring.\n\nMetrics / observability (must-have)\n- shadow_mirror_attempted_total{route_id, target_id, region}\n- shadow_mirror_success_total{...}\n- shadow_mirror_dropped_total{reason, ...} reasons:\n  - breaker_open\n  - local_concurrency_limit\n  - shadow_timeout\n  - request_too_large\n  - telemetry_shed\n  - scoring_degraded\n- shadow_breaker_state{state, ...} (0/1 gauges or enum via labels; keep label cardinality bounded)\n- shadow_scoring_queue_lag_seconds (gauge)\n- shadow_ingestion_lag_seconds (gauge)\n- shadow_effective_sampling_rate (gauge, per route target; bounded)\n- Dashboards: add panels to existing \u201cQuality delta\u201d dashboard for breaker state + dropped reasons (ref: observability-pack/pr-391-add-quality-delta-dashboards.json)\n\nAcceptance criteria\n- Under simulated scoring outage (workers down, queue lag increasing), control path p50/p99 latency delta remains within SLO budget (see shadow SLO doc) and shadow mirrors are automatically reduced/stopped within 5 minutes.\n- Under shadow target failure (timeouts/5xx), breaker opens and drop reason counts match expected behavior; no user-visible error increase.\n- No metric-cardinality regressions (route_id/target_id must be bounded; no prompt_id/customer_id labels).\n- Clear operator visibility: oncall can answer \u201care we shadowing?\u201d and \u201cwhy not?\u201d from dashboards.\n- Verified via load test suite (ENG-5412) and dogfood follow-up.\n\nImplementation plan\n- Add local concurrency limiter + per-request shadow timeout in routing mirror path (ties to ENG-5402 implementation).\n- Implement breaker state machine + persistence TTL in routing service (in-memory with periodic reset; no durable storage required for v1).\n- Add pipeline health signals to control plane / policy service so effective sampling rate can be clamped.\n- Add telemetry shed path and drop-reason taxonomy.\n- Wire feature flags + kill switch endpoints.\n\nRisks / trade-offs\n- Risk: breaker keyed too broadly -> reduces shadow coverage. Mitigation: key by route+target+region and use HALF_OPEN probes.\n- Risk: sampling clamp breaks deterministic comparisons if implemented incorrectly. Mitigation: clamp after bucketing but before mirror attempt, and record effective_sampling_rate in aggregates.\n- Risk: metrics could still be high volume. Mitigation: emit only counters/gauges with bounded labels; sample logs.\n\nReferences / related work\n- ENG-5402: routing mirroring implementation\n- ENG-5405: scoring queue + workers\n- ENG-5414: streaming shadowing semantics\n- ENG-5410: cardinality guardrails\n- PRs in flight/landed:\n  - sources/github/redwood/pr-24895-shadow-pipeline-backpressure-and-circuit-breaker.json (core breaker + lag-based shed)\n  - sources/github/redwood/pr-24833-routing-mirror-sampled-requests-fail-open.json (timeouts + fail-open skeleton)\n- Incident learnings:\n  - sources/slack/incidents/1768180020-shadow-scoring-queue-backlog.json\n\nOpen questions\n- What should be the default thresholds for OPEN/HALF_OPEN transitions for Dedicated vs Hosted? Proposal: same defaults, but Dedicated can raise max sampling only if they opt in and have capacity headroom.\n- Do we clamp sampling at policy layer (control plane) or at data plane only? Proposal: policy layer sets effective_sampling_rate; data plane enforces local budgets regardless.\n\nTest plan\n- Unit tests: breaker transitions, drop reason mapping, concurrency limiter.\n- Integration tests: simulated shadow target 5xx/timeouts; verify breaker open and control path unaffected.\n- Load tests: run perf-canary suite with scoring workers disabled; confirm mirroring reduces and no p99 regression.\n\nRollout plan\n- Internal tenants only behind feature flag.\n- Enable in one region for dogfood; monitor breaker panels and control path SLOs.\n- Expand to beta Dedicated tenants after SRE sign-off + runbook updates.\n",
+  "comments": [
+    "2026-01-16 (Sean Gallagher): Marking P0 for beta readiness. Need explicit breaker + shed path; we can\u2019t rely on \u201cbest effort\u201d only. Please coordinate thresholds with Allison Grant and Nadia Rahman.",
+    "2026-01-19 (Vikram Singh): Drafted design: local semaphore + 150ms shadow budget, plus breaker keyed by route+target+region. Plan to add drop_reason metric and clamp effective sampling based on scoring lag.",
+    "2026-01-22 (Allison Grant): +1 on drop_reason taxonomy. Please ensure labels are bounded; avoid customer_id/prompt_id. For breaker state, prefer numeric gauge with limited labels. Also add alert: breaker_open for >15m on any beta route.",
+    "2026-01-25 (Nadia Rahman): For scoring lag, we can publish a single \u201cscoring_degraded\u201d boolean flag from pipeline controller rather than having routers scrape queue depth. Let\u2019s keep coupling minimal. I\u2019ll provide a health endpoint/metric.",
+    "2026-01-29 (Vikram Singh): Implemented breaker + shed path in PR-24895. Added HALF_OPEN probing at 1% and 60s cool-down. Effective sampling clamp is applied after deterministic bucketing to preserve consistency.",
+    "2026-02-03 (Sean Gallagher): Reviewed PR: looks good. Need one more thing before ship: ensure telemetry shed path doesn\u2019t emit rich events when scoring_degraded=true (we saw ingestion cost spikes during the backlog incident).",
+    "2026-02-07 (Vikram Singh): Addressed: when scoring_degraded=true, we emit only dropped_total{reason=scoring_degraded} + breaker_state; skip shadow pair event generation. Added rate-limited logs.",
+    "2026-02-11 (Chloe Martin): Console should display \u201cScoring delayed / degraded\u201d banner when effective_sampling_rate is clamped. Please expose effective_sampling_rate in aggregates so UI can explain missing deltas."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_c0c9c3fcd61a4afc81a831cf364ecf5a"
+}

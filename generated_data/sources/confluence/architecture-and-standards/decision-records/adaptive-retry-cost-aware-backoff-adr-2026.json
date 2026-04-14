@@ -1,0 +1,62 @@
+{
+  "title": "Adaptive Retry Scheduling and Cost-Aware Backoff (ADR)",
+  "space": "architecture-and-standards",
+  "author": "Asha Gupta",
+  "owner_team": "engineering",
+  "status": "published",
+  "created_at": "2026-02-11",
+  "last_updated": "2026-03-01",
+  "reviewers": [
+    "Elliot Harper",
+    "Marcos Alvarez",
+    "Priya Menon"
+  ],
+  "labels": [
+    "adr",
+    "retry-policy",
+    "cost-control",
+    "slo",
+    "runtime-contract"
+  ],
+  "confidentiality": "internal",
+  "summary": "This ADR defines a cross-layer standard for adaptive retry scheduling and cost-aware backoff that coordinates client-side, gateway, and runtime behaviors to meet latency SLOs while preventing cost runaway and preserving correctness for idempotent and non-idempotent inference requests.",
+  "decision": "Adopt a standardized adaptive retry/backoff contract that: (1) expresses retry semantics and idempotency requirements in request metadata; (2) enables SLO-driven dynamic backoff windows at the gateway and runtime; (3) integrates a tenant-cost-burn signal to throttle retries when budget risk is detected; and (4) provides deterministic deduplication semantics to avoid duplicate-output hazards for non-idempotent tool-calls.",
+  "context_and_problem_statement": "Redwood services operate across hosted, dedicated, and private deployments. During transient upstream faults, naive retry strategies create two recurring problems: (a) traffic amplification leading to cascading failures and flare-ups in GPU cost; and (b) correctness hazards for requests that trigger external side effects or tool-calls. We need a consistent runtime + client contract that is SLO-aware, cost-sensitive, and compatible with our existing observability and routing stacks.",
+  "requirements": "Must meet the following requirements:\n\n- Preserve user-visible correctness for idempotent and non-idempotent requests.\n- Bound retry amplification under high error or latency percentiles.\n- Allow runtime to reduce retries when cost budget or GPU pressure is high.\n- Emit telemetry for every retry decision (reason, actor, attempt number).\n- Support per-tenant and per-route overrides with safe defaults.\n- Be implementable in hosted gateway, dedicated edge proxies, and private runtime sidecars.",
+  "runtime_contract_and_metadata": "Requests MUST carry the following headers/metadata (or SDK equivalents):\n\n- X-Req-Id (required): canonical request id for tracing/dedup.\n- X-Idempotency-Level (optional): values = {idempotent, best-effort, non-idempotent}. Default = best-effort.\n- X-Max-Retries (optional): integer cap from client; servers may lower. Default = 3.\n- X-Retry-Group (optional): logical group for dedup TTL (examples: chat.turn, embed.batch).\n- X-Retry-Hint (optional): one of {fast-retry, delayed-retry, do-not-retry}.\n\nThe runtime MAY override X-Max-Retries downward and MUST annotate response metadata with the final retry policy used (Retry-Policy-Applied: {max_retries: N, strategy: name}).",
+  "adaptive_backoff_algorithm": "Core algorithm (gateway/runtime cooperative):\n\n1) Classify failure: transient (timeout, 5xx, upstream-unavailable), permanent (4xx), ambiguous (rate-limit).\n2) For transient failures: consult SLO health signal and cost burn signal. Compute effective backoff multiplier M = base * SLO_factor * Cost_factor, where base is exponential base (default 2.0), SLO_factor \u2208 [0.5, 2.0] maps p95 latency and error budget consumption, Cost_factor \u2208 [0.25, 3.0] maps short-term cost burn.\n3) Apply jittered exponential backoff with cap = min(client_cap, runtime_cap).\n4) Short-circuit immediate retry if failure classified as fast-recoverable and system signals (queue depth, GPU utilization) below low-water thresholds.\n5) If tenant cost burn exceeds threshold or GPU pressure is high, reduce retries to 0 and route to degraded path (lower-fidelity model variant) if configured.\n\nThis algorithm is expressed via a single runtime config map (see examples) and must be versioned with runtime-config schema version metadata.",
+  "config_example": "# Example YAML for gateway/runtime policy (semantic, explanatory):\npolicy_version: v1\ndefaults:\n  max_retries: 3\n  base_backoff_ms: 100\n  cap_backoff_ms: 30000\n  jitter: full\n  idempotency_enforcement: strict\nscoring_parameters:\n  slo_p95_weight: 0.6  # how strongly p95 influences the SLO_factor\n  cost_burn_weight: 0.4\ncost_budgets:\n  tenant_override_enabled: true\n  default_cost_threshold_pct: 70\nrouting_fallbacks:\n  low_fidelity_model: model-small-quantized-v2\n  degrade_after_retries: 0\nper_route_overrides:\n  /api/v1/chat:\n    max_retries: 1\n    base_backoff_ms: 200\n    idempotency_enforcement: relaxed\n\nNote: actual implementations will store equivalent config as typed protobufs or JSON schemas with validations.",
+  "telemetry_and_slos": "Instrumentation MUST include the following emitted fields on retry decisions:\n\n- retry.attempt (int)\n- retry.actor (string): {client, gateway, runtime} \n- retry.reason (string): {timeout, transient-5xx, upstream-unavailable, rate-limit, cost-guard}\n- retry.final_policy (string): serialized policy id/version\n- retry.dedup_hit (bool)\n\nSLO integration: gateway/runtime will compute a real-time SLO_factor from: p95 latency window (5m), error budget consumption (30m), and recent retry amplification metric. When SLO_factor > 1.5, the system reduces retries aggressively.\n\nAlerting: create SLO alerts when retry amplification ratio (retries_sent / requests_received) > 0.2 over 5m for critical routes.",
+  "deduplication_and_correctness": "Dedup semantics: For idempotent requests, dedup TTL = 60s by default (configurable per route). For non-idempotent requests, dedup MUST NOT be used unless the request includes an explicit idempotency token and the back-end declares safe-replay semantics.\n\nImplementation notes:\n- Gateway-level dedup uses X-Req-Id and X-Retry-Group to detect duplicate inflight requests and reply with cached streaming state when possible.\n- Runtime-level dedup uses deterministic request hashes and a small LRU ephemeral store scoped to the model shard. LRU entry lifetime = dedup TTL.\n\nFailure modes: If dedup store is lost during failover, requests may be reprocessed; fallback policy should be configured to prefer degraded output over blocking.",
+  "rollout_and_migration_plan": "Phase 0 (design & test): 2 weeks. Implement library-level SDK headers and unit tests.\n\nPhase 1 (gateway canary): Roll out adaptive backoff at gateway for 10% of traffic to non-critical routes. Monitor retry amplification, p95, cost burn for 72 hours.\n\nPhase 2 (runtime opt-in): Enable runtime-side lowering of retries for dedicated pools under GPU pressure; adopt for staging.\n\nPhase 3 (tenant opt-in): Allow selected large tenants to opt into vendor config controlling cost_budgets and special fallbacks.\n\nPhase 4 (global enable): After 4 weeks of stability and no correctness regressions, flip default policy to adaptive for all routes. Feature flags: gateway.adaptive_retry.enabled, runtime.cost_guard.enabled.\n\nRollback knobs: instant disable on error budget breach or observed customer-impacting duplicated side effects. Rollback procedure documented in runbook (related_pages).",
+  "testing_and_validation": "Testing strategy:\n\n- Unit tests for policy arithmetic and deterministic backoff outputs.\n- Integration tests with synthetic latencies and injected 5xx to exercise policy paths.\n- Chaos tests: simulate dedup store loss and verify outputs for non-idempotent tokens.\n- Cost-simulation sandbox: run replayed production traces with adaptive policies to measure delta in cost and p95.\n- Contract tests: ensure SDKs send required metadata and servers respond with Retry-Policy-Applied header.\n\nAcceptance criteria: no >1% increase in undetected duplicate side effects in canary, 10\u201330% reduction in token-cost during burst-unavailability scenarios, and p95 not degraded >10% for critical routes.",
+  "alternatives_considered": "1) Client-only retries: rejected because clients lack global SLO/cost context and cause wide amplification.\n2) Fixed global backoff with per-route overrides: simple but brittle; cannot react to transient cost or GPU pressure.\n3) Full client-side token-bucket throttle: heavy lift for SDKs and cross-tenant fairness; deferred to future work.\n\nWe chose a cooperative gateway+runtime approach for rapid safety and centralized observability.",
+  "implications_and_larger_consequences": "Operational impact: new telemetry increases cardinality \u2014 must apply sampling and aggregation suggestions in observability-standards. Cost control: this ADR enables active cost bailouts but requires clear product communication to tenants (possible degraded fidelity).\n\nSecurity: metadata must be authenticated (signed tokens for idempotency where provided) to avoid spoofing replay protections.\n\nCompatibility: private deployments may opt-out or tune parameters; the contract is intentionally lenient (defaults conservative) so as not to break older clients.",
+  "related_pages": [
+    "/confluence/architecture-and-standards/observability-standards/telemetry-ingestion-and-retention-guidelines-2025",
+    "/confluence/architecture-and-standards/model-serving-standards/runtime-cache-invalidation-and-staleness-mitigation-playbook-2026",
+    "/confluence/eng-serving-runtime/runtime-architecture/adaptive-kv-coordinator-and-eviction-contract-2026"
+  ],
+  "approval_signatures": "Approvers:\n- Product: Priya Menon\n- Eng SRE: Elliot Harper\n- Runtime: Marcos Alvarez\n\nDocument owner: Asha Gupta (Engineering)",
+  "notes_and_open_questions": "- Q1: Default dedup TTL tradeoff for large multi-turn chats (60s may be too short).\n- Q2: Should cost_budgets be absolute dollars or normalized units per tenant? Recommendation: use normalized cost units and expose both controls.\n- Q3: How to annotate streaming partials when dedup hits? Proposal: include Retry-Dedup-Partial: true header and stream resume token.\n\nTrack these in the follow-up task board and link into the rollout runbook.",
+  "file_version": "1",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "decision",
+    "context_and_problem_statement",
+    "requirements",
+    "runtime_contract_and_metadata",
+    "adaptive_backoff_algorithm",
+    "config_example",
+    "telemetry_and_slos",
+    "deduplication_and_correctness",
+    "rollout_and_migration_plan",
+    "testing_and_validation",
+    "alternatives_considered",
+    "implications_and_larger_consequences",
+    "approval_signatures",
+    "notes_and_open_questions"
+  ],
+  "dataset_doc_uuid": "dsid_690f2a3212c64e929bb5605960db3937"
+}

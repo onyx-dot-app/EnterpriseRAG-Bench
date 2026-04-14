@@ -1,0 +1,99 @@
+{
+  "key": "SUP-215367",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "TGW IP-in-IP encapsulation + MSS clamping causing TLS record fragmentation and HTTP/2 frame split, corrupting presigned shard downloads",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Patel",
+  "assignee": "Marco Nguyen",
+  "customer_company": "DataSense Analytics",
+  "customer_tier": "private",
+  "environment": "prod | us-west-2",
+  "components": [
+    "serving-runtime",
+    "vpc-routing",
+    "egress-nat",
+    "tls"
+  ],
+  "labels": [
+    "networking",
+    "vpc-tgw",
+    "mss-clamp",
+    "artifact-download"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "affected_models": [
+    "gpt-large-3b-sharded"
+  ],
+  "sla_due_at": "2026-03-12",
+  "linked_issues": [
+    "INT-4021",
+    "SUP-712345"
+  ],
+  "related_github_prs": [
+    "gh.com/redwood/infra/pull/1289"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/TGW+Encapsulation+and+MSS+Guidance"
+  ],
+  "description": "Issue summary: Customer reports intermittent 403/Range mismatch errors when fetching large sharded model artifacts from Redwood control plane. Failures correlate with network path through customer's Transit Gateway (TGW) where IP-in-IP encapsulation and an inline WAN appliance perform MSS clamping. Impact: model pulls fail during model boot, causing degraded serving and elevated latency for customer-facing inference.",
+  "impact": "Model pull failures for ~20% of attempts during nightly scaling; serving nodes fall back to older cached weights, causing slower cold-start and a small percentage of inference errors.",
+  "environment_details": "Private deployment with TGW-attached branch sites using IP-in-IP (IPIP) encapsulation for site-to-site tunnels. Egress path traverses branch WAN appliance that applies MSS clamping to avoid PMTU blackhole on legacy MPLS links. Control plane and object storage endpoints reachable via VPCE gateway.",
+  "steps_to_reproduce": [
+    "1) Provision a serving node in customer's private deploy in us-west-2 with model gpt-large-3b-sharded pinned to version v2026-02-28.",
+    "2) Trigger a cold start by scaling from 0 -> 3 replicas during nightly batch window (large shard downloads).",
+    "3) Observe artifact presigned range GETs failing intermittently with HTTP 206/416/403 or aborted HTTP/2 stream resets in curl/nghttp2 logs when path traverses branch TGW -> appliance -> internet egress.",
+    "4) Re-run with tcpdump on serving node and packet capture on branch appliance to correlate MTU, IPIP headers, and TCP segments.",
+    "5) Reproduce is time-correlated with branch appliance applying MSS clamp to 1200 bytes for tunneled flows.",
+    "6) Disabling IPIP (or bypassing the appliance) removes the failure consistently."
+  ],
+  "logs": [
+    "[serving-node] 2026-03-10T03:14:22Z GET /shards/part-12 Range: bytes=0-1048575 -> HTTP/2 stream error: PROTOCOL_ERROR (frame size mismatch)",
+    "[serving-node] 2026-03-10T03:14:23Z curl: (18) transfer closed with outstanding read data",
+    "[appliance] 2026-03-10T03:14:21Z TCP: mss clamp applied: original 1460 -> 1200 for conn src=10.1.22.5 dst=54.239.12.10 (IPIP)",
+    "[pcap] seq 0x1a2b3c TCP payload sizes: 600, 600, 300 (after IPIP header) -> observed TLS record boundaries crossing frames leading to HTTP/2 HEADERS+DATA split and nghttp2 frame reassembly error"
+  ],
+  "comments": [
+    "Aisha Patel (Support) 2026-03-10: Initial triage \u2014 customer reports shard validation failures on 0->3 scale-up. Asked for packet captures and appliance config screenshots.",
+    "Customer (DataSense SRE) 2026-03-10: Uploaded tcpdump and appliance syslogs to shared S3 (link in ticket). Note: this started after TGW attachment to new branch hub and enabling IPIP with legacy WAN appliance.",
+    "Marco Nguyen (SRE) 2026-03-11: Observed consistent MSS clamp to 1200 bytes post-IPIP encapsulation resulting in TLS records spanning multiple TCP segments. Hypothesis: TLS record fragmentation + HTTP/2 frame splitting triggers nghttp2 frame length mismatch leading to stream resets and partial range reads, which artifact client treats as corruption and retries with invalid range -> 416/403.",
+    "Marco Nguyen (SRE) 2026-03-11: Requested customer to temporarily disable MSS clamp on appliance or route traffic around the appliance. Customer agreed to test bypass during maintenance window.",
+    "Customer (DataSense SRE) 2026-03-12: Bypassed appliance for VPCE egress path during 02:00-03:30 UTC; artifact downloads completed without error for 2000+ pulls. Re-enabling appliance reproduced failures. Will coordinate WAN vendor to change clamp policy.",
+    "Marco Nguyen (SRE) 2026-03-12: Created infra PR to add additional guardrails: increase artifact client retry validation, and detect HTTP/2 frame reassembly errors to initiate TLS renegotiation fallback (gh PR #1289)."
+  ],
+  "investigation_notes": [
+    "Reproduced locally using network emulation: adding 20 bytes of IPIP header + mss clamp to 1200 reproduces the nghttp2 frame error under HTTP/2 multiplexed shard fetches.",
+    "TLS stack (OpenSSL 3.1) preserves record boundaries but TCP segmentization from clamp causes a HEADERS frame split; nghttp2 treats illegal split as PROTOCOL_ERROR.",
+    "S3 presigned range behaviour: partial range retries with adjusted Range header contain offset mismatches when client received truncated payload leading to validation checksum mismatch -> server 403 on second attempt (presigned token replay semantics).",
+    "No evidence of model artifact corruption on S3 side; validation failures are client-side partial-read reassembly issues.",
+    "Related to path MTU/encapsulation interplay; existing docs mention PMTU but not interactions with MSS clamps on encapsulated flows.",
+    "Customer TGW route propagation timing and traffic steering to hub appliance exacerbated the window where this surface area affected scale-ups."
+  ],
+  "resolution": "Workaround: Instructed customer to disable MSS clamping for VPCE-bound flows or to adjust clamp to MTU 1350 (accounting for IPIP overhead) until WAN vendor can patch. Implemented client-side mitigations: increased HTTP/2 reassembly tolerance and added explicit detection of truncated TLS records to trigger connection restart in PR gh.com/redwood/infra/pull/1289. Post-change verification: customer reported 0 failures during bypass window and subsequent test with adjusted clamp=1350 showed successful pulls for 5000 sequential shard downloads.",
+  "postmortem_followup": [
+    "Confluence runbook update: add section on 'Encapsulation-aware MSS guidance' with recommended clamp values per encapsulation type.",
+    "Cloud infra task: add an early-detection metric for nghttp2 PROTOCOL_ERRORs during shard fetches and alert at >0.5% of shard pulls per minute.",
+    "Customer-facing docs: updated Private Deploy network checklist to call out TGW+IPIP interactions and VPCE egress validation steps.",
+    "Engineering: track gh issue #1290 to harden artifact client reassembly and add a test harness that injects small MTU and encapsulation headers."
+  ],
+  "original_location": "jira/customer-support/SUP-215367-tgw-ipip-mss-clamp-tls-fragmentation-http2-split-artifact-failures.json",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "impact",
+    "environment_details",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution",
+    "postmortem_followup"
+  ],
+  "dataset_doc_uuid": "dsid_1c9a117ffd7c40db9ac575cc400e1382"
+}

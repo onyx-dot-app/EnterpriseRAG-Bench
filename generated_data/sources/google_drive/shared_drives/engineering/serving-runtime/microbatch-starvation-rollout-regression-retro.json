@@ -1,0 +1,37 @@
+{
+  "title": "Microbatch starvation during canary rollout \u2014 regression retro",
+  "owner": "Priya Mehta",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/microbatch-starvation-rollout-regression-retro.json",
+  "doc_type": "doc",
+  "created_at": "2026-02-27",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Carlos Ruiz",
+    "Emma Chen",
+    "Liam O'Hara",
+    "Zoe Park"
+  ],
+  "team": "site-reliability-engineering",
+  "status": "in_review",
+  "tags": [
+    "incident",
+    "batching",
+    "canary",
+    "latency",
+    "oom",
+    "kv-cache",
+    "runbook"
+  ],
+  "linked_artifacts": [
+    "https://linear.app/RUN/INC-3421",
+    "https://github.com/redwood-inference/serving-runtime/pull/1892",
+    "https://slack-redwood.slack.com/archives/C01SERV/packet1234"
+  ],
+  "body": "Summary:\\n\\nDuring a canary rollout of the microbatching heuristic changes on 2026-02-27 we observed a gradual increase in tail latency (p95/p99) and small number of OOMs on a subset of serving hosts. The change adjusted the batching cutover thresholds to prioritize latency for short sequences; under mixed traffic this produced microbatch starvation where some request streams never accumulated enough tokens to form full batches and others flooded small fast batches. The starvation interacted with our per-host KV-cache shard assignment, causing uneven hot-shard amplification and memory spike on ~8% of pods.\\n\\nImpact:\\n- P95 increased from ~70ms to ~230ms for the affected route (chat/generation) over 45 minutes.\\n- 12 OOM restarts across 5 pods in two clusters (us-west-2 primary, eu-west-1 canary).\\n- No customer-visible data loss, but increased error budget burn and degraded QA canaries.\\n\\nHow detected:\\n- Alert: route_p95_latency_spike (threshold 180ms) triggered at 09:12 UTC.\\n- Autoscaler events showing queue-depth spike and host-level OOMs correlated to alert.\\n- SRE Slack channel: automated pager posted heap profiles and top-alloc callers.\\n\\nTimeline (high level):\\n- 09:00 UTC: Canary rollout starts (10% traffic to new microbatch heuristic).\\n- 09:08 UTC: early drift in per-instance batch sizes observed (dashboard).\\n- 09:12 UTC: p95 alert fires.\\n- 09:14-09:30 UTC: investigation \u2014 notable: some hosts show average batch size <1.2 tokens, others ~4.7.\\n- 09:32 UTC: 2 OOM restarts detected in us-west-2; rollback of canary initiated for the heuristic via ab-test flag toggle.\\n- 09:40 UTC: rollback completes; subsequent 15 minutes show p95 falling back toward baseline but some hosts still recovering cache/warmth.\\n\\nInitial hypotheses we considered:\\n1) Scheduling/CPU contention causing slower dispatch and small batches \u2014 ruled out by CPU and thread data.\\n2) Autoscaler misconfiguration causing hot hosts to get more traffic \u2014 partially true, but not full explanation.\\n3) New heuristic starving certain request patterns (short-turn chats) leading to inefficient KV-cache usage and hot-shard memory amplification \u2014 strongest lead.\\n\\nRoot cause (synthesized):\\nA combination of:\\n- The microbatching heuristic changed the batching accumulation window, causing frequent early flush of batches for low-token-rate streams while allowing other streams to form slightly larger batches. The net effect: more small batches overall and a larger number of short-lived KV cache entries per host.\\n- KV-cache shard assignment logic (hash by conversation id) concentrated many of the short-lived hot conversations on a small subset of hosts during the canary routing window (due to traffic steering rollouts), producing memory amplification on those hosts.\\n- The serving runtime's cache admission policy lacked an upper bound for short-lived prefix entries, so temporary churn accumulated until memory pressure triggered OOM.\\n\\nEvidence collected:\\n- Heap profiles from affected pods showing dominant allocations from KV cache small-entry buckets.\\n- Request traces showing batch sizes and token distributions per instance.\\n- Canary routing logs proving 10% traffic subset skewed toward a handful of user IDs (synthetic test traffic + real users) because of a routing key bug in the rollout script.\\n\\nMitigations applied during incident:\\n- Immediate: toggled canary flag off (09:32 UTC) to restore previous batching behavior.\\n- Scoping: set per-host cache admission caps (temporary server-side limiter) to 1000 active short-prefix entries to prevent immediate re-occurrence.\\n- Restarted the most afflicted pods after eviction to clear pathological state; monitored restart frequency.\\n\\nRunbook updates (draft entries to add):\\n- Add a pre-release checklist item for any batching heuristic change: simulate mixed traffic with skewed conversation-key distribution; verify batch-size distribution across instances.\\n- Add a rollback rapid-act step: if p95 > threshold && OOMs > 3 within 30m, immediately rollback and set temporary admission caps.\\n- Observability: expose per-host heatmap of batch size distribution and KV-cache short-prefix counts; add an alert for host-level hot-shard memory amplification ratio > 3x baseline.\\n- Canary steering: add validation to rollout script to ensure uniform distribution across routing keys (randomization check).\\n\\nPostmortem actions (owners):\\n- (Priya) Finish a fuzz-test harness to run microbatch heuristics under synthetic skewed-key workloads \u2014 due 2026-03-07.\\n- (Carlos) Implement permanent KV-cache short-entry admission policy and eviction prioritization by estimated lifetime \u2014 due 2026-03-14.\\n- (Emma) Add telemetry: per-host batch-size histogram and short-prefix count metric; wire to dashboards and alerting \u2014 due 2026-03-05.\\n- (Liam) Add rollout-script guardrail to verify routing-key uniformity (no more than 1.5x variance across shards in sampled window) \u2014 due 2026-03-01.\\n\\nOpen questions / follow-ups:\\n- Should we change conversation->shard hashing to include a top-level uniformizer when routing for canaries to avoid accidental skew? (design doc queued).\\n- What is the long-term policy for admission caps vs. cache hit-rate tradeoff? (product tradeoff review).\\n- Can we introduce unit tests that emulate memory amplification patterns and fail on regression?\\n\\nAppendix: debugging notes and useful commands\\n- Heap profiler path: /var/log/heapdumps/pod-heap-20260227-09-20.heap\\n- Query used to show batch size distribution (grafana): sum by (instance, bucket) (rate(batch_tokens_count_bucket[1m]))\\n- Slack thread: https://slack-redwood.slack.com/archives/C01SERV/p1643212345678\\n- Linear ticket tracking actions: https://linear.app/RUN/INC-3421\\n\\nStatus: this is a working retro draft. Planning a short review with serving-runtime and product-eval on 2026-03-12 to decide on rollout gating policy changes.\\n\\nNotes to self: include sample traces anonymized in next revision; attach synthetic harness results once available.\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body"
+  ],
+  "dataset_doc_uuid": "dsid_57121b956d73453fb88129e2362edd66"
+}

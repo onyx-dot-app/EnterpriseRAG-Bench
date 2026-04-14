@@ -1,0 +1,75 @@
+{
+  "key": "SUP-770321",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Intermittent egress proxy connection-reuse scrubs Host/Range on pooled connections causing sharded artifact fetch failures",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-08",
+  "updated_at": "2026-03-13",
+  "reporter": "Maya Chen",
+  "assignee": "Liam OConnor",
+  "customer_company": "AtlasHealth AI",
+  "customer_tier": "private",
+  "environment": "prod | us-east",
+  "components": [
+    "egress-proxy",
+    "vpce",
+    "serving-runtime",
+    "artifact-fetch"
+  ],
+  "labels": [
+    "private-deploy",
+    "artifact-download",
+    "egress-proxy",
+    "range-request"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "affected_models": [
+    "bert-large-sharded",
+    "gpt-3.5-sharded"
+  ],
+  "sla_due_at": "2026-03-14",
+  "linked_issues": [
+    "SUP-431207",
+    "SUP-71492"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/Artifact+download+troubleshooting"
+  ],
+  "description": "Issue summary: Customer reports intermittent model load failures for private deployment behind a corporate egress HTTP proxy. Serving nodes fail to fetch multiple model shards; some shard downloads return 200 OK (full object) or 403 when the serving runtime requested a Range GET, leading to shard checksum/offset mismatch and model load aborts.\n\nImpact: Multiple production instances in the customer's us-east private deployment fail model initialization at scale during rolling restarts. Impact is intermittent but reproducible under high shard-parallelism. Several customer services degraded; they escalated to P1.\n\nEnvironment: Private deployment (VPC + VPCE) with an on-premise egress appliance/proxy that the customer's networking team manages. Artifact storage is S3 via a VPCE endpoint; serving nodes use presigned range GETs over HTTP/1.1 keepalive to fetch model shards in parallel. Problem appears only when multiple consecutive shard requests reuse the same upstream connection.\n\nObserved behavior: Serving runtime logs show repeated errors: 'shard checksum mismatch' or 'unexpected content-length' followed by model load failure. HTTP traces from the serving node show second or later requests on the same connection had either missing Range headers or an incorrect Host header forwarded upstream. On the artifact side we see 200 responses where 206 expected, and occasionally 403 with S3 denying the request due to Host mismatch.\n\nExpected behavior: Each Range GET should be forwarded unchanged; upstream S3 should respond with 206 Partial Content for valid presigned Range requests and the data should match the requested byte ranges.\n",
+  "steps_to_reproduce": "1) Deploy a private cluster behind the customer's egress HTTP proxy.\n2) Start a serving node that downloads shards using presigned S3 range GETs over HTTP/1.1 keepalive.\n3) Configure parallel shard downloads that re-use the same persistent connection (default keepalive).\n4) Observe that some subsequent requests on the same TCP connection arrive at S3 without Range or with wrong Host header.\n5) Reproduce reliably when egress proxy connection pool latency < 50ms and when more than 4 shards are fetched in <2s window.",
+  "logs": "Selected snippets from serving node (trimmed):\n- [2026-03-06T21:12:03Z] fetch_shard(12) presigned_url=\"https://s3-vpce.example.amazonaws.com/bucket/object?X-Amz-Signature=...\" Range: bytes=0-1048575 => 206 OK\n- [2026-03-06T21:12:03Z] fetch_shard(13) presigned_url=... Range: bytes=1048576-2097151 => 200 OK (received full object size)\n- [2026-03-06T21:12:04Z] shard checksum mismatch for shard 13\n\nPacket capture (serving node -> egress): second GET includes Range header. Packet capture (egress -> s3): Range header absent; Host header changed to the first request's host header value. Full tcpdump attached to ticket (redacted).",
+  "investigation_notes": "- Reproduced in lab by placing Nginx-based connection pool proxy in front of S3 and enabling aggressive connection reuse. When pool reuses a connection the proxy reused request-line/headers from first request in buffer due to a bug in header handling under pipelined/keepalive workload.\n- Collected request/response traces from serving node and from egress appliance. Serving node always sends Range and correct Host. Egress logs show missing Range or Host rewritten to previous value prior to upstream write.\n- Hypothesis: Egress proxy uses an optimization to avoid reconstructing headers on connection reuse; under specific timing it replays a stale header block. The issue only manifests for rapid sequential range GETs that multiplex over a shared upstream connection.\n- Confirmed that switching serving runtime to disable HTTP keepalive (connection per request) eliminates the problem; also confirmed that disabling connection pooling on the egress appliance eliminates it.\n- Customer's egress proxy is a third-party appliance (version 8.2.1) with connection pool rewrite feature. Vendor has acknowledged a similar bug in older firmware but required a packet capture for confirmation.",
+  "comments": [
+    "2026-03-08 - Maya Chen (Customer): Initial report: model loads failing intermittently. Attached runtime logs and a short tcpdump from a serving node.",
+    "2026-03-09 - Support (Liam OConnor): Requested egress proxy logs and asked customer to temporarily disable keepalive on a canary serving node to test. Provided reproducer instructions and a curl-based test script to exercise sequential range GETs.",
+    "2026-03-10 - Customer NetOps (Raj Patel): Confirmed that disabling keepalive on one node mitigated the issue. We collected proxy traces and opened a vendor ticket (case #VN-99821). Vendor requests our tcpdump and indicates potential fix in 8.3.x.",
+    "2026-03-11 - Support (Liam OConnor): We reproduced locally with an Nginx connection pool configuration and filed an internal bug for 'presigned-range-pipelining' to the infra team (INT-90721). Recommended workaround to customer: set 'Connection: close' or disable pooling for S3 endpoints in egress proxy. Also recommended vendor upgrade plan.",
+    "2026-03-12 - Customer (Raj Patel): Applied temporary egress-proxy ACL to force new upstream connections for s3-vpce.example.amazonaws.com and reports 24 hours of stability so far.",
+    "2026-03-13 - Support (Liam OConnor): Marking investigation complete; vendor patch scheduled. Documenting long-term mitigation and follow-up items below."
+  ],
+  "root_cause": "Third-party egress proxy connection-pool implementation could reuse an upstream TCP connection while incorrectly reusing or omitting per-request header blocks (Range/Host) under rapid pipelined requests. This leads to incorrect responses (200 instead of 206) or Host mismatch causing 403 from S3, triggering shard corruption and model load failure.",
+  "workarounds": "1) Configure serving runtime to disable HTTP keepalive for presigned shard downloads (connection per request) until vendor patch is applied.\n2) On the customer's egress appliance: disable connection pooling or add an exception for S3 VPCE hostnames so each presigned URL gets its own upstream connection.\n3) As an immediate mitigation, decrease shard parallelism to reduce chance of reuse.",
+  "resolution": "Vendor acknowledged bug and provided a candidate firmware 8.3.0-rc with header-handling fix. Customer applied an egress ACL to disable pooling for S3 endpoints and observed stabilization. Support recommends vendor upgrade to 8.3.0 when available and applying the documented proxy exception as permanent config. Ticket to remain open until vendor upgrade is completed and verified in production.\n\nFollow-ups:\n- Customer to schedule vendor upgrade (owner: Raj Patel).\n- Support to validate post-upgrade in staging before closing (owner: Liam OConnor).\n- Docs: add troubleshooting note to Confluence about proxy pooling and presigned ranges.",
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/1245"
+  ],
+  "next_steps": "1) Customer: schedule upgrade to egress appliance 8.3.0 and share upgrade window.\n2) Support: run post-upgrade smoke tests using the provided reproducer script and one-week monitoring.\n3) Engineering: consider adding a safeguard in the serving runtime to verify Content-Range/Content-Length for each shard and retry with a new connection if mismatch detected. (Refer to INT-90721).",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "root_cause",
+    "workarounds",
+    "resolution",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_98bcc7d430eb4af4b273fe9c05caadf9"
+}

@@ -1,0 +1,47 @@
+{
+  "key": "ENG-4412",
+  "team": "engineering",
+  "title": "Backfill usage events missing cache-hit attribution fields (Hosted API)",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-12",
+  "updated_at": "2026-02-26",
+  "creator": "Logan Wright",
+  "assignee": "Caleb Johnson",
+  "project": "Billing meter hardening + pricing experiment integrity (Q1 2026)",
+  "cycle": "2026-W07",
+  "estimate": "5",
+  "due_date": "2026-03-06",
+  "customer_impact": "medium",
+  "release": "telemetry-2026.03",
+  "security_review_required": "false",
+  "labels": [
+    "metering",
+    "billing",
+    "data-quality",
+    "backfill",
+    "cache",
+    "hosted-api",
+    "revrec"
+  ],
+  "dependencies": [
+    "ENG-4438",
+    "ENG-4430",
+    "ENG-4421"
+  ],
+  "description": "## Context\nWe have a measurable spike in NULL/unknown values for cache attribution fields on `usage_events` for Hosted API traffic. This breaks:\n- Billing attribution for cache hits vs non-cache hits (needed for correct unit economics and some packaging rules)\n- Experiment analysis where variants change caching behavior (needs clean segmentation)\n- Finance reconciliation queries (NULL dimensions inflate \u201cunknown bucket\u201d and make drift checks noisier)\n\nThis ticket covers a *repair/backfill* for usage events already written with missing cache fields, plus hardening to prevent recurrence.\n\n## What\u2019s missing\nFields observed as NULL or defaulted incorrectly on a subset of events:\n- `cache_hit` (boolean)\n- `cache_hit_type` (e.g., prefix_cache / kv_cache / response_cache) \u2014 if present in schema; otherwise leave blank and only set `cache_hit`\n- `cache_read_tokens` / `cache_saved_tokens` (if available)\n- `cache_key` / `cache_namespace` (if applicable; only if we already store these internally)\n\nWe will not invent new schema in this backfill; we will populate only fields that already exist in the canonical usage events table.\n\n## Impact / severity\n- Billing: For most accounts, billed tokens are computed from model tokenization + pricing rules and should not change solely due to cache attribution. However, *packaging experiments and margin modeling* depend on cache_hit attribution, and some internal reporting treats cache hits differently.\n- Analytics: Experiment readouts for Q1 variants are currently flagged as \u201cnoisy\u201d due to cache attribution null-rate.\n- Support risk: Customers comparing our usage exports to their own logs are confused when cache attribution is missing, especially when discussing \u201cbilled vs raw tokens\u201d and caching behavior.\n\n## Suspected root cause\nBased on spot-checks and pipeline lineage, events emitted via the streaming/retry/fallback path were written before cache attribution was attached (race between request finalization and cache metrics emission). In addition, some events routed through OpenAI-compatible gateway paths did not map cache fields into the usage event payload.\n\nRelated threads/efforts:\n- Slack: `sources/slack/eng-platform/1770094420-usage-event-idempotency-design.json`\n- Slack: `sources/slack/eng-platform/1770069017-missing-region-dimension-in-usage-events.json` (similar \u201cmissing dimension\u201d pattern)\n- PRs (context): `pr-27485-expose-cache-hit-and-billed-token-fields-in-usage-api`, `pr-27555-hardening-usage-event-idempotency`\n\n## Proposed approach\n### 1) Define backfill window + scope\nInitial scope (to be validated with queries):\n- Date range: 2026-01-29 through 2026-02-14 UTC\n- Endpoints: chat/completions + completions (both native + OpenAI-compatible)\n- Only events where `cache_hit IS NULL` OR (cache fields all NULL) but request logs show cache activity\n\nOut of scope for first pass:\n- Recomputing billed_tokens\n- Any invoice regeneration without explicit Finance/Legal approval\n\n### 2) Source of truth for cache attribution\nUse request-log / runtime metrics tables that reliably capture cache behavior per request:\n- Primary join key: `request_id` (or `trace_id` if request_id is missing)\n- Fallback join: (`account_id`, `started_at`, `model`, `region`, `idempotency_key`) within a narrow window, only if request_id is absent\n\nIf request logs disagree with usage events on multiple cache metrics, prefer request logs (they come from the runtime and are closer to the cache instrumentation).\n\n### 3) Backfill mechanics\n- Create a backfill job that reads affected rows from `usage_events` and writes \u201cpatched\u201d rows to `usage_events_patches_YYYYMMDD` (append-only) with:\n  - `event_id`\n  - `patched_fields` (logical; implemented as explicit columns)\n  - `patch_reason = missing_cache_fields`\n  - `patch_version = 1`\n  - `patched_at`\n- Apply patches into the canonical usage table using existing idempotency/dedupe logic (do not create duplicates).\n- Preserve audit trail: keep the patch table + job run logs + counts.\n\n### 4) Verification\nSuccess criteria (must be met before merge to prod run + before any downstream \u201cofficial\u201d reporting refresh):\n- NULL-rate for `cache_hit` drops to < 0.1% for in-scope endpoints in the backfill window\n- No statistically significant change in total billed tokens vs billing ledger for the same window (expected: ~0 change)\n- Drift dashboard: no increase in duplicate event rate; no regression in freshness\n- Finance sign-off on a 10-account sample comparing old vs new attribution distributions\n\n### 5) Rollout & change control\n- Run in staging on a sampled day first\n- Run in prod under \u201cshadow\u201d mode (write patches but do not apply) to validate join correctness\n- Apply patches during a window aligned with Finance usage-freeze guidance (see Finance thread on freeze window)\n\n## Deliverables\n- Backfill job + runbook\n- Patch table + metrics (counts by day/account/region/model)\n- A short post-backfill note in the audit log (Confluence) with:\n  - window, counts, expected billing impact (should be none), and verification evidence\n\n## Links\n- Lineage/owners: `sources/google_drive/shared_drives/engineering/observability/metering-pipeline-lineage-and-owners.json`\n- Sanity checks queries: `sources/google_drive/shared_drives/engineering/observability/meter-sanity-checks-sql-queries-v1.json`\n- Meter dashboard spec: `sources/confluence/eng-platform/dashboards-and-alerts/meter-sanity-dashboard-spec.json`\n\n## Open questions\n1) How do we represent partial cache hits (e.g., prefix cache hit but still generates completion)? For this backfill we will only set `cache_hit=true/false` and leave detailed token deltas blank unless request logs provide unambiguous values.\n2) Do we need to re-export customer usage CSVs for the window? Default is no; only if Support/Finance requests for specific accounts.\n3) Any experiment analysis needs explicit pre/post segmentation so fixes don\u2019t bias results.\n\n## Acceptance criteria\n- Backfill completed for agreed window\n- Dashboard shows cache attribution null-rate normalized\n- No duplicate usage event inflation\n- Finance/RevRec acknowledges the change + evidence retained for audit trail",
+  "comments": [
+    "2026-02-13 \u2014 Caleb Johnson: Pulled initial numbers: cache_hit null-rate jumps from ~0.3% baseline to ~18\u201324% between 01/29\u201302/14 on chat/completions, skewed to streaming responses. Correlates with fallback/retry traffic. Next: confirm request_log has cache flags for those request_ids and build join coverage report.",
+    "2026-02-14 \u2014 Nadia Rahman: Please ensure we don\u2019t overwrite any already-populated cache fields; patch only where NULL/blank. Also keep patch_version so we can re-run safely. For partial cache-hit semantics: agree to only set cache_hit boolean for now; we\u2019ll do a v2 schema/semantics ticket if needed.",
+    "2026-02-17 \u2014 Mei Lin: Finance asks for (a) counts by customer/day and (b) confirmation billed_tokens totals remain unchanged. Suggest running a shadow aggregation that compares (old cache_hit distribution) vs (new) but keeps billed_tokens the same to prove no invoice impact. Also align with month-end close freeze guidance.",
+    "2026-02-18 \u2014 Connor O'Brien: From release perspective: treat this like a metering change. Run in shadow first, attach results to ENG-4421 alert notes, and get Emily Stone sign-off before applying patches broadly. If patch materially changes any invoice preview numbers, stop and escalate.",
+    "2026-02-21 \u2014 Caleb Johnson: Implemented backfill job skeleton in a branch (not yet PR): reads usage_events where cache_hit is null, joins request_logs on request_id, emits patch rows. Join coverage is ~97% for in-scope window; remaining 3% mostly missing request_id (OpenAI compat path). Next: add fallback join using trace_id where available; otherwise leave untouched and track as residual.",
+    "2026-02-26 \u2014 Logan Wright: Prioritize getting null-rate down for experiment readout reruns. For the residual bucket, it\u2019s acceptable to leave unknown as long as we can explain it and it\u2019s stable. Please add metrics: residual_count_by_endpoint and residual_count_by_gateway (native vs oai-compat)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_a3cce4eb65854dc5bc205c9e5c596388"
+}

@@ -1,0 +1,36 @@
+{
+  "title": "Percentile shift explainer: burst vs sustained workloads (draft)",
+  "owner": "Marcus Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/observability/percentile-shift-explainer-burst-vs-sustained-nov09-2026.json",
+  "doc_type": "doc",
+  "created_at": "2026-11-01",
+  "last_modified": "2026-11-09",
+  "collaborators": [
+    "Priya Natarajan",
+    "Elena Dubois",
+    "Kai Matsuda"
+  ],
+  "team": "eng-observability",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "burst",
+    "percentiles",
+    "SLO",
+    "batching",
+    "kvcache"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-obs/percentile-methods",
+    "JIRA-RED-4123",
+    "PR-gh-6789",
+    "slack:#observability thread 2026-10-28"
+  ],
+  "content": "Summary:\n\nThis note explains why p50/p95/p99 show different relative shifts under short high-amplitude bursts versus long sustained load. The goal is an intuitive explainer (for PMs and SREs) with a compact dataset and a couple of ASCII charts that we can paste into the December performance brief.\n\nKey takeaways (short):\n- Bursts disproportionately inflate high-percentile latencies (p99+) compared to sustained load, even when average utilization is similar.\n- Root causes: queueing microbursts, cold worker start penalties, KV-cache warmup decay, and scheduling preemption.\n- Fixes with high ROI: short prewarm windows for burst-prone routes, micro-batching adjustments (lower max-batch for burst traffic), and opportunistic local cache pins.\n\nExperimental setup (lightweight):\n- Model: small-proxy LLM (simulated forward latency shape) to avoid customer data in tests.\n- Hardware profile: 1x A100-equivalent serving node with multi-tenant queues.\n- Two traffic patterns (same total tokens/sec averaged over 5 minutes):\n  * Burst (B): 10s spike to 10x baseline every 60s (shape: sharp ramp up/down).\n  * Sustained (S): constant steady QPS at the same 5-minute mean as B.\n- Batch policy: default dynamic batching (max_batch=64, latency_target=120ms).\n- KV cache: cold at start of trace; no external warmers.\n- Measurement window: 10 minutes per trial, 3 trials per pattern, aggregated.\n\nRaw percentile table (median across trials):\n\nPercentile | Burst (ms) | Sustained (ms) | Delta (ms) | Delta (%)\n--------------------------------------------------------------\np50        | 86         | 81             | +5         | +6%\np75        | 144        | 120            | +24        | +20%\np90        | 260        | 200            | +60        | +30%\np95        | 460        | 260            | +200       | +77%\np99        | 1320       | 420            | +900       | +214%\n\nInterpretation notes:\n- p50 barely moves: the majority of requests see unchanged service time because most requests are served from warm paths and fit into small batches.\n- p95/p99 blow up under burst because a small fraction of requests experience a combination of: (A) queueing during micro-spikes, (B) cache misses when many new sessions appear at once, and (C) worker cold-start or preemption latencies.\n- The non-linear delta (p95 -> p99) suggests a heavy-tailed amplification mechanism: small probability events (e.g., a cache miss plus queueing) multiply.\n\nASCII percentile curve (illustrative):\n( X axis: percentile 0 -> 100, Y axis: latency ms, vertical compressed )\n\nBurst:    |      .                          *                            #\nSustained: |   .   .                     *    *                      #  #\nPercentile%-labels -> 50   75   90   95   99\nLatency(ms) scale -> 100  200  400  800  1400\n\n(Above is a rough visual: sustained curve rises slowly; burst curve has a sharp kink after p90.)\n\nWhy batching hurts some percentiles during bursts:\n- Dynamic batching tries to optimize throughput but can increase p95 when queues momentarily fill: large batches once formed add per-request latency for early arrivals while waiting for the batch to fill.\n- In bursts with rapid ramp-ups, we see both under-filled small batches (suboptimal throughput) and occasional large batches that increase tail latency. The variance of batch sizes increases.\n\nExample microtrace sequence that causes p99 spikes:\n1) Spike starts: 10s of new sessions.\n2) Many requests miss KV cache -> longer compute path executed.\n3) Scheduler starts new worker containers to absorb load -> cold / JIT penalties.\n4) Queueing + a single overloaded worker -> a subset of requests delayed by 4-10x.\n\nActionable mitigations (ranked by estimated impact/effort):\n1) Short prewarm policy for bursty routes (effort: low, impact: high): keep a small number of standby workers for routes flagged as burst-prone for 30-90s windows.\n2) Micro-batch cap during ramp-ups (effort: medium, impact: high): if arrival rate derivative > threshold, temporarily reduce max_batch to 8-16 to avoid large latency-inducing batches.\n3) KV-cache warming (effort: medium, impact: medium): on first spike, request small async warmers (predictive) for top-N keys seen historically.\n4) Opportunistic tail-shed fallback (effort: medium, impact: medium): route a small percentage of requests to a simpler, lower-latency model when queue depth > X.\n5) Measure-and-alert: emit percentiles on 10s sliding windows, fire when p95 > baseline*2 for a sustained 30s.\n\nCost vs latency trade-off notes:\n- Prewarm standbys increase steady-state cost slightly (idle GPU cycles) but reduce expensive p99 events which can cost more in user impact and potential downstream retransmits.\n- Micro-batch cap reduces token throughput efficiency but materially cuts tail latency; good candidate for SLO-protected routes.\n\nOpen questions / unknowns:\n- How well do these results generalize to multi-node (sharded) models with cross-node KV cache coherence? (we only tested single-node.)\n- What's the right arrival-rate-derivative threshold for our traffic mix? Need to tune per-customer class.\n- Can we cheaply detect burst-prone routes via historical burst index and auto-enroll them?\n\nNext steps (concrete):\n- P0: Roll a 2-week canary of prewarm standbys for 3 customer routes that historically show burst avgs (owner: Priya).\n- P1: Implement micro-batch cap toggle in the dynamic batching controller (owner: Kai).\n- P2: Add 10s-window percentile metrics and an alert rule for p95/p99 jumps (owner: Elena).\n- Instrumentation: capture batch sizes distribution with each request (delta work logged to RED-4123).\n\nAppendix A: compact raw numbers (per-trial variability)\n- Trials show p99 stddev ~ 120-300ms for sustained, ~320-580ms for burst (we see higher dispersion in burst trials).\n\nAppendix B: quick checklist for rollout\n- [ ] Identify 3 candidate routes (traffic, burstiness index)\n- [ ] Create prewarm config and safety limits\n- [ ] Simulate on staging with synthetic spike generator\n- [ ] Monitor 10s p95/p99 and rollback if error rates change\n\nNotes to reviewers: this is a working explainer draft intended for the Dec 2026 perf kit. Comments inline are welcome. If you want the raw CSV from the runs or the script that generated the spike schedule, see linked artifacts (PR-gh-6789) or ping me on Slack.\n\n-- Marcus\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_437e83e776604971b13691e71cf8ef2e"
+}

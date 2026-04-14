@@ -1,0 +1,65 @@
+{
+  "title": "memcpy-contention-microburst-postmortem-and-hotfix-validation",
+  "owner": "Priya Shah",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/memcpy-contention-microburst-postmortem-and-hotfix-validation-2025-06.json",
+  "doc_type": "doc",
+  "created_at": "2025-06-12",
+  "last_modified": "2025-06-17",
+  "collaborators": [
+    "Ethan Morales",
+    "Zoe Lin",
+    "Marc Gutierrez"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "final",
+  "tags": [
+    "postmortem",
+    "latency",
+    "profiling",
+    "hotfix",
+    "kvcache",
+    "contention"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/1487",
+    "JIRA-RT-6721",
+    "confluence:serving-runtime/perf/kv-cache-microburst-notes"
+  ],
+  "summary": "On 2025-06-11 we observed repeated sub-second microburst tail-latency spikes (95th->99.9th) on a subset of Dedicated clusters serving medium-context chat workloads. After investigation, the immediate root cause was high memcpy contention on the host NIC RX/TX path induced by a new multi-tenant KV cache replication path that used synchronous memcpy in the hotpath during model variant switches. A hotfix that changed the replication to async off-thread memcpy + backpressure reduced 99.9th latency by ~65% for affected routes. This doc summarizes findings, profiling artifacts, hotfix validation, customer impact and follow-ups.",
+  "impact": "Incidents: 3 customer escalations over 24h, SLO misses (95th latency SLO violated intermittently for 2 customers). Affected: ~12 Dedicated pods across two regions. Observable metrics: 95th latency increased from 120ms to 400\u2013550ms during bursts; 99.9th reached 1.2\u20131.6s. CPU steal and softirq counters spiked on hosts where NIC memcpy dominated. No data loss; model outputs remained correct. Financial/contract: potential SLA credits for two Dedicated accounts if repeated; customer experience degraded for low-latency products.",
+  "timeline": "2025-06-11 03:14 UTC \u2014 On-call alert: per-route latency alert fired for route 'chat-medium' in us-west-2-ded-3.\n2025-06-11 03:18 UTC \u2014 Triaged by eng-apps and SRE: identified latency correlation with KV cache replication QPS.\n2025-06-11 03:30 UTC \u2014 Initial mitigation: route-level traffic draining to alternate capacity; temporary QPS throttle to reduce bursts.\n2025-06-11 04:05 UTC \u2014 Profile capture (perf + eBPF) started on two affected hosts.\n2025-06-11 05:00 UTC \u2014 Root cause hypothesis: synchronous memcpy on replication path during model variant switch.\n2025-06-11 08:40 UTC \u2014 Hotfix PR created to offload memcpy to worker threads and add adaptive backpressure (PR #1487).\n2025-06-11 12:10 UTC \u2014 Hotfix deployed to canary pool; metrics showed immediate 50\u201370% reduction in 99.9th.\n2025-06-12 02:00 UTC \u2014 Full rollout to affected pools completed.\n2025-06-13 \u2014 Customers informed and postmortem draft began.\n2025-06-17 \u2014 Final validation and doc sign-off.",
+  "investigation": "Initial clues: spikes aligned with model-switch events (pin->variant fallback) and with higher-than-usual cache replication rate (new cheap-write replication introduced in May). Engineer notes from observability: high softirq, elevated netdev_stats.tx_dropped on some NICs and CPU runqueue length spikes concurrent with tail-latency bursts.\nSteps taken:\n- Captured perf samples and flamegraphs (user+kernel) for request-handling threads during a burst window.\n- Deployed eBPF scripts to measure memcpy syscall counts and durations per thread.\n- Correlated application traces (trace IDs) with kernel-level samples to ensure hotpath alignment.\nFindings: a tight loop in replication code path executed synchronous memcpy large-block copies (8\u201364 KB) while holding a replication mutex. When model variant switch triggered multiple replicas to update (N=3), the combined memcpy load saturated NIC CPU offload path and consumed host CPU cycles via softirqs, blocking request polling threads. The synchronous nature meant request-handling threads frequently waited on the replication mutex or queued behind softirq processing, amplifying tail-latency.",
+  "profiling_artifacts": "Key artifacts saved to: confluence perf folder (link above) and GH gist references in PR. Short summary of profiles:\n- Flamegraph (user+kernel): top kernel symbols: memcpy, net_rx_action, napi_poll, softirq_raise.\n- eBPF counters: memcpy_count per-second went from baseline ~120/s to 520/s during bursts on affected hosts.\n- Stack traces: replication_worker -> memcpy -> kernel memory ops -> napi_poll.\n- Heatmap: bursts aligned tightly with model switch trigger times (0\u2013300ms after switch event).\nAttached raw artifacts: perf.data.gz (saved), ebpf-memcpy-counts.csv, flamegraph.svg (all in linked_artifacts).",
+  "root_cause": "Design regression in multi-tenant KV cache replication introduced synchronous large-block memcpy in the model-variant switch code path. This synchronous copy was executed on threads that could be scheduled on the same CPUs handling NIC softirq processing, causing host-level contention and amplified tail-latency. Secondary contributors: lack of replication-rate backpressure and no per-pod memcpy offload threshold. New replication path was rolled out to Dedicated pools in May without microbenchmarking under realistic multi-variant churn.",
+  "reproducer": "Local reproducer steps (recommended to replicate in a perf lab, not prod):\n1) Start cluster with 3 replica workers and enable new replication path (env REPL_V2=on).\n2) Preload KV cache with 200k keys (use provided loader script).\n3) Create synthetic model-switch workload: send 50 concurrent model-switch requests across 3 pods at t=0, repeated every 30s for 10 rounds.\n4) Observe host-level metrics: softirq, runqueue length, memcpy_count with eBPF. Use scripts/bench/memcopy_burst.sh.\nNotes: a lightweight reproducer included in GH under scripts/bench; it uses iperf-like burster to mimic NIC pressure and triggers variant-switch flows.",
+  "hotfix_and_rollback": "Hotfix (PR #1487) summary:\n- Change replication copies from synchronous memcpy in request thread to async off-thread memcpy performed by dedicated replication worker pool.\n- Add a bounded output queue and adaptive backpressure: when queue depth > 16, replication requests are rate-limited and requests can take cached-stale path for up to 500ms.\n- Add per-pod memcpy-size histogram logging and a circuit-breaker that falls back to compact-delta replication if memcpy cost exceeds threshold.\nValidation performed on canary: enabled for 6 canary pods for 12 hours with synthetic churn; measured latency percentiles and host softirq/cpu.\nRollback plan: standard deploy rollback via orchestration if 5xx increase or 95th latency regresses beyond baseline +20% within 30m of rollout. No rollback needed; hotfix promoted after canary metrics passed.",
+  "validation": "Quantitative results after hotfix rollout:\n- 95th latency: baseline 120ms -> pre-hotfix bursts 400\u2013550ms -> post-hotfix 140\u2013160ms on affected routes.\n- 99.9th latency: pre-hotfix 1.2\u20131.6s -> post-hotfix 380\u2013520ms.\n- memcpy_count peak reduced by ~72% on affected hosts; softirq CPU usage dropped 60%.\n- No regression in throughput for normal traffic; slight increase in average replication lag (0ms -> 60ms median) during very high churn, within acceptable SLAs.\nValidation methods: A/B with stable and canary pools, synthetic churn tester, end-to-end traces to ensure no functional regression, load testing up to 1.25x expected peak.",
+  "customer_communication": "On 2025-06-13 we sent a targeted incident notification to the two impacted Dedicated customers with: incident timeline, root cause summary, mitigation steps, and planned follow-ups. Customers were offered 1:1 technical calls; two accepted and we reviewed the fix and test evidence. We proactively flagged potential future risks and offered configuration toggles (disable REPL_V2 or set replication_rate cap). No immediate SLA credits requested as the hotfix resolved repeatable regressions; Customer Success will follow up to confirm satisfaction.",
+  "follow_up_actions": "Short-term (next 2 weeks):\n- Add unit/microbench suite for replication path including large memcpy scenarios (owner: Marc).\n- Ship telemetry: memcpy histograms and replication-queue depth per pod (owner: Zoe).\n- Add canary gating: require replication microbench before Dedicated rollout (owner: Priya).\nMedium-term (quarter):\n- Reimplement replication to use zero-copy page remap where possible and evaluate io_uring for offloaded copies.\n- Design per-tenant replication rate controls in control plane.\n- Add automated chaos tests simulating multi-variant churn.\nLong-term:\n- Re-evaluate hotpath threading model; reduce host softirq coupling by pinning replication workers to non-NIC CPUs.\nOwners and deadlines listed in the separate follow-up ticket JIRA-RT-6789.",
+  "notes_and_lessons": "- Hotpath changes with host-level side effects must include kernel-level microbenching (softirq, memcpy cost).\n- Perf+eBPF remains the fastest way to map application-level events to kernel-level contention; keep that tooling in the standard SRE runbook.\n- Canary rollouts should include high-churn synthetic workloads that mimic model variant switching, not only steady-state throughput.\n- Consider explicit 'expensive-copy' annotation on code paths so runtime can prefer incremental/compact encodings.\n- Cross-team review (platform + infra + sRE) required for changes touching replication, NIC handling, and threading.",
+  "conclusion": "Root cause: synchronous large-block memcpy in new replication code path causing host-level softirq and memcpy contention, producing microburst tail-latency spikes. Hotfix (async off-thread memcpy + backpressure) mitigated the immediate issue and restored SLOs. Action items assigned to harden replication path and improve pre-rollout perf tests. Postmortem accepted by oncall lead and eng leadership.",
+  "attachments": [
+    "perf.data.gz",
+    "flamegraph.svg",
+    "ebpf-memcpy-counts.csv",
+    "scripts/bench/memcopy_burst.sh"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "impact",
+    "timeline",
+    "investigation",
+    "profiling_artifacts",
+    "root_cause",
+    "reproducer",
+    "hotfix_and_rollback",
+    "validation",
+    "customer_communication",
+    "follow_up_actions",
+    "notes_and_lessons",
+    "conclusion"
+  ],
+  "dataset_doc_uuid": "dsid_429e2436105c4e77b7522e3a66f8bb81"
+}

@@ -1,0 +1,105 @@
+{
+  "key": "ENG-17921",
+  "team": "engineering",
+  "title": "Floating-point non-determinism and deadlock in attention kernel handoff during prefill->decode transitions",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-02",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Kapoor",
+  "assignee": "Tom Rivera",
+  "project": "serving-runtime-stability",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "release": "runtime-1.20",
+  "labels": [
+    "bug",
+    "regression",
+    "performance",
+    "attention",
+    "kv-cache",
+    "prefill-decode",
+    "floating-point"
+  ],
+  "description": "After landing a set of attention micro-optimizations and a new kernel routing heuristic, we observed two distinct correctness issues in production workloads: sporadic numerical drift in softmax outputs and rare end-to-end deadlocks during prefill->decode transitions. The problems appear only under high concurrency with mixed sequence lengths and when fallback kernels are selected dynamically. This ticket tracks investigation, reproducible testcases, fixes, and rollout for the attention handoff path between prefill and decode kernels.",
+  "steps_to_reproduce": [
+    "1) Deploy runtime-1.20 with the new kernel routing heuristic enabled.",
+    "2) Run mixed batch workload: 40% long-context (4096), 60% short-context (256), sustained QPS >= 800 on a 8-GPU Dedicated pool.",
+    "3) Use prompt permutations that trigger KV caching (repeated prefixes) and intermittent fallbacks to quantized kernels.",
+    "4) Observe occasional inference responses with subtle semantic drift and monitor for worker stalls / request timeouts.",
+    "5) Collect per-request kernel selection logs and GPU-side kernel timestamps when anomaly occurs.\n"
+  ],
+  "investigation_findings": [
+    "Numerical drift: differences localized to attention softmax outputs of ~1e-6 to 1e-3 depending on sequence length; correlates with path that mixes FP16 fused softmax kernel and an FP32 reference kernel on fallback.",
+    "Root cause hypothesis for drift: inconsistent accumulation order and mixed-precision reductions between fused kernel (continuous-batch optimized) and fallback kernel produce different rounding patterns; routing heuristic can switch mid-request for segments causing non-deterministic results.",
+    "Deadlock: occurs when prefill writes KV cache metadata and decode immediately attempts to read and evict entries under a narrow race; observed GPU stream synchronization mismatch where host assumes completion but fallback kernel used a different stream and did not signal the shared mutex correctly.",
+    "Cache corruption traces: small subset of failures show invalid KV offsets (negative or out-of-range) after rapid prefill/evict cycles; reproduced by stressing prefix cache eviction path under concurrent prefill of overlapping prefixes.",
+    "Correlation: both drift and deadlock are surfaced more often when quantized model variants (int8) are eligible as fallbacks and when continuous batching merges sub-batches that cross a kernel boundary.",
+    "Similar issues referenced: ENG-16840 (mixed-precision ordering) and ENG-15734 (prefill-decode KV leak) provide background but do not cover the new stream-sync deadlock observed here.",
+    "Telemetry: stack traces captured from failing workers show host-side hang in mutex wait; GPU-side profiler shows kernels queued on non-default stream without proper event recording."
+  ],
+  "logs_artifacts": [
+    "s3://redwood-inference/bug-hunts/ENG-17921/kernel-routing-logs.tar.gz",
+    "perf-traces/2026-03-05/trace-2026-03-05-13h02.pb",
+    "attachments/prefill_decode_deadlock_gdb.txt",
+    "notebooks/bug-repro-cluster.ipynb"
+  ],
+  "proposed_fixes": [
+    "1) Enforce deterministic accumulation order in fused softmax kernel across FP16/FP32 paths and add cross-path unit tests comparing numerics for representative sequence-length distributions.",
+    "2) Make kernel routing decisions sticky per-request segment to avoid mid-request kernel type switches that change reduction ordering (configurable with an opt-in override for perf experiments).",
+    "3) Normalize GPU stream and event usage: ensure all fallback kernels use the request's canonical stream or emit a stream-to-stream event before touching shared KV metadata.",
+    "4) Add atomic guards and stronger bounds checking around KV cache index updates; add a debug-mode that validates offsets post-write.",
+    "5) Rollback: provide a fast revert flag for the routing heuristic to force previous stable selector if rollout triggers >0.1% regression in correctness tests.",
+    "6) Add an E2E deterministic test harness that runs with ASAN/TSAN-like toolchains for host concurrency and FP checkers for numerics on small models.",
+    "7) Post-fix: run 72-hour soak on Dedicated pool with mixed sequences and quantized fallbacks before removing opt-in gating.",
+    "Estimated risk: medium; fixes touch low-level kernels and stream sync points so require careful review and cross-team testing with infra/ops."
+  ],
+  "test_plan": [
+    "Unit tests: add deterministic softmax comparison tests across precisions and batch shapes.",
+    "Integration: synthetic prefill->decode workloads that force fallback selection at the segment boundary.",
+    "Fuzzing: randomized sequence length mixer for 48-hour job to exercise cache eviction races.",
+    "Canary: route 1% of traffic on runtime-1.20-candidate with full tracing enabled; validate delta against baseline numerics and request success rates.",
+    "Regression gates: block rollout if semantic-similarity metrics degrade >0.5% on benchmark prompts or if worker error rate increases >0.2%.",
+    "Performance validation: ensure fixes add <5% latency P99 overhead on critical long-context workloads."
+  ],
+  "rollout_plan": [
+    "Step 0: merge fixes behind feature flags and enable extended debug logging in candidate builds.",
+    "Step 1: run internal soak with deterministic tests and 72-hour mixed workload on CI cluster.",
+    "Step 2: enable canary at 1% for Dedicated customers with strict rollback on metrics anomaly.",
+    "Step 3: increase to 10% after 48 hours if stable; monitor numerics/latency/cost metrics live.",
+    "Step 4: full rollout with deprecation of old heuristic after 1 week of stability.",
+    "Rollback criteria: numerical drift above thresholds, any observed deadlock, or increase in cache-corruption signatures."
+  ],
+  "dependencies": [
+    "ENG-16840",
+    "ENG-15734"
+  ],
+  "customer_impact": "high",
+  "security_review_required": "false",
+  "notes": [
+    "Coordination needed with infra team to validate stream/event semantics on multi-GPU nodes (reach out to infra@redwood to schedule pair-debugging).",
+    "Design decision: prefer sticky routing per request-segment to preserve numerical determinism even if it marginally reduces short-term perf gains.",
+    "Consider adding a runtime flag to opt into aggressive mid-request routing for internal perf experiments only.",
+    "Follow-up: audit other kernel selectors (conv, matmul) for similar mid-request switching hazards."
+  ],
+  "comments": [
+    "2026-03-03 - Aisha Kapoor: Initial triage complete. Reproduced drift locally with smaller batch sizes; attaching traces.",
+    "2026-03-05 - Tom Rivera: Reproduced deadlock in stress harness. GPU profiler shows missing event record when fallback path is taken.",
+    "2026-03-07 - Elena Park (infra): Confirmed that some fallback kernels use per-GPU default stream; will deploy a test patch to unify streams.",
+    "2026-03-09 - QA: Added deterministic softmax unit tests and they fail on current branch; will iterate on accumulation ordering.",
+    "2026-03-11 - Tom Rivera: Drafted patch to make routing sticky and added stream-sync events; running CI with extended soak.",
+    "2026-03-12 - PM (Liam Chen): Prioritizing this P0; please keep PM updated on canary metrics before broad rollout."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "investigation_findings",
+    "proposed_fixes",
+    "test_plan",
+    "rollout_plan",
+    "notes",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_3d193aadb839422ba6c3be2e21f79e89"
+}

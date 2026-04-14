@@ -1,0 +1,119 @@
+{
+  "key": "ENG-700123",
+  "team": "engineering",
+  "title": "Aggregated usage snapshot lag causing temporary over-allow for per-org quotas",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-12",
+  "creator": "Ava Chen",
+  "assignee": "Diego Martinez",
+  "project": "billing-stability",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "labels": [
+    "metering",
+    "rate-limiter",
+    "high-sev",
+    "incubator-hotfix"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.26",
+  "security_review_required": "false",
+  "description": "Intermittent customer reports and internal alerts show short bursts of unmetered/over-allowed requests for some organizations when a shard aggregator failover occurs during high ingestion. Root cause appears to be a race where delayed aggregated-usage snapshots (async flush) are merged after a newer epoch has already advanced, leading to a merge that increases effective allowance instead of being discarded. This ticket tracks investigation, mitigation, and a long-term fix to ensure snapshot merges are monotonic and idempotent.",
+  "steps_to_reproduce": [
+    "Synthetic repro harness produced in staging: spin up 3 aggregator shards with per-route pre-aggregation enabled",
+    "Start steady traffic for org O with per-route quota limits and per-key token buckets; capture baseline usage",
+    "Trigger controlled failover: force shard A to crash during its async snapshot flush window",
+    "Simultaneously pump a short burst of traffic that would normally be throttled by per-org quota",
+    "Observe allowance change on reconciliation and compare metering records vs expected allowance"
+  ],
+  "observed_behavior": "After failover and shard reconciliation, the org's effective allowance briefly increases permitting a >N-second burst beyond configured quota. Metering records show duplicate attribution for a subset of requests (same snapshot IDs applied twice) and an aggregate allowance delta that doesn't match token consumption.",
+  "expected_behavior": "Aggregator snapshot merges should be monotonic: an incoming snapshot with an older epoch or duplicate snapshot ID should be ignored or tombstoned; merges must never increase allowance beyond summed consumptions and must be idempotent across retries/failovers.",
+  "reproduction_logs": [
+    "staging-agg-1.log: 2026-03-01T14:12:03Z INFO flush-snapshot id=sn-0a3e epoch=42 bytes=12kb",
+    "staging-agg-1.log: 2026-03-01T14:12:03Z DEBUG async-flush enqueued flush_id=fn-7f1",
+    "staging-router.log: 2026-03-01T14:12:05Z WARN shard-reassign shard=A->B in-flight-snapshot=fn-7f1",
+    "staging-agg-2.log: 2026-03-01T14:12:06Z INFO reconcile merge-incoming snapshot_id=sn-0a3e epoch=42 target_epoch=43",
+    "billing-asserts.log: 2026-03-01T14:12:06Z ERROR allowance-delta org=org_123 delta=+120 tokens expected=-120"
+  ],
+  "hypotheses": [
+    "Async flush completes after coordinator advances epoch; reconciliation code does not properly compare snapshot epoch vs current shard epoch and applies merge that incorrectly offsets debit sums",
+    "Duplicate snapshot IDs may be replayed across shards during rebalancing and not deduped because dedupe index is ephemeral and cleared on failover",
+    "Merge logic uses max() on per-route counters which can treat late partial snapshots as additive in the wrong commutative order leading to temporary overcounting of allowance instead of respecting ledger semantics"
+  ],
+  "investigation_notes": [
+    "Confirmed with index dump that flush with snapshot_id sn-0a3e arrived after coordinator moved target_epoch to 43. The merge path accepted epoch=42 snapshot and applied per-route counters by summing, which led to apparent double-counting when upstream had already accounted the same tokens.",
+    "Observed that the dedupe table is in-memory and keyed by ephemeral shard-local nonce; during failover the new shard had an empty dedupe table and accepted the replayed snapshot",
+    "Telemetry: added a temporary metric aggregator.snapshot.apply_latency which showed a 4-7s tail during heavy GC spikes on aggregator nodes",
+    "Correlation: high disk I/O on aggregator nodes (compaction) led to longer async flush completion times which increased the window for a stale snapshot to be merged post-epoch-advance"
+  ],
+  "short_term_mitigations": [
+    "Hotfix (PR #GHT-1428): treat incoming snapshot with epoch < current_epoch as tombstone; do not merge, log and emit metric aggregator.snapshot.stale_rejected",
+    "Deploy hotfix to staging and canary w/ aggressive sampling of orgs with high usage to validate no false negatives",
+    "Backpressure: temporarily increase sync flush frequency for affected aggregators to reduce async tail (config knob runtime: aggregator.flush.tail_ns=2000000000 -> 500000000)",
+    "Run a one-time reconciliation job to detect and correct any org balances that were inflated in last 48h (see reference script in /confluence/billing/reconcile-runbook)",
+    "Customer comms: prepare note for SRE and CS for impacted customers if reconciliation is required"
+  ],
+  "long_term_fixes": [
+    "Make snapshot merges epoch-aware and idempotent: include snapshot_id and origin_shard in dedupe index persisted in local durable store (leveldb) to survive failovers",
+    "Change merge semantics from additive naive-sum to monotonic-merge where per-route counters are merged by taking max(local, incoming) of cumulative counts plus explicit consumed-delta logic against ledger reference",
+    "Introduce a causal vector (or per-shard monotonically increasing sequence) alongside epoch to detect and order cross-shard snapshots deterministically",
+    "Add integration tests in chaos harness that simulate failover + concurrent snapshot flushes and assert no positive allowance deltas",
+    "Add canary dashboard and alert: snapshot.apply_rejected_rate and snapshot.duplicate_detected_rate, and billing-consistency.checks per-org"
+  ],
+  "decision_log": [
+    "2026-03-04: Interim decision to ship hotfix that rejects epoch-stale snapshots (PR GHT-1428). Consensus: low risk and addresses the immediate customer impact.",
+    "2026-03-08: Approve persisted dedupe index design and monotonic-merge approach. Assigned design owner: Priya Nair (platform-infra).",
+    "2026-03-10: Prioritized long-term change into runtime-1.26 milestone; estimated 3 sprints of work across aggregator and routing teams"
+  ],
+  "acceptance_criteria": [
+    "Hotfix merged to main and rolled to production canary with no regressions (GHT-1428 merged)",
+    "snapshot.apply_rejected_rate metric is >0 for at least one canary and no reported post-deploy over-allow incidents",
+    "Integration chaos test passes for 1000 simulated failover cycles with zero positive allowance deviation recorded",
+    "Persistent dedupe prototype merged to staging and shows <0.1% additional latency on snapshot apply path",
+    "Run reconciliation script and confirm corrected balances (if any) or assert no corrections necessary"
+  ],
+  "rollout_plan": [
+    "Stage: deploy hotfix to staging cluster, run synthetic harness (03/05)",
+    "Canary: deploy to 10% of production aggregator fleet with traffic shift and sampling (03/06)",
+    "Monitor metrics for 48h: snapshot.apply_rejected_rate, org_allowance_delta, billing-mismatch-alerts (03/06-03/08)",
+    "Full prod: ramp to 100% after canary green (03/09)",
+    "Begin long-term work in parallel: design doc and persisted dedupe PoC (03/11 onwards)"
+  ],
+  "linked_prs": [
+    "https://github.com/redwood-inference/server/pull/1428 (hotfix-reject-stale-snapshots)",
+    "https://github.com/redwood-inference/aggregator/pull/2157 (persisted-dedupe-prototype)",
+    "https://github.com/redwood-inference/tests/pull/508 (chaos-snapshot-failover-test)"
+  ],
+  "related_docs": [
+    "https://confluence.redwood.ai/display/BILL/Aggregator+Snapshot+Design+Notes",
+    "https://confluence.redwood.ai/display/BILL/Reconciliation+Runbook",
+    "drive.google.com/drive/folders/1BillingInvestigations/ENG-700123"
+  ],
+  "comments": [
+    "2026-03-02 - Ava Chen: Initial alert from billing-ops; creating ticket and triage. Attached preliminary logs and sampling script.",
+    "2026-03-03 - Diego Martinez: Run synthetic harness; confirmed repro in staging. Uploaded harness script to tests repo and added repro logs.",
+    "2026-03-04 - SRE (Liu Zhao): Hotfix looks safe; will coordinate canary and rollback playbook.",
+    "2026-03-06 - PM (Riley Torres): Notifying CS for orgs that may see brief allowance corrections; prepping comms if reconciliation required.",
+    "2026-03-09 - Diego Martinez: Hotfix fully rolled out to production. Observed several stale_rejected events and no new over-allow incidents in canary window.",
+    "2026-03-11 - Priya Nair: Design doc approved; work scheduled into runtime-1.26. Owner assigned for persisted-dedupe: Samir Patel."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "reproduction_logs",
+    "hypotheses",
+    "investigation_notes",
+    "short_term_mitigations",
+    "long_term_fixes",
+    "decision_log",
+    "acceptance_criteria",
+    "rollout_plan",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_7a6080107fca4b85afbb0565abba365a"
+}

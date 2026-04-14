@@ -1,0 +1,74 @@
+{
+  "key": "SUP-101999",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Misleading Retry-After durations and adaptive-quota smoothing causing interactive requests to be deprioritized",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Aisha Kumar",
+  "assignee": "Liam O'Connor",
+  "customer_company": "StreamlineAI",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "rate-limiter",
+    "scheduler",
+    "console"
+  ],
+  "labels": [
+    "429",
+    "retry-after",
+    "quota-smoothing",
+    "priority-inversion"
+  ],
+  "environment": "prod/us-east",
+  "affected_models": [
+    "redwood-3b-quant",
+    "open-ranker-v1"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-15",
+  "linked_issues": [
+    "SUP-71234",
+    "SUP-524321"
+  ],
+  "related_github_prs": [
+    "github.com/redwood-inference/rate-limiter/pull/412"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SUPPORT/Quota+Smoothing+Design"
+  ],
+  "description": "Issue summary:\nCustomers started seeing 429 responses with Retry-After headers that appear shorter than the time until quota actually becomes available. This coincided with a scheduled bulk ingestion job (background) that used an adaptive smoothing profile. Interactive/low-latency routes subsequently observed more frequent throttles and elevated tail latency as clients retried aggressively on the short Retry-After values.\n\nImpact:\n- StreamlineAI reported ~12% of interactive requests returned 429s during the ingestion window and experienced UIs stalled for up to 6s while the system rebalanced.\n- Customer-visible degraded QoE (chat response slowdowns) during the scheduled batch import windows.\n\nEnvironment:\n- Dedicated pool (dedicated) in prod/us-east.\n- Ingress through our shared api-gateway fronting route weights for interactive vs background routes.\n\nSteps to reproduce (high-level):\n1) Schedule a background bulk embedding job that uses simultaneous multipart uploads across 50 concurrent workers (simulates customer importer).\n2) Enable adaptive quota smoothing for background class (default smoothing factor).\n3) Simultaneously run low-latency interactive traffic (websocket short requests) at normal production rate.\n4) Observe 429s on interactive endpoints, with Retry-After sometimes < 1s but throttles persist for multiple seconds.\n\nObserved headers (example):\n- 429 Retry-After: 0.8\n- x-rl-window: 60\n- x-tenant-remaining-tokens: 1200\n- x-route-weight: interactive=1 background=4\n\nLogs / Metrics: (timestamps UTC)\n- 2026-03-12T02:14:01Z ingress: bulk-job worker spike (concurrent uploads 48 -> 52)\n- 2026-03-12T02:14:02Z rate-limiter: tenant-token-exhausted route=background smoothing_engaged=true\n- 2026-03-12T02:14:03Z api-gateway: returned 429 to ws-client id=abcd retry-after=0.8\n- 2026-03-12T02:14:09Z rate-limiter: interactive route still queued; per-route queue length=18\n\nNotes:\n- Retry-After header is being computed from route-level immediate-refill expectation rather than effective tenant-level refill delay when smoothing is active. This creates an optimistic delay value that causes client-side retry waves (short backoff) and leads to priority inversion: aggressive background retriers consume burst credits while interactive requests remain queued.\n\nCustomer quote:\n- \"Our chat sessions were becoming unresponsive during your nightly import window. The Retry-After header looked tiny, so our client retried immediately and made things worse.\"",
+  "investigation_notes": "Initial triage by Support: confirmed dedicated pool, reproduction on our staging cluster with similar smoothing config. SRE observed that when adaptive smoothing engages (background class), the internal token accounting publishes a per-route estimate computed before cross-route reconciliation finishes, leading to Retry-After representing route-local refill instead of tenant-level refill.\n\nHypothesis: the rate-limiter has a race in its smoothing reconciliation where per-route transient credits are signalled in headers before the tenant-level reservoir is decremented/locked. Clients interpreting Retry-After perform short sleeps and retry, causing the reservoir to be quickly consumed by background route retries due to higher route weight. Interactive route loses effective priority, causing perceived stall.\n\nData pulled:\n- heap snapshots and rate-limiter debug traces attached to github PR/trace ID 412.\n- Metric spikes: per-route retry attempts surged x3 during the 10s after first 429s.\n- No evidence of connection leak or NAT reuse causing duplication.",
+  "comments": [
+    "2026-03-12 09:30 - Aisha Kumar (Support): Created ticket based on customer report. Included sample headers and logs. Escalating to SRE to confirm heuristic.",
+    "2026-03-12 10:05 - Priya Shah (SRE): Reproduced in staging with a 50-worker background job. Confirmed Retry-After values can be <1s while tenant reservoir is actually drained for 10+ seconds. Attaching rate-limiter shard logs. Next: get rate-limiter code owner to weigh in.",
+    "2026-03-12 11:20 - Mateo Ruiz (Rate-limiter owner): This looks like the smoothing reconciliation race we discussed. Quick mitigation: stop publishing per-route optimistic refill in Retry-After until tenant reconciliation completes. I'll open an emergency PR to gate header emission.",
+    "2026-03-12 12:40 - Support (to customer): Thanks for the report. We're investigating and will provide a temporary mitigation you can enable (reduce background route concurrency and lower background route weight). Would you like us to apply this change to your dedicated pool?",
+    "2026-03-12 13:10 - Customer (StreamlineAI): Please apply mitigation to reduce background worker concurrency from 50 -> 8 during imports and lower background weight. We'll accept a console config change if SRE recommends it.",
+    "2026-03-12 16:55 - Liam O'Connor (Engineer): Mitigation applied to customer pool: background route weight set to 2, concurrency cap added. Monitoring for regressions. Adding feature flag to throttle Retry-After header publication.",
+    "2026-03-13 08:22 - Priya Shah (SRE): After mitigation, interactive 429 rate dropped from 12% -> 0.9% during a repeat ingestion. Tail latency returned to baseline. Preparing a patch to correct header computation."
+  ],
+  "resolution": "Mitigation applied: reduced background route weight and concurrency cap for customer; short-term feature-flag disabled optimistic per-route Retry-After emission. Root cause fix: patch submitted to rate-limiter to compute Retry-After from tenant-level reconciled refill when smoothing_engaged=true (PR: github.com/redwood-inference/rate-limiter/pull/416).\n\nRollout notes:\n- Patch staged to canary for 24h in us-east (canary flag: rl-header-reconcile). No regressions observed.\n- Scheduled full rollout 2026-03-16 with preflight traffic ramp.\n\nFollow-ups:\n- Add telemetry exposing mismatch between Retry-After header and effective tenant refill window (support dashboard alert).\n- Update docs: guidance for customers running mixed background+interactive workloads on dedicated pools (console toggle recommendations).",
+  "next_steps": "1) Merge PR and coordinate rollout with infra (scheduled 2026-03-16).\n2) Ship console guidance and default recommendation to cap background concurrency for customers on older client retry strategies.\n3) Add unit test to ensure Retry-After header reflects reconciled tenant refill whenever smoothing_engaged flag is set.\n4) Follow up with StreamlineAI in 72h after full rollout to confirm behavior and close ticket.",
+  "cc": [
+    "#support",
+    "#sre",
+    "#rate-limiter"
+  ],
+  "related_incident_id": "INC-2026-0312-07",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "comments",
+    "resolution",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_7d251db7887e4492935c8e75c5fe2a6a"
+}

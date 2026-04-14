@@ -1,0 +1,109 @@
+{
+  "key": "SUP-742809",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "SSE stream becomes silent mid-generation after client backpressure and batch reshuffle",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Khan",
+  "assignee": "Marcus Li",
+  "customer_company": "NovaHealth",
+  "customer_tier": "dedicated",
+  "components": [
+    "streaming-gateway",
+    "serving-runtime",
+    "scheduler",
+    "edge-proxy",
+    "autoscaler"
+  ],
+  "labels": [
+    "streaming",
+    "latency-regression",
+    "backpressure",
+    "batching",
+    "sse",
+    "timeout"
+  ],
+  "environment": "prod-us-west",
+  "affected_models": [
+    "redwood-alpha-3b",
+    "openchat-7b-q4"
+  ],
+  "affected_regions": [
+    "us-west"
+  ],
+  "sla_due_at": "2026-03-10T16:30:00Z",
+  "first_response_due_at": "2026-03-10T12:00:00Z",
+  "linked_issues": [
+    "SUP-741203",
+    "SUP-760123"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/6782"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/Streaming+Backpressure+Runbook"
+  ],
+  "description": "Issue summary: Several NovaHealth customers report that SSE (server-sent events) chat responses become silent partway through long generations (typically 1200-2500 tokens). The TCP connection remains open, no FIN is observed, and the client does not receive final chunks or the terminating [DONE] event. This appears to have started after rolling autoscaler/worker tweaks deployed 2026-03-09.\n\nImpact: Multiple customer sessions interrupted mid-response causing downstream application failures (form saves missing AI completion). Affected customers are on Dedicated capacity; estimated 12% of long-running chat requests in prod-us-west during the observed window. Customer visible symptom: streaming stalls (no data) for >60s and client eventually times out.\n\nEnvironment: prod-us-west, dedicated cluster \"nova-dc-03\", streaming over SSE via edge-proxy -> streaming-gateway -> serving-runtime. Autoscaler policy recently adjusted to be more aggressive on quantized-worker eviction under memory pressure.\n\nInitial hypothesis: Client-side backpressure (slow ACKs / small receive window) leads gateway to buffer; scheduler\u2019s dynamic batching attempts to reshuffle inflight requests to maintain GPU packing, triggering a preemption or worker swap for a quantized fallback worker. During the swap the SSE stream experiences a short stall; combined with HTTP proxy coalescing and the client TCP stack, the stall crosses the client-side timeout and no graceful retry path is taken (no [DONE]).\n",
+  "steps_to_reproduce": [
+    "1) Use a long prompt that produces ~1500-2200 tokens on redwood-alpha-3b.",
+    "2) Establish SSE stream against prod-us-west endpoint routed to dedicated NovaHealth capacity (token from customer account).",
+    "3) Introduce artificial client-side receive slowness (tc qdisc netem delay 200ms + limit socket recv buffer to 8KB) to simulate backpressure.",
+    "4) Observe streaming output: initial tokens arrive, then a prolonged silence (>30s) before client-side timeout/abort. Capture tcpdump on client and gateway if possible.",
+    "5) Repeat while reproducer load causes scheduler to perform batch reshuffle (use load generator to produce concurrent short and long requests)."
+  ],
+  "observed_behavior": "Stream delivers initial token chunks, then becomes silent for an extended period without a connection close; server logs show the worker marked as preempted and a fallback worker spun up but no final flush event recorded to the SSE connection. Client eventually reports timeout and marks conversation incomplete.",
+  "expected_behavior": "Worker preemption or fallback should gracefully forward remaining tokens (or emit an explicit abort/DONE event) so client can surface a deterministic error/retry. Streaming should not be silent mid-generation for healthy connections.",
+  "logs": [
+    "[streaming-gateway] 2026-03-10T09:14:22Z INFO request_id=abc123 start stream session",
+    "[serving-runtime] 2026-03-10T09:14:28Z WARN worker=quant-q4 evicting worker due to memory_pressure=true preemptible=true",
+    "[scheduler] 2026-03-10T09:14:28Z DEBUG request_id=abc123 moving_inflight_to_pack batch_id=442 reshuffle=true",
+    "[edge-proxy] 2026-03-10T09:14:28Z INFO connection 10.2.3.45: keepalive_probe, coalescing 3 frames",
+    "[serving-runtime] 2026-03-10T09:14:54Z ERROR request_id=abc123 stream_flush_failed: broken_pipe=false timeout_waiting_for_kv_cache",
+    "[customer-tcpdump] client shows continuous TCP window and no FIN; application-level last chunk received at 09:14:29Z"
+  ],
+  "investigation_notes": [
+    "Support triage: Collected customer request_id, procured pcap, verified client-side timeout set to 60s.",
+    "Reproduced in staging by throttling client recv buffer and running a mixed workload; observed similar silent window tied to scheduler reshuffle events.",
+    "Correlation seen between recent autoscaler policy commit (PR #6782) and increase in 'evict' logs in dedicated clusters during high memory pressure windows.",
+    "Hypothesis: aggressive eviction leads to worker preempt during in-flight streaming. The serving-runtime does not always flush KV/prefix buffers to the existing client connection during fallback; gateway/edge proxy coalescing may delay bytes until client-side buffer threshold, amplifying the stall.",
+    "Checked runtime metrics: spike in worker_preempt_count around 09:14, concurrent_kv_sync_latency increased from 30ms to 420ms during event window.",
+    "Reviewed gateway code path: fallback path writes directly to new worker stream but does not guarantee delivery if original stream writer has been paused by the scheduler (ticketed in code review notes).",
+    "Ran a controlled A/B in staging with autoscaler threshold relaxed: no stream silence observed under same simulated backpressure load.",
+    "Attached traces: link to flamegraphs and trace IDs included in GitHub PR comments."
+  ],
+  "comments": [
+    "2026-03-10 11:05 - Aisha Khan (Support): Customer provided request_id=abc123 and pcap. Reproduction attempts in staging succeeded with throttled client. Escalating to runtime team.",
+    "2026-03-10 13:22 - Marcus Li (SRE): Confirmed correlation with autoscaler commit. Pulling metrics for worker_preempt_count and kv_sync_latency. Assigning to serving-runtime squad for deeper code inspection.",
+    "2026-03-10 15:18 - Priya Shah (Runtime Eng): Found a code path where fallback_write does not set non-blocking flush when original writer is paused. Opening hotfix PR to ensure flush+ack behavior. See PR https://github.com/redwood-inference/runtime/pull/6782",
+    "2026-03-11 09:02 - Customer (NovaHealth): Customer notes this is high impact; they will temporarily increase client timeout to 120s as mitigation while fix is validated.",
+    "2026-03-12 07:40 - Marcus Li (SRE): Hotfix merged to staging, running soak tests with simulated backpressure. No silence observed in 12h soak. Planning prod rollout in maintenance window 2026-03-12 02:00-03:00 UTC."
+  ],
+  "root_cause": "Aggressive autoscaler eviction policy caused quantized workers to be preempted during in-flight streaming. The serving-runtime fallback path failed to guarantee flush of remaining tokens to the original client connection when the writer was paused, and edge-proxy coalescing combined with client-side small receive window turned short stalls into full client timeouts.",
+  "resolution": "Merged hotfix that: 1) ensures serving-runtime marks in-flight stream writers as non-blocking flushable during worker handovers; 2) adds a short 'graceful flush' period before worker eviction under streaming traffic; and 3) updated gateway to emit an explicit abort event if fallback cannot deliver within 5s. Deployed to prod-us-west 2026-03-12 02:15 UTC during maintenance window.",
+  "resolution_date": "2026-03-12",
+  "remediation": [
+    "Back out aggressive autoscaler eviction thresholds for dedicated clusters until additional soak tests complete.",
+    "Add unit/integration tests simulating client backpressure and verify fallback flush semantics.",
+    "Update runbook: include guidance to raise client streaming timeout to 120s as a stopgap for customers on Dedicated when running long generations.",
+    "Monitor metrics: worker_preempt_count, kv_sync_latency, stream_silence_rate (new metric) across prod clusters.",
+    "Follow-up: investigate edge-proxy coalescing behavior under small receive windows to reduce burst coalescing for SSE connections."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "root_cause",
+    "resolution",
+    "remediation"
+  ],
+  "dataset_doc_uuid": "dsid_b108c62fce5e473980916b679673ee9b"
+}

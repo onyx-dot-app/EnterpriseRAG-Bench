@@ -1,0 +1,107 @@
+{
+  "key": "ENG-836107",
+  "team": "engineering",
+  "title": "Per-route quota inheritance bug causes retroactive billing adjustments during canary policy merges",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-08",
+  "updated_at": "2026-03-12",
+  "creator": "Sofia Ramirez",
+  "assignee": "Ethan Brooks",
+  "project": "quota-and-metering",
+  "cycle": "Cycle 52",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "rate-limiter",
+    "billing",
+    "canary",
+    "high-risk"
+  ],
+  "dependencies": [
+    "ENG-271819",
+    "ENG-771333"
+  ],
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "customer_impact": "high",
+  "description": "Summary: During a staged canary rollout of a hierarchical per-route quota inheritance change, we observed retroactive adjustments to previously-reported usage for affected tenants. Some keys were granted positive credit adjustments after policy merge boundaries, causing underbilling for a subset of traffic. The issue appears tied to policy merge ordering + asynchronous policy application + reservation accounting when a route changes its effective parent during a window boundary.\n\nContext: We introduced a change to allow route-level quotas to inherit and override parent pool credits with a more permissive merge behavior (intended to ease transitions). The rollout is a canary that patches policy propagation and the policy-merge code path. On canary traffic we saw unexpected decreases in billed token counts and a handful of orgs received retroactive credit allocations in the daily aggregate.\n\nWhy this is critical: This impacts accounting correctness (billing and quota enforcement), can allow transient over-allow, and breaks guarantees for Dedicated customers who expect deterministic per-route spend.\n",
+  "repro_steps": [
+    "Deploy the canary policy merge on edge shard A with policy-version V+1 while shard B remains on V",
+    "Create a parent route (R_parent) with remaining credits, and a child route (R_child) that was recently remapped from a different pool",
+    "Send a steady traffic stream from the same API key that exercises R_child across the epoch boundary (close to top-of-window), ensuring some requests get evaluated under V and some under V+1",
+    "Observe enforcement logs, per-key reservation records, and the reconciler run that applies merged policy deltas",
+    "Check final daily aggregate for that org and compare to pre-change snapshots \u2014 look for positive credit corrections and missing debits"
+  ],
+  "observed_metrics_and_logs": [
+    "spike in reconciler.adjustment_count: +320 in the 10m window after deploy",
+    "per-key reservation table shows two entries for same transaction id with conflicting policy_version",
+    "billing-aggregator reported -0.7% delta for affected orgs compared to expected baseline",
+    "enforcer logs: \"policy-merge applied with no-op for existing reservation id\", followed by \"applied_credit_delta: +X tokens\"",
+    "trace: policy-sync (v1.20) latency increased from 12ms -> 180ms during rollout window"
+  ],
+  "investigation_notes": [
+    "Preliminary root cause: when a policy merge changes inheritance for a route, the policy-engine re-evaluates existing reservations atomically in-memory but writes reconciler adjustments asynchronously. If the enforcer services on different shards reconcile the same reservation against different policy snapshots (old vs new) there is a window where the final write path applies the delta using the newer snapshot without compensating for prior debits.",
+    "Edge case: transactions that were partially served (KV cache present) have memoized per-token debit counts. The reconciler applies the merged policy delta as if those tokens had never been debited under the old policy, resulting in a net positive credit in the aggregator.",
+    "Race appears amplified by: (1) policy-sync backoff retry causing duplicate adjust attempts, (2) reconciler idempotency key generation changed in runtime-1.20 causing mismatches, (3) cross-shard lease migration during canary causing mixed policy views."
+  ],
+  "interim_mitigations": [
+    "Pause canary rollout immediately and revert the policy merge change on the affected shards (done: rolled shards A,B back at 2026-03-10 09:22 UTC)",
+    "Enable strict policy-version pinning for enforcer until we ship a reconciliation fix (config flag: enforce_policy_versioned_reservations=true)",
+    "Run a targeted backfill that computes reconciliation deltas and emits compensating metering events to re-align billing aggregates for impacted orgs (backfill PR: github.com/redwood-inference/ops/pull/432)",
+    "Notify CS and Billing with a summary and action plan (message posted to #billing-incidents)"
+  ],
+  "proposed_fix": "1) Introduce epoched policy snapshots: reservations must reference the policy_epoch they were evaluated under. 2) Make reconciler adjustments compute delta = current_policy.compute_adj(reservation_state) - reservation_state.applied_under_epoch to avoid double counting. 3) Strengthen idempotency keys for adjustments using (reservation_id, policy_epoch). 4) Add cross-shard guard: a lightweight lease check that prevents two shards reconciling the same reservation concurrently. 5) Add unit/integration tests simulating interleaved policy-sync and canary traffic.",
+  "implementation_tasks": [
+    "ENG: add policy_epoch to reservation protobuf and database column (migrate with default=0)",
+    "ENG: update reconciler to include policy_epoch in idempotency key and calculation path",
+    "ENG: add cross-shard reconcile guard based on existing shard-lease API",
+    "ENG: add end-to-end tests simulating policy merge and route remap across epoch boundary",
+    "OPS: run backfill script and validate aggregates against pre-deploy snapshot",
+    "SWEET: run canary with sysbench traffic and monitor reconciler.adjustment_count metric"
+  ],
+  "rollback_plan": "If after fix we still observe (>0.1%) underbilling: revert policy_epoch gating and restore previous deterministic policy-merge behavior; run full double-check reconciliation across all shards and trigger manual audit for any orgs with >$100 discrepancy.",
+  "patch_refs": [
+    "https://github.com/redwood-inference/runtime/pull/1894",
+    "https://github.com/redwood-inference/ops/pull/432"
+  ],
+  "dashboards": [
+    "grafana.redwood/internal/dashboards/billing/reconciler-adjustments",
+    "grafana.redwood/internal/dashboards/alerts/policy-sync-latency"
+  ],
+  "comments": [
+    "2026-03-08 Sofia Ramirez: Logged after CS flagged a downstream billing variance for 3 enterprise orgs. Attached initial logs and aggregator snapshot.",
+    "2026-03-09 Ethan Brooks: Reproduced locally with a two-shard cluster; confirmed dual-apply of adjustments due to idempotency key mismatch. Beginning design for policy_epoch approach.",
+    "2026-03-10 Priya Shah (SRE): Paused canary and reverted deploy on shards A and B. Running the backfill dry-run against staging aggregates.",
+    "2026-03-11 Marcus Lee (Billing): Executed targeted backfill on staging, deltas within expected bounds. Requested a second opinion from finance for production backfill timing.",
+    "2026-03-12 Ethan Brooks: Started implemention branch runtime#1894, added reservation.policy_epoch field and updated reconciler idempotency; unit tests added. Needs review from infra and billing teams.",
+    "2026-03-12 Aisha Patel (PM): Marked P0 due to customer impact and asked for daily status updates until completion."
+  ],
+  "acceptance_criteria": [
+    "All reservations persisted with policy_epoch; reconciler idempotency prevents double adjustment across policy changes",
+    "E2E test reproducing old failure returns identical billed totals before and after policy merge",
+    "Canary run for 48 hours shows reconciler.adjustment_count within historical baseline and no retroactive positive credits observed",
+    "Billing team signs off on backfill results and produces a reconciled report for impacted orgs"
+  ],
+  "next_steps": [
+    "Code review for runtime#1894 and ops#432 (assigned: infra + billing)",
+    "Schedule production backfill window with Finance & Customer Success for low-traffic period",
+    "Add monitoring alert to detect policy_epoch divergence (>0) between shards within a 30s window",
+    "Ship runtime-1.20.1 with the patch and gated rollout behind enforce_policy_versioned_reservations flag"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "repro_steps",
+    "observed_metrics_and_logs",
+    "investigation_notes",
+    "interim_mitigations",
+    "proposed_fix",
+    "implementation_tasks",
+    "rollback_plan",
+    "comments",
+    "acceptance_criteria",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_6f0105f94ce440f4a048eb7115ce17f4"
+}

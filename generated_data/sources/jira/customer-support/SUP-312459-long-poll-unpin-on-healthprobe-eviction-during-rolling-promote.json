@@ -1,0 +1,72 @@
+{
+  "key": "SUP-312459",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Long-poll streaming connections lose model pin after health-probe eviction during rolling promote",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-13",
+  "updated_at": "2026-03-14",
+  "reporter": "Aisha Patel",
+  "assignee": "Marco Liu",
+  "customer_company": "BrightChat",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "edge-proxy",
+    "router"
+  ],
+  "labels": [
+    "pinning",
+    "canary",
+    "streaming",
+    "healthcheck",
+    "hotfix"
+  ],
+  "environment": "prod-us-east",
+  "affected_models": [
+    "redwood-7b-v1.2",
+    "openchat-13b-quant"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-14",
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/1829"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/123456/Streaming+pin+runbook"
+  ],
+  "linked_issues": [
+    "INT-9912"
+  ],
+  "description": "Issue summary: BrightChat reports that a subset of streaming sessions (long-poll / SSE clients) began receiving responses from the fallback model during a rolling promote of redwood-7b-v1.2. Sessions were previously pinned to v1.2 but lost affinity mid-stream after an automated health-probe eviction on the canary pool.\n\nImpact: ~120 active streaming sessions for BrightChat saw degraded model quality for ~11 minutes (users observed hallucinations and mismatched formatting). No tokens were billed incorrectly, but customer-facing feature quality was impacted.\n\nEnvironment: Dedicated tenant on prod-us-east, canary rollout to a subset of GPU pool nodes. Health probe configuration: edge L7 probe with 5s interval, 2 failures to mark unhealthy. Rolling promote increased canary weight from 10% to 40% during the window.\n\nObserved behavior: When a canary node returned transient 502 for probe traffic during the promote, the routing layer prematurely evicted pinned session state for active streaming sessions that had intermittent reconnects; upon reconnect the routing chose fallback model (openchat-13b-quant) due to fast-path fallback policy.\n\nExpected behavior: Streaming sessions should preserve pin affinity until an explicit unpin or a sustained failure threshold (longer than short-lived probe blips). Short probe-induced evictions should not break active long-poll streaming pins.\n\nNotes: This ticket focuses on the interaction between short health-probe failures, session reconnection behavior for long-poll clients, and the pin expiry/eviction logic in the router during weighted canary promotes.",
+  "steps_to_reproduce": "1) Configure a dedicated route for tenant 'brightchat' pinned to redwood-7b-v1.2 with streaming enabled (SSE/long-poll).\n2) Start 200 concurrent streaming sessions that maintain open connections with periodic partial messages.\n3) Start a gradual promote from 10% -> 40% canary weight and simultaneously induce a transient 502 on one canary node by returning bad frames on probe path for ~10s.\n4) Observe reconnects and routing decisions for sessions that briefly re-handshake during the probe window.\n5) Expected: pins remain intact; Observed: ~10% of sessions rebind to fallback model and lose pin affinity.",
+  "logs": "[2026-03-13T18:12:07Z] edge-proxy: probe /health -> 502 (canary-node-7)\n[2026-03-13T18:12:09Z] router: session_reconnect tenant=brightchat session_id=sn-7e4c pin=redwood-7b-v1.2 -> lookup returned no pin (ttl_evicted)\n[2026-03-13T18:12:09Z] router: fallback_route tenant=brightchat session_id=sn-7e4c chosen_model=openchat-13b-quant reason=fallback_policy:probe_eviction\n[2026-03-13T18:12:18Z] serving-runtime: model-load openchat-13b-quant on node=pool-2\n[2026-03-13T18:23:00Z] edge-proxy: probe /health -> 200 (canary-node-7)\n",
+  "investigation_notes": "Initial hypothesis: pin eviction is tied to node-level health events and a short TTL on session-affinity metadata. Router code currently treats a node marked 'unhealthy' as a signal to evict any pins associated with that node immediately. For streaming clients, a transient reconnect during this window triggers re-evaluation and a fallback decision.\n\nWhat we've checked:\n- Verified routing logs show immediate TTL eviction behavior when node state flips unhealthy.\n- Confirmed with BrightChat that affected clients were using long-poll with intermittent keepalive that triggered re-handshake within 5-12s windows.\n- Replayed traffic in staging with injected probe failures reproduces the rebind to fallback model.\n\nPotential root causes:\n- Aggressive pin eviction on node failure events (policy is tuned for standard request/response but too aggressive for long-lived streams).\n- Canary promote weight shift increases chance of clients reconnecting to different backend pools during promotion.\n- Edge probe flaps caused by a minor bug in canary image returning 502 under high probe concurrency (tracked in PR 1829).\n",
+  "comments": [
+    "Aisha Patel (Support): Customer Slack thread #support-brightchat with logs attached. Customer reports 11-minute window of degraded responses. Notified SRE and customer success.",
+    "Marco Liu (SRE): Reproduced in staging with curated long-poll client. Router evicts pin on node_unhealthy event; immediate evict is intentional for short RPCs but problematic for streams.",
+    "Evelyn Park (Platform Eng): Linked PR 1829 fixes probe handling in canary image; suspect interaction. Will open a short-lived hotfix to change router eviction semantics for streaming sessions.",
+    "BrightChat (Customer): Provided session IDs and user impact examples. Asking for mitigation and postmortem."
+  ],
+  "resolution": "Mitigation applied: Temporary policy change deployed to prod-us-east at 2026-03-14T02:10Z that prevents immediate pin eviction for sessions marked as 'streaming' \u2014 instead escalate to a 60s grace window before unpin. This lowered rebind rate to <1% in the affected tenant.\n\nWorkaround for customer: BrightChat enabled 'session_pin_strict=true' on affected route to persist pins across short reconnects.\n\nPlanned permanent fix: Update router pin-eviction logic to be session-type aware (streams vs RPS) and to consult session reconnection semantics. Also include safety: do not treat single probe failure as immediate eviction for active streams. Target patch in serving-runtime PR#1837 and router PR#1838; rollout gated behind integration tests (staging) and a canary with explicit streaming workload.\n\nFollow-ups:\n- Postmortem to be authored and linked here after closure.\n- Add test harness for long-poll + canary promote scenarios to catch regressions.\n- Confirm billing/usage checks with finance (no token misbilling observed).",
+  "follow_up_tasks": [
+    "INT-9912: Router change to session-type aware eviction (assigned to Marco Liu)",
+    "PR-1837: Add integration test for streaming reconnection during canary promote (assigned to Evelyn Park)",
+    "OPS-RUNBOOK-UPDATE: Document streaming pin grace behavior in runbook"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution",
+    "follow_up_tasks"
+  ],
+  "dataset_doc_uuid": "dsid_182e0323a23b4556929f0392821015e0"
+}

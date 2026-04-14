@@ -1,0 +1,112 @@
+{
+  "key": "ENG-307890",
+  "team": "engineering",
+  "title": "cudaasync-slab-aging-and-long-tail-kv-retention-leading-to-gradual-rss-drift",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-03-12",
+  "creator": "Asha Patel",
+  "assignee": "Miles Chen",
+  "project": "runtime-memory-stability",
+  "cycle": "2026-W06",
+  "estimate": "5",
+  "labels": [
+    "cudaMallocAsync",
+    "kv-cache",
+    "continuous-batching",
+    "memory-leak",
+    "investigation"
+  ],
+  "release": "runtime-1.20",
+  "description": "Summary: After rolling out adaptive continuous batching + aggressive KV prefetching for long-lived conversational sessions, we've observed a slow, steady increase in GPU RSS over days on a subset of nodes. The pattern is not classic sudden leak (OOM) but a gradual drift that correlates with presence of long-tail (very long context) requests and low-weight background traffic. The goal of this ticket is to reproduce, narrow the root cause (allocator hysteresis vs slab aging vs retained KV view references), and implement short-term mitigations plus a long-term fix.",
+  "steps_to_reproduce": [
+    "1) Deploy runtime-1.20 w/ adaptive continuous batching enabled and KV prefetch set to conservative=off in staging pool",
+    "2) Start 50 simulated long-lived chat sessions that steadily append tokens so average sequence length per request grows over time (target 8k-30k tokens across the session lifetime),",
+    "3) Inject background mixed workload (short-gen 16-128 tokens) to exercise multipool allocator behavior and cross-stream caching",
+    "4) Monitor per-process GPU Resident Set Size (nvidia-smi, nvml counters), gpu-mempool stats, and kernel-level slab residency every 15m for 72+ hours",
+    "5) Collect CUDA allocator traces by enabling MALLOCASYNC_LOGGING and nvtx spans for batch boundaries, and capture KV cache reference counts and prefix hit/miss metrics from the runtime's tracing endpoint"
+  ],
+  "observations": [
+    "- RSS rises steadily (~200MB/day) on affected nodes; not correlated with steady throughput spikes; nodes never fully OOM but drift is reproducible in staging under the reproduce scenario.",
+    "- nvml reports resident pages increasing while per-request allocation histograms show no single large allocation that stays alive; rather many small allocations with delayed frees (deferred-free queues).",
+    "- cudaMallocAsync internal pool size (per-device) grows and shows long-lived arenas that don't get trimmed; pool trim heuristics appear not to trigger under low pressure.",
+    "- KV entries associated with 'active' sessions remain in cache; however some prefix slices show stale reference counts (refs > logical readers) after prefetch + eviction races.",
+    "- When we force a global KV cache compaction and call cudamempoolTrim (simulated via internal API), a portion of resident pages are released and RSS drops, but the growth resumes within hours.",
+    "- Timeline correlation: RSS growth accelerates after enabling batch-merging optimization that keeps more KV cache views pinned across calls to reduce latency for long sequences."
+  ],
+  "logs_and_artifacts": [
+    "- nvml_export_2026-03-10.tar.gz (GPU RSS timeseries)",
+    "- cudaalloc-traces-2026-03-11.log (MALLOCASYNC + tracer spans)",
+    "- kv-refcounts-2026-03-11.json (runtime exported per-key refcounts)",
+    "- replicable-staging-playbook.md (runbook to reproduce in staging)",
+    "- link: https://github.com/redwood/runtime/pull/1284 (touched batching merge logic, for context)",
+    "- link: https://confluence.redwood.ai/pages/runtime-memory-tuning (design notes and previous investigations)",
+    "- grafana:dashboard/runtime/memory-drift (panel snapshots attached)"
+  ],
+  "hypothesis": [
+    "1) Allocator hysteresis: cudamallocAsync's pooling/arena retention heuristics combined with deferred frees (from async streams) accumulate when continuous batching merges streams and holds stream fences longer, preventing timely return of pages to device allocator.",
+    "2) KV view retention: aggressive batch-merge keeps KV view pointers alive across micro-batches; due to a subtle race, some views are not fully dereferenced on eviction and rely on finalizer path that runs on a different stream; finalizer stream lag leads to zombie references.",
+    "3) Slab/bitmap fragmentation: small prefix slices and mixed-size prefetches lead to fragmentation inside the allocator's arenas, causing the trim heuristics to believe memory is in use while actually fragmented and unreturnable.",
+    "4) Combined effect: none alone would cause sustained drift but together they produce a slow-resident growth that only trimming via heavy compaction clears temporarily."
+  ],
+  "proposed_changes": [
+    "Short term (quick mitigations):",
+    "- 1) Add a periodic background compaction job (configurable; default 6h) that calls platform-level mempool trim and runs an explicit KV cache drain for entries older than configurable threshold.",
+    "- 2) Reduce the default batching merge hold time for sessions older than 48h to avoid pinning views across idle windows.",
+    "- 3) Instrument and export an 'allocations awaiting free' metric to detect deferred-free backlog sooner.",
+    "Long term (root fixes):",
+    "- 4) Update allocator integration to flush/advance finalizer streams when a threshold of deferred frees is reached, so pages can be returned sooner.",
+    "- 5) Fix KV cache eviction/refcount race discovered in runtime: ensure eviction marks entry as 'draining' and uses synchronous teardown path if draining takes longer than X ms.",
+    "- 6) Rework trim heuristics to consider fragmentation vs utilization (scan free block distribution in arenas before classifying as in-use)."
+  ],
+  "testing_plan": [
+    "- Unit tests for KV eviction path to assert refcounts go to zero under simulated prefetch+eviction interleavings.",
+    "- Add e2e load test that exercises very long sequences with continuous batching for 96h in staging and validates RSS slope < 10MB/day.",
+    "- Canary release: enable background compaction and reduced merge hold time on 10% of staging fleet; monitor replica-level RSS curves and error rates for 48h.",
+    "- Regression dashboard checks for CPU/GPU latency impacts from compaction and stream flushing; ensure tail latency not negatively impacted by aggressive trims."
+  ],
+  "rollout_plan": [
+    "- Patch release runtime-1.20.1 with short-term mitigations behind feature flags.",
+    "- Roll to canary pool (10% nodes) for 48h; if stable and RSS slope reduced, roll to 50% then 100% over 3 days.",
+    "- After canary success, implement long-term runtime changes targeting runtime-1.21 with coordinated testing and a migration window for private deployments that need opt-in.",
+    "- Communicate to Dedicated customers about possible minor latency changes and offer toggle to disable periodic compaction if desired."
+  ],
+  "open_questions": [
+    "- What is the real contribution of fragmentation vs deferred-free backlog? Need a micro-benchmark that isolates fragmentation effects.",
+    "- Are particular GPU SKUs showing worse behavior (A100 vs H100) due to different granularity of page management? Collect per-SKU traces.",
+    "- Could our batch-merge optimization be tuned to avoid holding KV views for sessions with low recent activity without regressing hot-client latency?",
+    "- Should we expose compaction and merge-hold configs to Dedicated customers as opt-in knobs?"
+  ],
+  "dependencies": [
+    "ENG-21388",
+    "ENG-11021"
+  ],
+  "sub_issues": [
+    "ENG-308005",
+    "ENG-308006"
+  ],
+  "customer_impact": "medium",
+  "security_review_required": "false",
+  "comments": [
+    "2026-02-11 - Asha Patel: Initial reproduce successfully kicked off in staging. Observed same RSS drift after ~36h. Attached nvml timeseries.",
+    "2026-02-18 - Miles Chen: Narrowed correlation to the batch-merge change from PR #1284. Added tracing to KV eviction path; noticed occasional refcount spikes immediately after eviction events.",
+    "2026-02-25 - SRE (Priya Rao): Suggest adding prometheus alert when 'allocations_awaiting_free' > 1000 for > 15m. We can route to paging if release impacts prod.",
+    "2026-03-03 - Eng Lead (Ethan Rogers): Prioritize short-term mitigations; schedule a dedicated hacking day to prototype compaction job. Blocked on allocator API change in CUDA runtime shim.",
+    "2026-03-09 - Miles Chen: Prototype of compaction job decreased RSS slope by ~70% in staging runs. Need to validate latency impact under tail traffic. Preparing RFC for the long-term allocator change."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observations",
+    "logs_and_artifacts",
+    "hypothesis",
+    "proposed_changes",
+    "testing_plan",
+    "rollout_plan",
+    "open_questions",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_9025157fd3834a39a4de676c48c82d03"
+}

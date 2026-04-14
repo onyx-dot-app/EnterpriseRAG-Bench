@@ -1,0 +1,64 @@
+{
+  "title": "GIL impact, threading, and tokenizer profiling \u2014 notes",
+  "owner": "Aisha Patel",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/gil-impact-threading-tokenizer-deep-dive.json",
+  "doc_type": "doc",
+  "created_at": "2025-11-02",
+  "last_modified": "2026-02-15",
+  "collaborators": [
+    "Luca Moreno",
+    "Priya Sharma",
+    "Tom Baker"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "profiling",
+    "python",
+    "GIL",
+    "tokenizer",
+    "threadpool",
+    "perf",
+    "serving-runtime"
+  ],
+  "linked_artifacts": [
+    "CON-4021",
+    "JIRA-ENG-1983",
+    "https://github.com/redwood-inference/serving/pull/2123",
+    "confluence:serving-runtime/tokenization-benchmarks"
+  ],
+  "summary": "Investigate CPU-side overheads observed in low-token, high-QPS serving scenarios. Hypothesis: Python-level overhead (GIL + wrapper code) and threadpool/request-parsing are dominant for short requests; tokenization path is a hotspot even when using Rust tokenizers because of Python wrappers and per-request allocations.",
+  "background": "Symptoms: 95th tail spikes on short requests (~<=32 tokens) even when model inference (GPU) is not the bottleneck. Flamegraphs from load tests show a non-trivial fraction of wall time spent in Python runtime (async loop, request parsing, tokenizer wrapper). Incidents reported by SRE; stack traces point to blocking in threadpool callbacks and repeated small allocations.",
+  "methodology": "Combined approach: microbench tokenization (pybench harness), end-to-end synthetic load (wrk/fortio) hitting hosted API, CPU sampling with py-spy (native and with C extensions), perf + perf script to generate flamegraphs (user+kernel stacks), and targeted instrumentation (count allocations, GIL wait time using pyinstrument + gilstats patch). Measured median and p95 latencies, CPU ms per request, and system-wide runnable time.",
+  "environments": "Tests run on instance type c6i.4xlarge (16 vCPU) in staging cluster with identical software build used in production. Python runtime: 3.10.12, uvicorn+gunicorn stack using uvloop, tokenizers==0.13.3 (Rust bindings), FastAPI for request parsing. Load shapes: 500rps steady, 2000rps spiky 100ms inter-arrival, small payload sizes (prompt lengths 8/16/32 tokens).",
+  "results": "Key numbers from representative runs (median / p95):\n- Request parsing (JSON decode + validation): 0.9 ms / 2.6 ms per request\n- Tokenization (via tokenizers binding called from Python): 1.1 ms / 3.4 ms per request for 16 tokens; overhead increases non-linearly for many small requests due to call overhead\n- Event loop scheduling/context-switch overhead (async tasks, callbacks): 0.6 ms / 1.8 ms\n- ThreadPool/ProcessPool overhead when used for tokenization: adds 0.8 ms median (serialization+IPC) and up to 4 ms p95 under contention\n- Total CPU time per short request (excluding GPU model time): ~3.2 ms median, ~9.0 ms p95 (matches tail observed)\nNotes: numbers are per-request single-threaded equivalent; at scale, contention increases p95 significantly.",
+  "cpu-profiles": "py-spy sampling shows large stacks in: tokenizer._tokenize (Python wrapper) -> binding FFI -> rust_tokenizers::encode, but ~22-28% of time attributed to wrapper/decoding/UTF-8 checks in Python. Perf flamegraphs also show syscalls for small allocations and memcpy in the C layer. GIL wait analysis indicates measurable GIL contention when >N concurrent short requests (N ~= num_cores * 1.5). ThreadPoolExecutor callbacks often run on main thread and block the event loop for tens to hundreds of microseconds repeatedly.",
+  "observations": "1) Tokenizer Rust extension is fast for bulk work, but the overhead per call from Python is significant for many small requests.\n2) Using ProcessPoolExecutor moves tokenization off the interpeter and reduces GIL contention, but introduces IPC/serialization costs that dominate for very small payloads.\n3) ThreadPoolExecutor keeps work in-process but still suffers from GIL when Python-level post-processing runs; CPU time moves between worker threads and main thread.\n4) Request parsing (json.loads + pydantic validation) is a measurable slice \u2014 switching to faster parsers (or deferring validation) reduces median.\n5) Increasing threadpool worker count reduces queueing until CPU saturates; beyond that p95 gets worse due to scheduling contention.\n6) Caching prefixes/prefix tokenization reduces per-request CPU substantially for repeated prompts.\n7) Enabling memoryview/bytes-only paths in tokenizers binding (avoid str decode) reduces wrapper time by ~30% in microbench.",
+  "conclusions": "- Root causes for tail CPU in short requests are a combination of: Python wrapper overhead (calling into C/Rust), per-request allocations + JSON/pydantic validation, and suboptimal threading model causing GIL contention and event-loop stalls.\n- Strategies that avoid Python-level per-request work (pre-tokenization, bytes path, batched tokenization) show the best unit-cost wins.\n- Moving to processes helps for heavy tokenization but hurts for ultra-short requests because IPC cost > tokenization time.",
+  "action-items": "1) Short-term (owners and ETA):\n- (Priya) Add bytes-only tokenization codepath and benchmark (ETA 2w).\n- (Tom) Replace pydantic full validation with lightweight shape-check for hot route (ETA 1w).\n- (Luca) Add per-route tokenization cache (LRU) and toggle in runtime config (ETA 3w).\n2) Medium-term:\n- Explore zero-copy bindings for tokenizer to avoid PyUnicode decode allocations; prototype using memoryview/pybind11 (owner: Aisha, ETA 6w).\n- Add dedicated tokenization service option (gRPC) for Dedicated customers who want isolation; measure IPC vs process pool.\n3) Instrumentation: add GIL wait and allocation metrics to Console (owner: eng-observability, ETA 4w).",
+  "next-steps": "Planned experiments:\n- Run microbench comparing: direct binding (current), bytes-only binding, process-pool, dedicated worker process with pinned CPU. Measure end-to-end p50/p95 CPU-ms and total latency at 1k/5k RPS.\n- Canary lightweight validation on hot route for 2 days and compare error-related regression.\n- Launch A/B with tokenization cache enabled on 10% of traffic, capture hit-rates and latency delta.\nOwners: Priya/Luca/Tom. Sync weekly on Friday 11:30.",
+  "raw-notes": "random fragments / scratch:\n- saw ~200us overhead per call from Python binding in microbench (small sample)\n- thought: maybe use rust + wasm for tokenizer? overhead of wasm embed likely worse.\n- question: can we batch tokenization of concurrent requests with identical model config? maybe combine by route key\n- TODO: measure effect of uvloop off vs on (we currently have uvloop enabled)\n- TODO: add test with pypy (unlikely in prod) but might highlight interpreter-level differences\n- Slack refs: #serving-runtime threadpool-discussion, threads on 2025-10-28\n- logs: attach perf flamegraph images to confluence page",
+  "references": [
+    "https://github.com/huggingface/tokenizers",
+    "py-spy docs",
+    "perf+FlameGraph scripts in infra/tools/perf",
+    "JIRA-ENG-1983: threadpool tuning for serving"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "background",
+    "methodology",
+    "environments",
+    "results",
+    "cpu-profiles",
+    "observations",
+    "conclusions",
+    "action-items",
+    "next-steps",
+    "raw-notes",
+    "references"
+  ],
+  "dataset_doc_uuid": "dsid_4ed05fee5a744d51b2393de602e34be8"
+}

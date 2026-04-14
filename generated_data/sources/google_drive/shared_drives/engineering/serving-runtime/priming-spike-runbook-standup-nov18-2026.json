@@ -1,0 +1,47 @@
+{
+  "title": "Priming spike runbook and standup notes",
+  "owner": "Priya Menon",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/priming-spike-runbook-standup-nov18-2026.json",
+  "doc_type": "doc",
+  "created_at": "2026-11-18",
+  "last_modified": "2026-11-19",
+  "collaborators": [
+    "Evan Liu",
+    "Marissa Koh",
+    "Jonah Patel",
+    "Ava Rodriguez"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "perf",
+    "latency",
+    "kv-cache",
+    "kernel",
+    "priming",
+    "small-seq",
+    "regression"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/8143",
+    "https://redwood.atlassian.net/browse/INF-3421",
+    "slack://channel?team=T12345&id=C98765&thread_ts=1721234567.000123",
+    "https://grafana.redwood.internal/d/serving/canary-latency?orgId=1&from=1699459200000&to=1699545600000"
+  ],
+  "content": "Summary:\\nThis note captures the priming-related latency spike we observed on canary on 2026-11-17, the experiments we ran during the 11/18 perf sync, and the short runbook to reproduce and mitigate. Primary hypothesis: a change in kernel selection triggered by PR #8143 interacts poorly with our prefix/KV cache eviction heuristics for short-sequence requests (seq_len <= 64), causing a cascade of slower attention kernels and elevated p95/p99.\\n\\nAttendees:\\n- Priya Menon (owner)\\n- Evan Liu\\n- Marissa Koh\\n- Jonah Patel\\n- Ava Rodriguez\\n- On-call: Marco Silva (SRE, async)\\n\\nObserved symptom (canary):\\n- Date/time window: 2026-11-17 03:20 \u2013 03:50 UTC\\n- Workload: production-simulated shadow load, majority small seq requests (prompt ~20\u201340 tokens, generation limited to 24 tokens).\\n- Baseline before regress: p50 ~ 38ms, p95 ~ 120ms, p99 ~ 210ms for small-seq path.\\n- During spike: p50 ~ 55ms, p95 ~ 420ms, p99 ~ 890ms. Throughput dropped ~18% at same offered QPS.\\n- Memory/CPU/GPU: GPU utilization unchanged; modest bump in host CPU sys time on the inference sidecar; no OOMs.\\n- Correlation: spike aligns with canary fleet rolling to serving-runtime:v2.14.6 (kernel selector change).\\n\\nRepro instructions (quick):\\n1) Checkout the canary build: git checkout refs/pull/8143/head && bazel build //serving:runtime_canary\\n2) Run bench harness in local infra (use the small-seq profile):\\n   export MODEL=gpt-small-q8\\n   export BENCH_SEQ=48\\n   export BATCH=8\\n   ./tools/jbench --model $MODEL --seq $BENCH_SEQ --batch $BATCH --warmup 120 --duration 300 --profile > jbench_smallseq_canary.log\\n3) Capture kernel selection traces: set SERVING_TRACE=kernel_selection:true,kvcache:state\\n   ./tools/jbench --env SERVING_TRACE=... --model ...\\n4) Compare against stable runtime (v2.14.5) under identical load.\\n\\nWhat we ran in sync (11/18):\\n- Shadow run A: v2.14.6 vs v2.14.5 side-by-side, 30 minute runs, 1k RPS offered (small-seq focussed).\\n- Kernel trace extract: grep kernel_selection jbench_smallseq_canary.log | awk '{print $6,$8}' > kernel_choices.txt\\n- KV cache walk: instrumented run with kv_probe enabled (10% sample).\\n\\nKey findings from traces:\\n- v2.14.6 changes: more aggressive fused-attention path chosen when seq < 128 if tensor layout meets criteria. In many small-seq samples we saw selection flip between 'fused-attn-v2' and 'matmul-stream-v1' mid-request due to on-device shape rounding after quantization fallback.\\n- When flip occurs, we observed an extra kernel swap and a temporary stall while CUDA kernels rebind (~150\u2013350ms on average for affected requests). This explains the p95/p99 jump.\\n- KV cache eviction: our prefix cache TTL/temperature heuristic sometimes triggered eviction during warmup combined with the kernel flip; when eviction happened, subsequent requests paid the cost of re-prime + kernel swap.\\n- The problem is amplified for low-latency small-seq customers (dedicated and hosted light endpoints). High-seq steady workloads less impacted.\\n\\nHypotheses (ranked):\\n1) Kernel selector bug in v2.14.6 that flips selection when encountering quantization rounding \u2014 likely root cause.\\n2) KV cache heuristic aggressiveness surfaces the kernel flip more often (secondary amplifier).\\n3) Host-side scheduling causing delay during kernel rebind (less likely given GPU traces).\\n\\nImmediate mitigations tested during sync: (results)\\n- Rollback canary to v2.14.5: p95/p99 returned to baseline in 10 minutes. (Confirmed)\\n- Pin kernel selector to stable on canary builds via env override KERNEL_PREF=stable_fused (experiment): reduced flip rate by ~92%, p95 improved but not fully baseline (because some code paths still falling back).\\n- Increased prefix cache temperature threshold (temporary +30%): reduced eviction events by ~60% and lowered repeat prime cost.\\n\\nShort runbook (for on-call and perf leads):\\n1) If small-seq p95 > 350ms on canary, revert rollout to previous runtime tag (v2.14.5) and notify perf channel.\\n2) Apply KERNEL_PREF=stable_fused override to the canary deployment while debugging continues.\\n3) Temporarily bump prefix cache temperature threshold for affected shards: curl -X PATCH $OPS_API/shards/{id}/cache?temp_mult=1.3\\n4) Collect traces: jbench profile logs + kvcache sample + nsys GPU profile from 10 affected requests.\\n5) Open a bisect PR if we identify specific commit (assign to Evan/Liang).\\n\\nAction items (owners & dates):\\n- Evan Liu: prepare kernel-selector unit tests + minimal reproducer (due 2026-11-21).\\n- Marissa Koh: run full fleet shadow run with KERNEL_PREF override and report p95/p99 across regions (due 2026-11-20).\\n- Jonah Patel: add telemetry to kvcache to emit \"priming-miss-with-kernelflip\" event (due 2026-11-22).\\n- Ava Rodriguez: coordinate canary rollback and verify rollback runbook; update incident postmortem stub in Confluence (due 2026-11-19).\\n- Priya Menon: triage linked PR #8143 and assign kernel author for follow-up; own coordination with SRE (ongoing).\\n\\nLonger-term follow-ups (not blocking rollback):\\n- Add a conservative debounce window in kernel selector to avoid mid-request flips; consider pinning per-request kernel once chosen until next request.\\n- Revisit kvcache eviction heuristics for small-seq heavy endpoints; consider sticky priming for first N requests.\\n- Add continuous test that runs small-seq shadow runs during any kernel selector change PR gating.\\n\\nNotes / discussion highlights from sync:\\n- Marco (SRE): recommended automating rollback path in deployment pipeline so we can revert a rollout rapidly without manual patch.\\n- Evan: kernel flip repro is non-deterministic but we found a 1-in-250 trigger when running 10k small-seq requests with the canary tag. We should add a fuzz harness to increase coverage.\\n- Marissa: customer-facing risk low for now (mostly canary), but dedicated customers with low-latency SLAs could be impacted if rollout continues.\\n\\nAppendix \u2014 quick commands used during the session:\\n- Side-by-side bench (canary + stable):\\n  ./tools/jbench --model gpt-small-q8 --seq 48 --batch 8 --warmup 120 --duration 180 --tag canary > canary.log &\\n  ./tools/jbench --model gpt-small-q8 --seq 48 --batch 8 --warmup 120 --duration 180 --tag stable > stable.log &\\n- Kernel trace extraction:\\n  grep kernel_selection canary.log | cut -d' ' -f4- > canary_kernel_choices.txt\\n- Quick kv sample probe (10%):\\n  export KV_PROBE_SAMPLE=0.1 && ./tools/jbench --model ... --profile\\n\\nIf you\u2019re taking an action from the list, drop a short update in #serving-runtime-perf (thread: 1721234567.000123) when you start and when you finish so we can coordinate rollback and customer comms.\\n\\nEnd.",
+  "repro_commands": [
+    "git checkout refs/pull/8143/head && bazel build //serving:runtime_canary",
+    "export MODEL=gpt-small-q8",
+    "export BENCH_SEQ=48",
+    "export BATCH=8",
+    "./tools/jbench --model $MODEL --seq $BENCH_SEQ --batch $BATCH --warmup 120 --duration 300 --profile > jbench_smallseq_canary.log",
+    "./tools/jbench --env SERVING_TRACE=kernel_selection:true,kvcache:state --model $MODEL --seq $BENCH_SEQ --batch $BATCH --warmup 120 --duration 300 --profile > traced.log"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "content",
+    "repro_commands"
+  ],
+  "dataset_doc_uuid": "dsid_63c4ac9242de49d0b9094c7d2319599a"
+}

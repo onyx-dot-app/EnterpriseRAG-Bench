@@ -1,0 +1,62 @@
+{
+  "title": "gRPC keepalive + goroutine scheduling postmortem",
+  "owner": "Priya Menon",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/grpc-keepalive-goroutine-scheduling-postmortem-nov-2026.json",
+  "doc_type": "doc",
+  "created_at": "2026-11-15",
+  "last_modified": "2026-11-20",
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "collaborators": [
+    "Ethan Cole",
+    "Marta Ruiz",
+    "Jonah Park"
+  ],
+  "tags": [
+    "grpc",
+    "tail-latency",
+    "profiling",
+    "go-runtime",
+    "streaming",
+    "keepalive"
+  ],
+  "linked_artifacts": [
+    "JIRA-RT-4821",
+    "github.com/redwood-inference/serving-runtime/pull/669",
+    "confluence.redwood/streaming-tail-latency-playbook"
+  ],
+  "summary": "Postmortem of recurring P99 tail latency spikes observed in streaming gRPC requests for short prompt workloads. Investigation focused on interaction between gRPC keepalive, Go scheduler wakeups, and application-level goroutine bursts during KV-cache warmup and small-chunk streaming.",
+  "symptoms": "Around 2026-11-10 we started seeing intermittent P99 spikes (2.5x baseline) for streaming endpoints that serve short prompts (<128 tokens) under moderate concurrency (~50-200 concurrent streams). Spikes lasted 50-200ms and correlated with higher syscall and context-switch activity on proxy/sidecar hosts. No model OOMs or GPU stalls were observed.",
+  "environment": "Prod-like dedicated cluster (dedicated tier): 8x A100 nodes behind envoy sidecars, go-serving runtime v1.14, gRPC-go v1.57, network: 25GbE, sidecar proxies: envoy 1.26. Tests reproduced on staging (same artifact versions) with 16 client machines generating sustained streaming load via our loadgen harness.",
+  "hypothesis": "gRPC keepalive probes and short-lived streaming goroutines produce bursts of timers/epoll wakeups that interact poorly with Go's scheduler on busy cores. The resulting CPU scheduling jitter manifests as tail-latency in small-chunk streaming where per-chunk processing time is tiny and therefore scheduling overhead dominates.",
+  "experiment-setup": "Load profile: 120 concurrent streams, each stream sends 3 short chunks (avg 120 bytes) to produce ~10k tokens/s aggregate. Two configurations tested: (A) default keepalive (ClientKeepalive Time=30s, Server enforcement disabled), (B) aggressive keepalive (1s) used by a misconfigured proxy testbed, (C) disabled keepalive via proxy pass-through. Measurement: pprof CPU samples (5s/10s runs), go trace, eBPF sched records, tcpdump to capture keepalive/HTTP/2 frames. Repeated runs for statistical significance (10 runs each).",
+  "measurements": "Key metrics (median across runs):\n- Baseline (default keepalive): P50=18ms, P95=64ms, P99=140ms, CPU usage: 42% system+user on sidecar, goroutines: ~6500.\n- Aggressive keepalive (1s): P50=20ms, P95=120ms, P99=380ms, CPU spikes +20% on core 3-5, syscalls/s increased by 3.1x, context switches increased 2.8x.\n- Keepalive disabled: P50=17ms, P95=58ms, P99=120ms, CPU usage slightly reduced.\nAdditional observations: go trace showed repeated preemption/wakeup cycles pinned to small intervals matching keepalive interval. eBPF sched shows increased runnable->running transitions for the gRPC listener goroutine and per-request goroutines coincident with keepalive bursts.",
+  "profiling-notes": "CPU pprof flamegraphs show top stacks: net/http2.(*serverConn).serveStreams -> h2Stream readLoop -> runtime.netpoll -> runtime.schedule. User-space time dominated by http2 read/decode and HPACK for headers for every keepalive ping/pong and occasional control frames. Traces show short-lived goroutines created per incoming frame that incur scheduler overhead. The timer wheel and runtime timers scanned frequently at keepalive frequency in aggressive config.",
+  "root-cause-analysis": "A confluence of factors: (1) Aggressive keepalive settings from a subset of test proxies caused frequent control frames and timer events, (2) gRPC/google's http2 implementation creates work on per-frame delivery which produces transient goroutine activity, (3) Go scheduler's wakeup cost and syscall/epoll churn under high core utilization produced jitter that disproportionately affects tiny per-chunk latencies (the signal-to-noise ratio is low). Secondary contributor: sidecar CPU affinity had tight packing causing timer processing to contend with the serving goroutine.",
+  "mitigations-applied": "Immediate: rolled back aggressive keepalive configs in test fleet and enforced a minimum keepalive_time of 15s on proxies. Tuned envoy to use tcp keepalive only on idle connections instead of active streaming. Adjusted sidecar CPU pinning to separate timer/IO cores from processing cores (affinity change). Result: P99 dropped back to ~130ms and spikes largely disappeared.",
+  "longer-term-recommendations": "1) Add defensive server-side guard: rate-limit processing of control frames and coalesce small timer events in the serving runtime.\n2) Update our recommended proxy configuration in the docs: keepalive >= 15s for streaming endpoints; avoid proxy-inserted aggressive probes.\n3) Add a lightweight connection health-check that avoids full HTTP/2 control frames for high-churn clients.\n4) Investigate moving hpkt/HPACK decoding to a buffered worker to reduce per-frame goroutine churn.\n5) Run experiments with go1.21/1.22 scheduler improvements and measure improvements.\n6) Add automated regression tests in CI that replay keepalive/control-frame bursts and assert tail-latency bounds.",
+  "open-questions": "- Would using HTTP/1.1 chunked streaming for very small-payload workloads reduce scheduler churn? (initial microbench suggests yes for tiny chunks but worse at higher concurrency).\n- Can we safely relax server-side timer granularity without affecting idle connection cleanup?\n- Is there value in explicit connection pooling to reduce per-client control-frame noise?",
+  "next_steps": "1) Create RFC for proxy keepalive policy and land a doc change (owner: Marta).\n2) Prototype buffered HPACK decode worker and benchmark (owner: Ethan).\n3) Schedule an infra change for CPU affinity on sidecars in Dedicated (owner: Jonah).\n4) Add a JMH-style replay harness in CI to simulate keepalive bursts (owner: Priya).",
+  "conclusion": "Tail-latency spikes for small-chunk streaming were not a GPU or model issue but a networking+runtime interaction: frequent control frames and timer wakeups amplified by goroutine scheduling overhead. Operational fixes (keepalive policy, CPU pinning) mitigated the problem; engineering work (coalescing timers, buffered decode) can make the system more robust against noisy clients and aggressive proxies.",
+  "notes-to-self": "Keep an eye on any config drifts from proxies managed by partner teams; add an alert rule for sudden Syscall/sec increases on sidecars. Save raw pprof and trace bundles under /tmp/prof-2026-11-15 for root-cause forensic purposes.",
+  "attachments": "(pprof bundles, go traces, tcpdumps) attached in linked_artifacts; see github PR and Jira for diffs and follow-ups.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "symptoms",
+    "environment",
+    "hypothesis",
+    "experiment-setup",
+    "measurements",
+    "profiling-notes",
+    "root-cause-analysis",
+    "mitigations-applied",
+    "longer-term-recommendations",
+    "open-questions",
+    "next_steps",
+    "conclusion",
+    "attachments"
+  ],
+  "dataset_doc_uuid": "dsid_20cb08bb929d4a3fac6b94973d4ba74c"
+}

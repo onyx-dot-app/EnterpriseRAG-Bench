@@ -1,0 +1,33 @@
+{
+  "title": "Zonal diversion chronicle - scratch",
+  "owner": "Evan Chen",
+  "drive_area": "users",
+  "path": "users/zonal-diversion-chronicle",
+  "doc_type": "doc",
+  "created_at": "2026-02-10",
+  "last_modified": "2026-03-12",
+  "collaborators": [
+    "Priya Nair",
+    "Samir Gupta"
+  ],
+  "team": "eng-sre",
+  "status": "draft",
+  "tags": [
+    "routing",
+    "failover",
+    "zonal-diversion",
+    "investigation",
+    "debug"
+  ],
+  "linked_artifacts": [
+    "JIRA-OPS-1782",
+    "https://github.com/redwood-inference/runtime/pull/492",
+    "slack:#sre | thread ts=1710145612.000200"
+  ],
+  "content": "Purpose:\\nQuick personal chronicle of the zonal diversion incident that started 2026-03-11 02:12Z. This is a scratchpad: commands I ran, log excerpts, hypotheses to test, and short repro notes. Use/skip freely; __not a runbook__ (yet).\\n\\nBackground:\\n- Smart routing policy 'latency-pref' was active for customer cluster west-eu-prod.\\n- Autoscaler triggered burst to az1 and az3. At ~02:12 we started seeing route_eject events and an unusual spike in regional-diversion decisions: requests normally pinned to eu-west-1 -> were diverted to eu-west-2 and eu-central-1.\\n\\nWhat I saw (top-line):\\n- Client latencies p95 jumped 350ms -> 1.2s in region.\\n- Router logs show repeated handshake timeouts to az1 edge (timeout ~2500ms).\\n- Route decisions triggered fallback to 'regional-closest' variant but with a race: some requests retried; others were left in-flight and timed out.\\n\\nCommands / artifacts I ran / looked at: (rough order)\\n1) Grepped router events:\\n   $ zcat router-logs-2026-03-11.gz | egrep \\\"route_eject|divert|handshake\\\" | tail -n 120\\n   sample: 2026-03-11T02:13:01Z router-1 route_eject reason=handshake-timeout region=eu-west-1 trace=trx-8a3b\\n\\n2) Queried route-policy decisions via admin API:\\n   $ curl -s -H \\\"Authorization: Bearer $ADMIN\\\" \\\\ \\\\\\n     \\\"https://admin.internal/v1/route_decisions?region=eu-west-1&from=2026-03-11T02:10Z\\\" | jq '.results[] | {id,reason,alt_region,latency_ms}'\\n\\n3) Spot-checked edge pod logs for az1: kubectl logs -n edge edge-az1-7f8 -c edge-proxy --since=20m\\n   saw repeated: \\\"WARN handshake: peer=10.34.12.9 timeout=2500ms conn=0xc2e4\\\"\\n\\n4) Kernel network counters on one affected node (az1):\\n   $ ssh node-az1-05 -- sudo ss -s\\n   TCP: in-cnt=112345 out-cnt=110993 orphan=0 tw=14 alloc=1024 mem=0\\n   No obvious socket leak, but netdev rx buffer drops increased by ~2.3k in the 10m window (dmesg: \\\"pcie0 rx-err drop\\\").\\n\\n5) Packet capture (short) on edge interface while reproducing low-rps test:\\n   $ sudo tcpdump -i eth0 -w /tmp/az1-02.pcap port 443 and host 10.34.12.9 -c 500\\n   Observed 3x TLS handshakes that stalled waiting for server hello (server retransmission).\\n\\nReproductions attempted locally:\\n- ran a small vegeta load (50 RPS) against a rolling set of instances in eu-west-1 with header x-region=eu-west-1 to force routing: saw about 6% of requests diverted after ~90s.\\n- toggled fallback policy in non-prod to 'strict-local' and replayed: diversion dropped to <1% -> suggests diversion logic is sensitive to handshake latency signals.\\n\\nLog snippets (sanitized):\\n- router: 2026-03-11T02:12:59Z router-3 decision=divert reason=handshake-latency region=eu-west-1 alt=eu-west-2 policy=latency-pref trace=trx-8a3b\\n- edge: 2026-03-11T02:13:00Z edge-az1 WARN \\\"TLS handshake stalled\\\" conn=0x34a2 peer=10.34.12.9\\n- kubelet: 2026-03-11T02:13:05Z kubelet node-az1 kubelet: pod evicted due to image-pull backoff (unrelated?)\\n\\nHypotheses (ranked):\\n1) Transient NIC/PCIe issues on a subset of az1 hosts caused degraded TLS performance -> handshake latency -> routers ejected routes. Evidence: kernel rx drops, tcpdump stalls, dmesg pcie-err.\\n2) A control-plane change (recent PR to TLS session resume) introduced behavior under load that increases server hello latency for some cipher suites. Evidence mixed: PR linked below; only observed on hosts running older openssl.\\n3) Router health probe threshold too sensitive to transient handshake jitter and causes aggressive ejection. Evidence: fallback to regional happens within 2 failed handshakes.\\n\\nQuick mitigation timeline (what we did):\\n- 02:20Z: increased router handshake timeout from 2000ms -> 4000ms for eu-west-1 (hotfix flag) to see if ejections stop. Immediate reduction in diversions from ~5% -> 1.2%.\\n- 02:33Z: cordoned / reimaged 2 suspect az1 hosts. Diversions fell to <0.2% and client p95 recovered.\\n\\nFollow-ups / TODOs (next steps):\\n- [ ] Collect full pcap for longer window on reimaged host; attach to JIRA-OPS-1782.\\n- [ ] Confirm firmware/driver versions on az1 fleet nodes vs rest of cluster. Likely PCIe firmware mismatch. Priya to check with infra.\\n- [ ] Run a controlled experiment: deploy canary with new TLS resume PR to non-prod and stress handshake path (vegeta with 90% new sessions). Compare server hello timings.\\n- [ ] Revisit router ejection policy: add a short backoff hysteresis so two transient handshakes don't cause permanent ejection. Create a tiny A/B config in lab.\\n- [ ] Build metric: \\\"handshake-server-hello-ms\\\" at the router and emit to tracing for 95/99.\\n\\nNotes to self:\\n- Reimaging fixed immediate symptom but not root cause; prioritize firmware/driver matrix review.\\n- Keep admin hotflag for handshake-timeout around during the validation window; rollback plan must be documented in JIRA.\\n\\nAttachment refs: \\n- pcap sample: /mnt/ops-artifacts/pcaps/az1-2026-03-11-02.pcap (short)\\n- kube events dump: s3://ops-dumps/eu-west-1/2026-03-11/kube-events.json.gz\\n\\nOpen questions: \\n- Why were only a small subset of az1 hosts affected? hardware/placement pattern?\\n- Any correlation with recent kernel updates pushed 2026-03-09?\\n\\nIf I forget: first place to look is router traces (trace ids shown above), then edge node dmesg for pcie errors. Keep this doc updated as we get firmware matrix.\\n\\n-- Evan\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_b3cad68bf4a94ae0a53b7df5472b08d8"
+}

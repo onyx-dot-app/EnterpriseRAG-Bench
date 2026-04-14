@@ -1,0 +1,38 @@
+{
+  "title": "Jitter damping for routing in long-span MoE experiments",
+  "owner": "Ethan Martinez",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/jitter-damping-routing-long-span-experiments.json",
+  "doc_type": "doc",
+  "created_at": "2025-01-12",
+  "last_modified": "2025-02-03",
+  "collaborators": [
+    "Priya Shah",
+    "Lina Gomez",
+    "Victor Chen"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "moe",
+    "routing",
+    "long-context",
+    "qwen",
+    "mistral",
+    "llama",
+    "profiling",
+    "latency",
+    "pci-e"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/runtime/pull/789",
+    "https://redwood.atlassian.net/browse/ENGINF-4321",
+    "https://redwood-internal.atlassian.net/wiki/spaces/ENG/pages/987654321/Long-Span+Routing+Playbook"
+  ],
+  "content": "Summary:\\n\\nQuick notes from experiments attempting to reduce p95/p99 jitter in MoE routing when serving very long contexts (>=64k tokens window equivalent) across Llama/Mistral/Qwen families. Goal: find lightweight runtime-level damping heuristics that reduce oscillatory routing behavior and PCIe/UVM stalls without heavy architectural changes.\\n\\nHigh level hypothesis:\\n- Long-span requests increase router state churn (gating decisions + KV growth) and amplify tiny tokenization skew.\\n- This creates short-lived hot experts and backpressure on DMA + UVM when expert fanout spikes.\\n- Add a jitter-damping layer that (a) smooths routing probabilities over a tiny sliding window and (b) enforces a soft fanout cap to reduce instantaneous bursts. Expect lower tail latency and fewer page faults at slight cost to token throughput and potential small quality rejiggering.\\n\\nTestbed:\\n- Models: Llama-70B-Long, Mistral-30B-Long, Qwen-14B-Long (weights quantized to int8 for a subset of runs)\\n- Hardware: 8x A100-80GB nodes; NVLink local staging for primary, fallback PCIe path active for cross-GPU traffic; UVM enabled in some configs to reproduce pagefault patterns.\\n- Workload: mixed-batch long-span traces (median 12k tokens, 90th 48k, heavy tail to 120k simulated with split windows). Tokenization skew introduced by synthetic prefix sets (wiki/news/codex style).\\n- Metrics: p50/p95/p99 token latency, end-to-end request tail, GPU kernel stalls (ns), PCIe DMA queue depth, pagefault rate (/1000s), expert load imbalance (stddev per-step), throughput tokens/s.\\n\\nConfigurations tested:\\n1) baseline: current routing (hard top-2 gate, no damping), batching=auto, cache window=dynamic\\n2) soft-decay routing: per-token routing probs = alpha*prev + (1-alpha)*curr, alpha=0.6 over last 4 tokens\\n3) soft-cap fanout: allow top-k but with soft penalty after fanout>F (F=6) to probabilistically steer to next-best experts\\n4) both damping + soft-cap\\n5) adaptive prefetch window reduction: when pagefault rate > threshold, reduce prefetch window from 64 to 8 (eviction-friendly)\\n\\nKey results (aggregated):\\n- Baseline p99 end-to-end: 1.49s per request under mixed tail (GPU-level p99 token latency 9.8ms)\\n- Soft-decay only: p99 reduced 27% -> 1.09s, token p99 7.2ms, GPU stall ns reduced 34%\\n- Soft-cap only: p99 reduced 18% -> 1.22s, expert stddev reduced 40% but throughput -6%\\n- Combined damping+cap: p99 reduced 41% -> 0.88s, token p99 5.7ms, pagefaults down 62%, throughput -9%\\n- Adaptive prefetch window triggered in 48% of long-tail requests and reduced pagefaults further but introduced transient latency spikes during window changes; best used with combined damping for stability.\\n\\nObserved traces / root causes:\\n- Hotspot bursts: Many traces show a handful of adjacent tokens suddenly driving the same expert set due to tokenization boundary alignment. This causes instantaneous increase in memory reads/writes for KV and temporary fill of DMA queues.\\n- Oscillation: Router decisions flip across tokens for ambiguous inputs; without smoothing, this forces activation of different experts causing cross-GPU fetches and eviction churn.\\n- UVM thrash: When prefetch window was large, UVM page migrations combined with kernel scheduling led to 2\u20133x GPU stall durations during high-fanout bursts.\\n- Quantization sensitivity: Qwen int8 runs saw slightly larger sensitivity to damping (quality drop ~0.8 BLEU-equivalent on a held eval) vs float runs; Mistral had better resilience.\\n\\nProfiling notes (commands & tools):\\n- Collected kernel traces via nvprof/nvtx and our internal token-trace plumbing: python tools/trace_runner.py --model qwen-14b-long --trace longspan-mix --nvtx\\n- DMA queue depth instrumented with perf counters and /sys GPU stats; cross-validated with nsys sampling\\n- Example flame slice: longspan_trace_0123: DMA enqueue latency spike aligned with router.forward at step ~413 leading to KV write stall of ~1.1ms.\\n\\nMitigations tried (and quick comments):\\n- Jitter-damping (soft decay): cheap, per-token state (4 floats per request); easy to turn on/off per-route; improves tail a lot for ambiguous gating workloads.\\n- Soft fanout cap: reduces instantaneous expert set size; needs calibration per model and impacts final quality slightly when cap low.\\n- Prefetch window adapt: reactive but oscillatory if threshold too aggressive. Combine with hysteresis.\\n- Ring-buffer micro-batching: queue small tokens into a tiny micro-batch window (max 2\u20133 tokens) to amortize DMA; reduced PCIe ops by 21% but adds p50 overhead ~4%.\\n- Locality-driven KV placement: try to prefer local experts when load comparable; requires routing-policy change at orchestration layer.\\n\\nQuality impact / eval: \\n- On a small eval set (prompt completion coherence + task accuracy), combined damping+cap had negligible degradation for Llama/Mistral (<0.3% metric diff) but Qwen int8 showed -0.8% on our code-completion metric. Decision: enable by default for non-quantized routes; gate-on for quantized after runbook confirmation.\\n\\nFollow-ups / TODOs:\\n- Run extended 7-day canary with combined damping on a small percentage of hosted traffic; monitor quality regressions and pagefaults. (ENGINF-4321)\\n- Perf: add NVTX regions for routing soft-decay so we can quantify overhead in kernel timelines (PR #789 updates tracing hooks)\\n- Calibration job: autotune F (soft-cap fanout) per model family via historical traces (script: tools/fanout_autotune.py)\\n- Investigate deeper: could we avoid cross-GPU fetch by expert replication for top-2 hot experts? cost analysis needed.\\n\\nPractical playbook (short):\\n1) Enable soft-decay alpha=0.6 on long-context routes (>=32k tokens) for 2 weeks in canary mode.\\n2) Add soft-cap F=6 only for Mistral and Llama on float routes; skip Qwen-int8 initially.\\n3) Keep prefetch window dynamic but add hysteresis: only shrink if pagefaults > 10/1000s for 30s sustained.\\n4) Monitor: p99 end-to-end, pagefault rate, expert stddev, token quality metrics.\\n\\nNotes to reviewers:\\n- This is intentionally a runtime-level mitigation so we can ship quickly; longer term we should look at gating model-quantization interplay and router-aware tokenizer smoothing upstream.\\n- Questions: what is acceptable throughput loss for Hosted tier? Should Dedicated customers get a toggle?\\n\\nSlack threads / refs: #perf-longspan (internal), see thread pinned messages 2025-01-15 for initial traces.\\n\\nPatch pointers: PR 789 contains a prototype short-lived soft-decay state and unit tests. The fanout soft-cap is behind a feature flag.\\n\\nEnd of note.\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_803549caab4d4f76ac2e553918cc550b"
+}

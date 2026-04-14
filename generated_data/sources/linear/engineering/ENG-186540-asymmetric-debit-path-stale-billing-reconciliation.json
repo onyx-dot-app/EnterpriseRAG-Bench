@@ -1,0 +1,90 @@
+{
+  "key": "ENG-186540",
+  "team": "engineering",
+  "title": "Asymmetric debit path causes stale billing records after shard split",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-22",
+  "updated_at": "2026-03-10",
+  "creator": "Amelia Park",
+  "assignee": "Jorge Martinez",
+  "project": "metering-reliability",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "billing",
+    "shard-migration",
+    "rate-limiter",
+    "reconciliation",
+    "urgent"
+  ],
+  "description": "Summary: During a recent shard split rollout for the meter-write service, we observed a class of inconsistencies where some API keys (per-key) and route-level meters were left with stale/absent debit records for the split epoch. This manifests as underreported usage for affected keys in downstream billing pipelines and transient allowance to exceed quota windows before corrective reconciliation. Root cause appears to be an asymmetric debit path between the routing layer (which sometimes rewrites key->shard mapping during split) and the local debit authorizer which continued to commit to the original shard namespace. The mismatch produces either duplicate debits or missed debits depending on timing. This ticket tracks investigation, short-term mitigations, and a robust fix to ensure idempotent, shard-aware debits across shard split/rebalance events.",
+  "steps_to_reproduce": [
+    "1) Start meter-write service vX with shard mapping A and load per-key traffic for key K at moderate QPS (~40r/s).",
+    "2) Trigger controlled shard split (A -> A1 + A2) via maintenance pipeline used in canary.",
+    "3) Immediately during split, issue a burst of requests for key K routed by old mapping, interleaved with routing table refresh events.",
+    "4) Observe that some debit transactions are committed to the pre-split shard namespace while subsequent requests go to the new shard namespace; billing aggregation later fails to join records by idempotency token, producing holes or double counts.",
+    "5) Reconcile job shows missing ledger rows for epoch T for affected keys and corresponding alert on billing delta dashboard."
+  ],
+  "telemetry_observations": [
+    "- Increased 429->200 transition events on the edge during split window (edge logs: edge/2026-02-21-split.log).",
+    "- Debit service returned 200 but commit_count lagged in metrics by ~12s for some keys (meter-write.commit_latency_p95 spikes).",
+    "- Reconciliation job produced ~3.2k affected keys across two shard-split runs (dashboard: https://dash.redwood.ai/billing/recon/2026-02-21).",
+    "- Error traces show two code paths: allow_path -> legacy_debit_commit and new_path -> shardaware_debit_commit; they use different idempotency token derivation."
+  ],
+  "hypothesis": "The core issue is incompatible idempotency token generation between the legacy debit commit path and the shard-aware commit path after mapping updates. When routing updates race with debit commit, some commits land in the old shard namespace and lack the token pattern needed by aggregator to deduplicate or join across epochs. Additionally, local shard caching allowed stale mapping for ~5-15s leading to asymmetric debit destinations.",
+  "proposed_fix": "1) Normalize idempotency token format across both commit paths to include stable tenant-key + operation-sequence + mapping-version. 2) Add a 'shard-version' field to debit events so aggregator can rehydrate and join related rows if committed to old namespace. 3) Make debit commit idempotent by storing commit GUID in a single global ledger index (or via a lightweight coordinator) during the migration window. 4) Introduce a short-lived compatibility layer: on shard split detection, debit service will dual-write (old namespace + new namespace) for 60 seconds behind a feature flag to prevent holes while rollout completes.",
+  "tradeoffs_and_risks": "- Dual-write increases temporary write amplification and cost; acceptable for controlled maintenance windows but must be gated behind FFLAG and low-traffic mode for large tenants.\n- Global ledger index reduces window for duplicates but adds coordination latency; we'll scope to a weakly-consistent index with background compaction to balance latency.\n- Changing idempotency token format is forward-incompatible with older aggregators; we will add schema versioning and backward-compatible parsing in aggregator service.",
+  "proposed_implementation_steps": [
+    "A) Implement shard-version tag on debit events in meter-write (PR: https://github.com/redwood-inference/meter-write/pull/4621).",
+    "B) Refactor idempotency key generation into shared library (metering-common) and replace both commit paths to use it (PR: https://github.com/redwood-inference/metering-common/pull/321).",
+    "C) Implement dual-write feature flag in meter-write with telemetry gating and a rate limiter for cost control.",
+    "D) Update aggregator to accept shard-version and normalize join logic; add backfill job that scans commits that have shard-version and deduplicates/dedup-joins into canonical ledger rows.",
+    "E) Run canary on a small org cohort, monitor billing delta metrics and run reconciliation health checks before full rollout."
+  ],
+  "test_plan": "Unit tests for idempotency generation, integration tests simulating shard split with controlled timing (chaos test harness), load tests for dual-write cost and latency, and e2e reconciliation verification against synthetic dataset. Nightly job to run a reconciliation smoke test in staging with the new aggregator. Add a canary alert that will rollback the dual-write flag if reconciliation lag > 10s or billing delta > 0.1% for canary orgs.",
+  "rollout_plan": "1) Merge meter-write and metering-common changes behind feature flag.\n2) Deploy to canary hosts (5% of capacity) and enable dual-write for 1 hour windows during low-traffic nights.\n3) Monitor key metrics (reconciliation misses, write amplification, commit_latency_p95).\n4) If stable for 48h, expand to 25% then 100%.\n5) Run bounded backfill job to reconcile previously affected keys and mark resolved once ledger delta < 0.01%.",
+  "monitoring_and_alerts": [
+    "- New metric: meter_write.dual_write_failures (SLO target: 0).",
+    "- Alert: billing.reconciliation.misses > 1000 in 1h (pager).",
+    "- Dashboard: billing/delta-by-org and meter_write/commit_latency_by_shard (linked).",
+    "- Post-rollback healthcheck to run reconciliation on canary orgs automatically."
+  ],
+  "dependencies": [
+    "ENG-27458",
+    "ENG-33384"
+  ],
+  "parent_issue": [],
+  "sub_issues": [],
+  "customer_impact": "high",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "comments": [
+    "2026-02-23 - Amelia Park: Initial triage complete. Identified shard-version mismatch in traces. Created meter-write PR for early instrumentation.",
+    "2026-02-26 - Jorge Martinez: Added dual-write experiment plan and cost estimate (~+2.8% write ops for affected windows).",
+    "2026-03-02 - Ruth Chen (Billing): Confirmed revenue delta for 3 enterprise orgs; approved priority escalation.",
+    "2026-03-08 - Infra: Nightly canary scheduled for 2026-03-12 02:00 UTC and rollback playbook drafted.",
+    "2026-03-10 - Jorge Martinez: Began implementing idempotency refactor; unit tests in place."
+  ],
+  "attachments": [
+    "https://confluence.redwood.ai/display/BILLING/Shard+Split+Debits+Investigation",
+    "https://github.com/redwood-inference/meter-write/pull/4621",
+    "https://dash.redwood.ai/billing/recon/2026-02-21"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "telemetry_observations",
+    "hypothesis",
+    "proposed_fix",
+    "tradeoffs_and_risks",
+    "proposed_implementation_steps",
+    "test_plan",
+    "rollout_plan",
+    "monitoring_and_alerts",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_54bab68943b940619fef9b6964c5dae3"
+}

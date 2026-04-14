@@ -1,0 +1,75 @@
+{
+  "key": "ENG-4810",
+  "team": "engineering",
+  "title": "Implement burst pool admission controller service (APIs, state, integration tests)",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2025-03-03",
+  "updated_at": "2025-04-29",
+  "creator": "Talia Benson",
+  "assignee": "Benji Okafor",
+  "project": "Dedicated Burst Capacity",
+  "cycle": "2025-W10",
+  "estimate": "13",
+  "due_date": "2025-04-18",
+  "labels": [
+    "dedicated",
+    "burst-capacity",
+    "admission-control",
+    "control-plane",
+    "reliability",
+    "guardrails"
+  ],
+  "dependencies": [
+    "ENG-4816",
+    "ENG-4821",
+    "ENG-4902"
+  ],
+  "sub_issues": [
+    "ENG-4881",
+    "ENG-4848"
+  ],
+  "customer_impact": "high",
+  "release": "platform-2025.04",
+  "security_review_required": "true",
+  "description": "Build the Burst Admission Controller service (BAC) responsible for deciding whether a Dedicated tenant request may exceed reserved baseline by borrowing GPUs from a region/hardware-class burst pool.\n\nThis ticket covers:\n- Service implementation + deployable artifact\n- Public-ish (gateway/routing-facing) admit API(s)\n- State model required for fairness/cooldowns + idempotency\n- Integration tests (multi-tenant scenarios, telemetry lag scenarios)\n\nNon-goals (in this ticket):\n- Console UI (tracked separately)\n- Full billing export pipeline (separate ticket)\n- Cross-region bursting (out of scope for initial release)\n\nReferences:\n- Confluence design spec: sources/confluence/eng-platform/systems-and-services/burst-admission-controller-service.json\n- ADR (admission semantics): sources/confluence/architecture-and-standards/decision-records/adr-burst-pool-admission-control-semantics.json\n- ADR (fairness model): sources/confluence/architecture-and-standards/decision-records/adr-fairness-model-for-shared-burst-pools.json\n- Related routing integration: ENG-4812\n- Tenant config schema: ENG-4816\n\nOwner notes:\nWe must be conservative by default: if telemetry is stale or dependencies are unhealthy, deny burst (serve baseline only) and return explicit denial reason codes so support and customers can understand behavior.",
+  "acceptance_criteria": "1) Admission API is implemented and stable for routing to call in the hot path.\n2) Decisions are deterministic given an idempotency key and a stable policy/config snapshot.\n3) Fairness + guardrails state is implemented: per-tenant caps, cooldown windows, pool safety limits.\n4) Service fails closed for burst (deny burst) when telemetry is stale/unavailable.\n5) Integration tests cover:\n   - multi-tenant fairness under contention\n   - cooldown enforcement\n   - telemetry lag/staleness handling\n   - circuit breaker interactions (global safety cap)\n6) Metrics and logs exist to explain admit/deny at aggregate and per-tenant level (high level only; detailed dashboards tracked elsewhere).\n7) Rollout gating hooks exist (feature flag + per-tenant allowlist + per-region/hardware allowlist).",
+  "technical_plan": "API surface (routing-facing)\n- Endpoint: POST /v1/burst/admit\n  - Purpose: determine if a given request is allowed to consume burst capacity right now.\n  - Request fields (conceptual; final schema lives in proto/openapi):\n    - tenant_id\n    - request_id (or idempotency_key)\n    - region\n    - hardware_class (e.g., H100, L40S)\n    - baseline_allocation (reserved GPUs / capacity units)\n    - requested_increment (additional GPUs/capacity units over baseline)\n    - model_id (for observability only; not used to admit initially)\n    - priority_tier (e.g., default/silver/gold)\n    - now_ms (optional; for test harness only)\n  - Response fields:\n    - admitted: true|false\n    - decision_id (for tracing)\n    - reason_code (standardized denial/admit code)\n    - retry_after_ms (set for backoff guidance)\n    - effective_limit_snapshot (optional, redacted, internal-only)\n\n- Endpoint: GET /internal/burst/decision/{decision_id}\n  - Purpose: internal debugging/support tooling (redacted) to explain decision inputs and the guardrail that triggered.\n  - Must be protected by RBAC; do not leak pool-level sensitive numbers to customer-facing surfaces.\n\nCore decision flow\n1) Read tenant burst config (from control plane cache) + policy rules (policy engine) for:\n   - burst_enabled\n   - max_burst_ratio\n   - per-tenant max increment\n   - cooldown window\n   - priority tier weights\n2) Read pool telemetry snapshot (from fleet telemetry aggregator):\n   - pool_capacity_total\n   - pool_capacity_available\n   - pool_saturation\n   - telemetry_age_ms\n3) Hard safety gates (fail-closed):\n   - if !burst_enabled => deny (TENANT_BURST_DISABLED)\n   - if request exceeds tenant cap => deny (TENANT_CAP_EXCEEDED)\n   - if telemetry_age_ms > staleness_threshold => deny (TELEMETRY_STALE)\n   - if global circuit breaker open => deny (FLEET_SAFETY_CIRCUIT_OPEN)\n   - if pool safety headroom breached => deny (POOL_SAFETY_LIMIT)\n4) Fairness gate:\n   - Apply per-tenant token bucket / weighted allocation (per ADR) to avoid starvation and prevent a single tenant from consuming entire pool.\n   - Maintain per-tenant spend over a rolling window.\n   - If insufficient tokens => deny (FAIRNESS_RATE_LIMIT)\n5) Cooldown gate:\n   - If tenant recently burst above threshold and cooldown not elapsed => deny (COOLDOWN_ACTIVE)\n6) Admit:\n   - Reserve burst increment for a short TTL (soft reservation) to reduce race conditions.\n   - Emit decision metrics + structured log.\n\nState & storage\n- Required state:\n  - per-tenant fairness bucket counters (by region+hw_class)\n  - per-tenant cooldown last_burst_ts\n  - short-lived reservations keyed by idempotency_key\n- Storage approach:\n  - Use Redis (or existing platform KV) for shared state across replicas.\n  - Keep small in-memory cache for hot reads with short TTL; all writes go to shared store.\n- Idempotency:\n  - Same (tenant_id, idempotency_key) must return the same decision within decision_ttl.\n  - Prevent double-counting of fairness spend on retries.\n\nDeterminism requirements\n- Deterministic within a time slice: the same input tuple + same config snapshot + same idempotency key must yield identical admit/deny and reason_code.\n- Telemetry smoothing: apply an EWMA / monotonic staleness guard so the controller does not oscillate admit/deny when telemetry is delayed.\n\nObservability (minimum for this ticket)\n- Metrics:\n  - bac_admit_requests_total{region,hw_class,result,reason_code,priority_tier}\n  - bac_pool_telemetry_age_ms{region,hw_class}\n  - bac_state_store_errors_total\n  - bac_reservation_conflicts_total\n  - bac_latency_ms{endpoint}\n- Logs:\n  - Structured decision log with: tenant_id hash, decision_id, reason_code, policy_version, telemetry_age_ms.\n\nDeployment & rollout\n- Service deployed in platform cluster per region.\n- Feature flag gates:\n  - global enable\n  - per region/hw allowlist\n  - per tenant allowlist\n- Safe fallback:\n  - If BAC unavailable, routing should treat as deny burst and continue at baseline.\n\nTesting\n- Unit tests:\n  - fairness bucket math + edge cases\n  - cooldown enforcement\n  - idempotency behavior\n- Integration tests:\n  - simulated multi-tenant contention with fixed telemetry snapshots\n  - induced telemetry lag and validation of fail-closed behavior\n  - reservation TTL expiry + retry behavior\n  - circuit breaker open/close transitions\n- Contract tests:\n  - schema validation for request/response + reason codes list stability",
+  "denial_reason_codes": "Initial reason code set (must match gateway/routing expectations):\n- TENANT_BURST_DISABLED\n- TENANT_CAP_EXCEEDED\n- TENANT_NOT_ALLOWLISTED\n- REGION_HW_NOT_ENABLED\n- TELEMETRY_STALE\n- POOL_SATURATED\n- POOL_SAFETY_LIMIT\n- FAIRNESS_RATE_LIMIT\n- COOLDOWN_ACTIVE\n- FLEET_SAFETY_CIRCUIT_OPEN\n- INTERNAL_ERROR (only when we can confidently say it is controller-local; prefer TELEMETRY_STALE / dependency-specific codes where possible)\n\nNotes:\n- Denials should include retry_after_ms when backoff is appropriate.\n- Some denials should be treated as \"do not retry\" (e.g., TENANT_BURST_DISABLED, TENANT_NOT_ALLOWLISTED).",
+  "rollout_notes": "Dogfood plan:\n- Start with internal Dedicated workloads in us-east / H100 burst pool only.\n- Gate on: no statistically significant p95/p99 regression for non-burst tenants, and denial reason distribution matches expected (mostly FAIRNESS_RATE_LIMIT / POOL_SAFETY_LIMIT under load).\n\nRollback plan:\n- Flip global burst enable flag off (BAC still running but always returns deny burst).\n- If needed: disable by region/hw allowlist.\n- If BAC is causing latency in routing path: routing fallback to baseline-only without BAC call (separate routing kill switch).",
+  "links": [
+    "GitHub: sources/github/redwood/pr-23758-burst-admission-controller-initial-service-skeleton.json",
+    "GitHub: sources/github/redwood/pr-23795-add-denial-reason-codes-and-client-surface.json",
+    "GitHub: sources/github/redwood/pr-23777-implement-token-bucket-fairness-for-burst-pools.json",
+    "GitHub: sources/github/redwood/pr-23822-add-metrics-burst-saturation-and-denials.json",
+    "GitHub: sources/github/redwood/pr-23963-add-support-debug-endpoint-for-burst-decisions.json",
+    "GitHub: sources/github/redwood/pr-24057-add-integration-tests-for-multi-tenant-burst-scenarios.json",
+    "Confluence: sources/confluence/eng-platform/systems-and-services/burst-admission-controller-service.json"
+  ],
+  "updates": [
+    "2025-03-05 (Benji Okafor): Landed service skeleton + wiring to policy engine stub. Next: define request/response schema and reason codes with Routing (Mina/Ravi).",
+    "2025-03-11 (Jordan Lee): Reviewed determinism concerns. Strong recommendation: idempotency keyed decisions + avoid direct dependency on instantaneous pool_available without smoothing; otherwise deny oscillation under telemetry lag.",
+    "2025-03-14 (Benji Okafor): Implemented initial admit endpoint and config reads (tenant burst enable + max ratio). Blocking on ENG-4816 schema finalization for priority tiers/cooldown config fields.",
+    "2025-03-20 (Keiko Yamamoto): Guardrail defaults proposal shared: staleness_threshold=10s, cooldown=120s, max_burst_ratio default=1.5x. Please make these policy-driven (not hard-coded).",
+    "2025-03-26 (Benji Okafor): Added Redis-backed idempotency + reservation TTL. Added fail-closed on telemetry stale/unavailable. Need integration tests for retries to ensure no double-spend in fairness buckets.",
+    "2025-04-03 (Allison Grant): Metrics naming/labels reviewed; keep tenant_id out of labels to avoid cardinality blowups. Use tier + result + reason_code only.",
+    "2025-04-09 (Benji Okafor): Fairness token bucket implementation merged behind flag. Observed oscillation in staging when telemetry delayed; added EWMA smoothing + monotonic staleness guard.",
+    "2025-04-16 (Peter Holtz): SRE review: ensure BAC latency budget <5ms p95; add timeout and quick deny path if store is slow. Also ensure structured logs include decision_id for support triage.",
+    "2025-04-22 (Benji Okafor): Integration test suite added for multi-tenant contention + cooldown. Test harness simulates telemetry lag and validates TELEMETRY_STALE behavior. Ready for final review.",
+    "2025-04-29 (Ethan Park): Approved. Service meets acceptance criteria; rollout gated via feature flags and allowlists. Follow-ups: tighten reason_code mapping for POOL_SATURATED vs POOL_SAFETY_LIMIT; ensure support debug endpoint is RBAC-protected (tracked in ENG-4881)."
+  ],
+  "risks_and_mitigations": "Key risks\n- Telemetry lag causes unfair denials or admit oscillations.\n  Mitigation: staleness thresholds + EWMA smoothing + deterministic idempotency decisions.\n- State store latency impacts routing hot path.\n  Mitigation: strict timeouts, fast deny path, caching, and ensure routing can bypass BAC in emergency.\n- Label cardinality in metrics/logs becomes unbounded.\n  Mitigation: never label by tenant_id; use tier and reason_code only.\n- Incorrect idempotency semantics leads to double-spend / inconsistent decisions.\n  Mitigation: reservation keyed by idempotency_key; integration tests for retry paths.\n\nOperational notes\n- BAC must fail closed for burst. Worst case: customer can\u2019t burst (but baseline remains intact), which is preferable to fleet SLO regression.",
+  "next_steps": "Post-merge follow-ups (not blocking Done):\n- Confirm RBAC + audit coverage for internal debug endpoint and config reads (ENG-4881, ENG-4870).\n- Ensure routing integration handles retry_after_ms and do-not-retry reason codes (ENG-4812).\n- Tie BAC decision IDs to metering reconciliation hooks (ENG-4827).\n- Add load-test coverage using the burst harness to validate non-burst tenant tail latency protection (ENG-4841).",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "technical_plan",
+    "denial_reason_codes",
+    "rollout_notes",
+    "updates",
+    "risks_and_mitigations",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_4583c8cd10b14dbaa3b24d20966bee99"
+}

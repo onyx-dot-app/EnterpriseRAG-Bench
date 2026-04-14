@@ -1,0 +1,84 @@
+{
+  "key": "SUP-55801",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Client write-buffering causes out-of-order terminal events and interleaved partials on streaming responses",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Maya Patel",
+  "assignee": "Ethan Brooks",
+  "customer_company": "NovaHealth",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "streaming-proxy",
+    "serving-runtime"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "websocket",
+    "partial-output",
+    "client-behavior"
+  ],
+  "environment": "prod:us-east",
+  "affected_models": [
+    "redwood-8k-13b",
+    "rw-instruct-7b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-4721",
+    "SUP-33210"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serve/pull/9123"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/Stream+Stitching+Runbook"
+  ],
+  "description": "Issue summary: Multiple customers (starting with NovaHealth) report streaming responses (SSE and WS) where final/terminal events arrive before some later partial tokens, or multiple 'end' markers appear interleaved with truncated choice fragments. Impact: Generated outputs are stitched incorrectly in the client UI, producing duplicated trailing phrases or missing punctuation. This affects user-visible completions and upstream validation logic. Environment: Production (us-east), NovaHealth dedicated pool behind their app-proxy. Observed with both SSE and websocket clients.\n\nObservations: The pattern appears correlated with client libraries that implement their own write buffering on the POST/upgrade connection (e.g., buffering small writes into 64KB windows). When the client flush happens asynchronously the gateway sees a burst of bytes that contains multiple logical event fragments; our streaming proxy (nginx/keepalive settings + our buffering layer) sometimes reorders internal writes when handling concurrent keepalive probe responses, leading to out-of-order event boundaries delivered to downstream client, or duplicated trailing metadata frames. This differs from pure network disconnect/resume cases \u2014 there is no explicit reconnect recorded.\n\nNeeded: Investigate whether gateway buffering + streaming-proxy assembly is causing reassembly reordering and whether we should enforce per-connection sequencing and per-choice markers before forwarding. Also validate whether adding a small delimiter or enforcing chunked transfer boundaries on the gateway side mitigates the issue for apps that buffer writes.",
+  "steps_to_reproduce": [
+    "1) Customer runs a long-running SSE generation call against /v1/stream with model redwood-8k-13b from a client that aggregates writes into 32\u2013128KB windows (example: custom Java client using HttpUrlConnection with write buffering).",
+    "2) Client triggers token output frequently; client write flushes are coalesced into a single TCP burst on flush.",
+    "3) Gateway receives coalesced burst and forwards to streaming-proxy; streaming-proxy interleaves keepalive/probe responses during the same flush window.",
+    "4) Client reads SSE stream; final 'event: done' (or websocket 'DONE' control) appears before some preceding partial token fragments, or an extra terminal event is observed followed by more partials."
+  ],
+  "logs": [
+    "2026-03-09T15:12:02.811Z gateway-nginx[conn-4121]: recv 42KB from upstream, wrote 42KB to client in 1 write; downstream ack order preserved, but deliver loop ran with keepalive-probe; seq window 3/4",
+    "2026-03-09T15:12:02.813Z streaming-proxy[worker-7]: forwarded-fragment id=frag-9221 seq=11 size=1024\n2026-03-09T15:12:02.813Z streaming-proxy[worker-7]: forwarded-fragment id=frag-9222 seq=12 size=512\n2026-03-09T15:12:02.814Z streaming-proxy[probe]: keepalive response interleaved\n2026-03-09T15:12:02.815Z streaming-proxy[worker-7]: forwarded-terminal id=term-110 seq=10 size=64",
+    "Client-side capture (NovaHealth Java client)\nWRITE(flush) @15:12:02.810 -> bytes[frag-9221,frag-9222,term-110]\nClient received @15:12:02.817 tokens: [term-110,frag-9221,frag-9222]",
+    "App logs: stitcher reported unexpected terminal then trailing tokens, caused validation failure on sentence boundary check."
+  ],
+  "investigation_notes": [
+    "Initial triage (Support): validated only observed from NovaHealth's custom client; reproduced partially with a synthetic client that buffers writes and flushes on timer (reproducer attached).",
+    "Hypothesis 1: multiple logical frames coalesced into one TCP write and our streaming-proxy delivery loop does not strictly preserve original logical ordering when interleaving keepalives or control frames \u2014 leads to sequencing gaps at the client parser.",
+    "Hypothesis 2: client-side parsing expects each SSE 'data:' chunk to be an atomic output; when multiple 'data:' entries are sent in a single write, some clients re-parse differently depending on newline boundaries.",
+    "Reproducer notes: a Go client that writes each SSE line individually shows correct behavior; Java client (HttpUrlConnection) default buffering replicates issue.",
+    "Metrics: small spike in 5xx errors is absent; no reconnection recorded in logs. No obvious CPU/GPU pressure on serving nodes."
+  ],
+  "comments": [
+    "Maya Patel (Support) 2026-03-10: Customer reported repeated cases in the last 48h; attached client HAR and custom Java client code. Asked NovaHealth to run non-buffered client for comparison.",
+    "Ethan Brooks (SRE) 2026-03-11: I reproduced locally with their client config. It looks like nginx sendfile + proxy buffering can reorder when keepalive is injected. Opening a side investigation on proxy code path. Linked PR suggestion: switch to 'tcp_nodelay' / flush-on-delimiters at gateway.",
+    "Sofia Martinez (Runtime) 2026-03-12: Suggest adding a streaming boundary marker (zero-length 'meta' event) on our side before forwarding terminal events to ensure clients pick correct finalization ordering. This will be low-risk feature flag behind gateway."
+  ],
+  "resolution": "Workaround: Instruct customer to disable aggressive write coalescing in their client (flush more frequently) \u2014 NovaHealth validated this immediately and saw correct stitching. Temporary server-side mitigation: toggle gateway feature flag 'sse-enforce-chunk-boundaries' for NovaHealth dedicated pool to insert explicit newline separators between logical events. Long-term fix: implement strict per-connection sequencing in streaming-proxy and ensure keepalive/probe writes are serialized after logical event boundaries. Follow-up work: ENG-STREAM-612 to add unit tests and e2e reproducer suite. Rollout notes: feature-flag enabled for NovaHealth pool on 2026-03-12; monitoring for duplicates/timeline regressions for 72h.",
+  "regression_risk": "Low-medium: change affects streaming proxy delivery ordering and may impact latency by an additional ~2-6ms per event when strict serialization is enabled. Feature flag guarded.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_faf0721d5c54404b9fe61408bcfd6e7a"
+}

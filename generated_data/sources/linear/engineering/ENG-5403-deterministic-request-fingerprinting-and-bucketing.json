@@ -1,0 +1,54 @@
+{
+  "key": "ENG-5403",
+  "team": "engineering",
+  "title": "Deterministic request fingerprinting + bucketing for shadow traffic",
+  "status": "Done",
+  "priority": "P1",
+  "created_at": "2026-01-06",
+  "updated_at": "2026-02-12",
+  "creator": "Ravi Menon",
+  "assignee": "Vikram Singh",
+  "project": "Shadow traffic tool for eval metrics",
+  "cycle": "2026-W03",
+  "estimate": "8",
+  "due_date": "2026-02-07",
+  "labels": [
+    "shadow-traffic",
+    "routing",
+    "privacy",
+    "determinism",
+    "metrics-quality",
+    "cardinality-guardrails"
+  ],
+  "parent_issue": "ENG-5402",
+  "dependencies": [
+    "ENG-5401",
+    "ENG-5404"
+  ],
+  "customer_impact": "medium",
+  "release": "routing-2026.02",
+  "security_review_required": "true",
+  "description": "Problem\nShadow traffic requires comparing control vs shadow outputs with low variance across time windows. If we use per-request randomness, the set of shadowed requests changes minute-to-minute and makes quality deltas noisy. We need deterministic bucketing so that the same request (as defined by stable inputs) is consistently mirrored (or not) for the lifetime of an experiment / policy.\n\nGoal\nImplement stable, privacy-preserving request fingerprinting and deterministic bucketing that:\n- Produces consistent sampling decisions across time windows and retries.\n- Supports multiple concurrent shadow experiments on the same route without cross-contamination.\n- Minimizes PII risk (no raw prompts in hashes; no reversible identifiers).\n- Allows per-experiment sampling % and per-variant assignment where needed.\n- Works for Hosted/Dedicated/Private deployments with consistent semantics.\n\nNon-goals\n- User-level sticky assignment for interactive multi-turn chat across days (we only guarantee stability per-request and within an experiment; future work can extend to session-level).\n- Perfect dedupe of semantically identical prompts (this is a fingerprint, not a similarity measure).\n\nProposed approach (decision)\nWe will compute a deterministic fingerprint and then derive a bucket value (0..9999) for sampling and variant assignment.\n\n1) Canonical request representation\n- Create a canonical string from selected request fields that are stable and low-risk:\n  - tenant_id (internal numeric id)\n  - route_id (internal route uuid)\n  - request_type (chat/completions/embeddings/rerank)\n  - model_family (e.g., llama3, mistral) OR model_interface (chat vs completions)\n  - normalized input shape:\n    - messages_count, tool_calls_present (bool), streaming (bool)\n    - prompt_hash (see below)\n- Do NOT include:\n  - raw prompt/content\n  - client-provided user_id/email\n  - request headers with high cardinality\n  - timestamps\n\n2) Prompt/content hashing\n- Compute prompt_hash as HMAC-SHA256 over a canonicalized prompt representation using a service secret.\n- Canonicalization rules (chat):\n  - role + content only\n  - drop whitespace runs and normalize newlines\n  - truncate each content field to N bytes before hashing (default N=4KB) to bound CPU and avoid hashing huge payloads\n  - include tool schemas only by hash (tool_definitions_hash) to avoid large token blobs\n- Canonicalization rules (completions):\n  - normalize whitespace\n  - truncate to N bytes\n- Rationale: we want stability for \u201csame prompt\u201d without storing it; truncation prevents worst-case overhead and reduces sensitive content exposure surface.\n\n3) Deterministic bucketing\n- Compute fingerprint = HMAC-SHA256(secret_fingerprint, canonical_request_string).\n- For each shadow experiment, derive an experiment-specific bucket:\n  - bucket_input = HMAC-SHA256(secret_bucket, experiment_id + \":\" + fingerprint)\n  - bucket = uint32(bucket_input[0..4]) mod 10000\n- Sampling decision: bucket < (sampling_rate * 10000).\n- Variant assignment (if experiment has multiple shadow targets):\n  - assignment_input = HMAC-SHA256(secret_assign, experiment_id + \":\" + fingerprint)\n  - variant_index = uint32(assignment_input[4..8]) mod num_variants\n- Rationale: experiment-specific salting ensures that two experiments with different IDs don\u2019t shadow the exact same subset unless desired, and prevents accidental correlation across experiments.\n\n4) Collision handling\n- We assume negligible collision probability with HMAC-SHA256; we will still treat fingerprint as an opaque identifier and never use it as a unique key without including experiment_id + request_id in storage.\n\n5) Observability + cardinality guardrails\n- Emit only:\n  - fingerprint_prefix (first 8 hex chars) for debugging in sampled logs (behind debug flag)\n  - bucket (0..9999)\n  - sampled (bool)\n- Full fingerprint is permitted in internal telemetry events only if explicitly approved by telemetry/data-retention policy; default is to store a truncated digest and keep the full digest only in ephemeral (<=24h) troubleshooting logs for internal tenants.\n\nImplementation notes\n- Add shared library to routing dataplane (and Private package) so Hosted/Dedicated/Private share the same algorithm.\n- Secrets management:\n  - Use environment-provided secrets per deployment; rotate via standard secret rotation playbook.\n  - Include secret version in debug logs to ease rotation troubleshooting (no secrets in logs).\n- Performance:\n  - Hashing should be < 50\u00b5s per request at p50 on typical payloads; truncation prevents pathological cases.\n  - Ensure canonicalization uses bounded allocations; avoid JSON re-serialization where possible.\n- Streaming:\n  - Fingerprint is computed from the initial request envelope only (pre-stream). We do not incorporate streamed tokens.\n\nAcceptance criteria\n- Same input request to same route under same experiment_id results in identical sampled decision over repeated calls.\n- Changing experiment_id changes sampled subset (verified by property test).\n- Sampling decisions are stable across process restarts and across regions (assuming same secrets).\n- Fingerprinting does not include raw prompt text in logs/telemetry by default.\n- Load test shows negligible overhead on user path (validated in ENG-5412).\n- Unit tests include:\n  - canonicalization invariants\n  - truncation boundaries\n  - multi-variant assignment determinism\n  - distribution sanity checks (bucket uniformity)\n\nRollout plan\n- Ship behind feature flag: shadow_fingerprint_v1.\n- Enable for internal dogfood tenant only for 48h.\n- Validate distribution and stability using dashboard query (see related links).\n- If issues, disable flag (fall back to non-deterministic sampling for dogfood only; production remains blocked).\n\nRisks / open questions\n- Do we include route_id in fingerprint? (Current: yes, to avoid cross-route correlation and reduce accidental reuse of sampled sets.)\n- Prompt normalization can cause unintuitive stability (e.g., whitespace-only differences). Current approach normalizes whitespace; this is desired to reduce variance but should be documented.\n- For Dedicated/Private with customer-managed secrets, we need explicit docs on secret rotation impact on experiment consistency.\n\nOwners\n- Routing implementation: Vikram Singh\n- Design review: Ravi Menon\n- Privacy/security consultation: Marcus Lin / Kevin Osei\n\nTest plan\n- Unit + property tests for determinism and distribution.\n- Integration test with routing mirror path (ENG-5402): ensure the same request mirrors to the same shadow target.\n- Canary in internal tenant with known prompt set; compare sampled set overlap across consecutive 1h windows (>99.5% overlap expected, excluding natural traffic changes).\n\nNotes\nThis work is a prerequisite for meaningful confidence intervals in quality deltas. Without deterministic bucketing, hourly aggregation looks like variance even when model behavior is stable.",
+  "comments": [
+    "2026-01-08 \u2014 Ravi Menon: Please ensure we don\u2019t incorporate any timestamp/request_id fields; we want stability across retries and time windows. Also preference for HMAC over raw hash to avoid offline guessing of prompts.",
+    "2026-01-10 \u2014 Marcus Lin: +1 on HMAC. Truncation before hashing is OK for perf, but document it clearly (security review will ask). Avoid emitting full fingerprints into metrics labels; limit to debug logs with explicit gating.",
+    "2026-01-14 \u2014 Allison Grant: From observability side, we can accept bucket and sampled boolean; do not add fingerprint as a dimension in Prometheus. Telemetry events can carry a short digest if needed for joining pairs.",
+    "2026-01-18 \u2014 Vikram Singh: Implemented canonicalization for chat/completions; embeddings/rerank will use request payload hash only (no content). Added property tests for uniform bucket distribution across 1M random payloads.",
+    "2026-01-25 \u2014 Ravi Menon: Reviewed algorithm. Request: make experiment_id salting mandatory for all derived values (bucket + assignment) so multiple concurrent experiments don\u2019t share the exact same sampled set by default.",
+    "2026-02-03 \u2014 Priya Natarajan: Approving direction. Please confirm behavior across regions and during secret rotation. We need predictable guidance for Dedicated customers (rotation breaks continuity; expected).",
+    "2026-02-12 \u2014 Vikram Singh: Merged. Feature flag enabled for internal tenant. Early results: stable sampled overlap across 2 consecutive 1h windows ~99.8% (traffic-dependent). No measurable latency impact at p50; p99 +0.2ms under worst-case 4KB truncation."
+  ],
+  "related_links": [
+    "GitHub PR: sources/github/redwood/pr-24851-deterministic-fingerprint-for-shadow-bucketing.json",
+    "Related: ENG-5402 (routing mirror sampled requests)",
+    "Related: ENG-5404 (telemetry events need stable join key)",
+    "Related: ENG-5412 (overhead benchmarks)",
+    "Slack thread: sources/slack/eng-platform/1767998802-shadow-traffic-bucketing-hash-choice.json"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_e6662a519dd34862a2019b1ad9815ea3"
+}

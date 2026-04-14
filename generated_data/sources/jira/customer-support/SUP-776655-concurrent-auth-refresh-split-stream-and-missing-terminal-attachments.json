@@ -1,0 +1,78 @@
+{
+  "key": "SUP-776655",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Concurrent auth refresh during SSE resume causes duplicated heartrate frames and omission of attachment URL in tail",
+  "status": "Triage",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-03",
+  "reporter": "Aisha Patel",
+  "assignee": "Marco Nguyen",
+  "customer_company": "FinLedger",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "auth",
+    "console"
+  ],
+  "labels": [
+    "sse",
+    "reconnect",
+    "auth-refresh",
+    "attachments",
+    "investigation"
+  ],
+  "environment": "prod | us-east-1",
+  "affected_models": [
+    "redwood-v1.3-large"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-02",
+  "first_response_due_at": "2026-03-01",
+  "linked_issues": [
+    "SUP-271001",
+    "SUP-314158"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/4987"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/pages/viewpage.action?pageId=9876543"
+  ],
+  "description": "Issue summary:\nCustomer reports that when a long SSE streaming session is resumed after an auth-token refresh the final payload (attachment URL + trailer metadata) is never received by their client. Instead the stream includes two near-identical heartbeat frames in quick succession and then connection silence. This appears to correlate with an auth refresh being processed concurrently with our SSE resume logic on the same session.\n\nImpact:\n- Key customer flows that deliver generated attachments (PDF links/embeds) are missing the attachment URL; end-user sees partial text but no downloadable link.\n- Affects ~10% of resumed streams for this customer during their peak window.\n- Customer is on a Dedicated plan with strict SLAs; business impact reported as \"users cannot download generated statements\".\n\nEnvironment:\n- Redwood hosted (dedicated tenant) in us-east-1\n- Production traffic, customer uses long-running chat + attachment feature that streams interim text and final attachment URL as the last event\n- Model: redwood-v1.3-large\n\nSteps to reproduce (customer-provided):\n1) Start a long streaming generation that ends with an attachment (customer artifact) returned as the last event.\n2) Force an auth token rotation on the client (their middleware refreshes at the same time).\n3) Allow connection to briefly drop (e.g., client network swap) and rely on SSE resume behavior.\n4) Observe that the stream yields two rapid heartbeat events followed by silence; final attachment event is missing.\n\nObserved behavior:\n- Two heartbeat-like events (small keepalive JSON envelopes) are observed arriving back-to-back during resume.\n- The trailing attachment metadata event (\"attachment_url\": \"https://...\") never makes it to the client.\n- Server logs show the resume completed and the serving-worker emitted the attachment event, but downstream API gateway logs show the final event was dropped or replaced by an extra keepalive.\n\nExpected behavior:\n- Resume should replay buffered/generated tail events exactly once and deliver the final attachment metadata as the terminal event; heartbeats should not duplicate and should not suppress trailing payloads.\n\nWorkaround (customer):\n- Customer temporarily added extra polling for the attachment endpoint (after a 2s delay) to surface missing attachments; workable but increases cost and latency.\n\nLogs / snippets (redacted):\n- Gateway trace (proxy): resume-id=abc123: forwarded event: heartbeat {\"ts\": 167.., \"type\": \"hb\"}\n- Gateway trace: forwarded event: heartbeat {\"ts\": 167..+10ms, \"type\": \"hb\"}\n- Serving-runtime: emitted terminal_event {\"type\":\"attachment\", \"url\":\"https://files.finledger/...\"}\n- API gateway: downstream socket closed after second heartbeat; final event aborted with ECONNRESET\n\nNotes: customer supplied pcap and SDK logs; see attached artifacts in ticket thread.",
+  "comments": [
+    "2026-03-01 09:22 - Aisha Patel (Support): Acknowledged with first-response. Asked for SDK logs, pcap and time window. Marked as P1 due to customer SLA.",
+    "2026-03-01 12:05 - Customer (FinLedger - S. Romero): Uploaded pcap + SDK logs. Notes that outage occurs when they rotate an OAuth token and network briefly switches from corp VPN to home network.",
+    "2026-03-01 15:40 - Marco Nguyen (SRE): Grepped gateway logs for resume-id=abc123. Found duplicated small frames forwarded; gateway showed a rapid second keepalive forwarded after token rebind. Opening an investigation into auth-refresh path and resume ordering.",
+    "2026-03-02 10:12 - Elena Rossi (Runtime): Reproduced locally by simulating token-refresh race. Observed that auth-refresh path triggers a short-lived session-rebind which races with resume flush; gateway's connection-layer treats a late small frame as a new keepalive and closes the stream prior to final data chunk delivery.",
+    "2026-03-02 16:30 - Marco Nguyen (SRE): Correlated to https://github.com/redwood-inference/runtime/pull/4987 which changed resume backpressure handling. Assigning to runtime + gateway teams for fix. Notifying customer of planned mitigation (config change) and timeline.",
+    "2026-03-03 08:58 - Support (Aisha Patel): Provided customer workaround (client polling) and ETA for patch: 2026-03-05 for config mitigation; full fix in 2026-03-10 release. Customer accepted workaround temporarily."
+  ],
+  "investigation_notes": [
+    "Initial hypothesis: concurrent auth refresh triggers session rebind at API gateway, race with resume flush causes gateway to interpret trailing event as a stale control frame.",
+    "Reproduction steps executed in staging: triggered client-side token rotation during resume; reproduced missing terminal event ~6/10 attempts under load.",
+    "Root cause narrowed: gateway treats the late small frame as an out-of-order keepalive and performs conn reset when it arrives while TLS session rebind in progress (0rtt-like behavior). Serving-runtime correctly emitted event; loss happens at gateway+conn layer.",
+    "Related change: resume backpressure adjustments in PR #4987 lowered the buffer window; combined with token rebind timings this increases probability of dropping trailing frames.",
+    "Temporary mitigation: increase resume buffer window at gateway to tolerate quick control-frame bursts and avoid conn tear-down on near-simultaneous keepalive frames."
+  ],
+  "resolution_notes": [
+    "Mitigation applied (2026-03-04): gateway config bump to 150ms resume flush tolerance for affected dedicated cluster in us-east-1. Monitoring for regression.",
+    "Customer confirmed on 2026-03-04 that missing attachments dropped to 0/200 reproductions; accepted as interim fix.",
+    "Root fix scheduled: runtime + gateway coordination to sequence auth-refresh hooks before resume flush and to tag resume frames with a session-stable marker. Target date: 2026-03-10.",
+    "Postmortem action items: (1) add an integration test that simulates auth-rotation during resume; (2) add gateway metric for 'resume-silence-after-heartbeat' and an alert; (3) update docs runbook to recommend client backoff when rotating tokens during active streams.",
+    "Close plan: resolve ticket once full fix deployed and 3 days of no regression in customer telemetry; customer to be offered credits for operational impact (pending billing review)."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_c7499faaa5294c98a3ee16b0eacaa83e"
+}

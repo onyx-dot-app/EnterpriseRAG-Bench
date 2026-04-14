@@ -1,0 +1,77 @@
+{
+  "key": "SUP-392104",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Unexpected 5xx elevation during concurrent model-variant eviction and prefetch cancellation",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-13",
+  "reporter": "Asha Patel",
+  "assignee": "Lina Gomez",
+  "customer_company": "LexiSearch Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "prefetch",
+    "kv-cache"
+  ],
+  "labels": [
+    "5xx",
+    "variant-eviction",
+    "accept-queue",
+    "embeddings",
+    "urgent"
+  ],
+  "environment": "prod us-east",
+  "affected_models": [
+    "redwood/7B-chat-v2",
+    "open/llama-2-13b"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-12T16:30:00Z",
+  "first_response_due_at": "2026-03-12T15:00:00Z",
+  "linked_issues": [
+    "SUP-472901",
+    "SUP-827364"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/5821"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/runbooks/variant-eviction-prefetch"
+  ],
+  "description": "Issue summary: Customers started reporting a sharp increase in 5xx responses (~20x baseline) for embedding and chat routes between 14:12-14:38 UTC. Elevation correlated with a tenant (LexiSearch dedicated pool) performing concurrent requests that triggered model-variant eviction and a series of prefetch cancellations. Impact: LexiSearch experienced degraded throughput and 10+ minute retries; several streaming sessions dropped. Environment: prod (us-east), dedicated pool assigned to customer. Observed at multiple edge nodes in us-east; no config rollout at the time.\n\nObserved behavior: api-gateway returned 502/503s intermittently, with serving-runtime upstream showing SIGABRT and runtime restarts. Accept-queue length spiked concurrently and keepalive reuse dropped. Prefetch subsystem logged repeated cancellation events with simultaneous eviction of variant shards; KV-cache saw hot-shard lock contention.\n\nWhy this ticket: Customer-facing incident requires triage + immediate mitigation (reduce customer impact) and post-incident action (fix eviction-prefetch interaction).",
+  "steps_to_reproduce": "1) Use a dedicated tenant with mixed embedding + chat workload.\n2) Send concurrent high-rate embedding uploads (parallel multipart batches) while also running medium-sized chat bursts pinned to a model variant.\n3) Trigger model-variant eviction by repeatedly toggling a model pin/rollout on the tenant and concurrently canceling several in-flight prefetch requests.\n4) Observe accept-queue growth and increased 5xx responses at api-gateway.\n\nNotes: reproduction requires dedicated pool isolation and may be rate-sensitive; seen reproducible in controlled perf lab with scaled-down traffic profile (50% of customer traffic) after ~5 minutes.",
+  "logs": "Sample lines from runtime logs: \n[2026-03-12T14:17:03Z] serving-runtime(worker-23) ERROR: eviction: variant shard 0x7f evicted while prefetch active\n[2026-03-12T14:17:03Z] prefetch INFO: cancelling prefetch request id=pf_9c1a; reason=eviction-in-progress\n[2026-03-12T14:17:04Z] api-gateway WARN: accept_queue_length=842 target=200; enqueue_latency_ms=312\n[2026-03-12T14:17:05Z] serving-runtime(worker-23) FATAL: signal SIGABRT at 0x0000; backtrace: ... ; restarting runtime\n[2026-03-12T14:17:05Z] api-gateway ERROR: upstream reset while reading response; returning 502 to client\n\nAttached traces: grafana panels show apigw 5xx rate rising at 14:12 and CPU on runtime worker threads spiking immediately before SIGABRTs.",
+  "comments": [
+    "2026-03-12 14:25 - Support (Asha Patel): Initial customer contact. LexiSearch reports ~25% of embedding uploads are failing with 502 and chat responses occasionally returning 503. Requesting immediate mitigation; they are on Dedicated plan.",
+    "2026-03-12 14:32 - SRE (Lina Gomez): Acknowledged. Gathering traces and scaling dedicated pool by +2 nodes as temporary mitigation. Investigating runtime logs; seeing repeated eviction/cancel pattern on shards for that tenant.",
+    "2026-03-12 14:40 - Eng (Marcus Li): Observed SIGABRT in runtime worker associated with kv-cache write while eviction was in progress. Hypothesis: race between eviction path and prefetch cancel which can leave invalid pointers during async callback. Adding instrumentation to reproduce stack trace in staging.",
+    "2026-03-12 15:05 - Support (Asha Patel): Customer accepted temporary mitigation (throttling their embedding batch concurrency) while we work on the fix. They've provided a sanitized request pattern and sample payloads.",
+    "2026-03-13 09:22 - SRE (Lina Gomez): Nightly mitigation: rolling restart of affected instances performed to clear fragmented KV locks; CPU and accept-queue returned to baseline. Continued root-cause work in progress.",
+    "2026-03-13 12:10 - Eng (Priya Nair): Confirmed race in eviction->prefetch cancellation path. Preparing a PR with synchronization fix and additional metrics. Targeting hotfix canary for prod us-east in next 6 hours.",
+    "2026-03-13 13:40 - Customer (LexiSearch support): Thank you; errors fell to <1% after throttling guidance. Please keep us posted about permanent fix."
+  ],
+  "investigation_notes": "Timeline: spike began at ~14:12 UTC; initial mitigation (scale up) temporarily reduced accept-queue but didn't prevent subsequent runtime restarts. Root cause hypothesis evolved: not pure load but an interactive race between eviction and prefetch cancellation creating a dangling pointer leading to SIGABRT. Evidence: repeating stack traces tied to kv-cache write path while eviction is logged within same millisecond window. Observed hot shards: shard_id set 0 and 3 had >90% of eviction events. Accept-queue behavior: long tail of enqueue latency grew until runtime restarted; api-gateway then returned 502/503s. Reproducible in perf lab when interleaving variant rollouts with heavy embedding prefetch cancellation. Related to prior issue SUP-472901 (connection thrashing) but distinct root cause. Action items created: 1) patch eviction/prefetch synchronization (PR linked), 2) add guardrails to prevent eviction when prefetch active for tenant-heavy shards, 3) improve metrics to alert earlier (prefetch_cancel_rate + shard_eviction_rate correlation), 4) run a canary rollout and validate with LexiSearch traffic patterns.",
+  "resolution": "Workaround applied: instructed customer to reduce embedding multipart concurrency and applied temporary per-tenant prefetch rate cap; scaled dedicated pool + rolling restarts cleared transient fragmentation. Engineering produced hotfix PR (https://github.com/redwood-inference/serving-runtime/pull/5821) that introduces a mutex around eviction callback + safe-cancel checks. Planned rollout: canary in prod us-east (5% traffic) 2026-03-13 18:00 UTC, followed by fast-fail rollback window. Postmortem actions: add runbook steps to throttle prefetch on eviction spikes, instrument KV-lock hold times, and schedule post-deploy verification with LexiSearch.",
+  "attachments": [
+    "grafana-apigw-5xx-2026-03-12.png",
+    "runtime-backtrace-14-17.log",
+    "lexisearch-sanitized-requests.json"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_5d76aedaa9b64c62b871a49e42f3e623"
+}

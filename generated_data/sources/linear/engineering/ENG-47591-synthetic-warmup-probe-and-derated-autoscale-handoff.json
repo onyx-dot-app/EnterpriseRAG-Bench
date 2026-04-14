@@ -1,0 +1,69 @@
+{
+  "key": "ENG-47591",
+  "team": "engineering",
+  "title": "Synthetic warmup prober and derated autoscale handoff for SLO-preserving replica join",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-01-18",
+  "updated_at": "2026-02-02",
+  "creator": "Aisha Raman",
+  "assignee": "Diego Morales",
+  "project": "Regional SLO Resilience",
+  "cycle": "2026-W04",
+  "estimate": "8",
+  "due_date": "2026-02-15",
+  "labels": [
+    "autoscaling",
+    "probes",
+    "slo",
+    "multi-region",
+    "kv-cache",
+    "canary"
+  ],
+  "description": "Problem statement:\nWhen new inference replicas join (cold start / redeploy / failover) they frequently cause SLO regressions because model kernels, memory mappings, and KV caches are cold. Typical readiness gating (simple health check + latency threshold) either stalls capacity ramps (overconservative) or lets cold replicas accept full traffic (underprotective). We need a probe + autoscaler handoff that allows a joining replica to accept a small, controlled fraction of traffic while performing a deterministic warmup (KV prefill, kernel touch, prefix cache priming) and only mark full readiness when measured steady-state token latency and error rate meet SLO-derived thresholds.\n\nProposal summary:\nImplement a \"synthetic warmup prober\" that runs targeted micro-inferences and KV-access patterns representative of real workloads. The prober reports a multi-dimensional readiness score (latency percentiles, op success rate, kv-hit-rate, memory pressure). The autoscaler and route-gating logic use a derated handoff: new replicas are added to the routing pool at an initial weight (eg. 5%) and increase weight automatically as probes cross thresholds. The handoff is SLO-aware (weights and thresholds are derived from the customer's configured SLOs for latency and error rate) and integrates with circuit breakers (if the region-level circuit breaker is tripped, warmup stops and replica stays isolated until manual/automated recovery).\n\nGoals:\n- Reduce SLO regressions during regional failover and scale-up events by ensuring replicas warm deterministically before full traffic.\n- Keep steady-state capacity ramp time acceptable (target < 2 minutes to 50% weight for typical model+instance class) while preventing high tail latencies during joins.\n- Provide observability surfaces and alerting for warmup failures and derated handoff behavior.\n\nKey design elements:\n1) Synthetic warmup probe: small, dependency-contained harness that executes a configurable set of micro-requests: 1-3 short-token generations for representative prompt shapes, KV get/set patterns for prefix caches, short attention-window sequences to exercise kernels and memory maps. Probe outputs: p50/p95/token-latency-ms, generation-error-count, kv-prefill-hit-rate, process-memory-mb, gpu-util-sm.\n\n2) Readiness score and thresholds: probe converts raw metrics into a score (0-100) using weighted rules: latency and error are high weight; kv-hit-rate is medium; memory and GPU saturation contribute negative adjustments. Thresholds mapped to SLO tiers: safe (score>=85), degraded (70-85), initial (50-70).\n\n3) Derated autoscale handoff: route weight progression policy per replica: start_weight (default 0.05), step_up (x2 every N probe intervals if score improves), max_step_interval_seconds, ttl for backoff on regression. If score falls below degraded, replica weight step is paused and advanced backoff applied. The Autoscaler controller uses the joining replica's score and the region's current SLO budget to decide global admission (eg. temporarily limit new join weights if region has low SLO budget).\n\n4) Circuit breaker integration: when regional circuit breaker (latency or error triggered) is active, probes are allowed in 'diagnostic' mode but will not cause any increase in routing weight; joining replicas remain isolated. Synthetic probe results feed into circuit-breaker decision as diagnostic signal for recovery automation.\n\n5) Telemetry and observability: expose per-replica probe timeseries (score, latency percentiles, kv-hit-rate), route-weight timeline, and canary progression charts. Add alerts for: probe failure rate > 5% for 3 minutes, replicas stuck in initial tier > 5 minutes, unusual slow step-ups, and mismatches between probe latency and production latency after weight increases.\n\n6) Config knobs (customer and infra): warmup_window_seconds, initial_weight, step_up_multiplier, probe_interval_seconds, kv_prefetch_keys (pattern), steady_state_latency_target_ms, slo_latency_percentile (p95/p99). Sensible defaults will ship in hosted, dedicated can override.\n\nDesign trade-offs considered:\n- Synthetic probes vs traffic mirroring: probes are cheaper and deterministic but may not exercise rare long-tail prompts. We'll complement with short traffic-mirroring during canary phases.\n- Aggressive warmup reduces SLO risk but increases time-to-capacity. We aim for adaptive step-up driven by score rather than fixed timers.\n- Prefetching KV keys uses network and memory; default conservative prefetch counts recommended and special-casing large KV tables.\n\nAcceptance criteria (must be met before broad rollout):\n- New-replica join events in staged canary region show <= 10% increase in region P99 latency compared to baseline during scale-up, averaged over 30 trials.\n- Replicas reach 50% average route weight within 2 minutes in >= 80% of trials for our standard small-model+GPU instance profile.\n- Synthetic probe score correlates with production p95 latency (Spearman rho >= 0.7) across test traffic profiles.\n- No customer-facing service regressions in canary (defined as error-rate spike > 2x or p99 > 2x baseline).\n\nRollout plan:\n- Phase 0 (engineering rollout): integrate probes in runtime dev clusters. Run unit and integration tests.\n- Phase 1 (internal staging): enable for non-critical internal tenants in eu-west-1 region. Observe telemetry for 72h, run controlled scale-up/scale-down and failover scenarios.\n- Phase 2 (customer canary): opt-in feature flag for small set of customers and one additional region. Run at least two automated failover drills and one maintenance redeploy per customer.\n- Phase 3 (gradual global): enable by default for hosted customers; provide toggles to Dedicated/Private customers. Default conservative knobs for Dedicated; allow platform teams to adjust.\n\nTest plan and experiments:\n- Synthetic benchmark suite to validate score -> production latency correlation across 8 representative prompt shapes and 3 model sizes.\n- Chaos testing: random process restarts during warmup, network packet loss simulation to observe step-up pause behavior.\n- Load tests: concurrent cold join of 50 replicas to measure region SLOs and the autoscaler's behavior.\n- Post-rollout A/B: compare regions with and without derated handoff for 14 days looking at SLO burn rate and time-to-capacity metrics.\n\nSafety and rollback:\n- Feature gate at routing layer to disable weight progression globally for emergency rollback.\n- Replica-level kill-switch to force immediate full routing weight (for debugging only).\n- Default to conservative behavior (never exceed safe initial_weight in hosted unless explicitly enabled).\n\nOpen design questions / follow-ups:\n- Standardizing score weights across models and instance types vs per-model calibration. Proposal: start with a small matrix of calibrated profiles (small/medium/large) then expand.\n- How to integrate with KV eviction policies when prefetching aggressively; ops constraints may require soft-limits.\n- UX in Console: visualization of per-replica warmup progression and ability to manually promote a replica for support calls.\n\nLinks and artifacts:\n- Design doc: https://docs.internal.redwood/reliability/synthetic-warmup-probe (draft)\n- PR (runtime): https://github.com/redwood-inference/runtime/pull/1245\n- PR (autoscaler): https://github.com/redwood-inference/autoscaler/pull/302\n- Dashboard (staging): https://dashboards.internal.redwood/org/region-warmup\n- Incident baseline reference: INC-2025-07-euw1-failover-postmortem\n\nRisks and mitigation:\n- Risk: Probe false negatives cause underutilized capacity. Mitigation: conservative defaults & step-up multiplier, canary telemetry.\n- Risk: Prefetching increases memory/gpu overhead. Mitigation: cap prefetch size and dynamic adaptation using observed memory pressure.\n- Risk: Complexity in autoscaler logic increases maintenance burden. Mitigation: modular controller with well-defined contracts and feature flags.",
+  "acceptance_criteria": [
+    "<=10% increase in region p99 latency during staged canary scale-up (30 trials)",
+    "Replicas reach 50% route weight within 2 minutes in >=80% of standard trials",
+    "Synthetic probe score Spearman rho >= 0.7 with production p95 latency across test profiles",
+    "No customer-facing regression (error spike >2x or p99 >2x baseline) during canary"
+  ],
+  "rollout_plan": [
+    "Phase 0: integrate probes in runtime dev clusters and run unit/integration tests",
+    "Phase 1: enable in internal staging (eu-west-1) for 72h with controlled drills",
+    "Phase 2: customer canary opt-in for small set and run failover drills",
+    "Phase 3: gradual global enablement with conservative defaults and toggles"
+  ],
+  "metrics": [
+    "per-replica probe score (time-series)",
+    "route-weight progression per replica",
+    "region p50/p95/p99 latency before/during/after join",
+    "kv-prefill hit-rate",
+    "time-to-50% weight and time-to-100% weight"
+  ],
+  "dependencies": [
+    "ENG-61109 (probe-stream-smoothing and eviction rate limiter)",
+    "ENG-31877 (health telemetry pipeline refactor)",
+    "ENG-9274 (probe failure mode degradation mitigation)",
+    "AUTOSCALER-ops: autoscaler controller hook for per-replica score"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-2026.02",
+  "security_review_required": "false",
+  "comments": [
+    "2026-01-19 - Diego Morales: Spike completed for synthetic probe harness. Initial micro-inference tasks implemented in runtime dev branch. Observed significant warmup latency improvement on small-model profile.",
+    "2026-01-25 - Claire Nguyen (PM): Please ensure console UX shows per-replica progression \u2014 support will need manual promote action for urgent customer restores.",
+    "2026-01-28 - Diego Morales: PRs opened: runtime#1245 and autoscaler#302. Load test script available at tools/loadtests/warmup_join.py. Early staging run shows median time-to-50% weight = 1:40 for small model cluster.",
+    "2026-01-29 - SRE review (Jamal Patel): Add alert when replicas are stuck in initial tier > 5 minutes. Also recommend limiting kv_prefetch default to 10 keys initially.",
+    "2026-02-02 - Aisha Raman: Updated thresholds after canary run: increased initial_weight default to 0.08 for hosted small-models to reduce time-to-capacity while maintaining SLO targets. Proceeding to wider staging tests."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "rollout_plan",
+    "metrics",
+    "dependencies",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_a148b3d8726f4e44abb6d4d0f2c416cd"
+}

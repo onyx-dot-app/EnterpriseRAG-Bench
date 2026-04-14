@@ -1,0 +1,60 @@
+{
+  "key": "ENG-712345",
+  "team": "engineering",
+  "title": "Apex Failover Coordinator: connection hedging, prioritized egress shedding, and circuit leash",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-02",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Kapoor",
+  "assignee": "Marco Diaz",
+  "project": "regional-failover-2026",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-04-05",
+  "labels": [
+    "slo",
+    "multi-region",
+    "failover",
+    "streaming",
+    "circuit-breaker",
+    "load-shedding"
+  ],
+  "dependencies": [
+    "ENG-645312",
+    "ENG-104512"
+  ],
+  "release": "runtime-1.25",
+  "security_review_required": "false",
+  "description": "Problem statement:\nHosted API ingress must fail over between regions without dropping live streaming sessions or violating SLOs. Current per-gateway heuristics create hard drops during regional evacuations and produce noisy telemetry. We need a coordinator (\"apex\" node) that makes SLO-driven regional decisions, performs connection hedging to reduce tail-loss for in-flight streams, applies prioritized egress shedding when capacity is constrained, and manages short-lived 'circuit leash' rules to prevent cascade failures.\n\nGoals:\n- Prevent >1% increase in 99th percentile streaming request completion time during controlled failovers.\n- Ensure <0.05% permanent connection loss for sessions active >2s during a regional shift (target application-level resume token behavior).\n- Keep total token cost overhead for hedging <8% for failover windows.\n- Provide clear observability and playbook items for operators and SREs.\n\nNon-goals:\n- This ticket does not implement cross-region KV cache replication; it will rely on short-lived prefix fallback and eventual background sync (separate work).\n\nHigh-level approach:\n- Introduce an Apex Failover Coordinator service that receives region health signals, SLO headroom metrics, and gateway telemetry and emits region-level directives: (1) hedge connections (parallel secondary routing for a bounded window), (2) egress buckets and prioritised shed lists, (3) circuit leash activation with tunable backoff windows.\n- Gate directives behind SLO headroom rules: only enable hedging when a region's p99 latency is within configurable headroom and downstream capacity allows the overhead.\n- Streaming-aware hedging: for streaming sessions, hedging will mirror request prefixes and KV-cache hints for a timeboxed period, attach resume tokens, and cancel lower-priority replicas on first successful completion.\n- Prioritised egress shedding: classify routes by priority (critical, best-effort, low-cost) and apply proportionate shedding first against low-priority routes, preserving critical control paths and admin flows.\n- Circuit leash: short-lived, per-node circuit rules to stop retry storms and to throttle rejoin attempts from a node for a bounded period to protect neighboring regions.\n\nSuccess metrics / acceptance criteria:\n- Controlled chaos test (see testing_plan) shows <0.05% permanent session loss and p99 increase below threshold for at least 5 failover runs.\n- Dashboards exist for: regional SLO headroom, hedging overhead (additional tokens), shed rate by priority, circuit leash triggers, resumed-session ratio, and failed-resume causes.\n- A playbook entry with manual override (force egress buckets, disable hedging) exists and is tested.\n\nDesign notes:\n- Apex coordinator is logically centralized per-customer-region-pair, implemented as a small HA control-plane component deployed in hosted-control-plane. It only emits opaque directives; gateways enforce directives locally to avoid single-point data-plane control-plane bottlenecks.\n- Directive schema (v0): {directive_id, scope, action, priority_list, hedge_window_ms, max_hedge_overhead_pct, circuit_leash_ms, reason_code, observed_metrics_signature}. (Implementation: store as protobuf on control-plane; gateways fetch diffs every 500ms.)\n- Hedging semantics:\n  * On directive=HEDGE start, gateway starts parallel optimistic secondary routing for new requests for hedge_window_ms. Secondary identical to primary but tagged with hedge replica id and low-cost quota.\n  * On streaming sessions: gateway sends initial stream prefix and KV-cache hints to secondary; both keep shallow KV cache for hedge_window_ms to reduce cold starts.\n  * First responding replica becomes authoritative; the other replica is gracefully canceled (send cancel marker to client if supported).\n  * Gateways must account extra tokens to telemetry as \"hedge_overhead\" to reconcile billing and cost dashboards.\n- Prioritised shedding:\n  * Routes labelled at the API-router layer with priorities supplied by PMs and product configs.\n  * Coordinator emits an ordered list of buckets to shed; gateways apply proportional shedding and use probabilistic drop with token-aware admission when available.\n- Circuit leash:\n  * When a gateway node repeatedly reintroduces high failure rates or causes retry floods, apex emits leash directive for the node or flow label.\n  * Leash enforces exponential backoff windows for rejoin attempts and increments risk score; leash expires or is force-cleared by operators.\n\nTelemetry and observability:\n- New metrics: hedging_overhead_tokens_total, hedged_requests_count, hedged_streams_resumed_count, egress_shed_rate_by_bucket, circuit_leash_triggers, resumed_session_success_ratio, primary_failover_latency_ms.\n- Dashboards: regional-failover/apex-overview, apx-hedge-cost-by-customer, failover-playbook-runbook.\n- Traces: tag hedged traces with replica_id to attribute latency and success to primary/secondary.\n\nAPI / Gateway changes required:\n- Gateway fetch diff endpoint for directives (control-plane change).\n- Hedged request lifecycle bookkeeping for billing and telemetry.\n- Route priority config joiner to surface to coordinator.\n- Streaming resume token handshake extension: a small wire-level marker that allows resume of canceled streams at the application boundary.\n\nRollout plan:\n1) Canary: implement in control-plane and gateways behind feature flag; enable for internal tenants only. Run failovers to measure hedging overhead. (2 weeks)\n2) Beta: enable for 10 external customers with high streaming usage, collect metrics and iterate (3 weeks).\n3) Gradual rollout: tiered by region pairs, escalate to Dedicated customers after 6 weeks of stable metrics.\n\nTesting plan:\n- Unit tests for directive schema and gateway enforcement logic.\n- Integration tests: local multi-gateway harness that simulates region partitioning and measures resumed-session ratio.\n- Chaos: repeated N-second regional drain (simulate AZ/regional outage) with hedging on/off to measure differences.\n- Load test: synthetic streaming workload to validate hedging cost and egress-shed behavior under constrained capacity.\n- Game-day: SRE-run with step-by-step playbook; confirm manual overrides behave as expected.\n\nOperational playbook (short):\n- Start: Activate directional drain on target region via coordinator; monitor p99 and headroom.\n- If resumed_session_success_ratio drops below 98% -> rule out resume-token mismatch and increase hedge_window by 100ms.\n- If hedge_overhead_tokens_total exceeds configured max -> disable hedging and enable broader proportional shedding against low-priority routes.\n- Circuit leash trigger -> inspect node risk score; if false positive, manually clear leash; otherwise escalate to infra and consider node replacement.\n\nRisks and mitigation:\n- Cost spike from hedging: mitigate by strict headroom gating and per-customer max_hedge_overhead_pct. Add billing attribution and temporary cap enforcement.\n- Unexpected client behavior on canceled streams: provide opt-out header and incrementally roll out; notify partner integrators.\n- Control-plane lag -> stale directives could be harmful. Gateways will ignore directives older than X seconds and fall back to local safe defaults.\n\nOpen questions:\n- Should hedging be allowed for very long-lived sessions (>5 minutes)? (proposal: only hedge initial reconnection windows and short-lived operations; long sessions rely on resume tokens and persistent state.)\n- Exact default for max_hedge_overhead_pct per tier (P0 customers higher).\n\nNext steps (this ticket):\n- Design doc review with SRE and product (link below).\n- Implement directive diff endpoint + protobuf schema (control-plane).\n- Gateway hedging prototype and telemetry plumbing.\n- Prepare canary jobs and dashboards.\n",
+  "acceptance_criteria": "1) Unit + integration tests pass; 2) Canary results: hedging overhead <8% and resumed_session_success_ratio >= 99.5% on internal tenants; 3) Dashboards populated and playbook verified in a SRE run; 4) Feature flag and manual overrides implemented.",
+  "design_notes": "Apex coordinator should be treated as advisory; all enforcement lives at gateways to preserve data-plane resilience. Protobuf versioning required (v0->v1 compatibility). Lease TTL for directives should default to 15s and gateway diff interval 500ms to reduce latency to act while avoiding control-plane thundering. Circuit leash scoring uses moving-window error-rate plus retry amplification metric.",
+  "rollout_plan": "Canary (internal) -> Beta (10 customers) -> Gradual (region pairs) -> GA. Feature flags at customer and region level. Monitor hedging cost and shed rates daily during rollout.",
+  "testing_plan": "Unit tests, integration harness simulating region partition, chaos engineering with 10 runs, load tests for hedging cost, game-day with SRE and PM present.",
+  "risks": "Cost, client compatibility, stale directives. Mitigations: headroom gates, opt-out header, directive TTLs and safe local defaults.",
+  "comments": [
+    "2026-03-03 - Aisha K: Initial write-up. Added high-level constraints and acceptance targets. Assigned to Marco.",
+    "2026-03-04 - Marco D: Spike scheduled to prototype directive diff fetch and local enforcement. Blocking: need proto crate bump in gateway build. Added ENG-645312 as dependency.",
+    "2026-03-06 - SRE review (Lina Torres): love the headroom gating. Request: add explicit dashboard for 'hedge cost by tenant' to spot noisy customers.",
+    "2026-03-08 - Marco D: Prototype implemented for diff endpoint. Canary harness ready. PR: github.com/redwood-inference/runtime/pulls/2819 (attachment).",
+    "2026-03-10 - Product (Samir Patel): Route priority mapping needed in Console; added PM task to product-management backlog.",
+    "2026-03-11 - Marco D: Early canary run (internal) showed resumed_session_success_ratio=99.6% and hedging_overhead_tokens_total=6.2% for two runs. Observed one leash trigger due to a misconfigured test node; adjusted leash sensitivity.",
+    "2026-03-12 - Aisha K: Updated acceptance thresholds after canary. Schedule Beta kickoff for 2026-03-18."
+  ],
+  "attachments": [
+    "https://github.com/redwood-inference/runtime/pull/2819",
+    "https://confluence.redwood.ai/display/INF/Apex+Failover+Coordinator+Design+Doc",
+    "https://grafana.redwood.ai/d/regions/apex-overview"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "design_notes",
+    "rollout_plan",
+    "testing_plan",
+    "risks",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_a685cb2238ca4d4e9caeae5ae289fad5"
+}

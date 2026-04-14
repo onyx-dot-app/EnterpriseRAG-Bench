@@ -1,0 +1,105 @@
+{
+  "key": "SUP-864999",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Intermittent SSE disconnect behind AWS ALB strips 'end' event and duplicates trailing paragraph on resume",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Daniel Kim",
+  "assignee": "Aisha Patel",
+  "customer_company": "EditorFlow",
+  "customer_tier": "enterprise",
+  "components": [
+    "api-gateway",
+    "streaming",
+    "edge-proxy",
+    "serving-runtime"
+  ],
+  "labels": [
+    "sse",
+    "reconnect",
+    "aws-alb",
+    "http2-to-http1"
+  ],
+  "environment": [
+    "prod:us-east-1"
+  ],
+  "affected_models": [
+    "gpt-redwood-1.1"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "linked_issues": [
+    "INT-4421"
+  ],
+  "related_github_prs": [
+    "github.com/redwood/inference/pull/4281"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/runbooks/streaming-resume-behavior"
+  ],
+  "description": "Issue summary: Customer reports that during intermittent network flaps through their ALB, SSE streams produced by our API sometimes arrive at the client missing the closing '</stream>' type end marker (we use a JSON control frame with event: \"end\"). Client reconnects, the resumed stream contains a duplicated trailing paragraph (the last sentence appears twice) and the response metadata envelope is repeated.\n\nImpact: EditorFlow's editor integrations render partial HTML blobs and occasionally show duplicate concluding paragraphs. This leads to user confusion and corrupted saved drafts for a subset (~0.6%) of streaming sessions.\n\nEnvironment: Production, routed through customer-managed AWS ALB that performs HTTP/2 fronting to our HTTP/1 edge. Customer uses server-sent events (SSE) streaming and a short client reconnect/backoff sequence.\n\nObserved behavior: SSE stream terminates without emitting the standard '</stream>' type end marker (we use a JSON control frame with event: \"end\"). Client reconnect resumes with an earlier offset but the trailing paragraph is duplicated and trailing metadata block (conversation_id, timestamp) appears twice.\n\nExpected behavior: On transient disconnects, stream resume should deliver a continuous output without duplicated sentences and should include a single, well-formed terminal control event indicating completion.",
+  "steps_to_reproduce": [
+    "1) Create a long-running SSE generation request via the public API with chunked streaming enabled and a prompt that generates a 4+ paragraph response (example prompt attached).",
+    "2) Route traffic through an AWS ALB configured with HTTP/2 listener -> HTTP/1 target (same as customer config).",
+    "3) Induce a short connection flap by triggering an ALB target health probe during streaming (simulate by toggling backend target's socket for ~200-400ms).",
+    "4) Allow client to reconnect using normal resume logic (client sends last-received token index as resume_offset).",
+    "5) Observe the resumed stream: check for absence of 'end' control event and duplication of trailing paragraph and duplicate metadata envelope."
+  ],
+  "logs": [
+    "edge-proxy (2026-03-10T15:12:03Z) INFO connection reset by peer: client socket closed during write, session_id=abc123",
+    "service-runtime (2026-03-10T15:12:03Z) WARN chunker: emitted-final-marker but upstream connection terminated before flush, request_id=rf-7f4c",
+    "edge-proxy (2026-03-10T15:12:04Z) INFO reconnect attempt from client ip 54.83.21.9, resume_offset=298",
+    "upstream (2026-03-10T15:12:04Z) INFO resumed session rf-7f4c at offset 298 and re-emitted buffered suffix length=72",
+    "upstream (2026-03-10T15:12:04Z) INFO metadata-envelope emitted {conversation_id: 'cdf-99', ts: '2026-03-10T15:12:04Z'}",
+    "upstream (2026-03-10T15:12:04Z) INFO metadata-envelope emitted {conversation_id: 'cdf-99', ts: '2026-03-10T15:12:04Z'}",
+    "client-side capture (EditorFlow) - final console: '...and that concludes our summary.' appears twice in sequence"
+  ],
+  "investigation_notes": [
+    "Initial hypothesis: ALB health probe / upgrade path may be causing partial TCP half-close that the edge-proxy interprets as a clean end, so the runtime flushes a final buffered suffix and then resume logic replays same suffix on reconnection.",
+    "Edge-proxy trace shows two metadata-envelope emits in quick succession during resume; need to determine whether duplication is from runtime replay or proxy retransmit logic.",
+    "Reproduced locally using a HTTP/2 -> HTTP/1 conversion proxy and a synthesized 300ms disconnect; observed missing 'end' control frame in 3/20 trials and duplicate trailing paragraph on 2/20 trials.",
+    "Binary tracing added: request_id rf-7f4c shows event sequence: CHUNK[n-1] -> CHUNK[n] (flushed) -> connection half-close -> client reconnect -> resume replay CHUNK[n] -> METADATA -> METADATA. The runtime's flush path writes CHUNK[n] and METADATA but does not mark session state as terminal when tcp half-close seen (race).",
+    "We suspect a race where the runtime's flush-on-half-close path emits the final chunk and metadata but fails to atomically set terminal flag; resume handler treats session as resumable and replays buffered suffix + metadata again."
+  ],
+  "comments": [
+    "Support (2026-03-10): Thanks for the report \u2014 capturing details and routing to streaming infra. Can you attach a HAR or client capture? \u2014 Daniel",
+    "Customer (EditorFlow - 2026-03-10): Attached a client-side capture and ALB access log for two sample sessions. We see the repeated paragraph in both client and application logs.",
+    "SRE (2026-03-11): Reproduced on staging with an ALB-like proxy. Adding an internal tracepoint to the runtime to log terminal flag transitions (PR opened: github.com/redwood/inference/pull/4281). \u2014 Liam O'Connor",
+    "Infra (2026-03-12): Patch to runtime replay logic created to add an atomic terminal set before flush returns success. Patch in review; test matrix shows duplicates eliminated in our harness. \u2014 Aisha Patel"
+  ],
+  "root_cause": "Race in runtime's flush-on-half-close path: final chunk and metadata could be emitted without atomically setting the session terminal flag. If a client reconnects quickly, resume handler replays buffered suffix and metadata producing duplicated trailing paragraph and duplicate metadata envelope.",
+  "workaround": "Customer workaround: configure ALB idle timeout to be longer than typical keepalive (recommended 120s) and update client to use a brief exponential backoff (start at 200ms) before resuming to reduce resume/replay overlap. Also recommended: enable client-side de-duplication of immediate trailing sentences if present.",
+  "next_steps": [
+    "1) Merge runtime patch that sets terminal state atomically before flush (PR#4281).",
+    "2) Deploy patch to staging and run the ALB-proxy regression harness across 10k simulated stream sessions.",
+    "3) Coordinate a canary deploy to production for a subset of customers behind HTTP/2->HTTP/1 ALBs and monitor duplicate-trailer metric.",
+    "4) Follow up with EditorFlow to schedule a short maintenance window to test their ALB configuration and apply the recommended timeout change (if they accept).",
+    "5) Add a metric and alert for repeated metadata-envelope emits in a single session to catch regressions early."
+  ],
+  "resolution": "In Progress - fix PR under review. Customer has applied the suggested ALB timeout and temporary client backoff; observed reduction in duplicates in their QA environment. Will update after production canary.",
+  "notes_for_postmortem": [
+    "Consider adding a unit test that simulates TCP half-close during flush and asserts that terminal state is set before any resume unknowns.",
+    "Document guidance for customers using ALBs with HTTP/2 fronting and recommend default ALB idle timeout and client resume backoff settings in streaming best-practices page.",
+    "Instrument a lightweight 'resume-duplication' signal that increments when metadata envelope emitted more than once within 1s for same session_id."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "root_cause",
+    "workaround",
+    "next_steps",
+    "resolution",
+    "notes_for_postmortem"
+  ],
+  "dataset_doc_uuid": "dsid_1c7e332339f44d88b776cf704d1f1c6e"
+}

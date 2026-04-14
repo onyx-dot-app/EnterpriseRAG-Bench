@@ -1,0 +1,54 @@
+{
+  "title": "Queue priming & shadow-gate sync notes - Oct 28 2026",
+  "owner": "Avery Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/",
+  "doc_type": "doc",
+  "created_at": "2026-10-28",
+  "last_modified": "2026-10-29",
+  "collaborators": [
+    "Sofia Alvarez",
+    "Gregory Park",
+    "Lina Kowalski",
+    "Ethan Rivera"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "in_review",
+  "tags": [
+    "latency",
+    "benchmark",
+    "queue-priming",
+    "shadow-gate",
+    "kv-cache",
+    "batching"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/serving-runtime/pull/1327",
+    "JIRA-INF-4892",
+    "https://app.slack.com/client/T01REDWOOD/C05PERF/thread-1698470000000-1698471234567",
+    "https://confluence.redwood.ai/display/INF/queue-priming-investigations"
+  ],
+  "attendees": [
+    "Avery Chen",
+    "Sofia Alvarez",
+    "Gregory Park",
+    "Lina Kowalski",
+    "Ethan Rivera",
+    "Nikhil Rao (observability)"
+  ],
+  "body": "Purpose: capture the sync from 2026-10-28 covering recent benchmark runs that surfaced p95/p99 latency regressions during short, high-arrival bursts. This doc is a working artifact \u2014 hypothesis-led notes, quick data excerpts, and concrete next steps to unblock the shadow/gating plan.\n\nAgenda:\n- Quick recap of the regression window (10/26-10/27 smoke runs)\n- Reproduce steps and test harness config used in the runs\n- Observed signals and anomaly signatures (time series snippets)\n- Root-cause hypotheses and quick experiments to validate\n- Shadow-gate rollout adjustments and acceptance criteria\n- Action items and owners\n\nRecap / context:\n- Regression first seen in CI smoke and then reproducible in the lab when running mixed-sequence workloads with variable arrival jitter. Affected model: open-metric-7B-v2 (same variant used in canary).\n- Baseline SLO: p95 <= 100 ms for short sequences (<= 128 tokens), p99 <= 220 ms. During bursts, p95 climbed to 350\u2013480 ms and p99 spiked to >900 ms for short windows (~30\u201390s).\n- Reproducible with both jambench harness and in-cluster shadow traffic replay. Shadow-gate (traffic-limited) showed reduced but still visible latency bumps.\n\nTest harness configuration (how we reproduced):\n- jambench config: qps target 120, mix: 60% seq32 / 30% seq128 / 10% seq512, arrival jitter: exp(0.3) to mimic front-end bunched arrivals.\n- Cluster test: 8-nodes x gtx-pool3, autoscaler disabled, KV-cache warm state (hit rate ~72% before runs).\n- Batcher settings: dynamic-batcher enabled; batch_size_cap=128 tokens; batching-window-ms=12ms; prefer-fast-path=true.\n- Shadow gating: gating fraction = 0.15 (15% of production traffic), fallback to smaller model variant if latency > 400ms for >10s.\n\nKey observations / signals:\n- Queue fill snapshots (sampled every 50ms) show short-lived peaks where instantaneous queued tokens jump 2\u20136x for 200\u2013800ms. Those peaks align exactly with p95 spikes.\n- Batch size distribution shifts during peaks: median batch tokens moves from 24 -> 110, causing larger kernel launches and longer individual token latencies.\n- KV cache hit-rate dips by ~8\u201312% during the same windows (prefix cache thrash suspected).\n- Sidecar probe (heap/metrics) shows small native allocator stalls on 2 nodes coincident with spikes; not full GC but allocation backpressure observed in C++ sidecar logs.\n- Observability traces: long tail is dominated by model-infer time when big microbatches are processed; scheduling delay (time request waits as part of a batch) accounts for 60\u201375% of added latency during incidents.\n\nImmediate hypotheses (ranked):\n1) Batching heuristic amplification: arrival jitter + current batching-window leads to sudden coalescing of very large batches for short windows; runtime kernel selection isn't optimal for those large microbatches causing heavy tail.\n2) KV cache pressure & eviction storm: simultaneous popularity shift for a small set of prefixes causes cache thrash and increases decode time (more attention state misses).\n3) Sidecar allocator/backpressure: temporary memory allocator contention increases time-to-schedule for worker threads on affected nodes.\n4) Smart-routing feedback loop: when a zone becomes slightly slower, a routing tweak retries or re-routes causing short bursts to a smaller subset of nodes amplifying burstiness.\n\nQuick experiments run during the sync:\n- Lowered batching-window-ms from 12 -> 6 on a 2-node test subset: p95 reduced ~28% during synthetic bursts, batch size distribution capped (median remained <60 tokens).\n- Reduced batch_size_cap from 128 -> 64: p99 tail decreased but end-to-end throughput lost ~9% in steady-state; acceptable for canary if limited to bursty routes only.\n- Increased prefix-cache TTL to 60s in lab: observed hit-rate increase ~6% and p95 improved marginally (~10%); suggests cache warming helps but not the dominant factor.\n- Injected 150ms arrival jitter smoothing at client-simulator: latency spikes largely dissipated \u2014 indicates front-end pacing is a strong mitigant but not always possible in prod.\n\nShadow-gate rollout plan discussion:\n- Current shadow gating approach rejects >X% of shadow traffic when latency > threshold and falls back to smaller model. That helps availability but masks the underlying regression. We need a two-pronged approach: (A) gate-by-route (only apply gating to high-variance routes) and (B) adaptive-batch caps during detected microburst windows.\n- Acceptance criteria for opening shadow gate wider: sustained p95 <= 140ms across 24h of mixed traffic and no p99 spikes > 350ms lasting >2 minutes.\n\nProposed immediate mitigations (do-first list):\n1) Short-term: Roll batch_size_cap=64 for routes tagged bursty (route metadata: /chat/stream, /completion/parity) \u2014 roll this via feature-flag for 48h. Owner: Gregory Park. Due: 2026-10-30.\n2) Add heuristic: if instantaneous queued tokens > 4x median for route over 1s, temporarily halve batching-window-ms for that route (adaptive windowing). Owner: Lina Kowalski. Prototype by 2026-11-02.\n3) Expose queue_fill_snapshot metric (histogram of queued tokens per sample) and a derived alert if >90th percentile > threshold. Owner: Nikhil Rao. JIRA: JIRA-INF-4892. Due: 2026-10-31.\n4) Prevent cache eviction storms: bump prefix cache TTL to 60s for candidate routes and monitor hit-rate. Owner: Ethan Rivera. Run 72h experiment starting 2026-10-29.\n5) Experiment: add a client-side micro-pacer for 10% of traffic to validate smoothing at scale. Owner: Sofia Alvarez. Start 2026-11-01.\n\nLonger-term engineering changes (backlog candidates):\n- Revisit batcher kernel-selection: add a fast-path for medium-large batches (64\u2013128 tokens) that currently falls back to generic kernel. Estimated effort: 2 sprints.\n- Improve sidecar allocator behavior to avoid allocation stalls at high burst rates; profile and consider jemalloc tuning or arena preallocation.\n- Routing policy: add burst-aware routing that spreads microbursts across more nodes rather than concentrating.\n\nAcceptance metrics we will observe during the next 72h:\n- p95 for short sequences <= 140ms (target)\n- p99 <= 350ms, and no >2 minute continuous window above that during synthetic jittered runs\n- Queue_fill_snapshot 95th percentile < 1.8x baseline during traffic runs\n- KV-cache hit-rate not drop >5% from baseline during bursts\n\nOpen questions / risks:\n- Will halving batch_size_cap be too expensive for high-throughput steady-state routes? Need to run cost vs latency tradeoff analysis after 48h trial.\n- Adaptive windowing complexity: risk of oscillation if multiple nodes simultaneously toggle windows; need damping/backoff.\n- Shadow gating currently hides incidents; we must ensure observability remains robust so we don't regress silently when gating is enabled.\n\nAction items (explicit):\n- Gregory Park: Feature-flag rollout batch_size_cap=64 for tagged routes, run 48h. Deliverable: rollout plan + rollback steps. Due 2026-10-30.\n- Lina Kowalski: Prototype adaptive batching-window heuristic (server-side) and a simple param-store flag to enable. Due 2026-11-02.\n- Nikhil Rao: Implement queue_fill_snapshot metric + grafana dashboard panel + alert. JIRA-INF-4892. Due 2026-10-31.\n- Ethan Rivera: Launch prefix cache TTL experiment (60s) for candidate routes; collect hit-rate and latency deltas for 72h. Due 2026-11-02.\n- Sofia Alvarez: Coordinate client-side pacer A/B (10% traffic) and run smoke for 48h. Deliver results summary. Due 2026-11-03.\n- Avery Chen: Open PR with a short readme describing the incident patterns and link to this doc; include reproduction steps and test harness configs. PR: https://github.com/redwood-inference/serving-runtime/pull/1327. Due 2026-10-29.\n\nNotes / logs attached:\n- Sample trace ids: trace-20261027-8a7f, trace-20261027-9b2c, trace-20261028-1c3e (use these to drill into p95 spike windows).\n- Lab run ids: lab-run-2026-10-27-burst-a, lab-run-2026-10-28-shadow-pass-1.\n\nNext sync: 2026-11-02 10:00 PT \u2014 focus on results from the 48/72h experiments and decide whether to widen routing or revert changes.\n\nNotes to self (informal):\n- This doc will become the canonical handoff for SRE/observability to add the metric and alert. Keep it terse but include reproduction commands in the PR.\n- Try to capture before/after histograms and place them in Confluence page linked above.\n\nSummary: We have a reproducible microburst-induced p95/p99 regression dominated by batching amplification and temporary cache/allocator pressure. Short-term mitigations (batch caps + pacing + cache TTL bump) look promising; the primary engineering work is an adaptive batcher/window heuristic and improved kernel-selection for medium-large batches.\n\n",
+  "action_items": [
+    "Gregory Park: rollout batch_size_cap=64 (feature-flag) for tagged routes - due 2026-10-30",
+    "Lina Kowalski: prototype adaptive batching-window heuristic - due 2026-11-02",
+    "Nikhil Rao: implement queue_fill_snapshot metric + dashboard + alert (JIRA-INF-4892) - due 2026-10-31",
+    "Ethan Rivera: run prefix cache TTL 60s experiment for 72h - start 2026-10-29, end 2026-11-01",
+    "Sofia Alvarez: run client-side micro-pacer A/B (10% traffic) - start 2026-11-01",
+    "Avery Chen: open PR with repro steps + test harness (PR #1327) - due 2026-10-29"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "action_items"
+  ],
+  "dataset_doc_uuid": "dsid_3100105fe9ee4cd4bb7dbdb78059ca42"
+}

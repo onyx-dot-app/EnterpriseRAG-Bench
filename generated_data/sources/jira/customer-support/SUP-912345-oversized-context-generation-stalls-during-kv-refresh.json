@@ -1,0 +1,70 @@
+{
+  "key": "SUP-912345",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Large context generations stall and eventually time out after KV refresh on dedicated capacity",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-13",
+  "updated_at": "2026-03-14",
+  "reporter": "Maya Patel",
+  "assignee": "Liam O'Connor",
+  "customer_company": "Edgetech Labs",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "kv-cache",
+    "api-gateway",
+    "autoscaler"
+  ],
+  "labels": [
+    "large-context",
+    "timeout",
+    "kv-refresh",
+    "dedicated-capacity"
+  ],
+  "environment": "prod:us-west",
+  "affected_models": [
+    "redwood-v2-large",
+    "rw-instruct-13b-qlo",
+    "gptx-open-13b"
+  ],
+  "affected_regions": [
+    "us-west",
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-14",
+  "first_response_due_at": "2026-03-13",
+  "linked_issues": [
+    "SUP-29541",
+    "SUP-60735"
+  ],
+  "related_incident_id": "INC-2026-03-13-45",
+  "related_github_prs": [
+    "github.com/redwood-inference/serving-runtime/pull/1789",
+    "github.com/redwood-inference/kv-cache/pull/402"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/INF/Long+Context+Timeouts+Runbook",
+    "https://confluence.redwood.ai/display/ENG/KV+Eviction+Behavior"
+  ],
+  "description": "Issue summary:\nEdgetech Labs reports repeated request timeouts for generation calls that include very long prefixes (>200k tokens) paired with large max_tokens (>=120k). Calls initially stream tokens but stall at a seemingly arbitrary point during generation; after ~90-120s the client sees a server-side timeout (HTTP 504) and the server emits a finalizer timeout in logs.\n\nImpact:\n- Affects several high-throughput endpoints on the customer's dedicated pool.\n- Intermittent but reproducible for their workload; impacts 20-40% of long-context jobs during peak.\n- Customer's training/ingestion pipelines rely on these completions for metadata extraction so business processes are blocked.\n\nEnvironment:\n- Dedicated tenant on prod:us-west (edgetech-dedicated-01).\n- Serving runtime v1.14.2, kv-cache v0.9.8, autoscaler v2.3.0.\n- Typical request: streaming chat generate with prefix size ~220k tokens, max_tokens=125000, streaming=true, batching=auto.\n\nSteps to reproduce:\n1) Create a generation request with prefix ~220k tokens and max_tokens=125000 against redwood-v2-large pinned to v1.2.\n2) Enable streaming in the client and set client timeout to 180s.\n3) Send concurrent batch of 4 identical requests to the dedicated endpoint.\n4) Observe streaming progress; generation stalls after a variable number of tokens (often ~40-60k into the output).\n\nObserved behavior:\n- Token stream pauses without an intermediate error; client connection remains open for ~90-120s before receiving 504.\n- Server logs show repeated KV cache evictions and a sequence of \"kv_refresh_started\" followed by \"kv_refresh_blocked\" traces and increased RPC latency to GPU workers.\n- Autoscaler shows transient scale-in/out events within the same minute.\n- No OOM reported on the workers, but GPU utilization drops and RPC queue depth spikes.\n\nExpected behavior:\n- Long-context generation should proceed to completion or fail fast with a clear error; streaming should not silently stall then time out at the finalizer.\n\nTemporary workaround (customer):\n- Reduce max_tokens to <=32k or split prompt into smaller segments; this avoids the stall in our repro cases.\n- Set client streaming timeout >300s to allow for longer tail behavior (not ideal).\n\nLogs (sanitized snippet):\n2026-03-13T18:04:12Z INFO serving: request_id=R-9a3f kv_refresh_started prefix_tokens=220312\n2026-03-13T18:04:13Z WARN kv-cache: evicting segment seg-42 reason=memory_pressure\n2026-03-13T18:04:14Z ERROR runtime: rpc_latency_high worker=worker-17 latency_ms=2430 queue_depth=37\n2026-03-13T18:05:48Z ERROR serving: finalizer_timeout request_id=R-9a3f elapsed_ms=94216\n",
+  "investigation": "Initial hypothesis: KV cache eviction during very large prefix loads causes blocking rebuilds (kv_refresh) that interact poorly with continuous batching and autoscaler events. The race between KV disk/host reads, batcher flush, and autoscaler scale events leads to RPC queueing and an effective stall.\n\nWhat we've checked so far:\n- Correlated timeline with customer's request IDs and our autoscaler metrics (match between kv_refresh_started and scale events).\n- Captured a heap of runtime traces showing repeated attempts to rehydrate evicted KV segments; rehydration latency ~1.8-3s per segment and multiple segments required.\n- Confirmed that worker GPUs did not OOM but GPU-side token generation paused while waiting on KV rehydration RPCs.\n- Verified batching window behavior: with batching=auto, batcher is holding large batches while waiting for KV responses, increasing RPC queue depth.\n- Reproduced with internal load generator on a dedicated pool using identical model and request shapes.\n\nOpen questions:\n- Whether autoscaler scale-in/out within the time window is causing worker reassignment that invalidates cached KV pointers.\n- If particular hardware (A100 vs H100) shows different susceptibility due to PCIe/host transfer characteristics.\n",
+  "resolution": "Workaround applied to customer: set per-tenant policy to cap max_tokens for streaming requests to 50k and enable aggressive KV prefetch path for large prefixes.\nEngineering plan (in progress):\n1) Short-term: push a patch to batcher to detect long-context jobs and apply conservative batching (PR: github.com/redwood-inference/serving-runtime/pull/1789). Rollout to staging immediately, to prod next week behind feature flag.\n2) Medium-term: modify KV cache eviction strategy to prefer sequential-prefetch for very large prefixes and add backpressure signals to autoscaler to avoid scale events during active kv_refresh windows (tracked in PR above and kv-cache PR #402).\n3) Long-term: add explicit circuit-breaker and clearer error path for cases where kv_refresh exceeds threshold so we fail fast and return structured error to clients rather than finalizer timeout.\n\nRollout notes:\n- The short-term patch will be gated by the feature flag `long_context_conservative_batching`. We will enable for Edgetech's dedicated pool first.\n- Monitor token-stream continuity, rpc_queue_depth, and finalizer_timeout counts for the tenant for 48h post-rollout.\n\nFollow-ups:\n- Postmortem if issue recurs after rollout; update long-context runbook with guidance for dedicated customers.\n",
+  "comments": [
+    "2026-03-13 18:15 - Maya Patel (Support): Opened ticket after customer provided three failing request IDs. Attached sanitized traces and sample payload. Marked P1 due to blocked ingestion jobs.",
+    "2026-03-13 19:02 - Liam O'Connor (SRE): Reproduced locally on a dedicated pool with loadgen. Observed same kv_refresh_blocked traces. Added autoscaler timeline to ticket. Assigning to runtime and kv owners.",
+    "2026-03-13 20:30 - Priya Singh (Runtime Eng): Initial patch to batcher drafted to reduce batch window for long-context. Needs QA and staging run. Linked PR: github.com/redwood-inference/serving-runtime/pull/1789.",
+    "2026-03-13 22:05 - Edgetech Support (Customer): Confirmed that reducing max_tokens to 32k eliminates the stall. They asked whether there will be configuration knobs in the console for per-route caps.",
+    "2026-03-14 09:12 - Liam O'Connor (SRE): Deployed conservative batching flag to staging and reran customer's repro; stall rate dropped from ~35% to ~4% in tests. Preparing to enable on customer's pool behind flag."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation",
+    "resolution",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_1a42c0a697b14d5bab73fe24b0d96038"
+}

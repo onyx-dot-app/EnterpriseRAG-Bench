@@ -1,0 +1,37 @@
+{
+  "title": "Spindle latency microprofile log \u2014 experimental scratchpad",
+  "owner": "Uma R. Banerjee",
+  "drive_area": "users",
+  "path": "users/spindle-latency-microprofile-log-uma.json",
+  "doc_type": "doc",
+  "created_at": "2024-11-03",
+  "last_modified": "2024-11-07",
+  "collaborators": [
+    "Anya Kovalev",
+    "Miguel Torres"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "microprofile",
+    "latency",
+    "benchmark",
+    "kv-cache",
+    "batching",
+    "warmup",
+    "arrival-jitter"
+  ],
+  "linked_artifacts": [
+    "CON-4821",
+    "SERV-1293",
+    "https://github.com/redwood-inference/serving-runtime/pull/412",
+    "https://linear.app/redwood/issue/ING-789/arrival-jitter-sim"
+  ],
+  "content": "Purpose: quick exploratory log for a tiny, focused latency microprofile I called 'spindle' \u2014 aim is to capture microsecond-level effects from small changes: sub-token batching, KV prefetch window, and jittered arrival patterns. This is a personal scratchpad: rough numbers, plots-as-text, questions to follow up on.\n\nHypothesis: a narrow combination of aggressive sub-token batching + prefetch window reduction reduces p95 but can worsen p999 when arrival jitter > 15ms. The spindle profile isolates short streams (prompt length 12-40 tokens, generation 8-24 tokens) typical of chatlets and short completions.\n\nEnvironment:\n- Fleet: 4x A100s (dedicated perf pool, isolated tenant)\n- Runtime: serving-runtime@main (commit 7f3a2b4), with microbatching enabled\n- Model: rwd-open-13b-8k (float16, 4-bit quantized variant Q4_0 for this run)\n- Client: synthetic-injector v0.3 (arrival jitter control) on devbox\n- Key config knobs varied: sub_token_batching (on/off), prefetch_kv_window (256/128/64 tokens), arrival_jitter (0/10/25ms)\n\nQuick run notes:\n- Warmup: 60s of steady 50 qps (zipf-like), then ramp to target for 120s, then steady phase for 300s sampled\n- Measurement: token-level latency histogram at worker, p50/p95/p99/p999 at request completion, cpu/gpu-util, kv-cache hit ratio, recovered warm-cache rate\n- Sampling: 10k requests per config (approx)\n\nRepresentative raw table (aggregated):\nCONFIG                                      | p50  | p95  | p99  | p999 | KV-hit\nsub_batch=on, prefetch=256, jitter=0ms        | 8ms  | 22ms | 36ms | 130ms| 0.91\nsub_batch=on, prefetch=128, jitter=10ms      | 9ms  | 24ms | 44ms | 210ms| 0.88\nsub_batch=off, prefetch=256, jitter=0ms      | 11ms | 28ms | 52ms | 180ms| 0.84\nsub_batch=on, prefetch=64,  jitter=25ms     | 12ms | 35ms | 120ms| 840ms| 0.62\n\nObservations / quick analysis:\n- Sub-token batching (on) consistently lowers p50/p95 compared to off for low-jitter runs \u2014 expected: better amortization of kernel launch overhead.\n- However, when arrival jitter increases (25ms), smaller prefetch windows (64) cause KV miss amplification: p99/p999 explode. Likely because the runtime evicts entries more aggressively when window is small relative to arrival variability.\n- The p999 numbers are sensitive to microbursts injected by the generator; adding jitter transforms dozens of 200ms spikes into a long tail at p999.\n- KV-hit ratio correlates strongly with tail behavior here; below ~0.7 we start seeing pathological tails.\n\nQuick chart sketch (ASCII sparkline of p99 across prefetch windows at jitter 25ms):\npre=256: \u2582\u2582\u2583\u2583\u2585\u2585\u2586\u2587\u2587\u2587\npre=128: \u2582\u2583\u2583\u2585\u2586\u2586\u2587\u2587\u2587\u2587\npre=64 : \u2586\u2587\u2587\u2587\u2587\u2587\u2587\u2587\u2587\u2587  (much taller, long-tail)\n\nFailure-mode anecdote:\n- At iteration ~32 with prefetch=64 and jitter=25ms, observed repeated cache churn: worker logs show frequent KV cache refills (+30% traffic to cache backend), combined with GPU stalls reported at the kernel queue. Suggests the prefetch window is too narrow to amortize cache reuse under jittered arrivals.\n\nMicro-profiling traces (notes):\n- Kernel queue lengths spike ~4x during microbursts; observed small GC-like stalls on Python side (cooperative scheduling backpressure) at 100-200ms scale \u2014 need better tracing to attribute to Python vs runtime C++ threadpool.\n- Sampling callback shows more L2 cache misses in prefetch=64 case (need hardware perf counters to confirm).\n\nImmediate actions / TODOs:\n- Re-run targeted prefetch window sweep with hardware counters on (perf counters) to validate L2 miss hypothesis (assign to Miguel).\n- Add a run with sub_token_batching=on but with conservative max-batch latency threshold lowered (so we don't overly delay short requests) \u2014 check p95/p999 tradeoff (Anya).\n- Try a hybrid prefetch strategy: dynamic window that grows on observed arrival jitter > 10ms. Prototype idea: measure 1s sliding stddev of inter-arrival, multiply base window by (1 + k*stddev_ms/10). Cheap heuristic to test.\n- File an issue to add per-request KV metadata to traces (so we can correlate misses to tails) \u2014 linked: SERV-1293.\n\nOpen questions / oddities:\n- Why does sub_token_batching=on sometimes increase p999 even in prefetch=256, jitter=0 (small number of runs showed tail bumps). Suspect interaction with overflow queue/backpressure when batch drains hit exactly at token boundaries. Need fine-grained timeline traces.\n- Is quantized model variant worsening kernel latencies in the tail? Float16 runs are needed as baseline.\n\nNotes for writeup if this turns into a reproducible experiment:\n- Keep plots per-quantization variant, and include KV-hit ratio and microburst count on same axis.\n- Suggested release to eng-sre as 'spindle-profile' experiment set so SRE can run on larger fleet.\n\nLast quick checklist before I forget:\n- [ ] Perf counters run configured (Miguel)\n- [ ] Add per-request KV trace flag behind a toggle (PR stub created) \u2014 link: https://github.com/redwood-inference/serving-runtime/pull/412\n- [ ] Reproduce float16 baseline\n- [ ] Try dynamic prefetch heuristic prototype\n\nShort conclusion draft (one-liner):\n- For short-chat workloads, aggressive sub-token batching + moderate prefetch (128-256) gives best p95 but tails are extremely sensitive to arrival jitter; avoid tiny prefetch windows (<100) unless you have strong arrival regularity or additional cache protections.\n\nAny follow-ups: ping Anya/ Miguel / Sasha (SRE) if you run more long tails. Leaving this as a living scratchpad \u2014 will refine into a short eng note if we can reproduce L2-miss hypothesis.",
+  "filename": "spindle-latency-microprofile-log-uma.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_6b1ce3e1bbf74a42bb7ff925b517261f"
+}

@@ -1,0 +1,103 @@
+{
+  "key": "ENG-942357",
+  "team": "engineering",
+  "title": "Sanitize tenant attribution for interleaved batched replays after key swap",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-05",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Patel",
+  "assignee": "Liam O'Connor",
+  "project": "metering-integrity",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "billing",
+    "metering",
+    "rate-limiter",
+    "high-impact",
+    "forensics"
+  ],
+  "dependencies": [
+    "ENG-612345",
+    "ENG-730111"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.26",
+  "security_review_required": "false",
+  "description": "Summary: A shard of customer requests that were queued during an API key swap can be replayed from the request buffer out-of-order and get attributed to the wrong project/org. This ticket investigates and implements a sanitizer that enforces deterministic tenant mapping for batched/replayed requests so attribution remains correct after key rotations and proxy handoffs.\n\nBackground: We observed two customer complaints where usage spikes appeared on unrelated projects immediately after a key rotation window. Early forensics show that an edge node had buffered ~300 small requests, received an API key swap signal, rewrote the request envelope, and then replayed the buffer while a background batch join loop continued to merge incoming traffic. The result: some buffered requests were processed with the new key binding and some with stale mapping; downstream metering aggregated both under the wrong project due to a race in the attribution hydration flow.\n\nScope: Covers runtime request ingress (proxy/batcher), attribution hydration service (tenant-resolver), and the metering ingestion pipeline that writes usage events. Does NOT include billing UI updates or downstream billing reconciliation automation (separate follow-up).",
+  "reproduction_steps": [
+    "1) Create two projects A and B in the same org and generate a long-lived API key template used by a proxy.",
+    "2) Start a steady stream of small generation requests (1-10 tokens) through the proxy at ~50rps.",
+    "3) Trigger a key swap event and simulate edge buffering by introducing a 1s stall on the proxy write path.",
+    "4) Allow buffered requests to replay concurrently with new requests; observe attribution tags and metering events in the warehouse.",
+    "Expected: All requests should be attributed to the project bound when the request was accepted (persisted mapping) so no cross-project bleed occurs."
+  ],
+  "investigation_notes": [
+    "Observed that the proxy uses a soft-binding table that can be updated mid-batch; when replay runs it re-looks-up mapping which may return the new binding.",
+    "Batch join window allows mixing buffered items and live requests; the ordering of hydrate->enrich->emit is non-atomic across the batch boundary.",
+    "Tenant-resolver caches are TTLed aggressively (100ms) which makes mapping unstable during a rotation 'storm'.",
+    "Metering ingestion expects a stable 'attribution_id' in the event payload; when provenance changes mid-flight we see duplicate events with different attribution tags for the same logical request."
+  ],
+  "root_cause": "Race between proxy buffer replay and tenant binding propagation: buffered requests are re-hydrated after key swap using the latest mapping rather than the mapping recorded at acceptance time. The batch-flush path does not pin attribution metadata atomically with the request body when buffering occurs.",
+  "proposed_solution": "1) Record and persist a compact attribution token (attribution_v1) upon request acceptance and store it alongside the buffered payload. 2) During replay, prefer the stored attribution token and skip a fresh tenant lookup. 3) Add a fast path sanitization step in the batch joiner that verifies attribution consistency for each batched item and rejects/rewrites items that are inconsistent. 4) Instrument metrics (replay-attributed-count, attribution-overrides) and add DAG tests. 5) Deploy as a staged rollout: canary on internal org, then opt-in customers, then global.",
+  "implementation_tasks": [
+    "Proxy: append 'adhoc_attribution_token' to buffered envelope and persist with buffer shards (ENG work).",
+    "Tenant-resolver: expose deterministic attachment function and stable hashing for the token format.",
+    "Batcher: add sanitization step that pins attribution before emit and records override metric; fail fast for mismatches to avoid silent bleed.",
+    "Metering pipeline: accept attribution token and prefer it over request-scoped lookup; add reconciliation job to dedupe conflicting events for last 7 days.",
+    "End-to-end tests: unit tests for token encoding, integration test that simulates key swap and replay ordering, and load test at 200rps for 10 minutes."
+  ],
+  "acceptance_criteria": [
+    "Automated integration test that reproduces previous leak scenario passes in CI and asserts zero cross-project events.",
+    "Canary rollout on staging org shows no attribution drift and metrics 'attribution-overrides' remain near 0 except during controlled tests.",
+    "No increase in tail latency (> p99) for batcher path beyond 10% under normal load after changes.",
+    "Reconciliation job able to identify and correct historical misattributed events for affected customers within SLA window."
+  ],
+  "testing_plan": [
+    "Unit: token encode/decode fuzz tests, deterministic hashing tests.",
+    "Integration: end-to-end simulation with proxy stalling + key-swap orchestrator (uses internal test harness).",
+    "Load: 200rps steady + 2s replay burst to verify batching sanitization at scale.",
+    "Post-deploy: monitor 'replay-attributed-count' and 'attribution-override-rate' rolling 5m windows; set alert if override_rate > 0.05%."
+  ],
+  "rollout_plan": [
+    "1) Merge feature gate behind 'sanitize_replay_attribution' toggled off by default.",
+    "2) Deploy to canary cluster (internal) for 48 hours. Validate metrics and run synthetic harness.",
+    "3) Enable for 5 pilot customers (opt-in) and monitor for 72 hours.",
+    "4) Global release with monitoring and a 24-hour rollback window."
+  ],
+  "risks_and_mitigations": [
+    "Risk: Breaking existing proxies that rely on current lookup behavior. Mitigation: feature-gate and backward-compatible token absent path.",
+    "Risk: Slight increase in buffer envelope size leading to higher memory usage. Mitigation: compact token (8 bytes) and shard-level eviction tuning.",
+    "Risk: Reconciliation may double-bill if not deduped. Mitigation: reconciliation job writes correction events and flags, does not trigger billing until verified."
+  ],
+  "links": [
+    "https://github.com/redwood-inference/runtime/pull/1234 (WIP PR for buffer envelope)",
+    "https://confluence.redwood.ai/display/INF/Attribution+Replay+Sanitization (design doc)",
+    "https://grafana.redwood.ai/d/s/usage/metering-replay?orgId=1 (dashboard for replay metrics)",
+    "https://github.com/redwood-inference/infra/pull/567 (batcher instrumentation changes)"
+  ],
+  "comments": [
+    "2026-03-06 - Aisha Patel: Initial triage complete; reproducer and test harness added under infra/test/harness/replay-sim.",
+    "2026-03-08 - Liam O'Connor: Found the soft-binding table update path; adding a short-term kill-switch to disable buffer replay on rotations for high-risk clusters.",
+    "2026-03-10 - Sarah Nguyen (Billing): Customer impact confirmed for two customers; spike matched rotation windows. Billing team requests reconciliation run after fix deploy.",
+    "2026-03-11 - Liam O'Connor: WIP PR created for proxy envelope change (see links); adding metrics and plaintext examples in PR description.",
+    "2026-03-12 - Engineering lead review: Approved approach; note to coordinate with infra for memory budget and with billing for reconciliation tolerances."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "reproduction_steps",
+    "investigation_notes",
+    "root_cause",
+    "proposed_solution",
+    "implementation_tasks",
+    "acceptance_criteria",
+    "testing_plan",
+    "rollout_plan",
+    "risks_and_mitigations",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_d4652d0b2c5b4e4e87593b7f85a49f54"
+}

@@ -1,0 +1,119 @@
+{
+  "key": "ENG-4725",
+  "team": "engineering",
+  "title": "Concurrency leak in rate-limiter policy evaluation causing incorrect per-key/quota accounting",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-14",
+  "creator": "Priya Menon",
+  "assignee": "Diego Alvarez",
+  "project": "billing-and-quotas",
+  "cycle": "2026-W11",
+  "estimate": "8",
+  "due_date": "2026-03-20",
+  "labels": [
+    "rate-limiter",
+    "billing",
+    "quota",
+    "bug",
+    "high-priority",
+    "needs-hotfix"
+  ],
+  "parent_issue": [
+    "ENG-4600"
+  ],
+  "dependencies": [
+    "ENG-4701",
+    "ENG-4692"
+  ],
+  "customer_impact": "high",
+  "release": "billing-2026.03",
+  "security_review_required": "false",
+  "description": "Production reports and internal audits show that under concurrent burst traffic the rate-limiter policy engine sometimes allows more tokens/requests than configured for per-key and per-org quotas. This manifests as both (a) short-term bursts bypassing per-route limits and (b) incorrect usage accounting where some requests are not recorded against the customer's quota. Root cause appears tied to race conditions between the in-memory policy evaluation cache and the downstream persistent counters (Redis).",
+  "reproduction_steps": [
+    "1) Use the load test harness (tools/rl-test) with 200 concurrent clients keyed to 50 unique API keys targeting the /v1/generate route.",
+    "2) Configure per-key rate limit: 100 requests/min, per-org aggregate: 2000 requests/min.",
+    "3) Run two separate runs: a) steady ramp to 1000 RPS, b) sudden burst of 3000 RPS for 30s.",
+    "4) Observe metrics in billing-dashboard and redis: rl.policy.evictions, rl.cache.hits, and redis key counters.",
+    "5) Reproduce consistently in staging when redis latency is artificially increased (tc qdisc) to 50-150ms.",
+    "6) Capture tracer spans using trace-id header for suspect flows (span names: rl.eval, rl.commit_counter)."
+  ],
+  "observed_behavior": "During bursts, some API keys temporarily exceed the configured per-key limit. The billing pipeline later shows missing increments for those excess requests leading to underbilling and quota drift. Logs show 'rl.eval:cache-miss -> concurrent-eval' followed by 'rl.commit_counter:timeout' for some requests.",
+  "expected_behavior": "Policy engine must deterministically enforce per-key, per-org, and per-route limits at the moment of request evaluation regardless of concurrent load or downstream counter latency. All allowed requests must have corresponding usage increments recorded; disallowed requests must be rejected and not counted.",
+  "investigation_notes": [
+    "- Initial triage (2026-03-10): High correlation between incidents and elevated Redis latency simulated in staging.",
+    "- Code paths: policy evaluator does optimistic allowance when local cache shows availability, and queues counter increments asynchronously to Redis (commit path).",
+    "- Race: If two concurrent requests both see the same cached allowance and both proceed to async commit, the cache isn't updated atomically; subsequent commit failures are retried but the evaluator cache never reflects pending increments, allowing more inflight allocations.",
+    "- Found a missing compare-and-swap (CAS) step in rl/cache.go around slot reservation (lines ~214-238).",
+    "- Observed that the commit retry uses exponential backoff but will eventually mark the request as failed without compensating the local cache state on cancellation.",
+    "- Trace sample: trace/2026-03-11T19:23:04Z id=trc_9a2b: two rl.eval spans with identical key saw allowance 3, both allowed 3 allocations each resulting in +6 committed eventually but cache expected +3.",
+    "- Unit tests in rl/* did not cover high concurrency with transient Redis failures; integration test harness revealed the scenario.",
+    "- Relevant files: services/ratelimiter/evaluator.go, services/ratelimiter/cache.go, services/ratelimiter/committer.go."
+  ],
+  "proposed_solution": [
+    "1) Make cache reservation atomic: add CAS-based reservation or use singleflight semaphore per key to serialize reservation updates.",
+    "2) Introduce 'pending' counter tracked in the cache that increments synchronously during eval and decrements on commit success/failure to avoid double allocation under retries.",
+    "3) On commit failure after exhausted retries, run compensating decrement to the pending counter and emit a specific metric rl.commit.compensations.",
+    "4) Add stricter contract between evaluator and committer: evaluator must await local commit of pending counter before returning ALLOWED to caller for all P0 paths, or otherwise return THROTTLED when commit cannot be scheduled within sane bound (100ms).",
+    "5) Add integration test into chaos/staging harness that injects Redis latency and verifies exact quota accounting across 60s windows.",
+    "6) Instrument additional metrics and logs: rl.pending_by_key, rl.compensation_count, rl.eval.serialize_latency.",
+    "7) Small refactor to make cache.go behavior explicit and add concurrency-safe invariants in unit tests."
+  ],
+  "rollout_plan": [
+    "- Branch: fix/eng-4725-ratepolicy-concurrency",
+    "- PR: https://github.com/redwood-inference/platform/pull/7623 (WIP)",
+    "- Code owner review: @marta (serving-runtime), @samir (billing), @timk (infra)",
+    "- Staging rollout: feature-flag 'rl_atomic_reservations' off-by-default. Gradually enable for 5% of traffic for 24h, then 25%, 100% if stable.",
+    "- Monitor rl.* metrics, billing-dashboard anomalies, and error budget for 48h after full rollout.",
+    "- In case of regression, rollback feature-flag and apply hotfix reverting to prior behavior while mitigation is applied.",
+    "- Post-mortem and permanent release planned in billing-2026.03 after validations."
+  ],
+  "qa_plan": [
+    "- Unit tests: add concurrency unit tests exercising cache reservation CAS and pending counters.",
+    "- Integration: run chaos test that injects 50-200ms Redis latency and validates no quota overshoot across 5k requests.",
+    "- Load test: reproduce original failure pattern using rl-test harness and confirm counts match expected values.",
+    "- Canary: enable flag for internal Redwood accounts first; validate billing pipeline shows no missing increments for 24h.",
+    "- Edge cases: test commit retry exhaustion, process restarts during pending state, long GC pauses.",
+    "- Acceptance criteria: <1% variance between allowed and committed counts over 1 minute windows under burst scenarios; zero unexplained misses in billing pipeline."
+  ],
+  "risks_and_mitigation": [
+    "- Risk: Synchronous waiting during eval (to ensure commit of pending counter) may increase P95 latency for /generate. Mitigation: limit to 100ms bound and allow fast-path with backpressure refusal if exceeded.",
+    "- Risk: Added complexity to cache state increases memory usage. Mitigation: bounded pending counters per-key, eviction policies unchanged.",
+    "- Risk: Rollout might surface new race under a different codepath. Mitigation: canary + metrics + rapid rollback playbook.",
+    "- Risk: Potential partial double-count if compensating decrement fails. Mitigation: strong idempotent commit semantics and separate reconciliation job to fix drift nightly if needed."
+  ],
+  "related_links": [
+    "GitHub issue: https://github.com/redwood-inference/platform/issues/1489",
+    "PR (WIP): https://github.com/redwood-inference/platform/pull/7623",
+    "Confluence doc: https://redwood.atlassian.net/wiki/spaces/BILL/pages/rl-concurrency-debugging",
+    "Dashboard: https://grafana.redwood-inference.internal/d/rl/billing-quotas?view=ENG-4725",
+    "Load-test harness: repo://tools/rl-test (internal)",
+    "Trace sample: https://traces.redwood.internal/trace/trc_9a2b"
+  ],
+  "updates": [
+    "2026-03-10 11:14 - Priya: Opened ticket after post-incident review; linked initial traces and metrics.",
+    "2026-03-11 09:40 - Diego: Added reproduction harness and initial unit tests that fail under concurrency.",
+    "2026-03-12 16:22 - Diego: Implemented pending-counter + CAS reservation (draft). Running integration tests in staging.",
+    "2026-03-13 08:05 - Marta: Code review requested additional metrics and asked to tighten timeouts; requested a design comment on compensating decrements.",
+    "2026-03-13 14:30 - Samir: Confirmed billing pipeline would accept compensating events; recommended metric rl.commit.compensations.",
+    "2026-03-14 10:12 - Diego: Pushed e2e run results to PR (link above). Staging canary shows corrected counts for internal accounts during 3h stress run.",
+    "2026-03-14 15:00 - Priya: Marked as In Progress; requested prioritization for hotfix lane if any regression in canary appears."
+  ],
+  "last_comment": "Diego: WIP branch implements atomic reservation and pending counters. Staging canary so far looks good. Next: expand canary to 25% and run overnight; if stable, schedule production rollout as per plan.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "reproduction_steps",
+    "observed_behavior",
+    "expected_behavior",
+    "investigation_notes",
+    "proposed_solution",
+    "rollout_plan",
+    "qa_plan",
+    "risks_and_mitigation",
+    "updates",
+    "last_comment"
+  ],
+  "dataset_doc_uuid": "dsid_a7aecd1df9224b498c1780dd303c8c00"
+}

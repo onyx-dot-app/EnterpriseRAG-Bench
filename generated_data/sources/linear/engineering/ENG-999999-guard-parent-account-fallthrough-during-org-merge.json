@@ -1,0 +1,60 @@
+{
+  "key": "ENG-999999",
+  "team": "engineering",
+  "title": "Guard parent-account fallthrough during staged API-key handoff in org-merge",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-10",
+  "creator": "Maya Chen",
+  "assignee": "Luis Ortega",
+  "project": "Billing Integrity",
+  "cycle": "Cycle 48",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "billing",
+    "metering",
+    "attribution",
+    "rate-limiter",
+    "org-merge"
+  ],
+  "release": "runtime-2.4",
+  "security_review_required": "false",
+  "customer_impact": "high",
+  "description": "Summary: During a staged organization merge flow (customer-initiated), we observed requests that should have been attributed to child projects being attributed to the parent billing account. This causes incorrect per-project invoices and mis-applied rate limits. The issue appears during API-key handoff when keys are aliased or temporarily reissued and the mapping layer falls back to parent-account resolution instead of honoring transient project bindings.\n\nWhy this matters: Customers with merged orgs or nested billing structures can see: 1) over/under billing on projects, 2) burst rate-limiter credit applied to wrong owner leading to noisy throttling, and 3) incorrect cost dashboards causing customer support escalations. High confidence this is reproducible and occurred in two customer incidents in Feb.\n\nScope: Affects hosted API requests that traverse the proxy/auth stack while a key alias or key transfer is in-progress. Impact window is per-hour to per-day depending on reconciliation cadence.\n\nLinks: Internal incident notes: https://confluence.redwood.internal/incidents/ORGMERGE-2026, support threads: https://drive.redwood.internal/support/ORG-5412",
+  "steps_to_reproduce": "1) Create two orgs (parent P, child C) with separate projects. 2) Initiate staged org-merge that aliases API keys from project C into parent namespace P while preserving existing tokens for a short transition window. 3) Send a mix of gen/embedding requests authenticated with the aliased key while the auth registry is in reconciliation. 4) Observe attribution in ingestion: requests are tagged with owner=P instead of owner=C in the metering pipeline. 5) Simulate rate-limiter accounting: see counters increment under P's rate limiter and quota buckets.\n\nObserved behavior: When the token alias exists but the token lineage metadata (token_lineage_id) hasn't been backfilled in the cache, the attribution lookup falls back to a parent-account resolution path which uses the top-level account mapping. The fallback is correct for orphaned tokens but incorrect in this transient aliasing scenario.",
+  "hypothesis": "Root cause: the auth-to-metering handoff relies on a two-step resolution: fast cache (token->project) and slow canonicalization (lineage lookup). During org-merge we create key aliases without atomically updating the fast cache and we intentionally mark the alias as 'temporary'. The metering service treats 'temporary missing mapping' as a signal to fall back to parent-account resolution. This fallback path predates aliasing support and therefore misattributes transient alias traffic to the parent account.\n\nContributing factors:\n- Token aliasing creates a window where token.id != token_lineage.id and cache invalidation is eventual.\n- Rate limiter owner tag is derived from the resolved owner at ingress rather than from canonical lineage documented on the auth service.\n- Reconciliation job backfills lineage after the fact but doesn't repair historical metering buckets, only future windows.",
+  "proposed_solution": "Short-term (fast mitigation):\n- Change ingress attribution to prefer a 'pending_alias' header emitted by the auth service when key-aliasing is in-flight; if present, stall attribution for up to 5s and query canonical lineage service synchronously for that token.\n- Update rate limiter owner tag to include 'provenance' metadata so we can retroactively filter incorrect owner writes.\n\nMedium-term (systemic fix):\n- Add atomic alias activation: when aliasing keys for org-merge, update token->project cache and token_lineage atomically under a migration lock (or use a versioned key) so there is no transient window.\n- Extend reconciliation job to emit compensation writes: for any window where historical buckets were attributed to parent P but canonical lineage shows child C, emit reverse meter adjustments and annotate invoices.\n- Add an e2e test harness that runs a simulated org-merge and verifies no cross-account attribution after a 30s steady-state.\n\nImplementation notes:\n- Modify auth proxy (gateway) to add X-Token-Provenance header and a Token-Lineage-Sync endpoint in auth service (idempotent).\n- Metering ingestion should consult the Token-Lineage-Sync endpoint on 'pending' tokens; fallback timeout 5s.\n- Reconcile job must publish compensating delta records into the billing-stream with 'correction' tag so downstream consumers (billing, console) can apply them deterministically.",
+  "acceptance_criteria": "- In staging, run simulated org-merge test: zero incorrectly attributed requests in historical window after reconciliation run.\n- Rate-limiter owner counters show no spikes under parent account for aliased key traffic.\n- Reconciliation job produces correction records and billing dashboard flags affected invoices for manual review.\n- Add automated Canary: enable change for 5% of traffic for 24h with alerting on parent-account attribution > 0.5% of baseline.\n- Peer review + security review completed.",
+  "dependencies": [
+    "ENG-632204",
+    "ENG-50321"
+  ],
+  "parent_issue": [
+    "ENG-471209"
+  ],
+  "notes": "Design trade-offs: synchronous lineage lookup at ingress adds p99 risk; we mitigate by limiting to 5s and gating on 'pending_alias' header which should be rare. The compensation write approach lets us avoid retroactive datastore migrations at scale but requires careful invoice annotation and customer communication.\n\nBusiness impact estimate: For affected customers we project up to 10% billing variance on merged projects during the window. This is high-severity for enterprise customers.\n\nRollback plan: If the ingress change causes unacceptable latency, revert header-checking behavior and instead enable a soft-block that rejects aliased tokens until canonicalization completes (requires customer coordination).",
+  "rollout_plan": "1) Implement auth-proxy header + Token-Lineage-Sync endpoint in a feature branch. 2) Deploy to staging and run e2e org-merge harness. 3) Canary to 5% of production traffic for 24h with tight SLI/SLO monitoring. 4) If stable, ramp to 50% then 100% over 48h. 5) Run reconciliation compensation job once per data-partition for the last 72h of traffic and monitor billing diffs.\n\nCommunication: Publish customer-facing note and CS playbook for invoice adjustments and support queries. Coordinate with Sales for high-touch accounts.",
+  "monitoring": "Dashboards to add/update: \n- Metering: per-project attribution delta (expected vs canonical) per hour.\n- Rate limiter: owner tag distribution (parents vs children) for aliased keys.\n- Latency: ingress p50/p95/p99 for requests where X-Token-Provenance header present.\n- Reconciliation: count and size of compensation records emitted and number of invoices flagged.\n\nAlerting thresholds:\n- parent-account attribution > 0.5% of merged-org baseline in 1h -> P1 pager.\n- Reconciliation failure rate > 1% per partition in 24h -> P2 alert.\n\nLogging: Include token_id, token_lineage_id, resolved_owner, and provenance flags in ingestion trace so we can run fast forensic queries.",
+  "comments": [
+    "2026-03-02 Maya Chen: Initial triage complete \u2014 reproduced in local env with org-merge script. Token alias TTL observed at 11s and cache propagation at ~30s.",
+    "2026-03-03 Luis Ortega: Added experimental Token-Lineage-Sync stub. Will wire into gateway tomorrow. Estimating 2 days for PoC.",
+    "2026-03-05 Sarah Patel (Billing): Confirmed two enterprise customers affected; finance wants compensating adjustments for last billing cycle. Asked for a conservative repair plan.",
+    "2026-03-07 Ops: Canary metrics show parent-owner attribution spikes near 1.2% for aliased keys. Implementing header-based sync should reduce this.\nAction: block further org-merge runs in prod until mitigation deployed.",
+    "2026-03-10 Luis Ortega: PoC merged to staging branch. Running e2e harness now. Next: run reconciliation job in dry-run mode to validate compensation semantics."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "hypothesis",
+    "proposed_solution",
+    "acceptance_criteria",
+    "notes",
+    "rollout_plan",
+    "monitoring",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_f779f4bc7a2948aebcdac4b7010381df"
+}

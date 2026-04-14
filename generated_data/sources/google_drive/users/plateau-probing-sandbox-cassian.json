@@ -1,0 +1,33 @@
+{
+  "title": "Plateau probing sandbox \u2014 latency smoothing experiments",
+  "owner": "Cassian Patel",
+  "drive_area": "users",
+  "path": "users/plateau-probing-sandbox-cassian.json",
+  "doc_type": "doc",
+  "created_at": "2025-02-18",
+  "last_modified": "2025-03-01",
+  "collaborators": [
+    "Rae Kim"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "throughput",
+    "plateau",
+    "benchmark",
+    "batching",
+    "kv-cache",
+    "gpu-util"
+  ],
+  "linked_artifacts": [
+    "https://github.com/redwood-inference/inference-runtime/pull/874",
+    "INF-1324"
+  ],
+  "content": "Goal:\n- Understand the latency 'plateau' behaviour when QPS increases across the batching thresholds. Find quick knobs to smooth p95/p99 without sacrificing too much tokens/sec.\n\nBackground / hypothesis:\n- We see an odd region where increasing QPS doesn't lower p50 (expected) but p95/p99 spikes and then relaxes (sustained plateau). Hypothesis: queueing/batch-formation time + intermittent KV cache misses + GPU kernel warm paths cause non-linear tails.\n- Two levers to try quickly: 1) force smaller max_batch for hot models to reduce batch wait; 2) prefill / pin top-K tokens in KV cache; 3) introduce small jittered batching windows to avoid synchronized batch flush.\n\nTestbed:\n- Model: open-llama-13b-quant (local dedicated node emulation)\n- Hardware: 1x A800 80GB equiv (shared dev pool)\n- Inference runtime: rwinf-runtime:main @ PR #874 (linked) + local kernel selection toggles turned on\n- Config knobs: max_batch_size, max_latency_ms (batch wait), kv_cache_prefill=true/false, jitter_ms=0/1/3\n- Traffic generator: k6 + small python harness for controlled bursts (attached quick script below)\n- Workloads: short-context (64 tokens), med-context (256 tokens), long-context (1024 tokens). Most experiments focused on med-context since plateau visible there.\n\nQuick commands used:\n- baseline run: k6 run --vus 50 --duration 5m --http-debug=0 --rps 0 script.js (script.js contains POSTs to /v1/generate with varied seq len)\n- manual targeted burst: python burst_play.py --qps 120 --burst 300s --pattern poisson\n- runtime tweak: curl -X POST $ADMIN/config -d '{\"model\":\"open-llama-13b\",\"max_batch\":8,\"max_latency_ms\":20,\"kv_prefill\":true}'\n\nRaw observations (single run snapshots) \u2014 med-context (256 tokens):\n- Baseline (max_batch=16, max_latency_ms=50, kv_prefill=false, jitter=0):\n  QPS observed: 95 token-req/s\n  p50: 48 ms  p95: 238 ms  p99: 496 ms\n  GPU util: 67%  avg batch size: 12.3\n\n- Reduce max_batch -> 8, keep other knobs:\n  QPS observed: 85 token-req/s\n  p50: 42 ms  p95: 128 ms  p99: 212 ms\n  GPU util: 59%  avg batch size: 7.9\n\n- Same as above but kv_prefill=true (simple prefix cache for top-16 frequent prefixes):\n  QPS observed: 88 token-req/s\n  p50: 40 ms  p95: 96 ms  p99: 138 ms\n  GPU util: 61%  avg batch size: 8.1  kv_hit_rate: 23%\n\n- max_batch=16, add jitter_ms=3 (stochastic batch window), kv_prefill=false:\n  QPS observed: 92 token-req/s\n  p50: 47 ms  p95: 110 ms  p99: 172 ms\n  GPU util: 65%  avg batch size: 11.6\n\n- Lower max_latency_ms=20 (more aggressive flush), max_batch=16, kv_prefill=false:\n  QPS observed: 90 token-req/s\n  p50: 44 ms  p95: 140 ms  p99: 260 ms\n\nInterpretation:\n- The plateau/tail seems strongly correlated with average batch size crossing ~10-12; large batches reduce p50 but increase variance in p95/p99 due to occasional long queueing + kernel/alloc overheads on large B.\n- Turning on small jitter (3 ms) collapsed a lot of the tail without a big throughput hit \u2014 seems to de-synchronize arrivals and avoid pathological simultaneous flushes.\n- Prefill KV cache gave a surprising improvement to p95/p99 (kv_hit_rate ~ 20\u201325%) with negligible QPS loss \u2014 probably avoids early token-generation overheads (memory page faults / index lookups) on some common prefixes.\n- Aggressive batch flush (lower max_latency_ms) reduced avg tail in some runs but sometimes increased p99: likely because flushes triggered small micro-batches during bursts causing GPU inefficiency and CPU-side overhead for many small kernels.\n\nMini table (med-context, aggregated of 3 runs each, median values):\n- config: default (mb=16, ml=50, kv=false) -> p95 238 ms, p99 496 ms, qps 95\n- config: mb=8, ml=50, kv=false -> p95 128 ms, p99 212 ms, qps 85\n- config: mb=8, ml=50, kv=true -> p95 96 ms, p99 138 ms, qps 88\n- config: mb=16, ml=50, jitter=3, kv=false -> p95 110 ms, p99 172 ms, qps 92\n\nASCII quick chart (p95 across effective avg batch size):\n  avgBatch:  4   6   8    10    12    14    16\n  p95(ms):  72  84  98   135   220   270   238\n(note: the bump at 16 sometimes lower than 14 due to variance between runs; trend is non-monotonic)\n\nActionable takeaways (short):\n- For med-context workloads, prefer moderate max_batch (~8) + small jitter (1\u20133ms) as default policy for p95-sensitive customers.\n- Offer kv_prefill as an opt-in optimization for common prompt templates (low cost, measurable tail reduction).\n- Beware forcing too-aggressive flush thresholds; they can make many micro-batches and increase kernel churn.\n\nOpen questions / next experiments:\n- Repeat with long-context (1024) \u2014 initial micro-runs show even stronger tail due to KV misses and long-kernel spikes.\n- Measure CPU-side GC/paging during tail events to confirm paging hypothesis. Add perf counters (page-faults, mmap stats).\n- Explore dynamic adaptive batch cap based on recent p95 signal (auto downscale when tail drift detected).\n- Benchmark with two-model cascade (small fast model fallback) to see impact on tail during bursts.\n\nNotes to self / TODOs:\n- Push a small test harness to infra: run 6-hour continuous mixing poisson + diurnal to see real-world plateaus (ticket INF-1324).\n- Add kv_prefill config flag into runtime admin API if we keep testing positive results. PR #874 touches batching logic so watch for merge conflicts.\n- Share this doc with Rae and link into the canary run board (confluence TBD).\n\nAppendix: small helper script (pseudo) used for burst play:\n- burst_play.py (concept):\n  - generate arrivals using poisson lam; send POSTs with varied seq len; sleep jitter; record latencies client-side; emit p50/p95/p99 every 30s.\n\nClient latency capture snippet (k6-like):\n  http.post(url, payload, {tags: {seq: \"256\"}});\n\nEnd.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_43019714736f4690beaba196f63688d2"
+}

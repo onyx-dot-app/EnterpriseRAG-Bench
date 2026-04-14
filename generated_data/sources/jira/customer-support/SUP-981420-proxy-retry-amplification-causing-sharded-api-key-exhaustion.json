@@ -1,0 +1,110 @@
+{
+  "key": "SUP-981420",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Proxy retry amplification causing sharded API-key exhaustion and cascading 429s",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-14",
+  "reporter": "Maya Chen",
+  "assignee": "Luca Romano",
+  "customer_company": "QuantileAI",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "rate-limiter",
+    "serving-runtime",
+    "dedicated-pool"
+  ],
+  "labels": [
+    "429",
+    "rate-limits",
+    "retry-amplification",
+    "dedicated",
+    "proxy-sharding"
+  ],
+  "environment": "prod | us-east",
+  "affected_models": [
+    "redwood/gpt-large-v1"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-12",
+  "linked_issues": [
+    "INT-4421",
+    "SUP-71234"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/infra/pull/2789"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/Proxy+Retry+Amplification+Runbook"
+  ],
+  "description": "Issue summary: QuantileAI reported sustained 429 responses for a subset of production requests starting 2026-03-12 09:10 UTC. Traffic pattern: high-cardinality microservice front proxy that shards requests across ephemeral API keys per upstream worker. Symptoms indicate token-bucket exhaustion on the tenant-level accounting caused by synchronized client retries and per-request key fanout.\n\nImpact: ~12% of live inference requests return 429s intermittently across two services that share a forwarding proxy. Latency and throughput degraded for latency-sensitive features; customer reported increased errors in user-facing inference endpoints and alerted CSM.\n\nEnvironment: Dedicated pool (QuantileAI-reserved), prod us-east, HTTP/2 between customer proxy and Redwood edge, customer uses short-lived API keys minted per worker.\n\nObserved at: 2026-03-12 09:10\u201311:45 UTC.\n\nLogs & snapshots: see logs_snippet field for representative lines. Rate limiter metrics show tenant token balance hit zero for 30\u201390s windows while per-key buckets still had tokens (indicating misaligned accounting).\n\nHypothesis: Customer-side retry library performs coordinated retries with limited jitter plus our edge proxy shards requests across multiple ephemeral keys. When a subset of requests hit transient backend 503s, clients retried aggressively causing multiple keys to be used in quick succession and amplifying token consumption at the tenant level. The combination of per-request key fanout + synchronized retries caused tenant-level token buckets to be exhausted leading to cascading 429s for unrelated requests.",
+  "steps_to_reproduce": [
+    "1) Deploy small proxy that mints ephemeral API keys per outbound worker and multiplexes via HTTP/2 to Redwood edge.",
+    "2) Run 200 concurrent clients that call the proxy with a short timeout and a retry library configured with exponential backoff but no jitter (retries at 50ms, 100ms, 200ms).",
+    "3) Inject transient 503 responses at the serving-runtime for 2 minutes (simulate noisy GPU or model eviction).",
+    "4) Observe tenant token-bucket metrics and request traces in Console; expect tenant_quota_tokens to reach zero while individual key buckets report remaining capacity.",
+    "5) Observe surge of 429s across unrelated endpoints during retry window."
+  ],
+  "logs_snippet": [
+    "2026-03-12T09:11:03Z quantile-proxy worker-17 INFO outbound-key=k_3a9f path=/v1/generate status=503 latency_ms=312",
+    "2026-03-12T09:11:03Z edge rate-limiter tenant=quantileai token_balance=0 window=60s action=throttle key=k_7b12 returned=429",
+    "2026-03-12T09:11:04Z quantile-proxy worker-03 INFO retry_attempt=1 outbound-key=k_7b12 attempt_delay_ms=50",
+    "2026-03-12T09:11:04Z edge trace request_id=abc123 key=k_7b12 tenant=quantileai status=429 route=/v1/generate",
+    "2026-03-12T09:11:05Z monitoring tenant_quota quantileai tokens_consumed=12000 tokens_refilled=0 interval=60s"
+  ],
+  "investigation_notes": [
+    "Initial triage: verified 429s were tenant-scoped (Console tenant view) rather than per-key; deduced accounting at the tenant layer dropped below zero while some per-key counters remained positive.",
+    "Checked dedicated-pool autoscaler logs: no scaling events during window; serving-runtime reported transient 503s consistent with a single host eviction (investigation INT-4421).",
+    "Replayed customer traffic in staging with their proxy config: reproduced tenant-level 429s when retry library had no randomized jitter and when ephemeral keys were minted per request.",
+    "Confirmed customer was using an internal retry strategy that retries up to 5x with minimal backoff, amplifying the original failure into N simultaneous attempts across multiple keys.",
+    "Identified missing smoothing at the token-refill layer for tenant-level accounting when key fanout is high; rate-limiter treats each key consumption equally but tenant refill pulse is coarse (60s)."
+  ],
+  "customer_communication": [
+    "2026-03-12 10:05 UTC - Maya Chen (Support): 'Thanks for the report \u2014 we see tenant-level throttling in your account and are investigating. Can you confirm whether your proxy mints short-lived keys per worker and if your retry library adds jitter?'",
+    "2026-03-12 10:12 UTC - Alex Park (QuantileAI): 'Yes we mint keys per worker to isolate leaks. Our retry lib is internal; configured retries 0->50ms->100ms->200ms, no jitter. We can test toggling jitter if recommended.'",
+    "2026-03-12 10:40 UTC - Luca Romano (SRE): 'Working hypothesis: retry amplification across multiple ephemeral keys. Temporary mitigation: pause key fanout (reuse a pooled key for short bursts) or add jitter to retry. We'll also throttle internal health-checks to not count toward tenant tokens.'",
+    "2026-03-12 11:20 UTC - Alex Park: 'Applied pooled-key change and added randomized jitter (uniform 30-150ms). Errors dropped to baseline within ~90s. Customer confirms feature restored.'"
+  ],
+  "temporary_mitigations": [
+    "Instructed customer to switch proxy to a small pool of stable API keys (reuse across workers) for 10 minutes to absorb retry bursts.",
+    "Recommended enabling jitter in their retry library (random delay between 30\u2013150ms) to avoid synchronized retries.",
+    "Applied a short-term rule at edge to exclude internal health-check endpoints from tenant accounting while we audit the probe list (edge rule id=EXCLUDE-qa-health-2026-03-12)."
+  ],
+  "root_cause": "Combination of customer-side coordinated retries without jitter + per-request ephemeral API key fanout + coarse tenant-level token refill caused tenant token exhaustion and 429 responses across services.",
+  "resolution": "Customer applied pooled-key reuse and jitter; Support deployed a temporary health-check exclusion rule. Engineering (rate-limiter team) scheduled a change to smooth tenant-level refills and add a configurable per-tenant short-window burst multiplier to reduce sensitivity to transient retry storms. Patch tracked in infra PR and linked runbook. Final follow-up assigned to INT-4421 for persistent fix rollout.",
+  "resolution_links": [
+    "https://github.com/redwood-inference/infra/pull/2789",
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/Proxy+Retry+Amplification+Runbook"
+  ],
+  "next_steps": [
+    "ENG: Implement tenant-level refill smoothing and a short-window burst allowance (owner: rate-limiter team, target: 2026-03-20).",
+    "SRE: Monitor dedicated-pool tenant_quota for QuantileAI for 7 days post-fix (owner: Luca Romano).",
+    "CS: Share best-practice guidance with QuantileAI (pooled keys, retry jitter, health-check exclusion) and capture config in account notes."
+  ],
+  "final_status_notes": "Monitoring in progress \u2014 customer reports normal error rates since 2026-03-12 11:30 UTC. Engineering follow-up scheduled.",
+  "related_incident_id": "INC-2026-03-12-quantile-retry-amplification",
+  "audit_trail": [
+    "2026-03-12T10:30Z support:update assigned to Luca Romano",
+    "2026-03-12T11:00Z edge:update applied rule EXCLUDE-qa-health-2026-03-12",
+    "2026-03-12T11:25Z customer:update QuantileAI confirmed mitigation effective"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "investigation_notes",
+    "customer_communication",
+    "temporary_mitigations",
+    "root_cause",
+    "resolution",
+    "next_steps",
+    "final_status_notes"
+  ],
+  "dataset_doc_uuid": "dsid_2bc2cd757fbc42a69172f9b5d9928553"
+}

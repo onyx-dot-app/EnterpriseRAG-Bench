@@ -1,0 +1,125 @@
+{
+  "key": "ENG-488624",
+  "team": "engineering",
+  "title": "Investigate and remediate real-time vs reconstructed per-model peaks divergence in Console charts",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-24",
+  "updated_at": "2026-03-14",
+  "creator": "Ava Chen",
+  "assignee": "Miguel Torres",
+  "project": "console-usage-accuracy",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-31",
+  "labels": [
+    "metering",
+    "rate-limits",
+    "console",
+    "usage-accounting",
+    "backfill"
+  ],
+  "dependencies": [
+    "ENG-70123",
+    "ENG-112233"
+  ],
+  "release": "console-2026.03",
+  "description": "Summary: Over the last three weeks we've observed persistent divergence between the real-time streaming usage lines and reconstructed (ledger-based) per-model peak traces in the Console 'Top Models' chart for a subset of tenants. Divergence takes the form of short (~5-30 minute) positive spikes in reconstructed traces that have no corresponding events in the real-time stream, and occasional negative dips when a backfill replay removes previously attributed tokens. This ticket investigates root causes and implements fixes to ensure reconstructed aggregates match streaming view within agreed tolerance (<=1% hourly delta) and to eliminate customer-facing regressions after late ingests/backfills.",
+  "investigation_notes": [
+    "2026-02-25: Initial triage by telemetry team (Ava) - flagged from internal SLO alert: per-model hourly delta > 10% for 4 customers between streaming_feed and ledger_reconstructed aggregates.",
+    "2026-02-27: Pulled sample tenant audit (tenant_alpha): found late shard replays originating from shard-replayer service GC window; late events had sequence_ids but were missing ingestion_uuid header leading to no de-dup at reconstruction stage.",
+    "2026-03-01: Correlated spikes to rate-limit credit adjustments: dedicated-tenant burst credits were retroactively applied by billing-ledger job which mutates allocation_weight on historical tokens during commit; this causes reconstructed aggregation to add buckets after the fact.",
+    "2026-03-04: Frontend smoothing misalignment: chart smoothing window aligns to dashboard refresh time rather than event_time. When reconstruction inserts retroactive tokens the smoothing algorithm computed on client produced negative dips due to inconsistent time alignment.",
+    "2026-03-07: Reproducer created - synthetic ingestion pipeline produced late events (simulated network partition) and replayed into ledger; observed duplicate token attribution when ingestion_uuid missing; sample scripts and datasets uploaded to Drive (link in attachments).",
+    "2026-03-10: Hypothesis: two independent issues - (1) missing ingestion UUID and weak dedup logic during reconstruction, (2) mutation of historical allocation_weight by billing job without emitting compensating reconciliation events. Both amplify when smoothing window is misaligned in the UI.",
+    "2026-03-12: Confirmed cause-of-duplicates: shard-replayer retries used a different canonical_id and the ledger merge used a last-writer-wins on allocation_weight, not an additive adjustment; ledger_rebuild job lacks idempotent check for replayed sequences.",
+    "2026-03-13: Discussed with Billing (Leila Morgan) and Runtime (Ravi Patel) - agreed to stop retroactive allocation_weight edits without an audit delta event and to add ingestion_uuid propagation from gateway to ledger.",
+    "2026-03-14: Plan reviewed and approved by SRE and PM (Nina Roberts). Code owners assigned for reconstruction job and frontend chart smoothing.",
+    "Artifact links: console dashboard (internal) - https://console.internal/redwood/top-models; reproducer dataset (Drive) - https://drive.redwood/repro/late-events.zip; initial PR draft - https://github.com/redwood/recon/pull/1428"
+  ],
+  "root_cause_summary": "Two interacting defects: (A) Reconstruction pipeline did not reliably deduplicate late/replayed events because ingestion UUID was not mandatory and the idempotency key was sometimes different on retries; (B) Billing-ledger job applied allocation_weight corrections in-place on historical records instead of emitting reconciliation deltas, so reconstructed aggregates changed retroactively without a clear audit trail. The Console's smoothing logic then exaggerated visual artifacts when event_time and render_time diverged.",
+  "decision_log": [
+    "Make ingestion_uuid required at gateway and propagate to downstream tenants and ledger. Backfill existing records with best-effort UUIDs only for internal reconciliation where safe.",
+    "Change billing-ledger to emit explicit 'allocation_delta' reconciliation events rather than mutating historical allocation_weight. These deltas will be applied via the same reconstruction pipeline as regular token events so they are visible to streaming metrics and have an audit id.",
+    "Modify reconstruction job to perform idempotent merge by using (ingestion_uuid, sequence_id, tenant_id) tuple and skip events already applied. Add a small tombstone TTL for removed duplicates to prevent reapplication during backfill windows.",
+    "Adjust Console smoothing algorithm to window on event_time and make smoothing alignment configurable; surface 'data backfilled' marker if any backfilled events are applied older than 72 hours.",
+    "Introduce a 'reconciliation-mode' for the first run where we run reconstruction in dry-run and produce a diff report to validate before committing changes to the ledger.",
+    "Rollout plan: internal canary -> staging -> 100% once diff metrics under thresholds."
+  ],
+  "proposed_work_items": [
+    "ENG: Add ingestion_uuid enforcement to API gateway and return 400 if missing for new ingests (gateway change) - assignee: Miguel",
+    "ENG: Update reconstruction Spark job to deduplicate on (ingestion_uuid, sequence_id, tenant) and add dry-run mode (recon repo) - assignee: Priya S.",
+    "BILLING: Stop in-place allocation_weight edits and emit allocation_delta events instead (billing-ledger service) - assignee: Leila Morgan",
+    "ENG: Add reconciliation-run tooling to produce human-readable diff report and a reversed-apply path for safe rollback - assignee: Ravi",
+    "FE: Change chart smoothing to event_time alignment and add UI marker for backfilled data (console frontend) - assignee: Hana Kim",
+    "QA: Create synthetic test harness to simulate late replays and assert streaming vs reconstructed delta <1% hourly - assignee: QA Team"
+  ],
+  "implementation_notes": [
+    "Reconstruction: introduce state table 'applied_events_v2' keyed by (tenant, ingestion_uuid, sequence_id) with 'applied_at' timestamp. This table is append-only; deletions use tombstones so we can still compact later. Store only hashes to limit storage growth.",
+    "Billing: add producer for allocation_delta events. Fields: tenant_id, model_id, delta_tokens, reason, source_job_id, audit_id. Emitted deltas consumed by the same reconstruction pipeline so they show up in reconstructed aggregates in the same code path.",
+    "Frontend: smoothing change will be behind feature flag 'console.smoothing.event_time' initially. When enabled, smoothing uses event_time aligned windows. Also surface a small tooltip: 'Some values shown are from backfilled events applied after ingestion.'",
+    "Backward compatibility: gateway will accept older clients without ingestion_uuid for 30 days but will tag them as 'legacy' and route into a separate reconciliation queue to avoid immediate double-counting. After 30-day window we will enforce 400 errors.",
+    "Migration window: run dry-run recon on a 72-hour sliding window and produce diffs. Expect ~0.2% of tokens to reassign for most tenants; any tenant >5% flagged for manual review.",
+    "Performance: dedup checks will add a point lookup per event. We'll batch lookups in memory per partition and use Bloom filter heuristic to reduce DB load.",
+    "Observability: add reconciliation metrics: recon_diff_tokens, recon_diff_pct, deduped_event_count, allocation_delta_count. Add dashboards and pager rules if recon_diff_pct > 5% sustained for 1h.",
+    "Safety: large historical runs (>30 days) require Runbook signoff and manual throttling to avoid DB IOPS storms."
+  ],
+  "testing_qa": [
+    "Unit tests for dedup logic (ingestion_uuid missing/slightly different canonical ids)",
+    "Integration test: simulate gateway replay + billing delta emission and assert single final attribution per sequence_id",
+    "Staging job: run reconstruction dry-run for last 7 days, review diff report, and sample tenants in slack channel #recon-audit",
+    "Visual test: enable smoothing.event_time FF in staging and validate charts do not show negative dips after backfill runs",
+    "Canary: rollout to 10% of tenants with low churn for 48 hours and verify recon_diff_pct < 1% and no alert fires"
+  ],
+  "rollout_and_monitoring": [
+    "Phase 1 (internal): apply gateway and reconstruction dry-run on internal tenants - 3 days",
+    "Phase 2 (staging): enable allocation_delta emission and run dry-run recon across staging - 4 days",
+    "Phase 3 (canary): enable features for 10% tenants and monitor recon_diff_pct, chart anomaly rate, and user complaints - 48 hours",
+    "Phase 4 (global): full rollout if canary metrics OK. Post-rollout: weekly audit for 4 weeks to ensure no regressions.",
+    "Key metrics: streaming_vs_recon_token_diff_pct (goal <=1%), deduped_event_count, allocation_delta_count, console_chart_anomaly_rate",
+    "Alerting: create pager for recon_diff_pct > 5% sustained 1 hour (SRE Pager)",
+    "Postmortem: if any tenant experiences >10% token reassignments, block rollout and open incident review."
+  ],
+  "risk_and_mitigation": [
+    "Risk: Large historical reconciliation may cause DB/IO spikes. Mitigation: rate-limit backfill, use batched windows, and require runbook approval for >7-day runs.",
+    "Risk: Changing gateway to require ingestion_uuid may break older SDKs. Mitigation: 30-day grace period, legac y routing queue, and proactive customer comms.",
+    "Risk: Allocation deltas may not fully capture prior business logic (billing rounding). Mitigation: run parity checks against billing reports and involve Finance for validation.",
+    "Risk: Frontend FF may introduce minor visual differences. Mitigation: default FF off, compare before/after snapshots, and revert quickly if user impact seen."
+  ],
+  "comments": [
+    "2026-02-26 - Nina Roberts (PM): Thanks Ava \u2014 please prioritize tenants with revenue > $10k/month for earliest reconciliation windows.",
+    "2026-03-05 - Leila Morgan (Billing): I agree that we should emit allocation_delta events. I'll schedule changes for billing-ledger and share design doc (https://confluence.redwood/billing/allocation-delta).",
+    "2026-03-08 - Priya S. (Eng): Draft PR posted for recon changes - https://github.com/redwood/recon/pull/1428 - currently unit tests failing on dedup race. Need review from Ravi.",
+    "2026-03-10 - Ravi Patel (Infra): Suggested Bloom filter approach for dedup pre-filter; this should cut DB lookups by ~85% on typical traffic patterns. I'll prototype.",
+    "2026-03-12 - Hana Kim (Frontend): Will implement event_time smoothing behind flag. Need example API field 'event_ingest_timestamp' from reconstruction API.",
+    "2026-03-13 - QA Lead (Jordan Blake): Preparing synthetic harness. Will post results in #recon-testing channel after first run.",
+    "2026-03-14 - Miguel Torres (assignee): Beginning implementation for gateway enforcement and small recon dry-run window. ETA first PR by 2026-03-18."
+  ],
+  "attachments": [
+    "Reproducer dataset (Drive): https://drive.redwood/repro/late-events.zip",
+    "Design doc - allocation_delta: https://confluence.redwood/billing/allocation-delta",
+    "Draft PR - recon dedup: https://github.com/redwood/recon/pull/1428",
+    "Internal dashboard: https://console.internal/redwood/top-models?filter=recon-diff"
+  ],
+  "notes_for_follow_up": [
+    "After rollout, run monthly audit comparing billing invoice totals to reconstructed aggregates for 90 days.",
+    "Coordinate messaging for customers who may see small attribution revisions; prepare templated support response.",
+    "Consider making ingestion_uuid part of SDKs and generating server-side for older clients if adoption lag remains high."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "root_cause_summary",
+    "decision_log",
+    "proposed_work_items",
+    "implementation_notes",
+    "testing_qa",
+    "rollout_and_monitoring",
+    "risk_and_mitigation",
+    "comments",
+    "attachments",
+    "notes_for_follow_up"
+  ],
+  "dataset_doc_uuid": "dsid_6e6705e434734ac2a2508458fa5e19f5"
+}

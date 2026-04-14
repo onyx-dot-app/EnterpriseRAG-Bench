@@ -1,0 +1,95 @@
+{
+  "key": "ENG-73214",
+  "team": "engineering",
+  "title": "Tenanted Graceful Yield Policy with KV Temporary Reservation",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-28",
+  "updated_at": "2026-03-10",
+  "creator": "Aisha Kumar",
+  "assignee": "Carlos Mendes",
+  "project": "runtime-preemption-and-fairness",
+  "cycle": "2026-W09",
+  "estimate": "8",
+  "due_date": "2026-03-31",
+  "labels": [
+    "slo-aware",
+    "kv-cache",
+    "continuous-batching",
+    "gpu-memory",
+    "preemption"
+  ],
+  "parent_issue": [
+    "ENG-70412"
+  ],
+  "dependencies": [
+    "ENG-68950",
+    "ENG-72601"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.24",
+  "security_review_required": "false",
+  "description": "Problem: In high-util scenarios our continuous-batching preemptor aggressively evicts tenant KV state and GPU allocations to meet hard SLOs for higher-priority tenants. This causes two problems: (1) cache thrash when the preempted tenant resumes, leading to long tail latency spikes and increased token cost; (2) transient OOMs during preemption handoff because memory accounting is coarse-grained and doesn't distinguish reclaimable KV slabs from pinned model state.\n\nGoal: Implement a tenanted graceful-yield policy that (a) minimizes cache thrashing for preempted tenants by reserving a small temporary KV slab during a configurable grace window, (b) provides short \"burst-shield\" allowance for tenants to complete in-flight low-latency requests without triggering full preemption, and (c) refines GPU memory accounting to separate soft-evictable KV slabs from hard allocations to avoid unnecessary OOMs. The scheduler should remain SLO-aware (latency percentile and token budget) and be configurable per-customer tier.\n\nNon-goals: This ticket does not change multi-GPU placement or implement cross-node migration. It also does not add new tenant-level billing metrics (follow-up).\n\nProposed design (high level):\n1) KV temporary reservation: when a tenant is selected for preemption, the preemptor marks a small fraction of the tenant's KV cache (configurable, default 8% or 64MB, whichever smaller) as \"kv_grace_reserve\" and excludes those slabs from immediate eviction for a configurable grace_window (default 3s). The reserved slabs are backed by a soft reference which can be released earlier if overall GPU memory pressure crosses a hard threshold.\n\n2) Burst-shield tokens: each tenant has a burst token bucket (configurable tokens/time). During scheduling, low-latency requests (<= 200ms expected) can consume burst tokens to bypass preemption for short durations. Tokens are replenished on a rate tied to tenant SLA and weight. This prevents expensive preemption for quick interactive flows.\n\n3) Memory accounting refinement: split GPU memory into categories: model_core (pinned), kv_soft (evictable), kv_reserve (temporary reserved slabs), and transient (batch workspace). The preemptor uses kv_soft pressure to make eviction decisions first and only reclaims kv_reserve on hard pressure. We will add per-tenant slab-level reference counts and an approximate LRU aging score to prefer evicting slabs with lowest reuse probability.\n\n4) SLO integration: preemption decisions incorporate a tenant SLO budget vector (p50/p95 latency headroom and token-rate budget). A tenant approaching p95 SLA will be shielded from preemption unless another tenant has higher immediate SLO risk. Policies are weighted by tenant tier (free, standard, enterprise) and a runtime-configurable weight multiplier.",
+  "acceptance_criteria": [
+    "Scheduler honors kv_grace_reserve: reserved slabs are not reclaimed during grace_window under soft pressure.",
+    "Burst-shield prevents preemption for sub-200ms interactive requests when tokens available.",
+    "No increase in 99th percentile latency for sheltered tenants beyond baseline in our internal perf suite.",
+    "Overall memory reclamation still succeeds under worst-case stress (verified by fault-injection tests).",
+    "Feature gated behind runtime flag runtime.preemption.grace_reserve and per-tenant config.",
+    "E2E integration tests that simulate tenant churn and verify cache hit-rate improvement after preemption-resume cycle (target >= 15% hit-rate delta)."
+  ],
+  "notes": [
+    "2026-02-28: Ticket created after postmortem of incident INC-2026-01 where resumed tenants saw sustained latency spikes after preemption.",
+    "2026-03-03: Spike experiment on staging shows naive reservation of 128MB reduces resumed-p95 by 28% but increases preemption latency by ~15ms. Need smaller default reserve and soft-reclaim path.",
+    "2026-03-05: Design review with runtime team. Agreed to do slab-level reserve, not whole-cache reservation. Action: prototype kv slab tagging and soft-ref counting (ENG-72601).",
+    "2026-03-08: UX/PM (Liam) requested per-customer opt-out for burst-shield to avoid fairness exploit by noisy-tenants; decision: allow override in tenant policy with admin flag.",
+    "2026-03-10: Initial prototype landed in branch feat/preempt-grace-reserve. Microbenchmarks show ~12% lower token cost after resume in interactive workload. Next: add SLO weight integration and run CI fault-injection tests."
+  ],
+  "links": [
+    "Design doc: https://redwood.atlassian.net/wiki/spaces/INF/pages/GRACE-RESERVE-POLICY",
+    "Prototype PR: https://github.com/redwood-inference/runtime/pull/4192",
+    "Incident postmortem: https://redwood.atlassian.net/browse/INC-2026-01",
+    "Perf dashboard (staging): https://grafana.redwood-infra/staging/d/kv-grace/resume-latency"
+  ],
+  "decisions": [
+    "Use slab-level reservation instead of whole-cache reservation to limit memory overhead.",
+    "Default kv_grace_reserve = min(64MB, 8% of tenant_kv) and grace_window = 3s.",
+    "Burst-shield tokens apply only to requests tagged as interactive by SDK runtime metadata.",
+    "kv_reserve is soft and will be forcibly reclaimed under hard_memory_pressure > 92%.",
+    "Expose per-tenant admin override to disable burst-shield and adjust reserve size."
+  ],
+  "rollout_plan": "1) Canary on 10% of tenants on a single region with synthetic interactive traffic. 2) Monitor resume-p95, cache-hit delta, preemption latency; threshold gates: resume-p95 improvement >=10% and preemption-latency regression <=25ms. 3) Gradual ramp to 50% after 48h, full rollout after 7 days if metrics stable. 4) Provide kill-switch runtime.preemption.grace_reserve.disable=true.",
+  "metrics": [
+    "resume_p95_latency_ms (by tenant)",
+    "kv_cache_hit_rate_delta_after_resume (by tenant)",
+    "preemption_wall_time_ms",
+    "burst_tokens_consumed_per_minute",
+    "forced_reclaims_of_kv_reserve_count",
+    "overall_gpu_memory_pressure_percent"
+  ],
+  "test_plan": [
+    "Unit tests: slab tagging, soft-ref counting, reserve allocation and early-reclaim path.",
+    "Integration: continuous-batcher + preemptor interaction tests that validate reserve semantics under controlled memory pressure.",
+    "Fault-injection: simulate OOM path and ensure reserve reclamation prevents node crash.",
+    "Load tests: run multi-tenant interactive workload and measure resume-p95 and token cost over 24h.",
+    "Chaos: random preemption and tenant churn in staging with observability dashboards."
+  ],
+  "next_steps": [
+    "Finish SLO-weight integration (hook in telemetry signals for p95 headroom) - assigned to Carlos.",
+    "Add admin tenant policy UI spec for opt-out - pinged PM Liam for console ticket.",
+    "Run 72h staging ramp with focused interactive traces and collect baseline metrics.",
+    "Follow-up ticket to add billing-visible metrics around burst-shield usage (ENG-73801)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "notes",
+    "decisions",
+    "rollout_plan",
+    "metrics",
+    "test_plan",
+    "next_steps"
+  ],
+  "dataset_doc_uuid": "dsid_5c25aca541c744ed897fff6cc0abbf19"
+}

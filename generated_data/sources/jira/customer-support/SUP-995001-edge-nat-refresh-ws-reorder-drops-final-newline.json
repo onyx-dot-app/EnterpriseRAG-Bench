@@ -1,0 +1,97 @@
+{
+  "key": "SUP-995001",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Edge NAT refresh during idle triggers websocket midstream reorder and drops final newline-enabled chunk",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Sofia Chen",
+  "assignee": "Evan Brooks",
+  "customer_company": "MapleAI",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "edge-proxy",
+    "client-sdk"
+  ],
+  "labels": [
+    "streaming",
+    "websocket",
+    "nagle",
+    "reconnect",
+    "partial-output"
+  ],
+  "environment": "prod us-east-1",
+  "affected_models": [
+    "gpt-redwood-2.7b",
+    "gpt-compat-1.3"
+  ],
+  "affected_regions": [
+    "us-east"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-219210",
+    "SUP-4721"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/4523"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/SUP/pages/streaming-troubleshooting"
+  ],
+  "description": "Issue summary: Multiple customers on Dedicated seats (MapleAI) observed truncated final tokens or missing trailing newlines when a long-lived websocket streaming session becomes idle and a NAT or edge device refresh/rebind occurs. Impact: downstream document generation truncates last sentence; some clients see duplicate fragments when the connection is re-established. Environment: prod us-east-1, dedicated pool id d-34, traffic passes through customer edge + Redwood api-gateway -> edge-proxy -> serving-runtime chain. Observed since 2026-03-09 22:00 UTC after a customer-side firewall update. Noted only for streams > 30s idle with infrequent keepalives. Expected behavior: reconnect handshake or session migration should resume without losing the terminal JSON chunk and without duplicating previously emitted tokens.",
+  "steps_to_reproduce": [
+    "1) Start a long generation via websocket using model gpt-redwood-2.7b with a prompt that will emit a final newline-terminated paragraph (~350 tokens).",
+    "2) Let the stream stay idle for ~35s after last partial tokens are sent (simulate client-side NAT expiry or edge rebind).",
+    "3) Trigger a NAT refresh by forcing client IP rebind / toggling wifi briefly to mimic carrier NAT reassign, or run a simulated TCP RST from an upstream firewall.",
+    "4) Allow client to reconnect and resume the stream using the existing session token. Observe final chunk behavior and token ordering in client logs."
+  ],
+  "logs": [
+    "[2026-03-09T22:12:31Z] ef-proxy: tcp_connection_rebind client_ip=100.64.31.12 old_conn=2389 new_conn=2390",
+    "[2026-03-09T22:12:31Z] api-gateway: ws-close 1006 reason='peer reset' session=maple-user-71",
+    "[2026-03-09T22:12:32Z] serving-runtime: streamed_chunk id=abcd1234 offset=0 size=286 final=false",
+    "[2026-03-09T22:12:33Z] serving-runtime: streamed_chunk id=abcd1234 offset=286 size=42 final=true",
+    "[2026-03-09T22:12:33Z] api-gateway: resume-request session=maple-user-71 token=tok-xxxx resume_offset=320",
+    "[2026-03-09T22:12:33Z] api-gateway: resume-success session=maple-user-71 new_stream=stream-901",
+    "[2026-03-09T22:12:33Z] client-sdk: received_chunks=[chunk(offset=0), chunk(offset=286)] observed_final=false // missing trailing newline"
+  ],
+  "investigation_notes": [
+    "Initial hypothesis: NAT/edge rebind is causing a mid-flight TCP close that the gateway interprets as a hard terminal and the resume path is failing to replay a small terminal fragment (single chunk containing final newline + metadata).",
+    "Reproducer confirmed with internal loadgen when forcing ephemeral port change on client after idle period > 30s.",
+    "Edge proxy (ef-proxy) logs show connection rebind events correlated with missing final newline. In some traces resume sequence shows offsets matching pre-close chunk boundary but client does not receive the terminal delimiter; parser on client therefore treats last JSON choice as incomplete.",
+    "Client-side ACK ordering shows a minor reorder in chunk sequence when rebind happens; gap is always on last chunk boundary (final=true on server but not observed by client).",
+    "Nagle/Coalesce suspected: small final fragment may be coalesced into TCP FIN sequence which is lost on rebind; gateway resume logic currently assumes whole-chunk atomicity and doesn't re-emit last 8-16 bytes when resume_offset equals chunk end.",
+    "No evidence of corruption in serving-runtime; all chunks are recorded in storage and present in runtime logs. Problem appears in the handoff between ef-proxy and api-gateway session resume logic."
+  ],
+  "comments": [
+    "2026-03-10 09:12 - Support (Sofia Chen): Customer reports ~1-2% of long-running websockets missing final newline which breaks downstream JSON parsing. Provided SDK logs and sample trace ids.",
+    "2026-03-10 11:04 - SRE (Aisha Patel): Captured ef-proxy trace for session maple-user-71; saw connection rebind at TCP layer. Opening investigation with api-gateway owners.",
+    "2026-03-10 14:22 - API Team (Evan Brooks): Confirmed resume path does not force re-emit last 16 bytes when resume_offset matches recorded chunk_end; working on a patch to conservatively re-send trailing partial fragment when reconnect is detected.",
+    "2026-03-11 08:30 - Customer (MapleAI - ops@maple.ai): Able to reproduce with our QA harness; impact is primarily a downstream parse error in our ingestion pipeline. We can accept a client-side workaround to add tolerance for missing trailing newline but prefer server-side fix.",
+    "2026-03-11 13:56 - Support (Sofia Chen): Raised incident communication to customer; ETA for patch included below."
+  ],
+  "resolution": "Workaround: Customer updated client to treat missing trailing newline as valid end-of-stream for 24h window; deployed parsing fallback. Fix: API gateway patch merged to ensure on resume, if resume_offset == recorded_chunk_end, gateway will retransmit up to 64 bytes of trailing data or the final chunk marker. Patch PR: https://github.com/redwood-inference/runtime/pull/4523. Deployed to staging 2026-03-12; running A/B on dedicated cluster d-34. Full rollout scheduled after 48h of no regressions.",
+  "follow_up_tasks": [
+    "1) Instrument keepalive heuristics: add metric for idle-time-to-rebind events and correlate with missing-final-chunk rate (assigned to SRE).",
+    "2) Update client SDK docs with guidance on tolerant JSON parsing for streaming outputs (DX team).",
+    "3) Add integration test that simulates NAT rebind and asserts final chunk delivery (runtime test-suite).",
+    "4) Evaluate whether to change default keepalive interval for dedicated pools behind NAT-prone edges."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution",
+    "follow_up_tasks"
+  ],
+  "dataset_doc_uuid": "dsid_f8518c73e44d4dd8a0d5a266aa4026ac"
+}

@@ -1,0 +1,93 @@
+{
+  "key": "SUP-920202",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Duplicate function calls during Go worker graceful restart due to ephemeral idempotency-seed derived from PID",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-13",
+  "reporter": "Aisha Kumar",
+  "assignee": "Liam O'Connor",
+  "customer_company": "BrightCart",
+  "customer_tier": "private",
+  "components": [
+    "sdk-go",
+    "serving-runtime",
+    "private-deploy",
+    "idempotency-service"
+  ],
+  "labels": [
+    "idempotency",
+    "duplicates",
+    "go-sdk",
+    "private-deploy",
+    "urgent"
+  ],
+  "environment": "prod | eu-west",
+  "affected_models": [
+    "rw-infer-13b-v1"
+  ],
+  "description": "BrightCart reports repeated duplicate executions of a downstream payment webhook (charge_customer) after their orchestrator workers are restarted as part of scheduled rolling updates. Duplicates occur intermittently when a restarted Go worker reuses the same OS PID as the previous process, and our Go SDK's ephemeral idempotency seed (pid + timestamp-derived salt) collides with the prior in-flight requests, causing the serving runtime to accept a retry as a new request and re-run the function call.",
+  "steps_to_reproduce": [
+    "1) Deploy BrightCart's Go orchestrator on Private Redwood in eu-west. The worker uses SDK-Go v0.34 which derives ephemeral idempotency seeds using `fmt.Sprintf(\"%d-%d\", os.Getpid(), time.Now().UnixNano())` for session-scoped idempotency.",
+    "2) Start a long-running orchestration that triggers an external `charge_customer` function call (external webhook) and does not immediately receive the webhook callback (delayed ack pattern).",
+    "3) Trigger a graceful restart of the worker (kubectl rollout restart or systemd restart) while the orchestration is in-flight so the original process exits and a new process starts quickly.",
+    "4) If PID is recycled by the OS and the new process generates an ephemeral idempotency seed identical to the previous (rare but possible under high churn), Redwood's serving runtime treats the incoming replay/new connection as a new idempotent scope and does not match the original confirmation token. The SDK sends a retry and the function executes again, leading to duplicate side effects (double charge).",
+    "Expected: SDK/server should deduplicate by a stronger request identifier (UUID or persisted session id) rather than ephemeral PID to avoid collisions across process restarts."
+  ],
+  "logs": [
+    "2026-03-09T21:14:12.673Z INFO orch_worker.go:342 starting orchestration run=brc-ord-2304 pid=2143 idempotency_seed=2143-1615383426730000000",
+    "2026-03-09T21:14:45.912Z INFO http_client.go:142 webhook outbound POST /charge_customer status=202 body=\"accepted\"",
+    "2026-03-09T21:14:50.001Z INFO systemd: main process exited pid=2143 code=0",
+    "2026-03-09T21:14:50.210Z INFO orch_worker.go:77 new process started pid=2143 idempotency_seed=2143-1615383426745000000",
+    "2026-03-09T21:14:50.315Z WARN sdk-go retry.go:58 no confirmation received; scheduling retry; seed=2143-1615383426730000000",
+    "2026-03-09T21:14:50.420Z ERROR serving-runtime func_exec.go:211 function=charge_customer run=brc-ord-2304 duplicate_execution_detected=false -> executing again"
+  ],
+  "investigation_notes": [
+    "Support reproduced locally with a controlled PID recycle using a small container pool: when the worker process restarts quickly, the SDK's seed generator can produce identical seeds because it uses PID + time-snap; race window small but observed under rapid restarts.",
+    "Serving runtime uses idempotency key namespace that included the SDK-provided seed. Because seed collides and the confirmation token path relies on per-connection confirmation events, the runtime cannot correlate the original ack with the retry coming from a new connection context.",
+    "Hypothesis: root cause is weak entropy in SDK seed + short-lived session scoping for function confirmations. The Private deployment environment (low PID entropy in small k8s node pool) increases probability of collision.",
+    "We inspected other customers (dedicated/hosted) and do not see wide impact; likely specific to small on-prem clusters with rapid orchestrator rollouts.",
+    "Customer used SDK-Go v0.34; later SDK versions include UUID-based session ids (v0.35+)."
+  ],
+  "comments": [
+    "2026-03-10T09:05:21 - Aisha Kumar (Support): Logged after customer provided call traces and webhook payloads. Customer is in private tier and has production impact (payment duplicates). Requested escalation.",
+    "2026-03-10T11:12:03 - BrightCart (Customer): We saw 3 duplicate charges across 2 customers during a rolling update. We've reverted the rollout to stop churn but need a root cause and fix before resuming.",
+    "2026-03-10T13:40:11 - Liam O'Connor (Eng): Initial reproduction performed in sandbox. Confirmed PID-based seed generation in SDK-Go v0.34. Created minimal repro harness and reproduced duplicate execution in 1/200 restarts (matches customer frequency given their rollout cadence).",
+    "2026-03-11T08:22:47 - SRE (Emma Torres): Private eu-west k8s nodes have small PID allocation ranges due to ephemeral container reuse on their host images. This increases PID recycling speed vs public clouds.",
+    "2026-03-12T15:03:59 - Eng (Liam O'Connor): Draft PR to SDK-Go to switch default ephemeral seed to RFC4122 UUIDv4 and to persist session id to a file descriptor across graceful restarts when possible. PR: github.com/redwood-inference/sdk-go/pull/482 (pending review).",
+    "2026-03-12T16:20:10 - Support (Aisha): Sent mitigation steps to customer (see resolution). Customer agreed to test SDK patch in staging before stable rollout."
+  ],
+  "linked_issues": [
+    "SUP-412530"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/sdk-go/pull/482",
+    "https://github.com/redwood-inference/serving-runtime/commit/7f0b2a1"
+  ],
+  "related_confluence_pages": [
+    "https://redwood-internal.atlassian.net/wiki/spaces/INF/pages/Idempotency+Design+Notes"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "resolution": "Workarounds provided: 1) BrightCart rolled back the aggressive restart window to ensure PID reuse window is avoided; 2) Short-term: set environment variable REDWOOD_IDEMPOTENCY_SALT to a stable per-process random UUID at process bootstrap (customer applied and validated in staging). Engineering changes: merged SDK-Go PR to use UUIDv4 for ephemeral seeds (v0.35.0). Serving runtime safe-guard added to treat exact-seed collisions from different connection contexts as potential replays and prefer confirmation matching by request-level request_id when present (deploy rollout planned to private eu-west on 2026-03-16).",
+  "follow_up_actions": [
+    "1) Engineering to backport UUID seed change to v0.34.x branch for customers who cannot upgrade; timeline: 3 business days.",
+    "2) SRE to recommend node image update to increase PID entropy for Private customers; documentation update in Confluence runbook.",
+    "3) Product to notify other private customers with small node pools about recommended SDK upgrade and env var mitigation.",
+    "4) Postmortem to be prepared if customer confirms duplicates in wider window; due date 2026-03-20."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution",
+    "follow_up_actions"
+  ],
+  "dataset_doc_uuid": "dsid_b5cdbc9bb7e546bba5c8aae8e02d1ec7"
+}

@@ -1,0 +1,42 @@
+{
+  "title": "eventstream-sendq-throttle-debug-scratchpad",
+  "owner": "Maya Kim",
+  "drive_area": "users",
+  "path": "users/",
+  "doc_type": "doc",
+  "created_at": "2025-11-10",
+  "last_modified": "2026-03-05",
+  "collaborators": [
+    "Jonah Patel",
+    "Eli Turner"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "sse",
+    "backpressure",
+    "tcp",
+    "debug",
+    "repro"
+  ],
+  "linked_artifacts": [
+    "https://linear.app/redwood/issue/RWD-1234-sse-backpressure",
+    "https://github.com/redwood-inference/runtime/issues/421",
+    "slack://channel/C12345/thread/p1627381912000100"
+  ],
+  "repro_commands": [
+    "# basic SSE consumer (no buffering): curl -N -H \"Accept: text/event-stream\" -H \"Authorization: Bearer $TOKEN\" \"https://api.redwood.example/v1/stream?model=gpt-r1&prompt=hello\"",
+    "# simulate very slow consumer (throttle stdout with pv): curl -N -H \"Accept: text/event-stream\" -H \"Authorization: Bearer $TOKEN\" https://api.redwood.example/v1/stream?model=gpt-r1 | pv -qL 100 > /dev/null",
+    "# pause/resume consumer with Node (repro script in ./scripts/pause-consumer.js): node ./scripts/pause-consumer.js",
+    "# check socket queues while reproducing: watch -n1 'ss -tnp | grep <server-pid-or-port>'",
+    "# capture packets: sudo tcpdump -i any -s0 -w /tmp/sse-backpressure.pcap 'tcp and port 443'",
+    "# force network throttling (local dev): sudo tc qdisc add dev lo root tbf rate 100kbit burst 32kbit latency 400ms; # remove with tc qdisc del dev lo root"
+  ],
+  "content": "Notes / breadcrumbs for the intermittent streaming/backpressure bug. Personal scratchpad \u2014 very rough.\n\nSummary:\n- Observed sessions where server emits SSE chunks fine for ~10s, then client-side recv-Q grows and server starts logging broken pipe / write errors shortly after client resumes. Behavior seems tied to a slow consumer scenario + proxy buffering.\n- Repro is intermittent in staging behind envoy/nginx; easier to trigger by intentionally throttling the client (pv / tc / paused reads).\n\nTimeline + symptoms observed:\n- 2025-11-09: first reported by support (customer seeing truncated responses after long pauses).\n- 2025-11-11: instrumented worker: saw send-Q jump to ~65k for socket while CPU on worker stayed low; server eventually hit EPIPE when trying to write the next chunk and connection went away.\n- 2025-12-02: QA reproduced locally by piping to pv -L 50B/s \u2014 server wrote ~200 chunks then connection reset.\n\nLocal repro notes (what I ran):\n- curl -N -H 'Authorization: Bearer $TOKEN' 'https://api.redwood.example/v1/stream?model=gpt-r1' | pv -qL 100 > /dev/null  # reliable locally\n- node scripts/pause-consumer.js -> script opens connection, consumes some chunks, then calls stream.pause() for 12s, then resume; server logs show write blocking and later EPIPE.\n- Added 'watch ss -tnp' during run and saw send-Q growing to > 60000 while recv-Q near 0 on server side (i.e. client not ACKing or kernel buffering).\n\nRepresentative server log snippets:\n- 2025-11-11T14:22:10Z WARN [streaming/conn-389] send-Q high=65536 -> applying backpressure to model runner\n- 2025-11-11T14:22:24Z ERROR [io/writer] write failed: broken pipe (EPIPE) while streaming delta chunk id=0x7b3c\n- 2025-11-11T14:22:24Z DEBUG [runner] last-produced-offset=640128 in-cache; aborted-shard=3\n\nHypotheses (ranked):\n1) Proxy or LB buffering combined with client pause -> TCP send buffers fill up then kernel signals RST when buffer pressure grows and server keeps writing. Envoy/nginx config might covertly buffer the stream and hold open connection to downstream.\n2) Server doesn't detect slow consumer fast enough (we rely on non-blocking writes and EAGAIN loops); when writes repeatedly return EAGAIN we should apply backpressure to the model runner earlier (we already have a gating mechanism, may be tuned incorrectly).\n3) Client or OS-level keepalive/timeouts interfering: some clients close without proper FIN after long pauses, creating RSTs.\n4) Memory pressure in connection write path (KV-cache flush causing a large burst followed by no emission -> one big write that fills send-Q).\n\nWhat I've tried (quick notes):\n- Disabled proxy buffering on nginx: set 'proxy_buffering off' and 'X-Accel-Buffering: no' \u2014 reduced incidence in one test but not eliminated. Might be a config rollout mismatch.\n- Tuned server backpressure thresholds down (send-q threshold from 64k -> 32k) in a sandbox; reproduced still but slightly faster failure (meaning threshold matters but not full fix).\n- Added strace -e write -p <pid> while run: observed write() returning -1 EAGAIN repeatedly for ~3s before eventual EPIPE. We probably aren't handling EAGAIN backpressure window long enough.\n- Reproduced with and without TLS (terminating at envoy): more flaky when envoy terminates TLS (possibly because envoy has its own buffering/flow control semantics).\n\nUseful debugging commands / low-level checks:\n- ss -tnp | grep <port>  # check Send-Q / Recv-Q columns for server socket\n- sudo tcpdump -i any -s0 'tcp and port 443' -w /tmp/cap.pcap then open in Wireshark to inspect window updates/zero-window events\n- strace -f -e write -p <worker-pid> to see blocking behaviour of userland write syscalls\n- sudo perf top / pmap to ensure memory spikes not correlated to the event\n\nQuick repro (full):\n1) Start local dev worker (no envoy)\n2) run: curl -N -H 'Authorization: Bearer $TOKEN' 'http://127.0.0.1:8080/stream?model=gpt-r1' | pv -qL 80 > /dev/null\n3) observe server logs and ss output\n\nNode pause-consumer.js (notes):\n- Implementation: simple https.get(...), on('data') push to buffer, after 5s call stream.pause(), setTimeout(() => stream.resume(), 12000)\n- Observed: kernel send-Q jumps and server write returns EAGAIN repeatedly until client resume; on resume client gets only some partial data then TCP connection reset.\n\nOpen questions / next actions:\n- Is envoy intentionally buffering upstream data for some interval and only flushing in bursts? Check envoy config for 'stream_error_on_invalid_http_message' or 'flush_interval' settings.\n- Revisit our non-blocking write loop: do we spin CPU when EAGAIN? should we register POLLOUT and yield model runner earlier? Add metrics for EAGAIN count per connection.\n- Add socket-level metrics: send-Q / recv-Q gauge per connection (sample every 1s) and log when > threshold.\n- Test with keepalive tweaks: net.ipv4.tcp_retries2, tcp_keepalive_time, and TCP_USER_TIMEOUT to see if an RST path triggers sooner and avoid stuck writes.\n\nImmediate todo for next session:\n- Add ephemeral metric for consecutive EAGAINs and expose via console-dashboard for a few days. (Jonah)\n- Run end-to-end test with envoy disabled and then with envoy configured 'stream_idle_timeout' low to force earlier reset; compare behavior (Eli).\n- Attempt a small runtime change: after N consecutive EAGAINs mark connection as slow and pause model runner output for that connection (Maya).\n\nNotes-to-self:\n- This is not the same as chunk boundary corruption \u2014 payloads themselves look valid when received. Root cause is flow-control/backpressure.\n- Watch for related tickets: RWD-1284 (client-side retry logic) \u2014 could be masking issue.\n\nReferences / past artifacts:\n- GH issue: runtime/issues/421 (sse: handle socket backpressure better)\n- Linear: RWD-1234 (customer observed truncation)\n- Slack thread: #serving-runtime diagnostics (link above)\n\nIf I lose this file: also check ~/notes/streaming/sse-backpressure.txt and the test harness in ./scripts.\n\nEnd of scratchpad.\n",
+  "original_location": "google_drive/users/eventstream-sendq-throttle-debug-2026.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_50c587bfbd024821a03a02f869f6815f"
+}

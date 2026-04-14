@@ -1,0 +1,106 @@
+{
+  "key": "ENG-26109",
+  "team": "engineering",
+  "title": "Untangle batch commit path and migrate KV cache lease ledger out of global scheduler",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2024-11-06",
+  "updated_at": "2024-11-18",
+  "creator": "Ava Chen",
+  "assignee": "Diego Morales",
+  "project": "runtime-stability",
+  "cycle": "2024-W45",
+  "estimate": "8",
+  "due_date": "2024-12-05",
+  "labels": [
+    "tech-debt",
+    "kvcache",
+    "batching",
+    "perf"
+  ],
+  "parent_issue": [
+    "ENG-24678"
+  ],
+  "dependencies": [
+    "ENG-20456",
+    "ENG-17382"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "We have accumulating complexity in the continuous batching controller: commit/ack paths are entangled with the global scheduler and a KV-cache lease/ledger implementation that serializes operations under a global lock. This is causing tail latency spikes under mixed workloads and makes iterative rollouts risky. This ticket aims to separate the batch commit state machine from scheduling responsibilities and migrate the KV-cache lease ledger into a sharded lease coordinator with lease handoff semantics and lock-free read paths.",
+  "background": "Current behavior: the batch controller holds a global commit lock during finalize/commit which touches the KV cache lease ledger to update slot ownership. The ledger is a single map guarded by a mutex; high concurrency leads to contention and tail latency increases. Past tactical fixes (shorter mutex windows, retry backoff) reduced incidents but didn't eliminate SLO regressions for large multi-tenant bursts. This is recurring tech debt identified in previous retros and related tickets listed in dependencies.",
+  "investigation_findings": [
+    "Observed 95th percentile token latency increase from 120ms to 340ms under mixed short/long seq workloads (see perf dashboard).",
+    "Heap profiler shows KV-lease map mutex hold times frequently >5ms during high concurrency windows.",
+    "Batch commit path performs synchronous updates to ledger which can cascade into waiting threads in the continuous batch drain loop.",
+    "Scheduler code mixes policy decisions (which lane to prefer) with low-level commit bookkeeping, increasing cognitive load and making small changes risky."
+  ],
+  "proposed_solution": [
+    "Extract the commit state machine from the scheduler into a dedicated BatcherCommit service with a small, well-defined API (prepare/commit/abort).",
+    "Replace the global KV-lease ledger with a sharded LeaseCoordinator: N shards by key-range, each with a lock-free read path and an optimistic fast-path for lease refreshes. Writes will be serialized per-shard but parallel across shards.",
+    "Introduce a short-lived commit token propagated through requests so commit operations can be reconciled without touching global scheduler state.",
+    "Provide a compatibility shim so existing scheduler can call the new APIs; migrate callers incrementally behind feature flags."
+  ],
+  "implementation_steps": [
+    "1) Add LeaseCoordinator interface and in-memory sharded implementation (unit tests).",
+    "2) Implement BatcherCommit service with APIs and local integration tests; wire prepare/commit/abort flows with in-memory lease coordinator for integration tests.",
+    "3) Add feature flag 'sharded-kv-lease' and 'separate-commit-service' for incremental rollout.",
+    "4) Swap scheduler calls to use compatibility shim that delegates either to legacy ledger or new coordinator based on flags.",
+    "5) Run microbench harness comparing legacy vs sharded lease under synthetic multi-tenant bursts; collect p50/p95/p99 token latencies and mutex contention metrics.",
+    "6) Canary deploy new behavior in dedicated region for low-traffic customer subset; monitor for errors and regressions for 72 hours.",
+    "7) Full rollout after sign-off and monitoring stabilization."
+  ],
+  "rollback_plan": "Feature flags allow instant rollback: flip 'separate-commit-service' and 'sharded-kv-lease' back to false to restore legacy code paths. If rollback required during canary, we'll also clear any ephemeral commit tokens and run a reconciliation job to ensure no partial commits remain (script in links).",
+  "test_plan": [
+    "Unit tests for LeaseCoordinator shard correctness and boundary cases (ownership transfer, concurrent refresh).",
+    "Integration tests for BatcherCommit lifecycle (prepare -> commit -> abort) with simulated delays and failures.",
+    "Stress test harness reproducing mixed workload profile from perf dashboard (short+long sequences, ~200 concurrent clients).",
+    "Chaos tests: kill shard workers mid-lease-refresh, simulate network partitions between scheduler and coordinator.",
+    "End-to-end canary validation with perf and correctness checks for 72h."
+  ],
+  "monitoring_metrics": [
+    "token_latency_p50/p95/p99 (per-region, per-model)",
+    "kv_lease_mutex_hold_time_ms histogram (legacy) and lease_coordinator_shard_hold_ms (new)",
+    "batch_commit_success_rate",
+    "failed_commits_due_to_lease_conflict",
+    "scheduler_queue_depth_by_lane"
+  ],
+  "acceptance_criteria": [
+    "95th percentile token latency under synthetic mixed workload is <= legacy baseline + 5% (target: <=130ms).",
+    "Mutex hold time on legacy map is eliminated behind flag; new shard hold times are <1ms median under stress.",
+    "No increase in commit-related error rates (<=0.1% observed in production windows).",
+    "Canary runs 72 hours with no regression and stable metrics; roll-forward approved by eng leads."
+  ],
+  "links": [
+    "Confluence: https://redwood.atlassian.net/wiki/spaces/INFR/pages/123456/untangle-batch-commit",
+    "Design doc (internal drive): https://drive.google.com/file/d/1a2b3c-kv-lease-design",
+    "Perf dashboard: https://grafana.redwood.ai/d/commit-lease/perf-overview",
+    "PR: https://github.com/redwood-inference/runtime/pull/4821",
+    "Reconciliation script: https://github.com/redwood-inference/tools/blob/main/scripts/commit_reconcile.sh"
+  ],
+  "comments": [
+    "2024-11-07 - Ava Chen: Initial triage completed. Reproduced tail latency locally with the mixed workload harness. Suggest sharded lease approach after profiling mutex hotspots.",
+    "2024-11-09 - Diego Morales: Spike spike: prototype for LeaseCoordinator shard map implemented. Benchmarks show p95 drop ~30% in microbench harness. Need to instrument more metrics before landed.",
+    "2024-11-12 - Monica Patel (SRE): Please ensure reconciliation script idempotency. Also suggest adding a metric for 'lease_handoff_failures' to monitor potential contention windows.",
+    "2024-11-14 - Diego Morales: Opened PR 4821 with the initial refactor; feedback from code review requests stronger separation of concerns and smaller functions for testability. Addressing comments now.",
+    "2024-11-17 - Ava Chen: Canary started in eu-west-1 for ~12 customers behind flag. Early signals look good; p95 token latency down 18% vs baseline. Continuing monitoring for 48h.",
+    "2024-11-18 - Diego Morales: Found a rare race during lease handoff when shard rebalancer runs concurrently; added a lightweight per-shard quiesce phase and updated tests. Will re-run canary tomorrow."
+  ],
+  "notes": "This refactor is intentionally staged to reduce blast radius: feature flags + compatibility shim allow us to revert instantly. Primary risk is subtle race during shard reconfiguration - added canary and chaos tests to catch this. Coordinate with SRE for alert thresholds and escalation playbook before full rollout.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "background",
+    "investigation_findings",
+    "proposed_solution",
+    "implementation_steps",
+    "test_plan",
+    "monitoring_metrics",
+    "acceptance_criteria",
+    "rollback_plan",
+    "comments",
+    "notes"
+  ],
+  "dataset_doc_uuid": "dsid_4c651631c61d4e8cad7929de1a063e3e"
+}

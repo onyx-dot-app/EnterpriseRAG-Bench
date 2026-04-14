@@ -1,0 +1,33 @@
+{
+  "title": "burstbackoff-coalescing-probe",
+  "owner": "Felix Ortega",
+  "drive_area": "users",
+  "path": "users/burstbackoff-coalescing-probe-felix",
+  "doc_type": "doc",
+  "created_at": "2025-11-02",
+  "last_modified": "2025-11-08",
+  "collaborators": [
+    "Mira Patel",
+    "Liam Chen"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "burstiness",
+    "backoff",
+    "coalescing",
+    "gpu-scheduling",
+    "microbenchmark"
+  ],
+  "linked_artifacts": [
+    "https://redwood-confluence/internal/INF-BURST-PLANS",
+    "GITHUB: redwood/runtime#4821",
+    "JIRA: INF-2345"
+  ],
+  "content": "Purpose:\nQuick personal log of experiments exploring a burst backoff + request coalescing strategy to reduce p99 tail for short, bursty text-gen requests on Dedicated pools. Trying to find low-friction knobs that reduce tail without harming median latency or throughput.\n\nHypotheses:\n- Small negotiated coalescing windows (2\u201310ms) during microbursts can increase batching efficiency and reduce GPU kernel churn, lowering p95/p99.\n- An exponential backoff applied to immediate retry paths (i.e., reject->retry by client) can smooth scheduler pressure if the serving layer responds with a short server-side backoff hint.\n- Cooperative GPU scheduling (let a competing long request yield) combined with request coalescing yields better tail than pure preemption for medium-length responses (<=256 tokens).\n\nTest bed:\n- Cluster: dedicated-pool-small (4xA100-40GB), preemptible=false, isolation=tenant-1\n- Runtime: redwood-runtime v1.9.2 (local build from GH PR 4821)\n- Model: llama-2-7b-chat quantized (int8 fallback kernels enabled)\n- Clients: 8 worker processes generating Poisson arrivals (lambda varied) from a separate node in same AZ\n- Baseline config: max_batch_tokens=4096, batch_timeout_ms=5, kv_cache_prefill=true, coalesce_window_ms=0, server_backoff_hint_ms=0\n\nWorkloads:\n1) microburst-1: steady 40 qps, every 10s a spike of 400 qps for 200ms\n2) microburst-2: steady 20 qps, randomized spikes (Weibull interarrival) 300\u2013800 qps for 100\u2013500ms\n3) mixed-short: 50% short (30 tokens), 50% medium (150 tokens), steady 120 qps with 1s bursts of 400 qps\n\nConfigs tried (names used below):\n- baseline (no coalescing/backoff)\n- c5 (coalesce_window_ms=5)\n- c10 (coalesce_window_ms=10)\n- b50 (server_backoff_hint_ms=50)\n- c5b50 (coalesce 5ms + backoff 50ms)\n- coop (cooperative-scheduler=true, coalesce_window_ms=5)\n\nCommands (microbench harness):\n- launcher: ./bench-driver --target tenant-1 --arrival microburst-1 --duration 600s --clients 8 --qps 40\n- change runtime config via /admin/config apply --file configs/c5.json\n- tail logs: kubectl logs -f pod/runtime-xxxxx -c runtime | grep \"batch_size\"\n\nKey raw observations (aggregated over three 10-minute runs each):\n- Baseline (microburst-1): p50=18ms, p95=120ms, p99=580ms, throughput sustained at 98% of capacity but with frequent 500\u2013700ms spikes during bursts (kernel switch+prefetch stalls).\n- c5: p50=20ms (+2ms), p95=95ms (-25ms), p99=320ms (-260ms). Reduced number of tiny single-request kernels by ~32% (runtime metric \"kernel_invocations/s\" dropped).\n- c10: p50=24ms, p95=110ms, p99=350ms. Slightly worse median due to added wait but some tail improvement vs baseline.\n- b50: p50=18ms, p95=100ms, p99=400ms. Backoff alone reduced some contention but caused temporary client retry storms if clients were naive.\n- c5b50: p50=22ms, p95=80ms, p99=210ms. Best tail improvement across short bursts; median slightly higher but within SLO.\n- coop: p50=19ms, p95=75ms, p99=190ms. Cooperative scheduler + small coalesce window seems to provide consistent wins without client retry changes.\n\nAdditional micro-observations:\n- GPU SM occupancy charts (perf slice) show fewer sub-10ms kernels for c5/c5b50/coop. Bigger kernels but higher amortized throughput per kernel.\n- KV-cache prefill still important; turns a 2x increase in token generation for medium requests into a much smoother profile.\n- When coalesce_window_ms > 8ms, user-perceived median for short queries starts to feel sluggish; tradeoff point around 5ms for our dataset.\n- Client-side exponential retry combined with server backoff hints needs jitter to avoid sync retry peaks (observed small retry storms when hint was identical and no jitter).\n\nASCII heatmap snippet (request latency by ms across time window, microburst-1, c5b50 run):\n[00:00] 10 12 14 18 22 35 40 48 60 65 70 180 220 260 310 180 30 14 12 11\nInterpretation: short cluster around median with a handful of mid-tail events during heavy kernel transitions; far fewer >200ms events vs baseline.\n\nConclusions so far:\n- Small coalescing windows (around 5ms) + cooperative scheduling offer the best tail reduction while keeping median impact small.\n- Adding a moderate server-side backoff hint (50ms) helps when clients are well-behaved; otherwise add jitter or server-enforced gradual accepts (token-bucket).\n- The biggest wins come not from aggressive queuing but from reducing kernel fragmentation (fewer micro-kernels).\n\nOpen questions / follow-ups:\n- Re-run coop config across mixed-short and microburst-2 with longer duration (4x) to validate stability and throughput hit under sustained load.\n- Explore adaptive coalesce window that grows during detected microburst then decays (state machine in scheduler).\n- Quantify client retry patterns: instrument clients with randomized jitter and exponential backoff to measure retry amplification with b50 hints.\n- Test with larger model (13B) and on A10 pools \u2014 do the same coalescing gains hold when token gen costs dominate?\n\nQuick TODOs:\n- [ ] Add a bench flag to bench-driver to simulate client jitter and retry with backoff (assigned to Mira)\n- [ ] Add observability metric: kernel_invocations_per_minute per tenant and surface in Console (Liam)\n- [ ] Prototype adaptive coalesce heuristic in a branch (felix/burst-adaptive)\n\nNotes to self: keep the coalesce window conservative by default (0ms) in prod; enable experiment gate for Dedicated customers with opt-in. Share an internal note summarizing p95/p99 improvements for SRE and placements team.\n\nRelated links and artifacts:\n- GH PR: redwood/runtime#4821 (cooperative scheduler prototype)\n- Design doc draft: /confluence/INF-BURST-ADAPTIVE (WIP)\n- Bench harness code: github.com/redwood-inference/bench-driver (branch: burstbackoff-probes)\n\nEnd of log.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_65052c9c28be4e12a290fee47030a9fd"
+}

@@ -1,0 +1,92 @@
+{
+  "key": "SUP-96501",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Prefetch workers and backoff loop triggering repeated 429 throttles during bulk ingest",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Raman",
+  "assignee": "Liam Chen",
+  "customer_company": "NovaDocs",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "rate-limiter",
+    "ingestion-service"
+  ],
+  "labels": [
+    "throttling",
+    "rate-limit-config",
+    "backoff",
+    "dedicated-customer",
+    "ingest"
+  ],
+  "environment": [
+    "prod",
+    "us-west-2"
+  ],
+  "affected_models": [
+    "open-llama-13b",
+    "redwood-rlhf-7b"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-99823",
+    "INT-412"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/ingest/pull/341",
+    "https://github.com/redwood-inference/rate-limiter/pull/89"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/SUPPORT/pages/ingest+best+practices",
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/rate-limiter+design"
+  ],
+  "description": "Issue summary:\nCustomer NovaDocs reports a burst of 429 (Too Many Requests) responses during a scheduled bulk content ingest. The ingestion system uses a prefetch worker pool that aggressively retries failed requests with a short fixed sleep before exponential backoff kicks in. The result appears to be a self-amplifying retry loop that floods our API gateway and triggers per-key and tenant throttles.\n\nImpact:\n- NovaDocs experienced ~18% of upload operations failing with 429s over a 45-minute window, causing duplicate retries and prolonged ingestion time.\n- Customer reports downstream processing delays and user-visible failures in their upload UI.\n- Customer is on a dedicated pool; they expect higher throughput but also stricter quota guarantees.\n\nEnvironment:\n- Customer: NovaDocs (dedicated capacity)",
+  "steps_to_reproduce": [
+    "1) Use a dedicated customer API key configured with high concurrent upload threads (200 concurrent workers).",
+    "2) Start large ingest: POST batches of 500 small documents each to /v1/ingest with client-side prefetch to warm model caches.",
+    "3) Configure client retry policy: 3 immediate retries at 100ms, then exponential backoff (200ms, 400ms, 800ms), no jitter.",
+    "4) Observe API gateway metrics and client responses over the first 10 minutes of ingest."
+  ],
+  "observed_behavior": "Rapid onset of 429s within the first 2 minutes. Because the client retries synchronously with little jitter, the retries line up and create repeated bursts that sustain throttle windows. Gateway shows per-key token bucket exhaustion and tenant-level short-term throttling. Streaming sessions were unaffected, but many short POSTs to the inference endpoint were blocked.",
+  "expected_behavior": "Client should back off with jitter and allow the platform rate limiter to smooth bursts. Dedicated customers should be able to sustain steady throughput proportional to their reserved capacity without triggering token bucket exhaustion for short spikes.",
+  "logs": "Example 429 response (truncated): {\n  \"status\": 429,\n  \"error\": \"Too Many Requests\",\n  \"message\": \"rate limit exceeded: per-key concurrency window exhausted\",\n  \"retry_after_ms\": 1200\n}\nGateway metrics snapshot: per-key tokens consumed: 1000/s -> 0/s within 90s. Tenant throttle events: 42 in 45m. Refer to Grafana: https://grafana.redwood.local/d/xyz/rate-limiter-dashboard?orgId=1&from=now-1h",
+  "comments": [
+    "2026-03-10 - Aisha Raman (support): Opened ticket after receiving customer logs and a timeline. Requested request_id samples and the API key used.",
+    "2026-03-10 - NovaDocs (customer): Provided request_ids: req_9f1b, req_9f1c, req_9f27. Confirmed they were using prefetch=3 and 200 workers.",
+    "2026-03-11 - Liam Chen (eng): Noted gateway token bucket shows 'burst refill' policy at 1000 tokens/sec and per-key window of 250 requests/second. Hypothesis: client retry pattern aligns with refill cadence causing repeated bucket drain. Asked for p99 latency traces for affected requests.",
+    "2026-03-11 - SRE (investigation): Temporarily increased per-key burst allowance for NovaDocs by 2x for 30 minutes to observe behavior; observed immediate reduction in 429s but overall tenant throttle events still present during peaks.",
+    "2026-03-12 - NovaDocs (customer): Confirmed improvement during the 30m window but saw a second spike once setting reverted. Asked for recommended client-side changes and permanent tuning options."
+  ],
+  "investigation_notes": [
+    "Hypothesis A: Client retry window without jitter produces synchronized retries that coincide with bucket refill, producing cascading 429s.",
+    "Hypothesis B: Dedicated pool autoscaler temporarily reduced CPU on a subset of workers during the ingest, raising p99 inference latency and increasing request dwell time at gateway, which exacerbated token consumption rate.",
+    "Findings: API gateway logs show clustered request timestamps around second boundaries. Latency traces show p95 increased from 60ms to 420ms for redwood-rlhf-7b during two spike periods. Autoscaler logs show two transient scale-down events in us-west-2 during the ingest.",
+    "Dashboards: https://grafana.redwood.local/d/xyz/ingest-latency?from=now-3h highlights increased queueing.\nRelated PRs reviewed: rate-limiter change that adjusted refill granularity (PR #89).",
+    "Interim mitigation tested: applied temporary per-key burst boost for NovaDocs and applied a server-side short holdback (introduce jitter on accept window) \u2014 reduced immediate 429 count by ~70% but did not eliminate tenant-level throttles during sustained high concurrency.",
+    "Recommended client changes: add randomized jitter to immediate retries, limit initial concurrent worker count to <= 64 for bulk warm-up, and implement circuit-breaker to pause on >10% 429s in a 1-minute window."
+  ],
+  "resolution": "Partial mitigation applied: SRE increased per-key burst allowance for the customer for a rolling 8-hour window and scheduled a permanent rate-limiter tuning change to be applied during the next maintenance window. Engineering to deploy a change to the refill granularity to avoid alignment with millisecond-precise client retry loops (tracked in linked PR).\n\nOwner action items:\n- ENG (Liam Chen): Deploy rate-limiter refill granularity change (PR #89) to staging and run soak for 48h.\n- SRE: Coordinate a scheduled config rollout to prod outside peak hours and monitor tenant throttle counts.\n- Support: Share client guidance with NovaDocs including suggested retry/jitter policy and recommended worker concurrency ceiling.\n\nFollow-ups: After change deploy, validate over 72h of sustained ingest and close ticket when tenant-level throttles return to baseline.",
+  "resolution_status": "Partial mitigation applied; awaiting permanent tuning and customer client changes",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "observed_behavior",
+    "expected_behavior",
+    "logs",
+    "comments",
+    "investigation_notes",
+    "resolution",
+    "resolution_status"
+  ],
+  "dataset_doc_uuid": "dsid_d3d40250e9344eef9ba4f7861d023d7a"
+}

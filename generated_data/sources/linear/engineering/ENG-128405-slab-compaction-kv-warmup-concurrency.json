@@ -1,0 +1,116 @@
+{
+  "key": "ENG-128405",
+  "team": "engineering",
+  "title": "Investigate slow allocator compaction during high-concurrency KV-cache warmup",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-14",
+  "creator": "Aisha Patel",
+  "assignee": "Liam O'Connor",
+  "project": "runtime-memory-2026",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-24",
+  "labels": [
+    "kv-cache",
+    "cudaMallocAsync",
+    "allocator",
+    "fragmentation",
+    "investigation",
+    "continuous-batching"
+  ],
+  "description": "Summary: We observe slow and increasing GPU resident memory after a KV-cache warmup phase that uses high-concurrency prefetches. The allocator (cudaMallocAsync + slab pool) is failing to compact quickly, leading to fragmentation and an upward drift in resident sets when many small KV entries are prefetched simultaneously. This ticket captures the reproducer, instrumentation, observed allocator behavior, short-term mitigations, and a proposed long-term allocator heuristic change.\n\nContext: This surfaced in a Dedicated customer workload and in nightly load tests: during model cold start followed by an aggressive KV prefetch (concurrent N=64 prefetch requests, each requesting 3-4 small tensors ~128KB-1MB), GPU memory growth continues past expected steady-state. We see many stale small arenas and unreturned pinned staging allocations held by async frees tied to CUDA streams.\n\nGoal: Find root cause(s) and produce a fix or reasonable mitigation that prevents resident growth > 10% over steady-state under typical warmup patterns, without regressing throughput/latency for normal serving traffic.",
+  "reproduction_steps": [
+    "1) Launch runtime with debug allocator flags: --allocator=slab_pool --cuda-malloc-async=true --allocator-verbose=2",
+    "2) Use the attached reproducer harness (kv_warmup_stress.py) to issue concurrent prefetches: python kv_warmup_stress.py --concurrency 64 --requests 500 --model gptx-small --prefetch-size 128K-1M",
+    "3) Observe nvidia-smi and allocator logs during and after warmup window (timestamps T0..T5), and collect /proc/driver/nvidia/gpus/* memory counters if available",
+    "4) Run compare with single-threaded prefetch (concurrency 1) to validate concurrency sensitivity",
+    "5) Capture cudaMallocAsync statistics via CUPTI trace and runtime allocator histogram (see logs field below)"
+  ],
+  "logs": [
+    "allocator: slab_pool: created arena id=7 size=64MB slab=4KB buckets=16",
+    "allocator: cudaMallocAsync allocations queued on stream 0x7f2ac0; deferred_free_count=142",
+    "malloc_async: issued 1200 mallocs during warmup window (T0-T1), avg_size=384KB, peak_concurrent_allocs=320",
+    "resident: 8124MB -> 9196MB (+13.2%) after warmup; slow decay, resident at T+300s = 9020MB",
+    "kv: cache prefetch requests: 512 total, hit_rate after warmup 0.0 (this is pure prefetch), latency P90=18ms",
+    "cuda: async_free_latency_percentile: p50=1.2ms p95=41ms p99=280ms (heavy tail)",
+    "slab: fragmentation_ratio=0.28 (28% unusable holes across arenas); small bucket churn high for sizes <=256KB"
+  ],
+  "findings": [
+    "1) High concurrency prefetch pattern generates many short-lived small allocations that stress small-bucket paths and cause frequent slab churn.",
+    "2) cudaMallocAsync deferred frees backlog grows because frees are associated with many distinct CUDA streams used by concurrent prefetch tasks; stream synchronization latencies cause transient retention of stacked staging buffers.",
+    "3) Slab compaction heuristic currently based on 'free_fraction < X' fires too late under bursty traffic; compaction is single-threaded and serialized with bookkeeping causing delayed reclamation.",
+    "4) Pinned staging fallback triggers for some larger prefetches; pinned staging arenas are less aggressively reused which amplifies resident growth.",
+    "5) The allocator's slab bucket granularity (4KB) produces internal fragmentation for sub-4KB tensors; while not dominant, it contributes to measurable waste at high QPS.",
+    "6) When concurrency is reduced (<=8), resident set returns to baseline quickly; this confirms the problem is concurrency-driven rather than a persistent leak in model code.",
+    "7) Telemetry gaps: we lack per-stream deferred-free queue depth metrics and per-arena last-used timestamps in production which makes diagnosis harder in customer's Dedicated cluster."
+  ],
+  "proposed_fixes": [
+    "Short-term mitigations (low-risk, config):",
+    "- Introduce 'kv_prefetch_concurrency_limit' (default 32 in Dedicated) to throttle simultaneous prefetches at the serving layer; quick rollout via config flag.",
+    "- Enable 'async_free_coalesce_window' set to 5ms to batch frees on the same CUDA stream and reduce tail latencies observed in CUPTI traces.",
+    "- Temporarily reduce small-bucket slab size to 2KB for runtimes used by heavy-KV customers to reduce internal fragmentation (A/B test).",
+    "Medium-term changes (allocator heuristics):",
+    "- Modify slab compaction trigger: fire earlier when deferred_free_count on any stream > threshold OR global fragmentation_ratio > 0.15, and allow parallel compaction across arenas rather than serialized single-threaded compaction.",
+    "- Track per-arena 'last_used_ts' and implement LRU-driven aggressive reclamation for arenas that are cold but still resident after warmup period.",
+    "Long-term (architectural):",
+    "- Add a 'stream-affinity' slab view that co-locates allocations from hot prefetch streams into separate arenas to limit cross-stream churn and reduce cross-stream deferred_free delays.",
+    "- Instrument runtime to expose deferred-free queue depth and per-arena fragmentation metrics via Console for Dedicated customers.",
+    "PR/Link: draft PR at https://github.com/redwood-inference/runtime/pull/4382 (allocator: compaction heuristic + telemetry)"
+  ],
+  "experiments": [
+    "Exp A (throttle prefetch to 32): resident delta reduced to +6% and decays to baseline in 45s; P50 latency unchanged, P95 improved by 4ms",
+    "Exp B (enable async_free_coalesce_window=5ms): deferred_free p99 reduced 3x; resident delta reduced to +5.6%",
+    "Exp C (2KB small bucket): internal fragmentation decreased from 28% -> 17% for our synthetic workload; CPU overhead +1.8% during allocation-heavy phase",
+    "Exp D (parallel compaction prototype): wall-clock compaction time dropped from 18s to 4s in synthetic stress, but requires careful locking to avoid allocator races (prototype branch available)"
+  ],
+  "decisions": [
+    "1) Rollout short-term mitigations to Dedicated customers impacted by warmups: kv_prefetch_concurrency_limit=32 and async_free_coalesce_window=5ms (ops-approved).",
+    "2) Proceed with medium-term heuristic changes in a feature branch with extensive unit tests and stress harness; do not enable by default until we add per-arena telemetry.",
+    "3) Add telemetry metrics first: deferred-free queue depth per stream, per-arena last_used_ts, and fragmentation_ratio. These are required for safe rollout and SRE monitoring.",
+    "4) Schedule a canary with a single Dedicated customer (customer-canal) for the parallel compaction feature behind an opt-in flag; observe for 72h before wider rollout."
+  ],
+  "follow_up_tasks": [
+    "ENG-128406: implement deferred-free queue depth telemetry (estimate 3)",
+    "ENG-128407: KV prefetcher: add runtime concurrency limiter and expose config in Console (estimate 2)",
+    "ENG-128408: implement parallel arena compaction prototype and add stress tests (estimate 8)",
+    "PM-4521: communicate config knobs and best-practice for Dedicated customers with heavy KV workloads (docs + support playbook)",
+    "DES-221: Console dashboard tile mockups for per-arena fragmentation and deferred-free heatmap"
+  ],
+  "notes": [
+    "Related: ENG-100112 and ENG-67432 touched allocator drift and async-free patterns but did not address per-stream deferred-free tail behavior. This ticket focuses on concurrency-induced compaction latency.",
+    "Customer impact: medium. Some Dedicated customers reported transient OOMs during aggressive warmups; with throttling the risk drops substantially.",
+    "Risk: parallel compaction must be implemented carefully to avoid ABA races in slab bookkeeping; add heavy fuzzing and sanitizer runs.",
+    "Owner: Liam O'Connor (assignee) will shepherd short-term rollout and own the feature branch for medium-term changes."
+  ],
+  "comments": [
+    "2026-03-10 09:21 - Aisha Patel: Created ticket after cross-checking nightly stress logs. Attaching reproducer and initial CUPTI traces to ticket attachments (see attachments).",
+    "2026-03-11 14:03 - Liam O'Connor: Reproduced locally with kv_warmup_stress.py. Confirmed deferred_free backlog on 64-stream run and heavy P99 async_free latency. Started a small prototype to parallelize compaction.",
+    "2026-03-12 10:47 - Grace Huang: Runbook note - while we test throttles, suggest ops set kv_prefetch_concurrency_limit=16 for clusters with <16 GPUs to avoid overall throughput cliffs.",
+    "2026-03-13 17:30 - SRE (Marcus Lee): Observability gap acknowledged \u2014 we'll accept a telemetry-only PR to surface per-stream queue depth before enabling compaction changes in canary clusters.",
+    "2026-03-14 08:12 - Liam O'Connor: Short-term config PR prepared: https://github.com/redwood-inference/runtime/pull/4369. Planning canary rollout tomorrow at 03:00 UTC.",
+    "2026-03-14 12:05 - Aisha Patel: Updated ticket with experiment results. Moving to In Progress and scheduling follow-up ENG tickets for implementation.",
+    "2026-03-14 12:20 - Product (Nina Martinez): Please coordinate PM-4521 for customer communication after canary proves stable."
+  ],
+  "attachments": [
+    "reproducer: https://drive.redwood.ai/kv_warmup_stress.py",
+    "cupTI_trace: https://drive.redwood.ai/traces/alloc_async_2026-03-10.cupti",
+    "draft_design: https://confluence.redwood.ai/display/RUNTIME/Parallel+Compaction+Design",
+    "draft_pr_throttle: https://github.com/redwood-inference/runtime/pull/4369"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "reproduction_steps",
+    "logs",
+    "findings",
+    "proposed_fixes",
+    "experiments",
+    "decisions",
+    "follow_up_tasks",
+    "notes",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_e19edc836ae34084a58444bceacf4aa4"
+}

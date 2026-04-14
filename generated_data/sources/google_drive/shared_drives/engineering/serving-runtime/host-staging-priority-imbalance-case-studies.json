@@ -1,0 +1,89 @@
+{
+  "title": "Host staging priority imbalance \u2014 case studies and mitigation notes",
+  "owner": "Aditi Rao",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/host-staging-priority-imbalance-case-studies.json",
+  "doc_type": "doc",
+  "created_at": "2025-01-20",
+  "last_modified": "2025-02-04",
+  "collaborators": [
+    "Ethan Li",
+    "Marco Hernandez",
+    "Sara Nguyen"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "multi-gpu",
+    "nvlink",
+    "pcie",
+    "latency",
+    "host-staging",
+    "profiling",
+    "tail-latency"
+  ],
+  "linked_artifacts": [
+    "JIRA-INF-4321",
+    "PR: github.com/redwood/infer-runtime/pull/2102",
+    "slack: C012ABCDEF/thread-1674012345678",
+    "CONFLUENCE-CON-1847"
+  ],
+  "summary": "Working notes from a set of small experiments showing that low-priority host staging threads (PCIe reads to satisfy tensor slices) can create long-tail latency spikes for multi-GPU inference pipelines. Documents observed modes, microbenchmarks, and mitigations we should evaluate in the runtime.",
+  "motivation": "We periodically see sporadic p99/p999 spikes in production for medium-sized chat requests (~1k tokens) on 8x A100 boxes. Hypothesis: contention between inference work and host-side staging I/O (page faults / PCIe reads) where low-priority worker threads are preempted or throttled, allowing request-handling paths to stall waiting for staged data.",
+  "environment": "Test cluster: 2x DGX-A100 (8x A100 80GB) nodes connected via 100GbE + NVLink fabric. PCIe between host and GPU is Gen4 x16; NVidia driver 535.x, CUDA 12.3, NCCL 2.16. Runtime build: infer-runtime v0.38.0 (local profiling build). OS: Ubuntu 22.04, kernel 5.15 with preemptible desktop scheduling. Workloads: 1) many small concurrent requests (QPS 120), 2) single large-context request (6k tokens) running pipeline/tensor-sliced model (12-way tensor shards + 2-pipeline stages).",
+  "methodology": "Repro steps summarized: 1) baseline latency profile with no background IO; 2) introduce synthetic NVMe/PCIe read workload to emulate host-side staging; 3) vary staging-thread niceness/rt priority (nice/chrt) and CPU pinning; 4) toggle use of io_uring vs pread/preadv; 5) measure end-to-end latency distributions (median, p95, p99, p999) and collect perf traces (sched_switch, block_rq_issue, pread latency), nvprof+nsys for GPU-side stalls, and tcpdump/strace for request timing. Microbenchmarks for read size: 4KB, 64KB, 2MB; for batch sizes: 1, 4, 16. Each test ran for 15 minutes and repeated 3x to ensure variance.",
+  "experiment_results": "Baseline (no extra IO): median 22ms, p95 48ms, p99 120ms. When low-priority host staging threads run (nice +19, default SCHED_OTHER): median 24ms (+9%), p95 62ms, p99 380ms, p999 spikes to 1.2s observed. When staging threads are promoted to SCHED_FIFO with modest rt priority (50): median 25ms, p95 54ms, p99 128ms \u2014 almost baseline but with fewer 1s spikes. Using io_uring for staging reduced CPU syscalls and dropped p99 by ~30% relative to pread under same priority. PCIe read amplification (many small reads) increased host CPU overhead and correlated with p99 growth; aggregating reads (2MB contiguous) shortened median and tail substantially. On pipeline-sliced workloads the effect amplified: small interleaved slices caused repeated host pulls and each preemption cascaded across pipeline stages, creating multi-hop stall amplification (one slow stage stalls downstream replicas).",
+  "observations_and_trace_excerpt": "Trace snippet (abridged):\n[00:12:01.542] request start id=abc123\n[00:12:01.560] stage-1: waiting for weight slice pread (tid=5231)\n[00:12:01.560] sched_switch: tid=5231 -> tid=2048 (staging low-prio)\n[00:12:01.642] block_rq_issue: dev=nvme0n1, sector=..., len=4096, rq_lat=78ms\n[00:12:01.642] stage-1: resumed, kv-cache miss, begin compute\n[00:12:01.643] stage-2: waiting for stage-1 output, blocked 82ms\n[00:12:01.645] request end id=abc123 latency=1240ms (p999 event)\nNotes: multiple retries where staging thread was chased off CPU by background processes; observed many pread syscalls returning only partial data requiring multiple round-trips.\n",
+  "root_causes": [
+    "Host-side staging implemented with many small synchronous reads (4KB-64KB) => high syscall rate and PCIe read amplification",
+    "Staging threads run at default niceness and get preempted by other system activity (cron, kubelet, monitoring agents) causing long waits",
+    "Pipeline/tensor-sliced workloads magnify single-stage stalls because downstream stages are blocked waiting on upstream I/O",
+    "OS scheduler and IRQ affinity are suboptimal: NVMe queues and staging thread CPUs are not pinned, leading to cache misses and migrations"
+  ],
+  "mitigations_explored": [
+    "Promote staging threads to SCHED_FIFO with bounded RT priority (tested priority 40-60) \u2014 large tail reduction but RT threads must be watchdoged",
+    "Switch staging path to async io_uring batching with pre-registered buffers to reduce syscall overhead and partial reads",
+    "Aggregate small reads into larger DMA-friendly chunks (2MB) when safe \u2014 reduced PCIe read amplification",
+    "CPU pinning: reserve 1-2 isolated cores for staging and pin NVMe IRQs to same cores",
+    "NUMA-aware placement: ensure staging threads and request handlers share NUMA node with PCIe root to lower latency",
+    "Increase prefetch window in runtime so fewer host round trips are necessary (trade memory for tail reduction)",
+    "Consider GPUDirect/peer-DMA where available to avoid host bounce for certain topologies"
+  ],
+  "tradeoffs_and_risks": "RT scheduling reduces tail but makes debugging harder and can starve other system services. Aggregating reads increases memory footprint (prefetch buffers) and risks wasting bandwidth if prefetch heuristics are wrong. io_uring adoption is promising but requires careful buffer lifecycle management to avoid double-copy. CPU isolation reduces consolidation efficiency and can increase cost. GPUDirect requires hardware and driver support and may not be portable across all deployments (private vs hosted).",
+  "action_items": [
+    "INF-4321: add a runtime flag to toggle staging mode (sync/async + prefetch size) \u2014 owner: Ethan Li \u2014 due: 2025-02-14",
+    "INF-4350: prototype SCHED_FIFO promotion + watchdog to demote if CPU starvation observed \u2014 owner: Marco Hernandez \u2014 due: 2025-02-21",
+    "INF-4351: run 24h soak with io_uring staging on 3 production-like boxes, collect p95/p99/p999 \u2014 owner: Sara Nguyen \u2014 due: 2025-02-28",
+    "INF-4352: update deployment docs with recommended CPU pinning and NVMe IRQ affinity recipes \u2014 owner: Aditi Rao \u2014 due: 2025-03-07"
+  ],
+  "unresolved_questions": [
+    "What is the minimum safe prefetch size for transformer shard reads without wasting memory for the largest models we serve?",
+    "Can NCCL scheduling be adjusted to hide upstream staging variance (e.g., asynchronous fine-grained signaling)?",
+    "Do cloud-hosted Dedicated boxes expose IRQ/NVMe controls necessary for CPU pinning guidance?"
+  ],
+  "references": [
+    "internal-bench: /bench/logs/host-staging/2025-01-20/trace-abc123.nsys",
+    "Design doc (draft): CONFLUENCE-CON-1847: Host staging redesign notes",
+    "Jira: INF-4321 (staging-mode feature)",
+    "RFC: kernel-io-uring-best-practices (internal)"
+  ],
+  "notes_to_self": "Next run: repeat tests with reduced background monitoring (disable node_exporter) to verify noise floor. Also capture nvlink counters during spikes to see if staging stalls correlate with increased NVLink retransmit. Good candidate for a short slide for infra sync \u2014 show before/after graphs.",
+  "conclusions": "Host-side staging priority and the size/pattern of PCIe reads are first-order contributors to long-tail latency in multi-GPU inference pipelines. Practical short-term mitigations (io_uring, staging thread promotion, CPU pinning, read aggregation) produce meaningful tail reductions. Longer-term work should aim to reduce number of host round trips (prefetch, smarter shard packing) and investigate direct-GPU-data paths where feasible.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "summary",
+    "motivation",
+    "environment",
+    "methodology",
+    "experiment_results",
+    "observations_and_trace_excerpt",
+    "root_causes",
+    "mitigations_explored",
+    "tradeoffs_and_risks",
+    "action_items",
+    "unresolved_questions",
+    "references",
+    "conclusions"
+  ],
+  "dataset_doc_uuid": "dsid_f53a58b07d7c4a72afe62a0d32b47a80"
+}

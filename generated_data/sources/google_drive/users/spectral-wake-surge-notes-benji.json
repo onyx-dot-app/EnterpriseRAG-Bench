@@ -1,0 +1,34 @@
+{
+  "title": "Spectral wake surge notes \u2014 autocorrelation & batching implications",
+  "owner": "Benji Moreno",
+  "drive_area": "users",
+  "path": "users/spectral-wake-surge-notes-benji",
+  "doc_type": "doc",
+  "created_at": "2025-11-02",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Maya Krishnan",
+    "Ibrahim Chen",
+    "Rowan Patel"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "spectral-analysis",
+    "autocorrelation",
+    "batching",
+    "sfx"
+  ],
+  "linked_artifacts": [
+    "JIRA-ENG-3421",
+    "github.com/redwood-inference/serving-runtime/pull/1189",
+    "slack://channel/infra-bench#thread-4f2a"
+  ],
+  "content": "Quick context:\n- Trying a different lens on bursts: instead of only looking at qps/time and p99s, I ran spectral (power spectral density) and autocorrelation on ingress timestamps for a set of production-like traces. Goal: find periodicities or long-memory effects that cause repeated warm-cache misses and batching inefficiencies (\"wake\" events).\n\nRaw traces used:\n- trace-A (weekday-peak, customer-sim): 10m, 600k requests\n- trace-B (randomized poisson overlay): 15m, 1.1M requests\n- trace-C (diurnal + microbursts): 30m, 2.4M requests\n\nMethod notes (quick):\n- convert timestamps -> interarrival series (ms), resample to 10ms bins (0/1) to avoid jitter noise\n- compute autocorrelation up to lag 2000 bins (~20s) using FFT-based conv (numpy.correlate-ish)\n- apply Welch PSD (hann, 50% overlap) to binned series to look for frequency peaks in 0.01\u20132 Hz\n- run on local laptop for exploratory, then small k8s job for full set (see linked PR)\n\nObservations (high level):\n- trace-A: strong low-frequency peak ~0.04 Hz (~25s period). Autocorr shows damped oscillations at same period up to ~8 cycles. Suggests a recurring influx \u2014 likely client-side batching/retries or a gateway doing fan-in flushes.\n- trace-B: near-flat spectrum (expected). No significant autocorr beyond 200ms; behaves like Poisson.\n- trace-C: broadband high-frequency energy 0.5\u20130.9 Hz plus low-frequency hump 0.03\u20130.05 Hz. The HF band corresponds to microbursts (~1\u20132s wide), LF is a ~20\u201330s envelope.\n\nWhy this matters for batching / latency:\n- Our batching algorithm groups requests based on a short window (max-wait 8ms, dynamic) and a token budget. Periodic envelopes (20\u201330s) that repeatedly flood the worker cause frequent cold-ish prefixes for KV cache and short bursts that push batch sizes to max quickly, increasing p99s for mid-size requests.\n- Microbursts (1\u20132s) create rapid throttle events and evictions in the hotpool: if eviction policy is LRU with small active set, we see cache churn exactly aligned with HF PSD band.\n\nSmall experiment summary (local probe with k=16 model replica):\n- baseline (no spectral-aware changes): p50=22ms p95=130ms p99=460ms, CPU sched jitter visible\n- add short prefix-caching heuristic (keep last 2 prefixes pinned for 30s): p50=20ms p95=110ms p99=320ms\n- add spectral-aware delay (if energy in 0.4\u20131.0Hz band > threshold, increase max-wait by +4ms to allow coalescing HF bursts): p50=21ms p95=100ms p99=250ms\n- combined heuristic (prefix pin + spectral delay): p50=19ms p95=95ms p99=210ms (best so far)\n\nRaw micro-table from a run (100k requests sample window):\n- Config | mean qps | p95 | p99 | avg batch size | cache-hit\n- base   | 250      | 130 | 460 | 3.1            | 0.61\n- pin2   | 245      | 110 | 320 | 3.4            | 0.72\n- specD  | 240      | 100 | 250 | 3.9            | 0.69\n- both   | 238      | 95  | 210 | 4.2            | 0.78\n\nNotes on thresholds and false positives:\n- PSD energy threshold chosen by histogram OOM: top 10% of energy windows flagged as HF-bursts. Needs tuning per-customer.\n- Danger: delaying in a genuinely low-latency workload increases mean latency; must gate by SLA class (hosted free-tier vs enterprise).\n\nOpen questions / hypotheses:\n- Is the LF (~25s) envelope originating from client SDK flush windows? Check SDKs for default flush timers ~25s. (ACTION: ask SDK owners Maya)\n- Do certain tenant mixes amplify HF band because of synchronized background jobs? (ACTION: correlate tenant IDs with HF windows)\n- Can a cheap exponential moving average (EMA) of PSD energy be computed online with <0.5% CPU overhead? If yes, could be used in edge proxies for early coalescing.\n\nNext experiments to run (short checklist):\n- [ ] Replay trace-C against a fleet with different cache eviction sizes (active set 128/256/512) and measure p99 delta\n- [ ] Sweep spectral-delay + max-wait in grid: {+2,+4,+8}ms x {pin none, pin2, pin4} -> target: find knee where mean latency stops improving but p99 still drops\n- [ ] Run tenant-level PSD to test if single-tenant sync patterns exist (privacy ok since using timestamps only)\n- [ ] Implement quick streaming PSD estimator in Go (PR draft exists: linked_artifacts PR)\n\nImplementation caveats:\n- Need to ensure any \"pin prefix\" doesn't create memory blowups under large fanouts. Use soft-pinning with TTL and eviction weight.\n- For spectral detector, avoid per-request FFTs. Use buffered counters per 10ms bin and run Welch every 5s on rolling window. This reduces cost and gives timely signal.\n\nNotes to self:\n- Keep this doc as an evolving scratchpad \u2014 would like to convert to a short playbook if combined heuristics are robust across traces.\n- If results hold, propose a small dedicated feature flag for tiered rollout: beta customers -> enterprise -> general.\n\nReferences / quick links (copied):\n- PSD primer: https://en.wikipedia.org/wiki/Welch%27s_method\n- PR: github.com/redwood-inference/serving-runtime/pull/1189\n- Correlate with telemetry: link to infra-bench slack thread above\n\nEnd notes (timestamped):\n- 2026-03-10 11:08 \u2014 consolidated combined run; p99 wins look encouraging but need more checks on tail noise due to VM steals\n- 2026-03-10 16:35 \u2014 pushed small Go prototype for PSD estimator (local cpu ~0.3%)\n\nTODO immediate:\n- send short summary to eng-serving-runtime sync (2 slides) + schedule 30m review with Maya & Ibrahim\n- instrument tenant-level energy histogram in next replay run\n\n----\nSmall unstructured ideas:\n- expose a \"burst fingerprint\" telemetry vector (HF-energy, LF-energy, autocorr-decay) per route \u2014 could help ops detect repeated pathological traffic quickly\n- combine with routing policy: if HF-energy high and route is non-critical, route to cheaper instance type that is better at handling short bursts (cheaper preemptible with up to 1s cold penalty)\n\nEnd of scratchpad.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_66bd04e0c483475f96dc31600c449522"
+}

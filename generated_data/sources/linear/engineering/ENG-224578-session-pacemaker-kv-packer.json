@@ -1,0 +1,57 @@
+{
+  "key": "ENG-224578",
+  "team": "engineering",
+  "title": "Session Pacemaker: Latency-aware KV Packer for Streaming Chat",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-10",
+  "updated_at": "2026-03-13",
+  "creator": "Riley Chen",
+  "assignee": "Asha Kapoor",
+  "project": "streaming-batcher-v2",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "kv-cache",
+    "batching",
+    "gpu-memory",
+    "streaming-chat",
+    "latency"
+  ],
+  "dependencies": [
+    "ENG-64892",
+    "ENG-91274"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.22",
+  "security_review_required": "false",
+  "description": "Summary: We need a lightweight, deployment-safe batching heuristic (\"Session Pacemaker\") that packs streaming chat requests into micro-batches while respecting per-request latency budgets and KV-cache memory constraints. The goal is to reduce per-token cost and GPU tail utilization without increasing 95/99th latency beyond configured SLOs. This ticket designs the heuristic, implements it in the streaming batcher, and validates behavior in synthetic and shadow-prod workloads.\n\nBackground: Current continuous batchers optimize throughput by aggregating turns into large windows, but they can cause KV cache growth and GPU memory spikes for long contexts, and they sometimes hold low-latency interactive sessions until batch windows fill. We must balance three constraints: per-session latency budgets, KV cache memory footprint, and overall GPU utilization (to avoid OOMs and noisy neighbor effects).\n\nProblem statement:\n- Streaming chat workloads have a mixed distribution: many short interactive sessions with tight latency budgets and a tail of long-history sessions that cause large KV cache growth.\n- Existing heuristics either favor throughput (leading to latency spikes on p95/p99) or favor strict latency (leading to poor GPU utilization).\n\nDesign goals:\n1) Respect per-request latency SLOs (configurable by route): ensure median and p95 latency increases are minimal for interactive sessions.\n2) Bound active KV cache allocation per-GPU by packing fragments (sessions) such that aggregate KV memory stays within safe headroom.\n3) Opportunistically coalesce turns from sessions with compatible context shapes to improve kernel utilization.\n4) Graceful fallback: when KV pressure is high, favor small-batch fast-paths and spill low-priority long-history sessions to secondary model variants.\n\nProposed heuristic (Session Pacemaker):\n- Each incoming streaming request is tagged with (priority, latency_budget_ms, context_length_tokens_est).\n- Maintain 3 concurrently open micro-queues per GPU slab: fast-path, balanced, long-context.\n- Admission: place requests into fast-path if latency_budget <= 200ms and context_length_est <= 512; balanced for median requests; long-context otherwise.\n- Packing policy per micro-queue (every 8ms cadence or on N requests):\n  * Fast-path: form micro-batches of up to M_fast tokens or until a per-request deadline (min remaining latency budget across members) would be violated. Target: batch sizes 1-8 requests.\n  * Balanced: allow larger aggregation up to M_balanced tokens, but enforce per-slab KV_memory_headroom threshold H (e.g., 70% of allocable KV region). If headroom < H, reduce target batch token cap by 50% and prioritize earliest-deadline-first.\n  * Long-context: prefer single-request or 2-request batches; if several long-context requests share a common prefix hash (detected by prefix fingerprint), pack them to reuse KV segments.\n- KV packing: when assembling a batch, compute combined KV token footprint; if combined footprint exceeds per-slab headroom, apply one or more of: (a) evict cold KV fragments based on LRU+session-score, (b) split the batch into smaller sub-batches, (c) reroute some requests to a spill pool (secondary model variant or CPU staging).\n- Dynamic pacing: monitor observed p95 latency per-route and per-GPU every 10s. If p95 > target*1.05, temporarily lower micro-queue aggregation windows for fast-path and balanced by 25% for 30s. If GPU utilization < target_util_low and headroom available, increase batch caps by 20% to improve throughput.\n\nParameters (initial defaults):\n- cadence_ms = 8\n- M_fast_tokens = 1024 (cap on combined tokens per micro-batch)\n- M_balanced_tokens = 8192\n- KV_headroom_threshold_H = 0.7\n- p95_latency_critical_multiplier = 1.05\n- spill_routing_enabled = true\n\nImplementation notes:\n- Integrate as a new pluggable PackStrategy in the streaming batcher (code path: runtime/streaming/batcher/packers).\n- Add metrics hooks: pack_size_tokens, pack_size_requests, pack_latency_wait_ms, kv_footprint_before, kv_footprint_after, pack_evictions_triggered, spill_routed_count, per_route_p95_windowed.\n- Extend request envelope to contain latency_budget_ms (derived at API gateway from route SLO and client-specified wants_fast param). Backwards compatible: default latency_budget_ms = route_default (e.g., 500ms).\n- Ensure the packer can run lock-free on the hot path: maintain per-slab ring buffers and only take a short CAS to claim a slot; expensive operations (evictions, fingerprint compute) run on worker threads.\n\nAcceptance criteria:\n- End-to-end latency: synthetic workloads with 80% short sessions (<=128 tokens) must keep p95 within +5% of baseline and median within +3%.\n- KV memory: under mixed workload, per-GPU KV footprint must not exceed configured headroom H more than 0.5% of time in 1h test.\n- Throughput: token/s efficiency should improve by >=10% on balanced workloads vs current conservative packer.\n- No GPU OOMs in 24h Canary with production traffic slice.\n\nTest plan:\n1) Unit tests: pack decisions for synthetic request sets around edge cases (deadline just before dispatch, combined KV>headroom, multiple prefix-sharing sessions).\n2) Load tests in perf cluster: three workload mixes (interactive-heavy, balanced, long-history-heavy). Validate metrics above.\n3) Shadow canary: route 2% of streaming traffic to runtime with Session Pacemaker for 48h in shadow mode (no impact to clients) and compare metrics.\n4) Progressive canary: 0.5% real traffic, monitor p95/p99, kv_footprint. Ramp if stable.\n\nRollout plan:\n- PR + internal design doc link -> review with runtime and infra (2 d).\n- Merge behind feature flag default=false.\n- Shadow canary (2 days).\n- Progressive canary (0.5% -> 5% -> 20% -> 100%) over 2 weeks with automatic rollback on safety triggers.\n\nMonitoring & safety triggers:\n- Auto-rollback if per-route p95 increases by >15% for 5m AND kv_oom_count > 0.\n- Alert on pack_evictions_triggered > baseline_rate*3 sustained for 10m.\n- Dashboard widgets: per-slab KV headroom heatmap, queue-depth heatmap (fast/balanced/long), spill_routed_count timeseries.\n\nRisks and mitigations:\n- Risk: Fingerprint collision or CPU cost for prefix detection could increase overhead. Mitigation: use a 64-bit rolling hash sampled on first 256 tokens, run on worker pool, fallback to conservative packing if CPU-backed pool is saturated.\n- Risk: Eviction churn harming quality of long-history sessions. Mitigation: session-score that penalizes recently-interacted sessions; prefer spill routing over aggressive eviction.\n\nOpen questions / follow-ups:\n- How should we choose default H per instance type (A100 vs H100 quantized paging)? Action: perf team to provide recommended H for common SKUs.\n- Should we expose per-route latency_budget in public API or keep as internal routing hint? Proposal: internal-only for v1; evaluate for beta.\n\nArtifacts and links:\n- Design notes (confluence): https://confluence.redwood.ai/display/INF/Session+Pacemaker+Design (internal)\n- Prototype PR: https://github.com/redwood-inference/runtime/pull/12891 (WIP)\n- Perf dashboard: https://grafana.redwood.ai/d/streaming/session-pacemaker (internal)\n- Linked tickets: ENG-64892 (turn-amalgamator-kv-pressure-balancer), ENG-91274 (windowed-composer-kv-reclamation-gpu-skyline)\n\nOwners and reviewers:\n- Owner: Asha Kapoor (serving runtime)\n- Reviewers: Miles Duncan (perf), Nia Gomez (infra), Priya Singh (QA)\n",
+  "acceptance_criteria": "1) p95 latency delta <= +5% on interactive-heavy synthetic runs. 2) Per-GPU KV footprint stays below headroom threshold H for >=99.5% of test duration. 3) Token/s efficiency +10% on balanced workloads. 4) No GPU OOMs in 24h production slice canary.",
+  "implementation_notes": "Add PackStrategy: SessionPacemakerPackStrategy. Implement per-slab micro-queues and a fast CAS enqueue/dequeue. Heavy ops (evictions, fingerprinting) run in dedicated worker threads. New metrics and tracing spans required. Feature flag gating and route-level config flags. Maintain backward compatibility for requests without latency_budget_ms. Avoid blocking GC by using preallocated buffer pools.",
+  "test_plan": "Unit tests for packing logic; synthetic perf workloads (interactive-heavy, balanced, history-heavy); shadow canary 48h; progressive canary with safety monitors and alerting; synthetic fault injection to ensure spill routing and evictions execute correctly.",
+  "rollout_plan": "Merge behind ff; shadow 2 days; progressive: 0.5% -> 5% -> 20% -> 100% over two weeks; automated rollback on safety triggers.",
+  "metrics_to_monitor": "per_route_p95, per_route_p99, pack_size_tokens, pack_wait_ms, kv_footprint_per_slab, pack_evictions_triggered, spill_routed_count, gpu_utilization_pct",
+  "links": [
+    "https://confluence.redwood.ai/display/INF/Session+Pacemaker+Design",
+    "https://github.com/redwood-inference/runtime/pull/12891",
+    "https://grafana.redwood.ai/d/streaming/session-pacemaker"
+  ],
+  "comments": [
+    "2026-02-12: Initial spike experiments show 12% token/s gain when batching balanced sessions up to 8k tokens.",
+    "2026-02-25: Miles requested additional metrics for prefix-sharing efficiency; added prefix_fingerprint_hit_ratio metric to scope.",
+    "2026-03-05: QA found nondeterministic ordering when splitting batches under pressure; resolved by stable sort by arrival_ts before split.",
+    "2026-03-11: Infra recommends conservative default H=0.7 for H100 dense quantized workloads; will parameterize per-SKU later."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "implementation_notes",
+    "test_plan",
+    "rollout_plan",
+    "metrics_to_monitor",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_d6c597ba830f4b1da76e43f06006e713"
+}

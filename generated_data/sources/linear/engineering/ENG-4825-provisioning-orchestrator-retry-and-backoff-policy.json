@@ -1,0 +1,59 @@
+{
+  "key": "ENG-4825",
+  "team": "engineering",
+  "title": "Provisioning orchestrator retry/backoff policy + quarantine triggers",
+  "status": "Done",
+  "priority": "P1",
+  "created_at": "2025-10-03",
+  "updated_at": "2025-10-18",
+  "creator": "Vanessa Ortiz",
+  "assignee": "Gabe Wilson",
+  "project": "Provision-to-ready automation sprint (Dedicated Capacity & Fleet Management)",
+  "cycle": "2025-W40",
+  "estimate": "5",
+  "due_date": "2025-10-18",
+  "labels": [
+    "fleet",
+    "provisioning",
+    "orchestrator",
+    "retries",
+    "backoff",
+    "quarantine",
+    "sre-review"
+  ],
+  "dependencies": [
+    "ENG-4822",
+    "ENG-4823",
+    "ENG-4824",
+    "ENG-4821"
+  ],
+  "customer_impact": "medium",
+  "security_review_required": "false",
+  "linked_artifacts": [
+    "Confluence: ADR-017 Provision-to-ready readiness state machine",
+    "Confluence: Provision-to-ready failures triage runbook",
+    "GitHub: redwood/pr-18452-quarantine-nodes-on-repeat-validation-failures (implementation follow-through)",
+    "GitHub: redwood/pr-18481-harden-validation-agent-timeouts-and-retries (agent-side hardening follow-through)"
+  ],
+  "description": "Context\n- As we move Dedicated capacity bring-up to an automated provision-to-ready workflow, the orchestrator needs a consistent retry/backoff policy per step, and clear quarantine criteria.\n- Today, manual \u201cjust retry it\u201d and unbounded retries cause (a) long tail time-to-ready, (b) noisy metrics/alerts, and (c) thrash on flaky validations (notably NCCL smoke + network jitter).\n\nGoals\n- Bound retries and time spent per node/step while keeping success rate high on transient failures.\n- Make retry behavior predictable and observable (attempt counters, last error, next retry time, step duration).\n- Define when to quarantine vs. keep retrying vs. reimage.\n- Ensure policy aligns with SRE alerting expectations (avoid paging loops during staged rollout).\n\nNon-goals\n- Redesign of scheduler/autoscaler behavior.\n- Comprehensive \u201cself-heal everything\u201d framework; this is focused on initial bring-up and readiness validation.\n\nDefinitions\n- Attempt: a single execution of a provisioning/validation step.\n- Retryable: failure class where a subsequent attempt is likely to succeed without operator intervention (e.g., temporary API errors, transient network failures).\n- Non-retryable (fatal): failure class that should stop the workflow and either quarantine or require operator action (e.g., GPU health hard failures).\n- Quarantine: node is removed from eligibility for serving pools and surfaced to operators with a reason + artifact pointers; re-entry requires explicit operator action (reimage / override) or a later automated \u201crevalidate after reimage\u201d path.\n\nProposed policy (approved)\n\nA) Global orchestrator defaults\n- Backoff algorithm: exponential backoff with full jitter.\n  - base_delay: 30s\n  - multiplier: 2.0\n  - max_delay: 15m\n  - jitter: full (random in [0, backoff])\n- Default max_attempts_per_step: 3\n- Default step_deadline: 30m (hard stop; if exceeded -> quarantine with reason=STEP_TIMEOUT)\n- Default total_workflow_deadline: 2h from Allocated -> Ready (if exceeded -> quarantine with reason=WORKFLOW_TIMEOUT)\n- Retry budget guardrail:\n  - If 3 consecutive steps fail due to the same root cause class (e.g., NETWORK_UNREACHABLE), quarantine early to avoid thrash.\n\nB) Step-by-step retry/timeout/quarantine table\n\n1) Bootstrap / agent heartbeat (node-online)\n- What it is: wait for node agent to heartbeat + basic node identity (instance_id, image_version, gpu_sku).\n- Retryable failures: missing heartbeat.\n- Policy:\n  - max_attempts: 6\n  - base_delay: 20s, max_delay: 5m\n  - step_deadline: 20m\n- Quarantine:\n  - If no heartbeat by deadline -> quarantine (BOOTSTRAP_NO_HEARTBEAT).\n\n2) Kube join (node-joined)\n- Retryable failures: kubelet registration transient failures, API throttling, short-lived auth token issues.\n- Non-retryable: repeated TLS/cert misconfig, node name collisions, obvious config drift vs baseline (kubelet flags mismatch).\n- Policy:\n  - max_attempts: 4\n  - base_delay: 30s, max_delay: 10m\n  - step_deadline: 25m\n- Quarantine:\n  - Quarantine after max_attempts with KUBE_JOIN_FAILED + include last 50 lines of kubelet journal pointer.\n  - Immediate quarantine if config drift detected (KUBELET_CONFIG_BASELINE_MISMATCH) (this should be \u201creimage required\u201d).\n\n3) Preflight: GPU discovery + driver/toolkit parity\n- Retryable: nvidia-smi transient failure due to driver init on first boot.\n- Non-retryable: driver version mismatch vs pinned image channel, missing devices, persistent NVML errors.\n- Policy:\n  - max_attempts: 3\n  - base_delay: 1m, max_delay: 10m\n  - step_deadline: 20m\n- Quarantine triggers (immediate):\n  - GPU not enumerated after attempt 2 (GPU_NOT_FOUND)\n  - Driver mismatch (DRIVER_PARITY_FAILED)\n  - NVML init error persists across 2 attempts (NVML_INIT_FAILED)\n\n4) Networking + storage sanity (baseline checks)\n- Retryable: packet loss spikes, transient DNS issues, temporary EBS attachment lag.\n- Policy:\n  - max_attempts: 5\n  - base_delay: 30s, max_delay: 10m\n  - step_deadline: 30m\n- Quarantine:\n  - Only after step_deadline, unless we detect a known-fatal signature (e.g., no NIC, persistent route missing) -> quarantine (NETWORK_CONFIG_INVALID).\n\n5) Postflight: NCCL smoke test\n- Known risk: flake rate due to transient fabric issues, noisy neighbors, early-boot contention.\n- Retryable: NCCL timeout, \u201cconnection reset\u201d style errors.\n- Non-retryable: consistent topology mismatch, consistent bandwidth far below floor across attempts.\n- Policy:\n  - max_attempts: 3\n  - base_delay: 5m, max_delay: 20m (cooldown is intentional to avoid hammering fabric during transient issues)\n  - step_deadline: 60m\n  - Per-attempt timeout: 10m\n- Quarantine:\n  - Quarantine on 3rd failure with NCCL_SMOKE_FAILED.\n  - Immediate quarantine if NCCL reports topology/peer mapping errors that indicate miswired fabric (NCCL_TOPOLOGY_ERROR).\n\n6) Postflight: inference perf canary (lightweight)\n- Policy:\n  - max_attempts: 2\n  - base_delay: 2m, max_delay: 10m\n  - step_deadline: 30m\n- Quarantine:\n  - Quarantine after 2 failures with PERF_CANARY_FAILED.\n\nC) When to reimage vs quarantine\n- Orchestrator default action is quarantine (not infinite reimage loops).\n- Operator-driven remediation:\n  - For baseline drift / driver mismatch / kubelet config mismatch: recommended action is \u201creimage to stable channel\u201d, then re-run validations.\n  - For transient network/storage flakes: safe action is \u201cretry validations\u201d once; if repeat -> quarantine.\n- Future (not in scope): automated single reimage attempt for a narrow set of image-related failures (guarded by a feature flag), with a strict cap of 1 reimage per instance_id.\n\nD) Observability requirements (must be emitted)\n- Per step:\n  - attempt_count (counter)\n  - step_duration_seconds (histogram)\n  - backoff_seconds (histogram)\n  - error_class (enum label; low-cardinality)\n- Workflow:\n  - time_to_ready_seconds (histogram)\n  - quarantine_count (counter) labeled by reason + gpu_sku + region\n- Cardinality constraints (SRE requirement):\n  - NO per-node-id tags on metrics.\n  - Node identifiers only in logs/traces with sampling.\n\nE) State machine integration\n- Orchestrator writes transition reasons into readiness service:\n  - last_failed_step\n  - last_error_class\n  - last_error_summary (short, sanitized)\n  - validation_artifacts_uri (pointer)\n  - next_retry_at (timestamp)\n- Quarantine is a terminal state from the orchestrator\u2019s perspective.\n\nAcceptance criteria\n- Policy documented and reviewed by SRE.\n- Implemented configuration is parameterized (per step overrides) and behind rollout flag.\n- Control plane surfaces: attempt_count, last_failed_step, last_error_class, next_retry_at.\n- No infinite retries observed in staged rollout; overall workflow deadline enforced.\n\nSRE review notes (captured + addressed)\n- (Sean Gallagher) Ensure we don\u2019t page on expected early-rollout flake spikes; retry policy must prevent \u201cretry storms.\u201d\n  - Addressed by: longer cooldown for NCCL; bounded retries; workflow deadline; metrics without node-level tags.\n- (Miles Thornton) Backoff must be jittered; otherwise synchronized retries can amplify fabric/API issues.\n  - Addressed by: full-jitter exponential backoff.\n- (Aisha Bello) Quarantine reasons must be low-cardinality enums; free-form strings in metrics are a no-go.\n  - Addressed by: enumerated error_class/quarantine_reason; keep verbose detail in logs/artifact bundle.\n\nRollout plan (for this policy)\n- Start enabled for us-east / A100 only (feature flag), with alerting in \u201cticket-only\u201d mode for 48h.\n- Promote to paging alerts only after:\n  - quarantine rate < 2% sustained\n  - NCCL flake < 1% sustained OR understood/mitigated\n\nNotes / follow-ups\n- If NCCL flake remains >1% after cooldown tuning, consider splitting NCCL into:\n  - quick \u201cconnectivity\u201d check (fast fail)\n  - slower bandwidth floor check (run only after node otherwise healthy)\n- Add explicit \u201coperator override: mark ready\u201d path only for non-production pools (do not allow on Dedicated serving pools).\n",
+  "comments": [
+    "2025-10-06 (Rafael Mendes): Please add a hard workflow deadline. Otherwise we\u2019ll accumulate stuck nodes in Provisioning/Validating and it\u2019ll inflate time-to-ready without triggering quarantine. Also +1 to full jitter on exponential backoff.",
+    "2025-10-07 (Miles Thornton): Strong preference for error classes as enums. We\u2019ve been burned by high-cardinality labels when people include raw error strings. Also ensure backoff and attempt counters are visible in readiness service so oncall doesn\u2019t need to grep logs.",
+    "2025-10-09 (Aisha Bello): For NCCL smoke retries, do a longer cooldown than other steps; immediate retries tend to keep failing when fabric is congested. Also please confirm we won\u2019t tag metrics with node IDs.",
+    "2025-10-10 (Gabe Wilson): Added step-by-step table + workflow deadline. Implemented full-jitter backoff in orchestrator library; plumbed error_class/quarantine_reason enums into readiness writes.",
+    "2025-10-16 (Sean Gallagher): Looks good. Only remaining concern is retry storms during rollout; please ensure the default base_delay isn\u2019t too low for kube join when API is throttling. Suggest 30s base with max 10m and cap attempts at 4.",
+    "2025-10-18 (Vanessa Ortiz): Updated kube join base_delay to 30s and confirmed attempt cap. Marking done; implementation tracked in follow-on PRs."
+  ],
+  "activity_log": [
+    "2025-10-03: Ticket created after Infra/SRE sync on bring-up reliability.",
+    "2025-10-07: Draft policy posted for review; added observability/cardinality section.",
+    "2025-10-10: Incorporated SRE feedback; added workflow deadline + NCCL cooldown guidance.",
+    "2025-10-18: Final SRE sign-off; policy considered baseline for staged rollout."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_a39dea74b85e45ac96e5e161ed09e718"
+}

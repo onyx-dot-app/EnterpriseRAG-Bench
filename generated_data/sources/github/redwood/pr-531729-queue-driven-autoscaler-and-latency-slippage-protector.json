@@ -1,0 +1,93 @@
+{
+  "repo": "redwood",
+  "pr_number": "531729",
+  "title": "Queue-driven autoscaler and latency-slippage protector for Dedicated fleets",
+  "author": "Maya Chen",
+  "created_at": "2024-11-05",
+  "updated_at": "2024-11-12",
+  "merged_at": "2024-11-12",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/queue-drain-autoscaler-latency-protector",
+  "reviewers": [
+    "Liam O'Connor",
+    "Priya Singh",
+    "Noah Rivera"
+  ],
+  "labels": [
+    "autoscaler",
+    "runtime",
+    "perf",
+    "telemetry",
+    "dedicated"
+  ],
+  "linked_linear": [
+    "ENG-4027",
+    "ENG-4089"
+  ],
+  "linked_jira": [
+    "SUP-1286"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "9",
+  "additions": "842",
+  "deletions": "173",
+  "breaking_change": "false",
+  "release_notes": "Introduces a new queue-driven autoscaler that uses queue depth and p99 tail-latency slippage to make scale decisions; adds a transient \"latency-slippage protector\" that reserves burst capacity when tail latency degrades; exposes new per-shard utilization percentiles and an opt-in sliding-window exporter for Dedicated fleets.",
+  "description": "Motivation:\\nWe continue to see tail-latency spikes in Dedicated fleets caused by bursty arrival patterns that do not show up in mean utilization metrics. The existing utilization-based autoscaler reacts too late because it relies primarily on CPU/GPU utilization and average token throughput. This PR introduces a queue-driven autoscaler that incorporates request queue depth and a tail-latency slippage signal to make earlier scale decisions, plus a temporary protective mechanism (latency-slippage protector) that allocates a bounded burst reservation to impacted shards while the autoscaler ramps capacity.\\n\\nScope / changes in this PR:\\n- New queue-driven autoscaler service (services/autoscaler/queue_driven.go) that performs continuous sampling of per-shard request queue depth, recent p50/p90/p99 latency, and calculates a slippage score (p99_current / p99_baseline). Decision logic combines smoothed queue growth rate and slippage to trigger scale-up/scale-down events.\\n- Latency-slippage protector (pkg/protector) \u2014 when slippage crosses a configured threshold the protector may provision a small burst allocation from the fleet's soft-burst pool for up to N seconds while the autoscaler provisions nodes. This is bounded and rate-limited per-tenant to preserve fairness.\\n- Telemetry: new exporter (telemetry/sliding_percentiles.go) that reports per-shard sliding-window percentiles (1m/5m) for queue depth and latency to CloudMetrics and Influx backends. Also adds a rollup metric for \\\"slippage_incidents\\\" for alerting.\\n- Configuration: new policy schema fields in dedicated/policy.yaml to configure queue thresholds, slippage thresholds, max-burst-seconds, and per-tenant burst caps.\\n- Tests: unit tests for decision heuristics, integration test that replays production-like traces through a lightweight simulator (tests/autoscaler_simulator).\\n- Docs: runbook additions for incident response when slippage_incidents alert fires.\\n\\nWhy this is different from prior work:\\nPrevious PRs emphasize utilization smoothing, reservation credits, and probabilistic burst contracts. This change focuses on request queue dynamics and tail-latency signal fusion \u2014 an orthogonal approach that reacts to SLA-sensitive tail events without requiring higher long-term committed capacity. The protector provides graceful short-term relief while the system provisions capacity, thereby reducing user-visible errors during transient hotspots.\\n\\nBenchmarks and safety checks:\\n- Local and canary runs against production traces (sampled requests from July\u2013October): median time-to-detect increased from ~45s to ~11s on sustained bursts; p99 tail latency reduced by 18% in those traces when protector + autoscaler enabled versus baseline autoscaler.\\n- Abuse and fairness: protector enforces per-tenant caps and global throttle to avoid starvation of other tenants.\\n- CI: unit tests + linter + integration simulator passed in CI; e2e canary run in eu-west region before merge.\\n\\nRollout plan:\\n1) Deploy telemetry exporter only (no decision logic) for 2 days to gather baseline percentiles.\\n2) Canary enable autoscaler+protector for 3 dedicated small fleets with opt-in tenants. Monitor slippage_incidents and cost delta.\\n3) If green after 48h extend to all small fleets and monitor for one week.\\n4) Gradually enable default policy with conservative knobs.\\n\\nOpen questions / follow-ups:\\n- We should evaluate integrating memory/KV cache miss rates as another signal (future PR).\\n- Consider exposing a tenant-facing advisory API that can opt-in to pre-warm capacity for scheduled events.\\n\\nCommits summary:",
+  "commits": [
+    "a1d3b4c: introduce queue-driven autoscaler skeleton and interfaces",
+    "b7f8e2a: implement slippage score and smoothing windows",
+    "c2fe9d1: add latency-slippage protector implementation and unit tests",
+    "d9b4a87: telemetry: sliding percentiles exporter and metrics registration",
+    "e5c1f3b: config: extend dedicated policy schema and defaults",
+    "f0a2179: tests: autoscaler simulator harness and sample traces",
+    "f9b3341: docs: add runbook + rollout notes",
+    "ff12aa2: polish: add feature flag and canary gating; update changelog"
+  ],
+  "changed_files": [
+    "services/autoscaler/queue_driven.go",
+    "pkg/protector/protector.go",
+    "telemetry/sliding_percentiles.go",
+    "dedicated/policy.yaml",
+    "tests/autoscaler_simulator/simulator_test.go",
+    "docs/runbooks/latency-slippage.md",
+    "cmd/flags/feature_flags.go",
+    "internal/metrics/registry.go",
+    "README.md"
+  ],
+  "diff_snippets": [
+    "--- a/services/autoscaler/queue_driven.go\n+++ b/services/autoscaler/queue_driven.go\n@@\n- // previous placeholder autoscaler\n+ // queue-driven autoscaler samples queue depth and tail-latency slippage\n+ func evaluateShard(shard SampleWindow) Decision {\n+     slippage := shard.P99 / shard.BaselineP99\n+     if shard.QueueGrowthRate > cfg.QueueGrowthThreshold || slippage > cfg.SlippageThreshold {\n+         return ScaleUp\n+     }\n+     return MaybeScaleDown\n+ }",
+    "--- a/pkg/protector/protector.go\n+++ b/pkg/protector/protector.go\n@@\n+// Protect reserves bounded soft-burst credits for at most MaxBurstSeconds\n+func (p *Protector) Protect(ctx context.Context, tenant string, shardID string) bool {\n+    if p.exceededTenantCap(tenant) {\n+        return false\n+    }\n+    // atomically reserve credits and start expiration timer\n+    return true\n+}",
+    "--- a/telemetry/sliding_percentiles.go\n+++ b/telemetry/sliding_percentiles.go\n@@\n+// ExportSlidingPercentiles reports p50/p90/p99 for queue_depth and tail_latency per-shard\n+func ExportSlidingPercentiles() { /* ... */ }"
+  ],
+  "review_comments": [
+    "Liam O'Connor: Overall nice approach. Two questions: do we have a safety valve if the protector is repeatedly used by many tenants at once? Also please add a circuit-breaker in the protector to avoid linearized reservations.",
+    "Maya Chen (author): Protector has a global throttle and per-tenant cap. Added circuit-breaker config and tests in c2fe9d1. See protector_test for concurrency coverage.",
+    "Priya Singh: The slippage baseline calculation is sensitive to noisy p99s. Can we use a trimmed mean baseline instead of raw p99 medians?",
+    "Maya Chen: Good call. I switched baseline to an exponential moving trimmed-p99 (drop top 1 sample per window) in b7f8e2a to reduce noise. Added comment and unit tests.",
+    "Noah Rivera: Need to ensure the new metrics don't blow quota in low-retention clusters. Suggest making sliding percentile export opt-in per-cluster.",
+    "Maya Chen: Exporter is behind feature flag and opt-in per-cluster in policy.yaml (see defaults)."
+  ],
+  "ci_checks": [
+    "Unit tests: pass",
+    "Linter: pass",
+    "Integration simulator: pass",
+    "E2E canary (eu-west): pass",
+    "Security scan: pass"
+  ],
+  "merge_summary": "Merged via squash-merge after green CI and successful canary. Merge note: enabled feature flag off by default; will be rolled out as described in PR notes. Changelog updated.",
+  "post_merge_actions": [
+    "Telemetry-only rollout scheduled: 2024-11-13",
+    "Canary enablement for 3 fleets scheduled: 2024-11-14",
+    "On-call notified: SRE rotation for 2024-11-14 to watch slippage_incidents"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes",
+    "review_comments",
+    "merge_summary"
+  ],
+  "dataset_doc_uuid": "dsid_aa72c6885d4a46578912024fc7334d04"
+}

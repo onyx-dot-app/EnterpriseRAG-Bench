@@ -1,0 +1,88 @@
+{
+  "key": "INT-860351",
+  "project": "internal-support",
+  "issue_type": "Bug",
+  "summary": "GCP Workload Identity federation -> AWS assume-role: session-tag truncation causing KMS key policy denies during Dedicated provisioning",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-14",
+  "reporter": "Ava Chen",
+  "assignee": "Miguel Alvarez",
+  "components": [
+    "auth",
+    "private-deploy",
+    "scheduler",
+    "kms"
+  ],
+  "labels": [
+    "cross-cloud",
+    "workload-identity",
+    "assume-role",
+    "dedicated-provisioning",
+    "blocking"
+  ],
+  "environment": "prod-us-east",
+  "affected_regions": [
+    "us-east-1",
+    "us-east4"
+  ],
+  "linked_issues": [
+    "INT-606060",
+    "INT-947663"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/provisioner/pull/439",
+    "https://github.com/redwood-inference/iam-configs/pull/112"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/OPS/Cross-Cloud+WIF+Runbook",
+    "https://confluence.redwood.ai/display/SEC/Key+Policy+Guidelines"
+  ],
+  "description": "Issue summary:\nDuring automated Dedicated capacity provisioning for customer-tenant 'acme-ml', the cross-cloud credential broker (GCP Workload Identity Federation -> AWS STS) succeeded but downstream KMS operations failed with AccessDenied. Impact: Dedicated provisioner could not finish creating reserved clusters for two customers, blocking onboarding and test traffic.\n\nImpact:\n- 2 Dedicated provisioning runs failed in us-east region (customer-facing).\n- Provisioner left partial resources (EC2 instances created without required KMS-wrapped secrets).\n- Oncall had to rollback an attempted retry causing extra cost.\n\nEnvironment:\n- Provisioner service: prod-us-east namespace\n- Broker: gcp-wif-broker (uses service account svc-provisioner@redwood-prod.iam.gserviceaccount.com)\n- AWS role: arn:aws:iam::222222222222:role/redwood-dedicated-provisioner\n- KMS key: arn:aws:kms:us-east-1:222222222222:key/aa11-bb22-cc33\n\nExpected behavior:\n- Broker issues STS token with session tags (team, tenant, request_id); AWS assume-role propagates tags and KMS key policy allows Encrypt/Decrypt when aws:PrincipalTag/team == \"platform\" or tenant == \"acme-ml\".\n\nObserved behavior:\n- STS assume-role succeeded (AssumeRoleWithWebIdentity) but subsequent KMS Encrypt calls return AccessDenied: \"User: arn:aws:sts::222222222222:assumed-role/redwood-dedicated-provisioner/session is not authorized to perform: kms:Encrypt on resource ... because condition aws:PrincipalTag/tenant missing\"\n",
+  "steps_to_reproduce": [
+    "1) Use GCP service account svc-provisioner@redwood-prod to request OIDC token for workload identity federation.",
+    "2) Call AWS STS AssumeRoleWithWebIdentity including >6 session tags (tenant, team, request_id, env, feature_flag, region, extra_tag) via provisioner codepath.",
+    "3) With returned creds, call KMS:Encrypt against customer key that has condition checking aws:PrincipalTag/tenant.",
+    "4) Observe AccessDenied in CloudTrail and provisioner failure."
+  ],
+  "logs": [
+    "CloudTrail: AssumeRoleWithWebIdentity: Success - RequestedSessionTags: {tenant=acme-ml, team=platform, request_id=pr-9857, env=prod, feature_flag=dedicated, region=us-east-1, extra_tag=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx}",
+    "CloudTrail: KMS Encrypt: AccessDenied - Error: User arn:aws:sts::222222222222:assumed-role/redwood-dedicated-provisioner/session is not authorized to perform: kms:Encrypt on resource arn:aws:kms:us-east-1:222222222222:key/aa11-bb22-cc33 due to failed condition: aws:PrincipalTag/tenant\n",
+    "GCP Broker logs (gcp-wif-broker): TokenSize=3792 bytes, TruncatedTagsCount=2, Warning: session tag payload exceeds AWS STS max size; dropped last 2 tags",
+    "Provisioner: Error: provisioning aborted after KMS failure; partial infra left (i-0abcd1234)."
+  ],
+  "investigation_notes": [
+    "03-10 09:12 - Reproduced in staging by creating OIDC token with many session tags; observed identical KMS denial when tags were dropped.",
+    "03-10 11:00 - AWS STS enforces a max size for session tags and will silently drop tags if token payload exceeds limit; keys after a certain index were missing in assumed-role session (confirmed in CloudTrail).",
+    "03-11 14:30 - KMS key policy uses aws:PrincipalTag/tenant condition to scope access to tenant-specific keys. If 'tenant' tag missing, KMS denies even if caller is assumed-role principal.",
+    "03-12 08:05 - Provisioner recently added extra session tags (feature_flag and extra_tag) in PR 439 to carry trace metadata. This increased session tag payload size and pushed 'tenant' tag past the truncation boundary in some calls.",
+    "03-13 16:20 - Confirmed with AWS Support that when tag payload exceeds STS limit, AWS may drop a subset of tags without failing the AssumeRole; there is no server-side error in that case.",
+    "Hypothesis: Addition of non-essential tags caused session payload > limit for some requests, causing tenant tag to be dropped leading to KMS denial."
+  ],
+  "comments": [
+    "Ava Chen (reporter) 2026-03-10: First observed during dedicated provisioning for acme-ml; escalation requested.",
+    "Miguel Alvarez (assignee) 2026-03-10: Acknowledged - assigning to SRE + Auth to investigate token size and tag propagation.",
+    "SRE-Lead (comment) 2026-03-11: Confirmed CloudTrail shows missing PrincipalTag keys on assumed role. Captured full STS request/response for sample trace id pr-9857.",
+    "Auth-Engineer (comment) 2026-03-12: We reproduced in staging. Suspect session tag ordering in caller code matters; recommend moving tenant/tag keys up earlier and dropping non-essential tags.",
+    "Miguel Alvarez 2026-03-13: Coordinated with Provisioner owners to open PR to remove extra_tag and always emit tenant as first tag. Built hotfix branch for immediate rollout.",
+    "Provisioner-Owner 2026-03-14: Hotfix merged and deployed to prod canary; provisioning for acme-ml retried and completed successfully. Monitoring for two hours."
+  ],
+  "resolution_notes": [
+    "Root cause: Provisioner started sending additional non-essential session tags which increased the OIDC/session payload beyond AWS STS tagging size threshold. AWS truncated the tail of session tags; the tenant tag was sometimes dropped, causing KMS key policy conditions to fail and produce AccessDenied on kms:Encrypt.",
+    "Immediate mitigation: Reverted the non-essential tag (extra_tag) and reordered tags in the provisioner code so tenant and team are emitted first. Deployed hotfix to prod canary on 2026-03-14 08:40 UTC and rolled to full prod after 2-hour verification window.",
+    "Long-term remediation actions:\n- PROV-214: Add validation in provisioner CI to ensure total session tag payload stays under AWS documented limits and fail PRs that exceed the threshold.\n- AUTH-59: Add instrumentation to gcp-wif-broker to report dropped tags count as a metric and alert on >0 drops in prod.\n- SEC-87: Update KMS key policies to include a fallback allow for the provisioner assumed-role (with tight conditions) to reduce single-point failure mode while other mitigations land.\n- Runbook update: Confluence runbook updated with troubleshooting steps for session tag truncation and checklist to check CloudTrail for missing aws:PrincipalTag entries.",
+    "Status: Resolved for the immediate customer onboarding runs. Follow-up work assigned to Provisioner and Auth teams with tickets PROV-214, AUTH-59, SEC-87 linked."
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs",
+    "investigation_notes",
+    "comments",
+    "resolution_notes"
+  ],
+  "dataset_doc_uuid": "dsid_7b144ffd26004361972a6a4bdd9f53e0"
+}

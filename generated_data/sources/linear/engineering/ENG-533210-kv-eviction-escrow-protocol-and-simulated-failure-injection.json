@@ -1,0 +1,43 @@
+{
+  "key": "ENG-533210",
+  "team": "engineering",
+  "title": "KV eviction escrow protocol and simulated failure injection",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-02-12",
+  "updated_at": "2025-03-03",
+  "creator": "Asha Patel",
+  "assignee": "Lukas Meyer",
+  "project": "kv-cache-resilience",
+  "cycle": "2025-W08",
+  "estimate": "8",
+  "due_date": "2025-03-28",
+  "labels": [
+    "kv-cache",
+    "eviction",
+    "continuous-batching",
+    "gpu-memory",
+    "safety"
+  ],
+  "dependencies": [
+    "ENG-314159",
+    "ENG-21488"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.21",
+  "security_review_required": "false",
+  "description": "Summary:\nWe need a deterministic, auditable eviction handshake that prevents prefix-corruption during continuous batching and aggressive prefetching. This ticket proposes an \"eviction escrow\" protocol: evictors obtain a short-lived escrow token for candidate KV slices, coordinate with in-flight batch owners, and only commit reclamation once a set of lightweight invariants are proven. The protocol aims to maintain correctness across LRU/TTL/prefix-aware heuristics while enabling GPU slab reclamation and cooperative prefetching.\n\nMotivation:\n- Continuous batching and aggressive prefetch reduce GPU stall and improve throughput, but they increase races between eviction and inflight cache readers/writers.\n- Existing heuristics (LRU + TTL) work well for steady state but are brittle under bursty prefix-heavy workloads and when batches hold references across kernel boundaries.\n- We need a pragmatic protocol that: (1) protects prefix-affinity invariants, (2) allows bounded-time reclamation for GPU memory pressure, and (3) is testable via fault injection and property tests.\n\nProposal (high level):\n1) Escrow token allocation: evictor marks a slice with an escrow token containing: token_id, proposed-evict-level (soft/hard), epoch, and hint-set of prefixes touched. Token is visible to batch owners via a small in-memory ledger.\n2) Inflight check window: batch owners periodically check the ledger; if they hold references to a tokened slice they register a short lease (ms-resolution) indicating active use.\n3) Quiesce-or-renegotiate: evictor waits up to a configurable grace window (default 50ms) for active leases to either expire or for owners to signal a safe demote path (e.g., copy-to-evict-buffer or move to colder memory).\n4) Commit with proof: when grace window elapses with no active leases, evictor commits eviction and emits a compact proof record (token_id, epoch, commit-timestamp, affected-prefixes) appended to eviction-audit log for later replay or verification.\n5) Fallbacks: if grace window exceeds a threshold or owner signals inability to demote, evictor either (a) lower reclaim aggressiveness (downgrade to soft) or (b) defer eviction to next pass.\n\nCorrectness invariants to guarantee:\n- Invariant A (No-live-reference-evict): an eviction commit must not occur while any batch owner holds a live reference to the slice.\n- Invariant B (Prefix-consistency): for a prefixed request sequence, eviction+prefetch must preserve prefix semantics: cached prefix contexts must never be interleaved in a way that changes model output deterministically for the same prefix.\n- Invariant C (Bounded-liveness): eviction decision must make forward progress within a bounded time for high-memory-pressure events (configurable emergency path).\n\nDesign details and data structures:\n- Ledger: append-only ring buffer per-shard, small records for token state and owner lease registrations. Compact to avoid GPU-visible stalls.\n- Token lifecycle: ALLOCATED -> PENDING (owner leases detected) -> READY -> COMMITTED -> RETIRED. Each transition is linearizable per-shard.\n- Owner lease: lightweight timestamp + holder-id. Owners must renew on long-running batches. Renewal rate bounded to avoid thundering herd.\n- Emergency reclaim path: if GPU memory falls below emergency threshold, the evictor can use a forced-demote that signals owners to copy KV slice to fallback memory (CPU pinned) with prioritized background transfer. This path requires explicit audit log entries and increases latency cost; used sparingly.\n\nTest plan and validation harnesses:\n- Unit tests: token lifecycle, ledger wrap-around, lease renewals, failure in middle of transition.\n- Property tests: randomized sequences of allocations, prefetch, batch hold/release to assert Invariant A and B. Use proptest-style fuzz to discover edge races.\n- Simulation: extend existing eviction fuzzer to simulate multi-tenant workloads, continuous batching, and varying kernel latencies. Include explicit failure-injection hooks (RPC loss, process pause, ledger truncation).\n- Benchmarks: microbench for escrow overhead (token ops / ms) and end-to-end tail latency impact on typical chat workloads; stress test for reclaim throughput under memory pressure.\n\nMonitoring and observability:\n- Emit eviction-audit log shards to console tracing system. Dimensions: token_id, shard, epoch, lifecycle events, latency to commit, decision (commit/soft-defer/emergency-demote).\n- New Console panels: token churn rate, average grace-window duration, emergency-reclaim frequency, prefix-collision incidents (where owner signaled blocking).\n\nRollout plan:\n- Phase 1 (canary): implement ledger + token allocation but keep evictor in no-op mode (only emit tokens). Run in prod for 2 weeks, collect telemetry and run verifier that replays proofs offline.\n- Phase 2 (limited commit): enable commit for low-risk shards with low prefix density; monitor errors and tail latency for 1 week.\n- Phase 3 (wide): enable across clusters with emergency path and telemetry alerts.\n\nAcceptance criteria:\n- No violation of Invariant A or B observed in extended simulation (100k randomized trials).\n- Escrow token ops add <1% p99 token-op latency overhead in steady-state on benchmark hardware.\n- Emergency reclaim path triggers audited and reduces GPU memory usage without data corruption in end-to-end tests.\n- Console shows clear metrics and alerting rules for token churn and emergency reclaim rates.\n\nOpen questions / Trade-offs:\n- Grace window sizing: default 50ms vs workload-specific tuning. Longer windows reduce false-positive evicts but increase memory pressure.\n- Ledger footprint vs fidelity: smaller records minimize overhead but reduce offline-verifiability of prefix-histories.\n- Forced-copy cost: copying hot KV slices to CPU memory introduces latency spikes; we may prefer soft demote + re-prefetch heuristics for typical workloads.\n\nLinks and artifacts:\n- Design doc (Confluence): https://redwood.atlassian.net/wiki/spaces/INF/pages/EV-ESCROW-PROTOCOL\n- Simulation harness (GitHub): https://github.com/redwood-inference/eviction-fuzz/tree/escrow-protocol\n- Draft PR: https://github.com/redwood-inference/runtime/pull/2987\n- Console dashboard (internal): https://console.redwood.ai/dashboards/eviction-escrow-canary\n\nSecurity/Compliance notes:\n- Eviction audit logs may include tenant IDs and prefix hints; ensure logs are redacted or routed to tenant-isolated telemetry when running in Dedicated/Private mode.\n\nNext steps:\n- Lukas: prototype ledger API + token allocators (ETA 2 weeks).\n- Asha: extend fuzzer and property tests (ETA 1 week).\n- Riley (SRE): prepare canary cluster and add alerting thresholds (ETA 1 week).\n",
+  "comments": [
+    "2025-02-13 - Asha Patel: Initial design drafted and shared with runtime team. Added simulation checklist.",
+    "2025-02-18 - Lukas Meyer: Prototyped ledger ring buffer; observed 0.6us median op cost on dev GPU. Pushed microbench to GH PR.",
+    "2025-02-22 - Riley Chen: SRE reviewed emergency reclaim; requested explicit alert for emergency-demote frequency > 1/hr per cluster.",
+    "2025-03-01 - Design review: PM and infra approved canary plan but asked for stronger privacy controls on eviction-audit logs.",
+    "2025-03-03 - Lukas Meyer: Integrated owner-lease renewal path. Running extended fuzz overnight; no invariants violated so far."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_8009a0315fd640c0be378eabe7708bef"
+}

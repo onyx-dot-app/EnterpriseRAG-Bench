@@ -1,0 +1,54 @@
+{
+  "key": "ENG-119901",
+  "team": "engineering",
+  "title": "Granular prefetch safety and eviction commit protocol for KV cache under continuous batching",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-20",
+  "updated_at": "2026-03-14",
+  "creator": "Priya Kothari",
+  "assignee": "Liam O'Neill",
+  "project": "runtime-inference",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-04-01",
+  "labels": [
+    "kv-cache",
+    "eviction",
+    "gpu-memory",
+    "batching",
+    "correctness",
+    "prefetch"
+  ],
+  "parent_issue": [
+    "ENG-99204"
+  ],
+  "dependencies": [
+    "ENG-71012",
+    "ENG-82019"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.25",
+  "security_review_required": "false",
+  "description": "Summary:\nWe need a provably-safe, low-latency eviction/commit protocol for our KV cache that supports: continuous batching, aggressive prefetching, prefix-aware retention, and GPU memory slab sharing. The goal is to introduce a lightweight commit/abort contract for prefetched entries (and their associated slices) so that evictions driven by LRU/TTL/space-pressure do not violate correctness of in-flight token generation or cause silent model regressions.\n\nBackground & problem statement:\n- Continuous batching increases concurrency: many requests share a KV cache and may prefetch contiguous prefix blocks for future decode steps.\n- Prefetching improves throughput but complicates eviction: prefetched slices can be referenced by in-flight decodes, speculative beams, or later requests that become active as batches evolve.\n- GPU memory optimization relies on slab/arena allocation and shared slices to reduce fragmentation. Evicting a slice must reclaim memory without violating guarantees for other users or interrupting ongoing inference.\n- Existing heuristics (LRU/TTL/prefix-affinity) do not encode safety for prefetched slices or provide atomic commit semantics when we need to evict partially-consumed prefixes.\n\nGoals & success criteria:\n- Define a commit/lease protocol for KV slices that: (1) prevents evictions of slices still referenced by in-flight decodes, (2) allows safe preemption when necessary with defined fallback, and (3) supports fast reclamation for non-referenced memory.\n- Provide formal invariants and an implementable algorithm compatible with our runtime scheduler and batching system.\n- Ensure overhead < 3% p99 latency for typical small- to mid-size workloads and no measurable throughput regression for large batched workloads.\n- Rollout path with canary, monitoring, and automatic fallback to previous eviction policy.\n\nProposed design (high level):\n1) Slice lease metadata: every KV slice is associated with a small lease record: {lease_id, holder_count, epoch_version, prefix_keys, ttl_hint}. The runtime increments holder_count when a decode or batch references a slice; prefetch operations create a provisional lease (holder_count=0, provisional=true).\n2) Two-phase commit for prefetch: prefetch creates provisional slices. When a request actually uses the slice, it issues an 'acquire' which flips provisional->committed and increments holder_count. If a provisional slice expires without acquisition before its ttl_hint, a background scavenger can reclaim it cheaply.\n3) Eviction decision: eviction candidates are scored by a combined policy: score = alpha*LRU_rank + beta*ttl_expiry + gamma*prefix_affinity_penalty + delta*provisional_penalty. Candidates with holder_count>0 are excluded. For tied candidates or under emergency pressure, we allow 'preemptive abort' where provisional slices can be evicted and any dependent speculative work is failed-over to the fallback model variant.\n4) Atomic reclamation: to reclaim GPU memory we use a small per-slice fence token updated via the allocator's epoch. Reclamation proceeds only when holder_count==0 AND epoch_version <= current_epoch. This guarantees no in-flight kernel will touch freed memory.\n5) Fast path for small prefixes: for prefixes smaller than a configurable threshold we permit a coalesced eviction that rewrites adjacent slices into a compacted slice to reduce per-slice overhead and fragmentation with minimal pause.\n\nCorrectness invariants (to be proven/tested):\n- Safety invariant: No slice that is referenced by an in-flight decode/kernel will be freed until holder_count transitions to zero and reclamation fence has advanced past the epoch when the last holder released.\n- Prefix-consistency invariant: If a decode depends on a contiguous prefix, either all constituent slices of that prefix remain available for the duration of the decode or the decode is signaled to fallback early (deterministic failure path).\n- Determinism invariant: Under identical request sequences and scheduling events, eviction decisions may vary for optimization but must not change functional outputs unless an approved fallback path is executed and recorded.\n\nProof sketch & reasoning:\n- Model holder_count and epochs as monotonically-updated counters. Show that any kernel that holds a reference must increment holder_count before using the slice and decrement after. The allocator uses epochs to order reclamation: reclamation of slice S at epoch E only proceeds if last_release_epoch(S) < E. By coupling these counters, we can show absence of use-after-free.\n\nCompatibility with continuous batching and prefetching:\n- Batching scheduler must acquire provisional slices lazily: when the scheduler decides to pin the prefix for the batch, it should perform acquire to convert provisional to committed atomically before kernel dispatch.\n- For beams/speculation, we treat speculative users as normal holders; if speculation is aborted we decrement holder_count accordingly.\n\nImplementation plan (milestones):\n- Prototype metadata and allocator extension (C++ low-level) + unit tests for holder_count and epoch fences (2w).\n- Integrate with continuous batching scheduler and prefetch path, instrumenting acquire/release hooks (2w).\n- Simulation harness: fuzz scheduling and eviction under heavy concurrency to find races and behavior (2w).\n- E2E canary on canary infra with gated fallback to previous eviction policy and telemetry (2w).\n\nObservability & rollouts:\n- New metrics: slice_leases_total, provisional_slices, holder_count_histogram, reclamation_wait_ms, eviction_rejects_due_to_holder_count, preemptive_evictions.\n- Dashboards: per-model and per-GPU memory pressure heatmap; alert on preemptive_evictions>0.1% of total evictions.\n- Canary rollout sequence: 5% traffic (low-variance), 20% (multi-tenant), 100% with 24h guardrail. Auto-disable if p99 latency regresses >5% or preemptive_evictions spike above threshold.\n\nTesting strategy:\n- Unit: holder_count invariants, provisional timeouts, epoch fencing.\n- Integration: simulated batching and prefetch race tests under stress (fuzz harness).\n- Load: p99 latency/throughput comparison with legacy policy across three representative workloads and two GPU types.\n- Chaos: forced kernel delays and abrupt worker restarts to validate reclamation fence soundness.\n\nDocumentation & follow-ups:\n- Confluence design doc: https://redwood.atlassian.net/wiki/spaces/RUNTIME/pages/GRANULAR+PREFETCH+SAFETY (placeholder)\n- Implementation PRs: https://github.com/redwood-inference/runtime/pull/XXXX\n- Runbook for fallback and incident response: link to runbook (placeholder)\n\nRisks & open questions:\n- Overhead of holder_count updates for extreme micro-batched workloads (1-2 token per request rate): need microbenchmarks to quantify counter update cost.\n- TTL tuning for provisionals: conservative ttl may waste memory, aggressive ttl may evict useful prefetched slices.\n- Behavior when multiple prefixes overlap and share slices: need canonical ownership model to avoid thrashing.\n\nNext actions:\n- PR 1: allocator metadata and epoch fencing (assignee: Liam) - due 2026-03-02 (in flight).\n- PR 2: batching scheduler acquire/release integration (assignee: Priya) - follow-on after PR 1.\n- Schedule design review with systems + perf + product to validate rollout plan (target 2026-03-05).",
+  "comments": [
+    "2026-02-22 Priya Kothari: Created ticket and initial design draft. Shared with runtime and infra teams for early feedback.",
+    "2026-02-25 Miguel Santos: Reviewed design; requested clarification on overlap handling when two prefixes share internal slices \u2014 suggested canonical owner by earliest-acquire timestamp.",
+    "2026-03-01 Liam O'Neill: Pushed allocator metadata prototype branch and basic unit tests. Observed 0.6% p99 regression in microbench with holder_count atomic increments; investigating batching coalescing to mitigate.",
+    "2026-03-04 Nadia Patel (Perf): Ran fuzz harness; found a race when provisional->committed flip coincides with background scavenger reclaim. Proposed adding short handoff window or compare-and-swap on provisional flag.",
+    "2026-03-10 Priya Kothari: Incorporated Nadia's handoff window suggestion. Updated documentation links and added provisional_ttl configurable knob for canary.",
+    "2026-03-12 Product review (Alex Martinez): Approved rollout plan conditional on canary metrics and auto-fallback. Requested customer-communication plan for Dedicated customers with strict memory limits.",
+    "2026-03-14 Liam O'Neill: Started canary deployment to 5% traffic on canary cluster. Telemetry hooks enabled. Monitoring configured for reclamation_wait_ms and preemptive_evictions."
+  ],
+  "attachments": [
+    "https://github.com/redwood-inference/runtime/pull/XXXX",
+    "https://redwood.atlassian.net/wiki/spaces/RUNTIME/pages/GRANULAR+PREFETCH+SAFETY",
+    "https://grafana.redwood.internal/d/kv/kv-eviction-dashboard"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_49647dcbce514f01b8b9ef2c0330c393"
+}

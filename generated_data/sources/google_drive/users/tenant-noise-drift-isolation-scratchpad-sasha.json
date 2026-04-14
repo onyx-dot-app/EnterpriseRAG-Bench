@@ -1,0 +1,35 @@
+{
+  "title": "Tenant noise drift isolation scratchpad - Sasha Patel",
+  "owner": "Sasha Patel",
+  "drive_area": "users",
+  "path": "users/tenant-noise-drift-isolation-scratchpad-sasha.json",
+  "doc_type": "doc",
+  "created_at": "2025-01-14",
+  "last_modified": "2025-01-18",
+  "collaborators": [
+    "Mei Chen",
+    "Lucas Rivera"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "multi-tenant",
+    "noise",
+    "benchmark",
+    "A100",
+    "p99",
+    "isolation"
+  ],
+  "linked_artifacts": [
+    "ENG-4821",
+    "PR#2345",
+    "confluence:perf/noise-isolation-draft"
+  ],
+  "content": "Context:\nQuick personal notes and running log for tests exploring multi-tenant interference / latency drift over long runs. The goal is to validate that our serving runtime can maintain tail SLOs under low-level noisy neighbors and to identify easy isolation knobs (cgroups, CUDA MPS tweaks, CPU pinning, mem limits).\n\nSummary (top-line):\n- Repro: Stable p50 but p95/p99 drift upward after ~30m in mixed-workload tenant.\n- Hypothesis: NVMe burst GC + occasional host CPU steal from other containers + periodic model compaction kicks.\n- Immediate mitigations that looked promising in short runs: disable host-level cron tasks on test node, enforce CPU shares for worker containers, limit IO bandwidth for background tenants.\n\nEnvironment:\n- Cluster: perf-edge-04 (shared testbed), 8x NVIDIA A100 (80GB).\n- Runtime build: inference-runtime v0.37.1+local (kernel tweaks: cudnn 8.2, CUDA 11.8).\n- Models used: rwin-13b-fp16 (baseline), rwin-13b-q4_0 (quantized).\n- Serving config: dynamic-batch=true, max_batch_size=8, kv_cache=true, async_prefetch=on.\n- Client: redwood-bench v0.12 (custom), traffic generator: synthetic conversational traces (mix of short/long requests).\n\nTest matrix (high level):\n1) Single-tenant baseline (dedicated GPU) \u2014 run 2h, concurrency=16, report per-minute p50/p90/p95/p99 + qps\n2) Two-tenant noisy (main workload + background mem-intensive tenant) \u2014 background runs at 0.6 GPU util, main same as baseline\n3) Multi-noise: background tenants x3 (IO heavy, short-burst CPU, long-tail low qps)\n4) Isolation knobs: CPU pinning, cgroups cpuset, MPS disabled/enabled, nvme throttling (fio), container io.weight\n\nCommands used (bench):\n- baseline: ./redwood-bench --host perf-edge-04:443 --model rwin-13b-fp16 --concurrency 16 --duration 7200 --rate-limit 0\n- background fio: sudo fio --name=bgwrite --filename=/dev/nvme0n1 --size=10G --bs=1M --iodepth=32 --rw=write --runtime=3600\n- collect perf: sudo sar -n DEV 60, iostat -x 60, nvidia-smi dmon -s u, ps aux --sort=-%mem | head\n\nRaw snapshot (selected excerpts, minute-resolution aggregate):\n- Single-tenant (2h window) \n  avg_qps: 650, p50=12ms, p90=28ms, p95=45ms, p99=110ms, errors=0.05%\n- Two-tenant noisy (first 30m)\n  avg_qps: 640, p50=13ms, p90=32ms, p95=60ms, p99=180ms, errors=0.2%\n- Two-tenant noisy (30-90m)\n  avg_qps: 620, p50=15ms, p90=48ms, p95=120ms, p99=420ms, errors=0.9%\n- Multi-noise (three backgrounds, 90m window)\n  avg_qps: 590, p50=16ms, p90=55ms, p95=200ms, p99=950ms, errors=3.1%\n\nAscii p99 drift (per-minute snapshots, short form):\n(0m) 110 | (10m) 130 | (20m) 140 | (30m) 180 | (40m) 250 | (50m) 320 | (60m) 410 | (70m) 370 | (80m) 360 | (90m) 950\nNote: big jump at 90m correlates with NVMe GC event on host (dmesg shows garbage-collect/trim logged at +89m).\n\nObservations / possible signals correlated with p99 spikes:\n- NVMe background write pressure correlated with long tails \u2014 observed device_util spiking to 98% and queue avg wait rising.\n- CPU steal: at times the host showed ~20% steal on a few cores \u2014 aligns with periodic cron backup on a different container.\n- GPU context switching (MPS disabled) reduced tail variance slightly (p99 lowered ~15%), but throughput marginally impacted (-4% qps).\n- KV cache churn: when long context (>2048 tokens) requests appear, KV eviction increased CPU scheduling and briefly blocks serving threads -> tail blips.\n\nExperiment: isolate NVMe with fio throttling (limit-bg):\n- fio cgroup with blkio.weight lowered for tenants -> p99 improved from 420ms -> 160ms in 30-90m window. Errors dropped to 0.3%.\n- downside: background tenants suffered throughput, acceptable for internal multi-tenant SLA tests.\n\nIntervention: CPU pinning & cpuset for serving container\n- Pin main serving threads to isolated cores (no other containers scheduled) -> p99 drops ~20% across all noisy scenarios, throughput stable or slightly up.\n- Implementation: systemd slice + cpuset.cpus set to dedicated range, kernel isolated= on boot for test nodes.\n\nQuick checklist of actionable mitigations to try cluster-wide:\n- Enforce blkio weights or throttling for non-critical tenants on shared test clusters\n- Use CPU isolation slices for latency-sensitive serving containers by default (systemd unit templates)\n- Consider enabling MPS for high-concurrency stable workloads, but gate by noise-cases (feature flag)\n- Add nvme GC awareness to autoscaler / admission control (reject background IO-heavy jobs on serving nodes)\n\nUnresolved questions / next experiments:\n- Is the NVMe GC frequency predictable? Run longer test (48h) with periodic snapshots and fio simulation of steady-state write pattern to trigger GC deterministically.\n- Quantify cost of isolation knobs on overall cluster utilization (how much capacity lost if we reserve N cores per serving container).\n- Evaluate H100 nodes: do they show the same drift pattern? (likely not NVMe bound but CPU steal still matters)\n\nNotes to self / TODOs:\n- Run longer 48h baseline on h100-perf-02 with identical workload and no background tenants; record per-minute device stats. (ticket: ENG-4830)\n- Draft a lightweight operator to set blkio for non-critical pods via admission webhook (sketch in PR#2345).\n- Share this scratchpad with SRE and Capacity planning; schedule a run on staging with more realistic customer traces (not synthetic).\n\nReferences / quick links:\n- dmesg excerpts: /var/log/dmesg.2025-01-14.gz (see trim/gc events around +1h30)\n- perf dashboard: https://perf.redwood.internal/dash/tenant-noise/2025-01-14\n- related ticket: ENG-4821 (background job scheduling causing CPU steal)\n\nEnd notes: This is a working scratchpad \u2014 experiments are rough, lots of noise in the testbed. Main takeaway: hardware-level IO events and host CPU scheduling are first-order contributors to tail drift in mixed-tenant scenarios. Proper IO and CPU isolation prevents most of the observed p99 spikes without complex changes to the inference runtime.\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_e16ac1d9f2e440fdb732e4ae6e2e3a96"
+}

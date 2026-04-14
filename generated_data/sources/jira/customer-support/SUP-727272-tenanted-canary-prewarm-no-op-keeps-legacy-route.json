@@ -1,0 +1,66 @@
+{
+  "key": "SUP-727272",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Prewarm no-op during canary causes tenant to remain bound to legacy route after rollout",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Maya Chen",
+  "assignee": "Raj Patel",
+  "customer_company": "QuietSearch, Inc.",
+  "customer_tier": "dedicated",
+  "components": [
+    "serving-runtime",
+    "orchestrator",
+    "edge-proxy"
+  ],
+  "labels": [
+    "canary",
+    "prewarm",
+    "model-pin",
+    "fallback-routing",
+    "investigation"
+  ],
+  "environment": "prod-us-east-1",
+  "affected_models": [
+    "open-econ-7b-v1",
+    "open-econ-3b-quant"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "sla_due_at": "2026-03-11",
+  "first_response_due_at": "2026-03-10",
+  "linked_issues": [
+    "SUP-3141592",
+    "SUP-42156"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/orchestrator/pull/2147"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/runbooks/canary-prewarm-failure-playbook"
+  ],
+  "description": "Issue summary:\nCustomer reports that after a scheduled canary (weighted rollout) the tenant continued to be routed to the legacy model variant despite the canary being marked as healthy. Traffic shows pinned behavior to the older variant.\n\nImpact:\n- QuietSearch sees ~30% of their requests hitting the legacy model post-rollout which returns older tokenization (quality delta).\n- Elevated per-request latency on legacy variant and slight cost increase due to fallback path triggering.\n- Customer-facing: 12 users reported degraded results in a rolling window, customer flagged as urgent due to production usage.\n\nEnvironment:\n- Dedicated pool (tenant-dedicated) in prod-us-east-1.\n- Rollout used: weighted canary 10% -> 50% -> 100% over 45m window with prewarm step.\n- Model variants: open-econ-3b-quant (legacy), open-econ-7b-v1 (canary).\n\nSteps to reproduce (observed by CS and customer):\n1) Start rollout with prewarm mirror to prepare GPU pool.\n2) Prewarm mirror service returned 204 (no-op) for several prewarm requests due to cache warmup guard engaged.\n3) Orchestrator proceeded to shift weights per schedule.\n4) After canary marked healthy, ~30% tenant traffic still routed to legacy variant for ~2 hours.\n\nLogs / telemetry attached:\n- Edge routing logs show persistent route key binding to legacy variant (route_key=tenant:qs-12345) even after snapshot epoch advanced.\n- Orchestrator snapshot commit entries present, but prewarm events show repeated \"prewarm-noop: already-warmed\" at t=03:04-03:09.\n- Serving runtime metrics: hybrid-serving reported \"pin-lease-renewal\" success but edge cookies show older cookie path for affected connections.\n\nInitial hypothesis:\n- Prewarm no-op (guarded mirror response) left a tombstone in the prewarm metadata which prevented the edge from observing the resume handshake that clears legacy pin.\n- Edge cookie scope truncation during the prewarm step caused session affinity mismatches and the tenant remained bound to old route for long-lived connections.\n\nRequested from customer:\n- Full request ids for two affected traces and a pcap of a representative stream (customer provided request-ids: rq_20260310_1142a, rq_20260310_1337b).\n\nNotes: please avoid broad-side restarts; prefer targeted reconciliation steps described in runbook.\n",
+  "comments": [
+    "Maya Chen (Support) 2026-03-10: Triage complete. Assigned to Raj. Collected request IDs and initial logs from customer. Noted prewarm returned 204 no-op in timeline.",
+    "Raj Patel (SRE) 2026-03-10: Acknowledged. Creating an orchestrator snapshot pull. Suspect prewarm metadata tombstone; will query snapshot diffs and edge cookie logs.",
+    "Alex Gomez (Eng) 2026-03-11: Found a code path where prewarm-noop sets 'prewarm_tombstone=true' in in-memory metadata but commit path ignores tombstone clearing on subsequent reconcile. Preparing a small patch to clear tombstones during snapshot apply. Linking PR after validation.",
+    "QuietSearch (Customer) 2026-03-11: Confirmed we still see 25-35% of responses from legacy model on our end between 03:00-05:00 UTC. Appreciate quick remediation.",
+    "Raj Patel (SRE) 2026-03-11: Deployed a targeted snapshot reconcile for tenant qs-12345 to edge nodes (no restart). Observed immediate reduction of legacy hits to <2% for newly established sessions. Long-lived connections still have legacy cookie scope. Will escalate cookie refresh path.",
+    "Maya Chen (Support) 2026-03-12: Customer reports degraded responses have fallen to zero for new sessions. Asking Eng/SRE for permanent fix and postmortem steps."
+  ],
+  "investigation_notes": "Findings:\n- Orchestrator committed the new variant snapshot at epoch 8421. Edge nodes pulled the commit, but prewarm metadata included 'tombstone' flags from the no-op prewarm responses. Snapshot apply code merged the tombstone into route metadata because tombstone clearance only happens on explicit prewarm success, not on subsequent reconciles.\n- Long-lived client sessions maintained cookies with 'Path=/v1/route/legacy' which kept affinity. Edge cookie normalization code had an off-by-one that truncated cookie path when prewarm returned 204, leading to silence about commit.\n- Related logs: orchestrator commit log lines 8421..8430 show tombstone merge events; edge logs show cookie-era header 'Set-Cookie: r=qs-12345; Path=/v1/route/legacy; Expires=...'.\n\nHypothesis validated by targeted reconcile: clearing tombstone metadata and replaying snapshot cleared routing for new sessions. Existing connections require cookie refresh\u2014observed via metrics where persistent connections continued to route legacy for ~90-120 minutes until cookie expired or client reconnected.\n\nAction items (short-term):\n- Run tenant-scoped metadata tombstone purge on affected shard and trigger edge reconcile (done for qs-12345).\n- Provide customer a proactive recommendation to rotate their client session cookies if they can perform a graceful reconnect.\n\nAction items (long-term):\n- Engineer patch: ensure snapshot apply treats prewarm-noop tombstones as idempotent and clears them on subsequent successful prewarm or explicit reconcile. PR linked.\n- Fix edge cookie normalization to avoid truncation on 204 prewarm responses; add unit tests.\n- Add additional telemetry: tombstone delta gauge per-tenant and a canary prewarm health metric exposed to console.",
+  "resolution": "Workaround and fix applied:\n- Short-term: performed a tenant-scoped metadata tombstone purge and forced edge reconcile for qs-12345 at 2026-03-11T21:05Z. New sessions immediately routed to canary variant; legacy route hits dropped to <2% for new connections. Provided customer instructions to force reconnects for active clients.\n- Medium-term: deployed orchestrator patch (PR https://github.com/redwood-inference/orchestrator/pull/2147) that prevents prewarm-noop tombstones from persisting across snapshot applies and explicitly clears stale tombstones during reconcile.\n- Edge cookie normalization patch scheduled in staging (PR queued).\n\nFollow-up:\n- Postmortem to be written and linked to this ticket (owner: Raj Patel).\n- Add runbook step to detect prewarm-noop tombstone spikes and auto-trigger a tenant-scoped reconcile if tombstone ratio > 0.05 for more than 5 minutes.\n\nCustomer status: QuietSearch confirmed recovery for new sessions and accepted the workaround. They requested the postmortem and a timeline for the edge cookie fix; SRE/Eng will follow up with dates.",
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_c779e68c19e94720ad443403ad806262"
+}

@@ -1,0 +1,98 @@
+{
+  "key": "ENG-421007",
+  "team": "engineering",
+  "title": "Prefetch credit tombstone causing transient double-throttle and misattributed usage during shard handover",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-02-25",
+  "updated_at": "2026-03-03",
+  "creator": "Marisol Gomez",
+  "assignee": "Ethan Wu",
+  "project": "billing-core",
+  "cycle": "2026-W09",
+  "estimate": "5",
+  "release": "runtime-2.4.1",
+  "labels": [
+    "billing",
+    "rate-limits",
+    "shard-failover",
+    "hotfix-candidate"
+  ],
+  "parent_issue": [
+    "ENG-27458"
+  ],
+  "dependencies": [
+    "ENG-562900"
+  ],
+  "customer_impact": "high",
+  "description": "Summary: We observed a class of incidents where short-lived burst traffic to a route experienced spurious throttles and simultaneously resulted in overcounted usage during shard handovers. Root cause appears to be the 'prefetch credit tombstone' state left behind by the old shard aggregator when it relinquishes lease. The new leader re-applies currently valid credits but the tombstoned record is still read by the downstream billing reconciler, producing duplicate debit records and transient per-key throttles. Impact: incorrect billing (double-count), temporary 429s for impacted keys, customer tickets for unexpected charges and degraded latency for affected requests. This ticket tracks investigation, mitigation, and a safe rollout for the fix.",
+  "observed_behavior": "During controlled failovers and a handful of production shard transfers (2026-02-24...02-25) we saw a spike in 429s for specific org+route keys. Metering pipeline shows two debits for the same logical request ID in a ~200ms window: one coming from the new aggregator and one reconciled later referencing a tombstoned credit key. Billing aggregation shows +100% for affected short bursts in several orgs before subsequent reconciliation corrections (+24 hours).",
+  "expected_behavior": "When a shard handover occurs, credits (prefetch/k\u2011credits) owned by the old leader must be safely relinquished without leaving any tombstone that will be interpreted as an active debit by downstream reconciliers. Each logical request should be debited at most once and throttles should accurately reflect active credit state on the new leader only.",
+  "repro_steps": [
+    "1) Create a test org with per-key burst credits and a high-frequency short-lived route (seq length 8, p99 latency under 30ms).",
+    "2) Drive a burst of ~500 concurrent requests for 10s routed to a shard leader A (observe expected credits consume).",
+    "3) Trigger a shard leadership transfer (kill leader A or force lease revocation).",
+    "4) Observe new leader B consuming its in-memory credits; watch downstream reconciler logs for reads on tombstone records from A that lead to duplicate debits.",
+    "5) Capture request IDs and correlate with metering pipeline (edge + aggregator + reconciler) to see double-debit pattern."
+  ],
+  "investigation_notes": [
+    "2026-02-25 10:12 - Marisol: Initial alert from SRE about bursty 429s; pulled logs and found duplicate debits for same request IDs.",
+    "2026-02-25 13:40 - Ethan: Added instrumentation to aggregator to log tombstone writes and included lease-id + epoch in tombstone payloads.",
+    "2026-02-26 09:05 - Marisol: Reproducer validated in staging; confirmed tombstone TTL was not being honored by reconciler component due to a schema mismatch in key prefixing after an earlier refactor (ENG-27458).",
+    "2026-02-27 16:30 - Dev: Identified reconciler reads both live credit keys and tombstone keys because tombstone keys share the same lookup prefix; reconciler logic treats tombstones as 'negative credits' when an older write appears after a newer one due to eventual ordering in KV store.",
+    "2026-03-01 11:20 - Engineering: Confirmed that the issue is exacerbated when prefetch credit writes are batched and when there is a small clock skew between nodes; tombstone writes occasionally land after the new leader's initial state due to staggered replication visibility."
+  ],
+  "logs_snippet": "[aggregator-A] INFO 2026-02-25T10:15:02Z write: credit_key(org=org-123,route=r-86,epoch=42,value=50)\n[aggregator-A] WARN 2026-02-25T10:15:02Z tombstone: credit_key(org=org-123,route=r-86,epoch=42)\n[reconciler] INFO 2026-02-25T10:15:02Z read: credit_key(org=org-123,route=r-86) => tombstone(epoch=42)\n[reconciler] ERROR 2026-02-25T10:15:02Z debit: request_id=req-9a7 => applied debit for 50 tokens (src=tombstone)\n[new-leader-B] INFO 2026-02-25T10:15:02Z live-consume: request_id=req-9a7 => consumed 50 tokens (src=live)\n=> duplicate debit observed",
+  "root_cause_summary": "Tombstone records created by old shard leaders are persisted using a lookup prefix that the reconciler still queries; due to replication and write-ordering race, reconciler may see the tombstone after the new leader has already applied live credits, resulting in two debits for the same request. The schema change from ENG-27458 changed key layout and inadvertently kept tombstone keys queryable under a broad prefix.",
+  "mitigation": "Short-term: Add a reconciler-side filter that ignores tombstone records with epoch < leader_epoch_cutoff for the shard (configurable). Emergency patch rolled to prod canary to reduce immediate customer impact. We also applied a transient rate-limit exemption for affected route aliases while we validate the rollouts. Medium-term: run a tombstone sweep job that safely purges tombstones older than safe-replay-window and reprocesses ambiguous debits into reconciliation queue.",
+  "proposed_change": [
+    "1) Change tombstone key format to include lease_id and set tombstone-specific prefix so reconciler queries no longer return them by default (backwards-compatible read path).",
+    "2) Update reconciler to respect epoch and lease metadata: ignore tombstones with epoch <= last_granted_epoch for that shard and rely on explicit 'replay marker' metadata for any delayed writes to be considered.",
+    "3) Add an integration test that simulates staggered replication visibility with controlled clock skew and leadership changes to assert no double-debits occur.",
+    "4) Add a migration job (idempotent) to sweep and compact tombstones older than safe window; the job will emit an audit log and a dry-run mode before actual purging."
+  ],
+  "risk": "Medium to High: Changing key layout and reconciler query semantics touches the billing reconciliation path and has direct impact on customer invoices. Migration must be idempotent and reversible for a rolling rollback. There's also risk of temporarily undercounting if tombstones are purged incorrectly. We'll mitigate via feature flags, canaries, and a dry-run migration with reconciliation audit logs.",
+  "rollout_plan": [
+    "Phase 0 (canary): Deploy reconciler filter (ignore tombstones under epoch cutoff) behind feature flag in canary cluster; monitor duplicate-debit metric, 429 rate, and billing delta for 48h.",
+    "Phase 1 (staged): Deploy new tombstone key format and reconciler read path to 10% of traffic with migration job in dry-run; compare reconciler outputs and audit logs.",
+    "Phase 2 (sweep): Run idempotent tombstone purge with 24h visibility; then promote new key format to 50% and monitor for 72h.",
+    "Phase 3 (global): Flip feature flags globally and deprecate old tombstone keys after 30 days (final sweep and archive)."
+  ],
+  "acceptance_criteria": [
+    "No duplicate debits seen for reproducible failover repro in staging (run repro 50 times with varying skews).",
+    "Production canary shows >95% reduction in duplicate-debit incidents for shard handovers within 48h.",
+    "Migration run produces audit artifacts that reconcile previous overcounts for affected orgs and provides a plan for customer refunds if necessary.",
+    "Unit + integration tests added and green in CI; code reviewed and approved."
+  ],
+  "linked_prs": [
+    "https://github.com/redwood-inference/serving-runtime/pull/1987",
+    "https://github.com/redwood-inference/billing-reconciler/pull/442"
+  ],
+  "attachments": [
+    "https://drive.google.com/drive/fake-link-to-investigation-notes",
+    "confluence.redwood.ai/display/BILL/Prefetch+Tombstone+Investigation"
+  ],
+  "comments": [
+    "2026-02-25 11:00 - Asha Patel (SRE): Noted customer 'Acme AI' reported unexpected 429s and spike in token spend; added to incident bridge.",
+    "2026-02-26 15:10 - Ethan Wu: Deployed reconciler filter patch to staging (feature flag on). Initial results: duplicate-debit metric dropped ~80% for repro runs.",
+    "2026-03-01 09:30 - Marisol Gomez: Prepared migration dry-run plan; requires runbook sign-off from billing and legal for potential credits/refunds.",
+    "2026-03-02 14:00 - Product (Liam O'Connor): Approved communication draft for customers affected in last 48h; will coordinate with CS after we have final numbers."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "observed_behavior",
+    "expected_behavior",
+    "repro_steps",
+    "investigation_notes",
+    "logs_snippet",
+    "root_cause_summary",
+    "mitigation",
+    "proposed_change",
+    "risk",
+    "rollout_plan",
+    "acceptance_criteria",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_986a1d5caca24818a165e783742cba29"
+}

@@ -1,0 +1,35 @@
+{
+  "title": "Burst reshuffle latency investigation (scratchpad)",
+  "owner": "Nora Patel",
+  "drive_area": "users",
+  "path": "users/burst-reshuffle-latency-investigation-nora",
+  "doc_type": "doc",
+  "created_at": "2026-01-15",
+  "last_modified": "2026-03-10",
+  "collaborators": [
+    "Liam Chen",
+    "Marta Silva"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "latency",
+    "burst",
+    "reshuffle",
+    "kv-cache",
+    "tail-latency",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "JIRA-4821",
+    "https://github.com/redwood-inference/serving-runtime/pull/347",
+    "https://confluence.redwood.ai/display/INF/Burst+Reshuffle+Notes"
+  ],
+  "content": "Goal: quick notebook-style log for the burst-reshuffle tail-latency we keep seeing on Dedicated pools when autoscaler moves jobs between hosts. Not a formal report \u2014 notes to iterate and hand off to SRE/infra.\n\nBackground / hypothesis\n- Repro: repeated customer traffic pattern (sudden +40% QPS for ~90s every 15m) triggers burst capacity which reshuffles pods across a warm pool. During reshuffle we see p95->p99 spikes (200ms->1.8s) for some requests.\n- Hypothesis A: KV cache warmup penalty + mutex contention on host-level disk I/O during container startup.\n- Hypothesis B: Network TCP warmup + TLS handshake when routing flips to new host (cold TLS context in some edge cases).\n- Hypothesis C: Scheduler-induced co-location causing GPU oversubscription briefly; GPU kernel queues stall then flush.\n\nQuick environment summary (experiment run 2026-03-09)\n- model: small-gen-v1 (16k context, 8-bit quant)\n- pool: dedicated-warmpool-4g (4xA100 logical), reserved 12 workers, autoscale policy: add 2 workers on burst, reshuffle policy: pack_then_spread\n- client load: poisson arrivals mean 18 qps baseline, bursts to 25 qps over ~90s\n- payload: mean tokens in/out 64 tokens; streaming disabled\n- runtime config tweaks tested: batcher.max_batch_size=8, batcher.batch_timeout_ms=6, kvcache.enabled=true, prefetch=true\n\nExperiment run log (raw timeline)\n- 08:00 TTL check: baseline stable, p95 ~ 120ms, p99 ~ 240ms\n- 08:14 incoming ramp starts (synthetic load generator)\n- 08:15 autoscaler spins two additional workers; reshuffle initiated at 08:16:12\n- 08:16:18 first client-side 504s observed (short spikes) -- concurrent with pod drain of worker-3\n- 08:16:30 sustained tail at p99 ~ 1800ms for ~48s\n- 08:18 autoscaler settles, workers up, p99 returns to ~260ms\n- Observed correlation: p99 spike begins ~6s after reshuffle start and lasts ~50s\n\nMeasurements collected\n- KV cache hit rate (per-host): host-A: 82%->15% during reshuffle; host-B: 45%->70% after warmup\n- GPU util: slight dip on new hosts for 12s while workloads balance; no maxed-out GPU observed (peak 68%)\n- Syscalls: increased open()/close() patterns during 08:16-08:17 (suggests file-backed KV cache miss path)\n- TCP connections: new connections peaked +54% for 18s around reshuffle window\n- TLS handshake latencies: median TLS handshake increased from 8ms->56ms during reshuffle for new connections\n\nSmall CSV-style snippets captured (excerpt):\ntimestamp,qps,p95_ms,p99_ms,kv_hit\n08:14:50,18,118,238,0.83\n08:16:05,24,156,980,0.21\n08:16:30,25,190,1800,0.17\n08:17:15,23,172,430,0.62\n08:18:10,18,125,270,0.80\n\nQuick ASCII mini-chart (p99 over time, rough):\n08:14 | ---|\n08:15 | ----|\n08:16 | =========|  <-- spike\n08:17 | ===|\n08:18 | --|\n\nWhat I tried (fast experiments)\n1) Force warm prefetch on new workers: kvcache.prefetch_on_attach=true\n   - Result: reduced duration of p99 spike by ~20s in 2/3 runs. KV hit warmed faster but increased disk IO bursts.\n2) Increase batcher.batch_timeout_ms from 6->12 in new workers until steady state\n   - Result: slightly higher median latency (+15ms) but reduced p99 amplitude by ~260ms. Tradeoff acceptable for some SLAs.\n3) Keep-alive connection pool bump (proxy-level): keepalive.max_idle=200 -> reduced number of new TLS handshakes per reshuffle by ~70%\n   - Result: handshake spike removed for clients that reused connections; some clients still created new connections (curl-like) -> residual tail persisted.\n4) Experiment: no-reshuffle run (disabled pack_then_spread) \u2014 simulate scale-up-only policy\n   - Result: p99 spike eliminated in synthetic runs but increases steady-state cost by 12% (expected).\n\nPreliminary conclusions\n- Primary contributors: KV cache cold miss path + connection churn (TLS) when reshuffle routes requests to newly-attached hosts.\n- GPU oversubscription appears unlikely (util never maxed), though short kernel-queue jitter cannot be fully ruled out.\n- Short-term mitigations with low-risk: prefetch_on_attach + increase batch timeout + proxy keepalive tuning.\n- Long-term: change reshuffle policy to a slower ramp (graceful attach window), or ensure pre-warmed ephemeral cache images on new hosts (snapshot kvcache state), or sticky routing for short-lived bursts.\n\nOpen questions\n- Can we snapshot kvcache across warmpool instances cheaply? Disk/rsync latency and security concerns.\n- Is there a way to decouple TLS warmups e.g., session ticket reuse across hosts? Need security review.\n- For customer traffic shapes (many curl-like one-off connections), will keepalive-level fixes be sufficient?\n- Do other models with larger KV cache size show worse penalties? need to run scaling matrix (1x/2x/4x cache)\n\nNext runs to schedule (short list)\n- A: Repeat the prefetch_on_attach test but with kvcache stored in tmpfs to eliminate disk open()/close() spikes \u2014 measure IO and p99. (CRITICAL: monitor memory pressure)\n- B: Run reshuffle with keepalive enforced (client sim forced to reuse connections) to isolate TLS effect.\n- C: Run with batch_timeout=20ms on 1/3 traffic to evaluate median tradeoff vs tail improvement.\n- D: Run the same pattern on model medium-gen-v2 to check cache-size scaling.\n\nQuick ops checklist to hand off to SRE\n- Add temporary config flag to warmpool that enables kvcache.prefetch_on_attach for 72h on staging.\n- Schedule a controlled reshuffle window at 03:00 UTC with synthetic bursts and GRPC probe enabled.\n- Collect the ring-buffer traces for open()/close(), TLS handshake times, and per-request KV miss traces.\n\nNotes to self (scratchy)\n- Don't forget to tag JIRA-4821 with results and link graphs.\n- Slack thread #serving-runtime: paste p99 CSV and short timeline snapshot.\n- If prefetch helps but disk I/O becomes noisy, consider tmpfs prototype then cost estimate.\n\nAttachments recorded elsewhere:\n- perf traces: s3://redwood-perf/burst-reshuffle/2026-03-09/\n- scripts used: https://github.com/redwood-inference/bench-scripts/blob/main/reshuffle-run.sh\n\nEnd of scratchpad. Will formalize into a one-pager if we converge on a recommended mitigation.",
+  "_notes_for_auditors": "internal-scratchpad-style; contains experiment logs and subjective notes. Keep in users/ (personal workspace).",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_77c025a8754e4fc59fa14740e1e2bdff"
+}

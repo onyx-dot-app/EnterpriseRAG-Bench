@@ -1,0 +1,45 @@
+{
+  "repo": "redwood",
+  "pr_number": "48291",
+  "title": "Cohorted continuous-batcher: scheduler cohorting, kernel affinity, and KV anti-starvation heuristics",
+  "author": "Priya Menon",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-02-25",
+  "merged_at": "2026-02-25",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/cohorted-batcher-kv-anti-starve",
+  "reviewers": [
+    "Evan Brooks",
+    "Mar\u00eda Alvarez",
+    "Calvin Park"
+  ],
+  "labels": [
+    "runtime",
+    "perf",
+    "sched",
+    "kv-cache",
+    "infra"
+  ],
+  "linked_linear": [
+    "ENG-7821",
+    "ENG-7902"
+  ],
+  "linked_jira": [
+    "SUP-4123"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "11",
+  "additions": "1284",
+  "deletions": "312",
+  "merge_method": "squash",
+  "breaking_change": "false",
+  "release_notes": "Introduce cohort-based continuous batching with kernel affinity and KV anti-starvation heuristics. Reduces p99 tail by ~30% for mixed workloads; no API changes.",
+  "description": "Context and motivation: We observed repeated tail spikes in mixed workloads where a minority of long-sequence or KV-heavy requests would monopolize batching resources and push many small/kv-hit requests into long queue wait times. Previous approaches (simple priority buckets, deadline-based preemption) improved tails but produced oscillation and suboptimal kernel utilization on GPU (switching kernels frequently hurt throughput). This PR implements a cohort-oriented scheduling layer on top of the continuous batcher that: 1) groups requests into stable cohorts (short/normal/long sequences and kv-hit vs kv-miss), 2) assigns a weighted schedule that enforces proportional service to cohorts, and 3) biases kernel selection (kernel affinity) to reduce expensive kernel switches while still honoring fairness targets. Design summary: - Cohorting: requests are classified on enqueue into cohorts based on sequence_length quantiles and a KV-hit flag (fast path if cache hit). Cohort keys are compact (3 length buckets x 2 kv-hit = 6 cohorts). Cohorts are sticky for the lifecycle of a request. - Scheduling: per-cohort deficit counters implement a proportional deficit-round-robin with decay. Each scheduling tick selects batches from cohorts in order of deficit, but a soft cap prevents any cohort from consuming >X% of cycles for Y ms. - Kernel affinity: batches composed predominantly of short sequences prefer the int8 small-kernel path; long cohorts prefer the large-kernel fused path. The scheduler attempts to co-locate consecutive batches to the same kernel to reuse warmed kernels and reduce JIT/queue churn. - KV anti-starvation heuristics: kv-hit cohorts are given a small carry-forward credit and a short preemption window. If a cohort has seen repeated misses (i.e., been skipped >N times) the scheduler temporarily boosts its weight. Additionally, KV pinned entries get an aging score so that pinning does not permanently block eviction; very-old pins decay faster to avoid indefinite starvation of cache-backed requests. - Timeouts and preemption: soft-timeouts can preempt a batch that has not started execution after queueing for T_soft ms; preempted requests are requeued into the same cohort but receive a temporary priority bump to bound tail latency. Hard timeouts still exist for SLA enforcement. Implementation notes: - Changes live in runtime/batcher/cohort_scheduler.{cc,py} and runtime/kv/aging_cache.cc. - Minimal API surface: behavior is entirely internal to the batcher; no public API changes. - Added telemetry: cohort.dispatched_count, cohort.wait_ms_histogram, kernel.switches_per_minute, kv.pin_age_histogram. - Compatibility: new cohort mapping is feature-flagged via BATCHER_COHORTING=on; default is off for safe rollouts. Commit summary: - add cohorting classifier and unit tests - implement proportional deficit scheduler and soft caps - implement kernel affinity heuristics and kernel warm flags - add KV pin aging and anti-starve boost path - telemetry and dashboards - integration tests for mixed workloads - docs + rollout playbook High-level changed files (illustrative snippets): - runtime/batcher/cohort_scheduler.cc (new) - runtime/batcher/cohort_scheduler.h (new) - runtime/batcher/continuous_batcher.cc (modifications ~+130 lines) - runtime/kv/aging_cache.cc (modifications ~+85 lines) - runtime/metrics/cohort_metrics.cc (new) - infra/feature_flags/config.go (expose BATCHER_COHORTING) - tests/integration/cohort_mixed_workload.test (new) Example scheduler config (defaults in code): - cohort_buckets: [\"short\",\"normal\",\"long\"] - kv_hit_boost: 0.12 - soft_cap_pct: 0.45 - soft_timeout_ms: 25 - long_cohort_kernel: \"fused-large\" - short_cohort_kernel: \"int8-small\" Tests and validation: - Unit tests cover classifier boundaries, deficit counter wrap, and pin-aging behavior. - Integration harness simulated mixed workloads (70% short-kv-hit, 20% short-kv-miss, 10% long) across GPU types (A100, H100, and a CPU fallback). - Performance results (A100, 4x GPUs, steady-state synthetic):   - Baseline (no cohorting): p95=48ms p99=210ms throughput=1.00x cost-index=1.00   - Cohorting on (tuned defaults): p95=36ms p99=150ms throughput=0.99x cost-index=0.95   - Notes: p99 improvement is concentrated on mixed workloads; homogeneous long-only workloads see negligible change. Rollout and canary plan: - Feature-flag rollout in 3 phases: internal dev cluster -> 10% production w/ realtime telemetry -> gradual ramp to 100% if no regressions after 48h. - Canary health checks: cohort.wait_ms_histogram, kernel.switches_per_minute, p99 latency, error-rate. - Automated rollback triggers: p99 increase >10% or kernel.switches spike >3x. Review conversation (high level): - Evan: requested tighter bounds on soft_cap_pct and asked for thought-through defaults for small clusters. Response: added config override and conservative defaults; documented in rollout. - Mar\u00eda: noted potential for oscillation when many cohorts are equal weight; I added exponential decay on deficit boosts to damp oscillation. - Calvin: asked for more telemetry around kernel switches; added kernel.switches_per_minute and single-run traces for first 10s. CI and flaky tests: - Initial CI run failed an integration test due to a race in requeue path; fixed by introducing a requeue backoff and re-ran CI. Final status: all checks passed. Performance experiments and regressions: - Microbench harness run for A100/H100/CPU showed kernel affinity reduced kernel-init jitter by ~20%. - Memory: no measurable increase in resident set; KV pin aging introduced small metadata overhead (~1.2% in cache footprint). Known limitations and TODOs: - Current cohorting uses static quantiles; future work (ENG-7928) will add adaptive cohort boundary tuning. - We do not yet auto-tune soft_cap_pct per-cluster; follow-up planned. - Edge case: pathological workloads that intentionally craft many very-large batches can still cause transient cache pressure; mitigation is documented in runbook. Related PRs and work items: - PR #47109 (kernel warm path improvements) - ENG-7928 (adaptive cohort boundaries) - ENG-7902 (kv-cache observability) Checklist: - [x] Unit tests added - [x] Integration tests added - [x] Telemetry and dashboards added - [x] Rollout plan documented - [x] Feature flagged - [x] Docs updated Merge outcome: Squash-merged into main on 2026-02-25 after approvals from reviewers and green CI.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_031e5daff4ea4a9c8acb9c05a6c0cd97"
+}

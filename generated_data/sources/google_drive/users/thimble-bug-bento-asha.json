@@ -1,0 +1,34 @@
+{
+  "title": "Thimble bug bento \u2014 morning triage",
+  "owner": "Asha Menon",
+  "drive_area": "users",
+  "path": "users",
+  "doc_type": "doc",
+  "created_at": "2024-11-07",
+  "last_modified": "2024-11-12",
+  "collaborators": [
+    "Diego Morales",
+    "Priya Singh"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "triage",
+    "p95",
+    "kv-cache",
+    "microbatch",
+    "investigation",
+    "todo"
+  ],
+  "linked_artifacts": [
+    "JIRA-RT-4821",
+    "https://github.com/redwood-inference/runtime/pull/2157",
+    "CONFLUENCE-RT/kv-cache-eviction-notes"
+  ],
+  "content": "Quick capture for the morning (keep concise)\\n\\nContext:\\n- Intermittent p95 spikes (~200ms delta) on text-gen route since deploy v2024.11.05. Not steady \u2014 flares happen in bursts every ~30\u201390m. Reported by SLO alerts and live traffic.\\n- Hypothesis space: KV cache thrash + microbatch scheduling edge + a rare kernel selection path causing a fallback to slower op.\\n\\nObservations from last night (11/11 22:00\u201302:00):\\n- Pattern: spike coincides with multi-tenant burst (10\u201330 concurrent short requests, ~<=80 tokens).\\n- When spike occurs, CPU load on control plane pod increases modestly; GPU utilization stays moderate.\\n- Eviction logs show small bursts of KV evictions at ~100ms before spike.\\n- Affected model: rdlv-small-7B-q4; fallback profile not triggered.\\n- No thermal events on GPU (checked nv-smi logs).\\n\\nImmediate checks (do these first)\\n- Reproduce locally with the same short-request pattern (use traffic-replay script).\\n  - script: tools/traffic/replay-shortburst.sh --model rdlv-small-7B-q4 --concurrency 20 --burst-interval 45s --req-len 30\\n- Tail eviction + batching logs: kubectl -n infra logs -f svc-runtime-01 --since=10m | grep -E \\\"evict|batch|kv-cache|batcher\\\"\\n- Perf profile of a spike by sampling: perf record -F 99 -a -g -- sleep 20; perf report (on host).\\n\\nNotes from quick experiments:\\n- Replay with concurrency 20 reproduced a p95 bump (~+170ms) within 3 bursts.\\n- Turning off prefix caching (config override) eliminated the bump in replay \u2014 suggests prefix/KV interaction.\\n- Small change in batcher window (from 2ms to 1ms) reduced the probability of a spike in replay but increased avg token latency by ~6ms.\\n\\nHypotheses (ranked):\\n1) KV cache eviction race: microbatching and cache eviction interact such that an in-flight request loses its KV page and forces re-computation of a chunk -> CPU costs + latency. Explains burstiness.\\n2) Kernel fallback: rare sequence lengths cause the runtime to pick an unoptimized matmul kernel (cuBLAS->fallback) for a tiny set of shapes when batcher groups heterogeneous lengths.\\n3) NUMA/CUDA pinning mismatch under small bursts causes host<->GPU skews leading to queuing on control path.\\n\\nData to collect next:\\n- Per-request KV hit/miss flag sampled in logs for a window around spikes (add ephemeral logging at trace level).\\n- Add a short metric: runtime.kv.evictions_per_min and runtime.kv.misses_per_req (sampled percentile).\\n- Trace of kernel selection: instrument path that chooses kernels and emit model+shape->kernel mapping for the burst window.\\n\\nActionable todo (priority ordered):\\n- [ ] Add ephemeral trace logs to batcher and kv-cache (PR branch: asha/trace-kv-evict-2024-11) \u2014 limit to 1% of requests to reduce noise. (owner: Asha; ETA: today EOD)\\n- [ ] Re-run replay with and without prefix caching, capture logs, and attach perf profile. (owner: Diego; ETA: today lunch)\\n- [ ] Experiment: force-use-optimized-kernel flag for rdlv-small-7B-q4 on canary to see if spikes disappear. If yes, create follow-up to adjust kernel heuristics. (owner: Priya; ETA: tomorrow morning)\\n- [ ] Run NUMA/cuda pinning checklist on affected host pool, compare to unaffected pool: sudo numactl --hardware; nvidia-smi topo --matrix. (owner: Asha; ETA: today)\\n- [ ] Add a lightweight metric for kv evictions; dashboard tile on Console for quick lookout. (owner: SRE/infra; contact: Diego)\\n- [ ] If replay consistently reproduces, schedule 30min deep-dive with Priya + Diego + runtime infra (tomorrow 10:30am).\\n\\nCommands/quick snippets I used:\\n- replay: ./tools/traffic/replay-shortburst.sh --model rdlv-small-7B-q4 --concurrency 20 --burst-interval 45s --req-len 30 --trace-file /tmp/replay-trace.json\\n- tail logs: kubectl -n infra logs -f svc-runtime-01 --since=30m | grep -E \\\"evict|kv-cache|batcher\\\" -n --line-buffered\\n- perf: sudo perf record -F 99 -p $(pgrep runtime-service) -g -- sleep 20; sudo perf report --children\\n- check topo: sudo nvidia-smi topo --matrix; sudo lscpu | sed -n '1,12p'\\n\\nQuick dump of a sample trace (sanitized):\\nTS 2024-11-11T22:03:12Z | req_id b1f3 | batch_id 987 | kv_hit false | evict_trigger true | kernel_choice matmul_fallback_v2 | latency 312ms\\nTS 2024-11-11T22:03:12Z | req_id b1f4 | batch_id 987 | kv_hit false | evict_trigger true | kernel_choice matmul_fast_v1 | latency 138ms\\n(interesting: same batch, different kernel picks)\\n\\nOpen questions / thinking aloud:\\n- Why would two requests in same batch pick different kernels? Batcher shape grouping should be deterministic. Could there be a race where cache state influences kernel heuristics?\\n- If eviction is happening mid-batch, we should see a correlation between evict logs and kernel_fallback logs. Need to capture both in same trace.\\n- If forcing kernel eliminates problem, we need to understand long-term perf/cost tradeoffs (fallback may be slower but more numerically stable?).\\n\\nMeeting prep (tomorrow deep dive):\\n- Bring: replay logs, two perf profiles (with/without prefix cache), batcher trace (per-batch shapes), host NUMA topo.\\n- Goal: pin root cause to either cache eviction or kernel selection; decide mitigation (short-term patch + long-term fix).\\n\\nNotes to self: keep trace sampling low; do not enable heavy trace on prod without SRE guard. If we need more signal, run canary with 5% traffic and full traces.\\n\\nRandom tangents / ideas (capture quickly):\\n- Try a tiny experiment: decouple prefix cache eviction TTL on canary (e.g., 10s -> 60s) to see effect on spike frequency. Easy rollback.\\n- Consider a fast-path that pins kernel choice per-model at startup instead of per-batch if variance continues.\\n\\nEnd note: prioritize reproducible replay + combined trace of batcher+kv+kernel-selection. If we can reproduce reliably, we can test mitigations quickly.\\n\\n-- Asha\\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_e5c8a245f61e49229f199762bdf11dad"
+}

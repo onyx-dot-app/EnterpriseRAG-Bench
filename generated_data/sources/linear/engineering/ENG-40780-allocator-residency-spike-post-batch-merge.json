@@ -1,0 +1,50 @@
+{
+  "key": "ENG-40780",
+  "team": "engineering",
+  "title": "Investigation: allocator residency spike after continuous-batching merge optimization",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2025-02-12",
+  "updated_at": "2025-02-26",
+  "creator": "Asha Kapoor",
+  "assignee": "Miguel Torres",
+  "project": "runtime-kv-cache-optim",
+  "cycle": "2025-W07",
+  "estimate": "13",
+  "due_date": "2025-03-05",
+  "labels": [
+    "kv-cache",
+    "cuda",
+    "allocator",
+    "continuous-batching",
+    "memory-leak",
+    "investigation"
+  ],
+  "parent_issue": [
+    "ENG-36142"
+  ],
+  "dependencies": [
+    "ENG-24721",
+    "ENG-33109"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Summary:\nWhen the continuous-batching \"merge-small-reqs\" optimization is enabled, we observe a slow but sustained increase in GPU resident memory over long-running load tests. Memory usage does not return to baseline between load phases and eventually causes OOMs on smaller Dedicated nodes. Initial signals point at interactions between merged request allocation patterns, the KV cache prefetcher, and the CUDA async allocator (cudaMallocAsync) pool residency policies.\n\nProblem observed:\n- Under steady traffic with merge-small-reqs enabled, GPU memory climbs by ~12-18% over 6\u201312 hours compared to runs without merging.\n- Heap-like metrics (from our allocator instrumentation) show many short-lived mid-size allocations (8\u201364KB) turning into persistent slab residency for larger bucket sizes after repeated coalescing.\n- The KV cache prefetch path is issuing batched loads that combine many keys into a single (merged) allocation request; freed buffers appear to be retained in the cudaMallocAsync arenas instead of being returned to the OS or trimmed, causing sustained high resident memory.\n- There are intermittent spikes in cudaFreeAsync backlog on certain streams, indicating free work being deferred behind long-running compute kernels.\n\nWhy this is critical:\n- Impacts Dedicated customers with tight GPU memory budgets and causes tail OOMs during long steady-state operation (not just peak bursts).\n- The problem is surfaced only when two runtime features are active together: continuous-batching merge heuristic and aggressive KV prefetch. Both features are important for latency/cost, so disabling one is not acceptable as a long-term fix.\n\nRepro steps (dev/test harness):\n1) Start runtime-1.20 branch with merge-small-reqs=true and kv-prefetch=aggressive flags.\n2) Run the continuous batching load generator (tools/bench/load_merge_harness.py) at ~80% target QPS for 8 hours with realistic token distributions.\n3) Collect metrics every 30s: GPU free memory (nvidia-smi), our allocator counters (alloc_count_by_size, free_count_by_size, pool_residency_by_arena), NVTX traces, and per-stream outstanding free queue length.\n4) Compare with a control run (merge-small-reqs=false).\n\nInstrumentation added so far:\n- Allocator histograms by size/arena (log every minute).\n- NVTX markers around merged-batch allocation and KV prefetch paths.\n- Extra counters for cudaMallocAsync vs cudaMalloc backoff fallback occurrences.\n- A lightweight periodic dump of per-stream pending async frees.\n\nPreliminary findings:\n- Reproducer shows that repeated merges cause the allocator to allocate larger backing slabs due to coalescing; when many small objects are allocated from the same slab and freed on different CUDA streams, the slab cannot be reclaimed promptly because free operations are queued on streams with outstanding work. The pool retains those slabs.\n- The default cudaMallocAsync arena size and trimming heuristics (on our DGX nodes) are not aggressive enough to trim the pool between workload phases.\n- There is a hysteresis with the KV cache eviction logic: evicted entries are freed but immediately re-prefetched in nearby traffic windows, preventing slabs from reaching an idle state and triggering any trimming.\n\nHypotheses to validate:\n- If we bind KV cache allocations to a dedicated mempool (separate from general-purpose allocator arenas) with a bounded max resident size, the general allocator will not be forced to grow slabs for merged batches.\n- Introducing a periodic pool-trim (at low-traffic boundaries) or lowering the cudaMallocAsync max pool size will reduce long-term residency without materially impacting latency for merged batches.\n- Ensuring freed buffers are freed on a stream that reaches quiescence (or using an explicit stream synchronization point during background trimming) will reduce deferred free buildup.\n\nProposed mitigations (short-term and medium-term):\nShort-term (safe, config-driven):\n- Add runtime flag to cap merge-small-reqs.max_merge_bytes and lower default value for Dedicated customers (roll out via config).\n- Add a background trimming task that, when QPS < X for > Y seconds, invokes pool-trim APIs (via cuMemPoolTrim or cudaMallocAsync trimming helpers if available) and optionally synchronizes a low-priority stream to drain pending frees.\n- Expose a diagnostic endpoint that triggers a manual mempool trim + NVTX dump to accelerate on-call mitigation.\n\nMedium-term (code + allocator changes):\n- Implement dedicated KV mempool: allocate a bounded slab pool at startup for KV cache objects; implement LRU eviction within that pool to avoid cross-contamination of general allocator slabs.\n- Improve stream-aware free path: tag allocations with owning stream id and prefer to issue frees on a stream that is already quiescent for that allocation's lifetime, or use pooled free lists per-stream.\n- Add heuristics in merge algorithm to avoid pathological coalescing patterns (e.g., avoid >N merged keys when avg key size < threshold).\n\nTelemetry & dashboards to add:\n- Per-arena residency over time (30s window) plus rolling delta.\n- Ratio of merged-allocation bytes to plain-allocation bytes.\n- Per-stream pending-free queue depth histogram.\n- Traces tying merged batch id -> allocation histogram -> free time distribution.\n\nArtifacts / links:\n- Reproducer harness: https://github.com/redwood-inference/runtime-tools/tree/main/load_merge_harness (branch: eng-40780-repro)\n- Initial perf dashboard: https://monitoring.redwood.ai/d/rM4k/alloc-residency?view=merged\n- Design doc for dedicated KV mempool (draft): https://confluence.redwood.ai/display/RUN/KV+Dedicated+Mempool+Design\n- PR for instrumentation: https://github.com/redwood-inference/runtimes/pull/5123\n\nNext steps (owner assignments):\n- Miguel: finish reproducer runs across Dedicated node types (A100-40GB, H100-80GB) and attach logs to this ticket (by 2025-02-18).\n- Priya Nair (runtime): prototype a config-driven pool-trim task and test on staging (by 2025-02-22).\n- Liam O'Connor (infra): validate CUDA driver / library versions across Dedicated fleet and report any differences in allocator default behavior (by 2025-02-17).\n- Asha: coordinate customer-facing mitigation (config toggle to reduce merge size) with Growth & CS (by 2025-02-19).\n\nAcceptance criteria for resolution:\n- Reproducer with merge-small-reqs enabled shows long-run steady-state residency within 5% of control run for 12-hour test window, and no OOMs on Dedicated 40GB nodes.\n- A safe mitigation path is available as a runtime config that can be rolled out to impacted customers without service disruption.\n- Long-term plan (bounded KV mempool + allocator improvements) has a vetted design doc and a timeline for implementation in runtime-1.21.",
+  "comments": [
+    "2025-02-12 Miguel Torres: Initial triage complete. Reproducer runs started on two node types. Early traces match hypothesis about cross-stream frees retaining slabs.",
+    "2025-02-13 Priya Nair: Added allocator histograms and NVTX marks. Observed that >70% of freed allocations are awaiting stream quiescence for >30s under heavy merge scenarios.",
+    "2025-02-14 Liam O'Connor: Fleet check: two dedicated customers are running driver 12.3 while rest are on 12.2; will standardize driver versions in a rolling update. No obvious bug in driver-level pool trimming found yet.",
+    "2025-02-16 Miguel Torres: reproduced on H100-80GB; residency growth is steeper on H100 (possible differences in default pool size / page size alignment). Uploaded logs to the ticket attachments.\nReproducer run IDs: run-20250216-01 (A100), run-20250216-02 (H100).",
+    "2025-02-18 Asha Kapoor: Decided to ship a safe config toggle to limit max_merge_bytes to 64KB for affected tiers. Rolling out to staging today. CS notified for customer opt-in.",
+    "2025-02-21 Priya Nair: Prototype pool-trim task applied to staging. On staging runs, resident memory returned to baseline within 2 minutes after low-QPS windows. Need to measure perf impact under SLO-constrained workloads.",
+    "2025-02-24 Miguel Torres: Opened follow-up engineering tasks: ENG-40811 (dedicated-kv-mempool-prototype) and ENG-40812 (stream-aware-free-path). Requesting design review next week.",
+    "2025-02-26 Asha Kapoor: Marking this ticket as In Progress; medium-term work tracked in child issues. Customer mitigation (merge cap) enabled for affected Dedicated clusters and monitoring alert created (ALERT-alloc-residency-high)."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_bb5ac4b7b7694cb680390d81ef82fb1e"
+}

@@ -1,0 +1,53 @@
+{
+  "key": "ENG-4827",
+  "team": "engineering",
+  "title": "Audit-log-exporter: normalize legacy events, tag schema_version, and validate outgoing payloads against schema v1",
+  "status": "In Review",
+  "priority": "P0",
+  "created_at": "2026-01-13",
+  "updated_at": "2026-02-27",
+  "creator": "Kevin Osei",
+  "assignee": "Kevin Osei",
+  "project": "Audit logging standardization (schema v1 + 100% sensitive-actions coverage)",
+  "cycle": "2026-W07",
+  "estimate": "8",
+  "due_date": "2026-03-04",
+  "labels": [
+    "security",
+    "compliance",
+    "audit-logging",
+    "exporter",
+    "schema-v1",
+    "backcompat",
+    "siem"
+  ],
+  "dependencies": [
+    "ENG-4821",
+    "ENG-4822",
+    "ENG-4833"
+  ],
+  "customer_impact": "high",
+  "release": "audit-logging-2026.03",
+  "security_review_required": "true",
+  "description": "We need audit-log-exporter to emit a consistent, schema-v1-shaped event payload across Hosted/Dedicated/Private, even while some producers are still on legacy field names. This ticket covers: (1) adding schema_version tagging, (2) normalizing legacy producers into the v1 canonical shape, and (3) validating outgoing payloads against the JSON Schema, with clear failure behavior and metrics.\n\nMotivation / background\n- Customer reports inconsistent fields in SIEM exports (SUP-18477) and duplicates under retry semantics (SUP-18510).\n- Security review feedback: customers want an explicit schema version so they can build stable parsers and manage breaking changes.\n- Platform goal: schema v1 becomes the stable contract; exporter is the compatibility boundary while service-by-service instrumentation catches up.\n\nIn-scope\n- Add `schema_version` (string) and `schema_name` (string) tags in the exporter output.\n- Normalize legacy fields into v1 equivalents (field mapping below).\n- Validate outgoing events against the v1 JSON schema (strict required fields; permissive for namespaced extensions).\n- Emit exporter-side metrics/logs for normalization+validation outcomes (drop counts, invalid counts, latency impact).\n- Document behavior for invalid events (do not block export pipeline; avoid silent data loss).\n\nOut of scope\n- Designing schema v1 itself (ENG-4821).\n- Registering taxonomy / event_type enum rules in producers (ENG-4822).\n- Refactoring all producers to v1 (service-specific tickets + ENG-4833).\n\nProposed implementation\n1) Version tagging\n- Add `schema_name = \"redwood.audit_event\"` and `schema_version = \"1.0\"` to every exported event.\n- If producer already includes schema_version, preserve it unless it is missing/empty; if it is unrecognized, keep original in `legacy_schema_version` and set canonical `schema_version` to the exporter-normalized version.\n\n2) Normalization layer (legacy -> v1)\n- Implement a pure function `Normalize(event) -> (normalized_event, normalization_warnings[])`.\n- Preserve original raw payload as a stringified JSON under `legacy_raw_event` for debugging only when `exporter.debug_include_legacy_raw_event=true` (default false). Ensure this cannot leak secrets and is gated behind private deployments only.\n\nLegacy field mapping (initial set; expand as we inventory producers)\n- `time` / `ts` / `timestamp_ms` -> `event_time` (RFC3339). If ms epoch provided, convert; if timezone missing, assume UTC and annotate warning.\n- `tenant` / `tenant_id` -> `tenant_id` (string). If only `org_id` exists, map to `tenant_id` and store `legacy_org_id`.\n- `user_id` / `actor_id` -> `actor_id` and `actor_type`.\n  - If `user_id` present: `actor_type=\"user\"`.\n  - If `service` or `service_name` present: `actor_type=\"service\"` and `actor_id=service_name`.\n- `ip` / `source_ip` -> `source_ip` (string). If array of forwarded IPs present, keep first public IP as `source_ip` and store full chain in `source_ip_chain` (comma-separated string) subject to cardinality budget.\n- `action` / `event` -> `event_type` (string). If unknown, set `event_type=\"unknown\"` and attach `legacy_action` while incrementing `audit_exporter_unknown_event_type_total`.\n- `resource`/`target` legacy shapes -> v1 `target_type`, `target_id`, `target_display_name` (best-effort).\n- `request_id`, `trace_id`, `correlation_id` -> v1 correlation fields. Prefer explicit `request_id` and `trace_id` if present.\n\n3) Validation\n- Vendor the schema artifact from Confluence-generated source (ENG-4821 output) into exporter repo at build time (or pull from an internal artifact registry). Avoid runtime network fetch.\n- Use JSON Schema validation on the normalized event.\n- Validation modes:\n  - Default: `warn_and_export` (export event even if invalid, but include `validation_error` field and increment `invalid_total`).\n  - Optional (enterprise/private hardening): `drop_invalid` (do not export invalid events; still emit a local error log + metric and (if configured) write to a local quarantine file).\n- Never throw in the hot path; exporter must continue processing.\n\n4) Idempotency / duplicates guidance (non-breaking improvement)\n- Ensure exporter forwards `event_id` if present; if missing, generate ULID as `event_id` (stable per exporter processing, not per retry) using a deterministic hash when input has a unique key, otherwise random ULID.\n- Add `dedupe_key` (string) computed from (tenant_id, event_type, event_time, actor_id, target_id, request_id) truncated to 128 chars for SIEM de-dup usage. (This is guidance; not all SIEMs will use it.)\n\n5) Metrics + dashboards hooks\n- Counters:\n  - `audit_exporter_events_received_total`\n  - `audit_exporter_events_normalized_total`\n  - `audit_exporter_events_invalid_total`\n  - `audit_exporter_events_dropped_total` (only if drop_invalid)\n  - `audit_exporter_unknown_event_type_total`\n- Histogram:\n  - `audit_exporter_normalization_latency_ms`\n  - `audit_exporter_schema_validation_latency_ms`\n\nAcceptance criteria\n- Every exported event includes `schema_name` and `schema_version`.\n- Legacy producers with known mappings are emitted in v1 shape without breaking downstream exports.\n- JSON schema validation is running in CI and in-prod (with configurable mode).\n- Clear, documented behavior for invalid events and unrecognized legacy fields.\n- Unit tests cover mapping edge cases (timestamps, actor attribution, missing tenant_id) and ensure we never export secrets.\n\nTesting plan\n- Unit tests for Normalize() mapping (table-driven fixtures).\n- Contract tests validating a representative set of events against schema v1 (use fixtures from SUP-18477 samples where allowed; otherwise sanitized reproductions).\n- Integration test: run exporter in a container with a mock sink and assert emitted events include version tags + pass schema validation.\n\nRollout plan\n- Stage 1: ship behind feature flag `audit_exporter.enable_schema_v1_normalization` default ON in Hosted/Dedicated, OFF in Private until installer config is updated.\n- Stage 2: enable in Private by default with `warn_and_export` (avoid customer-visible data loss).\n- Stage 3: after 2 weeks of metrics, revisit `drop_invalid` for selected enterprise tenants / private installs.\n\nRisks / notes\n- Cardinality: avoid copying large nested legacy payloads; keep only whitelisted legacy_* fields.\n- PII/secrets: do not include request bodies, prompt text, tokens, API keys. Ensure redaction rules are applied before `legacy_raw_event` is ever written.\n- Backcompat: exporter normalization must not rename fields in a way that breaks existing customer parsers without also providing the new fields (additive where possible during transition).\n\nReferences\n- Exporter PR (draft): sources/github/audit-log-exporter/pr-842-add-schema-version-tagging-and-normalization.json\n- Customer tickets: SUP-18477, SUP-18510\n- Related platform work: ENG-4830 (correlation IDs), ENG-4828 (coverage dashboard)\n",
+  "comments": [
+    "2026-01-16 (Kevin Osei): Created ticket after reviewing SIEM samples from Support (SUP-18477). Main pattern: mixed `tenant` vs `tenant_id`, `action` vs `event_type`, and inconsistent timestamp keys. Proposed exporter as compatibility boundary until all producers migrate.",
+    "2026-01-22 (Allison Grant): Please ensure schema validation does not block export path; metrics + warnings are required. Also align field names with observability standard (no free-form nested blobs).",
+    "2026-01-29 (Logan Wright): For coverage dashboard correlation, please preserve `event_id`, `request_id`, `trace_id`. If you generate `event_id`, ensure it is stable for retries within exporter (otherwise duplicates look worse).",
+    "2026-02-03 (Olga Petrov): For SOC2 evidence, we need an explicit statement: schema_version is included, and invalid events are surfaced (not silently dropped) unless customer chooses a stricter mode. Please add this to exporter README once merged.",
+    "2026-02-12 (Kevin Osei): Implemented Normalize() skeleton and initial mapping set. Open question: if `source_ip_chain` is long, should we truncate to N entries? Proposal: keep first 3 IPs max, comma-separated, and store `source_ip_chain_truncated=true` when truncated.",
+    "2026-02-18 (Sean Gallagher): Ensure exporter emits `invalid_total` and alerts can be built. During sink outage, exporter buffering/retry can amplify duplicates; `event_id` forwarding is critical. Any new fields must be bounded in size to avoid backpressure issues.",
+    "2026-02-24 (Hanae Suzuki): Redaction check: do not include auth headers; ensure we never log token prefixes even in debug mode. Add a unit test that fails if `legacy_raw_event` contains patterns like `sk-` or `Bearer `.",
+    "2026-02-27 (Kevin Osei): PR ready for review (pr-842). Remaining: finalize validation mode defaults in Private, and confirm schema artifact sourcing approach (vendored vs artifact registry)."
+  ],
+  "sub_issues": [
+    "ENG-4836",
+    "ENG-4832"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_b29d315cf80a4a86b8354f5eb2981943"
+}

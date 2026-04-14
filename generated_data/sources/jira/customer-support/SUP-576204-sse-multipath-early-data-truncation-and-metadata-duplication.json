@@ -1,0 +1,71 @@
+{
+  "key": "SUP-576204",
+  "project": "customer-support",
+  "issue_type": "Support Request",
+  "summary": "Multipath SSE: terminal JSON-array terminator missing and trailing metadata duplicated after TLS 0-RTT / path migration",
+  "status": "Triage",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-13",
+  "updated_at": "2026-03-14",
+  "reporter": "Lena Brooks",
+  "assignee": "Marco Rivera",
+  "customer_company": "AcmeForms Inc.",
+  "customer_tier": "dedicated",
+  "environment": "prod - us-west",
+  "components": [
+    "serving-runtime",
+    "api-gateway",
+    "networking"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "reconnect",
+    "0rtt",
+    "http3",
+    "dedicated"
+  ],
+  "affected_models": [
+    "open/llama-13b"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-14",
+  "linked_issues": [
+    "SUP-90421",
+    "INT-1420"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/2316"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/ENG/pages/streaming-resume-playbook"
+  ],
+  "description": "Issue summary: Customer sees incomplete streamed payloads from SSE endpoint when their clients perform path migration (HTTP/3) or resume TLS 0-RTT. The last token of a JSON array (the closing \"]\") is missing, and a small metadata line (\"::meta:session\") is duplicated in the final frames. Impact: downstream parsers throw JSON parse errors and the customer application truncates saved transcripts. Occurs intermittently (3-8% of sessions) under higher concurrency and during client network transitions.\n\nImpact: Blocks AcmeForms production ingestion pipeline (batch-facing form summarization). Customer reports ~17% failed jobs when they have concurrent SSE sessions per host. They are on Dedicated capacity and require a P1 response.\n\nEnvironment: Dedicated serving pool (cluster-id: ded-west-11), customer VPC peered to us-west-2, clients are using a mobile browser SDK with HTTP/3 enabled and 0-RTT TLS enabled. Observed when mobile device switches between Wi\u2011Fi and cellular or when NAT mapping changes.\n\nSteps to reproduce (customer-provided):\n1) Start SSE session to /v1/stream with model=open/llama-13b, accept: text/event-stream.\n2) Send a prompt that results in a streamed JSON array response (large list, 900-1200 tokens).\n3) While stream is active, trigger a client network handover (Wi\u2011Fi -> LTE) or enable QUIC path migration in the client lib.\n4) Allow client to resume; observe final event(s) delivered.\n\nObserved behavior:\n- Stream ends without the trailing \"]\" token.\n- A small metadata event line similar to \"event: meta\\n:data: {\\\"session\\\":\\\"abc123\\\"}\\n\\n\" appears twice near the end.\n- Parsers error on incomplete JSON array.\n\nExpected behavior:\n- Complete JSON payload with closing array token and a single metadata event.\n\nCustomer logs / sample: (sanitized)\n- request_id: rwd-20260313-9a5b\n- trace: trace-77da\n- last received SSE frames (line-delimited):\n  data: [\"choice1\", \"choice2\", \"choice3\", ... \"choiceN\"\n  event: meta\n  data: {\"session\":\"abc123\"}\n  event: meta\n  data: {\"session\":\"abc123\"}\n  \n  (connection closed)\n\n- Note: the closing bracket \"]\" never arrives.\n\nClient-side: reported client SDK v1.8.4 with QUIC path migration enabled and TLS early-data (0-RTT). Server-side: dedicated pool running runtime v2.11.3 behind the API gateway with HTTP/3 and keepalive enabled.\n\nAttachments: customer pcap (redacted), stacktrace of parser failure, chunk log for request rwd-20260313-9a5b.",
+  "investigation_notes": "- Reproduced internally with simulated path migration using a QUIC emulator and 0-RTT replays; saw same symptom at low frequency when connection handover happened mid-stream.\n- Correlation with worker log timestamps shows resume request arriving on a different worker (worker-id changed) and the resume handshake finishing while the tail buffer on the original worker still had pending buffered frames.\n- Hypothesis A: resume/handshake idempotency token reused by client leads gateway to route resumed connection to new worker, old worker flushes remaining chunk set but our resume aggregator drops the final closing token because it believes resume has been completed earlier.\n- Hypothesis B: early-data (0-RTT) replay at the gateway causes duplicate metadata emission path (metadata event is emitted both from pre-handshake buffer and post-handshake requeued frames).\n- Packet captures show sequence: final JSON fragment, meta frame (A), connection migration, meta frame (A repeated), FIN. The closing bracket was in a tiny frame that appears lost during handover in 40% of repro attempts.\n- Cross-referenced with INT-1420 (worker-session-handoff-race) and recent gateway changes in PR #2316 introducing micro-batch coalescing on resume paths.\n- Reached out to SRE to get access to haproxy frontend logs and worker resume traces for the affected request ids.",
+  "comments": [
+    "2026-03-13 09:12 - Lena Brooks (Support): Acknowledged with customer, asked for PCAP and sample request IDs; requested environment info and whether client uses HTTP/3. Customer confirmed HTTP/3 + 0-RTT enabled.",
+    "2026-03-13 11:05 - Marco Rivera (SRE): Reproduced locally with QUIC path migration emulator. Observed missing final 12-byte fragment in 3/10 runs; metadata duplicate present in 6/10 runs. Opening INT ticket to trace worker resume mapping.",
+    "2026-03-13 15:30 - Marco Rivera (SRE): Linked INT-1420 and runtime PR https://github.com/redwood-inference/runtime/pull/2316 which may be related. Suggest temporary mitigation: instruct customer to disable 0-RTT in their SDK or disable QUIC path migration. Asked customer to confirm ability to change client flags.",
+    "2026-03-14 08:22 - Customer (AcmeForms): Applied SDK patch to disable 0-RTT; reported immediate drop in failures to ~1.2% for an hour of live traffic. Confirming longer run to validate.",
+    "2026-03-14 09:50 - Marco Rivera (SRE): Added diagnostic flag to dedicated pool to emit resume-assemble debug logs for requests with >800 tokens. Will monitor for 24h and provide follow-up."
+  ],
+  "resolution": "Workaround: Customer disabled TLS 0-RTT and QUIC path migration on client SDK which reduced failure rate to baseline; this is acceptable short-term for AcmeForms.\n\nFix plan: Engineering to implement de-duplication guard in resume assembler and add explicit detection for tiny final fragments during worker handoff. Proposed changes:\n- Add sequence-number anchoring to final-fragment buffer so a tiny trailing frame cannot be dropped when worker changes.\n- Deduplicate metadata emission by tracking meta-event IDs for a resume window.\n- Add integration test that simulates QUIC path migration + 0-RTT with fragmented JSON arrays.\n\nRollout plan: Patch to runtime v2.11.4 (hotfix) -> canary on a subset of dedicated pools -> full rollout. Target ETA for canary: 2026-03-20.\n\nFollow-ups: INT-1420 to track long-term hardening of worker handoff logic; add an entry to the streaming-resume-playbook for customers using HTTP/3 to recommend disabling 0-RTT during upgrades until patch is rolled out.",
+  "actions": [
+    "Applied mitigation: customer disabled 0-RTT / QUIC path migration on SDK (confirmed improvement)",
+    "SRE: enabled verbose resume debug on ded-west-11 for 24h (monitoring ticket INT-1420)",
+    "ENG: prepare hotfix PR for resume assembler de-duplication and final-fragment anchoring (target v2.11.4)",
+    "Support: follow up with customer on 2026-03-18 to validate stability post-mitigation"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "investigation_notes",
+    "comments",
+    "resolution",
+    "actions"
+  ],
+  "dataset_doc_uuid": "dsid_aabc3c7866a44b13827793d2cf0bcce1"
+}

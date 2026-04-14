@@ -1,0 +1,60 @@
+{
+  "key": "ENG-3814",
+  "team": "engineering",
+  "title": "Usage Insights: query API endpoints (breakdown + top drivers) with pagination + caching",
+  "status": "Done",
+  "priority": "P0",
+  "created_at": "2026-01-29",
+  "updated_at": "2026-02-19",
+  "creator": "Chloe Martin",
+  "assignee": "Felix Schneider",
+  "project": "In-console usage insights",
+  "cycle": "2026-W06",
+  "estimate": "8",
+  "due_date": "2026-02-14",
+  "labels": [
+    "console-backend",
+    "telemetry",
+    "api",
+    "pagination",
+    "caching",
+    "beta"
+  ],
+  "parent_issue": "PM-1427",
+  "dependencies": [
+    "ENG-3812",
+    "ENG-3813",
+    "ENG-3818",
+    "ENG-3820"
+  ],
+  "customer_impact": "high",
+  "release": "console-2026.03",
+  "security_review_required": "true",
+  "description": "Goal\nImplement backend query endpoints powering the Console Usage Insights views:\n1) Route + model cost/usage breakdown tables\n2) \u201cTop cost drivers\u201d + \u201cWhat changed?\u201d insights cards\n\nThis ticket covers:\n- API endpoints (request/response semantics, filter validation)\n- Pagination strategy (cursor-based)\n- Caching strategy (server-side + cache headers)\n- Guardrails for query complexity (time ranges, dimensions)\n\nNon-goals\n- Warehouse aggregation jobs/schema (ENG-3812)\n- Route normalization library (ENG-3813)\n- UI implementation (ENG-3815)\n- CSV export job lifecycle (ENG-3816)\n\nBackground / context\nCustomers (and internal Finance) need consistent, drillable cost attribution by API route and model, with totals reconciling against billing. The Console requires interactive queries (p95 latency targets) and stable pagination, while also handling late-arriving telemetry and freshness indicators.\n\nReferences\n- Confluence API contract: sources/confluence/architecture-and-standards/api-standards/usage-insights-api-contract.json\n- Query service system doc: sources/confluence/eng-platform/systems-and-services/usage-insights-query-service.json\n- ADR: route normalization & attribution: sources/confluence/architecture-and-standards/decision-records/adr-route-normalization-and-attribution.json\n- SLO budget (beta): sources/confluence/eng-sre/slo-and-error-budgets/usage-insights-slo-and-performance-budget.json\n\nProposed endpoints (v1)\nAll endpoints require auth and workspace context. RBAC gating will be enforced in ENG-3820 (this ticket wires permission checks but may feature-flag the response fields until ENG-3820 merges).\n\n1) Breakdown query\nGET /v1/usage/insights/breakdown\nPurpose: Populate the Route \u00d7 Model breakdown table and drilldown views.\n\nRequired query params\n- workspace_id (from auth context; not a raw query param in Console calls)\n- start, end (ISO-8601 timestamps; inclusive start, exclusive end)\n\nOptional query params\n- project_id\n- environment (prod|staging|dev; if present)\n- deployment_mode (hosted|dedicated|private)\n- region\n- route (canonical normalized route string; see ENG-3813)\n- model (stable model ID; version bucketing handled in ENG-3823)\n- group_by (comma-separated list; allowed: route, model, project, environment, deployment_mode, region)\n- sort (allowed: cost_usd, tokens_in, tokens_out, requests, p95_latency_ms)\n- order (asc|desc)\n- limit (default 50, max 200)\n- cursor (opaque)\n\nResponse fields (per row)\n- dimensions: route, model, project_id, environment, deployment_mode, region (only those in group_by)\n- metrics: cost_usd, requests, tokens_in, tokens_out, cache_hit_rate, retries, fallbacks, streaming_requests, avg_latency_ms, p95_latency_ms\n- computed hints: context_length_p50, context_length_p95 (if available; otherwise omitted)\n- freshness: dataset_max_timestamp, aggregation_lag_seconds (returned at top-level in response)\n\n2) Top drivers\nGET /v1/usage/insights/top-drivers\nPurpose: Returns ranked explanations of cost drivers and deltas vs previous period.\n\nQuery params\n- start, end\n- compare (optional; default \u201cprevious_period\u201d)\n- filters: project_id, environment, route, model, deployment_mode, region\n- limit (default 10, max 25)\n\nResponse\n- drivers[]: { driver_key, title, impact_usd, impact_percent, explanation, recommended_actions[], supporting_metrics }\n- changes[] (optional): { dimension, before, after, delta_percent, explanation }\n- freshness block (same shape as breakdown)\n\nNotes on \u201cdriver_key\u201d\nKeep stable keys for UI + telemetry: token_out_increase, cache_hit_drop, retries_increase, fallback_rate_increase, context_length_shift, model_mix_shift, streaming_overhead_increase.\n\nPagination\n- Cursor-based pagination for breakdown rows. Cursor encodes sort + last_seen tuple (dimension values + metric used for sort) and is signed to prevent tampering.\n- Cursor invalidation: If underlying aggregation version changes (schema bump) return 400 with error code INSIGHTS_CURSOR_INVALID and message \u201cCursor expired; rerun query.\u201d\n\nCaching strategy\nPrimary goal is to keep p95 interactive queries < 700ms for common ranges (24h/7d) and protect the warehouse from identical repeated queries from Console refreshes and multiple viewers.\n\nLayer 1: Service cache\n- Cache key: (workspace_id, endpoint, normalized filters, start/end bucketed to minute, group_by, sort, order, limit, cursor)\n- TTLs:\n  - last 24h: 60s\n  - 7d: 5m\n  - 30d: 15m (but may be blocked by guardrails; see below)\n- Store: Redis in the console-backend cluster\n- Compression: enable for payloads > 64KB\n\nLayer 2: HTTP semantics\n- Set Cache-Control: private, max-age=30 (Console only; do not allow shared caches)\n- ETag on full response bodies; support If-None-Match to reduce payload\n\nGuardrails / limits\n- Hard max time range in beta: 31 days. For > 31 days return 400 with error code INSIGHTS_RANGE_TOO_LARGE.\n- If group_by includes > 3 dimensions, return 400 INSIGHTS_TOO_MANY_DIMENSIONS.\n- If route filter is unnormalized (contains raw UUID segments) return 400 INSIGHTS_ROUTE_NOT_CANONICAL, with message instructing to use normalized routes.\n- If query is likely to exceed row limit due to cardinality (estimated via preflight stats), return 422 INSIGHTS_QUERY_TOO_EXPENSIVE with a hint to add filters (project/model/route) or reduce time range.\n\nAuth / permissions\n- Endpoint access is feature-flagged for beta allowlist (ENG-3825).\n- Cost fields gated behind \u201cview_cost\u201d permission; if user lacks permission:\n  - Return 403 for /top-drivers (since it\u2019s inherently cost)\n  - For /breakdown either (a) return 403 or (b) return rows with cost_usd omitted and a \u201ccost_hidden=true\u201d marker. Decision: return 403 to avoid \u201cpartial confusing\u201d UI states. (Design and PM aligned in Slack #eng-platform 1737821108.)\n- All access logged (audit log events added in ENG-3820/ENG-3816 for exports; this ticket ensures request IDs and principal IDs propagate).\n\nAcceptance criteria\n- Endpoints implemented behind feature flag and wired to aggregated dataset (ENG-3812).\n- Cursor pagination works consistently with sorting by cost_usd and tokens_out; verified via integration tests.\n- Caching reduces repeat identical query warehouse hits by >80% in staging load test.\n- Error responses follow API standards with stable error codes and actionable messages.\n- p95 latency for 7d breakdown (group_by=route,model) < 700ms in staging with warm cache; < 1500ms cold.\n\nImplementation notes\n- Query compilation: translate filters to warehouse predicates only on partitioned fields (time_bucket, workspace_id, project_id) where possible.\n- All time handling in UTC; Console passes user-local but must convert. Response includes start/end echoed back in UTC.\n- For \u201cprevious_period\u201d comparisons, compute compare_start = start - (end-start), compare_end = start.\n\nTesting\n- Unit tests: validation (range, group_by), cursor encode/decode, error codes\n- Integration tests: seeded dataset fixtures for pagination stability and sorting\n- Load test: 20 concurrent users, 1 rps each, mix of 24h and 7d queries; verify cache hit rate\n\nRollout plan\n- Deploy endpoints disabled by default.\n- Enable for internal dogfood workspaces, then beta allowlist (ENG-3825).\n- Monitor warehouse query volume + cache hit metrics; coordinate with SRE on alert thresholds.\n\nOpen questions\n1) Should /breakdown support returning both \u201ctotals\u201d and \u201crows\u201d in one call?\n   - Decision: yes. Top-level totals included to keep UI totals consistent with table rows.\n2) Should /top-drivers require a compare param always?\n   - Decision: default compare=previous_period; UI can override.\n3) How to handle missing route tags (partial data)?\n   - Decision: return freshness + partial_data=true when ingestion gaps detected (from data quality signals). UI will show banner (ENG-3824).\n",
+  "updates": [
+    "2026-02-01 (Felix Schneider): Implemented initial /breakdown handler with validation + warehouse query builder; basic limit/offset removed in favor of cursor draft. Added ETag support and private Cache-Control header. Pending: cursor signing + compare logic for top drivers.",
+    "2026-02-03 (Logan Wright): Confirmed aggregation dataset partition keys (workspace_id, day_bucket). Please ensure queries always include day_bucket constraints to avoid full scans. Suggest TTL 5m for 7d queries; 60s for last 24h is fine.",
+    "2026-02-05 (Chloe Martin): API contract review with PM/Design: group_by allowed dims limited to route/model/project/environment/deployment_mode/region. Sort keys restricted to cost_usd, tokens_out, requests, p95_latency_ms. Please align error codes with standards doc (INSIGHTS_*).",
+    "2026-02-07 (Felix Schneider): Added cursor signing (HMAC) and invalidation on schema_version change. Added totals block to /breakdown response and echoed start/end in UTC. Implemented /top-drivers stub returning empty until ENG-3819 lands; endpoint contract finalized.",
+    "2026-02-10 (Marcus Lin): Security review note: if user lacks cost permission, prefer 403 over redacting cost fields to avoid inference via other metrics. Also ensure request context logs principal_id and workspace_id for auditability.",
+    "2026-02-12 (Felix Schneider): Wired RBAC check to existing permission service (cost:view). Returns 403 for both endpoints when unauthorized. Added rate limiting at 30 rpm per user to protect warehouse (configurable).",
+    "2026-02-14 (Allison Grant): Perf test: cold cache 7d breakdown was ~2.2s p95; warm cache ~620ms p95. Please add query timeout at 3s and surface INSIGHTS_QUERY_TIMEOUT with guidance to reduce time range.",
+    "2026-02-16 (Felix Schneider): Added query timeout and standardized error mapping. Reduced payload size by dropping context_length metrics when not requested; added include_metrics param (default core metrics) to keep response lighter. Updated docs comments in code.",
+    "2026-02-19 (Chloe Martin): Shipped behind feature flag. Linked PR: sources/github/redwood/pr-23135-usage-insights-query-api-v1.json. Marking ticket Done; follow-ups: ensure /top-drivers returns real drivers after ENG-3819 merges; add partial_data indicator after ENG-3824."
+  ],
+  "links": [
+    "sources/github/redwood/pr-23135-usage-insights-query-api-v1.json",
+    "sources/confluence/architecture-and-standards/api-standards/usage-insights-api-contract.json",
+    "sources/confluence/eng-platform/systems-and-services/usage-insights-query-service.json",
+    "sources/linear/engineering/ENG-3812-usage-insights-aggregation-dataset-route-model.json",
+    "sources/linear/engineering/ENG-3819-top-cost-drivers-service.json",
+    "sources/linear/engineering/ENG-3820-rbac-permissions-for-cost-views.json",
+    "sources/linear/engineering/ENG-3824-data-freshness-indicators-in-console.json"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "updates"
+  ],
+  "dataset_doc_uuid": "dsid_e54365cea8254098937d178e1078f916"
+}

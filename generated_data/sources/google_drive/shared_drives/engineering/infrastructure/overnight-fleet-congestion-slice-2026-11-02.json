@@ -1,0 +1,35 @@
+{
+  "title": "overnight-fleet-congestion-slice-2026-11-02",
+  "owner": "Riley Chen",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/infrastructure",
+  "doc_type": "sheet",
+  "created_at": "2026-11-02",
+  "last_modified": "2026-11-04",
+  "collaborators": [
+    "Priya Nair",
+    "Jonah Alvarez",
+    "Evan Park"
+  ],
+  "team": "eng-infrastructure",
+  "status": "in_review",
+  "tags": [
+    "gpu",
+    "capacity",
+    "postmortem",
+    "saturation",
+    "queueing",
+    "regional"
+  ],
+  "linked_artifacts": [
+    "JIRA:INFRA-8421",
+    "JIRA:INFRA-8433",
+    "https://github.com/redwood-inference/runtimes/pull/918"
+  ],
+  "content": "Overnight fleet congestion snapshot \u2014 data export for postmortem\n\nContext:\n- Incident window: 2026-11-01 22:30 UTC -> 2026-11-02 03:45 UTC. Reported symptoms: elevated p95/p99 token latency across hosted-api in eu-west and us-central, increased throttle events and queueing observed.\n- This sheet is a consolidated extract used for RCA and capacity planning follow-ups. Pull combines telemetry (gpu/cpu/util, queue depth), scheduler events (preempt, migrate), and rate limiter/throttle logs.\n\nRaw rows (one-line CSV-format for quick import):\ntimestamp,region,zone,instance_type,gpu_count,avg_gpu_util_pct,avg_cpu_util_pct,queue_depth_avg,queue_depth_peak,throttle_count,throttle_reasons,backpressure_ms,active_jobs_sample,dominant_model,p95_latency_ms,p99_latency_ms,error_rate_pct\n2026-11-01T22:40:00Z,eu-west,eu-west-1a,n1-highgpu-8,8,92,68,12,35,48,rate-limit(60%),queueing(30%),500,48,redwood-7b-instruct,210,490,0.6\n2026-11-01T23:00:00Z,eu-west,eu-west-1b,n1-highgpu-4,4,87,55,9,24,26,queueing(70%),rate-limit(20%),320,32,redwood-3b-chat,190,420,0.5\n2026-11-01T23:20:00Z,us-central,us-central-2a,n1-highgpu-8,8,95,72,15,42,82,rate-limit(50%),preempt(25%),queueing(25%),820,61,redwood-13b,260,730,1.2\n2026-11-02T00:10:00Z,us-central,us-central-2b,n1-highgpu-2,2,78,44,6,18,14,queueing(60%),rate-limit(40%),210,16,redwood-3b-chat,170,360,0.2\n2026-11-02T01:45:00Z,ap-southeast,ap-southeast-1a,n1-highgpu-4,4,80,50,8,21,19,queueing(80%),rate-limit(10%),280,22,redwood-7b-instruct,200,410,0.4\n2026-11-02T02:30:00Z,eu-west,eu-west-1a,n1-highgpu-8,8,93,71,18,56,104,rate-limit(65%),queueing(35%),960,74,redwood-13b,320,820,1.7\n\nAggregates (incident window):\n- Regions impacted (by throttle_count > 20): eu-west, us-central. Minor impact in ap-southeast.\n- Median GPU util (samples): 89%  | Median queue_depth_avg: 10 | Total throttle events observed: 293 in window\n- Peak per-node backpressure: 960 ms observed on eu-west-1a at 2026-11-02T02:30Z\n- Model mix during peaks: heavy fraction of redwood-13b (background batch reranks + low-latency chat requests) correlated with highest p99 latencies.\n\nQuick hypotheses (for triage):\n1) Cross-regional traffic spike + simultaneous model rollout increased seq length and KV cache misses for redwood-13b leading to longer decode times and pipeline queueing.\n2) Autoscaler lag: burst of short-lived jobs saturated small-instance pools (2/4 GPU shapes) causing cascade of queueing onto 8-GPU machines.\n3) Rate limiter policy mismatch: token-based quotas were being applied but spike was request-bursty (many short requests) causing token-bucket refills to produce transient high throttle counts rather than smoothing.\n\nQueries used for extract (simplified):\n- Telemetry join: SELECT ts, region, zone, instance_type, gpu_count, avg_gpu_util AS avg_gpu_util_pct, avg_cpu_util AS avg_cpu_util_pct, avg(queue_depth) AS queue_depth_avg, max(queue_depth) AS queue_depth_peak, sum(throttle_event) AS throttle_count, any_value(throttle_reason) AS throttle_reasons, avg(backpressure_ms) AS backpressure_ms FROM telemetry.node_1s WHERE ts BETWEEN '2026-11-01T22:30:00Z' AND '2026-11-02T03:45:00Z' GROUP BY ts, region, zone, instance_type, gpu_count\n- Workload join: SELECT job_id, model_family, request_type, tokens_in, tokens_out, latency_p95, latency_p99 FROM workloads.jobs WHERE ts BETWEEN ... AND job_id IN (sample_active_jobs)\n\nNotable observations and evidence:\n- Evidence A: eu-west-1a repeated high backpressure spikes coincident with background batch rerank jobs starting a scheduled job at 02:15 UTC (see INFRA-8421). Batch job configuration used large-seq = true which disabled prefix KV caching for those requests.\n- Evidence B: Autoscaler logs show scale-up events with 90s median provisioning time; scale decisions were conservative because node provisioning budget stepups capped at +10% per 15m window (see INFRA-8433).\n- Evidence C: Rate limiter telemetry shows token refill rate configured for steady-state throughput; a burst of short requests (many under 50 tokens) created request-level contention not handled by token refill smoothing.\n\nImmediate mitigations applied during incident (notes from Slack channel #infra-incident):\n- Emergency canary rollback of the scheduled batch rerank in eu-west at 02:40 UTC. Reduced incoming long-seq background work by ~60% in 12 minutes.\n- Temporary increase in per-region soft autoscaler budget for us-central and eu-west to allow faster scale-ups (applied 02:55 UTC).\n- Short-term rate limiter tweak: switched request-count smoothing window from 60s -> 10s for hosted-api ingress to reduce burst amplification (03:10 UTC).\n\nFollow-ups / action items: (owners assigned)\n- Fix: add KV-cache-aware job annotation so scheduler can separate long-seq batch reranks from low-latency chat workloads. Owner: Priya Nair. Due: 2026-11-10.\n- Fix: review autoscaler budget step and reduce provisioning cap during business hours; add predictive headroom for scheduled batch jobs. Owner: Jonah Alvarez. Due: 2026-11-17.\n- Investigate: rate limiter policy redesign for mixed request-size traffic patterns (token vs request smoothing hybrid). Owner: Riley Chen. Due: 2026-11-24.\n\nAppendix: snippets from logs (redacted) and sample chart notes:\n- eu-west-1a backpressure timeline: 22:40->23:30 low, 23:30->00:00 ramp, 02:15->02:45 max spike (aligned with batch start), post-rollback drop 02:55->03:15.\n- Suggest adding a dedicated capacity pool for scheduled batch reranks (4 x 8-GPU reserved for nightly windows) to avoid consumer-visible interference.\n\nNotes-to-self / open questions:\n- Need to verify whether preemption events caused additional cache invalidation and exacerbated seq-decode timeouts.\n- Should run a synthetic workload (mixed short chat + long-seq batch) against a staging autoscaler config to reproduce scale lag.\n\nReferences: JIRA INFRA-8421 (batch rerank rollout), JIRA INFRA-8433 (autoscaler budget), Slack #infra-incident thread (link redacted), GH PR runtimes#918 (rate limiter change)\n\nEnd of export.",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_41dee5ba6b2a4b529e8302aa246a289a"
+}

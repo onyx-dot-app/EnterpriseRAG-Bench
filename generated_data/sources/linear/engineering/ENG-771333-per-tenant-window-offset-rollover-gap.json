@@ -1,0 +1,76 @@
+{
+  "key": "ENG-771333",
+  "team": "engineering",
+  "title": "Per-tenant quota-window offset rollover gap causing under-enforcement of org caps",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-05",
+  "creator": "Noah Green",
+  "assignee": "Asha Patel",
+  "project": "rate-engine-stability",
+  "cycle": "2026-W09",
+  "estimate": "5",
+  "due_date": "2026-03-12",
+  "labels": [
+    "billing",
+    "rate-limiter",
+    "high-impact",
+    "timezone"
+  ],
+  "description": "Summary: We've observed a reproducible enforcement gap where organization-level burst caps are not applied for a small window (~1\u20133s) during tenant-specific quota window rollovers. This happens only when tenants configure a non-zero window offset (used to align quota windows with local business hours) and a per-route override exists with higher precedence in the policy graph. The result is transient under-enforcement: requests that should have been blocked by org caps are allowed through during the rollover gap, creating small but measurable billing and quota violations.\n\nWhy unique: Existing tickets covered shard collisions, day-light savings, and duplicate-metering; this is specifically about offset-aligned window boundary arithmetic + policy precedence ordering causing a brief allowance window.\n\nObserved in production: high-frequency clients hitting an endpoint with a per-route override set to allow higher burst; during that tenant's window rollover the org-level cap evaluation incorrectly reads the previous-window usage instead of including the in-flight debits, leading to allowance when org cap is exceeded.\n",
+  "steps_to_reproduce": [
+    "1) Create org with an org-level burst cap of 10 requests/sec over 60s window and enable a tenant-specific window offset of +5s.",
+    "2) Add a route-level override that temporarily elevates route-level burst allowance for a single API key.",
+    "3) Drive traffic: send 12 req/sec from that API key starting at T = window_end - 2s for ~5s.",
+    "4) Observe: instead of getting throttled when the org cap is reached, some requests between T+0s and T+3s succeed. The accounting shows debits in two windows but enforcement check used stale cumulative value for the new window.",
+    "5) Repro on staging with local clock skew and telemetry level DEBUG on rate-engine for verification logs."
+  ],
+  "impact": "medium: customer-visible rate-limit breaches, small billing variances (under-charging), potential SLA exposure for customers relying on strict org-level limits. Affects tenants using custom window offsets (about ~7% of orgs) and high-burst clients. No evidence of large-scale financial loss yet, but measurable billing discrepancies on the order of a few thousand token-requests across affected tenants during peak rollover windows.",
+  "root_cause_analysis": "Preliminary RCA: a race condition in the quota-window reconciliation code path. When an org has a custom window_offset, the rate-engine computes the target window boundaries per-candidate-request. For performance we fast-path evaluation by reading the previously computed window accumulator (cached) and merging in-flight debits via a transient delta. The bug is a precedence ordering error: for route-level overrides we evaluate per-route allowances first and then apply org caps using the cached window accumulator WITHOUT merging the queued debits that were applied during evaluation of route overrides. If debits occurred in the last ~2s before window boundary and the offset shifts the logical boundary across that time, we read an accumulator representing the pre-rollover state and undercount usage in the new window. This is exacerbated by optimistic concurrent credit prefetch for sticky sessions, which can send debits asynchronously and re-order merge timing.",
+  "proposed_solution": "1) Update evaluation flow to canonicalize policy precedence: ALWAYS compute a merged view of 'current window accumulator + in-flight debits' before performing org-level cap evaluation. 2) Add a deterministic merge-point in the evaluation pipeline so per-route overrides cannot observe a different accumulator snapshot than the org-level check. 3) Add a small reconciliation delay (configurable, default 50ms) when a window rollover is imminent (<200ms to boundary) to serialize window transition merges. 4) Add a unit test matrix covering window_offset values (-3600..+3600s), sticky-session reordering, and simultaneous per-route override application.",
+  "implementation_notes": "- Key files: rate_engine/evaluator.go, rate_engine/window_accumulator.go, rate_engine/policy_precedence.md.\n- Add new synchronized merge API: Accumulator.MergeInFlightDeltas(deltaList).\n- Replace ad-hoc reads in route-override path with Accumulator.GetMergedSnapshot(ctx, includeInFlight=true).\n- Ensure changes are non-blocking for majority of requests by only taking the reconciliation delay when system clock indicates boundary proximity.\n- Update telemetry flags: emit 'window_rollover_gap' event when we used the reconciliation path.",
+  "rollout_strategy": "Ship behind a feature flag 'fix/window-offset-merge' on edge and runtime. Canary rollout: 1) deploy to staging and canary AWS region; 2) enable flag for internal orgs and 5 low-traffic customers for 48 hours; 3) monitor for spike in latency or new throttles; 4) expand to 25% of orgs, then 100%. Rollback plan: flip flag off, which reverts to previous semantics; if we see regressions, hotfix branch with narrower change (only merge snapshot without reconciliation delay).",
+  "qa_tests": [
+    "Unit tests: new table-driven tests for offsets and boundary reordering.",
+    "Integration: synthetic workload in k8s staging with clock-shifted nodes and sticky sessions.",
+    "E2E: simulate 10 orgs with offsets and heavy per-route overrides to ensure no allowance during rollovers.",
+    "Load: verify throughput impact <1% latency p99 with reconciliation enabled for near-boundary traffic."
+  ],
+  "monitoring_plan": [
+    "Create dashboard: 'window_offset_rollover' showing events/sec, allowed/blocked ratio, and billing delta by org.",
+    "Add alert: weekly delta in billed requests >0.05% for flagged orgs => investigate.",
+    "Instrument: emit 'rollover_reconciliation_ms' histogram and 'merged_snapshot_used' counter.",
+    "Retrospective: run billing backfill for affected windows to estimate historical undercounts."
+  ],
+  "dependencies": [
+    "ENG-314271",
+    "ENG-712908"
+  ],
+  "related_links": [
+    "https://github.com/redwood-inference/rate-engine/pull/4523",
+    "https://console.redwood.internal/dashboards/window-offset-rollover?org=1234",
+    "confluence.redwood.ai/pages/viewpage.action?pageId=81523"
+  ],
+  "comments": [
+    "2026-03-01 - Noah Green: Initial detection via anomaly alert from billing-explorer. Linked the incident logs and sample traces. Assigned to Asha for investigation.",
+    "2026-03-02 - Asha Patel: Reproduced on staging with a deterministic harness. Found that changing window_offset to 0 removes the gap, confirming offset is a required condition. Added debug logs to evaluator and created branch fix/window-offset-merge.",
+    "2026-03-03 - Marco Ruiz: Code review notes posted on PR #4523 - questioned whether reconciliation delay is necessary; suggested metric-first approach and trimmed default to 25ms. Leaving decision to Asha.",
+    "2026-03-04 - Asha Patel: Implemented merged snapshot API and reduced default reconciliation to 40ms. Ran load test: p95 latency +0.8%, p99 +1.4% in heavy boundary scenarios. Preparing canary config.",
+    "2026-03-05 - Priya Nair (PM): Please include a short customer communication template for any customers exposed to quota anomalies. Also request legal/compliance sign-off if we need to issue billing adjustments."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "impact",
+    "root_cause_analysis",
+    "proposed_solution",
+    "implementation_notes",
+    "rollout_strategy",
+    "qa_tests",
+    "monitoring_plan",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_027a64b93f9b49ef97b3bcbb1d381dbb"
+}

@@ -1,0 +1,83 @@
+{
+  "key": "SUP-1008342",
+  "project": "customer-support",
+  "issue_type": "Incident",
+  "summary": "Streaming 5xx spike for NovaHealth tenant correlated with TLS session-affinity and prefetch batching imbalance",
+  "status": "In Progress",
+  "priority": "P0",
+  "severity": "Sev1",
+  "customer_company": "NovaHealth",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "prefetcher",
+    "kvcache",
+    "autoscaler"
+  ],
+  "labels": [
+    "streaming",
+    "5xx",
+    "tls-affinity",
+    "tenant-impact",
+    "prefetch"
+  ],
+  "environment": "prod | us-east",
+  "affected_models": [
+    "redwood-stream-3b",
+    "open-llama-7b"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "created_at": "2026-03-12",
+  "updated_at": "2026-03-13",
+  "sla_due_at": "2026-03-12",
+  "first_response_due_at": "2026-03-12",
+  "reporter": "Arielle Park",
+  "assignee": "Diego Martinez",
+  "description": "Issue summary: NovaHealth (dedicated tenant) reported a sudden increase in 5xx errors and streaming session drops starting 2026-03-12 09:10 UTC. Errors primarily 502/503 from API gateway and upstream runtime restarts. Impact: affected production streaming chat routes (low-latency consumer workflows) resulting in ~18% increase in failed requests and multiple customer alerts. Environment: prod, us-east, tenant pinned to a dedicated pool.\n\nObserved behavior: during a midday traffic ramp, long-lived streaming sessions began showing frequent half-closed socket resets and 502 responses. Runtime logs show OOM-like evictions and prefetch backlog growth. API gateway traces show persistent connection affinity to a small set of runtimes (TLS session reuse + client keepalive) during the ramp.\n\nSteps to reproduce (approx):\n1) Customer repro traffic pattern: many concurrent streaming sessions with intermittent large prefix prompts (~5k tokens total per user) and periodic embedding uploads.\n2) Prefetcher issues: prefetch worker for the tenant began batching aggressive model prefetches and KV cache warmups with high concurrency.\n3) API Gateway maintained TLS session affinity for streaming keepalives to a subset of runtimes, amplifying load on those hosts.\n\nKey logs / metrics (high level):\n- api-gateway: connection_affinity.hot_runtime_count=3, keepalive_reuse_ratio=0.88, http2_rst_rate=0.12/s\n- serving-runtime: kvcache_eviction_rate=670/s, prefetch_queue_depth=420, runtime_process_restarts=5 in 12m, gpu_mem_fragmentation=high\n- host OOMs: repeated kill/unclean shutdown traces around 2026-03-12T09:18:00Z\n\nHypothesized root cause: a feedback loop where TLS connection affinity concentrated streaming sessions on a small runtime subset while the tenant-prefetcher concurrently issued high-concurrency prefetches and KV writes. This caused memory pressure (KV cache and prefetch buffers), increased GPU memory fragmentation, and runtime watchdog resets producing 502/503 waves. The autoscaler did not immediately respond because the runtimes remained 'healthy' at the liveness probe level until they hit resource limits.\n\nImmediate customer impact: degraded success rate for streaming chat and a small number of aborted long-poll sessions. Customer reported reduced throughput for critical workflows during the window.\n\nAttempted mitigations prior to ticket: briefly applied tenant-level client-side backoff suggestion and increased prefetch throttle in staging (not yet applied to prod).\n\nRequired next steps: SRE and runtime team to validate affinity distribution logic, add short-term prefetch concurrency cap for this tenant, apply a targeted runtime restart sequence to drain hot runtimes, and rollout a guardrail in the autoscaler to detect kvcache_eviction spikes and preemptively scale.\n",
+  "comments": [
+    "2026-03-12 09:30 UTC - Arielle Park: Customer (NovaHealth) opened chat with screenshots showing 502s for streaming route /v1/stream/chat. Provided request IDs and approximate timestamps: req-20260312-091712, req-20260312-091820.",
+    "2026-03-12 09:45 UTC - SRE (Diego Martinez): Logged into tenant pool, observed high prefetch_queue_depth and repeated runtime restarts on runtimes r-ue1-43, r-ue1-44. Temporarily set prefetch max concurrency to 8 for tenant; early signal shows decreased kvcache_eviction_rate.",
+    "2026-03-12 10:12 UTC - Customer (NovaHealth - Sarah Lee): Confirmed improved success rates after prefetch throttle; however, some clients still see intermittent stream resets. Asked for ETA on permanent fix and explanation for why autoscaler didn't add capacity earlier.",
+    "2026-03-12 11:00 UTC - Runtime Team (Priya Nair): Investigating runtime heap fragmentation and GPU memory allocation patterns. Found that some runtime workers keep large pinned KV buffers during streaming sessions which are not released promptly on prefix eviction.",
+    "2026-03-13 08:34 UTC - Diego Martinez: Autoscaler log review attached (see related_github_prs). Found scaling signals delayed by 30s due to threshold smoothing; proposing to add kvcache_eviction_rate as a fast path metric."
+  ],
+  "investigation_notes": [
+    "Checked API gateway traces for provided request IDs: affinity header x-rt-affinity present, consistent reuse of TLS session for >15 minutes leading to load concentration.",
+    "Heap dump analysis on runtime r-ue1-44 shows many large prefetch buffers (~200MB each) held by pending batch tasks; memory returned slowly after batch completion due to pooling behavior.",
+    "KV cache shards uneven: tenant hash maps mapped to small subset of kvcache workers resulting in lock contention and eviction thrashing.",
+    "Autoscaler: configured to use cpu and overall latency smoothing; did not read kvcache_eviction spikes as immediate signal, causing delayed pod addition.",
+    "No evidence of GPU driver crash; restarts are watchdog-initiated process terminations due to host-level memory pressure and runtime OOM guard.",
+    "Related historical ticket: SUP-762143 (hot swap pipeline drift) - similar kvcache imbalance pattern; useful runbook sections referenced."
+  ],
+  "resolution": [
+    "Applied a targeted mitigation at 2026-03-12 10:00 UTC: tenant prefetch concurrency cap reduced from 64 -> 8; observed 60% drop in prefetch_queue_depth within 6 minutes and kvcache_eviction_rate normalized.",
+    "Drained and rotated two overloaded runtimes (r-ue1-43, r-ue1-44) and restarted with updated runtime flags to return large prefetch buffers to the allocator faster (tuning: --prefetch-buffer-lifetime=2s).",
+    "Rolled out a short-term autoscaler rule to treat kvcache_eviction_rate > 300/s as an immediate scale-up trigger for the dedicated pool. Rule is enabled as a canary in us-east and monitoring alerts created (pager duty playbook updated).",
+    "Engineering follow-up: runtime team to implement finer-grained KV shard balancing and change prefetcher batching logic to prefer spreading warmups across shards instead of concentrating them. Target PR drafted: gh-rt/1257.",
+    "Customer communication: Notified NovaHealth at 2026-03-12 12:00 UTC of mitigations and next steps. Offered a postmortem and assistance with client-side keepalive settings to reduce TLS affinity hot-spotting.",
+    "Ticket status: We consider the immediate outage mitigated but work remains to prevent recurrence. Keeping ticket In Progress until postmortem and permanent fixes are completed."
+  ],
+  "linked_issues": [
+    "SUP-762143",
+    "SUP-44120"
+  ],
+  "related_github_prs": [
+    "github.com/redwood/rt/pull/1257",
+    "github.com/redwood/autoscaler/pull/842"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/123456/Prefetch+and+KV+cache+runbook",
+    "https://redwood.atlassian.net/wiki/spaces/INC/pages/789012/2026-03-12-NovaHealth-incident"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments",
+    "investigation_notes",
+    "resolution"
+  ],
+  "dataset_doc_uuid": "dsid_6dec20a6fe1242f1959591b68e990ecd"
+}

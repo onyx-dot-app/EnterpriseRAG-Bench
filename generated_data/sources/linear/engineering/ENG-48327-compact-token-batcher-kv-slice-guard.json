@@ -1,0 +1,47 @@
+{
+  "key": "ENG-48327",
+  "team": "engineering",
+  "title": "Compact-token batcher with KV-slice guard and memory-fence for streaming chat completions",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-02-18",
+  "updated_at": "2026-03-13",
+  "creator": "Aisha Menon",
+  "assignee": "Diego Alvarez",
+  "project": "runtime-batching-2026",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-31",
+  "labels": [
+    "streaming",
+    "kv-cache",
+    "gpu-memory",
+    "batching",
+    "heuristic"
+  ],
+  "parent_issue": [
+    "ENG-41207"
+  ],
+  "dependencies": [
+    "ENG-36921"
+  ],
+  "release": "runtime-1.22",
+  "customer_impact": "high",
+  "security_review_required": "false",
+  "description": "Summary:\nWe need a batching heuristic tailored for streaming chat completions that aggressively packs short-turn responses into compact micro-batches while protecting KV cache residency for long-running sessions. Current continuous batchers sometimes thrash the KV cache when many short completions interleave with long conversations, causing GPU memory pressure and P99 spikes. This ticket proposes the Compact-Token Batcher + KV-Slice Guard (CTB-KVSG) and a memory-fence mechanism to keep GPU memory fragmentation and eviction storms under control.\n\nGoals:\n- Reduce GPU memory churn from interleaved short and long sessions.\n- Keep streaming P99 latency under 250ms for conversational workloads with mixed turn lengths.\n- Reduce per-token cost by improving packing efficiency for short completions without harming long-session throughput.\n\nDesign outline:\n1) Compact-token grouping: incoming streaming requests are assigned to one of two micro-slab pools based on estimated remaining output length: COMPACT (<= 24 tokens expected) and STANDARD (> 24). The estimator uses the last-turn delta and user-configured max_tokens. The COMPACT pool packs many short-turn requests into a single microbatch to amortize kernel launch overhead.\n2) KV-slice guard: each microbatch obtains a small KV reservation \"slice\" (configurable fraction of a GPU slab) that pins minimal KV state for active long sessions referenced by the batch. When the scheduler observes many short requests, it avoids stealing slices from sessions whose pinned slice is < guard_threshold.\n3) Memory-fence: when GPU free memory drops below fence_low_mb, the batcher temporarily raises the compact-packing threshold (prefer longer packs) and triggers aggressive KV prefetch/eviction policies to avoid OOM or background eviction storms. The fence is a tunable safety net (fence_low_mb, fence_recovery_ms).\n4) Backoff & fallback: requests that cannot be packed without violating latency SLOs are immediately routed to a low-latency critical queue that bypasses aggressive packing. On sustained memory pressure, system falls back to STANDARD batching and conservative KV eviction policy.\n\nHeuristic parameters (initial):\n- compact_max_tokens = 24\n- compact_min_pack_size = 6 (don't form tiny microbatches < 6 requests unless idle_timeout)\n- compact_idle_timeout_ms = 12\n- kv_slice_fraction = 0.06 (6% of slab per pinned session for COMPACT pack)\n- guard_threshold = 0.75 (don't reclaim if pinned usage < 75% of slice)\n- fence_low_mb = 1024\n- fence_recovery_ms = 2500\n\nMetrics to track:\n- packing_efficiency = avg_tokens_per_batch / peak_tokens_per_kernel (target +10% over baseline)\n- KV-residency-stability = eviction_rate_per_min (target < 5/min under mixed load)\n- P50/P95/P99 latency for streaming completions (target P99 < 250ms)\n- GPU memory fragmentation metric (custom: active_slabs / total_slabs)\n\nExperiment plan and results (local perf env):\n- Workload: mixed chat trace (60% short-turns 1-20 tokens, 40% long-turns 80-600 tokens) replayed on p3-like instance.\n- Baseline: existing slab-batcher with naive continuous packing.\n- Trial 1 (CTB-KVSG default params): packing_efficiency +12%, overall token cost -9%, GPU memory churn -18%, streaming P99 improved from 320ms -> 230ms.\n- Trial 2 (aggressive compact_min_pack_size=3): slightly higher efficiency (+15%) but KV eviction spikes during synthetic adversarial interleaving; P99 regressed to 260ms. Conclusion: keep conservative min pack size.\n- Trial 3 (fence_low_mb=512): lower fence caused frequent fallbacks; increased P99 variability. Keep 1024MB safety.\n\nImplementation notes:\n- New scheduler mode: \"compact-token\" flag controlled per-route. Enabled by default for streaming-chat routes with turn_lengths_histogram skewed to short turns.\n- KV reservations implemented as soft reservations tracked in slab allocator metadata (no change to kernel). Reservations can be preempted only when guard condition violated.\n- Add a lightweight estimator in the request admission path. Estimator uses moving average of a user's previous turn length and configured max_tokens.\n- Expose heuristics as runtime flags under '/config/packing' in the admin API for canary tuning.\n\nTesting and rollout:\n- Unit tests: reservation bookkeeping, guard logic, fence transitions, estimator behavior under edge cases.\n- Integration: end-to-end replay with mixed traces and adversarial interleaving. Record detailed memory traces.\n- Canary: start with 5% traffic in runtime-1.22 in us-west-2 for streaming-chat routes with explicit opt-in. Gate rollout on P99 and eviction_rate.\n\nMonitoring dashboards and alerts:\n- New dashboard: /dashboards/batching/48327 (packing efficiency, eviction_rate, P99 latency, fence-trigger-rate).\n- Alerts: eviction_rate > 10/min for 5m -> rollback, packing_efficiency drop > 20% vs baseline -> alert.\n\nOpen questions / trade-offs:\n- How to compute expected remaining tokens accurately for multi-turn flows with function-calling? (PM suggested conservative estimates when functions are present).\n- Should reservations be billed as reserved memory for Dedicated customers? Billing implications for small KV slices need PM/legal alignment.\n- Interaction with quantized-model memory accounting: quantized KV sizes vary by model and must be normalized.\n\nAcceptance criteria:\n- Automated tests covering guard and fence behavior.\n- Canary with 5% traffic shows P99 <= 250ms and eviction_rate < 5/min for two weeks.\n- Documentation page describing knobs and recommended defaults for common workloads.\n\nNotes and links:\n- Design doc draft: https://confluence.redwood.ai/display/INF/Compact-Token+Batcher+Design (internal)\n- Implementation PR: https://github.com/redwood-inference/runtime/pull/5893\n- Replay traces and results: https://drive.redwood.ai/shared/48327/experiment-results.csv\n- Related tickets: ENG-41207 (turn-boundary-slab-batcher), ENG-36921 (stream-slicer-kv-aware-gpu-throttle)\n",
+  "comments": [
+    "2026-02-19 - Aisha: Created initial proposal after perf spike incident on 2026-02-17. Added baseline numbers from local replay.",
+    "2026-02-24 - Diego: Implemented estimator prototype and basic compact pool allocator. Submitted internal PR for early review.",
+    "2026-03-01 - PM review (Lina Chen): Billing question flagged; asked for documentation on how KV-slices are accounted for Dedicated customers.",
+    "2026-03-05 - SRE (Omar Bhatt): Reviewed fence thresholds; recommended raising fence_low_mb to 1GB for p3-class machines to avoid eviction storms seen in staging.",
+    "2026-03-08 - Design review: Agreed on compact_min_pack_size=6. Diego to run extended replay with mixed adversarial patterns. Action: add canary gating alerts.",
+    "2026-03-12 - Diego: Trial run completed on us-west-2 canary cluster (5% traffic). Initial telemetry looks good: packing_efficiency +11%, P99 ~238ms. Moving to broader canary if no regressions in 48h.",
+    "2026-03-13 - Aisha: Updated description with trial numbers and final parameter recommendations. Added links to PR and dashboard."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_7d88afbcf49844739025f8bae67d3594"
+}

@@ -1,0 +1,50 @@
+{
+  "key": "ENG-48211",
+  "team": "engineering",
+  "title": "Token allocation for staggered prefix-cache warmups",
+  "status": "In Review",
+  "priority": "P1",
+  "created_at": "2025-02-10",
+  "updated_at": "2025-03-02",
+  "creator": "Ava Chen",
+  "assignee": "Rafael Ortiz",
+  "project": "metering-billing-core",
+  "cycle": "2025-W06",
+  "estimate": "5",
+  "due_date": "2025-03-14",
+  "labels": [
+    "metering",
+    "quota",
+    "kv-cache",
+    "batching",
+    "billing",
+    "multi-tenant"
+  ],
+  "dependencies": [
+    "ENG-16421",
+    "ENG-42109"
+  ],
+  "customer_impact": "high",
+  "release": "billing-2025.04",
+  "security_review_required": "false",
+  "description": "Background:\nWe observed discrepancy between observed token billing and expected spend for workloads that produce many short requests with common prefixes. The runtime performs staggered prefix cache warmups and opportunistic KV cache hits, then coalesces requests into a single kernel batch when possible. Current metering attributes tokens to the batch and charges the full token count to the request that triggered batch creation, which can overcharge warmup requests and undercharge downstream requests that benefited from the warmed cache.\n\nProblem statement:\n- Short-running requests (e.g., p50 latency < 50ms) often trigger prefix prefetch or KV warmups that are shared across subsequent requests within the batching window.\n- Metering currently: attribute all tokens generated in the fused/coalesced kernel to the initiating request's quota and rate-limit counters.\n- Consequence: tenants that issue many warmup/priming calls see disproportional quota consumption and throttling, while tenants that arrive in the same batch receive cheap inference. This skews quota usage, rate-limit behavior, and customer billing.\n\nGoals:\n1) Produce a deterministic, auditable algorithm that apportions token charges for coalesced batches and staggered cache warmups across contributing requests.\n2) Preserve latency SLOs by keeping attribution calculation lightweight (no synchronous database round-trips per request).\n3) Handle multi-tenant batches (shared host/gpu) and single-tenant reserved pools uniformly.\n4) Ensure accounting is idempotent across retries and safe during failover/fallback (e.g., when a fallback model is used).\n\nProposal summary:\n- Introduce a compact Batch Attribution Header (BAH) propagated with each request internally through the serving runtime. BAH is a fixed-size token (base64) that encodes: batch_id, ordering index, prefix_warmup_flag, estimated_input_len, and a 32-bit checksum.\n- During kernel fusion, the runtime generates a list of contributing BAHs and records each contributor's claimed prefix hits count and input token length as metadata in an ephemeral in-memory batch ledger on the worker.\n- Token Attribution algorithm (deterministic, O(n) per batch):\n  1. Compute total_output_tokens from kernel result (N).\n  2. Compute beneficiary weight per contributor: weight_i = input_tokens_i + alpha * prefix_warmup_flag_i, where alpha is a small tunable (default 0.2) to reflect additional cost of cache priming.\n  3. prorated_tokens_i = round((weight_i / sum(weights)) * N)\n  4. Enforce floor/ceil rules to ensure sum(prorated_tokens_i) == N, distributing residuals by ordering index (earliest contributor first).\n- Attribution record (batch_id, per-issue prorated_tokens, kernel_latency, model_version) is flushed to the metering aggregator asynchronously over our existing metrics pipeline for final reconciliation and billing.\n\nImportant trade-offs and rationale:\n- Why weight includes input_tokens: larger prompts tend to cause larger KV cache churn and longer generation; this reflects a more plausible share of cost.\n- Why include prefix_warmup_flag * alpha: warmups do cause extra internal prefetch/compute not visible in input length; alpha allows tuning based on observed overhead.\n- Avoided approaches: per-token tracing (too heavy), assign all cost to last request (unfair to warmups), or split evenly (doesn't account for size skew).\n- Performance: all ops are integer arithmetic and work on in-memory arrays; no blocking network calls. The metering flush is batched and retried with existing aggregator backoff logic.\n\nEdge cases and handling:\n- Retries / Duplicate batches: BAH includes a nonce and checksum; worker ledger deduplicates duplicate batch flushes. Aggregator de-duplicates on batch_id and kernel_digest.\n- Fallback model path: when a request is routed to fallback model after batch creation, we include a fallback flag in BAH and the attribution records tag the kernel as fallback. External billing will apply fallback mapping rules (separate SKU).\n- Tiny contributors: contributors whose weight < threshold are assigned at least 1 token to prevent zero attribution for legal/regulatory traceability. Threshold configurable per release.\n\nImplementation plan:\n1) Runtime: implement BAH generation and in-memory batch ledger (worker side) \u2014 2 weeks (ENG + 1 reviewer).\n2) Kernel fusion hook: collect contributor metadata and run attribution algorithm. Add unit tests and microbenchmarks \u2014 1.5 weeks.\n3) Metering aggregator: accept batch attribution records, de-duplicate, and rollup to customer-level billing events \u2014 1 week.\n4) Console/Docs: add explanation + per-request attribution breakdown in Developer Console (expandable) \u2014 1 week.\n5) Release: Canary on hosted region us-west-2 with opt-in per-tenant flag; gather delta between old and new billing for one billing cycle before full migration.\n\nAcceptance criteria:\n- Integration tests show that sum(prorated_tokens) == total_output_tokens for 100% of test batches.\n- Benchmark shows no >2% p50 latency regression on median traffic.\n- Billing dashboards show no >5% change in net token revenue during opt-in canary window (expected churn between tenants but no material revenue loss).\n\nOpen questions for PM/Finance:\n- How should we bill the alpha-weighted portion attributable to cache priming? Charge back to priming tenant or amortize across batch? Proposal is to charge prorated per the algorithm and surface a separate line-item \"cache-warmup adjustment\" in invoice for visibility.\n- Legal/regulatory: ensure trace of attribution for audits; confirm retention window for batch ledgers.\n\nLinks and references:\n- PRD (Confluence): https://redwood.atlassian.net/wiki/spaces/INFR/pages/PRD-Batch-Attribution\n- Draft runtime PR: https://github.com/redwood-inference/runtime/pull/1286 (WIP)\n- Billing dashboard mock: https://redwood.app/dashboards/billing/batch-attribution-mock\n- Related tickets: ENG-16421 (refactor metering pipeline), ENG-42109 (apportion-token-billing-intermittent-kv-hits)",
+  "comments": [
+    "2025-02-11 - Ava Chen: Initial triage. Reproduced discrepancy with sample workload (10k requests, 60% prefix overlap). Attached heap profile and kernel logs.",
+    "2025-02-14 - Rafael Ortiz: Prototype of BAH implemented. Verified base64 encoding size is 24 bytes per request. No measurable GC pressure in load test. Pushed branch runtime/bah-proto.",
+    "2025-02-20 - Finance (Maya Patel): Concerned about revenue neutrality. Requesting canary metrics and a visibility line-item. We'll prepare a reconciliation script to show delta per-tenant.",
+    "2025-02-24 - Eng Infra (Jon Park): Noted dedupe requirement in aggregator to prevent double-billing during leader failover. Proposed adding batch_id plus kernel_digest dedupe key.",
+    "2025-02-27 - Rafael Ortiz: Added unit tests for residual distribution edge cases (sum residuals handling). Performance microbench shows 0.4% median latency overhead at 5k RPS.",
+    "2025-03-02 - PM (Lina Gomez): In Review. Requested UX copy for Developer Console and an optional tenant opt-in flag with visible metrics during canary.",
+    "2025-03-02 - Rafael Ortiz: Uploaded canary rollout plan and toggles: runtime.flag.batch_attribution and billing.flag.show_cache_adj. See PR links in description."
+  ],
+  "attachments": [
+    "https://drive.redwood.com/attachments/ENG-48211/heap-kernel-logs.zip",
+    "https://drive.redwood.com/attachments/ENG-48211/canary-rollout-plan.md"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_6077634b11ff46c1a33f7597655c7650"
+}

@@ -1,0 +1,36 @@
+{
+  "title": "Queue drain patterns and latency outliers journal",
+  "owner": "Priya Raman",
+  "drive_area": "shared_drives",
+  "path": "shared_drives/engineering/serving-runtime/queue-drain-patterns-latency-outliers-journal",
+  "doc_type": "doc",
+  "created_at": "2025-01-12",
+  "last_modified": "2025-02-03",
+  "collaborators": [
+    "Ethan Cole",
+    "Marta Liu",
+    "Diego Alvarez"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "continuous-batching",
+    "latency-outliers",
+    "profiling",
+    "scheduler-tuning",
+    "arrival-skew"
+  ],
+  "linked_artifacts": [
+    "https://confluence.redwood/serving/runtime/queue-drain-journal",
+    "JIRA-6634",
+    "https://github.com/redwood-inference/serving-runtime/pull/912",
+    "slack://channel?team=T12345&id=C061Y4K"
+  ],
+  "content": "Purpose:\\nThis is a working journal capturing experiments, profiling notes, and micro-benchmarks around an observed class of tail latency outliers tied to 'queue drain' behavior in the continuous-batching scheduler. Goal: identify simple heuristics and guardrails (short-term) and a robust algorithmic mitigation (mid-term) to reduce p99/p999 regressions without hurting throughput.\\n\\nBackground / why this surfaced:\\n- Multiple customer incidents where p99 increased by ~2-4\u00d7 under skewed arrival traces.\\n- Spike pattern: heavy arrival burst then a long sparse tail. Scheduler forms large batches during burst, then small stragglers cause repeated flushes during drain waves.\\n- Existing timeouts and size thresholds were tuned for steady Poisson-like traffic; they underperform for 'bursty then sparse' workloads.\\n\\nInstrumentation added this run:\\n- Per-request enqueue timestamp, batch formation start/end, flush-trigger reason (size/timeout/starvation-window).\\n- Batch histogram (size, latency), per-core queue occupancy timeline, KV-cache-hit-rate during drain.\\n- Flamegraphs for scheduler thread and GPU stall samples (1ms sampling).\\n\\nMeasurement harness / test parameters:\\n- Synthetic replay traces derived from production: two classes (A: bursty 10kqps 500ms window, then 2qps tail for 20s; B: steady 200qps).\\n- Models: open-llama-7B quantized int8, sequence len 512, greedy decoding 1 token per request to amplify overheads.\\n- Nodes: 4x V100-equivalent (dedicated dev cluster).\\n- Metrics: p50/p90/p99/p999, batch_size_distribution, per-request end-to-end, scheduler spin time, GPU utilization.\\n\\nKey observations (raw):\\n- Under trace A, p99 increased from 120ms baseline to ~720ms during drain waves. p999 spikes up to 1.8s.\\n- 65% of p99 outliers are in requests that were flushed due to 'starvation timeout' after being demoted from earlier batch windows.\\n- Flamegraphs show scheduler spends disproportionate CPU time in list traversal and eviction logic when many tiny batches are formed in rapid succession.\\n- KV cache pressure: when drain waves interleave with cache misses, per-token GPU time increases ~10-15%, amplifying latency.\\n\\nHypotheses generated:\\n1) Fixed absolute timeout (e.g., 20ms) causes premature flush of partially-filled batches during drain tails; adaptive timeout based on recent arrival rate would reduce unnecessary flushes.\\n2) Batch formation ordering (FIFO only) fails to pack latency-sensitive short requests that arrive during a drain wave; short-circuit priority or tiny-slot reservation could improve packing without impacting fairness.\\n3) Thundering small-batch flushes create scheduler CPU overhead \u2014 introduce coalescing gate with exponential backoff to prevent repeated flush cycles.\\n\\nSmall experiments run (notes):\\n- Experiment E1: adaptive timeout = max(10ms, 3 * median_interarrival_5s). Result: p99 reduced ~30% on trace A, throughput unchanged. Some requests saw +10ms tail.\\n- Experiment E2: reserve one \"packing slot\" per core to boost assembly of 2-4 request micro-batches; reduced p999 spikes but slightly increased p90 (tradeoff).\\n- Experiment E3: coalescing-gate (suppress flush if previous flush < X ms ago). Eliminated oscillations but induced rare 500ms waits when combined with long CPU GC pause \u2014 needs guard.\\n\\nProfiles and artifacts (short):\\n- scheduler_cpu.svg: shows repeated peaks aligned with small-batch flushes.\\n- batch_size_hist.csv: bimodal distribution during drain (mode 1 at size 1, mode 2 at size 64).\\n- kv_cache_miss_trace.log: correlated with the worst outliers.\\n\\nActionable heuristics we think are low-risk to ship ASAP:\\n- Adaptive timeout based on short-term interarrival median (window 3-5s, multiplier 2.5-3.5).\\n- Introduce an anti-oscillation suppression: once a batch flush happens due to timeout, disallow another timeout-based flush on the same queue for at least 2x the timeout value.\\n- Add instrumentation flags to enable per-tenant 'drain-mode' which toggles packing slot reservation.\\n\\nMid-term algorithm ideas (research tracks):\\n- Predictive drain detector: run a lightweight arrival-rate predictor (EWMA + burst detector) and switch scheduler policy modes (burst-mode vs drain-mode).\\n- Priority-aware packing with fairness aging: allow very-short requests to be packed ahead if their wait > some small quantile but ensure long requests don't starve.\\n- Hybrid scheduling: combine size-timeout with opportunistic deferred flush (if GPU utilization above threshold, be more aggressive packing).\\n\\nOpen questions / risks:\\n- Does adaptive timeout interact badly with tenant QoS SLAs? Need SLO safety checks.\\n- How do these heuristics interact with multi-model co-location and mixed-seq-length workloads? We saw cases where packing short requests into a large batch caused memory fragmentation and extra kernel launches.\\n- Edge-case: pause during long GC or OS scheduling caused our suppression gate to hold requests too long. Must include watchdog bypass if scheduler doesn't see progress.\\n\\nNext steps / TODOs:\\n- [ ] Run adaptive-timeout + packing-slot together on 10/10 replay; capture p999 distribution per-tenant (owner: Ethan).\\n- [ ] Add watchdog bypass to suppression gate (owner: Marta).\\n- [ ] Add synthetic mixed-seq experiment (seq lengths 64/512 mixed). (owner: Diego).\\n- [ ] Draft a small RFC for 'drain-mode' policy and safety rollback plan.\\n\\nNotes to self:\\n- Keep experiments small and feature-flagged. We want quick mitigation in prod without full algorithm swap.\\n- Preserve observability: add a per-flush reason label to metrics (size/timeout/starvation/backoff) so we can alert when drain-mode heuristics are in play.\\n\\nAppendix: rough numeric snapshot from run E1 (trace A):\\n- baseline p99: 120ms -> adaptive-timeout p99: 85ms (best-effort median over 5 runs)\\n- p999 baseline: 1800ms -> adaptive-timeout p999: 680ms\\n- avg batch size baseline: 28 -> during burst 62, during drain 3 -> adaptive-timeout increased drain avg to 7\\n\\nIf useful I'll convert this into a short playbook and a PR with the adaptive-timeout implementation and instrumentation toggles.",
+  "original_location": "google_drive/shared_drives/engineering/serving-runtime/queue-drain-patterns-latency-outliers-journal.json",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_e1ce297726c347129b9db7be80949588"
+}

@@ -1,0 +1,59 @@
+{
+  "key": "SUP-881999",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "Edge proxy half-close results in silent stream tail and missing final tokens for SSE sessions",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Ava Chen",
+  "assignee": "Jorge Martinez",
+  "severity": "Sev1",
+  "customer_company": "NimbusAI",
+  "customer_tier": "dedicated",
+  "components": [
+    "api-gateway",
+    "serving-runtime",
+    "edge-proxy"
+  ],
+  "labels": [
+    "streaming",
+    "sse",
+    "partial-output",
+    "proxy",
+    "investigation"
+  ],
+  "environment": "prod | us-west",
+  "affected_models": [
+    "redwood-v1.2",
+    "gpt-3o-instruct"
+  ],
+  "affected_regions": [
+    "us-west-2"
+  ],
+  "sla_due_at": "2026-03-12",
+  "linked_issues": [
+    "INT-4132"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/runtime/pull/872"
+  ],
+  "related_confluence_pages": [
+    "https://confluence.redwood.ai/display/SUPPORT/streaming-reconnect-runbook"
+  ],
+  "description": "Issue summary:\nCustomer reports that many SSE streams from the hosted API appear to terminate 'silently': the client receives the penultimate chunks and then the connection closes or reuses the underlying TCP connection without the expected final 'end' event or final JSON metadata. The visible symptom is truncated final tokens and missing choice/finish_reason metadata.\n\nImpact:\n- Multiple calls from NimbusAI show incomplete responses for medium-length completions (typically 800-2k tokens).\n- Affects production traffic routed through our edge proxy in us-west-2.\n- Customer experienced degraded UX in customer-facing chat flows (some messages appear cut off).\n\nEnvironment:\n- Redwood hosted API (production) behind edge proxy (Nginx-based layer) -> api-gateway -> serving-runtime (GPUs).\n- Customer traffic class: dedicated pool (reserved capacity).\n- Observed primarily on HTTP/1.1 keepalive connections with higher request concurrency.\n\nSteps to reproduce (observed from customer and reproduced locally):\n1) Client issues SSE generation call using chunked encoding over HTTP/1.1 (curl example provided).\n2) Server emits streaming choices and final metadata chunk.\n3) Under proxy connection reuse / half-close timing, the final metadata chunk is consolidated with a subsequent keepalive/newline heartbeat chunk and dropped by the proxy as an orphan fragment.\n4) Client either sees connection close without end event or a truncated last choice.\n\nMinimal repro curl (observed):\n  curl -N -H \"Accept: text/event-stream\" \\n    -H \"Authorization: Bearer <token>\" \\n    \"https://api.redwood.ai/v1/streams?model=redwood-v1.2&max_tokens=1500\"\n\nObserved logs / snippets:\n- Edge proxy access log (sample):\n  2026-03-09T22:11:04.423Z 198.51.100.22 \"POST /v1/streams HTTP/1.1\" 200 2345 \"-\" \"curl/7.85.0\" \"keepalive=1; reuse=1\"\n- Serving runtime trace (span):\n  span=stream:emit chunk_id=521 status=written flush=ok\n  span=stream:emit chunk_id=522 status=written flush=pending\n- Customer client log (truncated final payload):\n  [22:11:04.439] RECEIVED: {\"delta\":\"...final text partial\",\"chunk_id\":521}\n  [22:11:04.452] CONNECTION CLOSED (no end event)\n\nInvestigation notes so far:\n- Hypothesis: Edge proxy is performing a half-close/connection reuse optimization and coalescing a tiny final chunk (final metadata or '\\n' heartbeat) into a previously flushed packet; due to keepalive logic or an upstream timeout, this coalesced fragment is never forwarded as a proper SSE event boundary.\n- Reproduced locally behind a simplified Nginx config with HTTP/1.1 keepalive and small proxy_send_timeout (50s) when traffic is bursty. Setting proxy_buffering off reduces the rate of failures.\n- No evidence of serving-runtime failing to write the final chunk; runtime traces show write attempts and flush requests. Problem appears between serving-runtime socket write and the client-observed SSE framing.\n- Works reliably when forcing HTTP/2 (h2) at the edge or when client uses a fresh TCP connection per request (no keepalive).\n\nTemporary mitigations tried and results:\n- Turned off proxy buffering (proxy_buffering off) on a test edge instance -> repro rate dropped from ~12% to ~1.5%.\n- Increased proxy_send_timeout and proxy_read_timeout -> minor improvement but not eliminated.\n- Instructed customer to enable HTTP/2 in their client path (not viable for all due to legacy stack).\n- Implemented a server-side small trailing chunk hack in a lab build that emits an explicit SSE 'end-of-stream' sentinel as a separate write (flush) and observed reliable delivery in lab.\n\nNext steps / proposed engineering actions:\n1) Short-term: Recommend edge config change for affected customers: set proxy_buffering off for SSE endpoints and ensure proxy does not coalesce tiny final chunks (document in KB). Ops to roll a canary of this config to 2 edge nodes in us-west-2.\n2) Medium-term (engineering): Add a server-side safety write: always emit a dedicated terminal SSE event (e.g., 'event: _terminal\\ndata: {\"_final\":true}\\n\\n') as a separate flushable chunk to make end-of-stream robust to proxy coalescing. Add telemetry to count how often we needed the terminal write to be resent.\n3) Long-term: Evaluate upgrading edge terminating layer to prefer HTTP/2 for streaming or hardening HTTP/1.1 chunk framing behavior (ensure transparent pass-through of tiny chunks and keepalive heartbeats).\n\nWorkarounds for customer:\n- Enable HTTP/2 between client and edge if possible.\n- Configure edge proxy to disable buffering for SSE endpoints (proxy_buffering off).\n- Application-level: client can request a small post-stream validation token appended to payload ('append_status': true) which serving-runtime will put in the penultimate chunk to reduce reliance on a separate final chunk.\n\nAcceptance criteria for fix:\n- Repro rate for this vector drops to <0.1% for production traffic in us-west-2 across a 48h window after canary rollout.\n- No increase in other streaming regressions (e.g., duplicate tokens).\n- KB updated with configuration guidance and a postmortem-style incident note if customer impact is confirmed.\n",
+  "comments": [
+    "2026-03-10 09:12 - Support (Ava Chen): Customer reported chat messages ending abruptly; attached client logs and example request IDs: req-09c8a, req-09c8b. P1 requested due to user-facing UX impact.",
+    "2026-03-10 11:02 - Eng (Jorge Martinez): Started tracing through edge logs and runtime spans for the provided request IDs. Found matching span writes for final chunks. Opening INT-4132 to coordinate edge config checks.",
+    "2026-03-11 02:47 - SRE (Maya Patel): Deployed a test nginx config with proxy_buffering off on canary-edge-3. Early samples show repro rate falling to ~1.2% in test window. Added dashboard panel: 'sse_tail_loss_rate'.",
+    "2026-03-11 15:30 - Support (Ava Chen): Customer tried HTTP/2 path; they report stable deliveries for the previously failing message set. They cannot migrate all clients immediately. Recommended proxy_buffering change and provided KB steps.",
+    "2026-03-12 08:14 - Eng (Jorge Martinez): Built lab runtime that emits explicit terminal SSE event in its own flush. Verified consistent delivery behind nginx reproduction. Drafting code change and tests. Planning PR and will include telemetry to count terminal-emit fallbacks. Linked PR: https://github.com/redwood-inference/runtime/pull/872"
+  ],
+  "title_field_name": "summary",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_854a9ca8daf54716b75c22377df89654"
+}

@@ -1,0 +1,42 @@
+{
+  "repo": "redwood",
+  "pr_number": "19812",
+  "title": "Policy engine: deterministic failover signal hierarchy evaluation + config schema",
+  "author": "Jordan Lee",
+  "created_at": "2026-01-06",
+  "updated_at": "2026-01-10",
+  "merged_at": "2026-01-10",
+  "state": "merged",
+  "base_branch": "main",
+  "head_branch": "feature/policy-engine-signal-priority",
+  "reviewers": [
+    "Miles Thornton",
+    "Ravi Menon",
+    "Mina Haddad",
+    "Benji Okafor",
+    "Allison Grant"
+  ],
+  "labels": [
+    "sre",
+    "routing",
+    "reliability",
+    "control-plane",
+    "observability"
+  ],
+  "linked_linear": [
+    "ENG-2412"
+  ],
+  "ci_status": "pass",
+  "files_changed_count": "27",
+  "additions": "1134",
+  "deletions": "287",
+  "breaking_change": "false",
+  "release_notes": "Adds deterministic evaluation of failover trigger signals in the routing policy engine. Introduces a versioned config schema for signal hierarchy and corroboration rules. No behavior change unless `signal_hierarchy.v2` is enabled.",
+  "body": "## Summary\nThis PR implements deterministic evaluation semantics for failover trigger signals in the policy engine and introduces a versioned config schema to express signal priority, corroboration requirements, and anti-flap dampening inputs. The goal is to eliminate ambiguous/unstable decisions under noisy signals (false positives) and to make controller recommendations reproducible across replicas and over time.\n\nThis is a core building block for the Regional Failover Automation Upgrade (Reliability Program). It aligns with ADR-042 (failover trigger signal hierarchy) and is intended to be consumed by the failover controller (dry-run + execution) and by routing decisioning for Hosted API + Dedicated.\n\n## Motivation / problem\nToday the policy engine effectively evaluates \u201cbest effort\u201d based on whichever signal arrives first and the order of predicates in config. Under partial outages, slight differences in signal availability (or timestamp skew) can lead to:\n- non-deterministic policy flip recommendations across replicas\n- oscillation between regions when signals conflict\n- hard-to-audit decisions (no consistent \u2018why\u2019 path)\n- inability to safely validate dry-run recommendations against a recorded signal snapshot\n\n## What changed\n### 1) Deterministic evaluation pipeline\n- Added `SignalHierarchyEvaluator` which produces a stable decision outcome for a given set of signals + config.\n- Evaluation is explicitly ordered by configured priority (highest authority first), with deterministic tie-breaking.\n- The evaluator produces a structured `DecisionTrace` capturing which signals were considered, which were missing/stale, and which rule fired.\n\nDeterminism rules:\n- Signals are normalized and sorted by `(priority_rank, signal_type, region, source)`.\n- Only signals within freshness windows participate (defaults, override per signal type).\n- If a high-authority signal is present and crosses threshold, lower-priority signals cannot override it; they can only corroborate or contribute to confidence.\n\n### 2) Config schema update (versioned)\nIntroduced `signal_hierarchy` config stanza with `version: v2` behind a feature gate; the legacy interpretation remains default.\n\nNew schema concepts:\n- `priority_order`: an explicit ordered list of signal classes (e.g. `reachability`, `http_5xx_burn`, `tail_latency_burn`, `capacity_exhaustion`).\n- `corroboration`: optional rules requiring a second signal to confirm before declaring a region impaired, except for \u201cauthoritative\u201d signals.\n- `freshness`: per-signal TTLs and maximum allowed staleness.\n- `hold_down_inputs`: evaluator emits the recommended hold-down metadata (it does not enforce timers itself; enforcement stays with the controller/guardrails layer).\n\nDefault v2 order (per ADR-042): reachability > 5xx burn > tail latency burn > capacity exhaustion.\n\n### 3) Policy predicate API changes\n- Added `evaluate_with_trace()` for consumers that need audit/UX (controller dry-run, incident-bot summaries).\n- Kept `evaluate()` intact, implemented as a thin wrapper that discards trace.\n\n### 4) Unit tests + fixtures\n- Added golden tests for deterministic traces given identical recorded signal snapshots.\n- Added edge case tests:\n  - missing signal streams (should not crash; should degrade to \u201cinsufficient evidence\u201d)\n  - stale reachability vs fresh burn-rate (ensure stale signal cannot block)\n  - conflicting signals across regions (stable winner selection)\n  - corroboration requirement satisfied/unsatisfied\n  - tie-breaking stability across map iteration order\n\n## Files / areas touched (high level)\n- `controlplane/policy-engine/`\n  - `signal_hierarchy_evaluator.{go,ts}` (new)\n  - `policy_eval.{go,ts}` (wires in evaluator)\n  - `decision_trace.proto` + generated types\n- `config/schema/`\n  - `routing_policy.schema.json` (adds `signal_hierarchy` v2)\n  - `routing_policy.examples.yaml` (new examples)\n- `controlplane/policy-engine/testdata/`\n  - recorded signal snapshots (JSON)\n  - golden traces\n\n## Backwards compatibility / rollout\n- Default behavior is unchanged unless `signal_hierarchy.version: v2` is set for a route/tier.\n- The evaluator emits trace fields that are safe for internal logs (no customer payloads).\n- This PR does not change controller behavior directly; it only provides deterministic evaluation + schema.\n\nRecommended rollout plan (tracked in ENG-2412):\n1) Enable v2 in staging for a limited set of routes and compare decisions vs legacy mode (diff tool in follow-up).\n2) Turn on dry-run in prod for a limited tenant allowlist; emit audit events only.\n3) Once confirmed, allow v2 default for multi-region routes.\n\n## Testing\n- Unit tests: added/updated across evaluator + schema validation.\n- Config validation tests: ensure legacy configs continue to parse, and invalid v2 configs fail with clear errors.\n- CI: `policy-engine-unit`, `schema-validate`, `lint`, `integration-smoke` all green.\n\n## Follow-ups (not in this PR)\n- Add a CLI command in the failover controller tool to pretty-print `DecisionTrace` (see ENG-2415).\n- Add dashboard annotations derived from `DecisionTrace.reason` enums (observability pack PR).\n- Add simulation endpoint to replay recorded signals and verify determinism end-to-end (tracked separately).\n\n## Links\n- Linear: ENG-2412\n- ADR-042: Failover trigger signal hierarchy (authoritative priority + corroboration)\n- Related: PR #19810 (Region health aggregator service)\n\n---\n\n## Review conversation highlights (abridged)\nMiles Thornton: The priority rules look right, but we need to be explicit that reachability is authoritative only when freshness is valid. Otherwise it can freeze failover if the probe pipeline is down.\nJordan Lee: Agreed. Updated evaluator to treat stale/missing as \u201cunknown\u201d and added tests for stale reachability not blocking burn-rate.\n\nRavi Menon: Tie-breaking across regions should be stable and documented. Also please ensure we don\u2019t accidentally rely on map iteration order.\nJordan Lee: Added deterministic sort key (priority_rank, signal_type, region, source) and a regression test that randomizes insertion order.\n\nBenji Okafor: Can we keep legacy mode default and gate v2 per route? Also want a field in trace that indicates config version used.\nJordan Lee: Yes; v2 is opt-in and trace includes `config_version` + `policy_revision`.\n\nAllison Grant: Please keep trace labels bounded; we\u2019ll likely export a subset to metrics later.\nJordan Lee: Trace stores structured enums and bounded string fields (region, signal class). No raw error messages or free-form reasons.\n\nMina Haddad: Schema change needs examples in repo; on-call will copy/paste these.\nJordan Lee: Added `routing_policy.examples.yaml` including minimal v2 migration example.\n\nApprovals: Miles Thornton, Ravi Menon, Benji Okafor, Allison Grant.\n\n## Merge\n- Squash merged to `main` on 2026-01-10.\n- Squash commit message: \"policy-engine: deterministic signal hierarchy evaluation (v2 schema)\"",
+  "title_field_name": "title",
+  "content_field_names": [
+    "body",
+    "release_notes"
+  ],
+  "dataset_doc_uuid": "dsid_5b3278541a824fc7a21d24dc2d7bd5ba"
+}

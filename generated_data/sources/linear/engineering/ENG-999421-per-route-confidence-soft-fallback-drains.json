@@ -1,0 +1,78 @@
+{
+  "key": "ENG-999421",
+  "team": "engineering",
+  "title": "Per-route confidence scores and soft-fallback drains to stabilize autoscaler under intermittent GPU pressure",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-02-10",
+  "updated_at": "2025-03-03",
+  "creator": "Aisha Patel",
+  "assignee": "Miguel Alvarez",
+  "project": "SLO-Continuity-2025",
+  "cycle": "2025-W07",
+  "estimate": "3",
+  "due_date": "2025-03-15",
+  "labels": [
+    "slo",
+    "autoscaling",
+    "multi-region",
+    "health-checks",
+    "load-shedding"
+  ],
+  "dependencies": [
+    "ENG-721456",
+    "ENG-246802"
+  ],
+  "customer_impact": "medium",
+  "release": "runtime-1.20",
+  "security_review_required": "true",
+  "description": "Summary:\nThis ticket implements a per-route 'confidence score' emitted by the probe evaluation layer and a coordinated soft-fallback drain mechanism that shifts a small percentage of traffic away from constrained GPUs or regions without abrupt autoscaler churn. The goal is to reduce cascading scale-ups/scale-downs and protect tail SLOs during short GPU pressure spikes (e.g., tenant bursts, warmup storms, degraded kernels) while preserving overall throughput and cost predictability.\n\nMotivation and problem statement:\n- We see recurring incidents where brief GPU pressure (20\u201390s) from bursty request prefixes causes readiness flips, immediate autoscaler reactions, and then rapid scale-downs \u2014 producing instability and SLO blips.\n- Current readiness/liveness thresholds are binary and identical across routes; the autoscaler treats all passes equally, which amplifies noisy signals from low-volume, high-cost routes.\n- Operators want a way to: (1) attenuate noisy flips, (2) route transient traffic to fallback paths (cheaper model variants or other regions) gradually, and (3) avoid unnecessary reserved capacity churn.\n\nDesign overview:\n1) Per-route confidence score: each readiness probe will compute a confidence score in [0..100] per route/endpoint every probe window. The score is a lightweight aggregation of: recent success rate, 99th percentile latency minus target, error budget burn rate for that route, and model-variant compatibility. Scores are exposed as probe metrics and as a header in routing decisions (X-Route-Confidence).\n\n2) Confidence envelope and hysteresis: instead of immediately marking readiness false, we maintain a 3-state envelope: healthy (score>=70), guarded (40<=score<70), and degraded (score<40). Transition windows use exponential backoff hysteresis (30s base, doubling up to 8m) to avoid thrashing. The autoscaler treats guarded as a reduced-weight signal (50% influence) for scale-up decisions and as ineligible for immediate scale-down triggers until the envelope stabilizes.\n\n3) Soft-fallback drains: when a route enters guarded or degraded, the router layer initiates a gradual drain policy: 5% of traffic diverted at t=0, +5% every 15s up to 30% total. Diversion targets prefer: (a) compatible cheaper quantized model variant in the same region, (b) warm capacity in a lower-cost region (respecting geo constraints), (c) autoscale-safe queue with lower priority. This preserves tail latency for high-priority queries while shedding non-critical work.\n\n4) Token-weighted shedding: for routes with mixed priorities, shedding decisions are token-aware: large-token requests are more likely to be diverted when under pressure. This reduces GPU work density and helps keep median latency stable without moving majority of short requests.\n\n5) Autoscaler decoupling and buffered readiness: scaling policy change \u2014 scale decisions will use a 60s rolling aggregate of weighted readiness (confidence-weighted). Additionally, when a node reports degraded, we mark it for a 'soft-drain' state for at least 2m before being considered for scale-down to avoid bounce.\n\nTrade-offs considered:\n- Risk: Diverting traffic to other regions may violate data residency; mitigated by per-route geo constraints and allowlist.\n- Complexity: Adds instrumentation and routing logic; we limit surface area by keeping the confidence computation in the probe pipeline and exposing a small header for routing decisions.\n- Cost: Slightly higher cross-region egress during drains; we cap drains to 30% and add cost alerts.\n\nAcceptance criteria:\n- Confidence score metric emitted per route with <1s latency and <5% overhead on probe pipeline.\n- Guarded state reduces scale-up triggers from noisy short spikes by >= 60% in synthetic stress tests.\n- Soft-fallback drains maintain 95th percentile latency within 1.5x of baseline for high-priority routes during simulated GPU pressure.\n- No unintended data-residency violations; routes marked geo-restricted must never be diverted out of allowed regions.\n\nTesting plan:\n- Unit tests for score computation and state transitions (edge thresholds).\n- Integration canary in staging where 10% of traffic for low-risk routes exercises full drain flow.\n- Chaos run: synthetic warmup spikes (10s, 30s, 90s) across multiple regions; assert autoscaler stability and SLO breathing room metrics.\n- Load tests with mixed token-size distributions to validate token-weighted shedding behavior.\n\nRollout plan:\n- Phase 1 (feature flag off): telemetry only. Export metrics and dashboards.\n- Phase 2 (staged on for internal services): enable confidence header and guarded treatment for non-customer-facing routes. Monitor for 2 weeks.\n- Phase 3 (opt-in customers): allow customers to opt into soft-fallback drains via route config in Console.\n- Phase 4 (default roll): enable for all non-geo-restricted routes behind a controlled ramp and kill-switch.\n\nMonitoring & Metrics:\n- New metrics: route_confidence_score{route}, route_surface_state{healthy|guarded|degraded}, drain_percentage{route}, diverted_egress_bytes, token_shedding_rate.\n- Alerts: sustained average confidence<45 across top-50 routes for 5m, drain diversion >25% for >10m without corresponding CPU/GPU pressure, unexpected cross-region diversion for geo-restricted routes.\n\nRelated links and artifacts:\n- Design doc (confluence): https://redwood.atlassian.net/wiki/spaces/INF/pages/Per-Route+Confidence+and+Soft-Fallbacks\n- Prototype PR (runtime): https://github.com/redwood-inference/runtime/pull/1428\n- Router change request: https://github.com/redwood-inference/router/pull/331\n- Dashboard prototype: https://grafana.redwood.internal/d/auto/probe-confidence\n\nSecurity and compliance notes:\n- All diverted traffic will honor encryption-in-flight and KMS rules; no change to at-rest policies.\n- Geo-restricted routes are enforced by router allowlists; policy tests included in integration suite.\n\nImplementation breakdown (high-level):\n- probe/engine: compute confidence score + emit metric (owner: probe team) \u2014 2w\n- router: read X-Route-Confidence header and implement staged diversion + geo constraints (owner: router team) \u2014 2w\n- autoscaler: adjust weight of guarded state and add buffered readiness window (owner: autoscale team) \u2014 1w\n- console: per-route opt-in toggle and drain status (owner: console UX) \u2014 1w\n- e2e: test harness + chaos scenarios (owner: reliability) \u2014 1w\n\nNotes on metrics collection cost: we will sample 10% of low-volume routes to reduce cardinality and keep high-volume routes fully instrumented.\n",
+  "acceptance_criteria": [
+    "Per-route confidence score emitted and visible in Grafana",
+    "Guarded state reduces noisy scale-ups by >=60% in synthetic tests",
+    "Soft-fallback drains maintain 95p latency within 1.5x for high-priority routes",
+    "Geo-restricted routes never diverted outside allowed regions"
+  ],
+  "technical_notes": [
+    "Score computation uses EWMA of success rate and tail-latency delta to target",
+    "Hysteresis windows use exponential backoff with deterministic jitter to avoid correlated flips",
+    "Token-weighted shedding uses request token estimate field added by frontend"
+  ],
+  "rollout_plan": [
+    "Phase 1: telemetry only (2 weeks)",
+    "Phase 2: internal staging for non-customer routes (2 weeks)",
+    "Phase 3: opt-in customers via Console (ramp 10%, 30%, 100%)",
+    "Phase 4: full default enable with kill-switch and cost cap"
+  ],
+  "metrics": [
+    "route_confidence_score{route}",
+    "route_surface_state{healthy|guarded|degraded}",
+    "drain_percentage{route}",
+    "diverted_egress_bytes",
+    "token_shedding_rate"
+  ],
+  "related_links": [
+    "https://redwood.atlassian.net/wiki/spaces/INF/pages/Per-Route+Confidence+and+Soft-Fallbacks",
+    "https://github.com/redwood-inference/runtime/pull/1428",
+    "https://github.com/redwood-inference/router/pull/331",
+    "https://grafana.redwood.internal/d/auto/probe-confidence"
+  ],
+  "comments": [
+    "2025-02-11 - Aisha Patel: Initial triage and data collection. Added dataset of 30 incidents where short spikes caused autoscaler churn.",
+    "2025-02-18 - Miguel Alvarez: Prototype of confidence computation merged to runtime prototype branch. Observed <2% CPU overhead in staging.",
+    "2025-02-24 - Reliability: Ran warmup chaos experiment. Guarded envelope reduced immediate scale-ups by ~65% for the test routes. Need to tighten geo-restriction checks.",
+    "2025-03-01 - Security: Confirmed geo constraints enforcement approach; will include allowlist tests in CI.",
+    "2025-03-03 - Miguel Alvarez: Preparing PRs for router and autoscaler. Scheduling canary for 2025-03-10."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "acceptance_criteria",
+    "technical_notes",
+    "rollout_plan",
+    "metrics",
+    "related_links",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_661407e5371646e3a6c72bbeafaa2a20"
+}

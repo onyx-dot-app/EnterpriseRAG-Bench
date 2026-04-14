@@ -1,0 +1,53 @@
+{
+  "key": "ENG-16234",
+  "team": "engineering",
+  "title": "Dynamic batch-shedding and KV-priority allocator to stabilize micro-batching under sustained QPS",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-02",
+  "updated_at": "2026-03-12",
+  "creator": "Aisha Banerjee",
+  "assignee": "Luca Moretti",
+  "project": "runtime-batching-and-kv",
+  "cycle": "2026-W10",
+  "estimate": "8",
+  "due_date": "2026-03-28",
+  "labels": [
+    "kv-cache",
+    "batching",
+    "gpu-memory",
+    "high-qps",
+    "reliability",
+    "canary"
+  ],
+  "dependencies": [
+    "ENG-14902",
+    "ENG-13021"
+  ],
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Problem statement:\\n\\nUnder sustained high QPS spikes in production (customer workloads with short inference lifetime but bursty traffic), we observe the following combined failure modes:\\n- Micro-batching thresholds inflate to fill GPU throughput, causing longer queue latency and increased KV cache churn.\\n- KV cache eviction thrashing on the GPU leads to repeated KV loads, worsening memory pressure and occasionally triggering OOM or degraded kernel allocations.\\n- Static admission thresholds and simple backpressure heuristics do not adapt quickly enough to sudden QPS shifts, leading to unfair latency amplification across requests (longer-context requests push out short low-cost requests).\\n\\nGoal:\\nDesign and implement an adaptive \\\"dynamic batch-shedding + KV-priority allocator\\\" that:\\n1) Keeps p99/p995 latency within SLO during sustained QPS spikes;\\n2) Reduces GPU OOM events and kernel memory fragmentation;\\n3) Minimizes cost uplift by preferring cheaper degradation strategies (shedding, quantization fallback) over overprovisioning;\\n4) Provides an auditable canary rollout with observability for debugging decisions.\\n\\nProposed solution (high level):\\n- Dynamic batch-shedding controller: compute per-worker microbatch target using a short-window EWMA of queue latency, observed KV hit-rate, and GPU memory headroom. When memory headroom < X% or predicted queue delay > SLO, the controller selectively \\\"sheds\\\" (defers) low-priority requests from the fast path into a lower-priority lane or routes them to a quantized/approximate model variant. Shedding policy prioritizes: 1) non-interactive/low-urgency requests, 2) very long-context requests that inflate cache pressure, 3) requests from customers configured for best-effort.\\n- KV-priority allocator: maintain a small hot-set metadata structure per-GPU that assigns priority scores to KV entries based on recency, observed reuse rate, and request-criticality. Eviction then prefers cold & low-priority entries. When headroom permits, the allocator will prefetch and pin hot entries for upcoming predicted sequences.\\n- Asynchronous KV compaction and delayed freeing: instead of synchronous free on eviction (which can cause fragmentation), schedule compaction passes during idle micro-windows and use a fast deferred reclaim queue to batch frees.\\n- Fast-fallback quantization path: integrate a lightweight policy to reroute shed requests to a lower-precision kernel variant (mixed-int8 path) if available for the model, reducing memory pressure while preserving correctness for many workloads.\\n\\nImplementation plan / milestones (epics):\\n1) Simulation harness (Week 1-2): extend the existing microbatching simulator to model dynamic shedding + KV-priority eviction. Validate across synthetic workloads and our replay traces from customer A (see artifacts).\\n2) Prototype controller + allocator (Week 2-4): implement controller in the serving runtime as feature-flagged logic; KV-priority metadata stored in a small device-resident ring buffer. Provide metrics endpoints.\\n3) Internal canary (Week 4): rollout to internal low-traffic cluster with aggressive telemetry (queue latency histogram by priority lane, KV hit/miss by priority, memory headroom events).\\n4) Customer canary (Week 5-6): staged rollout to 3 customers with different workload profiles. Gate by safety checks.\\n5) Full rollout + tuning (Week 7-8): integrate learnings, increase coverage, add operator-configurable knobs in Console.\\n\\nTrade-offs considered and rationale:\\n- Aggressive global eviction: simple to implement but causes cold-cache misses and repeated reloads; measured to increase token cost by ~9% in replay tests. Rejected as primary strategy.\\n- Fixed headroom throttle: predictable but brittle; cannot differentiate between request priorities or context-length effects. Kept as a fallback safety guard.\\n- Per-request token reservations (reserve memory per incoming request): improves fairness but introduces allocation overhead and fragmentation. We'll implement a lightweight reservation token (small fixed-size ticket) instead of large reservations to reduce fragmentation risk.\\n\\nMetrics & acceptance criteria (final):\\n- p99 latency: <= SLO + 10% under 3x baseline QPS sustained for 10 minutes.\\n- OOM events: reduced to zero for reproducible spike tests used by replay harness.\\n- KV hit-rate: no more than 5% degradation vs baseline for steady-state workloads; >10% improvement in hot-set retention for bursty traces.\\n- Cost: <= 6% increase in token compute cost for worst-case canary customers (ideally negative cost delta via fewer retries/less overprovisioning).\\n\\nObservability & debugging artifacts:\\n- Canary dashboard: /dashboards/runtime/dynamic-shed-v1 (tracks priority-lane latencies, KV-hit-by-priority, headroom timeline).\\n- Perf simulation outputs and traces: gs://redwood-perf/replays/2026-02/dynamic_shed_run_03.tar.gz\\n- Design doc: https://redwood.quip.com/UXYb/dynamic-batch-shedding-kv-priority (initial spec + algorithms)\\n- Prototype PR: https://github.com/redwood-inference/runtime/pull/4821\\n\\nProgress updates (timeline):\\n- 2026-03-02 (Aisha): ticket created after spike replayed from customer A. Reproduced OOMs on replay harness with default admission logic.\\n- 2026-03-04 (Luca): completed simulation harness extension; initial synthetic runs show dynamic-shedding reduces p99 by ~14% under 2.5x QPS synthetic trace. Added basic KV-priority scoring prototype.\\n- 2026-03-08 (Luca): wrote allocator prototype and small device-resident metadata ring. Early internal tests show KV hot-set retention improved ~12% for bursty traces. Observed minor regressive tail latency for priority lane when shedding ratio > 30% \u2014 added hedging policy.\\n- 2026-03-10 (SRE: Maya Chen): validated deferred free reduces fragmentation spikes during compaction windows. SRE requests safety knobs to force fallback to static throttle for customers with strict SLAs.\\n- 2026-03-12 (Aisha): finalized canary run checklist and created dashboard. Preparing PR for runtime integration (see PR link).\\n\\nOpen questions / next decisions required:\\n- Default shedding thresholds and tiering: what should be Redwood default vs. customer-configurable? (Proposal: conservative defaults, expose knobs in Console).\\n- Billing implications for shed requests: should shed->slow-path count towards customer token usage differently? Need legal/GO-TO-MARKET input.\\n- Priority source: combine customer-config labels + request-size heuristics + inferred urgency. Need to surface in API for customers who want control.\\n\\nAcceptance tests to add to CI:\\n- Deterministic replay of three canonical bursty traces with and without dynamic-shed; assert no OOM, p99 within target.\\n- Stress test to assert deferred free does not cause long GC pauses on device.\\n\\nNext immediate tasks (owners):\\n- Luca: land prototype PR and add metrics endpoints (ETA 2026-03-15).\\n- Aisha: coordinate canary customers and legal on billing semantics (ETA 2026-03-18).\\n- Maya (SRE): add operator kill switch and static throttle fallback (ETA 2026-03-16).\\n\\nLinks to artifacts (quick):\\n- Design doc: https://redwood.quip.com/UXYb/dynamic-batch-shedding-kv-priority\\n- Prototype PR: https://github.com/redwood-inference/runtime/pull/4821\\n- Replay traces: gs://redwood-perf/replays/2026-02/dynamic_shed_run_03.tar.gz\\n- Canary dashboard: https://grafana.redwood.company/d/dynamic-shed-v1\\n\\nNotes:\\nKeep this ticket focused on the initial algorithm and runtime integration. Follow-ups (separate tickets) will capture Console UX for knobs, billing semantics, and broader policy templates for Dedicated/Private installs.",
+  "comments": [
+    "2026-03-04 - Luca: simulation harness changes pushed to feature branch, see branch feature/dynamic-shed-sim",
+    "2026-03-08 - Luca: allocator prototype shows promising hot-set retention improvements; filed micro-optimizations for ring buffer access in PR review",
+    "2026-03-10 - Maya: SRE verified deferred free behavior under a 90-minute stress run; recommended adding operator kill switch",
+    "2026-03-12 - Aisha: canary checklist created and owners tagged; waiting on PR merge to flip feature flag in canary cluster"
+  ],
+  "sub_issues": [
+    "ENG-16235",
+    "ENG-16236"
+  ],
+  "acceptance_criteria": [
+    "p99 latency <= SLO + 10% for sustained 3x QPS (10m window)",
+    "0 reproducible OOMs on replay traces used in simulation",
+    "KV hot-set retention improved for bursty traces (>10% compared to baseline)",
+    "Canary run with 3 customers completes without critical regressions"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments",
+    "acceptance_criteria"
+  ],
+  "dataset_doc_uuid": "dsid_e970a3b776754d819a4b6a18e65876a4"
+}

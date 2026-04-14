@@ -1,0 +1,85 @@
+{
+  "key": "SUP-330221",
+  "project": "customer-support",
+  "issue_type": "Bug",
+  "summary": "mTLS client cert CN parsing treats comma-separated SANs as delimiter, splitting service principal and causing admin API 401 in private deployment",
+  "status": "In Progress",
+  "priority": "P1",
+  "severity": "Sev1",
+  "created_at": "2026-03-10",
+  "updated_at": "2026-03-12",
+  "reporter": "Aisha Patel",
+  "assignee": "Liam Chen",
+  "customer_company": "FinReg Analytics",
+  "customer_tier": "private",
+  "environment": "prod-us-east",
+  "components": [
+    "auth",
+    "private-deploy",
+    "ingress",
+    "rbac"
+  ],
+  "labels": [
+    "mtls",
+    "certificate-parsing",
+    "rbac",
+    "high-impact",
+    "security"
+  ],
+  "affected_regions": [
+    "us-east-1"
+  ],
+  "summary_short": "mTLS CN parsing splits service principal at comma, admin API 401",
+  "description": "Issue summary:\nCustomer reports that after onboarding their private deployment behind an external ingress (Citrix ADC), their service account-based admin workflows intermittently receive 401s when calling Redwood admin APIs. The customer's service accounts authenticate using mutual TLS: they present a client certificate whose Subject CN contains the service principal, and SubjectAltName includes additional qualifier values concatenated with commas.\n\nImpact:\n- Tenant admin jobs (key rotation, role sync) failing intermittently with 401 on admin endpoints for several hosts in the customer's fleet.\n- Customer cannot complete onboarding and policy sync; escalated by their security team.\n\nEnvironment:\n- Private deployment (customer-managed VPC)\n- Ingress: Citrix ADC 13.1, configured to terminate TLS and forward mTLS client cert info in X-Client-Cert header to redwood-idp-proxy\n- Redwood version: private control plane 2026.01.3, auth-proxy 1.8.7\n- Affected tenant: finreg-prod (enterprise account)\n\nSteps to reproduce (customer):\n1) Deploy service account client cert with CN set to \"svc-admin-tenantA,svc-extra\" and SAN present (other names).\n2) Invoke admin API endpoint /v1/admin/roles with mTLS handshake via Citrix ADC.\n3) Observe 401 response and corresponding auth logs showing subject mismatch.\n\nObserved logs (redacted):\n- auth-proxy: \"subject-parsed=\\\"svc-admin-tenantA\\\"\"\n- idm: \"mapped-principal=svc-admin-tenantA\"\n- rbac: \"no-matching-service-account for principal=svc-admin-tenantA, rejecting\"\n- gateway: \"200 TLS handshake, forwarded-cert-length=2048\"\n\nHypothesis: The CN value includes a comma-separated second token (used by the customer's certificate tooling). Redwood's subject parsing code historically accepted the full CN verbatim, but recent hardening introduced a CSV-splitting step (to normalize lists in older SSO flows). That splitter is treating the CN as a list and keeping only the first token, which mismatches the customer's service-account lookup (their service principal requires the full literal CN with the comma). The result is an unmatched principal and a 401.\n\nAdditional notes: The customer's previous on-prem proxy passed the raw PEM and Redwood's mapping accepted the comma-containing CN. The Citrix ADC is not modifying the PEM content, but we suspect the header transformation path in the idp-proxy or an upstream shared library change introduced CSV-trimming when constructing the principal string.",
+  "steps_to_reproduce": [
+    "Create client cert with CN containing comma-separated tokens (e.g., 'svc-admin-tenantA,svc-extra')",
+    "Configure Citrix ADC to present client cert to Redwood via X-Client-Cert header",
+    "Call admin API /v1/admin/roles using mTLS client cert",
+    "Observe 401 and check auth-proxy and rbac logs"
+  ],
+  "logs_excerpt": [
+    "auth-proxy: subject-parsed=\\\"svc-admin-tenantA\\\"",
+    "rbac: no-matching-service-account for principal=svc-admin-tenantA",
+    "gateway: forwarded-cert-length=2048"
+  ],
+  "comments": [
+    "2026-03-10 09:18 - Aisha Patel (Support): Customer opened ticket after onboarding runbooks failed. Provided initial logs and example PEM with CN 'svc-admin-tenantA,svc-extra'. Requested urgent P1 investigation; customer is blocking go-live.",
+    "2026-03-10 11:02 - Liam Chen (Oncall Auth): Reproduced locally against test ingress. Observed parsing behavior where idp-proxy.stripListItems() appears to split on commas when normalizing principal headers. Suspect regression introduced in auth-proxy 1.8.5 -> 1.8.7.",
+    "2026-03-10 13:40 - Maya Rodriguez (SRE): Confirmed Citrix ADC is forwarding raw PEM via header. No truncation. Also confirmed legacy behavior in 1.7.x preserved commas. Adding label 'regression'.",
+    "2026-03-11 08:05 - Support (Aisha): Shared workaround request from customer: they can reissue certs without commas, but that will disrupt automation. Asked for temporary bypass option.",
+    "2026-03-11 09:22 - Liam Chen (Oncall Auth): Added temporary feature-flag patch to auth-proxy to disable list-splitting on Subject fields. Patch applied to staging for validation (PR linked).",
+    "2026-03-12 10:15 - Customer (FinReg Ops): Confirmed that staging patch accepts COMMA-containing CN and admin calls succeed. Awaiting production rollout and guidance on long-term fix."
+  ],
+  "investigation_notes": "- Reproduced with a minimal mTLS handshake through Citrix ADC; header intact.\n- Grep of auth-proxy changelog shows utility function normalizeHeaderValues introduced to split CSV-style claim headers. Unit tests focused on SSO token claim normalization.\n- Auth-proxy callstack: ingress -> header-extract -> normalizeHeaderValues -> buildPrincipalString. The function splits on ',' and trims whitespace.\n- Customer expects exact CN match; their automated cert generation includes commas as part of principal semantics (internal convention).\n- No evidence of Citrix or PEM corruption.\n- Risk: Changing behavior globally may affect other customers who rely on CSV-splitting for legacy SSO claims.\n- Related to INT-7780 (internal discussion about claim normalization) and SUP-105432 (proxy attribute truncation) for context.",
+  "resolution_notes": "Workaround implemented: feature-flag 'preserve-cn-commas' added to auth-proxy. We deployed to customer's private control plane with the flag enabled and validated admin API requests succeed.\nRoot cause: normalizeHeaderValues incorrectly applied to certificate Subject CN when header name matched a configured 'principal-claim' pattern. The normalization code assumed lists were comma-separated and applied to all headers indiscriminately.\nLong-term fix: Update normalizeHeaderValues to only split for configured list-claims (e.g., groups, roles) and add explicit whitelist for subject/cn headers. Patch PR created: https://github.com/redwood-inference/auth-proxy/pull/497 - includes unit tests and an opt-out config.\nRollout plan: Backport patch to 1.8.x branch and schedule hotfix release 1.8.8 for private customers on 1.8.x. Notify Dedicated/Private teams and add migration note in release notes.\nFollow-ups: 1) Add e2e test validating CN with commas preserved. 2) Update private deployment docs outlining certificate principal expectations. 3) Ask customer whether their cert generator can use an alternative delimiter for future-proofing.",
+  "linked_issues": [
+    "INT-7780",
+    "SUP-105432"
+  ],
+  "related_github_prs": [
+    "https://github.com/redwood-inference/auth-proxy/pull/497",
+    "https://github.com/redwood-inference/auth-proxy/pull/501"
+  ],
+  "related_confluence_pages": [
+    "https://redwood.atlassian.net/wiki/spaces/SEC/pages/123456/mTLS+header+handling+guidelines",
+    "https://redwood.atlassian.net/wiki/spaces/OPS/pages/789101/Private+deployment+ingress+cert+requirements"
+  ],
+  "resolution": "Workaround deployed; patch PR created; scheduled hotfix release",
+  "sla_due_at": "2026-03-12",
+  "first_response_due_at": "2026-03-10",
+  "customer_communication": [
+    "2026-03-10: Acknowledged and escalated (Support)",
+    "2026-03-11: Shared temporary workaround option (Support)",
+    "2026-03-12: Confirmed staging validation and scheduled production hotfix (Support)"
+  ],
+  "title_field_name": "summary_short",
+  "content_field_names": [
+    "description",
+    "steps_to_reproduce",
+    "logs_excerpt",
+    "investigation_notes",
+    "resolution_notes",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_dfde0babecdc40bfbf3c3e20aaf6d8f4"
+}

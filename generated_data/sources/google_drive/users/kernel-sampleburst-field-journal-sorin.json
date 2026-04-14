@@ -1,0 +1,34 @@
+{
+  "title": "Kernel sampleburst field journal \u2014 microburst/coldstart throughput notes",
+  "owner": "Sorin Patel",
+  "drive_area": "users",
+  "path": "users/kernel-sampleburst-field-journal-sorin.json",
+  "doc_type": "doc",
+  "created_at": "2025-09-15",
+  "last_modified": "2025-10-04",
+  "collaborators": [
+    "Ivy Chen",
+    "Mateo Ruiz"
+  ],
+  "team": "eng-serving-runtime",
+  "status": "draft",
+  "tags": [
+    "microburst",
+    "coldstart",
+    "throughput",
+    "p99",
+    "kernel-tuning",
+    "scratchpad"
+  ],
+  "linked_artifacts": [
+    "CONFLUENCE-1234 (warmup-strategies)",
+    "JIRA-INF-9421",
+    "https://github.com/redwood-inference/serving-runtime/pull/678"
+  ],
+  "content": "Context and goal:\n- Quick scratchpad for a weird microburst pattern observed in internal stress tests (region-eu-west, g4dn-like nodes). Trying to isolate if p99 spikes are kernel wakeups or scheduling/backpressure.\n- Goal: small reproducible runs, a few perf knobs toggled, extract p50/p95/p99 and a very rough throughput curve. Notes are rough; some TODOs at the bottom.\n\nSetup (how I ran it)\n- Model: llama-7b-ish quantized variant (q4_0) loaded with single-instance KV cache. Sequence len 512, prompt length ~32 tokens.\n- Serving binary: ./serve --model /mnt/models/llama-q4 --batcher continuous --kernel-opts=optA\n- Node: 1x GPU, 48GB RAM, pin_affinity=on, cpu governor=performance\n- Arrival pattern: custom client that emits 2000 requests in 30s windows: \"microburst\" = 500 reqs in 3s followed by 27s idle (repeat).\n- Client tool: bench-client v0.5 (parallel=64, timeout=30s)\n- Key config toggles tried: kernel-opts optA/optB, prefill-threshold 16/32, enable-kv-shard=true/false, ulimit -n 65536.\n\nRaw run notes (timestamps local)\n- 2025-09-15 09:10: baseline run (optA, kv-shard=false, prefill-16)\n  - Observed: steady p50 ~ 18ms, p95 ~ 120ms, p99 ~ 420ms during burst. Throughput cap ~ 650 qps during the 3s window, then trailing requests pile to next window.\n  - Notable telemetry: CPU user spikes sync with GPU kernel launches; small GC-like pauses in python supervisor (~50ms) right before p99 blips.\n\n- 2025-09-15 09:28: toggle kernel -> optB (prefill-16, kv-shard=false)\n  - p50 ~ 20ms, p95 ~ 90ms, p99 ~ 220ms. Throughput ~720 qps.\n  - Interpretation: optB reduces long tail, maybe better batch packing or fewer small kernels.\n\n- 2025-09-15 09:43: enable kv-shard=true (optB, prefill-16)\n  - p50 ~ 19ms, p95 ~ 85ms, p99 ~ 210ms, throughput unchanged. KV shard seems neutral on steady metrics for this arrival pattern.\n\n- 2025-09-16 14:05: increase prefill to 32 (optB, kv-shard=true)\n  - p50 ~ 21ms, p95 ~ 110ms, p99 ~ 280ms, throughput ~680 qps. More warmup/prefill increased headroom cost and introduced occasional p99 spikes.\n\n- Micro-observation: repeated p99 blips often coincide with small bursts of kernel loads where multiple small kernels are launched around the same time (observed in strace and kernel latency hist).\n\nCheap ascii timeline (single burst window: 3s active)\n- time (s)   0    0.5   1.0   1.5   2.0   2.5   3.0\n- requests   |||||  ||||||||||  ||||||  |||    |      ||    \n- p99 (ms)  120   180   420   280   220   190   140\n\nQuick hypothesis list (what might cause tail)\n1) Kernel wakeup / CPU scheduling spikes: small bursts cause many threads/processes to wake and contend CPU -> kernel entry/exit overhead. Corroborating evidence: high sys time and kernel latency hist spikes.\n2) Python supervisor sync points: supervisor thread does periodic housekeeping that can coincide with burst start -> adds ~50-100ms stall for a subset of requests.\n3) Small-kernel launcher inefficiencies: if optA, the runtime launches many tiny kernels; optB fuses or batches them better.\n4) Memory page faults on first-use paths of certain kernels (cold pages).\n\nMini experiments to confirm (next runs planned)\n- Run with cpu hotplug/isolcpus and pin serving process to isolated cores to check scheduling effect. If p99 drops significantly, scheduling is a primary culprit.\n- Run with supervisor process set to SCHED_FIFO (elevate priority) to see if that reduces 50\u2013100ms stalls.\n- Pre-touch pages: mlockall on model memory to avoid page faults; compare.\n- Increase client jitter to spread arrivals slightly (50ms jitter) and observe p99. If tails vanish, arrival synchronization matters.\n\nTelemetry snippets/commands I used\n- perf top during burst: top symbols were gpu driver kernel_am_launch, runtime_batcher_worker, python3.\n- sudo perf record -g -p <serve_pid> -- sleep 10; sudo perf script | flamegraph.pl > flame.svg\n- strace -f -tt -p <serve_pid> (look for futex/wake calls)\n- cat /proc/<pid>/status for VmRSS before/after burst\n\nQuick conclusions so far\n- optB looks like a strictly better kernel configuration for bursty traffic; reduces p99 by ~2x in baseline small runs.\n- KV sharding doesn't materially affect short microbursts for single-node tests.\n- Prefill aggressiveness is a tradeoff: higher prefill can smooth output but increases resource pressure and may introduce tail under extreme short bursts.\n- Scheduling/wakeup appears to be a meaningful contributor; next runs should isolate CPU scheduling.\n\nLoose TODOs / open questions\n- Try isolated-core experiment and SCHED_FIFO supervisor run (blocked on infra change ticket JIRA-INF-9421).\n- Re-run with mlockall or explicit pre-touch; check dmesg for minor page faults.\n- Run in multi-node mode (2 GPUs split traffic) to see if tail is local to single GPU kernel launches or a global scheduling artifact.\n- Add microsecond-resolution tracing wrapper around batcher enter/exit to precisely mark time slices.\n\nNotes-to-self\n- Keep run ids and small perf dumps saved under /home/sorin/tmp/microburst/<date>/ ; start naming with run-YYYYMMDD-HHMM\n- When filing a ticket, include perf flamegraph and strace snippet + exact bench-client args.\n\nReferences and quick links\n- Confluence: warmup-strategies (internal)\n- GitHub PR for optB: https://github.com/redwood-inference/serving-runtime/pull/678\n- JIRA INF-9421 (isolate-core infra change)\n\nEnd of scratchpad. This is intentionally terse \u2014 will turn into a short write-up if isolated-core tests show >30% tail reduction.\n\nSigned: Sorin\n",
+  "title_field_name": "title",
+  "content_field_names": [
+    "content"
+  ],
+  "dataset_doc_uuid": "dsid_6918a6ded588426b8941c6b5fe6468b9"
+}

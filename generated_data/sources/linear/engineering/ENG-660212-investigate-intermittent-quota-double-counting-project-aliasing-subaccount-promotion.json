@@ -1,0 +1,45 @@
+{
+  "key": "ENG-660212",
+  "team": "engineering",
+  "title": "Investigate intermittent quota double-counting when project aliasing occurs during subaccount promotion",
+  "status": "In Progress",
+  "priority": "P0",
+  "created_at": "2026-03-01",
+  "updated_at": "2026-03-13",
+  "creator": "Aisha Kapoor",
+  "assignee": "Miguel Santos",
+  "project": "Billing Integrity Q2",
+  "cycle": "2026-W10",
+  "estimate": "5",
+  "due_date": "2026-03-20",
+  "labels": [
+    "billing",
+    "metering",
+    "attribution",
+    "investigation",
+    "high-priority"
+  ],
+  "parent_issue": [
+    "ENG-318207"
+  ],
+  "dependencies": [
+    "ENG-41107"
+  ],
+  "customer_impact": "high",
+  "release": "billing-2026.03",
+  "security_review_required": "false",
+  "description": "Summary:\nWe observe intermittent double-counting of token/embedding usage when a subaccount is promoted to a first-class project and the project alias mapping update happens concurrently with in-flight requests. Affected customers see a short spike in reported usage (2x) for the affected window; bills and quotas are impacted. This looks distinct from prior key-rotation races (notably not a leaked API key), and reproduces when project alias records are updated in the same commit that migrates subaccount IDs to the new project namespace.\n\nWhy this matters:\n- Incorrect billing and quota enforcement for customers (potential overcharge or premature throttling).\n- Breaks Dedicated reserved capacity assumptions when attribution is duplicated across old and new project IDs.\n- High severity for mid-market/enterprise customers with strict quotas and billing audits.\n\nObserved behavior / signals:\n- Spike in metering rate for Project A at 12:43 UTC on 2026-02-28; two distinct project IDs (old-subaccount-123 and proj-7821) each show identical token counts.\n- Ingress logs show single request ID routed through gateway with two downstream attributions applied within ~50ms.\n- Rate limiter counters incremented on both project buckets, causing transient quota exhaustion for the new project.\n- Dashboard: /dashboards/metering/duplicate-attribution shows 0.6% of requests in the week had >1 attribution.\n- SQL snippet used to validate duplicates: SELECT request_id, array_agg(distinct project_id) as projects, sum(tokens) FROM metering.events WHERE time >= '2026-02-28T12:40:00Z' AND time <= '2026-02-28T12:50:00Z' GROUP BY request_id HAVING cardinality(array_agg(distinct project_id)) > 1;\n\nSteps to reproduce (dev environment):\n1) Create subaccount S under org O and simulate 50 concurrent streaming generation requests using the same API key bound to S.\n2) Trigger subaccount promotion job that creates project P and writes alias mapping row (aliases.project_id -> canonical project_id) while streaming requests are still active.\n3) Observe metering pipeline and rate limiter: certain requests get attributed to both S (old namespace) and P (new).\n- Repro rate ~ 1-3% when promotion overlaps with high concurrency; increases with batching enabled.\n\nInitial hypothesis:\n- Race in attribution pipeline where first-stage attribution (gateway mapping) and later-stage reconciliation (project alias canonicalization) both emit attribution events without atomic deduplication when alias updates are in-flight.\n- A downstream consumer (metering-aggregator) is subscribing to both pre-canonical and post-canonical topics during the migration window; dedupe key uses request_id+project_id (so different project_ids => duplicate tallies).\n\nFiles / links / artifacts:\n- Investigation doc: https://confluence.redwood.ai/display/BILL/ENG-660212\n- Repro harness: https://github.com/redwood-inference/repro-harness/pull/142 (branch: eng-660212-repro)\n- Chart: https://grafana.redwood.ai/d/abcd123/duplicate-attribution\n- Query runbook: https://drive.redwood.ai/drive/folders/billing-investigations\n\nMitigations attempted so far:\n- Hotfix: temporarily paused the alias promotion job for ongoing large migrations (reverted promotion job at 2026-03-02 04:12 UTC) \u2014 reduced incidence to near-zero during paused periods.\n- Added an aggregator-side filter to ignore events where project_id resolves to an alias already seen for the same request_id within 5s (heuristic) \u2014 reduced duplicate counts but not fully accepted due to edgecases and lack of upstream guarantees.\n\nRoot-cause candidate and proposed fix:\n- Root-cause: non-atomic alias creation combined with asynchronous event emission from gateway and canonicalization service. Both services emit attribution events that are independently consumed by metering and rate-limiter subsystems. Lack of an idempotent canonicalization layer or global dedupe key that normalizes project references leads to double-counting.\n- Proposed fix (three parts):\n  1) Gateway: do not emit final attribution until alias canonicalization has completed for that request OR include both project_id and canonical_project_id in the emitted event (short-term safer payload).\n  2) Metering & rate-limiter: switch dedupe key to canonical_project_id if present, falling back to project_id; add a short-lived in-memory request_id cache in aggregator to avoid counting the same request twice when canonicalization events arrive later.\n  3) Migration: implement promotive migration steps with write-ahead alias propagation, where the alias record is written and fully materialized (ensured by synchronous commit) before marking the subaccount as promoted (makes promotion idempotent).\n\nBackward compatibility and rollout plan:\n- Phase 1 (canary): deploy aggregator change to use canonical_project_id as primary dedupe key to 10% of ingestion nodes (billing-2026.03-canary). Monitor duplicates and latency impact for 48h.\n- Phase 2: change gateway emission to include canonical_project_id when available (feature flagged).\n- Phase 3: update promotion job to write-ahead alias and ensure synchronous propagation; coordinate with Console migration UI to gate large promotions behind scheduled windows.\n- Phase 4: deprecate heuristic aggregator filters.\n\nAcceptance criteria:\n- Duplicate attribution rate < 0.01% in canary after 48h under matched load.\n- No measurable increase (>1%) in ingestion latency at aggregator.\n- Regression tests added to repro harness covering concurrent promotion + streaming workloads.\n- Postmortem and customer notifications for impacted billing windows completed.\n\nNext steps (owner: Miguel):\n- 2026-03-03: finish aggregator patch and run canary on staging (PR #327).\n- 2026-03-05: run large-scale repro in staging with production-like batching/streaming (engines: gptx-8b).\n- 2026-03-10: extend rate-limiter unit tests for canonicalization-aware dedupe.\n- 2026-03-13: prepare rollout checklist and customer communication draft (billing team).\n\nNotes for postmortem and customer remediation:\n- For affected billing windows we can reconcile using deduped request_ids (where available) and issue invoice credits if overcharged. We need a safe SQL reconciliation path that groups by canonical_project_id computed by joining alias mapping snapshots at event time.\n- Add an alert to PagerDuty if duplicate_rate > 0.1% for 15m rolling window.\n",
+  "comments": [
+    "2026-03-01 - Triage: Marked P0 due to customer_impact: high. Aisha captured initial repro and assigned to Miguel.",
+    "2026-03-02 - Miguel: Paused bulk promotions as emergency mitigation; started implementing aggregator filter (heuristic). Early reduction in duplicate counts but still seeing edgecases.",
+    "2026-03-04 - Infra: Instrumented request_id propagation across gateway -> canonicalizer -> metering; found ~30% of affected requests had delayed canonicalizer acknowledgment >200ms.",
+    "2026-03-06 - Miguel: Submitted aggregator PR #327 for canonical_project_id dedupe key; opened canary plan. QA to run repro harness on 2026-03-07.",
+    "2026-03-12 - Billing ops: Drafted customer notification template for impacted invoices. Will wait for final reconciliation numbers before sending."
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_0399094a3d61455e843a18f7a9c5a9cc"
+}

@@ -1,0 +1,53 @@
+{
+  "key": "ENG-15802",
+  "team": "engineering",
+  "title": "Investigate allocator drift causing gradual GPU memory rise during continuous batching",
+  "status": "In Progress",
+  "priority": "P1",
+  "created_at": "2025-02-10",
+  "updated_at": "2025-03-04",
+  "creator": "Asha Patel",
+  "assignee": "Diego Morales",
+  "project": "runtime-memory-stability",
+  "cycle": "2025-W06",
+  "estimate": "8",
+  "due_date": "2025-03-15",
+  "labels": [
+    "cudaMallocAsync",
+    "kv-cache",
+    "continuous-batching",
+    "memory-fragmentation",
+    "investigation"
+  ],
+  "parent_issue": [
+    "ENG-11021"
+  ],
+  "dependencies": [
+    "ENG-14760"
+  ],
+  "customer_impact": "high",
+  "release": "runtime-1.20",
+  "security_review_required": "false",
+  "description": "Summary:\nWe observe a slowly increasing GPU memory footprint in production Dedicated clusters serving continuous-batched requests with active KV cache usage. The growth is not an immediate leak at process exit, instead it manifests as a gradual rise in resident GPU memory over hours of sustained traffic and does not recover to baseline after traffic drops. Hypothesis space includes: cudaMallocAsync arena growth and delayed trimming, allocator fragmentation from many small allocations for KV cache entries, delayed frees due to event/stream synchronization, and host pinned buffer retention from batched IO paths.\n\nKey observations so far:\n- Memory graphs (metrics/grafana/runtime/gpu_memory_retention) show a staircase-like upward trend correlated with sustained high batching (>40ms target latency) periods. Memory plateaus overnight but at a higher baseline.\n- nvprof/Nsight captures of a short trace show many small device allocations (~1-16KB) during KV cache evictions and batch assembly, and frequent cudaFreeAsync calls that are paired with cudaEventRecord on non-default streams.\n- Enabling CUDA_MALLOC_ASYNC=1 on local repro increases memory arena sizes more quickly than when disabled; turning it off reduces drift but increases tail latency.\n- Periodic manual calls to cudaMemPoolTrim (via a test harness) reduce resident memory temporarily but allocation churn resumes growth.\n\nRepro steps attempted:\n1) Microbenchmark that continuously issues simulated chat requests with 4 tokens average and heavy cache churn (random prefix substitutions) using same batching codepath as runtime. Reproduces upward trend within 2\u20133 hours on a 80GB A100 node.\n2) Run with environment variable MALLOC_TRACE on allocator wrappers to log allocations; logs show a large percentage of transient allocations during prefix concatenation and tokenizer staging that are ~32\u2013128 bytes after compression.\n3) Attach to running process and take cudaMemGetInfo snapshots every 5m; free memory declines steadily while total device memory stays constant.\n\nHypotheses and reasoning:\n- Hypothesis A: cudaMallocAsync arenas are resizing and not trimmed because frees are processed on different streams, delaying pool trimming. Evidence: frequent cudaFreeAsync + event pairs and known CUDA behavior where pool retention is stream-aware.\n- Hypothesis B: KV cache uses many small device allocations per cache entry; pooling granularity causes internal fragmentation (arenas holding many small free segments) and prevents returning to OS-level allocator. Evidence: profiler shows many small allocations; arena growth matches number of unique cache entries created.\n- Hypothesis C: Continuous batching reuses a small set of streams and records events to track completion; missed event synchronization or long-lived outstanding events prevents actual free until garbage collection at end of epoch. Evidence: some events remain in pending state for >30s in traces during dropped requests.\n- Hypothesis D: Host pinned memory and asynchronous memcpy staging for batching holds pages and causes CUDA to keep more device pinned allocations. Evidence: traces show pinned host allocations rising in parallel.\n\nImmediate mitigation ideas (short-term):\n- Implement conservative periodic pool trimming: call cudaMemPoolTrim during low-traffic windows (e.g., every 5\u201310 minutes) to bound arena size.\n- Add a flag to runtime to disable cudaMallocAsync for the KV cache allocator and use a fallback pooling allocator tuned for many small allocations.\n- Reduce the use of cudaFreeAsync + cross-stream event patterns in batch assembly; prefer freeing on same stream or explicitly synchronize small critical paths.\n- Limit KV cache entry GPU-side allocation size by coalescing small values into pooled segments (i.e., compact several small cache entries into a slab per shard) to reduce fragmentation.\n\nLonger-term / engineering work (next steps):\n1) Add deterministic microbenchmark harness that reproduces drift reliably within <1 hour on CI-sized instance. Instrument with per-arena stats exported to Prometheus. (owner: Diego)\n2) Add allocator telemetry: per-pool allocated_bytes, reserved_bytes, free_chunks_count, largest_free_chunk exported at 30s cadence. Integrate with runtime Console. (owner: Marcus)\n3) Prototype KV cache compaction strategy that preallocates N-byte slabs per shard and allocates entries from slab subranges; measure fragmentation reduction. (owner: Priya)\n4) Implement a configurable runtime knob to disable cudaMallocAsync for certain allocators and use a custom small-allocation pool when enabled. Expose via config and GKE nodepool rollout flag. (owner: Diego)\n5) Explore using cudaMemPoolSetAttribute to set trimming policy or integrate cuMemPoolTrim with longer-lived pools; engage NVIDIA support if behavior depends on driver/CUDA version. (owner: Asha)\n\nAcceptance criteria for fix:\n- No steady upward trend in GPU resident memory during 24h continuous-batching soak at production traffic profile (target < 5% baseline drift).\n- Memory trimming does not increase p99 latency by >5% for chat endpoints.\n- New allocator telemetry shows reduced fragmentation metrics under the same workload.\n\nLinks / artifacts:\n- Repro harness: https://github.com/redwood-inference/runtime/tree/main/tools/mem-leak-repro\n- Grafana dash: https://grafana.redwood/c/runner/runtime/gpu-memory-retention\n- PR with initial allocator logging: https://github.com/redwood-inference/runtime/pull/2345\n- Spike doc for slab compaction idea: https://confluence.redwood.com/display/RUN/kv-cache-slab-compaction-spike\n\nNotes on trade-offs:\n- Disabling cudaMallocAsync may reduce drift but increases latency and fragmentation risk moving to host pinned buffers. Need to measure p50/p99 impact across model families.\n- Aggressive trimming reduces memory but may reintroduce allocation overhead that hurts tail latency. We should parameterize trimming windows and only enable on lower-priority tenants.\n- Slab compaction increases implementation complexity and may make eviction/serialization code more brittle; however it directly addresses fragmentation for small allocations.\n\nNext actions (this ticket):\n- Diego: complete the deterministic repro harness and add per-arena prom metrics (ETA 2025-02-20).\n- Marcus: land allocator telemetry PR and dashboard panels (PR 2345 reviewer: Marcus) (ETA 2025-02-25).\n- Asha: run experiments toggling CUDA_MALLOC_ASYNC on/off across driver versions (11.8/12.2) and file results in spike doc (ETA 2025-03-01).\n- Priya: prototype slab-backed KV cache allocator in a branch for benchmarking (ETA 2025-03-10).",
+  "comments": [
+    "2025-02-10 @Asha: Initial report from Dedicated-prod on 2025-02-09. Set up local repro and captured traces. Marking as P1 due to customer impact.",
+    "2025-02-12 @Diego: Repro harness running in CI; seeing drift on A100 with batch qps 120. Captured allocator logs and pushed to PR #2345 for initial telemetry.",
+    "2025-02-17 @Marcus: Added Prometheus exporter for per-pool stats. Dashboard created under runtime/team-memory. Early graphs show reserved_bytes tracking arena growth.",
+    "2025-02-22 @Asha: Tested with CUDA 11.8 vs 12.2. 12.2 shows more aggressive arena growth with cudaMallocAsync enabled. Logging sent to NVIDIA support (case 987654).",
+    "2025-02-27 @Priya: Slab compaction prototype reduced number of device allocations by ~60% in microbenchmark and reduced fragmentation score (estimated) by ~35%. Need integration tests for eviction correctness.",
+    "2025-03-03 @Diego: Plan to land a feature flag for disabling cudaMallocAsync on kv-allocators and run canary on dedicated-smoke pool. Scheduling rollout for 2025-03-06 if canary OK."
+  ],
+  "attachments": [
+    "https://github.com/redwood-inference/runtime/pull/2345",
+    "https://confluence.redwood.com/display/RUN/kv-cache-slab-compaction-spike",
+    "https://grafana.redwood/c/runner/runtime/gpu-memory-retention",
+    "https://github.com/redwood-inference/runtime/tree/main/tools/mem-leak-repro",
+    "https://support.nvidia.com/case/987654"
+  ],
+  "title_field_name": "title",
+  "content_field_names": [
+    "description",
+    "comments"
+  ],
+  "dataset_doc_uuid": "dsid_751ba6f1e05e4a579278863b53dc45a2"
+}
