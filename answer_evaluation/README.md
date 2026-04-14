@@ -46,5 +46,5 @@ Results are written to `answer_evaluation/results-comparative.json` by default. 
 - You will need to export the necessary env variables for the LLM of choice to run the evals.
 - Run the scripts with `--help` for all options.
 - Use `--parallelism N` to run evaluations in parallel.
-- Both scripts auto-resume from existing results files. Use `--question-id qst_XXX` to re-evaluate a single question.
+- Both scripts auto-resume from existing results files. Use `--question-id qst_XXXX` to re-evaluate a single question.
 - Questions that receive corrections are flagged in the results and written to a separate `questions_updated` file.
