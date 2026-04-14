@@ -3,8 +3,8 @@
 <div align="center">
 <a href="https://github.com/onyx-dot-app/IndustryRAG-Dataset/blob/main/LICENSE"><img src="https://img.shields.io/badge/Code_License-MIT-blue" alt="license"></a>
 <a href="https://onyx.app/"><img src="https://img.shields.io/badge/Website-Onyx-green" alt="website"></a>
-<a href="#"><img alt="Dataset" src="https://img.shields.io/badge/🤗%20Dataset-orange?color=FF6F00"></a>
-<a href="#"><img alt="Leaderboard" src="https://img.shields.io/badge/🏆%20Leaderboard-yellow?color=FFD700"></a>
+<a href="https://github.com/onyx-dot-app/IndustryRAG-Dataset/releases/latest"><img alt="Dataset" src="https://img.shields.io/github/v/release/onyx-dot-app/IndustryRAG-Dataset?label=Dataset&color=FF6F00"></a>
+<a href="https://huggingface.co/spaces/onyx-dot-app/IndustryRAG-Bench-Leaderboard"><img alt="Leaderboard" src="https://img.shields.io/badge/🏆%20Leaderboard-yellow?color=FFD700"></a>
 <a href="#"><img src="https://img.shields.io/badge/arXiv-b5212f.svg?logo=arxiv" alt="arXiv"></a>
 </div>
 
