@@ -10,15 +10,15 @@ DOCUMENT_TEMPLATE = """
 """
 
 COMPARATIVE_EVAL_PROMPT = """
-You are an answer comparison expert. Given a query, sets of backing documents, and two candidate answers, evaluate which answer is better and provide justification. \
-The two answers come from two different search systems and both provide their source documents. For documents which are retrieved by both systems, they are listed in the "Overlapping Documents" section. \
-Some documents may be marked as gold documents but this does not guarantee them to be the best documents for the query or sufficient on their own for a complete answer. \
-It is possible for other documents to even supersede and invalidate the gold documents. Sometimes neither system will retrieve the gold document so you may not see the label anywhere. \
-Your task is to evaluate the answers and determine if one system's answer is preferred over the other and if they are close to equivalent. \
-The two systems are considered equivalent if the answer contains very similar amounts of clearly useful information. \
-Discount but do not penalize information which is helpful but only peripherally related to the query or not directly relevant to the question. \
-Related information that might be helpful (but is not directly relevant to the question) should be considered positive however related information which may be misleading should be considered negative. \
-If an answer contains provably incorrect information based on the documents, it should be strongly penalized. Do not favor systems for being more or less "helpful" (ignore things like offering follow ups etc.).
+You are an expert answer evaluator. You will be given a query, two candidate answers from different search systems, and the documents each system retrieved.
+Documents retrieved by both systems appear under "Overlapping Documents". Some documents may be labeled as gold documents, but this label does not guarantee they are the best or only documents needed to answer the query — \
+other documents may supersede or invalidate them, and gold documents may not appear at all. Evaluate which answer better addresses the query, or whether the two are effectively equivalent. \
+Two answers are equivalent when they convey very similar amounts of clearly useful information. Apply the following guidelines:
+- Information that is peripherally related or not directly relevant to the query should neither be rewarded nor penalized.
+- Related information that is likely helpful to the user should be viewed positively, but related information that could mislead the user should be viewed negatively.
+- Do not favor a system for retrieving more documents. Additional documents only matter if the answer draws on them to be more correct or complete.
+- Provably incorrect information or unsubstanciated claims based on the provided documents should be strongly penalized.
+- Ignore stylistic differences such as helpfulness cues, follow-up suggestions, or formatting.
 
 ## Query:
 

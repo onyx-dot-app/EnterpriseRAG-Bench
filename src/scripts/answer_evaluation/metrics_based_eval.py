@@ -22,6 +22,7 @@ Args:
 import argparse
 import json
 import os
+import random
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -149,8 +150,10 @@ def process_question_docs(
     if gold_set == answer_set:
         return (f"OK {qid}: document set matches gold", None)
 
-    # Find candidate docs that are not in the gold set
+    # Find candidate docs that are not in the gold set, capped at 20
     candidate_only = [d for d in deduped_doc_ids if d not in gold_set]
+    if len(candidate_only) > 20:
+        candidate_only = random.sample(candidate_only, 20)
 
     # Evaluate all documents (gold + candidates) with 3-run consensus
     eval_result, gold_confirmed, eval_error = evaluate_documents_with_consensus(

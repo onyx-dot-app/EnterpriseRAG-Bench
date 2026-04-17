@@ -335,8 +335,14 @@ def process_comparative_question(
     updated_q: dict | None = None
 
     if has_expected_docs:
-        union_doc_ids = set(docs_1) | set(docs_2)
-        candidate_only = sorted(d for d in union_doc_ids if d not in gold_set)
+        # Cap candidate (non-gold) docs at 10 per system
+        cands_1 = [d for d in docs_1 if d not in gold_set]
+        cands_2 = [d for d in docs_2 if d not in gold_set]
+        if len(cands_1) > 10:
+            cands_1 = random.sample(cands_1, 10)
+        if len(cands_2) > 10:
+            cands_2 = random.sample(cands_2, 10)
+        candidate_only = list(dict.fromkeys(cands_1 + cands_2))
 
         if candidate_only:
             eval_result, gold_confirmed, eval_error = evaluate_documents_with_consensus(
@@ -435,12 +441,25 @@ def process_comparative_question(
     )
     question_corrected = gold_answer_updated or docs_updated
 
-    # Compute overlapping/unique doc sets for comparison
+    # Compute overlapping/unique doc sets for comparison, capped at 15 docs
+    # per system. Overlapping docs count toward both systems' totals.
+    max_docs_per_system = 15
     set_1 = set(docs_1)
     set_2 = set(docs_2)
     overlapping = [d for d in docs_1 if d in set_2]
     only_1 = [d for d in docs_1 if d not in set_2]
     only_2 = [d for d in docs_2 if d not in set_1]
+
+    if len(overlapping) > max_docs_per_system:
+        overlapping = random.sample(overlapping, max_docs_per_system)
+        only_1 = []
+        only_2 = []
+    else:
+        remaining = max_docs_per_system - len(overlapping)
+        if len(only_1) > remaining:
+            only_1 = random.sample(only_1, remaining)
+        if len(only_2) > remaining:
+            only_2 = random.sample(only_2, remaining)
 
     effective_gold_set = set(effective_doc_ids)
 

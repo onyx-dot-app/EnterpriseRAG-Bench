@@ -2,6 +2,7 @@
 
 import json
 import os
+import random
 import re
 
 from src.llm import Message, get_llm
@@ -267,8 +268,12 @@ def evaluate_documents(
         doc_data = load_document_json_by_uuid(dsid, document_path_map)
         gold_docs_text.append(format_document_for_doc_evaluation(dsid, doc_data))
 
+    # Shuffle candidates to avoid positional bias across consensus runs
+    shuffled_candidates = list(candidate_doc_ids)
+    random.shuffle(shuffled_candidates)
+
     candidate_docs_text = []
-    for dsid in candidate_doc_ids:
+    for dsid in shuffled_candidates:
         doc_data = load_document_json_by_uuid(dsid, document_path_map)
         candidate_docs_text.append(
             format_document_for_doc_evaluation(dsid, doc_data),
