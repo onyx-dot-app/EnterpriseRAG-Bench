@@ -108,7 +108,7 @@ Results are written to `answer_evaluation/results-comparative.json`.
 ### Evaluation tips
 
 - **Parallelism**: Use `--parallelism N` to speed things up.
-- **Auto-resume**: Both scripts automatically resume from existing result files. Use `--question-id qst_XXX` to re-evaluate a single question.
+- **Resume**: Both scripts support `--resume` to skip already-evaluated questions. Use `--question-id qst_XXX` to re-evaluate a single question.
 - **Gold-answer corrections**: When your candidate documents differ from the gold set, the evaluation runs a three-judge consensus to decide whether the gold set should be updated.
 Corrected questions are written to a separate `questions_updated` file and flagged in the results. See the [Correction Utilities](methodology.md#correction-utilities) section for details.
 
