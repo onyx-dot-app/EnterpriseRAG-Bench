@@ -45,14 +45,13 @@ class OpenAILLM(LLMInterface):
         self.quiet = quiet
         self.reasoning_level = reasoning_level
 
-        # Use Braintrust tracing if configured
+        # Braintrust's wrap_openai does not support the Responses API
+        # streaming format (it assumes Chat Completions objects), causing
+        # AttributeError on stream finalization.  Use the raw client and
+        # initialise tracing separately so traced_span / log_to_span still work.
         if is_tracing_enabled():
             init_tracing()
-            from braintrust import wrap_openai
-
-            self.client = wrap_openai(OpenAI(api_key=self.api_key))
-        else:
-            self.client = OpenAI(api_key=self.api_key)
+        self.client = OpenAI(api_key=self.api_key)
 
     def _build_input(self, messages: list[Message]) -> list[dict[str, Any]]:
         """Convert messages to OpenAI Responses API input format."""

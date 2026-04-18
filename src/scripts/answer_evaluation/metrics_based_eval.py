@@ -17,11 +17,14 @@ Args:
     --parallelism             Number of parallel evaluation threads (default: 1)
     --question-id             Evaluate a single question_id only
     --skip-citation-stripping Skip LLM-based citation stripping from answers
+    --resume              Skip questions already in results file
+    --limit               Max questions to process
 """
 
 import argparse
 import json
 import os
+import random
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -44,7 +47,6 @@ from src.utils.eval_utils import (
 )
 from src.llm import Message, get_llm
 from src.prompts.answer_evaluation import ANSWER_WHOLISTIC_EVALUATION_PROMPT
-from src.utils.cli import confirm_yes_no
 from src.utils.document_index import DEFAULT_UUID_INDEX_CACHE_FILE
 from src.utils.file_io import load_json_file, write_json_file
 from src.utils.json_extraction import extract_json_from_response
@@ -149,8 +151,10 @@ def process_question_docs(
     if gold_set == answer_set:
         return (f"OK {qid}: document set matches gold", None)
 
-    # Find candidate docs that are not in the gold set
+    # Find candidate docs that are not in the gold set, capped at 20
     candidate_only = [d for d in deduped_doc_ids if d not in gold_set]
+    if len(candidate_only) > 20:
+        candidate_only = random.sample(candidate_only, 20)
 
     # Evaluate all documents (gold + candidates) with 3-run consensus
     eval_result, gold_confirmed, eval_error = evaluate_documents_with_consensus(
@@ -326,11 +330,9 @@ def score_answer(
         correct_docs = answer_doc_set & expected_set
         document_recall_pct: float | None = len(correct_docs) / len(expected_set) * 100
         non_required = answer_doc_set - expected_set
-        valid_extra_docs: int | None = len(non_required & valid_doc_id_set)
         invalid_extra_docs: int | None = len(non_required - valid_doc_id_set)
     else:
         document_recall_pct = None
-        valid_extra_docs = None
         invalid_extra_docs = None
 
     # Answer completeness (fact-level) and correctness (wholistic) in parallel
@@ -574,6 +576,14 @@ def main() -> None:
         default=False,
         help="Skip LLM-based citation stripping from answers",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip questions already in results file",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None, help="Max questions to process"
+    )
     args = parser.parse_args()
 
     # Validate input files exist
@@ -667,7 +677,7 @@ def main() -> None:
                     f"  [WARN] Could not load existing results from "
                     f"{args.results_file}, starting fresh"
                 )
-    elif os.path.exists(args.results_file):
+    elif args.resume and os.path.exists(args.results_file):
         try:
             existing_results = load_json_file(args.results_file)
             for r in existing_results.get("questions", []):
@@ -683,10 +693,10 @@ def main() -> None:
 
     answer_qids = {row["question_id"] for row in valid_rows}
     new_qids = answer_qids - completed_qids
-    overlapping_qids = answer_qids & completed_qids
     is_resuming = False
 
     if completed_qids and not args.question_id:
+        overlapping_qids = answer_qids & completed_qids
         print(
             f"\n  Found {len(completed_qids)} already-evaluated questions "
             f"in {args.results_file}"
@@ -695,27 +705,13 @@ def main() -> None:
         print(f"  {len(new_qids)} new questions to evaluate")
 
         if new_qids:
-            # Missing questions — resume automatically
             print(f"\n  Resuming evaluation for {len(new_qids)} missing questions...")
             is_resuming = True
         else:
-            # All questions already evaluated — ask to overwrite
-            try:
-                if not confirm_yes_no(
-                    "All questions already evaluated. Re-run from scratch?",
-                    default=False,
-                    retry_on_invalid=True,
-                ):
-                    print("Aborted.")
-                    sys.exit(0)
-            except EOFError:
-                print("Aborted (non-interactive).")
-                sys.exit(0)
-            # User chose to re-run: clear prior results
-            question_results.clear()
-            completed_qids.clear()
+            print("\n  All questions already evaluated, nothing to do.")
+            sys.exit(0)
     else:
-        print(f"\n  {len(answer_qids)} questions to evaluate (no prior results)")
+        print(f"\n  {len(answer_qids)} questions to evaluate")
 
     # =========================================================================
     # 3. Build and validate UUID path map
@@ -748,6 +744,10 @@ def main() -> None:
     remaining_rows = [
         row for row in valid_rows if row["question_id"] not in completed_qids
     ]
+    if args.limit is not None:
+        remaining_rows = remaining_rows[: args.limit]
+        print(f"  Processing {len(remaining_rows)} questions (--limit {args.limit})")
+
     if args.question_id:
         total_questions = len(question_results) + len(valid_rows)
     else:

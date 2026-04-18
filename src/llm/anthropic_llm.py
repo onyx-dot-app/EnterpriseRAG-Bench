@@ -45,14 +45,13 @@ class AnthropicLLM(LLMInterface):
         self.quiet = quiet
         self.reasoning_level = reasoning_level
 
-        # Use Braintrust tracing if configured
+        # Braintrust's wrap_anthropic may have similar streaming
+        # incompatibilities as wrap_openai (see openai_llm.py).  Use the raw
+        # client and initialise tracing separately so traced_span / log_to_span
+        # still work.
         if is_tracing_enabled():
             init_tracing()
-            from braintrust import wrap_anthropic
-
-            self.client = wrap_anthropic(anthropic.Anthropic(api_key=self.api_key))
-        else:
-            self.client = anthropic.Anthropic(api_key=self.api_key)
+        self.client = anthropic.Anthropic(api_key=self.api_key)
 
     def _convert_tools(self, tools: list[dict]) -> list[dict]:
         """Convert Responses API tool format to Anthropic tool format."""

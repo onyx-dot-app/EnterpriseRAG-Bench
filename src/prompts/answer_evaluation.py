@@ -4,7 +4,11 @@ Anything that is clearly a citation, regardless of format should be removed. Als
 Output the stripped string with no additional text or formatting changes.
 
 String to strip:
+```
 {answer_string}
+```
+
+CRITICAL: Output only the stripped string and nothing else. Only citations should be removed, everything else should be left unchanged.
 """.strip()
 
 

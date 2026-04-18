@@ -20,6 +20,8 @@ Args:
     --parallelism             Number of parallel evaluation threads (default: 1)
     --question-id             Evaluate a single question_id only
     --skip-citation-stripping Skip LLM-based citation stripping from answers
+    --resume              Skip questions already in results file
+    --limit               Max questions to process
 """
 
 import argparse
@@ -52,7 +54,6 @@ from src.prompts.comparative_answer_eval import (
     DOCUMENT_TEMPLATE,
     IS_GOLD_DOCUMENT_STR,
 )
-from src.utils.cli import confirm_yes_no
 from src.utils.document_index import (
     DEFAULT_UUID_INDEX_CACHE_FILE,
     load_document_content_by_uuid,
@@ -123,6 +124,11 @@ def compare_answers(
     system_2_text = format_document_section(
         only_2_doc_ids, gold_doc_ids, document_path_map
     )
+    presented_ids = set(overlapping_doc_ids) | set(only_1_doc_ids) | set(only_2_doc_ids)
+    missing_gold_ids = [d for d in gold_doc_ids if d not in presented_ids]
+    missing_gold_text = format_document_section(
+        missing_gold_ids, gold_doc_ids, document_path_map
+    )
 
     prompt = COMPARATIVE_EVAL_PROMPT.format(
         query=question,
@@ -131,6 +137,7 @@ def compare_answers(
         overlapping_documents=overlapping_text,
         retrieved_documents_1=system_1_text,
         retrieved_documents_2=system_2_text,
+        missing_gold_documents=missing_gold_text,
     )
 
     for attempt in range(_MAX_LLM_RETRIES):
@@ -335,8 +342,14 @@ def process_comparative_question(
     updated_q: dict | None = None
 
     if has_expected_docs:
-        union_doc_ids = set(docs_1) | set(docs_2)
-        candidate_only = sorted(d for d in union_doc_ids if d not in gold_set)
+        # Cap candidate (non-gold) docs at 10 per system
+        cands_1 = [d for d in docs_1 if d not in gold_set]
+        cands_2 = [d for d in docs_2 if d not in gold_set]
+        if len(cands_1) > 10:
+            cands_1 = random.sample(cands_1, 10)
+        if len(cands_2) > 10:
+            cands_2 = random.sample(cands_2, 10)
+        candidate_only = list(dict.fromkeys(cands_1 + cands_2))
 
         if candidate_only:
             eval_result, gold_confirmed, eval_error = evaluate_documents_with_consensus(
@@ -435,12 +448,25 @@ def process_comparative_question(
     )
     question_corrected = gold_answer_updated or docs_updated
 
-    # Compute overlapping/unique doc sets for comparison
+    # Compute overlapping/unique doc sets for comparison, capped at 15 docs
+    # per system. Overlapping docs count toward both systems' totals.
+    max_docs_per_system = 15
     set_1 = set(docs_1)
     set_2 = set(docs_2)
     overlapping = [d for d in docs_1 if d in set_2]
     only_1 = [d for d in docs_1 if d not in set_2]
     only_2 = [d for d in docs_2 if d not in set_1]
+
+    if len(overlapping) > max_docs_per_system:
+        overlapping = random.sample(overlapping, max_docs_per_system)
+        only_1 = []
+        only_2 = []
+    else:
+        remaining = max_docs_per_system - len(overlapping)
+        if len(only_1) > remaining:
+            only_1 = random.sample(only_1, remaining)
+        if len(only_2) > remaining:
+            only_2 = random.sample(only_2, remaining)
 
     effective_gold_set = set(effective_doc_ids)
 
@@ -519,6 +545,12 @@ def process_comparative_question(
     if swapped:
         flipped_pref = "2" if comparison_result["preferred_system"] == "1" else "1"
         comparison_result["preferred_system"] = flipped_pref
+
+    comparison_result["reason"] = (
+        "Note that the LLM sees the two systems in a random order so the "
+        "referenced System 1/2 in the provided reasoning may be out of order. "
+        "LLM provided reasoning: " + comparison_result["reason"]
+    )
 
     return updated_q, {
         "question_id": qid,
@@ -640,6 +672,8 @@ def build_comparative_question_type_stats(
 def write_comparative_results_snapshot(
     results_file: str,
     output_file: str,
+    answer_file_1: str,
+    answer_file_2: str,
     question_results: list[dict],
     skip_count: int | str,
     total_questions: int,
@@ -649,6 +683,8 @@ def write_comparative_results_snapshot(
     sorted_results = sort_question_results(question_results)
     stats = compute_comparative_stats(question_results)
     results_output = {
+        "system_1": answer_file_1,
+        "system_2": answer_file_2,
         "updated_question_file": output_file,
         "aggregate_stats": {
             "total_questions": total_questions,
@@ -726,6 +762,14 @@ def main() -> None:
         action="store_true",
         default=False,
         help="Skip LLM-based citation stripping from answers",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip questions already in results file",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None, help="Max questions to process"
     )
     args = parser.parse_args()
 
@@ -828,7 +872,7 @@ def main() -> None:
                     f"  [WARN] Could not load existing results from "
                     f"{args.results_file}, starting fresh"
                 )
-    elif os.path.exists(args.results_file):
+    elif args.resume and os.path.exists(args.results_file):
         try:
             existing_results = load_json_file(args.results_file)
             for r in existing_results.get("questions", []):
@@ -844,10 +888,10 @@ def main() -> None:
 
     valid_qids_set = set(valid_qids)
     new_qids = valid_qids_set - completed_qids
-    overlapping_qids = valid_qids_set & completed_qids
     is_resuming = False
 
     if completed_qids and not args.question_id:
+        overlapping_qids = valid_qids_set & completed_qids
         print(
             f"\n  Found {len(completed_qids)} already-evaluated questions "
             f"in {args.results_file}"
@@ -859,21 +903,10 @@ def main() -> None:
             print(f"\n  Resuming evaluation for {len(new_qids)} missing questions...")
             is_resuming = True
         else:
-            try:
-                if not confirm_yes_no(
-                    "All questions already evaluated. Re-run from scratch?",
-                    default=False,
-                    retry_on_invalid=True,
-                ):
-                    print("Aborted.")
-                    sys.exit(0)
-            except EOFError:
-                print("Aborted (non-interactive).")
-                sys.exit(0)
-            question_results.clear()
-            completed_qids.clear()
+            print("\n  All questions already evaluated, nothing to do.")
+            sys.exit(0)
     else:
-        print(f"\n  {len(valid_qids_set)} questions to evaluate (no prior results)")
+        print(f"\n  {len(valid_qids_set)} questions to evaluate")
 
     # =========================================================================
     # 3. Build and validate UUID path map
@@ -904,6 +937,10 @@ def main() -> None:
     # =========================================================================
 
     remaining_qids = [qid for qid in valid_qids if qid not in completed_qids]
+    if args.limit is not None:
+        remaining_qids = remaining_qids[: args.limit]
+        print(f"  Processing {len(remaining_qids)} questions (--limit {args.limit})")
+
     if args.question_id:
         total_questions = len(question_results) + len(valid_qids)
     else:
@@ -915,6 +952,8 @@ def main() -> None:
     write_comparative_results_snapshot(
         results_file=args.results_file,
         output_file=args.updated_questions_file,
+        answer_file_1=args.answer_file_1,
+        answer_file_2=args.answer_file_2,
         question_results=question_results,
         skip_count=display_skip_count,
         total_questions=total_questions,
@@ -951,6 +990,8 @@ def main() -> None:
         write_comparative_results_snapshot(
             results_file=args.results_file,
             output_file=args.updated_questions_file,
+            answer_file_1=args.answer_file_1,
+            answer_file_2=args.answer_file_2,
             question_results=question_results,
             skip_count=display_skip_count,
             total_questions=total_questions,
@@ -998,6 +1039,8 @@ def main() -> None:
     write_comparative_results_snapshot(
         results_file=args.results_file,
         output_file=args.updated_questions_file,
+        answer_file_1=args.answer_file_1,
+        answer_file_2=args.answer_file_2,
         question_results=question_results,
         skip_count=display_skip_count,
         total_questions=total_questions,

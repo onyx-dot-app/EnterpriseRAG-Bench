@@ -2,6 +2,7 @@
 
 import json
 import os
+import random
 import re
 
 from src.llm import Message, get_llm
@@ -228,8 +229,19 @@ def format_document_for_answer_update(title: str, content: str) -> str:
 # =============================================================================
 
 
+_DSID_PATTERN = re.compile(r"dsid_[a-f0-9]{20,32}")
+
+
+def _strip_dsid_references(text: str) -> str:
+    """Remove dsid_<hex> strings and clean up surrounding artifacts."""
+    cleaned = _DSID_PATTERN.sub("", text)
+    # Collapse whitespace runs left behind by removals
+    cleaned = re.sub(r" {2,}", " ", cleaned)
+    return cleaned.strip()
+
+
 def strip_answer_citations(answer: str) -> str:
-    """Strip citations from an answer string using LLM."""
+    """Strip citations from an answer string using LLM, then remove dsid references."""
     prompt = ANSWER_CITATION_STRIPPING_PROMPT.format(answer_string=answer)
 
     for attempt in range(_MAX_LLM_RETRIES):
@@ -243,11 +255,12 @@ def strip_answer_citations(answer: str) -> str:
                     response += chunk
 
             result = response.strip()
-            return result if result else answer
+            result = result if result else answer
+            return _strip_dsid_references(result)
         except Exception:
             if attempt == _MAX_LLM_RETRIES - 1:
                 raise
-    return answer
+    return _strip_dsid_references(answer)
 
 
 def evaluate_documents(
@@ -267,8 +280,12 @@ def evaluate_documents(
         doc_data = load_document_json_by_uuid(dsid, document_path_map)
         gold_docs_text.append(format_document_for_doc_evaluation(dsid, doc_data))
 
+    # Shuffle candidates to avoid positional bias across consensus runs
+    shuffled_candidates = list(candidate_doc_ids)
+    random.shuffle(shuffled_candidates)
+
     candidate_docs_text = []
-    for dsid in candidate_doc_ids:
+    for dsid in shuffled_candidates:
         doc_data = load_document_json_by_uuid(dsid, document_path_map)
         candidate_docs_text.append(
             format_document_for_doc_evaluation(dsid, doc_data),

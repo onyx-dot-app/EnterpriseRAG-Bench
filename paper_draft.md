@@ -260,7 +260,7 @@ python -m src.scripts.answer_evaluation.comparative_eval \
     --answer-file-2 answer_evaluation/system_2.jsonl
 ```
 
-Both modes support parallel execution (`--parallelism N`) and auto-resume from partial results. Questions that receive gold set corrections during evaluation are flagged in the results and written to a separate updated questions file.
+Both modes support parallel execution (`--parallelism N`) and resumption from partial results (`--resume`). Questions that receive gold set corrections during evaluation are flagged in the results and written to a separate updated questions file.
 
 ### A.3 Generation Pipeline
 
