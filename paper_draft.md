@@ -1,10 +1,10 @@
-# IndustryRAG-Bench: a RAG Benchmark for Company Internal Knowledge
+# EnterpriseRAG-Bench: a RAG Benchmark for Company Internal Knowledge
 
 ## Abstract
 
 **Retrieval-Augmented Generation (RAG)** has become the standard approach for grounding large language models in information that was not available during training. While existing datasets and benchmarks focus on web or other public sources, there is still no widely adopted dataset that realistically reflects the nature of company internal knowledge. Meanwhile, startups, enterprises, and researchers are increasingly developing AI Agents designed to operate over exactly this kind of proprietary data. To help close this gap, we introduce a new dataset that simulates enterprise knowledge environments and provide a flexible framework for extending and tailoring the data to specific use cases.
 
-We present **IndustryRAG-Bench**, a dataset consisting of approximately 500,000 synthetic documents spanning nine enterprise source types (Slack, Gmail, Linear, Google Drive, HubSpot, Fireflies, GitHub, Jira, and Confluence) and 500 questions across ten categories that test distinct retrieval and reasoning capabilities. The corpus is generated with cross-document coherence — grounded in shared projects, people, and initiatives — and augmented with realistic noise such as misfiled documents, near-duplicates, and conflicting information. The question set ranges from simple single-document lookups to multi-document reasoning, constrained retrieval, conflict resolution, and recognizing when information is absent. Alongside the dataset, we release the full generation framework, enabling teams to produce their own tailored datasets for different industries, company sizes, and source applications. The dataset, code, and evaluation harness, and leaderboard are accessible at [https://github.com/onyx-dot-app/IndustryRAG-Bench](https://github.com/onyx-dot-app/IndustryRAG-Bench).
+We present **EnterpriseRAG-Bench**, a dataset consisting of approximately 500,000 synthetic documents spanning nine enterprise source types (Slack, Gmail, Linear, Google Drive, HubSpot, Fireflies, GitHub, Jira, and Confluence) and 500 questions across ten categories that test distinct retrieval and reasoning capabilities. The corpus is generated with cross-document coherence — grounded in shared projects, people, and initiatives — and augmented with realistic noise such as misfiled documents, near-duplicates, and conflicting information. The question set ranges from simple single-document lookups to multi-document reasoning, constrained retrieval, conflict resolution, and recognizing when information is absent. Alongside the dataset, we release the full generation framework, enabling teams to produce their own tailored datasets for different industries, company sizes, and source applications. The dataset, code, and evaluation harness, and leaderboard are accessible at [https://github.com/onyx-dot-app/EnterpriseRAG-Bench](https://github.com/onyx-dot-app/EnterpriseRAG-Bench).
 
 
 ## 1. Introduction
@@ -26,7 +26,7 @@ Beyond these design principles, there are also **pragmatic constraints** that an
 
 ## 2. Dataset Overview
 
-The IndustryRAG-Bench corpus simulates a technology company called "Redwood Inference" and is organized across the following source types:
+The EnterpriseRAG-Bench corpus simulates a technology company called "Redwood Inference" and is organized across the following source types:
 
 | # | Source Type | Approx. Volume | Description |
 |---|-------------|----------------|-------------|
@@ -189,7 +189,7 @@ Four retrieval configurations are evaluated against the full question set. **BM2
 | High Level (10) | 50.0 / — | **60.0** / — | **60.0** / — |
 | Info Not Found (20) | **100.0** / — | **100.0** / — | **100.0** / — |
 
-BM25 leads on correctness and document recall. Vector search underperforms expectations even on semantic questions (32.8% correctness, 24.8% recall), the category explicitly designed to favor embedding-based retrieval by suppressing keyword overlap. One possible explanation is that embedding models are trained on public corpora (web pages, Wikipedia, forums) and have limited exposure to enterprise-specific vocabulary such as project codenames and internal acronyms, structured formats like tickets and CRM records, and conversational styles typical of internal messaging. This reinforces the premise motivating IndustryRAG-Bench: public benchmark performance does not transfer to enterprise retrieval.
+BM25 leads on correctness and document recall. Vector search underperforms expectations even on semantic questions (32.8% correctness, 24.8% recall), the category explicitly designed to favor embedding-based retrieval by suppressing keyword overlap. One possible explanation is that embedding models are trained on public corpora (web pages, Wikipedia, forums) and have limited exposure to enterprise-specific vocabulary such as project codenames and internal acronyms, structured formats like tickets and CRM records, and conversational styles typical of internal messaging. This reinforces the premise motivating EnterpriseRAG-Bench: public benchmark performance does not transfer to enterprise retrieval.
 
 The agent is the only system to exceed 60% overall completeness, achieving the highest score on that metric (61.1%) despite trailing BM25 on correctness and recall overall. Its strength is iterative discovery: once it reaches a relevant document, it can explore nearby files and similar patterns to find related documents. This possibly explains the high recall on `completeness` type question (59.0% vs. 46.5% for BM25 and 33.4% for vector), the hardest category overall. It is also the only system to achieve perfect recall on miscellaneous questions highlighting its strength at retrieving documents outside of dense topic areas. However, the agent approach comes at a substantial cost in latency and LLM cost: each question may take up to 10 minutes of iterative exploration, compared to a fraction of a second for retrieval plus a few seconds for generation with either BM25 and vector search.
 
@@ -209,7 +209,7 @@ The dataset is synthetic: no real enterprise corpus of comparable scale and dive
 
 ## 7. Conclusion and Future Work
 
-We introduced IndustryRAG-Bench, a benchmark for evaluating RAG systems over company-internal knowledge, a setting central to how enterprises deploy retrieval-augmented generation but absent from existing public benchmarks. The contribution has three components: a corpus of approximately 500,000 synthetic documents spanning nine enterprise source types with cross-document coherence and realistic noise; a question set of 500 questions across ten categories that test capabilities from single-document lookup to multi-document reasoning, conflict resolution, and recognizing absent information; and a correction-aware evaluation framework that treats gold labels as improvable rather than fixed, allowing ground truth to converge toward completeness as more systems are evaluated against the benchmark.
+We introduced EnterpriseRAG-Bench, a benchmark for evaluating RAG systems over company-internal knowledge, a setting central to how enterprises deploy retrieval-augmented generation but absent from existing public benchmarks. The contribution has three components: a corpus of approximately 500,000 synthetic documents spanning nine enterprise source types with cross-document coherence and realistic noise; a question set of 500 questions across ten categories that test capabilities from single-document lookup to multi-document reasoning, conflict resolution, and recognizing absent information; and a correction-aware evaluation framework that treats gold labels as improvable rather than fixed, allowing ground truth to converge toward completeness as more systems are evaluated against the benchmark.
 
 The generation framework is released alongside the dataset. The framework supports adaptation to different industries, company sizes, and source applications without requiring changes to the core methodology. This enables teams to produce tailored enterprise benchmarks rather than relying only on the released corpus.
 
@@ -226,11 +226,11 @@ The benchmark is designed to improve over time. As participating systems exercis
 
 ## Appendix A: Repository and Code Guide
 
-The dataset, generation framework, and evaluation harness are available at [https://github.com/onyx-dot-app/IndustryRAG-Bench](https://github.com/onyx-dot-app/IndustryRAG-Bench).
+The dataset, generation framework, and evaluation harness are available at [https://github.com/onyx-dot-app/EnterpriseRAG-Bench](https://github.com/onyx-dot-app/EnterpriseRAG-Bench).
 
 ### A.1 Dataset Artifacts
 
-The benchmark artifacts are available under the repository's [latest release](https://github.com/onyx-dot-app/IndustryRAG-Bench/releases/latest):
+The benchmark artifacts are available under the repository's [latest release](https://github.com/onyx-dot-app/EnterpriseRAG-Bench/releases/latest):
 
 - **`all_documents.zip`** — The full document corpus as a single archive.
 - **Per-source slices** (`<source_type>_slice_<N>.zip`) — Individual archives of up to 5,000 documents each, for partial downloads.

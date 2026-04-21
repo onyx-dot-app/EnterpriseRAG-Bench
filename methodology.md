@@ -2,7 +2,7 @@
 
 ## Core challenges
 
-The following are a list of requirements and challenges addressed by the IndustryRAG Bench approach.
+The following are a list of requirements and challenges addressed by the EnterpriseRAG Bench approach.
 
 1. Documents need to have consistent guiding principles to ensure they are realistic to the company / industry they are being generated for.
 2. The generation process must allow for interdependencies between individual documents. For example code changes (Pull-Requests) are necessarily linked to Product Requirement Documents (PRDs).

@@ -8,7 +8,7 @@ Usage:
     python -m src.scripts.answer_generation.index_document_bm25 [OPTIONS]
 
 Args:
-    --index-name        OpenSearch index name (default: "industryrag")
+    --index-name        OpenSearch index name (default: "enterpriserag")
     --opensearch-url    OpenSearch server URL (default: "http://localhost:9200")
     --batch-size        Documents per bulk request (default: 500)
     --recreate          Drop and recreate index if it exists
@@ -95,7 +95,7 @@ def main() -> None:
         description="Index source documents into OpenSearch for BM25 retrieval."
     )
     parser.add_argument(
-        "--index-name", default="industryrag", help="OpenSearch index name"
+        "--index-name", default="enterpriserag", help="OpenSearch index name"
     )
     parser.add_argument(
         "--opensearch-url",

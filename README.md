@@ -1,22 +1,22 @@
-<h1 align="center">IndustryRAG-Bench</h1>
+<h1 align="center">EnterpriseRAG-Bench</h1>
 
 <div align="center">
 <a href="https://github.com/onyx-dot-app/IndustryRAG-Dataset/blob/main/LICENSE"><img src="https://img.shields.io/badge/Code_License-MIT-blue" alt="license"></a>
 <a href="https://onyx.app/"><img src="https://img.shields.io/badge/Website-Onyx-green" alt="website"></a>
 <a href="https://github.com/onyx-dot-app/IndustryRAG-Dataset/releases/latest"><img alt="Dataset" src="https://img.shields.io/github/v/release/onyx-dot-app/IndustryRAG-Dataset?label=Dataset&color=FF6F00"></a>
-<a href="https://huggingface.co/spaces/onyx-dot-app/IndustryRAG-Bench-Leaderboard"><img alt="Leaderboard" src="https://img.shields.io/badge/🏆%20Leaderboard-yellow?color=FFD700"></a>
+<a href="https://huggingface.co/spaces/onyx-dot-app/EnterpriseRAG-Bench-Leaderboard"><img alt="Leaderboard" src="https://img.shields.io/badge/🏆%20Leaderboard-yellow?color=FFD700"></a>
 <a href="#"><img src="https://img.shields.io/badge/arXiv-b5212f.svg?logo=arxiv" alt="arXiv"></a>
 </div>
 
 
 ## 📖 Overview
 
-IndustryRAG Bench provides a dataset for company internal documents consisting of slightly over **500,000 documents** and **500 questions**.
+EnterpriseRAG Bench provides a dataset for company internal documents consisting of slightly over **500,000 documents** and **500 questions**.
 We release this dataset to help teams benchmark their RAG systems and fine-tune agents on realistic enterprise data.
 The code additionally provides a way of generating similar datasets for different industries, scales of companies, etc.
 
 > [!NOTE]
-> **See here for the latest [leaderboard rankings](https://huggingface.co/spaces/onyx-dot-app/IndustryRAG-Bench-Leaderboard).**
+> **See here for the latest [leaderboard rankings](https://huggingface.co/spaces/onyx-dot-app/EnterpriseRAG-Bench-Leaderboard).**
 
 The dataset simulates a company called "Redwood Inference" that provides AI model inference as a service.
 
@@ -91,7 +91,7 @@ Five principles guide the dataset design and generation process:
 
 ## Leaderboard
 
-The IndustryRAG-Bench leaderboard is available [here](https://huggingface.co/spaces/onyx-dot-app/IndustryRAG-Bench-Leaderboard).
+The EnterpriseRAG-Bench leaderboard is available [here](https://huggingface.co/spaces/onyx-dot-app/EnterpriseRAG-Bench-Leaderboard).
 
 > Note: Onyx offers a RAG-based product and excludes itself from the leaderboard to avoid conflict of interest.
 

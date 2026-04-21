@@ -9,7 +9,7 @@ Usage:
     python -m src.scripts.answer_generation.bm25_retrieval [OPTIONS]
 
 Args:
-    --index-name        OpenSearch index name (default: "industryrag")
+    --index-name        OpenSearch index name (default: "enterpriserag")
     --opensearch-url    OpenSearch server URL (default: "http://localhost:9200")
     --top-k             Documents to retrieve per question (default: 10)
     --questions-file    Path to questions JSONL (default: QUESTIONS_PATH)
@@ -54,7 +54,7 @@ def main() -> None:
         description="BM25 retrieval + LLM answer generation."
     )
     parser.add_argument(
-        "--index-name", default="industryrag", help="OpenSearch index name"
+        "--index-name", default="enterpriserag", help="OpenSearch index name"
     )
     parser.add_argument(
         "--opensearch-url",

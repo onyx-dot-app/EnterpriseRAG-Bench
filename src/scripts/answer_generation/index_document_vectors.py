@@ -12,7 +12,7 @@ Usage:
     python -m src.scripts.answer_generation.index_document_vectors [OPTIONS]
 
 Args:
-    --collection-name   Qdrant collection name (default: "industryrag")
+    --collection-name   Qdrant collection name (default: "enterpriserag")
     --qdrant-url        Qdrant server URL (default: "http://localhost:6333")
     --batch-size        Documents per embedding API call (default: 100)
     --chunk-size        Split documents into chunks of this many tokens (default: 512)
@@ -169,7 +169,7 @@ def main() -> None:
         description="Index source documents into Qdrant with text-embedding-3-large."
     )
     parser.add_argument(
-        "--collection-name", default="industryrag", help="Qdrant collection name"
+        "--collection-name", default="enterpriserag", help="Qdrant collection name"
     )
     parser.add_argument(
         "--qdrant-url", default="http://localhost:6333", help="Qdrant server URL"

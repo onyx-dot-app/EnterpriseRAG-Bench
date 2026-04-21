@@ -391,6 +391,6 @@ The agent-based approach can also be approximated using coding agents like Claud
 
 ## Leaderboard Submission
 
-To submit results for the IndustryRAG Benchmark leaderboard, reach out to joachim@onyx.app. Submissions must provide a method of verification:
+To submit results for the EnterpriseRAG Benchmark leaderboard, reach out to joachim@onyx.app. Submissions must provide a method of verification:
 - **Open source**: A guide for reproducing results.
 - **Closed source**: A sandbox or URL where questions can be sent for verification.
