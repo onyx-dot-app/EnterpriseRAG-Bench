@@ -1,10 +1,10 @@
 <h1 align="center">EnterpriseRAG-Bench</h1>
 
 <div align="center">
-<a href="https://github.com/onyx-dot-app/IndustryRAG-Dataset/blob/main/LICENSE"><img src="https://img.shields.io/badge/Code_License-MIT-blue" alt="license"></a>
-<a href="https://onyx.app/"><img src="https://img.shields.io/badge/Website-Onyx-green" alt="website"></a>
-<a href="https://github.com/onyx-dot-app/IndustryRAG-Dataset/releases/latest"><img alt="Dataset" src="https://img.shields.io/github/v/release/onyx-dot-app/IndustryRAG-Dataset?label=Dataset&color=FF6F00"></a>
 <a href="https://huggingface.co/spaces/onyx-dot-app/EnterpriseRAG-Bench-Leaderboard"><img alt="Leaderboard" src="https://img.shields.io/badge/🏆%20Leaderboard-yellow?color=FFD700"></a>
+<a href="https://huggingface.co/datasets/onyx-dot-app/EnterpriseRAG-Bench"><img alt="Dataset" src="https://img.shields.io/badge/🤗%20Dataset-orange?color=FF6F00"></a>
+<a href="https://github.com/onyx-dot-app/EnterpriseRAG-Bench/blob/main/LICENSE"><img src="https://img.shields.io/badge/Code_License-MIT-blue" alt="license"></a>
+<a href="https://onyx.app/"><img src="https://img.shields.io/badge/Website-Onyx-green" alt="website"></a>
 <a href="#"><img src="https://img.shields.io/badge/arXiv-b5212f.svg?logo=arxiv" alt="arXiv"></a>
 </div>
 
@@ -60,7 +60,7 @@ Up until now, there hasn't been a publically accessible dataset which focuses en
 
 ## Using the dataset
 
-Download the dataset from the [latest release](../../releases/latest):
+Download the dataset from the [latest release](../../releases/latest) or [HuggingFace](https://huggingface.co/datasets/onyx-dot-app/EnterpriseRAG-Bench):
 - **`all_documents.zip`** — all documents in a single archive.
 - **`<source_type>_slice_<slice_number>.zip`** — individual zip files, each containing up to 5000 docs (no nested directory structure).
 

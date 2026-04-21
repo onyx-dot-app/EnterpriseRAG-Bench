@@ -36,7 +36,7 @@ export CHEAP_LLM_MODEL_NAME="gpt-5-mini"
 
 ### 1. Download the data
 
-Grab the dataset from the [latest release](../../releases/latest):
+Grab the dataset from the [latest release](../../releases/latest) or [HuggingFace](https://huggingface.co/datasets/onyx-dot-app/EnterpriseRAG-Bench):
 - **`all_documents.zip`** — all documents in a single archive with directory structure preserved.
 - **`<source_type>_slice_<slice_number>.zip`** — per-source-type zips of up to 5,000 flat files each.
 
