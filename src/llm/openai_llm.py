@@ -10,7 +10,7 @@ from src.llm.tracing import get_current_span, init_tracing, is_tracing_enabled
 
 
 LLM_API_KEY = os.environ.get("LLM_API_KEY")
-LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "gpt-5.2")
+LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "gpt-5.4")
 CHEAP_LLM_MODEL_NAME = os.environ.get("CHEAP_LLM_MODEL_NAME", "gpt-5-mini")
 
 
@@ -30,7 +30,7 @@ class OpenAILLM(LLMInterface):
 
         Args:
             api_key: OpenAI API key. Defaults to LLM_API_KEY env var.
-            model: Model to use. Defaults to LLM_MODEL_NAME env var or gpt-5.2.
+            model: Model to use. Defaults to LLM_MODEL_NAME env var or gpt-5.4.
             tools: List of tool schemas in OpenAI format.
             quiet: If True, suppress status print statements.
             reasoning_level: Level of reasoning effort ("low", "medium", "high").

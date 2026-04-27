@@ -23,8 +23,8 @@ export LLM_PROVIDER="openai"
 # Required: API key for your chosen provider
 export LLM_API_KEY="your-api-key-here"
 
-# Optional: Override the default model (defaults: "gpt-5.2" for OpenAI, "claude-sonnet-4-6" for Anthropic)
-export LLM_MODEL_NAME="gpt-5.2"
+# Optional: Override the default model (defaults: "gpt-5.4" for OpenAI, "claude-sonnet-4-6" for Anthropic)
+export LLM_MODEL_NAME="gpt-5.4"
 
 # Optional: Override the cheap model used for less critical operations (defaults: "gpt-5-mini" for OpenAI, "claude-haiku-4-5" for Anthropic)
 export CHEAP_LLM_MODEL_NAME="gpt-5-mini"
