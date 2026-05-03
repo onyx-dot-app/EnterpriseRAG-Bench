@@ -17,6 +17,9 @@ Args:
     --parallelism             Number of parallel evaluation threads (default: 1)
     --question-id             Evaluate a single question_id only
     --skip-citation-stripping Skip LLM-based citation stripping from answers
+    --no-correction       Skip the consensus document-correction flow; score purely
+                          against the original gold doc set without rewriting gold
+                          answers, facts, or expected_doc_ids.
     --resume              Skip questions already in results file
     --limit               Max questions to process
 """
@@ -427,6 +430,7 @@ def compute_stats_for_group(results: list[dict]) -> dict[str, float | int]:
             "count": 0,
             "average_correctness_pct": 0.0,
             "average_completeness_pct": 0.0,
+            "combined_correctness_completeness_score": 0.0,
             "average_recall_pct": 0.0,
             "average_invalid_extra_docs": 0.0,
         }
@@ -448,6 +452,11 @@ def compute_stats_for_group(results: list[dict]) -> dict[str, float | int]:
         ),
         "average_completeness_pct": round(
             sum(r["completeness_pct"] for r in results) / n,
+            2,
+        ),
+        "combined_correctness_completeness_score": round(
+            sum(r["completeness_pct"] if r["answer_correct"] else 0.0 for r in results)
+            / n,
             2,
         ),
         "average_recall_pct": (
@@ -497,7 +506,7 @@ def build_aggregate_stats(
 
 def write_results_snapshot(
     results_file: str,
-    output_file: str,
+    output_file: str | None,
     question_results: list[dict],
     skip_count: int | str,
     total_questions: int,
@@ -505,18 +514,18 @@ def write_results_snapshot(
 ) -> None:
     """Write the current results snapshot to disk atomically."""
     sorted_question_results = sort_question_results(question_results)
-    results_output = {
-        "updated_question_file": output_file,
-        "aggregate_stats": build_aggregate_stats(
-            question_results=question_results,
-            skip_count=skip_count,
-            total_questions=total_questions,
-        ),
-        "question_type_stats": build_question_type_stats(
-            question_results, type_order=type_order
-        ),
-        "questions": sorted_question_results,
-    }
+    results_output: dict = {}
+    if output_file is not None:
+        results_output["updated_question_file"] = output_file
+    results_output["aggregate_stats"] = build_aggregate_stats(
+        question_results=question_results,
+        skip_count=skip_count,
+        total_questions=total_questions,
+    )
+    results_output["question_type_stats"] = build_question_type_stats(
+        question_results, type_order=type_order
+    )
+    results_output["questions"] = sorted_question_results
     write_json_file(results_file, results_output)
 
 
@@ -575,6 +584,16 @@ def main() -> None:
         action="store_true",
         default=False,
         help="Skip LLM-based citation stripping from answers",
+    )
+    parser.add_argument(
+        "--no-correction",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the consensus document-correction flow; score purely against "
+            "the original gold doc set. No gold answer/fact regeneration, no "
+            "questions_updated.jsonl is written."
+        ),
     )
     parser.add_argument(
         "--resume",
@@ -717,25 +736,34 @@ def main() -> None:
     # 3. Build and validate UUID path map
     # =========================================================================
 
-    updated_questions = load_updated_questions(args.updated_questions_file)
-    if updated_questions:
-        print(
-            f"  Loaded {len(updated_questions)} updated questions from "
-            f"{args.updated_questions_file}"
-        )
-    if args.question_id:
-        updated_questions.pop(args.question_id, None)
+    updated_questions: dict[str, dict] = {}
+    document_path_map: dict[str, str] = {}
 
-    try:
-        document_path_map = resolve_document_path_map(
-            questions=questions,
-            answer_sets=[answers],
-            updated_questions=updated_questions,
-            uuid_index_cache_file=args.uuid_index_cache_file,
+    if args.no_correction:
+        print(
+            "  --no-correction set; skipping updated-questions load and "
+            "document path resolution"
         )
-    except ValueError as exc:
-        print(f"\nFATAL: {exc}")
-        sys.exit(1)
+    else:
+        updated_questions = load_updated_questions(args.updated_questions_file)
+        if updated_questions:
+            print(
+                f"  Loaded {len(updated_questions)} updated questions from "
+                f"{args.updated_questions_file}"
+            )
+        if args.question_id:
+            updated_questions.pop(args.question_id, None)
+
+        try:
+            document_path_map = resolve_document_path_map(
+                questions=questions,
+                answer_sets=[answers],
+                updated_questions=updated_questions,
+                uuid_index_cache_file=args.uuid_index_cache_file,
+            )
+        except ValueError as exc:
+            print(f"\nFATAL: {exc}")
+            sys.exit(1)
 
     # =========================================================================
     # 4. Prepare worker pool and incremental output state
@@ -755,11 +783,14 @@ def main() -> None:
 
     # When resuming, the original skip_count is not recoverable
     display_skip_count: int | str = "N/A" if is_resuming else skip_count
+    results_output_file: str | None = (
+        None if args.no_correction else args.updated_questions_file
+    )
 
     # Initialize results file
     write_results_snapshot(
         results_file=args.results_file,
-        output_file=args.updated_questions_file,
+        output_file=results_output_file,
         question_results=question_results,
         skip_count=display_skip_count,
         total_questions=total_questions,
@@ -782,7 +813,7 @@ def main() -> None:
         updated_q: dict | None = None
         has_expected_docs = bool(questions[qid].get("expected_doc_ids"))
 
-        if row.get("document_ids") and has_expected_docs:
+        if not args.no_correction and row.get("document_ids") and has_expected_docs:
             status, updated_q = process_question_docs(
                 row,
                 questions,
@@ -833,7 +864,7 @@ def main() -> None:
 
         write_results_snapshot(
             results_file=args.results_file,
-            output_file=args.updated_questions_file,
+            output_file=results_output_file,
             question_results=question_results,
             skip_count=display_skip_count,
             total_questions=total_questions,
@@ -882,50 +913,55 @@ def main() -> None:
     print(f"  Writing {args.results_file}...")
     write_results_snapshot(
         results_file=args.results_file,
-        output_file=args.updated_questions_file,
+        output_file=results_output_file,
         question_results=question_results,
         skip_count=display_skip_count,
         total_questions=total_questions,
         type_order=type_order,
     )
 
-    # Build corrected qids from results
-    corrected_qids: set[str] = set()
-    for r in question_results:
-        if r.get("corrected"):
-            corrected_qids.add(r["question_id"])
+    if args.no_correction:
+        print(
+            "  --no-correction set; skipping write of " f"{args.updated_questions_file}"
+        )
+    else:
+        # Build corrected qids from results
+        corrected_qids: set[str] = set()
+        for r in question_results:
+            if r.get("corrected"):
+                corrected_qids.add(r["question_id"])
 
-    # Write questions_updated.jsonl from original questions + updates, sorted
-    print(f"  Writing {args.updated_questions_file}...")
-    all_question_rows: list[dict] = []
-    with open(args.questions_file) as f:
-        for line in f:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            row = json.loads(stripped)
-            qid = row.get("question_id")
-            if qid and qid in updated_questions:
-                row = dict(updated_questions[qid])
-            if qid and qid in corrected_qids:
-                # Insert "corrected" as second field after question_id
-                ordered: dict = {}
-                for key, value in row.items():
-                    if key == "corrected":
-                        continue
-                    ordered[key] = value
-                    if key == "question_id":
-                        ordered["corrected"] = True
-                row = ordered
-            else:
-                row = {k: v for k, v in row.items() if k != "corrected"}
-            all_question_rows.append(row)
+        # Write questions_updated.jsonl from original questions + updates, sorted
+        print(f"  Writing {args.updated_questions_file}...")
+        all_question_rows: list[dict] = []
+        with open(args.questions_file) as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                row = json.loads(stripped)
+                qid = row.get("question_id")
+                if qid and qid in updated_questions:
+                    row = dict(updated_questions[qid])
+                if qid and qid in corrected_qids:
+                    # Insert "corrected" as second field after question_id
+                    ordered: dict = {}
+                    for key, value in row.items():
+                        if key == "corrected":
+                            continue
+                        ordered[key] = value
+                        if key == "question_id":
+                            ordered["corrected"] = True
+                    row = ordered
+                else:
+                    row = {k: v for k, v in row.items() if k != "corrected"}
+                all_question_rows.append(row)
 
-    all_question_rows.sort(key=question_sort_key)
-    os.makedirs(os.path.dirname(args.updated_questions_file), exist_ok=True)
-    with open(args.updated_questions_file, "w") as f:
-        for row in all_question_rows:
-            f.write(json.dumps(row) + "\n")
+        all_question_rows.sort(key=question_sort_key)
+        os.makedirs(os.path.dirname(args.updated_questions_file), exist_ok=True)
+        with open(args.updated_questions_file, "w") as f:
+            for row in all_question_rows:
+                f.write(json.dumps(row) + "\n")
 
     # =========================================================================
     # 7. Print aggregate stats
@@ -943,6 +979,10 @@ def main() -> None:
     print(f"  Corrected questions: {aggregate_stats['num_corrected_questions']}")
     print(f"  Avg correctness:     {aggregate_stats['average_correctness_pct']}%")
     print(f"  Avg completeness:    {aggregate_stats['average_completeness_pct']}%")
+    print(
+        f"  Combined corr*comp:  "
+        f"{aggregate_stats['combined_correctness_completeness_score']}"
+    )
     print(f"  Avg recall:          {aggregate_stats['average_recall_pct']}%")
     print(f"  Avg invalid extra:   {aggregate_stats['average_invalid_extra_docs']}")
 
