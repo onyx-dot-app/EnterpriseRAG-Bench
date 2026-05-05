@@ -102,7 +102,7 @@ To submit to the leaderboard, contact joachim@onyx.app. All submissions require 
 
 ## Citation
 
-The paper is available [here](paper.pdf).
+The paper is available [here](paper.pdf) temporarily. Pending submission to arXiv.
 
 ---
 
