@@ -102,7 +102,7 @@ To submit to the leaderboard, contact joachim@onyx.app. All submissions require 
 
 ## Citation
 
-The paper is still being finalized but you can read a draft [here](paper_draft.md).
+The paper is available [here](paper.pdf).
 
 ---
 
