@@ -5,7 +5,7 @@
 <a href="https://huggingface.co/datasets/onyx-dot-app/EnterpriseRAG-Bench"><img alt="Dataset" src="https://img.shields.io/badge/🤗%20Dataset-orange?color=FF6F00"></a>
 <a href="https://github.com/onyx-dot-app/EnterpriseRAG-Bench/blob/main/LICENSE"><img src="https://img.shields.io/badge/Code_License-MIT-blue" alt="license"></a>
 <a href="https://onyx.app/"><img src="https://img.shields.io/badge/Website-Onyx-green" alt="website"></a>
-<a href="#"><img src="https://img.shields.io/badge/arXiv-b5212f.svg?logo=arxiv" alt="arXiv"></a>
+<a href="https://arxiv.org/abs/2605.05253"><img src="https://img.shields.io/badge/arXiv-2605.05253-b5212f.svg?logo=arxiv" alt="arXiv"></a>
 </div>
 
 
@@ -102,7 +102,19 @@ To submit to the leaderboard, contact joachim@onyx.app. All submissions require 
 
 ## Citation
 
-The paper is available [here](paper.pdf) temporarily. Pending submission to arXiv.
+The paper is available on [arXiv](https://arxiv.org/abs/2605.05253).
+
+```bibtex
+@misc{sun2026enterpriseragbench,
+      title={EnterpriseRAG-Bench: A RAG Benchmark for Company Internal Knowledge},
+      author={Sun, Yuhong and Rahmfeld, Joachim and Weaver, Chris and Desai, Roshan and Huang, Wenxi and Butler, Mark H.},
+      year={2026},
+      eprint={2605.05253},
+      archivePrefix={arXiv},
+      primaryClass={cs.IR},
+      url={https://arxiv.org/abs/2605.05253}
+}
+```
 
 ---
 
