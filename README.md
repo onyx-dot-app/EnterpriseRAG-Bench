@@ -36,7 +36,7 @@ The data sources and approximate volumes are as follows:
 
 The corpus provides broad coverage across key areas of business activity including (but not limited to) planning, engineering, documentation, sales, customer success, internal discussions, emails, and more.
 
-The [questions](questions.jsonl) are broken up into 10 categories:
+The question set, available from the [HuggingFace dataset](https://huggingface.co/datasets/onyx-dot-app/EnterpriseRAG-Bench), is broken up into 10 categories:
 
 | # | Category | Count | Description |
 |---|----------|-------|-------------|
@@ -64,17 +64,14 @@ Download the dataset from the [latest release](../../releases/latest) or [Huggin
 - **`all_documents.zip`** — all documents in a single archive.
 - **`<source_type>_slice_<slice_number>.zip`** — individual zip files, each containing up to 5000 docs (no nested directory structure).
 
-The question set can be found in [questions.jsonl](questions.jsonl) and also under the releases.
+The question set can be found as `questions.jsonl` in the [HuggingFace dataset](https://huggingface.co/datasets/onyx-dot-app/EnterpriseRAG-Bench) and also under the releases.
 
 To just run answer evaluation, reference the [README.md](answer_evaluation/README.md) in `answer_evaluation`.
-
-> [!TIP]
-> For more info on all of the ways to use this dataset and code, refer to the [Quickstart Guide](quickstart.md)
 
 
 ## Key Considerations
 
-__For more details on the process, refer to [methodology.md](methodology.md)__
+__For more details on the process, see the [paper](https://arxiv.org/abs/2605.05253)__
 
 Five principles guide the dataset design and generation process:
 

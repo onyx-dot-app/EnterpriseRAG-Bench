@@ -2,7 +2,7 @@
 
 This directory is provided for your convenience, the scripts for answer evaluation look for certain files in this directory as a default.
 
-For more details on the process and evaluation methods, see [methodology.md](methodology.md#evaluation)
+For more details on the process and evaluation methods, see the [paper](https://arxiv.org/abs/2605.05253).
 
 ## Answer File Format
 
