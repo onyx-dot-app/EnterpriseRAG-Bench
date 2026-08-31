@@ -54,6 +54,9 @@ The [questions](questions.jsonl) are broken up into 10 categories:
 > Note: An additional 100 metadata-dependent questions are available in [extra_questions.jsonl](extra_questions.jsonl) for teams interested in metadata-aware RAG.
 > These are excluded from the leaderboard since their evaluation criteria differ from the core retrieval-focused benchmark.
 
+> [!IDEA]
+> A proposed 11th category — **Poisoned Source** (deliberately tampered + synthetic documents, testing corpus-trust robustness) — is described in [poisoned_document_split_proposal.md](poisoned_document_split_proposal.md). Feedback welcome.
+
 Existing Retrieval Augmented Generation (RAG) and Information Retrieval (IR) datasets largely focus on publically accessible document sets (Bing searches, Stack Overflow forums, etc.).
 Up until now, there hasn't been a publically accessible dataset which focuses entirely on company internal data. This dataset/repo aims to provide that.
 
