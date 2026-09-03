@@ -131,3 +131,45 @@ Output a simple yes or no for if the answer is consistent with and contains the 
 
 CRITICAL: output only a simple yes if the answer is consistent with the statement or a no if the answer does not contain the information in the statement or contradicts the statement.
 """.strip()
+
+
+GOLD_CLAIM_VALIDATION_PROMPT = """
+You are an impartial fact checker. A grader marked a candidate answer as misaligned with the gold answer. \
+Your job is to determine, using ONLY the source documents below, whether the gold answer's disputed claims are \
+actually supported by the sources, and whether the candidate answer's version is supported by the sources.
+
+Judge strictly against the source documents. Do not use outside knowledge except to recognize logical or \
+factual impossibilities (e.g. a stated date not matching its stated weekday, or command sequences that cannot work). \
+Identifiers, names, titles, numbers, and commands must match what the sources actually say.
+
+## Query
+```
+{query}
+```
+
+## Gold Answer
+```
+{gold_answer}
+```
+
+## Candidate Answer
+```
+{candidate_answer}
+```
+
+## Grader's Reason For Marking The Candidate Misaligned
+```
+{disagreement_reason}
+```
+
+## Source Documents
+{reference_documents}
+
+## Output Format
+Output only a JSON object with the following fields in the order shown below (no additional text or formatting):
+{{
+  "reason": "max 2 sentence explanation citing what the sources say about the disputed claims",
+  "gold_supported": "yes or no - is the gold answer's disputed content supported by the source documents",
+  "candidate_supported": "yes or no - is the candidate answer's disputed content supported by the source documents"
+}}
+""".strip()

@@ -46,6 +46,7 @@ from src.utils.eval_utils import (
     sort_question_results,
     strip_answer_citations,
     update_gold_answer,
+    validate_gold_claims_with_consensus,
     validate_single_fact,
 )
 from src.llm import Message, get_llm
@@ -590,9 +591,9 @@ def main() -> None:
         action="store_true",
         default=False,
         help=(
-            "Skip the consensus document-correction flow; score purely against "
-            "the original gold doc set. No gold answer/fact regeneration, no "
-            "questions_updated.jsonl is written."
+            "Skip the consensus correction flows (document-set correction and "
+            "claim-level gold validation); score purely against the original "
+            "gold. No gold answer/fact regeneration, no questions_updated.jsonl."
         ),
     )
     parser.add_argument(
@@ -824,6 +825,93 @@ def main() -> None:
         original_question = questions[qid]
         effective_question = updated_q if updated_q else original_question
         result = score_answer(row, effective_question, original_question)
+
+        # Claim-level correction: when the wholistic judge marks the answer
+        # wrong, check the disagreement against the source documents. If a
+        # consensus finds the gold's disputed content unsupported by the
+        # sources while the candidate's version is supported, regenerate the
+        # gold from the sources and re-score. Complements the document-set
+        # correction above, which never validates what the gold answer says.
+        if (
+            not args.no_correction
+            and not result["answer_correct"]
+            and row.get("answer")
+            and effective_question.get("expected_doc_ids")
+            and effective_question.get("gold_answer")
+        ):
+            try:
+                overturned, claim_reason = validate_gold_claims_with_consensus(
+                    question=effective_question.get(
+                        "question", original_question.get("question", "")
+                    ),
+                    gold_answer=effective_question["gold_answer"],
+                    candidate_answer=row["answer"],
+                    disagreement_reason=result.get("correctness_reasoning", ""),
+                    gold_doc_ids=effective_question["expected_doc_ids"],
+                    document_path_map=document_path_map,
+                )
+            except Exception as exc:
+                overturned, claim_reason = False, ""
+                print(f"  [WARN] {qid}: claim validation failed: {exc}")
+
+            if overturned:
+                new_gold = update_gold_answer(
+                    question=effective_question.get(
+                        "question", original_question.get("question", "")
+                    ),
+                    previous_gold_answer=effective_question["gold_answer"],
+                    valid_doc_ids=effective_question["expected_doc_ids"],
+                    document_path_map=document_path_map,
+                )
+                if new_gold:
+                    claim_updated = dict(effective_question)
+                    claim_updated["updated"] = True
+                    claim_updated["gold_answer"] = new_gold
+                    claim_update_reasons = dict(
+                        claim_updated.get("update_reasons") or {}
+                    )
+                    claim_update_reasons["claim_validation"] = {
+                        "classification": "gold_overturned",
+                        "reason": claim_reason,
+                    }
+                    claim_updated["update_reasons"] = claim_update_reasons
+
+                    original_facts = effective_question.get("answer_facts", [])
+                    anti_hallucination_facts = (
+                        extract_anti_hallucination_facts(original_facts, quiet=True)
+                        or []
+                    )
+                    new_facts = (
+                        extract_answer_facts(
+                            claim_updated.get(
+                                "question", original_question.get("question", "")
+                            ),
+                            new_gold,
+                            quiet=True,
+                        )
+                        or []
+                    )
+                    new_facts_set = set(new_facts)
+                    combined_facts = list(new_facts)
+                    for fact in anti_hallucination_facts:
+                        if fact not in new_facts_set:
+                            combined_facts.append(fact)
+                    claim_updated["answer_facts"] = combined_facts
+
+                    updated_q = claim_updated
+                    result = score_answer(row, claim_updated, original_question)
+                    print(
+                        f"  {qid} claims: GOLD OVERTURNED by source check "
+                        f"({claim_reason[:100]}); gold regenerated and re-scored"
+                    )
+                else:
+                    print(
+                        f"  [WARN] {qid}: gold overturned but regeneration "
+                        "failed; keeping original score"
+                    )
+            else:
+                print(f"  {qid} claims: gold upheld by source check")
+
         recall_str = (
             f"{result['document_recall_pct']}%"
             if result["document_recall_pct"] is not None

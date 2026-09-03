@@ -622,3 +622,104 @@ def build_type_order(questions: dict[str, dict]) -> list[str]:
             seen_types.add(qt)
             type_order.append(qt)
     return type_order
+
+
+def _validate_gold_claims_once(
+    question: str,
+    gold_answer: str,
+    candidate_answer: str,
+    disagreement_reason: str,
+    gold_doc_ids: list[str],
+    document_path_map: dict[str, str],
+) -> tuple[bool, bool, str] | None:
+    """One claim-validation run. Returns (gold_supported, candidate_supported,
+    reason), or None if the LLM output was unusable."""
+    from src.prompts.answer_evaluation import GOLD_CLAIM_VALIDATION_PROMPT
+
+    docs_text = []
+    for dsid in gold_doc_ids:
+        title, content = load_document_content_by_uuid(dsid, document_path_map)
+        docs_text.append(format_document_for_answer_update(title, content))
+    if not docs_text:
+        return None
+
+    prompt = GOLD_CLAIM_VALIDATION_PROMPT.format(
+        query=question,
+        gold_answer=gold_answer,
+        candidate_answer=candidate_answer,
+        disagreement_reason=disagreement_reason or "(not provided)",
+        reference_documents="\n\n".join(docs_text),
+    )
+
+    for _ in range(_MAX_LLM_RETRIES):
+        try:
+            llm = get_llm(tools=None, quiet=True)
+            messages: list[Message] = [Message(role="user", content=prompt)]
+            response = ""
+            for chunk in llm.generate(messages):
+                if isinstance(chunk, str):
+                    response += chunk
+        except Exception:
+            continue
+
+        try:
+            parsed = json.loads(extract_json_from_response(response.strip()))
+        except Exception:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+
+        gold_s = parsed.get("gold_supported", "")
+        cand_s = parsed.get("candidate_supported", "")
+        reason = parsed.get("reason", "")
+        if not isinstance(gold_s, str) or not isinstance(cand_s, str):
+            continue
+        return (
+            re.search(r"\byes\b", gold_s, re.IGNORECASE) is not None,
+            re.search(r"\byes\b", cand_s, re.IGNORECASE) is not None,
+            reason if isinstance(reason, str) else "",
+        )
+    return None
+
+
+def validate_gold_claims_with_consensus(
+    question: str,
+    gold_answer: str,
+    candidate_answer: str,
+    disagreement_reason: str,
+    gold_doc_ids: list[str],
+    document_path_map: dict[str, str],
+    num_runs: int = 3,
+) -> tuple[bool, str]:
+    """Check a judged-wrong answer's disagreement against the source documents.
+
+    Returns (gold_overturned, reason). The gold answer is overturned only when
+    a majority of runs find the gold's disputed content unsupported by the
+    sources AND the candidate's version supported — ties keep the gold
+    (conservative, matching the document-correction flow's gold bias).
+    """
+    votes_overturn = 0
+    votes_total = 0
+    reasons: list[str] = []
+    for _ in range(num_runs):
+        result = _validate_gold_claims_once(
+            question=question,
+            gold_answer=gold_answer,
+            candidate_answer=candidate_answer,
+            disagreement_reason=disagreement_reason,
+            gold_doc_ids=gold_doc_ids,
+            document_path_map=document_path_map,
+        )
+        if result is None:
+            continue
+        gold_supported, candidate_supported, reason = result
+        votes_total += 1
+        if not gold_supported and candidate_supported:
+            votes_overturn += 1
+            if reason:
+                reasons.append(reason)
+
+    if votes_total == 0:
+        return (False, "all claim-validation runs failed")
+    overturned = votes_overturn * 2 > votes_total
+    return (overturned, reasons[0] if reasons else "")
